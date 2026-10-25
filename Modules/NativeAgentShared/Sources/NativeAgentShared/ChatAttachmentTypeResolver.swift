@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ChatAttachmentTypeResolver.swift` | `ChatAttachmentTypeResolver` enum; `typeAndMime`, `fileByteLimit`, `submittingSpeech` keeps composer wording on its utterances |
 
 /// Supported chat files have the same type and byte ceiling on every door.
 public enum ChatAttachmentTypeResolver {

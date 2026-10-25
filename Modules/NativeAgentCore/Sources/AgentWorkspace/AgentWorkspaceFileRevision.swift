@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceFileRevision.swift` | `AgentWorkspaceFileRevision` struct; `prepare` |
 
 /// A selected file, never an editable target. Reading the whole bounded source
 /// prepares the ordinary file form; the file owner checks its content again at

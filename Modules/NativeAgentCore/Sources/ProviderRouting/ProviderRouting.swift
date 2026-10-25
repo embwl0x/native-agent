@@ -2,6 +2,8 @@ import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
+import os
+// Blueprint: | `ProviderRouting.swift` | `SwiftNativeProviderRouting` actor; `checkedProviderSnapshot`, `checkedRoutingSnapshot`, `saveGroupSelection`, `adoptConnectedProvider`, `catalogContextLength`, `routingRepairInput`, `reconstructRouting`; effort-only group rows inherit Chat's current model/account without seeding other controls; provider interpretation, byte-checked picker/configuration decode reuse with fresh credential/readiness checks; checked picker revisions come from both files under the transaction lock and travel with phone snapshots/readbacks, recoverable group writes/adoption and byte-preserving explicit routing reconstruction |
 
 // MARK: - SwiftNative impl
 //
@@ -18,6 +20,20 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     private let surfacesPath: URL
     private let activeProviderPath: URL
     private let persistence: any PersistenceCoreProtocol
+    private struct PickerGeneration: Sendable {
+        let surfacesBytes: Data?
+        let activeBytes: Data?
+        let surfaces: [String: JSONValue]
+        let active: [String: String]
+    }
+    private nonisolated let pickerGeneration = OSAllocatedUnfairLock<PickerGeneration?>(initialState: nil)
+    // Only validated file objects live here, never resolved Keychain values or
+    // readiness. The writer's lock and a fresh byte read precede every lookup.
+    // Raw Foundation JSON is immutable; the lock guards the memo and callers
+    // mutate only their value copies, never its stored dictionaries.
+    private nonisolated let configurationGenerations = OSAllocatedUnfairLock(
+        uncheckedState: [String: (bytes: Data, read: ProviderConfigRead)]()
+    )
 
     /// `dataRoot` owns provider registry/config/catalog reads and writes. The
     /// two path overrides are narrower fixture seams for picker files only;
@@ -134,17 +150,28 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         at path: URL,
         description: String
     ) throws -> [String: JSONValue] {
+        try decodeProviderStateObjectChecked(
+            providerStateBytesChecked(at: path, description: description), at: path, description: description
+        )
+    }
+
+    private nonisolated static func providerStateBytesChecked(at path: URL, description: String) throws -> Data? {
         do {
             _ = try FileManager.default.attributesOfItem(atPath: path.path)
         } catch CocoaError.fileReadNoSuchFile {
-            return [:]
+            return nil
         }
-        let data: Data
         do {
-            data = try Data(contentsOf: path)
+            return try Data(contentsOf: path)
         } catch {
             throw providerStateFailure(at: path, description: description, detail: "is unreadable")
         }
+    }
+
+    private nonisolated static func decodeProviderStateObjectChecked(
+        _ data: Data?, at path: URL, description: String
+    ) throws -> [String: JSONValue] {
+        guard let data else { return [:] }
         let value: JSONValue
         do {
             value = try JSONDecoder().decode(JSONValue.self, from: data)
@@ -437,25 +464,59 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
 
     private func reconciledPickerState() async throws -> (
         surfaces: [String: JSONValue],
-        active: [String: String]
+        active: [String: String], revision: Double
     ) {
         try await persistence.withFileLock(surfaceTransactionPath) {
             try await self.reconcilePendingSurfaceConfigurationLocked()
-            let surfaces = try Self.loadProviderStateObjectChecked(
-                at: self.surfacesPath,
-                description: "surface preference"
+            return try self.checkedPickerStateLocked()
+        }
+    }
+
+    /// The transaction lock still guards recovery and both fresh byte reads.
+    /// Only decoding/canonicalization carries across identical checked bytes;
+    /// a read failure can never serve the previous generation.
+    private nonisolated func checkedPickerStateLocked() throws -> (
+        surfaces: [String: JSONValue], active: [String: String], revision: Double
+    ) {
+        let surfacesBytes = try Self.providerStateBytesChecked(at: surfacesPath, description: "surface preference")
+        let activeBytes = try Self.providerStateBytesChecked(at: activeProviderPath, description: "active-provider")
+        // Source revision is read under the same transaction lock as both
+        // picker files. Arrival, request order and a later serialization are
+        // not the revision of these recovered bytes.
+        var revision: Double = 0
+        for (url, bytes) in [(surfacesPath, surfacesBytes), (activeProviderPath, activeBytes)] where bytes != nil {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let modified = attributes[.modificationDate] as? Date else {
+                throw ProviderRoutingError.underlying("Provider selection has no source revision.")
+            }
+            revision = max(revision, modified.timeIntervalSince1970)
+        }
+        return try pickerGeneration.withLock { [revision] generation in
+            if let generation, generation.surfacesBytes == surfacesBytes, generation.activeBytes == activeBytes {
+                return (generation.surfaces, generation.active, revision)
+            }
+            let surfaces = try Self.decodeProviderStateObjectChecked(
+                surfacesBytes, at: surfacesPath, description: "surface preference"
             )
-            let active = try Self.loadActiveProviderStateChecked(at: self.activeProviderPath)
+            let rawActive = try Self.decodeProviderStateObjectChecked(
+                activeBytes, at: activeProviderPath, description: "active-provider"
+            )
+            let active: [String: String]
+            do { active = try Self.loadActiveProviderObjectChecked(rawActive) }
+            catch { throw Self.providerStateFailure(at: activeProviderPath, description: "active-provider", detail: error.localizedDescription) }
             // P2-3 read seam. Both picker files are keyed by surface, and a
             // 0.3.x install has `missions` keys in them. Fold here — the ONE
             // place either file becomes in-memory state — so the snapshot,
             // preferences, and pins all speak the canonical vocabulary. The
             // files themselves are left untouched; only a later WRITE migrates
             // them (see `updatedSurfaceRoot` / `updatedActiveRoot`).
-            return (
-                WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(surfaces),
-                WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(active)
+            let checked = PickerGeneration(
+                surfacesBytes: surfacesBytes, activeBytes: activeBytes,
+                surfaces: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(surfaces),
+                active: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(active)
             )
+            generation = checked
+            return (checked.surfaces, checked.active, revision)
         }
     }
 
@@ -492,7 +553,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             routing: routingSnapshot(
                 surfaces: state.surfaces, activeProviders: state.active,
                 soleConnectedProvider: soleConnectedProviderFamily(cache: cache),
-                soleConnectedRoute: soleConnectedProviderID(cache: cache), configCache: cache
+                soleConnectedRoute: soleConnectedProviderID(cache: cache), configCache: cache,
+                revision: state.revision
             ),
             providers: inventory.providers.map { provider in
                 var row = provider
@@ -742,7 +804,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         else { validateSelection = try await selectionValidator() }
         return try await saveSurfaceConfigurations(
             surfaces: surfaces, model: model, reasoningEffort: reasoningEffort,
-            serviceTier: serviceTier, providerId: providerID, seedMissingControls: true,
+            serviceTier: serviceTier, providerId: providerID,
+            seedMissingControls: reasoningEffort == nil || model != nil || providerID != nil || serviceTier != nil,
             reconcilePinnedModelWithProvider: model == nil && !clearOverride,
             clearOverride: clearOverride, selectionValidator: validateSelection
         )
@@ -780,6 +843,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         overwriteExisting: Bool = true,
         reconcilePinnedModelWithProvider: Bool = false,
         clearOverride: Bool = false,
+        adoptingConnectedProvider: Bool = false,
         selectionValidator: (@Sendable (String, String) throws -> Void)? = nil
     ) async throws -> ProviderGroupWriteResult {
         guard !surfaces.isEmpty, surfaces.allSatisfy(MODEL_SURFACES.contains),
@@ -810,6 +874,14 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             let savedActive = try Self.loadActiveProviderStateChecked(at: self.activeProviderPath)
             let originalActive = savedActive.mapValues(JSONValue.string)
             let active = WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(savedActive)
+            // Adoption decides from the saved assignments while holding the
+            // same transaction lock as the picker, never from a prior snapshot.
+            let available = adoptingConnectedProvider ? Set(Self.connectableProviderIds.filter {
+                self.providerReadiness(id: $0).ready
+            }) : []
+            if adoptingConnectedProvider, !available.contains(providerId ?? "") {
+                return await self.groupWriteResult(surfaces: [], surfaceRoot: originalSurfaces, activeRoot: originalActive)
+            }
             let current = model != nil && !clearOverride ? await self.selectionRoutingSnapshot(
                 surfaces: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(originalSurfaces),
                 active: active
@@ -817,6 +889,11 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             var surfaceRoot = originalSurfaces
             var activeRoot = originalActive
             for surface in surfaces {
+                if adoptingConnectedProvider {
+                    let assignment = (active[surface] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    if available.contains(assignment) || (surface != "chat" && assignment.isEmpty) { continue }
+                }
+                let clearOverride = clearOverride || (adoptingConnectedProvider && surface != "chat")
                 if let model, !clearOverride {
                     guard let route = providerId ?? current?.activeProviders[surface],
                           Self.connectableProviderIds.contains(where: { Self.normalizeProviderId($0) == Self.normalizeProviderId(route) }),
@@ -832,7 +909,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 // A bare provider switch preserves a compatible pin and refuses
                 // an incompatible one under the same lock as explicit choices.
                 var surfacesUntouched = false
-                if reconcilePinnedModelWithProvider, model == nil, let providerId {
+                if reconcilePinnedModelWithProvider, !clearOverride, model == nil, let providerId {
                     let folded = Self.canonicalizeRootForWrite(surfaceRoot, surface: surface)
                     let (models, _) = Self.parseSurfacesFile(.object(folded))
                     if let pinned = Self.stringFrom(models, key: surface),
@@ -1010,6 +1087,16 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             serviceTier: nil,
             providerId: providerId,
             reconcilePinnedModelWithProvider: true
+        )
+    }
+
+    /// Connect fills a missing/unavailable Chat route and retires unavailable
+    /// overrides. The eligibility decision and both files commit together.
+    public func adoptConnectedProvider(_ providerId: String) async throws -> ProviderGroupWriteResult {
+        try await saveSurfaceConfigurations(
+            surfaces: MODEL_SURFACES, model: nil, reasoningEffort: nil,
+            serviceTier: nil, providerId: providerId,
+            reconcilePinnedModelWithProvider: true, adoptingConnectedProvider: true
         )
     }
 
@@ -1191,8 +1278,14 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             let tokens = config["tokens"] as? [String: Any] ?? [:]
             let credentials = credentialKeys.compactMap { config[$0] as? String }
                 + [tokens["access_token"] as? String].compactMap { $0 }
-            let ready = credentials.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            return (ready, ready ? "ready" : "needs_credentials", ready ? "Provider credential available" : "No provider credential configured")
+            if let credential = credentials.first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+                return receiptReadiness(credential.trimmingCharacters(in: .whitespacesAndNewlines), holding: "Provider credential saved",
+                                        rejected: "Provider rejected this credential at its last check; save a new credential.") {
+                    $0.map { (true, "ready", "Provider credential checked \($0.formatted(.iso8601))") }
+                        ?? (true, "saved", "Provider credential saved, not yet proven by a check")
+                }
+            }
+            return (false, "needs_credentials", "No provider credential configured")
         }
     }
 
@@ -1292,25 +1385,23 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         codexCacheURL: URL? = nil,
         authEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [[String: JSONValue]] {
-        let openai = FirstPartyModelCatalog.publicOpenAIModels.map { $0.providerJSON() }
-
-        let anthropic = FirstPartyModelCatalog.anthropicModels.map { $0.providerJSON() }
-        let openrouter = openRouterModels ?? []
-        let xai = FirstPartyModelCatalog.xAIModels.map { $0.providerJSON() }
-        let moonshot = moonshotModels ?? FirstPartyModelCatalog.moonshotModels.map { $0.providerJSON() }
+        // Project only the selected route; the default still combines all rows
+        // in the same order. No unrelated catalog needs rebuilding for a pick.
+        var openai: [[String: JSONValue]] { FirstPartyModelCatalog.publicOpenAIModels.map { $0.providerJSON() } }
+        var anthropic: [[String: JSONValue]] { FirstPartyModelCatalog.anthropicModels.map { $0.providerJSON() } }
+        var openrouter: [[String: JSONValue]] { openRouterModels ?? [] }
+        var xai: [[String: JSONValue]] { FirstPartyModelCatalog.xAIModels.map { $0.providerJSON() } }
+        var moonshot: [[String: JSONValue]] { moonshotModels ?? FirstPartyModelCatalog.moonshotModels.map { $0.providerJSON() } }
         switch id {
         case "openai": return openai
         case "openai_oauth_direct", "codex":
-            if codexCacheURL == nil, CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment) != nil {
-                return []
-            }
             let cacheURL = codexCacheURL ?? CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(
                 dataRoot: dataRoot, environment: authEnvironment
             )
             return CodexAccountModelCatalog.providerModels(
                 providerID: id, cacheURL: cacheURL,
                 useDefaultCacheWhenNil: id == "codex" && cacheURL == nil
-                    && !OpenAIOAuthDirectAdapter.hasUsableTokens(at: NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: dataRoot))
+                    && !OpenAIOAuthDirectAdapter.hasAccessToken(at: NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: dataRoot)), dataRoot: dataRoot
             ).map { model in
                 var row: [String: JSONValue] = [
                     "id": .string(model.id), "name": .string(model.name),
@@ -1383,7 +1474,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             activeProviders: pickerState.active,
             soleConnectedProvider: soleConnectedProviderFamily(cache: configCache),
             soleConnectedRoute: soleConnectedProviderID(cache: configCache),
-            configCache: configCache
+            configCache: configCache, revision: pickerState.revision
         )
     }
 
@@ -1397,26 +1488,20 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     /// the reads. The lock may create a sidecar, but never writes authority.
     public func checkedRoutingSnapshotReadOnly() async throws -> ProviderRoutingSnapshot {
         let transactionPath = surfaceTransactionPath
-        let (surfaces, active) = try await persistence.withFileLock(transactionPath) {
+        let (surfaces, active, revision) = try await persistence.withFileLock(transactionPath) {
             guard !FileManager.default.fileExists(atPath: transactionPath.path) else {
                 throw ProviderRoutingError.underlying(
                     "provider selection is pending recovery; the read-only preference probe will not reconcile it"
                 )
             }
-            let surfaces = try Self.loadProviderStateObjectChecked(
-                at: self.surfacesPath,
-                description: "surface preference"
-            )
-            let active = try Self.loadActiveProviderStateChecked(at: self.activeProviderPath)
-            return (surfaces, active)
+            return try self.checkedPickerStateLocked()
         }
-        let canonicalActive = WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(active)
         let configCache = providerConfigCache(
-            for: Set(Self.soleConnectedProbeIds).union(canonicalActive.values)
+            for: Set(Self.soleConnectedProbeIds).union(active.values)
         )
         return routingSnapshot(
-            surfaces: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(surfaces),
-            activeProviders: canonicalActive,
+            surfaces: surfaces,
+            activeProviders: active,
             soleConnectedProvider: soleConnectedProviderFamily(cache: configCache),
             // 2026-09-13, fourth review: this read-only entry point omitted the
             // route, so an OAuth-only install with nothing pinned resolved to an
@@ -1424,7 +1509,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             // other side. Both entry points carry it now, and the parameter has
             // no default so a third one cannot forget.
             soleConnectedRoute: soleConnectedProviderID(cache: configCache),
-            configCache: configCache
+            configCache: configCache, revision: revision
         )
     }
 
@@ -1495,7 +1580,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         activeProviders: [String: String],
         soleConnectedProvider: String?,
         soleConnectedRoute: String?,
-        configCache: ProviderConfigCache?
+        configCache: ProviderConfigCache?,
+        revision: Double = 0
     ) -> ProviderRoutingSnapshot {
         let surfacesFile = JSONValue.object(surfaces)
         let (parsedSurfaceModels, parsedSurfaceEfforts) = Self.parseSurfacesFile(surfacesFile)
@@ -1530,11 +1616,11 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 guard case .string(let unusable)? = parsed[surface] else { continue }
                 let route = activeProviders[surface] ?? activeProviders["chat"]
                 if FirstPartyModelCatalog.descriptor(for: unusable) == nil {
-                    unusablePicks[surface] = "Your model, \(unusable), is no longer offered. Choose one."
+                    unusablePicks[surface] = "Your model, \(unusable), is no longer offered, so an available model must be chosen in Providers."
                 } else if let route {
-                    unusablePicks[surface] = "\(unusable) isn't offered on \(route). Choose one."
+                    unusablePicks[surface] = "\(unusable) isn't offered on \(route), so an available model must be chosen in Providers."
                 } else {
-                    unusablePicks[surface] = "\(unusable) isn't offered. Choose one."
+                    unusablePicks[surface] = "\(unusable) isn't offered, so an available model must be chosen in Providers."
                 }
             }
         }
@@ -1565,7 +1651,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 return nil
             }
             if !offered.isEmpty, !offered.contains(saved) {
-                unusablePicks[surface] = "\(saved) isn't offered on \(route). Choose one."
+                unusablePicks[surface] = "\(saved) isn't offered on \(route), so an available model must be chosen in Providers."
             }
         }
         // 2026-09-13 review: a RETIRED Chat pick is not quietly replaced by the
@@ -1592,24 +1678,10 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             Self.stringFrom(surfaceServiceTiers, key: "chat") ?? "default"
         )
 
-        // User, 2026-09-13: there is no per-surface seed table any more. Every
-        // surface belongs to a Providers group (`ProviderSurfaceGroups`, the one
-        // membership table the page reads too) and resolves to that group's
-        // choice: an override the page wrote onto every member, else Chat's
-        // route, model and effort. The hand-written seeds this replaced
-        // (`dream`/`rem`/`studio_wander` cheap, `workshop`/`autonomy`/`swarms`
-        // primary, `training` another) could aim a lane at a model the group's
-        // connected route cannot serve — exactly how 0.4.11 dreams died on a
-        // ChatGPT-account-only install ("Dream, REM, everything should go to the
-        // memory model").
-        // User, 2026-09-13, and the 2026-09-13 review: the Providers GROUP is the
-        // routing rule, not a coincidence of identical per-surface keys. Each
-        // group has one canonical tuple — model, effort, Fast, route — and every
-        // member resolves to it. Chat's group takes Chat's own keys; Work and
-        // Memory and mind take their override (the page writes it onto every
-        // member, so the first member carrying one IS the override) and
-        // otherwise Chat's. A per-surface key written by anything else is a pin
-        // the page shows, never a way to split a group's routing.
+        // ProviderSurfaceGroups owns membership. Every member resolves to its
+        // group's unanimous tuple, otherwise Chat's. Effort is independent:
+        // an effort-only group keeps Chat's current model and account. A stray
+        // per-surface pin is shown by the page, never splits group routing.
         struct CanonicalTuple: Equatable {
             let model: String
             let effort: String
@@ -1630,10 +1702,11 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             routes: [String: String]
         ) -> CanonicalTuple? {
             let saved = Self.stringFrom(models, key: surface)
-            guard saved != nil || routes[surface] != nil else { return nil }
+            guard saved != nil || routes[surface] != nil
+                || Self.stringFrom(efforts, key: surface) != nil else { return nil }
             let provider = routes[surface] ?? chatRoute
             let model = Self.normalizeModelIdStatic(
-                saved ?? provider.flatMap { defaultModelForProvider($0, savedDefaults: savedDefaults) } ?? "",
+                saved ?? (routes[surface] == nil ? chatModel : provider.flatMap { defaultModelForProvider($0, savedDefaults: savedDefaults) } ?? ""),
                 fallback: ""
             )
             // Keep a provider-only assignment even without a default: it needs
@@ -1784,7 +1857,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             preferences: out,
             activeProviders: resolvedProviders,
             pinnedModels: pinnedModels,
-            unusablePicks: unusablePicks.merging(mismatchedPicks) { saved, _ in saved }
+            unusablePicks: unusablePicks.merging(mismatchedPicks) { saved, _ in saved },
+            revision: revision
         )
     }
 
@@ -1834,7 +1908,6 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         let fault = switch providerID {
         case "openrouter" where openRouterModels == nil: OpenRouterModelCatalog.cacheFault(dataRoot: dataRoot)
         case "moonshot": MoonshotModelCatalog.cacheFault(dataRoot: dataRoot)
-        case "openai_oauth_direct", "codex": CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot)
         default: String?.none
         }
         if let fault { return ([], fault) }
@@ -1865,7 +1938,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         if lower.hasPrefix("claude") { return "anthropic_oauth_direct" }
         if lower.hasPrefix("gpt") { return "openai_oauth_direct" }
         if lower.hasPrefix("grok") { return "xai_oauth_direct" }
-        // Kimi Code SUBSCRIPTION ids (kimi-for-coding[-highspeed], bare k3).
+        // Kimi Code SUBSCRIPTION ids (kimi-for-coding[-highspeed], k3.1-pro[-highspeed], bare k3).
         if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(lower) { return "kimi-code" }
         // Moonshot by declared id: its shipped rows and its live catalog, never a prefix.
         if FirstPartyModelCatalog.descriptor(for: lower, providerID: "moonshot") != nil
@@ -1951,9 +2024,10 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return .absent
     }
 
-    /// One `providers/<id>.json`, read and parsed under the SAME per-file lock
-    /// `configureProvider` writes under. `object` nil with no `unreadable`
-    /// reason means the file simply is not there.
+    /// One `providers/<id>.json`, byte-checked under the SAME per-file lock
+    /// `configureProvider` writes under. Its validated decode can be reused;
+    /// resolved credentials are fresh. `object` nil with no `unreadable` reason
+    /// means the file simply is not there.
     struct ProviderConfigRead {
         var object: [String: Any]?
         var unreadable: String?
@@ -1995,17 +2069,23 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                         unreadable: "provider \(trimmedId) configuration could not be read"
                     )
                 }
-                guard var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    return ProviderConfigRead(
-                        unreadable: "provider \(trimmedId) configuration is not a JSON object"
-                    )
+                let read = try configurationGenerations.withLockUnchecked { generations -> ProviderConfigRead in
+                    if let generation = generations[trimmedId], generation.bytes == data { return generation.read }
+                    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        return ProviderConfigRead(unreadable: "provider \(trimmedId) configuration is not a JSON object")
+                    }
+                    guard case .object(let fields) = JSONValue(fromFoundation: object) else {
+                        return ProviderConfigRead(unreadable: "provider configuration is malformed")
+                    }
+                    try Self.validateProviderConfiguration(fields)
+                    if trimmedId == "xai_oauth_direct" { try ProviderStateValidation.credential(object) }
+                    let read = ProviderConfigRead(object: object)
+                    if generations[trimmedId] == nil, generations.count >= 32 { generations.removeAll(keepingCapacity: true) }
+                    generations[trimmedId] = (data, read)
+                    return read
                 }
-                guard case .object(let fields) = JSONValue(fromFoundation: object) else {
-                    return ProviderConfigRead(unreadable: "provider configuration is malformed")
-                }
-                try Self.validateProviderConfiguration(fields)
+                guard var object = read.object else { return read }
                 if trimmedId == "xai_oauth_direct" {
-                    try ProviderStateValidation.credential(object)
                     object = try XAIOAuthCredentialStore.resolve(object, at: path)
                 }
                 // Resolve the Keychain reference under the config writer's lock
@@ -2024,9 +2104,10 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         }
     }
 
-    /// Fill the per-snapshot cache. The set is the readiness probes plus every
-    /// provider a surface names, so neither lane has to read a file the other
-    /// already read.
+    /// Fill the per-snapshot cache. Durable decodes reuse exact checked bytes;
+    /// credentials, token expiry, PATH and receipt age are projected afresh.
+    /// The set is the readiness probes plus every provider a surface names,
+    /// so neither lane has to read a file the other already read.
     nonisolated func providerConfigCache(
         for providerIds: Set<String>,
         authEnvironment: [String: String] = ProcessInfo.processInfo.environment
@@ -2091,7 +2172,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     /// of any kind. `readActiveProvidersChecked` returns the RESOLVED map, in
     /// which a single connected account already supplies Chat's route, so a
     /// caller asking "has a choice been written down yet?" reads yes before
-    /// anything is persisted (2026-09-13 review). Adoption asks THIS.
+    /// anything is persisted (2026-09-13 review). Adoption reads the same saved
+    /// assignments inside its write transaction instead of carrying this read.
     public func savedActiveProvidersChecked() async throws -> [String: String] {
         try await reconciledPickerState().active
     }
@@ -2356,58 +2438,14 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     }
 
     private nonisolated static func validateOpenAIOAuthDirect(
-        dataRoot: URL, environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> (Bool, String, String?) {
-        let paths = openAIOAuthCandidatePaths(dataRoot: dataRoot, environment: environment)
-        var sawAuth = false
-        for path in paths {
-            guard let data = try? Data(contentsOf: path),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
-            sawAuth = true
-            let tokens = (obj["tokens"] as? [String: Any]) ?? [:]
-            let access = (tokens["access_token"] as? String) ?? ""
-            if access.isEmpty { continue }
-            let refresh = (tokens["refresh_token"] as? String) ?? ""
-            if let expDate = parseAuthExpiresAt(tokens["expires_at"])
-                ?? parseAuthExpiresAt(obj["expires_at"])
-                ?? jwtExpiry(access) {
-                if expDate > Date() {
-                    return (true, "Signed in", access)
-                }
-                if !refresh.isEmpty && OAuthRefreshBinding.permitsRefresh(obj, provider: "openai_oauth_direct") {
-                    return (true, "Signed in. Your session will renew on your next chat.", access)
-                }
-                continue
-            }
-            return (true, "Signed in", access)
-        }
-        if sawAuth {
-            return (false, "Reconnect your ChatGPT account in Providers.", nil)
-        }
-        return (false, "Sign in to your ChatGPT account in Providers.", nil)
-    }
-
-    /// Production keeps the intentional shared-Codex compatibility search.
-    /// An alternate root is a separate body: it may inspect only its exact
-    /// `<root>/codex_home/auth.json`, never the repo/default app-support path or
-    /// `~/.codex/auth.json`.
-    nonisolated static func openAIOAuthCandidatePaths(
         dataRoot: URL,
-        defaultDataRoot: URL = PersistenceCore.defaultDataRoot(),
         environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> [URL] {
-        let root = dataRoot.standardizedFileURL
-        guard root == defaultDataRoot.standardizedFileURL else {
-            return [root
-                .appendingPathComponent("codex_home", isDirectory: true)
-                .appendingPathComponent("auth.json")]
-        }
-        return OpenAIOAuthDirectAdapter.authPathCandidates(
-            dataRoot: root, environment: environment,
-            allowSharedFallbacks: true
-        )
+    ) -> (Bool, String, String?) {
+        let path = OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot, environment: environment)
+        let object = OpenAIOAuthDirectAdapter.loadAuthBlob(at: path)
+        let status = OpenAIOAuthDirectAdapter.credentialStatus(object, path: path)
+        let access = (object?["tokens"] as? [String: Any])?["access_token"] as? String
+        return (status.usable, status.detail, status.usable ? access : nil)
     }
 
     /// `preRead` is the routing snapshot's single locked read of this file; nil
@@ -2445,27 +2483,9 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             do { parsed = try XAIOAuthCredentialStore.read(at: path) }
             catch { return (false, "xAI Keychain credentials are unavailable. Reconnect in Providers.", nil) }
         }
-        guard let obj = parsed, !obj.isEmpty else {
-            return (false, "Sign in to your xAI account in Providers.", nil)
-        }
-        let tokens = OAuthRefreshBinding.tokenSet(obj, provider: "xai_oauth_direct")
-        let access = ((tokens["access_token"] as? String) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let refresh = ((tokens["refresh_token"] as? String) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !access.isEmpty, !refresh.isEmpty else {
-            return (false, "Reconnect your xAI account in Providers.", nil)
-        }
-        if let expDate = parseAuthExpiresAt(obj["expires_at"]) ?? jwtExpiry(access) {
-            if expDate > Date() {
-                return (true, "Signed in", access)
-            }
-            if !refresh.isEmpty && OAuthRefreshBinding.permitsRefresh(obj, provider: "xai_oauth_direct") {
-                return (true, "Signed in. Your session will renew on your next chat.", access)
-            }
-            return (false, "Reconnect your xAI account in Providers.", nil)
-        }
-        return (true, "Signed in", access)
+        let status = XAIOAuthDirectAdapter.credentialStatus(parsed)
+        let access = parsed.flatMap { OAuthRefreshBinding.string(OAuthRefreshBinding.tokenSet($0, provider: "xai_oauth_direct")["access_token"]) }
+        return (status.usable, status.detail, status.usable ? access : nil)
     }
 
     /// Decodes persisted OAuth expiry values in the shared app/routing compatibility order.
@@ -2488,12 +2508,6 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return iso.date(from: s)
     }
 
-    private nonisolated static func jwtExpiry(_ token: String) -> Date? {
-        guard let obj = jwtPayload(token) else { return nil }
-        if let exp = obj["exp"] as? Int { return Date(timeIntervalSince1970: TimeInterval(exp)) }
-        if let exp = obj["exp"] as? Double { return Date(timeIntervalSince1970: exp) }
-        return nil
-    }
 }
 
 // MARK: - Public model lookup

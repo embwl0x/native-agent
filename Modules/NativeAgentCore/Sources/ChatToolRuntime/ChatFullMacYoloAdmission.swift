@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import TrustCenter
+// Blueprint: | `ChatFullMacYoloAdmission.swift` | `ChatFullMacYoloAdmission` enum; `admitted` |
 
 /// Assembles current-task provenance; TrustCenter alone evaluates authority.
 public enum ChatFullMacYoloAdmission {

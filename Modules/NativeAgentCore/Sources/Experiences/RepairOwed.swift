@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `RepairOwed.swift` | `RepairOwed`: experience-backed repair claims and settlement; retries, restarts and unrelated successes cannot settle another operation's debt |
+
 /// Repair owed (User 10-18: "No fallbacks: it works and it works right, and
 /// never can the agent say I can't fix it"). A no whose cause lies outside the
 /// call that met it names its owner and carries its lever: her call, or the
@@ -12,6 +14,11 @@ import NativeAgentCore
 /// background job), so one projection (her home's OWED lines) shows them all.
 public enum RepairOwed {
     /// What an owed repair carries: who decided, which operation failed, and the lever.
+    /// The one reader of a claim the builder below wrote ("key: value").
+    public static func claim(_ experience: Experience, _ key: String) -> String? {
+        experience.claims.first { $0.claim.hasPrefix(key + ": ") }.map { String($0.claim.dropFirst(key.count + 2)) }
+    }
+
     public static func claims(owner: String, operation: String, lever: String? = nil,
                               nextCall: String? = nil, tap: String? = nil) -> [Experience.Claim] {
         var lines = ["owner: " + owner, "operation: " + operation]
@@ -38,19 +45,29 @@ public enum RepairOwed {
     public static func owe(_ dataRoot: URL, id: String, kind: Experience.Kind, cause: [String] = [],
                            evidence: [Experience.Ref] = [], operation: String, owner: String, words: String,
                            lever: String? = nil, nextCall: String? = nil, tap: String? = nil) -> Task<Void, Never> {
+        // One queue per operation for owe and settle, so a settle never overtakes the debt it settles.
+        ExperienceStore.record(dataRoot, "repair:" + operation) { store in
+            try await owe(store, id: id, kind: kind, cause: cause, evidence: evidence,
+                          operation: operation, owner: owner, words: words,
+                          lever: lever, nextCall: nextCall, tap: tap)
+        }
+    }
+
+    /// Already inside this operation's `repair:` queue: do not enqueue and
+    /// await another write behind the caller itself.
+    public static func owe(_ store: ExperienceStore, id: String, kind: Experience.Kind, cause: [String] = [],
+                           evidence: [Experience.Ref] = [], operation: String, owner: String, words: String,
+                           lever: String? = nil, nextCall: String? = nil, tap: String? = nil) async throws {
         var met = Experience(id: id, kind: kind, cause: cause, evidence: evidence,
                              outcome: .init(domain: operation, status: "failed", effects: Experience.Effects.none),
                              face: .init(words: words, artifacts: []),
                              owes: ["repair": .init(to: tap == nil ? "self" : "person")],
                              claims: claims(owner: owner, operation: operation, lever: lever, nextCall: nextCall, tap: tap))
         met.addressedTo = [tap == nil ? "self" : "person"]
-        // One queue per operation for owe and settle, so a settle never overtakes the debt it settles.
-        return ExperienceStore.record(dataRoot, "repair:" + operation) { [met] store in
-            if let open = try await openDebt(store, operation: operation, owner: owner) {
-                try await store.append([.evidence(.init(source: "repeat", id: met.id))], to: open.id)
-            } else {
-                try await store.begin(met)
-            }
+        if let open = try await openDebt(store, operation: operation, owner: owner) {
+            try await store.append([.evidence(.init(source: "repeat", id: met.id))], to: open.id)
+        } else {
+            try await store.begin(met)
         }
     }
 

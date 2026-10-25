@@ -7,6 +7,7 @@ import CoreText
 #endif
 #if canImport(AppKit)
 import AppKit
+// Blueprint: | `MacScreenViewRenderer.swift` | `CoreGraphicsMacScreenImageRenderer` struct; `renderPNG` masks secret frames before encoding; `encodePNG` |
 #endif
 
 // MARK: - Production renderer (CoreGraphics + CoreText)

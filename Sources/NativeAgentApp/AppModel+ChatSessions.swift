@@ -14,20 +14,15 @@ import Transcripts
 import NativeAgentCore
 import MemoryV2
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
 import ToolExecution
-import PersonaEngine
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatSessionWork
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
 import Research
 import MultimodalTTS
 import TriggerScheduler
@@ -39,17 +34,14 @@ import TelegramBot
 import Dispatcher
 import MacControl
 import Onboarding
-import MacAssistantStatus
+import MacIntegration
 import WorkflowOrchestration
-import Skills
 import Connectors
 import Browser
 import DeviceSync
+// Blueprint: | `AppModel+ChatSessions.swift` | `AppModel`: chat load/selection/index refresh and `recordPanelRefresh`; sidebar refresh uses engine persona/configuration/runs/provider and connector owners; `composerDraft(for:)` owns one draft per session for main/detached composers and commands, exact accepted-edit clearing and empty-only prefills; quiet chat commands delegate to shared transcript/session transactions |
 
 extension Notification.Name {
-    /// See `AppModel.flushLiveChatDrafts()`. Posted before a chat surface
-    /// reads a stored draft; every mounted composer commits its live text.
-    static let chatFlushLiveDrafts = Notification.Name("nativeagent.chat.flushLiveDrafts")
     /// A turn's user-visible notice (retry, timeout, advisory); ChatView
     /// places it in the turn's lane or as a toast.
     static let nativeAgentTurnNotice = Notification.Name("nativeagent.turn.notice")
@@ -65,58 +57,24 @@ extension AppModel: MacChatSessionSelectionPort {
         await reloadChatState()
     }
 
-    // S.1: prune stale drafts/attachments for sessions that no longer exist,
-    // drop empty drafts immediately, and cap to 50 most-recently-used entries.
+    // Keep one object's identity for each live session; cap nonempty drafts at 50.
     @MainActor
     private func pruneChatDrafts() {
         let activeIds = Set(engine.transcripts.sessions.map(\.id))
-        // Drop sessions that no longer exist
-        chatDrafts = chatDrafts.filter { activeIds.contains($0.key) }
+        chatComposerDrafts = chatComposerDrafts.filter { activeIds.contains($0.key) }
         chatPendingAttachments = chatPendingAttachments.filter { activeIds.contains($0.key) }
-        chatDraftLastTouched = chatDraftLastTouched.filter { activeIds.contains($0.key) }
-        // The edit stamp outlives an empty draft on purpose — it is what stops
-        // an older composer from re-filing text a newer one just cleared — so
-        // it is pruned by session lifetime only (2026-09-06).
-        chatDraftLastEdited = chatDraftLastEdited.filter { activeIds.contains($0.key) }
-        // PATCH-2026-05-08: review-fix-r5 Collect empty keys first then remove
-        // (was mutating dict while iterating it).
-        let emptyKeys = chatDrafts.compactMap { $0.value.isEmpty ? $0.key : nil }
-        for key in emptyKeys {
-            chatDrafts.removeValue(forKey: key)
-            chatDraftLastTouched.removeValue(forKey: key)
-        }
-        // S.6: Cap at 50 most-recently-used, but prefer evicting drafts not touched
-        // in the last 5 minutes before evicting recently-active ones.
-        let cap = 50
-        if chatDrafts.count > cap {
-            let now = Date()
-            let recentKeys = Set(chatDraftLastTouched.filter { now.timeIntervalSince($0.value) < 300 }.keys)
-            // Prefer evicting old (non-recent) drafts first, then fall back to LRU across all
-            let candidates = chatDraftLastTouched
-                .filter { !recentKeys.contains($0.key) }
-                .sorted { $0.value < $1.value }
-            let fallback = chatDraftLastTouched
-                .filter { recentKeys.contains($0.key) }
-                .sorted { $0.value < $1.value }
-            let evictionOrder = candidates + fallback
-            let overflow = chatDrafts.count - cap
-            for entry in evictionOrder.prefix(overflow) {
-                chatDrafts.removeValue(forKey: entry.key)
-                chatDraftLastTouched.removeValue(forKey: entry.key)
-            }
-        }
+        let nonempty = chatComposerDrafts.values.filter { !$0.text.isEmpty }.sorted { $0.editedAt < $1.editedAt }
+        for draft in nonempty.prefix(max(0, nonempty.count - 50)) { draft.edit("") }
     }
 
     @MainActor
     private func migrateEmptySessionChatState(to sessionId: String) {
         guard !sessionId.isEmpty else { return }
-        if let draft = chatDrafts.removeValue(forKey: ""), !draft.isEmpty {
-            if chatDrafts[sessionId, default: ""].isEmpty {
-                chatDrafts[sessionId] = draft
-            }
-            chatDraftLastTouched[sessionId] = Date()
+        if let draft = chatComposerDrafts[""], !draft.text.isEmpty {
+            let target = composerDraft(for: sessionId)
+            if target.text.isEmpty { target.edit(draft.text) }
+            draft.edit("")
         }
-        chatDraftLastTouched.removeValue(forKey: "")
         if let pending = chatPendingAttachments.removeValue(forKey: ""), !pending.isEmpty {
             var existing = chatPendingAttachments[sessionId] ?? []
             existing.append(contentsOf: pending)
@@ -141,12 +99,12 @@ extension AppModel: MacChatSessionSelectionPort {
             if remaining == 0 { panelRefreshCounts.removeValue(forKey: item) }
             else { panelRefreshCounts[item] = remaining }
         }
-        let persona = personaEngine
+        let persona = engine.persona
+        let previousName = persona.profile?.name
         let memory = engine.memory
         let approvalStore = engine.approvals
         let inbox = engine.inbox
         let toolStore = engine.tools
-        let desk = engine.desk
         var failedEndpoints: [String] = []
         // Branches that perform no read must not claim refreshed data.
         var performedRead = true
@@ -173,20 +131,20 @@ extension AppModel: MacChatSessionSelectionPort {
         switch item {
         case .chat:
             if !(await loadProvidersForChat()) { failedEndpoints.append("providers") }
-            engine.providers.catalog = fresh("model catalog", try? await engine.providers.modelCatalog(refresh: false))
+            if engine.providers.settings?.catalogError != nil { failedEndpoints.append("model catalog") }
             await reloadChatState()
             if chatStateLoadFailed { failedEndpoints.append("chat messages") }
-            compiledPersonality = fresh("personality", try? await PersonaCompiler(engine: persona).compiledPacket(surface: "chat"))
+            _ = fresh("personality", try? await persona.prepareDocuments())
             // The chat header, composer placeholder, and turn cards all read
-            // `agentDisplayName`, which resolves from `personality?.name`
+            // `agentDisplayName`, which resolves from `engine.persona.profile?.name`
             // first. That profile was only ever loaded by the Memory and
             // Personality screens, so a fresh launch straight into chat
             // labelled the agent with the app's fallback name until one of
             // those screens had been visited. Load it once here; the name is
             // the profile's, never a literal.
-            if personality == nil {
-                if let next = fresh("personality profile", try? await SwiftNativePersonaEngine.readPersonality(dataRoot: engine.dataRoot)), next != personality { personality = next }
-                teachMemoryHygieneName()
+            if persona.profile == nil {
+                _ = fresh("personality profile", try? await persona.loadProfile())
+                teachMemoryHygieneName(previousName: previousName)
             }
         case .legacyWorkshop:
             // 2026-06-06 sidebar-fix v3: removed the approvals side-effect
@@ -197,7 +155,7 @@ extension AppModel: MacChatSessionSelectionPort {
             // a double re-layout that shifted the scroll position. Approvals
             // have their own refresh in the .activity case and the sidebar's
             // own 30s poll; they don't need to ride along with the execution lane.
-            runs = fresh("runs", await RuntimeReadProjection.runs(dataRoot: engine.dataRoot) ?? []) ?? runs
+            _ = fresh("runs", try? await engine.runs.refresh(dataRoot: engine.dataRoot))
         case .desk, .workshop, .work, .command, .bots:
             // Nothing is read here, so nothing is said about freshness below.
             performedRead = false
@@ -206,353 +164,177 @@ extension AppModel: MacChatSessionSelectionPort {
             // 2026-07-23); its old command-summary fetch went with the view.
             break
         case .memory, .memories, .knowledge:
-            async let nextMemories = try? memory.activeMemories()
+            async let nextMemories = try? memory.refreshMemories()
             async let nextMemoryProposals = try? memory.proposals(status: "pending")
-            async let nextVectorStatus = try? MemoryStatusProjection.getMemoryVectorStatus(dataRoot: engine.dataRoot)
-            async let nextMemoryV2Status = try? MemoryStatusProjection.getMemoryV2Status(dataRoot: engine.dataRoot)
-            async let nextGraph = try? memory.graphView()
-            async let nextPersonality = try? PersonaCompiler.compileProfile(dataRoot: engine.dataRoot).sharedProfile
+            async let nextMemoryStatus = memory.refreshStatuses()
+            async let nextGraph: Void = memory.loadGraph()
+            async let nextPersonality = try? persona.loadProfile()
             async let nextTrustPolicy = try? engine.trust.load()
-            let (memoryRows, proposalRows, vectorRow, memoryV2Row, graphRow, personalityRow, trustRow) = await (
+            let (memoryRows, proposalRows, _, _, personalityRow, trustRow) = await (
                 nextMemories,
                 nextMemoryProposals,
-                nextVectorStatus,
-                nextMemoryV2Status,
+                nextMemoryStatus,
                 nextGraph,
                 nextPersonality,
                 nextTrustPolicy
             )
-            memory.memories = fresh("memories", memoryRows) ?? memory.memories
+            _ = fresh("memories", memoryRows)
             if memoryRows != nil, let query = memory.searchResultQuery, query.count >= 3 {
                 // Even an unchanged newest-200 list can hide a changed older
-                // search hit. Begin a new generation on every successful read.
+                // search hit. Ask the search owner again on every successful read.
                 await memory.search(query: query)
             }
-            memory.proposals = fresh("memory proposals", proposalRows) ?? memory.proposals
-            memoryVectorStatus = fresh("vector status", vectorRow) ?? memoryVectorStatus
-            memoryV2Status = fresh("memory v2 status", memoryV2Row) ?? memoryV2Status
-            agentGraph = fresh("agent graph", graphRow?.agentGraph) ?? agentGraph
-            graphEntities = fresh("graph entities", graphRow?.entities) ?? graphEntities
-            graphStatus = fresh("graph status", graphRow?.status) ?? graphStatus
-            if let next = fresh("personality", personalityRow), next != personality { personality = next }
-            teachMemoryHygieneName()
-            if let next = fresh("trust policy", trustRow), next != engine.trust.policy { engine.trust.policy = next }
+            _ = fresh("memory proposals", proposalRows)
+            failedEndpoints += memory.statusRefresh?.failedEndpoints ?? []
+            _ = fresh("personality", personalityRow)
+            teachMemoryHygieneName(previousName: previousName)
+            _ = fresh("trust policy", trustRow)
         case .connectors:
-            workspaces = fresh("shared folders", try? await ConnectorRegistryActions.listWorkspaces(root: engine.dataRoot)) ?? workspaces
+            _ = fresh("connectors", try? await engine.connectors.refresh().get())
+            _ = fresh("shared folders", try? await engine.connectors.refreshWorkspaces())
         case .settingsHub, .settings, .providers, .telegram, .inboxPolicy, .macIntegration:
-            async let nextConfig = try? RuntimeReadProjection.configuration(dataRoot: engine.dataRoot)
-            async let nextTelegramStatus = try? engine.telegram.load(manager: backgroundLoopsManager)
-            async let nextConnectors = try? ConnectorStatusProjection.readConnectorRecords(root: engine.dataRoot, platform: AppConnectorStatusPlatform())
+            async let nextConfig = try? RuntimeReadProjection.configuration(engine: engine)
+            async let nextTelegramStatus = try? engine.telegram.refresh(manager: backgroundLoopsManager)
+            async let nextConnectors = try? engine.connectors.refresh().get()
             let (configRow, telegramRow, connectorRows) = await (
                 nextConfig,
                 nextTelegramStatus,
                 nextConnectors
             )
-            if let config = fresh("config", configRow) {
-                engine.providers.codexAuth = config.codexAuth
-                applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
-            }
-            engine.telegram.status = fresh("telegram status", telegramRow) ?? engine.telegram.status
-            connectors = fresh("connectors", connectorRows) ?? connectors
+            _ = fresh("config", configRow)
+            _ = fresh("telegram status", telegramRow)
+            _ = fresh("connectors", connectorRows)
         case .approvals, .activity:
             async let nextApprovals = try? approvalStore.list()
             async let nextInbox = try? inbox.list()
             async let nextMemoryProposals = try? memory.proposals(status: "pending")
-            async let nextMisses = MemoryStatusProjection.recentMisses(dataRoot: engine.dataRoot)
             let (approvalRows, inboxRows, proposalRows) = await (
                 nextApprovals,
                 nextInbox,
                 nextMemoryProposals
             )
-            if let next = fresh("approvals", approvalRows), next != approvalStore.records { approvalStore.records = next }
-            inbox.items = fresh("inbox", inboxRows) ?? inbox.items
-            memory.proposals = fresh("memory proposals", proposalRows) ?? memory.proposals
-            missLessons = fresh("misses", await nextMisses) ?? missLessons
+            _ = fresh("approvals", approvalRows)
+            _ = fresh("inbox", inboxRows)
+            _ = fresh("memory proposals", proposalRows)
+            // LatestRead is main-actor owned: read it here, not in an async let child task.
+            let nextMisses = await missLessonsRead.read({ await MemoryStatusProjection.recentMisses(dataRoot: engine.dataRoot) }, publish: { rows in
+                if let rows { missLessons = rows }
+            })
+            _ = fresh("misses", nextMisses)
         case .capabilities:
-            async let nextSkills = try? RuntimeReadProjection.skills(dataRoot: engine.dataRoot)
+            async let nextSkills = try? toolStore.refreshSkills()
             async let nextTools = try? toolStore.listAuthored()
-            async let nextCapabilitySummary = try? engine.trust.loadCapabilities()
             async let nextApprovals = try? approvalStore.list()
-            async let nextWorkflows = try? SwiftNativeWorkflowOrchestrationClient(root: engine.dataRoot).listWorkflowRecords()
-            async let nextMCPServers = try? engine.tools.mcp.listServers()
-            // The compact MCP Builder is mounted in Capabilities too. Its
-            // server controls render live session evidence, so refresh both
-            // together rather than leaving those rows stale/empty until
-            // someone opens the separate MCP tab.
-            async let nextMCPSessions = try? engine.tools.listMCPSessions()
-            // Native macOS Power is part of the Capabilities hardening view.
-            // Refresh each live tile and action registry here so that view
-            // never inherits a stale launch snapshot from another surface.
-            async let nextNotificationStatus = try? RuntimeReadProjection.getNotificationStatus(dataRoot: engine.dataRoot)
-            async let nextBrowserRuntimeStatus = try? RuntimeReadProjection.getBrowserStatus(dataRoot: engine.dataRoot)
-            async let nextMemoryVectorStatus = try? MemoryStatusProjection.getMemoryVectorStatus(dataRoot: engine.dataRoot)
-            async let nextNativeActions = NativeActionRoutes.swiftNativeActionRecords()
-            async let nextNativeActionReceipts: [NativeActionReceipt] = RuntimeReadProjection.tailJSONL(
-                path: NativeActionRoutes.nativeActionReceiptsPath(dataRoot: engine.dataRoot), limit: 50)
-            async let nextConnectorActionRegistry = try? ConnectorActionRegistry.read(dataRoot: engine.dataRoot, platform: AppConnectorStatusPlatform())
-            async let nextImprovementGauntletStatus = try? RuntimeReadProjection.swiftImprovementGauntlet(dataRoot: engine.dataRoot)
-            async let nextCatalog = try? engine.trust.catalog()
-            async let nextCatalogSources = try? engine.trust.catalogSources()
-            async let nextPackInstalls = try? engine.trust.packInstalls()
-            async let nextCapabilityTrust = try? engine.trust.loadCapabilityNetwork()
+            async let nextCatalog = engine.trust.refreshCapabilityCatalog()
+            async let nextWorkflows: Void? = try? engine.desk.refreshWorkflows()
+            async let nextNativePower = toolStore.refreshNativePower()
+            async let nextMemoryStatus = memory.refreshStatuses()
+            async let nextHardening = engine.doctor.refreshHardening()
+            async let nextTraces: Void = engine.turns.refreshCapabilityTraces()
+            async let nextConnectorActionRegistry = try? engine.connectors.refreshActions()
             async let nextGenSnapshot = decodeLogged("nextgen snapshot") {
-                try await NextGenStatusProjection(dataRoot: engine.dataRoot).snapshot()
+                try await engine.nextGen.snapshot()
             }
-            async let nextGraph = try? engine.memory.graphView()
+            async let nextGraph: Void = engine.memory.loadGraph()
             let (
                 skillRows,
                 toolRows,
-                capabilityRow,
                 approvalRows,
-                workflowRows,
-                mcpRows,
-                mcpSessionRows,
-                notificationStatusRow,
-                browserRuntimeStatusRow,
-                memoryVectorStatusRow,
-                nativeActionRows,
-                nativeActionReceiptRows,
                 connectorActionRegistryRow,
-                improvementGauntletStatusRow,
-                catalogRows,
-                sourceRows,
-                installRows,
-                trustRow,
                 nextGenRow,
-                graphRow
+                _
             ) = await (
                 nextSkills,
                 nextTools,
-                nextCapabilitySummary,
                 nextApprovals,
-                nextWorkflows,
-                nextMCPServers,
-                nextMCPSessions,
-                nextNotificationStatus,
-                nextBrowserRuntimeStatus,
-                nextMemoryVectorStatus,
-                nextNativeActions,
-                nextNativeActionReceipts,
                 nextConnectorActionRegistry,
-                nextImprovementGauntletStatus,
-                nextCatalog,
-                nextCatalogSources,
-                nextPackInstalls,
-                nextCapabilityTrust,
                 nextGenSnapshot,
                 nextGraph
             )
-            skills = fresh("skills", skillRows) ?? skills
-            toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
-            engine.trust.capabilitySummary = fresh("capability summary", capabilityRow) ?? engine.trust.capabilitySummary
-            if let next = fresh("approvals", approvalRows), next != approvalStore.records { approvalStore.records = next }
-            workflows = fresh("workflows", workflowRows) ?? workflows
-            mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
-            engine.tools.mcpSessions = fresh("mcp sessions", mcpSessionRows) ?? engine.tools.mcpSessions
-            notificationStatus = fresh("notification status", notificationStatusRow) ?? notificationStatus
-            browserRuntimeStatus = fresh("browser status", browserRuntimeStatusRow) ?? browserRuntimeStatus
-            memoryVectorStatus = fresh("memory vector status", memoryVectorStatusRow) ?? memoryVectorStatus
-            nativeActions = fresh("native actions", nativeActionRows) ?? nativeActions
-            nativeActionReceipts = fresh("native action receipts", nativeActionReceiptRows) ?? nativeActionReceipts
-            connectorActionRegistry = fresh("connector actions", connectorActionRegistryRow) ?? connectorActionRegistry
-            improvementGauntletStatus = fresh("improvement gauntlet", improvementGauntletStatusRow) ?? improvementGauntletStatus
-            // The Builder renders the selected server's tools inline. Never
-            // leave those tools attached to a server which the same refresh
-            // proved absent, or an empty registry would still expose callable
-            // rows from the previous selection.
-            let previousMCPSelection = selectedMCPServerId
-            if selectedMCPServerId == nil || !mcpServers.contains(where: { $0.id == selectedMCPServerId }) {
-                selectedMCPServerId = mcpServers.first?.id
-            }
-            if selectedMCPServerId != previousMCPSelection || mcpServers.isEmpty {
-                mcpTools = []
-                mcpToolReadState = .notLoaded
-                mcpResources = []
-            }
-            capabilityCatalog = fresh("capability catalog", catalogRows) ?? capabilityCatalog
-            capabilityCatalogSources = fresh("catalog sources", sourceRows) ?? capabilityCatalogSources
-            capabilityPackInstalls = fresh("pack installs", installRows) ?? capabilityPackInstalls
-            engine.trust.capabilityNetwork = fresh("capability trust", trustRow) ?? engine.trust.capabilityNetwork
-            if let snapshot = fresh("nextgen snapshot", nextGenRow) {
-                nextGenSummary = snapshot.summary
-                nextGenPhases = snapshot.phases
-                nextGenReceipts = snapshot.receipts
-            }
-            agentGraph = fresh("skill memory graph", graphRow?.agentGraph) ?? agentGraph
-            graphEntities = fresh("skill memory graph entities", graphRow?.entities) ?? graphEntities
-            graphStatus = fresh("skill memory graph status", graphRow?.status) ?? graphStatus
-            if graphRow != nil {
-                graphLoadError = nil
-            } else {
-                graphLoadError = "The graph could not be loaded for Capabilities. Refresh Graph to retry."
-            }
+            let (_, workflowRead, _, _, _, _) = await (
+                nextCatalog, nextWorkflows, nextNativePower, nextMemoryStatus, nextHardening, nextTraces)
+            failedEndpoints += engine.trust.catalogRefresh?.failedEndpoints ?? []
+            _ = fresh("workflows", workflowRead)
+            failedEndpoints += toolStore.nativePowerRefresh?.failedEndpoints ?? []
+            failedEndpoints += memory.statusRefresh?.failedEndpoints ?? []
+            failedEndpoints += engine.doctor.hardeningRefresh?.failedEndpoints ?? []
+            _ = fresh("skills", skillRows)
+            _ = fresh("tools", toolRows)
+            _ = fresh("approvals", approvalRows)
+            _ = fresh("connector actions", connectorActionRegistryRow)
+            _ = fresh("nextgen snapshot", nextGenRow)
         case .autoImprovement:
             // The weekly pass reads its digest directly.
-            async let nextJobs = try? desk.listJobs()
-            desk.jobs = fresh("jobs", await nextJobs) ?? desk.jobs
+            _ = await refreshSchedulerJobs()
         case .dreams:
             // The Dreams tab fetches its diary itself; refresh the trust policy
             // here so the REM toggle (trainingPolicy.rem_cycle_enabled) reflects
             // current state on tab entry.
-            if let next = fresh("trust policy", try? await engine.trust.load()), next != engine.trust.policy { engine.trust.policy = next }
+            _ = fresh("trust policy", try? await engine.trust.load())
         case .cognition:
             performedRead = false
         case .skills, .skillLifecycle:
-            skills = fresh("skills", try? await RuntimeReadProjection.skills(dataRoot: engine.dataRoot)) ?? skills
+            _ = fresh("skills", try? await toolStore.refreshSkills())
         case .diagnostics:
-            // B2.1 (2026-07-23): the Diagnostics tab is now only Doctor / Status /
-            // Runs (DiagnosticsView). Its views read exactly activityEvents, runs,
-            // and watchdogStatus (StatusView) plus health (fetched unconditionally
-            // above) and the Doctor report (DoctorView fetches its own). The other
-            // fetches this case used to fire were Panels-tab residue — dead network
-            // work on every Diagnostics visit. Verified at HEAD, each removed fetch
-            // is either unread by any view (getReleaseChecklist, getEvals,
-            // getTrainingArtifacts, getNativePower — a P1 daemon-kill stub) or read
-            // only by another tab that refreshes it itself: getNotificationStatus +
-            // getBrowserStatus + getProductionHardening (CapabilitiesView). All of
-            // them are also refreshed by refreshAll() (launch + post-action), so no
-            // consumer is starved. See prerelease-upgrade-campaign.md B2.1 [W7#1].
-            async let nextActivity = try? RuntimeReadProjection.getActivity(root: engine.dataRoot)
-            async let nextRuns = RuntimeReadProjection.runs(dataRoot: engine.dataRoot)
-            async let nextWatchdog = engine.doctor.readWatchdog(manager: backgroundLoopsManager)
+            // Diagnostics reads Doctor's activity projection and the run ledger.
+            async let nextActivity: Void? = try? engine.doctor.refreshActivity()
+            async let nextRuns = try? engine.runs.refresh(dataRoot: engine.dataRoot)
+            async let nextWatchdog = engine.doctor.refreshWatchdog(manager: backgroundLoopsManager)
             // Health used to be fetched unconditionally for every page above;
             // Status is the page that actually reads it, so it reads it here.
-            let healthRow = engine.doctor.readHealth()
+            await engine.doctor.refreshHealth()
             let (activityRows, runRows, watchdogRow) = await (
                 nextActivity,
                 nextRuns,
                 nextWatchdog
             )
-            activityEvents = fresh("activity", activityRows) ?? activityEvents
-            runs = fresh("runs", runRows) ?? runs
-            engine.doctor.watchdog = fresh("watchdog", watchdogRow) ?? engine.doctor.watchdog
-            engine.doctor.health = healthRow
+            _ = fresh("activity", activityRows)
+            _ = fresh("runs", runRows)
+            _ = fresh("watchdog", watchdogRow)
         case .personality:
-            async let nextPersonality = try? PersonaCompiler.compileProfile(dataRoot: engine.dataRoot).sharedProfile
-            async let nextDocs = try? persona.listPersonaDocSpecs()
-            async let nextCompiled = try? PersonaCompiler(engine: persona).compiledPacket(surface: "chat")
-            async let nextGrowth = try? RuntimeReadProjection.swiftPersonalityGrowth(runtime: NativeAgentEngine.liveCognition)
-            let (personalityRow, docsResponse, compiledRow, growthRow) = await (
+            async let nextPersonality = try? persona.loadProfile()
+            async let nextDocs = try? persona.loadDocuments()
+            let (personalityRow, docsResponse) = await (
                 nextPersonality,
-                nextDocs,
-                nextCompiled,
-                nextGrowth
+                nextDocs
             )
-            if let next = fresh("personality", personalityRow), next != personality { personality = next }
-            teachMemoryHygieneName()
-            if let docsResponse = fresh("personality docs", docsResponse) {
-                personalityDocs = docsResponse.docs
-            }
-            compiledPersonality = fresh("compiled personality", compiledRow) ?? compiledPersonality
-            personalityGrowth = fresh("personality growth", growthRow) ?? personalityGrowth
+            _ = fresh("personality", personalityRow)
+            teachMemoryHygieneName(previousName: previousName)
+            _ = fresh("personality docs", docsResponse)
         case .trust:
             async let nextTrust = try? engine.trust.load()
-            async let nextConnectors = try? ConnectorStatusProjection.readConnectorRecords(root: engine.dataRoot, platform: AppConnectorStatusPlatform())
-            async let nextWorkspaces = try? ConnectorRegistryActions.listWorkspaces(root: engine.dataRoot)
-            async let nextBackups = try? engine.trust.listBackups()
-            let (trustRow, connectorRows, workspaceRows, backupRows) = await (
-                nextTrust,
-                nextConnectors,
-                nextWorkspaces,
-                nextBackups
-            )
-            if let next = fresh("trust policy", trustRow), next != engine.trust.policy { engine.trust.policy = next }
-            connectors = fresh("connectors", connectorRows) ?? connectors
-            workspaces = fresh("workspaces", workspaceRows) ?? workspaces
-            engine.trust.backups = fresh("backups", backupRows) ?? engine.trust.backups
+            async let nextConnectors = try? engine.connectors.refresh().get()
+            async let nextWorkspaces = try? engine.connectors.refreshWorkspaces()
+            async let nextBackups = try? engine.trust.refreshBackups()
+            let (trustRow, connectorRows, workspaceRows, backupRows) = await (nextTrust, nextConnectors, nextWorkspaces, nextBackups)
+            _ = fresh("trust policy", trustRow)
+            _ = fresh("connectors", connectorRows)
+            _ = fresh("workspaces", workspaceRows)
+            _ = fresh("backups", backupRows)
         case .panels:
-            async let nextSkills = try? RuntimeReadProjection.skills(dataRoot: engine.dataRoot)
+            async let nextSkills = try? toolStore.refreshSkills()
             async let nextTools = try? toolStore.listAuthored()
             let (skillRows, toolRows) = await (nextSkills, nextTools)
-            skills = fresh("skills", skillRows) ?? skills
-            toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
+            _ = fresh("skills", skillRows)
+            _ = fresh("tools", toolRows)
         case .tools:
             async let nextTools = try? toolStore.listAuthored()
-            async let nextConnectorActions = try? ConnectorActionRegistry.read(dataRoot: engine.dataRoot, platform: AppConnectorStatusPlatform())
-            async let nextMCPServers = try? engine.tools.mcp.listServers()
+            async let nextConnectorActions = try? engine.connectors.refreshActions()
             // Tools renders the current catalog *and* its Full Mac lifecycle
             // explanation. Refresh the Trust policy in the same pass so an
             // expired/unreadable window is never flattened into "off".
             async let nextTrustPolicy = try? engine.trust.load()
-            let (toolRows, connectorRows, mcpRows, trustPolicyRow) = await (
+            let (toolRows, connectorRows, trustPolicyRow) = await (
                 nextTools,
                 nextConnectorActions,
-                nextMCPServers,
                 nextTrustPolicy
             )
-            toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
-            connectorActionRegistry = fresh("connector actions", connectorRows) ?? connectorActionRegistry
-            mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
-            if let next = fresh("trust policy", trustPolicyRow), next != engine.trust.policy { engine.trust.policy = next }
+            _ = fresh("tools", toolRows)
+            _ = fresh("connector actions", connectorRows)
+            _ = fresh("trust policy", trustPolicyRow)
             if !(await toolStore.refreshCatalog()) {
                 failedEndpoints.append("tool catalog")
             }
-        case .mcp:
-            async let nextMCPServers = try? engine.tools.mcp.listServers()
-            async let nextMCPSessions = try? engine.tools.listMCPSessions()
-            let (mcpRows, sessionRows) = await (nextMCPServers, nextMCPSessions)
-            mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
-            engine.tools.mcpSessions = fresh("mcp sessions", sessionRows) ?? engine.tools.mcpSessions
-            // gpt-5.5 review: clear stale inventories when selection becomes
-            // invalid OR the server list is empty. Without this, the UI shows
-            // the old server's tools under the new server's name after the
-            // user removes a server or the daemon drops one.
-            let previousSelection = selectedMCPServerId
-            if selectedMCPServerId == nil || !mcpServers.contains(where: { $0.id == selectedMCPServerId }) {
-                selectedMCPServerId = mcpServers.first?.id
-            }
-            if selectedMCPServerId != previousSelection {
-                mcpTools = []
-                mcpToolReadState = .notLoaded
-                mcpResources = []
-                mcpResourceReadState = .notLoaded
-            }
-            if mcpServers.isEmpty {
-                mcpTools = []
-                mcpToolReadState = .notLoaded
-                mcpResources = []
-                mcpResourceReadState = .notLoaded
-            }
-            if let server = selectedMCPServer {
-                // Race-safe apply: only adopt fetched tools/resources if the
-                // user's selection didn't change while we were awaiting.
-                let pendingId = server.id
-                mcpToolReadState = .loading
-                let fetchedTools: [MCPTool]?
-                do {
-                    fetchedTools = try await MCPUIActions.listTools(serverId: pendingId, dispatcher: engine.tools.mcp)
-                } catch {
-                    fetchedTools = nil
-                    failedEndpoints.append("mcp tools")
-                    if selectedMCPServerId == pendingId {
-                        mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
-                    }
-                }
-                if selectedMCPServerId == pendingId {
-                    mcpResourceReadState = .loading
-                }
-                let fetchedResources: [MCPResource]?
-                do {
-                    fetchedResources = try await MCPUIActions.listResources(serverId: pendingId, dispatcher: engine.tools.mcp)
-                } catch {
-                    fetchedResources = nil
-                    failedEndpoints.append("mcp resources")
-                    if selectedMCPServerId == pendingId {
-                        mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
-                    }
-                }
-                if selectedMCPServerId == pendingId {
-                    if let t = fetchedTools {
-                        mcpTools = t
-                        mcpToolReadState = .current
-                    }
-                    if let r = fetchedResources {
-                        mcpResources = r
-                        mcpResourceReadState = .current
-                    }
-                }
-            }
-            refreshMCPHubRecentCall()
         case .inspector:
             // Turn Inspector (W3) owns its own data: it subscribes to the
             // in-process TurnTraceBus for live events and reads the persisted
@@ -661,19 +443,6 @@ extension AppModel: MacChatSessionSelectionPort {
         return nil
     }
 
-    static func keepingLastGood<Value>(_ previous: Value, fetched: Value?) -> Value {
-        fetched ?? previous
-    }
-
-    /// The privacy map, walked now off the main actor (seconds for a whole
-    /// data root). Trust asks for it whenever it shows the map.
-    func refreshPrivacyMap() async {
-        let root = engine.dataRoot
-        privacyMap = await Task.detached(priority: .utility) {
-            PrivacyMap(dataRoot: root, generatedAt: SwiftNativeManifestSigner.isoTimestamp(Date()))
-        }.value
-    }
-
     /// One user-facing sentence naming what could not be reached and how old
     /// the displayed data is, or nil when the last refresh was clean.
     @MainActor
@@ -684,7 +453,7 @@ extension AppModel: MacChatSessionSelectionPort {
         guard let lastSuccess = status.lastSuccessAt else {
             // The provider reads failing with none connected is that cause;
             // anything else failed for its own reason, which is not named here.
-            return Set(status.failedEndpoints).isSubset(of: ["providers", "model catalog"]) && !SwiftNativeProviderRouting(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).hasUsableCredentials()
+            return Set(status.failedEndpoints).isSubset(of: ["providers", "model catalog"]) && engine.providers.settings != nil && !engine.providers.hasReadyConnection
                 ? "Nothing has loaded yet this session: no AI provider is connected. Connect one in Providers."
                 : "Nothing has loaded yet this session: the last read failed."
         }
@@ -718,16 +487,7 @@ extension AppModel: MacChatSessionSelectionPort {
             nextInbox,
             nextMemoryProposals
         )
-        // Render-cost audit F13/F14: this is a file-watch-driven refresh
-        // approvals/inbox/memory files — including SQLite WAL churn that
-        // changed nothing. Observation fires on write, not on change, so gate
-        // collection writes before publishing the canonical work overview.
-        let nextApprovalRows = Self.keepingLastGood(approvalStore.records, fetched: approvalRows)
-        if approvalStore.records != nextApprovalRows { approvalStore.records = nextApprovalRows }
-        let nextInboxRows = Self.keepingLastGood(inbox.items, fetched: inboxRows)
-        if inbox.items != nextInboxRows { inbox.items = nextInboxRows }
-        let nextProposalRows = Self.keepingLastGood(memory.proposals, fetched: proposalRows)
-        if memory.proposals != nextProposalRows { memory.proposals = nextProposalRows }
+        // Approval, inbox and pending proposal reads publish through their owners.
         var failed: [String] = []
         if approvalRows == nil { failed.append("approvals") }
         if inboxRows == nil { failed.append("inbox") }
@@ -749,98 +509,32 @@ extension AppModel: MacChatSessionSelectionPort {
         return receipt
     }
 
-    // S.1: touch a draft key to mark it recently used; call on every chatDrafts write.
-    @MainActor
-    func touchChatDraft(sessionId: String) {
-        chatDraftLastTouched[sessionId] = Date()
+    func composerDraft(for sessionId: String) -> ChatComposerDraft {
+        if let draft = chatComposerDrafts[sessionId] { return draft }
+        let draft = ChatComposerDraft(sessionId: sessionId)
+        chatComposerDrafts[sessionId] = draft
+        return draft
     }
 
-    // MARK: - Chat draft commit / inject (H5)
-    //
-    // The composer holds in-progress text in view-local @State. These two
-    // entry points are the ONLY ways `chatDrafts` changes from outside it.
-    //
-    // - `commitChatDraft` persists the composer's text so it survives a tab
-    //   change or session switch. It does NOT bump the injection generation:
-    //   the composer already has this text, and re-broadcasting it would echo
-    //   straight back into the field it came from.
-    // - `injectChatDraft` writes text the composer has never seen (skill-build
-    //   starter, suggestion chip) and bumps the generation so the composer
-    //   pulls it. Rare by construction — never on the keystroke path.
-
-    /// 2026-09-06: the main composer and every detached panel hold their
-    /// in-progress text in view-local `@State` (H5), so `chatDrafts` lags what
-    /// is actually on screen. A surface about to ADOPT a draft posts this
-    /// first; the notification is delivered synchronously, so every live
-    /// composer has written its text through by the time the read happens.
-    /// Without it, opening a detached panel on the conversation the main
-    /// window is being typed into showed the last commit, not the typing.
-    @MainActor
-    func flushLiveChatDrafts() {
-        NotificationCenter.default.post(name: .chatFlushLiveDrafts, object: nil)
-    }
-
-    /// `editedAt` is when the committing composer's text was last typed. The
-    /// flush broadcast makes every dirty composer write inside one
-    /// notification with no order between them, so the newest edit wins and an
-    /// older one is dropped rather than overwriting it (2026-09-06). Callers
-    /// acting on a fresh user action (a send that clears the box) leave it at
-    /// the default and are treated as the newest write.
-    /// 2026-09-06: returns whether the write actually landed. A commit rejected
-    /// as older than the stored draft used to be reported as success, so the
-    /// panel marked its unsent text committed and dropped it on close.
-    @MainActor
-    @discardableResult
-    func commitChatDraft(_ text: String, sessionId: String, editedAt: Date = Date()) -> Bool {
-        guard !sessionId.isEmpty else { return false }
-        if let lastEdited = chatDraftLastEdited[sessionId], editedAt < lastEdited { return false }
-        chatDraftLastEdited[sessionId] = editedAt
-        if text.isEmpty {
-            // Mirrors pruneChatDrafts' empty-draft rule: an empty draft is an
-            // absent draft, and leaving the key behind would keep a dead
-            // session pinned in the 50-entry LRU.
-            chatDrafts.removeValue(forKey: sessionId)
-            chatDraftLastTouched.removeValue(forKey: sessionId)
-            return true
-        }
-        guard chatDrafts[sessionId] != text else { return true }
-        chatDrafts[sessionId] = text
-        touchChatDraft(sessionId: sessionId)
-        return true
-    }
-
-    /// Clear the draft a composer just SENT.
-    ///
-    /// 2026-09-06: this used to be `commitChatDraft("")` with a fresh
-    /// timestamp, so sending older text from one window outranked — and
-    /// deleted — a newer, still-unsent edit made in another window on the same
-    /// conversation. A send speaks only for the snapshot it sent: when the
-    /// stored draft is that snapshot it goes away without claiming a new edit
-    /// time (so the other composer's later commit still wins), and when the
-    /// stored draft is something else the clear must win on the sent
-    /// snapshot's own edit time or not at all.
+    /// Acceptance clears only the exact live edit that was sent.
     @MainActor
     func clearChatDraftAfterSend(_ sent: String, sessionId: String, editedAt: Date) {
-        guard !sessionId.isEmpty else { return }
-        if chatDrafts[sessionId] == sent {
-            chatDrafts.removeValue(forKey: sessionId)
-            chatDraftLastTouched.removeValue(forKey: sessionId)
-            return
+        let draft = composerDraft(for: sessionId)
+        if draft.text == sent, draft.editedAt == editedAt {
+            draft.edit("")
         }
-        commitChatDraft("", sessionId: sessionId, editedAt: editedAt)
     }
 
     @MainActor
     func injectChatDraft(_ text: String, sessionId: String) {
         guard !sessionId.isEmpty else { return }
-        chatDrafts[sessionId] = text
-        touchChatDraft(sessionId: sessionId)
-        bumpChatDraftInjectionGeneration()
+        let draft = composerDraft(for: sessionId)
+        if draft.text.isEmpty { draft.edit(text) }
     }
 
     @MainActor
     func chatDraft(for sessionId: String) -> String {
-        chatDrafts[sessionId] ?? ""
+        composerDraft(for: sessionId).text
     }
 
     /// Prepare the actual composer draft before routing to Chat. A
@@ -879,7 +573,7 @@ extension AppModel: MacChatSessionSelectionPort {
     @MainActor
     func refreshChatSessionIndex() async {
         await refreshChatSessionIndex { [transcripts = engine.transcripts] in
-            try await transcripts.listForPresentation()
+            try await transcripts.list()
         }
     }
 
@@ -890,11 +584,11 @@ extension AppModel: MacChatSessionSelectionPort {
     func refreshChatSessionIndex(
         load: @escaping @MainActor @Sendable () async throws -> [ChatSession]
     ) async {
+        let transactions = engine.transcripts.sessionTransactions
+        var replacement: ChatSession?
+        _ = await transactions.indexRead.read({ () async -> Result<[ChatSession], Error> in
         do {
             let refreshed = try await load()
-            if chatSessionIndexRefreshFailed {
-                chatSessionIndexRefreshFailed = false
-            }
             let knownSessionIds = Set(refreshed.map(\.id))
             if !chatTurnLifecycleRepairCompleted {
                 await repairChatTurnLifecyclesIfNeeded(
@@ -903,23 +597,30 @@ extension AppModel: MacChatSessionSelectionPort {
                     await self.readCanonicalChatTurnTerminalProof(identity: identity)
                 }
             }
+            return .success(refreshed)
+        } catch { return .failure(error) }
+        }, publish: { result in
+        switch result {
+        case .success(let refreshed):
+            let knownSessionIds = Set(refreshed.map(\.id))
+            chatSessionIndexRefreshFailed = false
             guard refreshed != engine.transcripts.sessions else { return }
-            engine.transcripts.sessions = refreshed
+            engine.transcripts.publishSessionIndexRead(refreshed)
             pruneChatDrafts()
             pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
             if !activeChatSessionId.isEmpty, !knownSessionIds.contains(activeChatSessionId) {
                 chatSelectionGeneration += 1
                 activeChatSessionId = ""
                 persistActiveChatSessionID(nil)
-                if let replacement = refreshed.first(where: { $0.archived != true }) {
-                    await selectChatSession(replacement)
-                }
+                replacement = refreshed.first(where: { $0.archived != true })
             }
-        } catch {
+        case .failure:
             if !chatSessionIndexRefreshFailed {
                 chatSessionIndexRefreshFailed = true
             }
         }
+        })
+        if let replacement { await selectChatSession(replacement) }
     }
 
     /// Simple has no conversation list, so it follows the conversation User is
@@ -927,13 +628,16 @@ extension AppModel: MacChatSessionSelectionPort {
     /// with it. A chat he opened here stays until the anchor moves again.
     @MainActor
     func followMovedAnchorInSimple() async {
+        engine.transcripts.refreshNavigationIdentity()
         guard SimpleViewMode.isShowing,
-              let anchorId = ConversationAnchor.currentSessionId(),
+              let anchorId = engine.transcripts.conversationAnchor?.sessionId,
               anchorId != MacChatSelectionIntent.lastSeenAnchorSessionId else { return }
         MacChatSelectionIntent.lastSeenAnchorSessionId = anchorId
         guard anchorId != activeChatSessionId else { return }
         if !engine.transcripts.sessions.contains(where: { $0.id == anchorId }) {
-            do { engine.transcripts.sessions = try await engine.transcripts.listForPresentation() } catch { return }
+            let selection = chatSelectionGeneration
+            await refreshChatSessionIndex()
+            guard chatSelectionGeneration == selection else { return }
         }
         guard let session = engine.transcripts.sessions.first(where: { $0.id == anchorId && $0.archived != true })
         else { return }
@@ -946,26 +650,27 @@ extension AppModel: MacChatSessionSelectionPort {
         let selectionGenerationAtStart = chatSelectionGeneration
         do {
             if engine.doctor.health?.ok != true {
-                engine.doctor.health = engine.doctor.readHealth()
+                await engine.doctor.refreshHealth()
             }
-            if let policy = try? await engine.trust.load() {
-                engine.trust.policy = policy
-            }
-            let fetchedSessions = try await engine.transcripts.listForPresentation()
-            chatSessionIndexRefreshFailed = false
-            engine.transcripts.sessions = fetchedSessions
+            _ = try? await engine.trust.load()
+            let transactions = engine.transcripts.sessionTransactions
+            _ = try await transactions.indexRead.read({ try await engine.transcripts.list() }, publish: { fetchedSessions in
+                chatSessionIndexRefreshFailed = false
+                engine.transcripts.publishSessionIndexRead(fetchedSessions)
+            })
             // Simple owns its current thread. Advanced may default to the
             // remote conversation anchor — but only until the human
             // picks something. `shouldAdoptAnchor` owns that rule and also
             // refuses an anchor that names no live session, so a stale pin can
             // never blank the window. Surface-agnostic: nothing here knows or
             // cares which adapter published the anchor.
+            guard chatSelectionGeneration == selectionGenerationAtStart else { return }
             if !SimpleViewMode.isShowing, ConversationAnchor.shouldAdoptAnchor(
-                anchorSessionId: ConversationAnchor.currentSessionId(),
+                anchorSessionId: engine.transcripts.conversationAnchor?.sessionId,
                 currentSelection: activeChatSessionId,
                 userChoseThisLaunch: MacChatSelectionIntent.userChoseThisLaunch,
                 liveSessionIds: Set(engine.transcripts.sessions.filter { $0.archived != true }.map(\.id))
-            ), let anchorId = ConversationAnchor.currentSessionId() {
+            ), let anchorId = engine.transcripts.conversationAnchor?.sessionId {
                 activeChatSessionId = anchorId
                 persistActiveChatSessionID(activeChatSessionId)
             }
@@ -975,24 +680,31 @@ extension AppModel: MacChatSessionSelectionPort {
                     return
                 }
                 let reconciled = try await engine.transcripts.sessionTransactions.reconcileStartupSession(store: engine.transcripts)
-                activeChatSessionId = reconciled.session.id
                 if reconciled.created {
                     NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: false)
                 }
+                guard chatSelectionGeneration == selectionGenerationAtStart else { return }
+                activeChatSessionId = reconciled.session.id
                 UserDefaults.standard.set(activeChatSessionId, forKey: "activeChatSessionId")
             }
             migrateEmptySessionChatState(to: activeChatSessionId)
+            let indexSnapshot = engine.transcripts.sessions
             let knownSessionIds = Set(engine.transcripts.sessions.map(\.id))
             await repairChatTurnLifecyclesIfNeeded(
                 knownSessionIds: knownSessionIds
             ) { identity in
                 await self.readCanonicalChatTurnTerminalProof(identity: identity)
             }
-            pruneChatDrafts()
-            // 2026-07-21 audit fix: prune per-session message caches
-            // for sessions the list no longer reports — mirrors the stale-draft
-            // prune above, same low-frequency hook.
-            pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
+            guard chatSelectionGeneration == selectionGenerationAtStart else { return }
+            // Pruning reads the index: only while it is still the one read here.
+            // The conversation itself loads either way.
+            if engine.transcripts.sessions == indexSnapshot {
+                pruneChatDrafts()
+                // 2026-07-21 audit fix: prune per-session message caches
+                // for sessions the list no longer reports — mirrors the stale-draft
+                // prune above, same low-frequency hook.
+                pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
+            }
             let targetSessionId = activeChatSessionId
             let lifecycleAtLoadStart = engine.turns.lifecycle(for: targetSessionId)
             let messages = try await engine.transcripts.loadMessages(sessionId: targetSessionId, cached: true)
@@ -1123,13 +835,8 @@ extension AppModel: MacChatSessionSelectionPort {
             engine.transcripts.setMessages([], for: session.id)
             activeChatSessionId = session.id
             persistActiveChatSessionID(activeChatSessionId)
-            engine.transcripts.sessions = try await engine.transcripts.listForPresentation()
+            await refreshChatSessionIndex()
             migrateEmptySessionChatState(to: activeChatSessionId)
-            pruneChatDrafts()
-            // 2026-07-21 audit fix: prune per-session message caches
-            // for sessions the list no longer reports — mirrors the stale-draft
-            // prune above, same low-frequency hook.
-            pruneStaleSessionChatState(knownSessionIds: Set(engine.transcripts.sessions.map(\.id)))
             statusText = "New chat session ready"
             publishChatSnapshot()
         } catch {
@@ -1149,7 +856,7 @@ extension AppModel: MacChatSessionSelectionPort {
 extension AppModel: QuietChatSessionCommandPort {
     var chatSessionTransactions: MacChatSessionTransactions { engine.transcripts.sessionTransactions }
     var chatCommandTranscripts: TranscriptsFacade { engine.transcripts }
-    var quietPinnedChatSessionIDs: [String] { ChatSessionRetention.load() }
+    var quietPinnedChatSessionIDs: [String] { engine.transcripts.pinnedSessionIDs }
     func quietChatIsDetached(_ sessionId: String) -> Bool {
         DetachedChatWindowController.shared.isDetached(sessionId)
     }
@@ -1161,11 +868,9 @@ extension AppModel: QuietChatSessionCommandPort {
     }
     func unpinQuietChatSession(_ sessionId: String) -> Bool? {
         do {
-            switch try ChatSessionRetention.closePinnedTab(sessionID: sessionId) {
+            switch try engine.transcripts.closePinnedTab(sessionId) {
             case .closed(let encoded):
-                ChatSessionRetention.request(encodedPinnedIDs: encoded) { _ in
-                    NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: false)
-                }
+                _ = engine.transcripts.publishPins(encoded, includeTranscripts: false)
                 return true
             case .refusedAlreadyUnpinned: return false
             case .refusedInvalidSessionID: return nil

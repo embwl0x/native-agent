@@ -1,6 +1,8 @@
 import Foundation
 import os
 
+// Blueprint: | `ModuleLogging.swift` | `nativeLog`: shared module diagnostics with local credential scrubbing before public logging, without importing Core |
+
 private let nativeModuleLogger = Logger(
     subsystem: "com.example.nativeagent",
     category: "NativeAgentShared"

@@ -1,5 +1,6 @@
 import Foundation
 import TurnTrace
+// Blueprint: | `MacChatTurnRetry.swift` | `MacChatTurnPresentationPort`: `admitMacChatRetry`, `runAdmittedMacChatRetry`, `settleMacChatRetry` |
 
 public struct MacChatRetryAdmission: Sendable {
     public let identity: MacChatTurnIdentity
@@ -12,6 +13,14 @@ public extension MacChatTurnPresentationPort {
         matchesCanonical: @MainActor () async -> Bool,
         stillMatchesLocal: @MainActor () -> Bool
     ) async -> MacChatRetryAdmission? {
+        guard let generation = macChatTurns.reserveTurn(sessionId: sessionId) else {
+            presentMacChatTurn(.status("Chat is already running in that session"))
+            return nil
+        }
+        var admitted = false
+        defer {
+            if !admitted { _ = macChatTurns.finishRuntime(sessionId: sessionId, generation: generation) }
+        }
         // FIX 4: same Stop-then-quick-restart ordering barrier as sendChat.
         await awaitPendingCancelFlagWrite(for: sessionId)
         let repairAvailable = await repairChatTurnLifecyclesIfNeeded(
@@ -27,15 +36,12 @@ public extension MacChatTurnPresentationPort {
             return nil
         }
         // PATCH-2026-05-13: parallel-sessions — guard per-session, not global
-        guard macChatTurns.tasks[sessionId] == nil, !macChatTurns.busySessions.contains(sessionId) else {
+        guard macChatTurns.taskGenerations[sessionId] == generation else {
             presentMacChatTurn(.status("Chat is already running in that session"))
             return nil
         }
         // Reserve the session across canonical reads. A second ordinary send
         // may queue, but cannot race this retry into provider execution.
-        macChatTurns.busySessions.insert(sessionId)
-        let generation = (macChatTurns.taskGenerations[sessionId] ?? 0) + 1
-        macChatTurns.taskGenerations[sessionId] = generation
         let lifecycleIdentity = MacChatTurnIdentity(
             sessionId: sessionId,
             turnId: TurnTraceContext.mintTurnId()
@@ -52,13 +58,13 @@ public extension MacChatTurnPresentationPort {
         let admissionStillCurrent = macChatTurns.lifecycle(for: sessionId)?.identity
             == lifecycleIdentity
             && macChatTurns.lifecycle(for: sessionId)?.cancellationRequestedAt == nil
+            && macChatTurns.taskGenerations[sessionId] == generation
             && canonicalMatches
             && stillMatchesLocal()
             && knownChatSessionIDs.contains(sessionId)
             && !Task.isCancelled
         guard lifecyclePersisted, admissionStillCurrent else {
-            macChatTurns.busySessions.remove(sessionId)
-            macChatTurns.taskGenerations[sessionId] = nil
+            _ = macChatTurns.finishRuntime(sessionId: sessionId, generation: generation)
             await abandonChatTurnLifecycleBeforeAdmission(identity: lifecycleIdentity)
             presentMacChatTurn(.status(lifecyclePersisted
                 ? "Regenerate failed: the conversation changed before retry began"
@@ -66,6 +72,7 @@ public extension MacChatTurnPresentationPort {
             await drainNextQueuedChatTurnIfPossible(sessionId: sessionId)
             return nil
         }
+        admitted = true
         return MacChatRetryAdmission(identity: lifecycleIdentity, generation: generation)
     }
 
@@ -76,6 +83,7 @@ public extension MacChatTurnPresentationPort {
     ) async {
         let sessionId = admission.identity.sessionId
         let lifecycleIdentity = admission.identity
+        guard macChatTurns.taskGenerations[sessionId] == admission.generation else { return }
         var regeneratedTurnCompleted = false
         let task = Task { @MainActor in
             _ = applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(

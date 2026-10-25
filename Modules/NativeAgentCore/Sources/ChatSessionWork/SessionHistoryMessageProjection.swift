@@ -4,6 +4,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+// Blueprint: | `SessionHistoryMessageProjection.swift` | `SessionHistoryMessageProjection` enum; `admission`, `project` |
 
 // MARK: - SessionHistoryMessageProjection (v2Prefix conversation prefix)
 
@@ -98,7 +99,7 @@ package enum SessionHistoryMessageProjection {
                 identity: row.historyIdentity,
                 role: row.isTool ? "tool" : row.role,
                 length: SessionHistoryPromptRenderer
-                    .renderedHistoryLine(row, budget: budget).count,
+                    .projectedHistoryText(row, budget: budget).count,
                 isAnchor: anchorIdentities.contains(row.historyIdentity),
                 isCompactionSummary: row.isCompactionSummary
             )

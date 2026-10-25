@@ -4,6 +4,7 @@ import PersistenceCore
 import ProviderRouting
 import BackgroundLoops
 import TelegramBot
+// Blueprint: | `EngineTelegram+Commands.swift` | Telegram configuration and mobile commands; Telegram token admission, settings and delivery commands, typed diagnostic-clear receipt; diagnostic state edits delegate to TelegramPollLoop.mutateState |
 
 public struct TelegramDiagnosticsClearReceipt: Equatable, Sendable {
     public let clearedAt: String
@@ -48,14 +49,12 @@ extension TelegramFacade {
         // wipe out the stored token. Clear is still explicit via clearToken.
         let root = dataRoot
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        let existing = try TelegramBot.TelegramConfig.loadSavedConfiguration(
-            dataRoot: root, resolveCredential: !clearToken && trimmedToken.isEmpty
-        )
-        let effectiveToken: String = {
-            if clearToken { return "" }
-            if !trimmedToken.isEmpty { return trimmedToken }
-            return existing?.botToken ?? ""
-        }()
+        let snapshot = try CredentialFileLock.withLock(root.appendingPathComponent("telegram/config.json")) {
+            let configuration = try TelegramConfig.loadSavedConfiguration(dataRoot: root, resolveCredential: false)
+            return (configuration: configuration, revision: try TelegramConfig.savedRevision(dataRoot: root))
+        }
+        let existing = snapshot.configuration
+        let effectiveToken = clearToken ? "" : trimmedToken
         let chatIds = try Self.telegramIDs(
             allowedChatIds,
             invalid: TelegramConfigurationError.invalidAllowedChatID
@@ -64,11 +63,10 @@ extension TelegramFacade {
             allowedUserIds,
             invalid: TelegramConfigurationError.invalidAllowedUserID
         )
-        // Enabled is now explicit: a saved-disabled token must round-trip so
-        // the user can toggle the poller off without wiping the token. clearToken
-        // and an empty effectiveToken both force enabled=false; otherwise the
-        // caller's explicit `enabled` arg wins.
-        let effectiveEnabled = !clearToken && !effectiveToken.isEmpty && enabled
+        // A saved-disabled token round-trips without being resolved before the
+        // routing await. Clear and missing credentials force enabled=false;
+        // otherwise the caller's explicit `enabled` arg wins.
+        let effectiveEnabled = !clearToken && (!effectiveToken.isEmpty || existing?.tokenConfigured == true) && enabled
         guard !effectiveEnabled || !chatIds.isEmpty || !userIds.isEmpty else {
             throw TelegramConfigurationError.destinationRequired
         }
@@ -101,7 +99,9 @@ extension TelegramFacade {
             voiceMaxBytes: existing?.voiceMaxBytes ?? TelegramBot.TelegramConfig.defaultVoiceMaxBytes
         )
         do {
-            try TelegramBot.TelegramConfig.saveToDisk(cfg, dataRoot: root)
+            try TelegramBot.TelegramConfig.saveToDisk(cfg, dataRoot: root,
+                expectedRevision: clearToken ? nil : snapshot.revision,
+                keepExistingToken: !clearToken && trimmedToken.isEmpty)
         } catch {
             throw TelegramConfigurationError.persistenceFailed(error.localizedDescription)
         }
@@ -199,10 +199,7 @@ extension TelegramFacade {
         )
         try await impl.clearLogs()
         let clearedAt = try await recordTelegramDiagnosticsCleared(root: root)
-        // Read the same complete mounted-root status the settings panel uses.
-        // The facade combines core transport status with the bounded feeds.
-        var status = try await load(manager: manager)
-        status.lastDiagnosticsClearedAt = clearedAt
+        let status = try await refresh(manager: manager)
         return TelegramDiagnosticsClearReceipt(
             clearedAt: clearedAt,
             removedFileCount: before.fileCount,
@@ -227,42 +224,23 @@ extension TelegramFacade {
     }
 
     private nonisolated func recordTelegramTestStatus(root: URL, error: String) async throws {
-        try await mutateTelegramDiagnosticsState(root: root) { object in
-            object["lastError"] = error
+        try await TelegramPollLoop.mutateState(dataRoot: root) { object in
+            object["lastError"] = .string(error)
         }
     }
 
     private nonisolated func recordTelegramDiagnosticsCleared(root: URL) async throws -> String {
-        try await mutateTelegramDiagnosticsState(root: root) { object in
+        try await TelegramPollLoop.mutateState(dataRoot: root) { object in
             let marker = ISO8601DateFormatter().string(from: Date())
-            object["lastDiagnosticsClearedAt"] = marker
+            object["lastDiagnosticsClearedAt"] = .string(marker)
             return marker
         }
     }
 
     private nonisolated func recordTelegramTestSuccess(root: URL) async throws {
-        try await mutateTelegramDiagnosticsState(root: root) { object in
+        try await TelegramPollLoop.mutateState(dataRoot: root) { object in
             object.removeValue(forKey: "lastError")
-            object["lastReplyAt"] = ISO8601DateFormatter().string(from: Date())
-        }
-    }
-
-    private nonisolated func mutateTelegramDiagnosticsState<Result: Sendable>(
-        root: URL,
-        _ update: @Sendable (inout [String: Any]) -> Result
-    ) async throws -> Result {
-        let path = root.appendingPathComponent("telegram/state.json")
-        let persistence = SwiftNativePersistenceCore()
-        return try await persistence.withFileLock(path) {
-            var object: [String: Any] = [:]
-            if let data = try? Data(contentsOf: path),
-               let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                object = decoded
-            }
-            let result = update(&object)
-            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: path, options: .atomic)
-            return result
+            object["lastReplyAt"] = .string(ISO8601DateFormatter().string(from: Date()))
         }
     }
 }

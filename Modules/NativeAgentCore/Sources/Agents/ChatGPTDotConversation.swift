@@ -1,10 +1,16 @@
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import AgentWorkspace
+import AgentConversations
 import CryptoKit
 import Foundation
 import Network
 import NativeAgentCore
 import PersistenceCore
+import PersonaEngine
 import ProviderRouting
+import Transcripts
+// Blueprint: | `ChatGPTDotConversation.swift` | `ChatGPTDotConversation` actor; `refresh`, `conversation`; saved arrivals wait on `TurnAdmission` capacity signals; cached failed-admission peer IDs gate link recovery before peer/file reads; room cleanup keeps the first revised message per ID; successful recovery owns network/provider subscriptions until retirement, which releases recovery admission on failure, cancellation and stop; the delegation runner stops subscriptions with discovery and Dot socket observation; old lifecycle callbacks cannot retry admissions |
 
 /// Dot's room is an ingress into his ordinary contact session, not an outbound reply tracker.
 actor ChatGPTDotConversation {
@@ -13,6 +19,7 @@ actor ChatGPTDotConversation {
     private var pull: Task<JSONValue, Error>?
     private var pendingMessages: [JSONValue] = []
     private struct Admission: Codable {
+        var lifeID: String?
         let message: JSONValue
         var started = false
         /// Why the turn it began did not finish (her model link dropped).
@@ -21,6 +28,10 @@ actor ChatGPTDotConversation {
     }
     private var admissionTasks: Set<String> = []
     private var link: NWPathMonitor?
+    private var linkChanges: Task<Void, Never>?
+    private var providerChanges: Task<Void, Never>?
+    private var generation = UUID()
+    private var recoveryAttempted = false
     /// The link is back: the network path came up (when), or her newest
     /// provider call anywhere succeeded.
     private var pathUp: Date?
@@ -40,42 +51,87 @@ actor ChatGPTDotConversation {
     /// At launch. A message whose turn began in an earlier run of the app and
     /// never finished waits for the link like one whose turn failed on it.
     func resumeAdmissions() async throws {
-        guard link == nil else { return }
-        for peer in try AgentPeerStore(dataRoot: dataRoot).list() where ChatGPTDotIPCTransport.owns(peer) {
-            for (id, admission) in try admissions(peer: peer.id) where admission.started {
-                try saveAdmission(Admission(message: admission.message, failed: "The app stopped before it finished."), id: id, peer: peer.id)
+        guard !recoveryAttempted, !Task.isCancelled else { return }
+        recoveryAttempted = true
+        let generation = generation
+        // Reserve this lifecycle before the recovery pass suspends.
+        let link = NWPathMonitor()
+        self.link = link
+        do {
+            for peer in try AgentPeerStore(dataRoot: dataRoot).list() where ChatGPTDotIPCTransport.owns(peer) {
+                for (id, admission) in try admissions(peer: peer.id)
+                    where try admission.started && DataRootLife.isCurrent(admission.lifeID, in: dataRoot)
+                        && !admissionTasks.contains(peer.id + ":" + id) {
+                    try saveAdmission(Admission(lifeID: admission.lifeID, message: admission.message, failed: "The app stopped before it finished."), id: id, peer: peer.id)
+                }
+                if try admissions(peer: peer.id).values.contains(where: { !$0.started && $0.failed == nil }) {
+                    _ = try await append([], peer: peer, recovery: generation)
+                    guard self.generation == generation else { return }
+                    try Task.checkCancellation()
+                }
             }
-            if try admissions(peer: peer.id).values.contains(where: { !$0.started && $0.failed == nil }) {
-                _ = try await append([], peer: peer)
-            }
+        } catch {
+            if self.generation == generation { retireSubscriptions() }
+            throw error
         }
+        guard self.generation == generation else { return }
+        if Task.isCancelled { retireSubscriptions(); return }
         // The link is back when the network path comes up (its state now
         // counts), or when a call to her model provider succeeds: a provider
         // timeout recovers with the path unchanged.
-        let link = NWPathMonitor()
-        link.pathUpdateHandler = { [weak self] path in
-            guard path.status == .satisfied, let self else { return }
-            Task { await self.linkBack(path: true) }
+        let paths = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        link.pathUpdateHandler = { path in
+            if path.status == .satisfied { paths.continuation.yield(()) }
+        }
+        linkChanges = Task { [weak self] in
+            defer { paths.continuation.finish() }
+            for await _ in paths.stream {
+                guard let self, await self.isCurrent(generation), !Task.isCancelled else { return }
+                await self.linkBack(path: true, generation: generation)
+            }
         }
         link.start(queue: DispatchQueue(label: "ChatGPTDotConversation.link"))
         self.link = link
         let clients = clients
-        Task { [weak self] in
-            guard let changes = await clients.cognitionChanges() else { return }
-            for await change in changes {
-                guard let self else { return }
-                switch change.reason {
-                case "provider_lifecycle:succeeded": await self.linkBack(path: false)
-                case "provider_lifecycle:failed": await self.providerFailed()
-                default: break
-                }
+        providerChanges = Task { [weak self] in await self?.followProvider(clients, generation: generation) }
+    }
+
+    private func followProvider(_ clients: any AgentContactClients, generation: UUID) async {
+        defer { if self.generation == generation { providerChanges = nil } }
+        guard let changes = await clients.cognitionChanges(), isCurrent(generation), !Task.isCancelled else { return }
+        for await change in changes {
+            guard isCurrent(generation), !Task.isCancelled else { return }
+            switch change.reason {
+            case "provider_lifecycle:succeeded": await linkBack(path: false, generation: generation)
+            case "provider_lifecycle:failed": providerFailed(generation: generation)
+            default: break
             }
         }
     }
 
-    private func providerFailed() { providerFine = false }
+    func stopSubscriptions() {
+        retireSubscriptions()
+    }
 
-    private func linkBack(path: Bool) async {
+    private func retireSubscriptions() {
+        recoveryAttempted = false
+        generation = UUID()
+        link?.pathUpdateHandler = nil
+        link?.cancel(); link = nil
+        linkChanges?.cancel(); linkChanges = nil
+        providerChanges?.cancel(); providerChanges = nil
+        providerFine = false; pathUp = nil
+    }
+
+    private func isCurrent(_ generation: UUID) -> Bool { self.generation == generation && link != nil }
+
+    private func providerFailed(generation: UUID) {
+        guard isCurrent(generation), !Task.isCancelled else { return }
+        providerFine = false
+    }
+
+    private func linkBack(path: Bool, generation: UUID) async {
+        guard isCurrent(generation), !Task.isCancelled else { return }
         if path { pathUp = Date() } else { providerFine = true }
         retriedAtOnce.removeAll()
         guard !failedAdmissionPeers.isEmpty else { return }
@@ -84,14 +140,16 @@ actor ChatGPTDotConversation {
     }
 
     private func retryAdmissions() async throws {
-        guard !failedAdmissionPeers.isEmpty, !retryingAdmissions else { return }
+        guard link != nil, !Task.isCancelled, !failedAdmissionPeers.isEmpty, !retryingAdmissions else { return }
+        let generation = generation
         retryingAdmissions = true
         defer { retryingAdmissions = false }
         let peers = try AgentPeerStore(dataRoot: dataRoot).list().filter { ChatGPTDotIPCTransport.owns($0) }
         failedAdmissionPeers.formIntersection(peers.map(\.id))
         for peer in peers where failedAdmissionPeers.contains(peer.id) {
+            guard isCurrent(generation), !Task.isCancelled else { return }
             if try admissions(peer: peer.id).values.contains(where: { !$0.started && $0.failed != nil }) {
-                _ = try await append([], peer: peer, retry: true)
+                _ = try await append([], peer: peer, retry: true, recovery: generation)
             }
         }
     }
@@ -106,7 +164,11 @@ actor ChatGPTDotConversation {
             failedAdmissionPeers.remove(peer)
             return [:]
         }
-        let saved = try JSONDecoder().decode([String: Admission].self, from: Data(contentsOf: file))
+        var saved = try JSONDecoder().decode([String: Admission].self, from: Data(contentsOf: file))
+        for id in saved.keys where try !DataRootLife.isCurrent(saved[id]?.lifeID, in: dataRoot) {
+            saved[id]?.started = true
+            saved[id]?.failed = DataRootLife.stoppedReason
+        }
         cacheFailedAdmissions(saved, peer: peer)
         return saved
     }
@@ -193,14 +255,15 @@ actor ChatGPTDotConversation {
         let session = principal(peer).storedConversation("mcp-" + peer.id)
         let transcript = dataRoot.appendingPathComponent("chat/messages/\(session).jsonl")
         let source = try await SwiftNativePersistenceCore().readJSONLReporting(transcript)
-        let saved = source.rows.reversed().compactMap { value -> [String: JSONValue]? in
-            guard case .object(let row) = value, case .string? = row["content"],
-                  row["role"] == .string("user") || row["role"] == .string("assistant") else { return nil }
-            return row
-        }
-        let rows = saved.map { row -> [String: JSONValue] in
-            ["id": row["id"] ?? .null, "at": row["createdAt"] ?? .null,
-             "from": .string(Self.author(of: row, peer: peer)), "text": row["content"] ?? .null]
+        let saved = ContactThread.project(source.rows.reversed().compactMap { value -> ContactThread.Line? in
+            guard case .object(let row) = value,
+                  row["role"] == .string("user") || row["role"] == .string("assistant"),
+                  case .string? = row["content"] else { return nil }
+            return ContactThread.Line(row)
+        }, own: PersonaCompiler.agentDisplayName(dataRoot: dataRoot), names: ["peer:" + peer.id: peer.name])
+        let rows = saved.map { line -> [String: JSONValue] in
+            ["id": line.id.isEmpty ? .null : .string(line.id), "at": line.timestamp.map(JSONValue.string) ?? .null,
+             "from": .string(line.speaker), "text": .string(line.text)]
         }
         let version = SHA256.hash(data: try JSONValue.array(rows.map { .object($0) }).serializedData(pretty: false))
             .map { String(format: "%02x", $0) }.joined()
@@ -225,7 +288,7 @@ actor ChatGPTDotConversation {
             row["text_offset"] = .int(Int64(textOffset))
             row["text_has_more"] = .bool(textOffset + part.count < text.count)
             selected.append(.object(row))
-            Self.consume(saved[index], peer: peer)
+            ContactThread.consume(saved[index], mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) })
             remaining -= part.count
             textOffset += part.count
             if textOffset < text.count { break }
@@ -265,7 +328,12 @@ actor ChatGPTDotConversation {
     }
 
     /// `retry`: the link is back, so messages whose turn failed on it run again.
-    private func append(_ messages: [JSONValue], peer: AgentPeerContact, retry: Bool = false) async throws -> JSONValue {
+    private func append(_ messages: [JSONValue], peer: AgentPeerContact, retry: Bool = false,
+                        recovery: UUID? = nil) async throws -> JSONValue {
+        func checkRecovery() throws {
+            if let recovery, !isCurrent(recovery) || Task.isCancelled { throw CancellationError() }
+        }
+        try checkRecovery()
         // Recheck the saved contact and Trust at ingestion, after the read-only IPC follow.
         guard let peer = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == peer.id }),
               ChatGPTDotIPCTransport.owns(peer) else {
@@ -281,6 +349,7 @@ actor ChatGPTDotConversation {
             seen = try JSONDecoder().decode([String].self, from: Data(contentsOf: seenFile))
         } else { seen = [] }
         var rows = try await persistence.readJSONL(transcript)
+        try checkRecovery()
         // Durable reply IDs supersede the temporary seen list.
         var durableIDs = Set(rows.compactMap(Self.replyID))
         let replies = try replies(messages, rows: rows)
@@ -292,8 +361,11 @@ actor ChatGPTDotConversation {
                 return "dot-room:" + id
             })
             try await cleanup(transcript: transcript, seen: Set(seen), replies: replies, erroneous: erroneous, persistence: persistence)
+            try checkRecovery()
             try await persistence.writeJSON(.bool(true), to: cleanupFile)
+            try checkRecovery()
             rows = try await persistence.readJSONL(transcript)
+            try checkRecovery()
             durableIDs = Set(rows.compactMap(Self.replyID))
         }
         let client = clients.bridgeChatClient()
@@ -308,6 +380,7 @@ actor ChatGPTDotConversation {
         }.sorted { $0.1 < $1.1 }.map { $0.0 }
         var offered: Set<String> = []
         for message in recovered + replies {
+            try checkRecovery()
             guard case .object(let fields) = message, case .string(let roomID)? = fields["id"],
                   case .string(let text)? = fields["text"] else {
                 throw AgentConversationStore.Failure(message: "Dot returned an unreadable room message.")
@@ -319,6 +392,7 @@ actor ChatGPTDotConversation {
             if durableIDs.contains(id), pending[id] == nil { continue }
             let failed = pending[id]?.failed
             if failed != nil, !retry { continue }
+            let lifeID = try DataRootLife.current(in: dataRoot)
             // His reply is a message in her Dot session that wakes her, like any
             // contact's; she answers him with agent_message when she wants to.
             // A retry is a new turn: the one before it ended, and may have done things.
@@ -329,7 +403,7 @@ actor ChatGPTDotConversation {
             let plain = turn.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
             let request = principal.turnRequest(context: context, plain: plain,
                 messageID: id, originID: id)
-            if pending[id] == nil { try saveAdmission(Admission(message: message), id: id, peer: peer.id) }
+            if pending[id] == nil { try saveAdmission(Admission(lifeID: lifeID, message: message), id: id, peer: peer.id) }
             var enqueued: EnqueuedUserMessage?
             let savedRows = rows.filter { Self.replyID($0) == id }
             if !savedRows.isEmpty, failed == nil {
@@ -369,7 +443,7 @@ actor ChatGPTDotConversation {
                     if ProviderFailure.classify(error) == .network { failed = error.localizedDescription }
                     else { nativeLog("Dot admission failed: %@", error.localizedDescription) }
                 }
-                do { try saveAdmission(failed.map { Admission(message: message, failed: $0) }, id: id, peer: peer.id) }
+                do { try saveAdmission(failed.map { Admission(lifeID: lifeID, message: message, failed: $0) }, id: id, peer: peer.id) }
                 catch { nativeLog("Dot admission could not be saved: %@", error.localizedDescription); return }
                 // The link may have come back while this turn was failing: that
                 // event found nothing saved yet. Retry after this task lets go.
@@ -387,14 +461,18 @@ actor ChatGPTDotConversation {
             AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peer.id, inbound: true)
         }
         rows = try await persistence.tailJSONL(transcript, limit: 100, maxBytes: 1_048_576)
+        let agentName = PersonaCompiler.agentDisplayName(dataRoot: dataRoot)
         return .object(["status": .string("ready"), "agent": .string(peer.name), "agent_id": .string("peer:" + peer.id),
                         "conversation_id": .string(session), "untrusted_remote_data": .bool(true),
-                        "conversation": .array(rows.compactMap { value -> JSONValue? in
-                            guard case .object(let row) = value, let text = row["content"],
-                                  row["role"] == .string("user") || row["role"] == .string("assistant") else { return nil }
-                            Self.consume(row, peer: peer)
-                            return .object(["id": row["id"] ?? .null, "at": row["createdAt"] ?? .null,
-                                            "from": .string(Self.author(of: row, peer: peer)), "text": text])
+                        "conversation": .array(ContactThread.project(rows.compactMap { value -> ContactThread.Line? in
+                            guard case .object(let row) = value,
+                                  row["role"] == .string("user") || row["role"] == .string("assistant"),
+                                  case .string? = row["content"] else { return nil }
+                            return ContactThread.Line(row)
+                        }, own: PersonaCompiler.agentDisplayName(dataRoot: dataRoot), names: ["peer:" + peer.id: peer.name],
+                            mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) }).map { line in
+                            .object(["id": line.id.isEmpty ? .null : .string(line.id), "at": line.timestamp.map(JSONValue.string) ?? .null,
+                                     "from": .string(line.speaker), "text": .string(line.text)])
                         })])
     }
 
@@ -403,38 +481,6 @@ actor ChatGPTDotConversation {
               case .object(let metadata)? = row["metadata"], case .object(let origin)? = metadata["origin"],
               case .string(let id)? = origin["replyTo"], id.hasPrefix("dot-room:") else { return nil }
         return id
-    }
-
-    /// Who wrote a row of Dot's session. The person talks to her here on
-    /// purpose, so a user row is Dot's only when it came over his bridge (it
-    /// carries his origin stamp); the rest are the person's own words.
-    /// A room row's speaker as its own row's stamp says: the person, her, Dot,
-    /// or another agent when the row attests no one.
-    private static func author(of row: [String: JSONValue], peer: AgentPeerContact) -> String {
-        if case .object(let metadata)? = row["metadata"], metadata["byPerson"] == .bool(true) { return "the person" }
-        guard row["role"] == .string("user") else { return "Agent" }
-        guard bridged(row, peer: peer), case .object(let metadata)? = row["metadata"] else { return "the person" }
-        let source = ContactThread.stamp(id: id(row), metadata: metadata).source
-        return source == "peer:" + peer.id ? peer.name : source ?? "another agent"
-    }
-
-    private static func bridged(_ row: [String: JSONValue], peer: AgentPeerContact) -> Bool {
-        guard row["role"] == .string("user"), case .object(let metadata)? = row["metadata"], metadata["byPerson"] != .bool(true) else { return false }
-        if metadata["origin"] != nil { return true }
-        guard case .object(let envelope)? = metadata["envelope"] else { return false }
-        return envelope["surface"] == .string("agent-bridge") || envelope["userId"] == .string(peer.id)
-    }
-
-    private static func id(_ row: [String: JSONValue]) -> String { if case .string(let id)? = row["id"] { id } else { "" } }
-
-    /// A room row she is shown, read under its own row's stamp.
-    private static func consume(_ row: [String: JSONValue], peer: AgentPeerContact) {
-        let metadata: [String: JSONValue] = if case .object(let value)? = row["metadata"] { value } else { [:] }
-        let stamp = ContactThread.stamp(id: id(row), metadata: metadata)
-        let text: String = if case .string(let text)? = row["content"] { text } else { "" }
-        ContactThread.consume(mine: !bridged(row, peer: peer), source: stamp.source, steeredBy: stamp.steeredBy, text: text) {
-            PeerDataTaint.markConsumed(peer: $0, line: $1)
-        }
     }
 
     private func roomDate(_ text: String) -> Date? {
@@ -476,7 +522,7 @@ actor ChatGPTDotConversation {
                 } else { ownSend = false }
                 afterSend = ownSend ? date : nil
             } else if fields["kind"] == .string("dot") {
-                // His answer to her ask, or anything he addresses to her ("Agent, …") at any time.
+                // His answer to her ask, or Dot's fixed routing address ("Agent, …") at any time.
                 let text = (fields["text"].flatMap { if case .string(let t) = $0 { return t }; return nil } ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 let addressed = text.hasPrefix("agent") || text.hasPrefix("@agent")
@@ -515,7 +561,7 @@ actor ChatGPTDotConversation {
                     changed = true
                 } else { output += line + ending }
             }
-            if changed { try await persistence.writeDataAtomicDurable(Data(output.utf8), to: transcript) }
+            if changed { try ContactThread.replace(Data(output.utf8), to: transcript) }
             return changed
         }
         if changed { NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: transcript.deletingPathExtension().lastPathComponent) }

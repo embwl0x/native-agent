@@ -1,4 +1,5 @@
 import Observation
+// Blueprint: | `ChatStreamingTailBox.swift` | `ChatStreamingTailBox` class |
 
 @MainActor
 @Observable

@@ -4,7 +4,6 @@ import Foundation
 import ApprovalTransactions
 import AttentionRouting
 import Agents
-import ChatOrchestration
 import Cognition
 import CognitiveSubstrate
 import MacIntegration
@@ -23,6 +22,7 @@ import MacControl
 import ApprovalInbox
 import WorkshopExecution
 import Browser
+// Blueprint: | `AppToolPlatform.swift` | AppToolExecutor platform bindings: browser, notification, workshop decisions and away sensing; chat.post receives the engine's existing background speech client |
 
 extension AppToolExecutor {
     /// Read the last report, or explicitly run checks (false) or repair (true).
@@ -69,6 +69,7 @@ extension AppToolExecutor {
             humanConversationReplyHandler: humanConversationReplyHandler ?? { input in
                 try await NativeAgentEngine.live.agents.humanReplies.reply(input: input)
             },
+            proactiveSpeechClient: { NativeAgentEngine.forRoot($0).chatClient(profile: .background) },
             workshopStepDecider: { id, approve in
                 try await ApprovalTransactionCoordinator.app().decideBlockedWorkshopStep(
                     id: id, approve: approve, runner: { NativeAgentEngine.makeWorkshopExecutionRunner() })

@@ -11,20 +11,13 @@ import PersistenceCore
 import NativeAgentCore
 import MemoryV2
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
 import ToolExecution
-import PersonaEngine
-import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
 import Research
 import MultimodalTTS
 import TriggerScheduler
@@ -36,11 +29,11 @@ import TelegramBot
 import Dispatcher
 import MacControl
 import Onboarding
-import MacAssistantStatus
+import MacIntegration
 import WorkflowOrchestration
-import Skills
 import Connectors
 import Browser
+// Blueprint: | `AppModel+Refresh.swift` | `AppModel`: `setIfChanged`, `refreshAll`; Telegram form reads share `refreshTelegramSettingsDraft` with the direct refresh |
 
 @MainActor
 extension AppModel {
@@ -85,28 +78,6 @@ extension AppModel {
             }
         }
 
-        let persona = personaEngine
-        let selfImprovement = SwiftNativeSelfImprovement(dataRoot: engine.dataRoot)
-        let telegramReadID = UUID()
-        telegramSettingsReadID = telegramReadID
-        let telegramBefore = telegramSettingsDraftSnapshot
-        let telegramBaseline = telegramSettingsDraftBaseline
-        func applyTelegramDraft(
-            _ saved: TelegramSettingsDraftSnapshot,
-            before: TelegramSettingsDraftSnapshot,
-            baseline: TelegramSettingsDraftSnapshot?
-        ) {
-            guard !Task.isCancelled, telegramSettingsReadID == telegramReadID else { return }
-            func mayUpdate<T: Equatable>(_ key: KeyPath<TelegramSettingsDraftSnapshot, T>) -> Bool {
-                telegramSettingsDraftSnapshot[keyPath: key] == before[keyPath: key]
-                    && (baseline.map { before[keyPath: key] == $0[keyPath: key] } ?? true)
-            }
-            if mayUpdate(\.enabled) { telegramEnabled = saved.enabled }
-            if mayUpdate(\.chats) { telegramAllowedChats = saved.chats }
-            if mayUpdate(\.users) { telegramAllowedUsers = saved.users }
-            if mayUpdate(\.requireMention) { telegramRequireMention = saved.requireMention }
-            telegramSettingsDraftBaseline = saved
-        }
         // Start a fresh, complete failure set for this pass. Individual lanes
         // append their detail through `recordRefreshFailure`; a successful
         // empty result remains a real empty projection rather than looking
@@ -114,270 +85,75 @@ extension AppModel {
         refreshAllFailureDetails.removeAll(keepingCapacity: true)
         isRecordingRefreshAllFailures = true
         setIfChanged(\.lastRefreshError, nil)
-        // Render-cost audit F11 — batching.
-        //
-        // Every `await` between two assignments lands them in *different*
-        // MainActor turns, which SwiftUI cannot coalesce: 73 sequential writes
-        // meant up to 73 render passes rippling through the observing views.
-        // Each block below now fetches its whole group into locals and then
-        // applies the group with no `await` in between, so the group collapses
-        // into a single MainActor turn / single render pass — and with
-        // `setIfChanged` an unchanged group produces no write at all.
-        //
-        // The grouping deliberately follows the sections that already existed
-        // here rather than collapsing the whole function into one trailing
-        // hop. A single end-of-function batch would defer *every* visible
-        // update until the last fetch returned: it would erase the interim
-        // "Swift runtime unavailable" message below, blank the whole UI for
-        // the duration of a cold refresh, and widen the window in which a
-        // concurrent user mutation gets clobbered by an older fetched value
-        // from ~one section to the entire pass. Those are timing-visible
-        // regressions; per-section batching gets the coalescing without them.
-        setIfChanged(\.engine.doctor.health, engine.doctor.readHealth())
+        // Each engine facade owns its retained reads and their availability.
+        // App-only fields below are published together after their reads.
+        await engine.doctor.refreshHealth()
 
-        let fetchedRuns = await refreshPreserving("getRuns", current: runs) { await RuntimeReadProjection.runs(dataRoot: engine.dataRoot) ?? [] }
-        let fetchedActivity = await refreshPreserving("getActivity", current: activityEvents) { try await RuntimeReadProjection.getActivity(root: engine.dataRoot) }
-        let fetchedMemories = await refreshPreserving("getMemories", current: engine.memory.memories) {
-            try await engine.memory.activeMemories()
+        _ = await decodeLogged("getRuns") { try await engine.runs.refresh(dataRoot: engine.dataRoot) }
+        _ = await decodeLogged("getActivity") { try await engine.doctor.refreshActivity() }
+        _ = await refreshPreserving("getMemories", current: engine.memory.memories) {
+            try await engine.memory.refreshMemories()
         }
-        let fetchedPersonality = await refreshPreserving("getPersonality", current: personality) { try await SwiftNativePersonaEngine.readPersonality(dataRoot: engine.dataRoot) }
-        let fetchedPersonalityDocs = await decodeLogged("getPersonalityDocs", { try await persona.listPersonaDocSpecs() })
-        let fetchedSkills = await refreshPreserving("getSkills", current: skills) { try await RuntimeReadProjection.skills(dataRoot: engine.dataRoot) }
-        let fetchedTools = await refreshPreserving("getTools", current: engine.tools.authored) { try await engine.tools.listAuthored() }
-        let fetchedCapabilitySummary = await refreshPreserving("getCapabilities", current: engine.trust.capabilitySummary) { try await engine.trust.loadCapabilities() }
-        let fetchedWorkflows = await refreshPreserving("getWorkflows", current: workflows) { try await SwiftNativeWorkflowOrchestrationClient(root: engine.dataRoot).listWorkflowRecords() }
-        let fetchedApprovals = await refreshPreserving("getApprovals", current: engine.approvals.records) { try await engine.approvals.list() }
-        // An unavailable inbox read is not an honest empty inbox. Keep the
-        // last model snapshot on failure so InboxView receives `[]` only when
-        // the real reader actually reported no cards.
-        let fetchedInboxItems = await refreshPreserving("getInboxItems", current: engine.inbox.items) { try await engine.inbox.list() }
-        let fetchedMCPServers = await refreshPreserving("getMCPServers", current: mcpServers) { try await engine.tools.mcp.listServers() }
-        let fetchedMCPSessions = await refreshPreserving("getMCPSessions", current: engine.tools.mcpSessions) { try await engine.tools.listMCPSessions() }
-        // No `await` from here to the end of the block: one MainActor turn.
-        setIfChanged(\.runs, fetchedRuns)
-        setIfChanged(\.activityEvents, fetchedActivity)
-        if engine.memory.memories != fetchedMemories { engine.memory.memories = fetchedMemories }
-        setIfChanged(\.personality, fetchedPersonality)
-        if let docsResponse = fetchedPersonalityDocs {
-            setIfChanged(\.personalityDocs, docsResponse.docs)
+        let previousName = engine.persona.profile?.name
+        if let profile = await decodeLogged("getPersonality", { try await engine.persona.loadProfile() }), profile.name != previousName {
+            NativeAgentShortcuts.updateAppShortcutParameters()
         }
-        setIfChanged(\.skills, fetchedSkills)
-        setIfChanged(\.engine.tools.authored, fetchedTools)
-        setIfChanged(\.engine.trust.capabilitySummary, fetchedCapabilitySummary)
-        setIfChanged(\.workflows, fetchedWorkflows)
-        if engine.approvals.records != fetchedApprovals { engine.approvals.records = fetchedApprovals }
-        if engine.inbox.items != fetchedInboxItems { engine.inbox.items = fetchedInboxItems }
-        setIfChanged(\.mcpServers, fetchedMCPServers)
-        setIfChanged(\.engine.tools.mcpSessions, fetchedMCPSessions)
-        // gpt-5.5 review-2 race-safety: late-arrival guard for tools/
-        // resources here too. refreshAll is invoked by long-lived polling
-        // and by post-mutation refreshes — both can interleave with a user
-        // tapping a different server mid-flight. Clear on invalid-selection,
-        // capture pendingId, guard on still-selected before adopting.
-        let previousSelection = selectedMCPServerId
-        if selectedMCPServerId == nil || !mcpServers.contains(where: { $0.id == selectedMCPServerId }) {
-            setIfChanged(\.selectedMCPServerId, mcpServers.first?.id)
+        _ = await decodeLogged("getPersonalityDocs", { try await engine.persona.loadDocuments() })
+        _ = await decodeLogged("getSkills") { try await engine.tools.refreshSkills() }
+        _ = await decodeLogged("getTools") { try await engine.tools.listAuthored() }
+        for failure in await engine.trust.refreshCapabilityCatalog() { recordRefreshFailure(failure.label, error: failure.error) }
+        _ = await decodeLogged("getWorkflows") { try await engine.desk.refreshWorkflows() }
+        _ = await decodeLogged("getApprovals") { try await engine.approvals.list() }
+        _ = await decodeLogged("getInboxItems") { try await engine.inbox.list() }
+        await engine.desk.refreshResearchRuns()
+        await engine.turns.refreshCapabilityTraces()
+        await engine.memory.loadGraph()
+        _ = await decodeLogged("nextgen snapshot") { try await engine.nextGen.snapshot() }
+        for failure in await engine.tools.refreshNativePower() { recordRefreshFailure(failure.label, error: failure.error) }
+        for failure in await engine.memory.refreshStatuses() { recordRefreshFailure(failure.label, error: failure.error) }
+        _ = await decodeLogged("getConnectorActions") { try await engine.connectors.refreshActions() }
+        for failure in await engine.doctor.refreshHardening() { recordRefreshFailure(failure.label, error: failure.error) }
+        _ = await decodeLogged("getTrustPolicy") { try await engine.trust.load() }
+        _ = await refreshPreserving("getBackups", current: engine.trust.backups) { try await engine.trust.refreshBackups() }
+        _ = await decodeLogged("getConnectors") { try await engine.connectors.refresh().get() }
+        _ = await decodeLogged("getWorkspaces") { try await engine.connectors.refreshWorkspaces() }
+        _ = await decodeLogged("getWatchdog") { await engine.doctor.refreshWatchdog(manager: backgroundLoopsManager) }
+        _ = await engine.desk.refreshJobs()
+        if let detail = engine.desk.jobsFeedState?.failureDetail {
+            recordRefreshFailure("getJobs", error: RuntimeReadError.unreadableFeed(detail))
         }
-        if selectedMCPServerId != previousSelection {
-            setIfChanged(\.mcpTools, [])
-            setIfChanged(\.mcpToolReadState, .notLoaded)
-            setIfChanged(\.mcpResources, [])
-            setIfChanged(\.mcpResourceReadState, .notLoaded)
-        }
-        if mcpServers.isEmpty {
-            setIfChanged(\.mcpTools, [])
-            setIfChanged(\.mcpToolReadState, .notLoaded)
-            setIfChanged(\.mcpResources, [])
-            setIfChanged(\.mcpResourceReadState, .notLoaded)
-        }
-        if let server = selectedMCPServer {
-            let pendingId = server.id
-            setIfChanged(\.mcpToolReadState, .loading)
-            let fetchedTools: [MCPTool]?
-            do {
-                fetchedTools = try await MCPUIActions.listTools(serverId: pendingId, dispatcher: engine.tools.mcp)
-            } catch {
-                fetchedTools = nil
-                if selectedMCPServerId == pendingId {
-                    setIfChanged(\.mcpToolReadState, .unavailable(UserFacingError.cause(error, action: "read the MCP tools")))
-                }
-            }
-            if selectedMCPServerId == pendingId {
-                setIfChanged(\.mcpResourceReadState, .loading)
-            }
-            let fetchedResources: [MCPResource]?
-            do {
-                fetchedResources = try await MCPUIActions.listResources(serverId: pendingId, dispatcher: engine.tools.mcp)
-            } catch {
-                fetchedResources = nil
-                if selectedMCPServerId == pendingId {
-                    setIfChanged(\.mcpResourceReadState, .unavailable(UserFacingError.cause(error, action: "read the MCP resources")))
-                }
-            }
-            if selectedMCPServerId == pendingId {
-                if let t = fetchedTools {
-                    setIfChanged(\.mcpTools, t)
-                    setIfChanged(\.mcpToolReadState, .current)
-                }
-                if let r = fetchedResources {
-                    setIfChanged(\.mcpResources, r)
-                    setIfChanged(\.mcpResourceReadState, .current)
-                }
-            }
-        }
-        refreshMCPHubRecentCall()
-
-        let fetchedResearchLabRuns = await refreshPreserving("getResearchLabRuns", current: engine.desk.researchRuns) { try await engine.desk.listResearchRuns() }
-        let fetchedTraceTimeline = await CapabilityTraceFeed.read(dataRoot: engine.dataRoot)
-        // One graph snapshot feeds all three, so they never mix generations.
-        let graphView: Result<KnowledgeGraphViewRead, Error>
-        do { graphView = .success(try await engine.memory.graphView()) } catch { graphView = .failure(error) }
-        let fetchedAgentGraph = await decodeLogged("getAgentGraph") { try graphView.get().agentGraph }
-        let fetchedGraphEntities = await refreshPreserving("getGraphEntities", current: graphEntities) { try graphView.get().entities }
-        let fetchedGraphStatus = await decodeLogged("getGraphStatus") { try graphView.get().status }
-        let fetchedAutonomyKernel = await decodeLogged("getAutonomyKernel") { try await RuntimeReadProjection.getAutonomyKernel(dataRoot: engine.dataRoot) }
-        let fetchedPersonalOS = await decodeLogged("getPersonalOS") { try await RuntimeReadProjection.getPersonalOS(dataRoot: engine.dataRoot) }
-        let fetchedCapabilityCatalog = await refreshPreserving("getCapabilityCatalog", current: capabilityCatalog) { try await engine.trust.catalog() }
-        let fetchedCapabilityCatalogSources = await refreshPreserving("getCapabilityCatalogSources", current: capabilityCatalogSources) { try await engine.trust.catalogSources() }
-        // A receipt-read failure is not an empty installed-pack list. Keep the
-        // last confirmed snapshot and let decodeLogged retain the failure for
-        // the visible refresh status; only a successful read may clear this
-        // collection to the legitimate bootstrap/empty state.
-        let fetchedCapabilityPackInstalls = await decodeLogged("getCapabilityPackInstalls") { try await engine.trust.packInstalls() }
-        let fetchedCapabilityTrust = await decodeLogged("getCapabilityTrust") { try await engine.trust.loadCapabilityNetwork() }
-        let fetchedNextGenPhases = await refreshPreserving("getNextGenPhases", current: nextGenPhases) { try await NextGenStatusProjection(dataRoot: engine.dataRoot).getNextGenPhases() }
-        let fetchedPersonalityGrowth = await decodeLogged("getPersonalityGrowth") { try await RuntimeReadProjection.swiftPersonalityGrowth(runtime: NativeAgentEngine.liveCognition) }
-        let fetchedNativeActions = await refreshPreserving("getNativeActionRegistry", current: nativeActions) { NativeActionRoutes.swiftNativeActionRecords() }
-        let fetchedNativeActionReceipts = await refreshPreserving("getNativeActionReceipts", current: nativeActionReceipts) { await RuntimeReadProjection.tailJSONL(path: NativeActionRoutes.nativeActionReceiptsPath(dataRoot: engine.dataRoot), limit: 50) }
-        let fetchedNotificationStatus = await decodeLogged("getNotificationStatus") { try await RuntimeReadProjection.getNotificationStatus(dataRoot: engine.dataRoot) }
-        let fetchedBrowserRuntimeStatus = await decodeLogged("getBrowserStatus") { try await RuntimeReadProjection.getBrowserStatus(dataRoot: engine.dataRoot) }
-        let fetchedMemoryVectorStatus = await decodeLogged("getMemoryVectorStatus") { try await MemoryStatusProjection.getMemoryVectorStatus(dataRoot: engine.dataRoot) }
-        let fetchedMemoryV2Status = await decodeLogged("getMemoryV2Status") { try await MemoryStatusProjection.getMemoryV2Status(dataRoot: engine.dataRoot) }
-        let fetchedConnectorActionRegistry = await decodeLogged("getConnectorActions") { try await ConnectorActionRegistry.read(dataRoot: engine.dataRoot, platform: AppConnectorStatusPlatform()) }
-        let fetchedImprovementGauntletStatus = await decodeLogged("getImprovementGauntlet") { try await RuntimeReadProjection.swiftImprovementGauntlet(dataRoot: engine.dataRoot) }
-        let fetchedProductionHardening = await decodeLogged("getProductionHardening") { try await DoctorStatusProjection.getProductionHardening(dataRoot: engine.dataRoot) }
-        let fetchedProductionExports = await refreshPreserving("getProductionExports", current: productionExports) { try await ProductionExport.list(dataRoot: engine.dataRoot) }
-        let fetchedTrustPolicy = await decodeLogged("getTrustPolicy") { try await engine.trust.load() }
-        let fetchedBackups = await refreshPreserving("getBackups", current: engine.trust.backups) { try await engine.trust.listBackups() }
-        let fetchedConnectors = await refreshPreserving("getConnectors", current: connectors) { try await ConnectorStatusProjection.readConnectorRecords(root: engine.dataRoot, platform: AppConnectorStatusPlatform()) }
-        let fetchedWorkspaces = await refreshPreserving("getWorkspaces", current: workspaces) { try await ConnectorRegistryActions.listWorkspaces(root: engine.dataRoot) }
-        let fetchedEvals = await refreshPreserving("getEvals", current: evals) { try await selfImprovement.evals() }
-        let fetchedWatchdogStatus = await decodeLogged("getWatchdog") { await engine.doctor.readWatchdog(manager: backgroundLoopsManager) }
-        let fetchedJobs = await refreshPreserving("getJobs", current: engine.desk.jobs) { try await engine.desk.listJobs() }
-        let fetchedTelegramStatus = await decodeLogged("getTelegramStatus") { try await engine.telegram.load(manager: backgroundLoopsManager) }
-        // No `await` from here to the end of the block: one MainActor turn.
-        setIfChanged(\.engine.desk.researchRuns, fetchedResearchLabRuns)
-        setIfChanged(\.capabilityTraceTimeline, fetchedTraceTimeline)
-        setIfChanged(\.traces, fetchedTraceTimeline.traces)
-        setIfChanged(\.agentGraph, fetchedAgentGraph)
-        setIfChanged(\.graphEntities, fetchedGraphEntities)
-        setIfChanged(\.graphStatus, fetchedGraphStatus)
-        setIfChanged(\.autonomyKernel, fetchedAutonomyKernel)
-        setIfChanged(\.personalOS, fetchedPersonalOS)
-        setIfChanged(\.capabilityCatalog, fetchedCapabilityCatalog)
-        setIfChanged(\.capabilityCatalogSources, fetchedCapabilityCatalogSources)
-        if let fetchedCapabilityPackInstalls {
-            setIfChanged(\.capabilityPackInstalls, fetchedCapabilityPackInstalls)
-        }
-        setIfChanged(\.engine.trust.capabilityNetwork, fetchedCapabilityTrust)
-        // DAEMON-KILL refreshAll: /v1/nextgen/summary + /v1/nextgen/receipts retired.
-        // nextGenPhases reads <dataRoot>/runtime/nextgen_phases.json natively; keep it.
-        setIfChanged(\.nextGenSummary, nil)
-        setIfChanged(\.nextGenPhases, fetchedNextGenPhases)
-        setIfChanged(\.nextGenReceipts, [])
-        setIfChanged(\.personalityGrowth, fetchedPersonalityGrowth)
-        // DAEMON-KILL refreshAll: /v1/native-actions retired; the Swift
-        // registry below exposes only dispatcher actions that have live native
-        // handlers wired through this app.
-        setIfChanged(\.nativeActions, fetchedNativeActions)
-        setIfChanged(\.nativeActionReceipts, fetchedNativeActionReceipts)
-        setIfChanged(\.notificationStatus, fetchedNotificationStatus)
-        setIfChanged(\.browserRuntimeStatus, fetchedBrowserRuntimeStatus)
-        setIfChanged(\.memoryVectorStatus, fetchedMemoryVectorStatus)
-        setIfChanged(\.memoryV2Status, fetchedMemoryV2Status)
-        setIfChanged(\.connectorActionRegistry, fetchedConnectorActionRegistry)
-        setIfChanged(\.improvementGauntletStatus, fetchedImprovementGauntletStatus)
-        setIfChanged(\.productionHardening, fetchedProductionHardening)
-        setIfChanged(\.productionExports, fetchedProductionExports)
-        // NOT gated: `engine.trust.policy` has a `didSet` that re-syncs `chatFileAccess`
-        // from the policy (AppModel.swift:370-378). Skipping the write on an
-        // unchanged policy would also skip that re-sync, so a `chatFileAccess`
-        // changed elsewhere would stop being snapped back to the policy value.
-        // That is a security-adjacent behavior change, not a render saving.
-        engine.trust.policy = fetchedTrustPolicy
-        setIfChanged(\.engine.trust.backups, fetchedBackups)
-        // DAEMON-DEAD PORT: read the Swift-owned connector registry directly;
-        // leaving this empty makes the Connectors tab race broad refreshes.
-        setIfChanged(\.connectors, fetchedConnectors)
-        setIfChanged(\.workspaces, fetchedWorkspaces)
-        setIfChanged(\.evals, fetchedEvals)
-        setIfChanged(\.engine.doctor.watchdog, fetchedWatchdogStatus)
-        setIfChanged(\.engine.desk.jobs, fetchedJobs)
-        setIfChanged(\.engine.telegram.status, fetchedTelegramStatus)
+        await refreshTelegramSettingsDraft({
+        await decodeLogged("getTelegramStatus") { try await engine.telegram.refresh(manager: backgroundLoopsManager) }
+        }, snapshot: { status in
+            guard let st = status else { return nil }
+            return TelegramSettingsDraftSnapshot(
+                enabled: st.enabled, chats: st.allowedChatIds.joined(separator: ","),
+                users: st.allowedUserIds.joined(separator: ","), requireMention: st.requireMention
+            )
+        }, publish: { fetchedTelegramStatus in
         if fetchedTelegramStatus != nil {
             telegramStatusRefreshError = nil
         }
-        if let st = fetchedTelegramStatus {
-            // Swift-native cutover: drive the UI vars straight from the native status
-            // so the Bot-token-configured badge + allowed list don't depend on
-            // the legacy config.json[telegram] overlay path decoding cleanly.
-            setIfChanged(\.telegramTokenConfigured, st.tokenConfigured)
-            applyTelegramDraft(TelegramSettingsDraftSnapshot(
-                enabled: st.enabled, chats: st.allowedChatIds.joined(separator: ","),
-                users: st.allowedUserIds.joined(separator: ","), requireMention: st.requireMention
-            ), before: telegramBefore, baseline: telegramBaseline)
-        }
-        setIfChanged(\.engine.providers.catalog, await decodeLogged("getModelCatalog") { try await engine.providers.modelCatalog(refresh: false) })
+        })
         // PATCH-2026-05-07: chat-provider-picker Populate providers list at
         // app startup so the chat brain bar's Provider dropdown isn't
         // empty on first render. The bar's own .task also calls this, but
         // that doesn't help when the chat surface mounts before the
         // providers fetch completes.
         await loadProvidersForChat()
-        await reloadChatState()
-        let fetchedCompiledPersonality = await decodeLogged("getCompiledPersonality") { try await PersonaCompiler(engine: persona).compiledPacket(surface: "chat") }
-        let telegramBeforeConfig = telegramSettingsDraftSnapshot
-        let telegramBaselineConfig = telegramSettingsDraftBaseline
-        let fetchedConfig = await decodeLogged("getConfig", { try await RuntimeReadProjection.configuration(dataRoot: engine.dataRoot) })
-        // Apply the fetched UI state in one MainActor turn before publishing the widget.
-        setIfChanged(\.compiledPersonality, fetchedCompiledPersonality)
-        if let config = fetchedConfig {
-            setIfChanged(\.engine.providers.codexAuth, config.codexAuth)
-            applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
-            if let telegram = config.telegram {
-                setIfChanged(\.telegramTokenConfigured, telegram.tokenConfigured)
-                applyTelegramDraft(TelegramSettingsDraftSnapshot(
-                    enabled: telegram.enabled, chats: telegram.allowedChatIds.joined(separator: ","),
-                    users: telegram.allowedUserIds.joined(separator: ","), requireMention: telegram.requireMention
-                ), before: telegramBeforeConfig, baseline: telegramBaselineConfig)
-                telegramModel = telegram.model ?? telegramModel
-                telegramReasoningEffort = telegram.reasoningEffort ?? telegramReasoningEffort
-            }
-            do {
-                let routing = config.modelRouting
-                // PATCH-2026-05-07: model-autosave Don't clobber the user's
-                // picker selection on every refresh. The picker auto-saves
-                // to daemon now (onChange → saveChatBrainDefaults), so the
-                // saved config follows the picker — not the other way
-                // around. Only seed chatModel from saved config if the
-                // user hasn't picked anything yet (still on the initial
-                // UserDefaults primary-model default).
-                let neverPicked = UserDefaults.standard.string(forKey: "chatModel") == nil
-                // Not gated: these are the `didSet`-persisted fields whose own
-                // `neverPicked` latch reads the UserDefaults key the `didSet`
-                // writes. Gating them would leave the latch permanently unset.
-                if neverPicked {
-                    chatModel = routing.current.chat.model
-                    chatReasoningEffort = routing.current.chat.reasoningEffort
-                    chatFastMode = routing.current.chat.serviceTier == "priority"
-                }
-                let neverPickedTg = UserDefaults.standard.string(forKey: "telegramModel") == nil
-                if neverPickedTg {
-                    telegramModel = routing.current.telegram.model
-                    telegramReasoningEffort = routing.current.telegram.reasoningEffort
-                }
-            }
+        if let detail = engine.providers.settings?.catalogError {
+            recordRefreshFailure("getModelCatalog", error: RuntimeReadError.unreadableFeed(detail))
         }
+        await reloadChatState()
+        await refreshTelegramSettingsDraft({
+        await decodeLogged("getConfig", { try await RuntimeReadProjection.configuration(engine: engine) })
+        }, snapshot: { config in
+            guard let telegram = config?.telegram else { return nil }
+            return TelegramSettingsDraftSnapshot(
+                enabled: telegram.enabled, chats: telegram.allowedChatIds.joined(separator: ","),
+                users: telegram.allowedUserIds.joined(separator: ","), requireMention: telegram.requireMention
+            )
+        })
         setIfChanged(\.statusText, engine.doctor.health?.ok == true ? "I'm online" : "I'm unavailable")
         await publishWorkStatus()
     }

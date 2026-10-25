@@ -5,6 +5,8 @@ import PersistenceCore
 import PersonaEngine
 import AgentConversations
 
+// Blueprint: | `HarnessDecidedRow.swift` | `HarnessDecidedRow`: rolling per-requester/tool decision visibility without push; info writes stay off the tool gate's path |
+
 /// User 10-01: Agent is the boss. Where the harness used to card the person for
 /// a peer's, a helper's or a driven agent's step and now lets her decide, it
 /// leaves one rolling info row per requester and tool (no push) so he can see

@@ -1,8 +1,10 @@
 // Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
 
 import Foundation
+import MemoryV2
 import ApprovalInbox
-import ChatOrchestration
+import AuthoredCapabilities
+import ChatTurnRuntime
 import CognitiveSubstrate
 import Context
 import ContextFlow
@@ -12,13 +14,16 @@ import PersistenceCore
 import ProviderRouting
 import TurnTrace
 
+// Blueprint: | `NativeCognitionRuntime+Organism.swift` | `NativeCognitionRuntime` organism integration: approval lifecycle expectations, somatic ingestion, felt resolutions and live body projections |
+
 extension NativeCognitionRuntime {
     func startApprovalLifecycleObservationIfNeeded() async {
         guard !isFlushedForTermination, approvalLifecycleObservationTask == nil else { return }
         let stream = await ApprovalLifecycleBus.shared.events()
         guard !isFlushedForTermination, approvalLifecycleObservationTask == nil else { return }
         approvalLifecycleObservationTask = Task { [weak self] in
-            for await event in stream {
+            // Approval expectations follow the request and the person's decision.
+            for await event in stream where event.phase == .requested || event.phase == .resolved {
                 guard !Task.isCancelled else { return }
                 await self?.ingestApprovalLifecycleEvent(event)
             }
@@ -291,6 +296,8 @@ extension NativeCognitionRuntime {
     ) async {
         let kind = signal.kind
         await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignalAdapter.movesFeelings(kind))
+        // A committed diary is a new Reach source even after a clean scan.
+        if kind == .dreamCompleted { sourceWakes.reachDirty = true }
         await drainFeltResolutionsIntoSubstrate()
         cachedBodyRead = nil
         if persistSynchronously {
@@ -355,6 +362,7 @@ extension NativeCognitionRuntime {
         let phoneDelivery = await organismKernel.latestPrediction(ofKind: .phoneDelivery)
         let liveRead = await Self.makeOrganismBodyRead(
             dataRoot: dataRoot,
+            mobileConfigured: (try? await host.phoneNotificationTargetCount(dataRoot: dataRoot)).map { $0 > 0 } == true,
             phoneDeliveryPrediction: phoneDelivery
         )
         await organismKernel.refreshBodySchema(liveRead, integratesChemistry: false)
@@ -381,17 +389,16 @@ extension NativeCognitionRuntime {
         return await organismKernel.behaviorPosture()
     }
 
-    /// Reset only commits after the new empty baseline is durable. The old
-    /// state remains both on disk and in memory when the writer refuses.
+    /// A failed reset restores its baseline only while it still owns the
+    /// kernel revision. Newer events survive a partial persistence failure.
     public func resetOrganismContinuityChecked() async -> OrganismContinuityApplyOutcome {
-        guard let before = await organismKernel.exportPersistentState() else {
+        guard let mutation = await organismKernel.beginContinuityMutation(reset: true) else {
             return OrganismContinuityApplyOutcome(
                 status: .organismDisabled,
                 snapshot: await organismKernel.snapshot(),
                 error: "The organism kernel is disabled."
             )
         }
-        await organismKernel.clearTransientState()
         // Reset Body clears the chemistry the caring lane doses, so the lane
         // clears with it (review item 4): the context ring, the per-turn ledger,
         // the recent encounters, and every verdict still in flight. A verdict
@@ -404,11 +411,13 @@ extension NativeCognitionRuntime {
         organismRestoreFailedHard = false
         guard await persistOrganismContinuity(reason: "reset") else {
             organismRestoreFailedHard = wasRestoreFrozen
-            await organismKernel.restorePersistentState(before)
+            let restored = await organismKernel.rollbackContinuityMutation(mutation)
             return OrganismContinuityApplyOutcome(
                 status: .persistenceFailed,
                 snapshot: await organismKernel.snapshot(),
-                error: "The reset was not saved; the previous organism state was restored."
+                error: restored
+                    ? "The reset was not saved; the previous organism state was restored."
+                    : "The reset was not saved completely; newer organism events were preserved."
             )
         }
         lastInjectedBodyLine = nil
@@ -419,23 +428,23 @@ extension NativeCognitionRuntime {
         return OrganismContinuityApplyOutcome(status: .applied, snapshot: snapshot, error: nil)
     }
 
-    /// Settle is likewise a checked durable mutation. A failed writer restores
-    /// the pre-settle state instead of leaving the screen to imply success.
+    /// Settle has the same revision-owned rollback as reset.
     public func settleOrganismContinuityChecked() async -> OrganismContinuityApplyOutcome {
-        guard let before = await organismKernel.exportPersistentState() else {
+        guard let mutation = await organismKernel.beginContinuityMutation(reset: false) else {
             return OrganismContinuityApplyOutcome(
                 status: .organismDisabled,
                 snapshot: await organismKernel.snapshot(),
                 error: "The organism kernel is disabled."
             )
         }
-        await organismKernel.settleContinuity()
         guard await persistOrganismContinuity(reason: "settle") else {
-            await organismKernel.restorePersistentState(before)
+            let restored = await organismKernel.rollbackContinuityMutation(mutation)
             return OrganismContinuityApplyOutcome(
                 status: .persistenceFailed,
                 snapshot: await organismKernel.snapshot(),
-                error: "The settle was not saved; the previous organism state was restored."
+                error: restored
+                    ? "The settle was not saved; the previous organism state was restored."
+                    : "The settle was not saved completely; newer organism events were preserved."
             )
         }
         let snapshot = await organismKernel.snapshot()
@@ -454,14 +463,14 @@ extension NativeCognitionRuntime {
     /// An absent file or window degrades to zone-only, and the curve falls back
     /// to its shipped 4 AM trough.
     ///
-    /// Behind the kernel's own five-minute staleness gate, so a preference that
-    /// changes roughly never is not re-read on every tool result.
-    private func refreshOrganismDiurnalClockIfStale(at fixedAt: Date) async {
-        guard await organismKernel.diurnalClockIsStale(at: fixedAt) else { return }
+    /// The runtime registers the preference/clock invalidation before the first
+    /// read. Unchanged preferences are never resampled on a body-read cadence.
+    private func refreshOrganismDiurnalClockIfInvalidated(at fixedAt: Date) async {
+        guard !isFlushedForTermination, sourceWakes.clockDirty else { return }
+        sourceWakes.clockDirty = false
         let window = TurnQuietHoursWindow.read(dataRoot: dataRoot)
         await organismKernel.configureDiurnalClock(
             OrganismDiurnalClock(
-                timeZoneIdentifier: TimeZone.current.identifier,
                 quietStartHour: window?.startHour,
                 quietEndHour: window?.endHour
             ),
@@ -484,18 +493,18 @@ extension NativeCognitionRuntime {
         // The frozen per-turn read (`refreshBodySchemaAndFrozenRead`) enters
         // here too, so the clock is fresh for the capsule as well as for the
         // background refresh above.
-        await refreshOrganismDiurnalClockIfStale(at: fixedAt)
-        // Item 6's external lane rides the same cadence. Its own staleness gate
-        // is a clock read, and the Desk load it may start is DETACHED — this
-        // await never waits on disk (see `+Rumination`).
-        await refreshDeskRuminationsIfStale(at: fixedAt)
+        await refreshOrganismDiurnalClockIfInvalidated(at: fixedAt)
         var liveRead: OrganismBodyRead
+        // This composite host/transport gauge has no complete push owner. Keep
+        // its two-second sampled cache; source-owned preferences/ruminations
+        // above no longer rescan on this cadence.
         if let cached = cachedBodyRead, fixedAt.timeIntervalSince(cached.at) < 2.0 {
             liveRead = cached.read
         } else {
             let phoneDelivery = await organismKernel.latestPrediction(ofKind: .phoneDelivery)
             liveRead = await Self.makeOrganismBodyRead(
                 dataRoot: dataRoot,
+                mobileConfigured: (try? await host.phoneNotificationTargetCount(dataRoot: dataRoot)).map { $0 > 0 } == true,
                 now: fixedAt,
                 phoneDeliveryPrediction: phoneDelivery
             )
@@ -710,16 +719,12 @@ extension NativeCognitionRuntime {
 
     nonisolated static func makeOrganismBodyRead(
         dataRoot: URL,
+        mobileConfigured: Bool,
         now: Date = Date(),
         phoneDeliveryPrediction: OrganismPrediction? = nil
     ) async -> OrganismBodyRead {
         let signedPeer = SignedPeerEvidenceStore.load(dataRoot: dataRoot)
         let mobileLastSeen = signedPeer?.contactAt
-        let mobileConfigured = hasReadableContent(
-            dataRoot.appendingPathComponent("mobile_push", isDirectory: true).appendingPathComponent("tokens.json")
-        ) || hasReadableContent(
-            dataRoot.appendingPathComponent("notifications", isDirectory: true).appendingPathComponent("push_tokens.json")
-        )
         let staleAfter: TimeInterval = 60 * 60 * 36
         let peerPresenceBelief = PeerPresenceBelief(
             generatedAt: now,
@@ -829,7 +834,6 @@ extension NativeCognitionRuntime {
             read.resourcePressureReading = ResourcePressureReading(
                 generatedAt: now,
                 thermalPressure: .critical,
-                lowPowerMode: false,
                 evidence: [BodyEvidenceReference(
                     id: "debug-resource-critical",
                     evidenceClass: .processThermalState,
@@ -970,8 +974,8 @@ extension NativeCognitionRuntime {
         let readableStores = storePaths.filter(hasReadableContent)
         let hygienePath = memoryRoot.appendingPathComponent("hygiene_last_run.json")
         let hygieneExists = FileManager.default.fileExists(atPath: hygienePath.path)
-        let hygieneObject = jsonObject(at: hygienePath) as? [String: Any]
-        let status = (hygieneObject?["status"] as? String)?
+        let hygiene = MemoryStatusProjection.readHygieneLastRun(dataRoot: dataRoot)
+        let status = hygiene?.status?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let successfulStatuses = ["ok", "complete", "completed", "success", "succeeded"]
@@ -980,7 +984,7 @@ extension NativeCognitionRuntime {
             guard let status else { return hygieneExists ? false : nil }
             if successfulStatuses.contains(status) { return true }
             guard status == "staged",
-                  let runId = (hygieneObject?["consolidationRunId"] as? String)?
+                  let runId = hygiene?.consolidationRunId?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
                   !runId.isEmpty
             else { return false }
@@ -1062,16 +1066,11 @@ extension NativeCognitionRuntime {
         dataRoot: URL,
         now: Date
     ) async -> ToolCapabilityReading {
-        let configuredPaths = [
-            dataRoot.appendingPathComponent("mcp", isDirectory: true).appendingPathComponent("servers.json"),
-            dataRoot.appendingPathComponent("mcp", isDirectory: true)
-                .appendingPathComponent("cache", isDirectory: true)
-                .appendingPathComponent("tools.json"),
-        ]
-        let activePath = dataRoot.appendingPathComponent("tools", isDirectory: true)
-            .appendingPathComponent("active", isDirectory: true)
-        let activeCatalogExists = FileManager.default.fileExists(atPath: activePath.path)
-        let configured = configuredPaths.contains(where: hasReadableContent) || activeCatalogExists
+        // Her hands are her abilities as they stand now: any one on means
+        // configured; a missing or stale run leaves them unproven, never unavailable.
+        let abilities = AbilityStore(dataRoot: dataRoot)
+        let configured = ((try? abilities.files(kind: .part, includeProposals: false)) ?? [])
+            .contains { $0.record?["status"] == .string("active") }
         let rows = try? await TurnTraceRecentReader(dataRootOverride: dataRoot)
             .traceEvidence(now: now, maximumReadBytes: 128 * 1_024).rows
         let liveReceipt = rows?.reversed().compactMap { row -> [String: JSONValue]? in
@@ -1085,19 +1084,11 @@ extension NativeCognitionRuntime {
         let live = liveReceiptAt.map {
             $0.timeIntervalSince(now) <= 5 && now.timeIntervalSince($0) <= 6 * 60 * 60
         } == true
-        var evidence = configuredPaths.compactMap { path -> BodyEvidenceReference? in
-            guard hasReadableContent(path), let date = modificationDate(path) else { return nil }
-            return BodyEvidenceReference(
-                id: "tool-config:\(path.lastPathComponent):\(date.timeIntervalSince1970)",
-                evidenceClass: .toolConfiguration,
-                observedAt: date,
-                receivedAt: date
-            )
-        }
-        if activeCatalogExists {
-            let date = modificationDate(activePath) ?? now
+        var evidence: [BodyEvidenceReference] = []
+        if configured {
+            let date = modificationDate(abilities.root) ?? now
             evidence.append(BodyEvidenceReference(
-                id: "tool-catalog:\(date.timeIntervalSince1970)",
+                id: "ability-catalog:\(date.timeIntervalSince1970)",
                 evidenceClass: .toolConfiguration,
                 observedAt: date,
                 receivedAt: date
@@ -1147,7 +1138,7 @@ extension NativeCognitionRuntime {
     }
 
     /// The only *process-global* sense in the body read: every other reading
-    /// above is derived from `dataRoot`. Sampling the host's thermal/low-power
+    /// above is derived from `dataRoot`. Sampling the host's thermal
     /// state under a non-default root breaks custom-root hermeticity — and it
     /// is not cosmetic, because `resourcePressure != .nominal` sets
     /// `resourceInhibited` in `OrganismResidualRepair.opportunity`, which nils
@@ -1174,21 +1165,14 @@ extension NativeCognitionRuntime {
         @unknown default:
             thermal = .elevated
         }
-        let lowPower = sensesHost && ProcessInfo.processInfo.isLowPowerModeEnabled
+        // Low Power Mode is not part of her body (User 10-24): it never changes what she does.
         return ResourcePressureReading(
             generatedAt: now,
             thermalPressure: thermal,
-            lowPowerMode: lowPower,
             evidence: [
                 BodyEvidenceReference(
                     id: "thermal:\(thermal.rawValue):\(now.timeIntervalSince1970)",
                     evidenceClass: .processThermalState,
-                    observedAt: now,
-                    receivedAt: now
-                ),
-                BodyEvidenceReference(
-                    id: "low-power:\(lowPower):\(now.timeIntervalSince1970)",
-                    evidenceClass: .lowPowerMode,
                     observedAt: now,
                     receivedAt: now
                 ),

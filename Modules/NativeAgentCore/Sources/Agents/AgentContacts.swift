@@ -1,6 +1,16 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import PersonaEngine
+import AgentWorkspace
+import AgentConversations
 import Cognition
+import StandingBots
+import ProviderRouting
+import PersistenceCore
+import NativeAgentCore
+import ChatTurnContracts
+// Blueprint: | `AgentContacts.swift` | Root-retained contact clients, tasks, reply handovers and desktop routes; helpers of this install reach the resident through the same contact runtime with their own sender and thread |
 
 /// The chat and tool clients an engine root builds for its agent contacts.
 public protocol AgentContactClients: Sendable {
@@ -25,6 +35,34 @@ public protocol AgentContactClients: Sendable {
 /// answers, and the continuation that brings a contact's reply, a bot's
 /// result or a delegate's stall back to the chat that asked.
 public final class AgentContacts: Sendable {
+    private let dataRoot: URL
+    private let clients: any AgentContactClients
+
+    package func helperDoor(for bot: BotDefinition) -> HelperContact.Door {
+        HelperContact.Door(name: PersonaCompiler.agentDisplayName(dataRoot: dataRoot), conversationID: ContactThread.session(owner: bot.sessionID)) { [self] text in
+            let owner = bot.sessionID
+            // One trust rule: a helper of this install carries the person's grant (PeerTrust).
+            let principal = AgentBridgePrincipal(id: owner, peerID: owner,
+                elevated: PeerTrust.ownerTrusts("peer:" + owner, dataRoot: dataRoot),
+                displayName: bot.name, localHelperID: bot.id)
+            let request = UUID().uuidString
+            let turn = AgentContactTurn(taskID: request, context: "mcp-" + owner,
+                requestID: request, principal: principal, parts: [.text(text)])
+            // A contact starts her own admitted turn, with none of the helper's identity or allowance.
+            return try await StandingBotContinuity.$currentBot.withValue(nil) {
+            try await HelperContact.$door.withValue(nil) {
+            try await ProviderTurnChoice.$current.withValue(nil) {
+            try await LLMCallContext.$turnTokenBudget.withValue(nil) {
+            try await ChatTurnExecution.$current.withValue(nil) {
+                let outcome = try await AgentContactRuntime.run(turn, client: clients.bridgeChatClient(), dataRoot: dataRoot, emit: { _ in })
+                return .object(["status": .string(outcome.state.rawValue),
+                    "reply": .string(outcome.parts.compactMap { if case .text(let text) = $0 { text } else { nil } }.joined(separator: "\n")),
+                    "parts": try JSONValue.fromEncodable(outcome.parts),
+                    "conversation_id": .string(principal.storedConversation(turn.context)),
+                    "detail": outcome.detail.map(JSONValue.string) ?? .null])
+            } } } } }
+        }
+    }
     public let tasks: AgentContactTasks
     public let desktop: DesktopAgentConversationRoute
     public let humanReplies: HumanConversationReplyService
@@ -44,6 +82,8 @@ public final class AgentContacts: Sendable {
     }
 
     public init(dataRoot: URL, clients: any AgentContactClients, completionSender: any AgentBridgeCompletionSending) {
+        self.dataRoot = dataRoot
+        self.clients = clients
         let dot = ChatGPTDotConversation(dataRoot: dataRoot, clients: clients)
         self.dot = dot
         ChatGPTDotIPCTransport.installConversation { root, peer, messages, sent, window in
@@ -88,7 +128,7 @@ public final class AgentContacts: Sendable {
         tasks = AgentContactTasks(dataRoot: dataRoot) { turn, emit in
             try await AgentContactRuntime.run(turn, client: clients.bridgeChatClient(), dataRoot: dataRoot, emit: emit)
         }
-        desktop = DesktopAgentConversationRoute(clients: clients)
+        desktop = DesktopAgentConversationRoute(clients: clients, dataRoot: dataRoot)
         humanReplies = HumanConversationReplyService(dataRoot: dataRoot, sender: completionSender) { id, expected, text, run in
             let client = clients.backgroundChatClient()
             try await client.appendHumanConversationReply(sessionID: id, expectedLastMessageID: expected,

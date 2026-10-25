@@ -5,8 +5,9 @@ import PersistenceCore
 import TrustPersistence
 import TrustCenter
 import ProviderRouting
-import ChatOrchestration
-import SelfImprovement
+import ChatSessionWork
+import PersonaEngine
+// Blueprint: | `RuntimeReadProjection.swift` | Autonomy delegates to TrustFacade's policy projection; unused personal-OS compiler read is deleted (Capabilities renders the published profile); `getSessionContext` requires the effective session provider |
 
 private struct SessionProviderUsageReceipt: Decodable {
     let model: String
@@ -32,6 +33,7 @@ public enum RuntimeReadProjection {
     public static func getSessionContext(
         sessionId: String,
         model: String? = nil,
+        providerID: String,
         dataRoot: URL,
         configuredThresholdTokens: Int?
     ) async throws -> SessionContextStatus {
@@ -63,7 +65,7 @@ public enum RuntimeReadProjection {
         let transcriptTokens = max(0, Int((Double(totalChars) / divisor).rounded()))
 
         // Her window (`effectiveWindowTokens`): 60% of the selected model's on
-        // the Chat route, capped by a Custom size; an injected size is Custom.
+        // this session's effective route, capped by a Custom size; an injected size is Custom.
         // The ring is of it, the same window the composer card reads, and she
         // compacts at it. A window no catalog row states is 0: unknown.
         var windowConfig = ChatSessionAutocompactionConfig.productionDefault()
@@ -71,8 +73,7 @@ public enum RuntimeReadProjection {
             windowConfig.thresholdTokens = configuredThresholdTokens
             windowConfig.contextWindowMode = .custom
         }
-        let route = await SwiftNativeProviderRouting(dataRoot: root).chatRouteProvider()
-        let budget = windowConfig.effectiveWindowTokens(forModel: resolvedModel, providerID: route, dataRoot: root) ?? 0
+        let budget = windowConfig.effectiveWindowTokens(forModel: resolvedModel, providerID: providerID, dataRoot: root) ?? 0
 
         let providerUsagePath = root
             .appendingPathComponent("chat", isDirectory: true)
@@ -103,7 +104,7 @@ public enum RuntimeReadProjection {
         let usedTokens = providerReceipt?.lastRequestInputTokens ?? transcriptTokens
         let promptTokens = max(0, usedTokens - transcriptTokens)
 
-        let threshold = windowConfig.effectiveThresholdTokens(forModel: resolvedModel, providerID: route, dataRoot: root)
+        let threshold = windowConfig.effectiveThresholdTokens(forModel: resolvedModel, providerID: providerID, dataRoot: root)
 
         // A carried-over receipt counts tokens against the PREVIOUS model's
         // window, so an 800k figure over a fresh 128k budget would read 600%.
@@ -142,119 +143,8 @@ public enum RuntimeReadProjection {
         )
     }
 
-    public static func getPersonalOS(dataRoot: URL) async throws -> PersonalOSSummary {
-        /// HONEST MINIMAL: NativeAgent ships a single active persona today
-        /// (persona/profile.json), so the PersonalOS summary surfaces exactly
-        /// one space derived from that file's `name`/`active` key. The daemon
-        /// never aggregated additional spaces — there is no fan-out to port —
-        /// so this is the real shape, not a stub. If/when multi-persona
-        /// support lands, this aggregator is the seam to extend.
-        let path = dataRoot
-            .appendingPathComponent("persona", isDirectory: true)
-            .appendingPathComponent("profile.json")
-        let primaryName: String?
-        if FileManager.default.fileExists(atPath: path.path) {
-            do {
-                let data = try Data(contentsOf: path)
-                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    throw RuntimeReadError.unreadableFeed(
-                        "Persona profile is not a JSON object"
-                    )
-                }
-                if let name = object["name"] {
-                    guard let string = name as? String else {
-                        throw RuntimeReadError.unreadableFeed(
-                            "Persona profile name is not text"
-                        )
-                    }
-                    primaryName = string
-                } else if let active = object["active"] {
-                    guard let string = active as? String else {
-                        throw RuntimeReadError.unreadableFeed(
-                            "Persona profile active name is not text"
-                        )
-                    }
-                    primaryName = string
-                } else {
-                    primaryName = nil
-                }
-            } catch let error as RuntimeReadError {
-                throw error
-            } catch {
-                throw RuntimeReadError.unreadableFeed(
-                    "Persona profile is unreadable: \(error.localizedDescription)"
-                )
-            }
-        } else {
-            primaryName = nil
-        }
-        let spaces: [PersonalOSSpace]
-        if let name = primaryName {
-            spaces = [PersonalOSSpace(id: "persona", name: name, count: 1, kind: "persona")]
-        } else {
-            spaces = []
-        }
-        return PersonalOSSummary(
-            spaces: spaces,
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
-    }
-
     public static func getAutonomyKernel(dataRoot: URL) async throws -> AutonomyKernelSummary {
-        // DAEMON-DEAD PORT (2026-06-03): summarize the Swift-owned autonomy
-        // gates from Trust policy. This is a
-        // status surface only; action execution remains guarded by its own
-        // native engines.
-        let policy = try await TrustFacade(dataRoot: dataRoot).load()
-        let trustEnabled = policy.enableAutonomy
-        let enabled = trustEnabled
-        let mode = policy.autonomyDefault ?? "supervised"
-        let disabledReason: String? = {
-            if !trustEnabled { return "Trust Center autonomy is disabled" }
-            return nil
-        }()
-
-        let outside = policy.filePolicy?.outsideWorkspaceDefault ?? "deny"
-        let backupRequired = policy.filePolicy?.requireBackupBeforeWrite ?? true
-        let memoryHygiene = policy.memoryPolicy?.hygiene_enabled ?? true
-
-        return AutonomyKernelSummary(
-            status: enabled ? "ok" : "off",
-            mode: mode,
-            enabled: enabled,
-            processEnabled: true,
-            trustEnabled: trustEnabled,
-            disabledReason: disabledReason,
-            guardrails: [
-                KernelGuardrail(
-                    id: "trust.enableAutonomy",
-                    title: "Trust autonomy switch",
-                    status: trustEnabled ? "ok" : "off"
-                ),
-                KernelGuardrail(
-                    id: "file.outsideWorkspaceDefault",
-                    title: "Outside-workspace file policy",
-                    status: outside == "allow" ? "wide" : "guarded"
-                ),
-                KernelGuardrail(
-                    id: "file.requireBackupBeforeWrite",
-                    title: "Write backup requirement",
-                    status: backupRequired ? "ok" : "warn"
-                ),
-                KernelGuardrail(
-                    id: "memory.hygiene_enabled",
-                    title: "Memory hygiene",
-                    status: memoryHygiene ? "ok" : "off"
-                ),
-            ],
-            approvalClasses: [
-                ApprovalClass(id: "external_send", title: "External sends", requiresApproval: true),
-                ApprovalClass(id: "filesystem_write", title: "Filesystem writes", requiresApproval: true),
-                ApprovalClass(id: "system_change", title: "System changes", requiresApproval: true),
-                ApprovalClass(id: "safe_read", title: "Safe reads", requiresApproval: false),
-            ],
-            createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
-        )
+        TrustFacade.autonomyKernel(for: try await TrustFacade(dataRoot: dataRoot).load())
     }
 
     public static func getActivity(root: URL) async throws -> [ActivityEvent] {
@@ -270,25 +160,7 @@ public enum RuntimeReadProjection {
     }
 
     public static func getActivityReadout(root: URL) async throws -> ActivityTailReadout {
-        // DAEMON-KILL P1: tail of <dataRoot>/activity/events.jsonl.
-        let path = root
-            .appendingPathComponent("activity", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: path.path) else { return ActivityTailReadout(records: [], malformedRowCount: 0) }
-        let attributes = try fileManager.attributesOfItem(atPath: path.path)
-        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        guard size > 0 else { return ActivityTailReadout(records: [], malformedRowCount: 0) }
-
-        let maximumBytes = UInt64(1_048_576)
-        let count = min(size, maximumBytes)
-        let startsMidFile = size > count
-        let handle = try FileHandle(forReadingFrom: path)
-        defer { try? handle.close() }
-        if startsMidFile {
-            try handle.seek(toOffset: size - count)
-        }
-        let data = handle.readData(ofLength: Int(count))
+        let (data, startsMidFile) = try SwiftNativePersistenceCore.activityTail(dataRoot: root)
         var lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
         if lines.last?.isEmpty == true { lines.removeLast() }
         if startsMidFile && !lines.isEmpty { lines.removeFirst() }

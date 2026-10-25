@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `AfterTurnNoveltyGate.swift` | `AfterTurnNoveltyGate.skipReason`: on-device acknowledgement/repetition admission for after-turn memory interpretation |
+
 /// Phase 5A (2026-10-03): the cheap on-device check in front of the after-turn
 /// memory call (~2.7k tokens, one per user turn).
 ///

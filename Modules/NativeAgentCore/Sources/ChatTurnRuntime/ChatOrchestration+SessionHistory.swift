@@ -8,33 +8,11 @@ import PersistenceCore
 import TurnTrace
 // v2Prefix delivery ladder: supportsMidConversationSystem / …ClearAt.
 import ProviderRouting
+// Blueprint: | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`: `buildTurnContextWithHistory` (history and digest gathered for them turn part), `fireAssemblyStageEvent`, `injectingSessionDigest` |
 
 // MARK: - SwiftNativeTurnEngine + history threading
 
 extension SwiftNativeTurnEngine {
-    /// Build per-turn context with prior conversation replayed as messages and
-    /// bounded derived history in the dynamic context. Missing session history
-    /// leaves the normal `buildTurnContext` shape. The two-line prior-session
-    /// anchor is opt-in through the explicit-provider overload and lands on a
-    /// session's first turn only.
-    public func buildTurnContextWithHistory(
-        surface: String,
-        userMessage: String,
-        sessionId: String,
-        historyLimit: Int = 400,
-        historyReader: SessionHistoryReader = SessionHistoryReader()
-    ) async throws -> TurnContext {
-        return try await buildTurnContextWithHistory(
-            surface: surface,
-            userMessage: userMessage,
-            sessionId: sessionId,
-            historyLimit: historyLimit,
-            historyReader: historyReader,
-            personaOverride: nil,
-            excludeHistoryRunId: nil
-        )
-    }
-
     /// Same as `buildTurnContextWithHistory(...)` but with a Mac UI
     /// `UserDefaults["chatPersona"]` override forwarded into the compiled
     /// persona packet. nil → no override (legacy callers unaffected).
@@ -184,8 +162,6 @@ extension SwiftNativeTurnEngine {
                 provider: sessionDigest
             )
         }
-        let naturalExpressionCue = NaturalExpressionGuidance.pendingCues(from: prior, userMessage: queryMessage)
-        trace.setFlag("expression.rhythmCuePending", naturalExpressionCue != nil)
         // Sweep R4 W3: the ONLY production caller of the history renderer, and
         // the first place in prompt assembly where the admitted model for this
         // turn is known (`buildTurnContext` resolved it above). That makes this
@@ -263,12 +239,14 @@ extension SwiftNativeTurnEngine {
             // tool-change message is never replayed: `app` is the whole tools
             // array, so the names it adds or removes are declared nowhere.
             let replaysClearAt = supportsMidConversationSystemClearAt(forModel: base.modelId)
+            var observedArchive: [String: [ArchivedVolatileBlock]] = [:]
             var archivedTurnMessages: [String: [LLMMessage]] = [:]
             let archive = await TurnVolatileArchiveRegistry.shared
                 .archive(dataRoot: historyReader.dataRoot)
             if replaysClearAt {
                 do {
-                    archivedTurnMessages = try await archive.load(sessionId: sessionId)
+                    observedArchive = try await archive.load(sessionId: sessionId)
+                    archivedTurnMessages = observedArchive
                         .mapValues { entries in
                             entries.filter { $0.toolChanges.isEmpty }.map(\.message)
                         }
@@ -283,10 +261,11 @@ extension SwiftNativeTurnEngine {
             // Bound the sidecar to the window the prefix actually replays: when
             // the cursor drops a turn, its archived messages go with it. That is
             // the archive's own chore; the turn does not wait for it, and it
-            // keeps this turn's own block whenever it lands.
+            // keeps this turn's own block and any unseen or re-recorded runs.
             if !archivedTurnMessages.isEmpty {
                 let keeping = projected.replayedRunIds.union([excludeHistoryRunId].compactMap { $0 })
-                Task { await archive.prune(sessionId: sessionId, keeping: keeping) }
+                let removing = observedArchive.filter { !keeping.contains($0.key) }
+                Task { await archive.prune(sessionId: sessionId, removing: removing) }
             }
             replayedRunIds = projected.replayedRunIds
             historyMessages = projected.messages
@@ -356,10 +335,7 @@ extension SwiftNativeTurnEngine {
         let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
         let clocked = await contextByAppendingCurrentTurnFacts(
             contextWithHistory, facts: currentFacts, sessionID: sessionId, clockNowOverride: clockNowOverride)
-        var finalContext = Self.contextBySettingNaturalExpressionCue(
-            clocked,
-            cue: naturalExpressionCue
-        )
+        var finalContext = clocked
         // An unread history is a fact of this turn, never a quiet empty one.
         if let unreadHistory {
             finalContext = Self.contextByAppendingRuntimeContext(finalContext, runtimeContext:

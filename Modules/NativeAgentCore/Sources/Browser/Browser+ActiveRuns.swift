@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `Browser+ActiveRuns.swift` | process-local run cancellation registry and attachment latch |
 
 // MARK: - Active browser run ownership
 

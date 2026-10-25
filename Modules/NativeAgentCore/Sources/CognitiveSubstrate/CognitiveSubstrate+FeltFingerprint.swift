@@ -1,6 +1,8 @@
 import Foundation
 import NaturalLanguage
 
+// Blueprint: | `CognitiveSubstrate+FeltFingerprint.swift` | `CognitiveSubstrate` felt fingerprint: graded live feeling words, safe subject labels and capsule line composition |
+
 // The FELT FINGERPRINT — the live "How you feel:" capsule core (wired 2026-07-08
 // via feltFingerprintLine in CognitiveSubstrate+Capsule.swift).
 //

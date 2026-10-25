@@ -1,5 +1,6 @@
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `AdvancedPresentation.swift` | `View`: `mobileReadingScreen` |
 
 /// Process-local screenshot fixtures. Never published to a store or transport.
 enum MobileDesignSamples {
@@ -288,18 +289,10 @@ enum MacHealthPresentation {
     }
 }
 
-/// One freshness contract for Mac-owned iCloud snapshots on the phone. Every
-/// screen that reports a snapshot age must use this threshold rather than
-/// deciding independently when a snapshot becomes stale.
-enum MobileSnapshotFreshnessPresentation {
+/// Mac-owned snapshots become stale after 30 seconds on every phone surface.
+enum StatusConnectionPresentation {
     static let staleAfter: TimeInterval = 30
 
-    static func isStale(lastSyncedAt: Date, now: Date = Date()) -> Bool {
-        now.timeIntervalSince(lastSyncedAt) > staleAfter
-    }
-}
-
-enum StatusConnectionPresentation {
     enum SyncState: Equatable {
         case current(age: TimeInterval)
         case stale(age: TimeInterval, limit: TimeInterval)
@@ -310,7 +303,7 @@ enum StatusConnectionPresentation {
     static func syncState(
         lastSyncedAt: Date?,
         now: Date = Date(),
-        staleAfter: TimeInterval = MobileSnapshotFreshnessPresentation.staleAfter,
+        staleAfter: TimeInterval = Self.staleAfter,
         maximumFutureClockSkew: TimeInterval = 60
     ) -> SyncState {
         guard let lastSyncedAt else { return .neverSynced }

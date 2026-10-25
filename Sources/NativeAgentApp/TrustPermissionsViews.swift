@@ -3,8 +3,9 @@ import SwiftUI
 import NativeAgentShared
 import PersistenceCore
 import ChromeControl
-import BackgroundWork
 import TrustCenter
+
+// Blueprint: | `TrustPermissionsViews.swift` | Trust permission views: checked Chrome/multimodal/training/Workshop/memory policy controls through existing Trust owners |
 
 struct ChromeControlPermissionsView: View {
     @Environment(AppModel.self) private var appModel
@@ -75,7 +76,7 @@ struct ChromeControlPermissionsView: View {
             }
             .task {
                 syncFromPolicy()
-                for await state in await NativeAgentEngine.live.chrome.connectionStates() {
+                for await state in await appModel.engine.chrome.connectionStates() {
                     connectionState = state
                 }
             }
@@ -213,16 +214,10 @@ struct MultimodalPermissionsView: View {
 // Permissions for unattended background work.
 struct TrainingPermissionsView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var draftEnableAutonomy = false
-    /// Full Mac (or checked Full Mac YOLO) admits unattended work whatever
-    /// `enableAutonomy` says — including an upgraded policy that never carried
-    /// the key. The switch shows the EFFECTIVE state, so it can never read OFF
-    /// while `WorkshopBackgroundWork.unattendedWorkAllowed` is admitting work.
-    @State private var unattendedForced = false
     @State private var isSaving = false
-    @State private var completedInitialRead = false
-    @State private var loadedPolicy: TrustPolicy?
-    @State private var unattendedReadGate = LatestAsyncRequestGate()
+
+    private var verdict: TrustFacade.FeatureVerdict? { appModel.engine.trust.unattendedWork }
+    private var unattendedForced: Bool { verdict?.forced == true }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
@@ -235,47 +230,18 @@ struct TrainingPermissionsView: View {
                         ? "Full Mac access keeps me working unattended: helpers on their schedules, background improvement. Choosing Safe on the Access tab turns it off. Work mode and Builder keep it on but unlock this switch, so you can turn it off here. Run once still works either way, because that is you asking."
                         : "The main switch for background work: helpers on their schedules and replies to events, the weekly improvement pass. Run once still works either way, because that is you asking. Even with this on, I can only change my own files inside NativeAgent, never the rest of your Mac.",
                     isOn: Binding(
-                        get: { draftEnableAutonomy || unattendedForced },
+                        get: { verdict?.enabled == true },
                         set: { newValue in
                             guard !unattendedForced else { return }
-                            draftEnableAutonomy = newValue
                             Task { await saveEnableAutonomy(newValue) }
                         }
                     )
                 )
-                .disabled(unattendedForced)
+                .disabled(isSaving || unattendedForced || verdict == nil)
+                if verdict == nil {
+                    FeatureNote("Permissions unavailable. Reload Trust to check your saved settings.")
+                }
             }
-        }
-        .task(id: appModel.engine.trust.policy) {
-            let policy = appModel.engine.trust.policy
-            guard !completedInitialRead || loadedPolicy != policy else { return }
-            if !isSaving {
-                syncDraftsFromPolicy()
-            }
-            guard !Task.isCancelled else { return }
-            await refreshUnattended()
-            guard !Task.isCancelled else { return }
-            loadedPolicy = policy
-            completedInitialRead = true
-        }
-        .onDisappear {
-            _ = unattendedReadGate.begin()
-        }
-    }
-
-    /// Check the authority override independently of the raw autonomy toggle.
-    private func refreshUnattended() async {
-        let request = unattendedReadGate.begin()
-        let root = appModel.firstRunDataRoot
-        let forced = await WorkshopBackgroundWork.unattendedWorkForced(
-            policy: appModel.engine.trust.policy, dataRoot: root)
-        guard !Task.isCancelled, unattendedReadGate.accepts(request) else { return }
-        unattendedForced = forced
-    }
-
-    private func syncDraftsFromPolicy() {
-        if let trustPolicy = appModel.engine.trust.policy {
-            draftEnableAutonomy = trustPolicy.enableAutonomy
         }
     }
 
@@ -283,73 +249,51 @@ struct TrainingPermissionsView: View {
         isSaving = true
         await appModel.saveEnableAutonomy(enabled)
         isSaving = false
-        syncDraftsFromPolicy()
     }
-
-
 }
 
 // PATCH-2026-05-07: executions-b Permissions panel for autonomous executions
 struct WorkshopPermissionsView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var draftPolicy = TrustWorkshopPolicy()
     @State private var isSaving = false
 
-    private var workshopExecutionsEnabled: Bool {
-        draftPolicy.enabled ?? false
-    }
-    private var showTimeline: Bool {
-        draftPolicy.showTimeline ?? true
-    }
+    private var verdict: TrustFacade.FeatureVerdict? { appModel.engine.trust.deskTasks }
+    private var deskTasksForced: Bool { verdict?.forced == true }
 
     /// Alive glass (2026-09-23): one group card of switch rows.
     var body: some View {
         AliveGroupCard {
             FeatureSwitchRow(
                 title: "Allow Desk tasks",
-                detail: "I create Desk tasks and plan them in several steps.",
+                detail: deskTasksForced
+                    ? "Developer mode allows Desk tasks, including in Full Mac."
+                    : "I create Desk tasks and plan them in several steps.",
                 isOn: Binding(
-                    get: { workshopExecutionsEnabled },
+                    get: { verdict?.enabled == true },
                     set: { newValue in
                         Task { await saveWorkshopPolicy(enabled: newValue) }
                     }
                 )
             )
-            FeatureSwitchRow(
-                title: "Show the Desk timeline",
-                isOn: Binding(
-                    get: { showTimeline },
-                    set: { newValue in
-                        Task { await saveWorkshopPolicy(showTimeline: newValue) }
-                    }
-                )
-            )
+            .disabled(isSaving || deskTasksForced || verdict == nil)
+            if verdict == nil {
+                FeatureNote("Permissions unavailable. Reload Trust to check your saved settings.")
+            }
             FeatureNote("Desk tasks follow the same approval rules as the rest of my tools. In Full Mac, allowed actions run without asking you again; narrower modes may ask before I send or delete anything.")
         }
-        .task { syncDraftPolicy() }
-        .onChange(of: appModel.engine.trust.policy) { _, _ in
-            if !isSaving { syncDraftPolicy() }
-        }
     }
 
-    private func saveWorkshopPolicy(enabled: Bool? = nil, showTimeline: Bool? = nil) async {
-        if let enabled { draftPolicy.enabled = enabled }
-        if let showTimeline { draftPolicy.showTimeline = showTimeline }
+    private func saveWorkshopPolicy(enabled: Bool) async {
         isSaving = true
-        await appModel.saveWorkshopPolicyToggle(enabled: enabled, showTimeline: showTimeline)
+        await appModel.saveWorkshopPolicyToggle(enabled: enabled)
         isSaving = false
-        syncDraftPolicy()
-    }
-
-    private func syncDraftPolicy() {
-        draftPolicy = appModel.engine.trust.policy?.workshopPolicy ?? TrustWorkshopPolicy()
     }
 }
 
 // PATCH-2026-05-07: living-memory Permissions panel for living memory system
 struct LivingMemoryPermissionsView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var draftPolicy = TrustMemoryPolicy()
+    private var policy: TrustMemoryPolicy? { appModel.engine.trust.memoryPermissions }
     @State private var isSaving = false
 
     private var pendingCount: Int {
@@ -364,11 +308,10 @@ struct LivingMemoryPermissionsView: View {
                 title: "Remember across conversations",
                 detail: "Each time you write, I look through all our past conversations for what is relevant. Read only; on by default.",
                 isOn: Binding(
-                    get: { draftPolicy.cross_session_recall },
+                    get: { policy?.cross_session_recall == true },
                     set: { v in
-                        var next = draftPolicy
+                        guard var next = policy else { return }
                         next.cross_session_recall = v
-                        draftPolicy = next
                         Task { await saveMemoryPolicy(next) }
                     }
                 )
@@ -377,11 +320,10 @@ struct LivingMemoryPermissionsView: View {
                 title: "Nightly memory consolidation",
                 detail: MemoryPolicyHelpCopy.nightlyConsolidation,
                 isOn: Binding(
-                    get: { draftPolicy.consolidation_enabled },
+                    get: { policy?.consolidation_enabled == true },
                     set: { v in
-                        var next = draftPolicy
+                        guard var next = policy else { return }
                         next.consolidation_enabled = v
-                        draftPolicy = next
                         Task { await saveMemoryPolicy(next) }
                     }
                 )
@@ -390,25 +332,19 @@ struct LivingMemoryPermissionsView: View {
                 title: "Knowledge graph",
                 detail: "I join up the people, places and things your conversations keep mentioning, and draw them in Memory → Graph.",
                 isOn: Binding(
-                    get: { draftPolicy.knowledge_graph_enabled },
+                    get: { policy?.knowledge_graph_enabled == true },
                     set: { v in
-                        var next = draftPolicy
-                        next.knowledge_graph_enabled = v
-                        draftPolicy = next
-                        Task { await patchMemoryPolicy(next, knowledgeGraph: v) }
+                        Task { await patchMemoryPolicy(knowledgeGraph: v) }
                     }
                 )
             )
             FeatureSwitchRow(
-                title: "Memories that recur become facts",
+                title: "Recurring memories are proposed as facts",
                 detail: "When something useful keeps coming back, I suggest keeping it as a lasting fact, without loading all my memory into every reply.",
                 isOn: Binding(
-                    get: { draftPolicy.adaptive_promotion },
+                    get: { policy?.adaptive_promotion == true },
                     set: { v in
-                        var next = draftPolicy
-                        next.adaptive_promotion = v
-                        draftPolicy = next
-                        Task { await patchMemoryPolicy(next, adaptivePromotion: v) }
+                        Task { await patchMemoryPolicy(adaptivePromotion: v) }
                     }
                 )
             )
@@ -416,15 +352,15 @@ struct LivingMemoryPermissionsView: View {
                 title: "Memory hygiene",
                 detail: "I regularly clear out old, noisy, duplicate and low-value memories so they don't pile up.",
                 isOn: Binding(
-                    get: { draftPolicy.hygiene_enabled },
+                    get: { policy?.hygiene_enabled == true },
                     set: { v in
-                        var next = draftPolicy
-                        next.hygiene_enabled = v
-                        draftPolicy = next
-                        Task { await patchMemoryPolicy(next, hygiene: v) }
+                        Task { await patchMemoryPolicy(hygiene: v) }
                     }
                 )
             )
+            if policy == nil {
+                FeatureNote("Permissions unavailable. Reload Trust to check your saved settings.")
+            }
             if pendingCount > 0 {
                 HStack(spacing: 8) {
                     AliveWaitingDot()
@@ -437,14 +373,7 @@ struct LivingMemoryPermissionsView: View {
             // named machinery; the user is being told which page to look on.
             FeatureNote("What I remember, how I recall it, and how I tidy myself up are all set here. Suggested memory changes wait for you in Memory; suggested changes to how I behave wait in Self-Improvement.")
         }
-        .task { syncDraftFromPolicy() }
-        .onChange(of: appModel.engine.trust.policy) { _, _ in
-            if !isSaving { syncDraftFromPolicy() }
-        }
-    }
-
-    private func syncDraftFromPolicy() {
-        draftPolicy = appModel.engine.trust.policy?.memoryPolicy ?? TrustMemoryPolicy()
+        .disabled(isSaving || policy == nil)
     }
 
     private func saveMemoryPolicy(_ policy: TrustMemoryPolicy) async {
@@ -454,10 +383,9 @@ struct LivingMemoryPermissionsView: View {
             crossSessionRecall: policy.cross_session_recall
         )
         isSaving = false
-        syncDraftFromPolicy()
     }
 
-    private func patchMemoryPolicy(_ draft: TrustMemoryPolicy, knowledgeGraph: Bool? = nil, adaptivePromotion: Bool? = nil, hygiene: Bool? = nil) async {
+    private func patchMemoryPolicy(knowledgeGraph: Bool? = nil, adaptivePromotion: Bool? = nil, hygiene: Bool? = nil) async {
         isSaving = true
         await appModel.patchMemoryPolicy(
             knowledgeGraphEnabled: knowledgeGraph,
@@ -465,7 +393,6 @@ struct LivingMemoryPermissionsView: View {
             hygieneEnabled: hygiene
         )
         isSaving = false
-        syncDraftFromPolicy()
     }
 }
 

@@ -9,8 +9,8 @@ import AppIntents
 import NativeAgentCore
 import EngineRuntime
 import WorkshopExecution
-import SelfImprovement
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatToolRuntime
 import ChromeControl
 import ContextFlow
 import BackgroundLoops
@@ -21,10 +21,6 @@ import Desk
 import Transcripts
 import TurnTrace
 import PersonaEngine
-import Skills
-import MCPDispatcher
-import GitHubConnector
-import SlackConnector
 import Connectors
 import Browser
 import Cognition
@@ -33,10 +29,18 @@ import os
 import DeviceSync
 import AppToolRuntime
 import NativeAgentShared
+// Blueprint: | `AppDelegate+Launch.swift` | `AppDelegate`: `applicationDidFinishLaunching`, `applicationShouldTerminateAfterLastWindowClosed`, `application` |
 
 extension AppDelegate {
+    @MainActor private static var launchTask: Task<Void, Never>?
+    @MainActor private static var bridgeLaunchWork: DispatchWorkItem?
+    nonisolated private static let launchStopping = OSAllocatedUnfairLock(initialState: false)
+    @MainActor private static var launchDidStart = false
+
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !Self.launchDidStart else { return }
+        Self.launchDidStart = true
         if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() {
             previousWorkApp = app
         }
@@ -49,7 +53,10 @@ extension AppDelegate {
         NativeAgentEngine.installActionLabelsAtLaunch()
         NativeAgentNotificationActions.register()
         TurnContinuationRuntime.installReplyMirror()
-        Task { await finishLaunching() }
+        Self.launchTask = Task {
+            defer { Self.launchTask = nil }
+            await finishLaunching()
+        }
     }
 
     @MainActor @objc func continuationAppActivated(_ notification: Notification) {
@@ -62,9 +69,11 @@ extension AppDelegate {
     private func finishLaunching() async {
         do { try await NativeAgentAppCoordinator.shared.prepare() }
         catch {
+            guard !Task.isCancelled else { return }
             NSApp.terminate(nil)
             return
         }
+        guard !Task.isCancelled else { return }
         NativeAgentShortcuts.updateAppShortcutParameters()
         approvalNotificationTask = Task { await NativeAgentApprovalNotifications.observe() }
         // Wire restart before the migration suspension: SwiftUI can already
@@ -81,28 +90,16 @@ extension AppDelegate {
                     }
                 }
             },
-            spawnRelauncher: AppRestartCoordinator.spawnDetached(argv:)
+            spawnRelauncher: { _ = try AppRestartCoordinator.spawnDetached(argv: $0) }
         )
+        guard !Task.isCancelled else { return }
         // Housekeeping, never awaited by launch: an older extension without
         // extension.reload, or a same-version resource change, still gets the
         // new copy. A reload request prepares the folder itself first.
         Task.detached(priority: .utility) { ChromeExtensionFolder.refreshIfPresent() }
-        do {
-            try await NativeAgentEngine.prepareExecutionStorageAtLaunch(dataRoot: PersistenceCore.defaultDataRoot())
-        } catch {
-            ModuleLog.app("%@", "[workshop-migration] failed: \(error)")
-            let alert = NSAlert()
-            alert.alertStyle = .critical
-            alert.messageText = "Desk execution storage migration failed"
-            alert.informativeText = "NativeAgent stopped before starting background work so no task state is lost. "
-                + UserFacingError.advice(for: error)
-            alert.addButton(withTitle: "Quit")
-            alert.runModal()
-            NSApp.terminate(nil)
-            return
-        }
-        await NativeAgentEngine.reconcileConnectorCredentialsAtLaunch(
-            dataRoot: PersistenceCore.defaultDataRoot(), github: { .shared })
+        guard !Task.isCancelled else { return }
+        await NativeAgentEngine.reconcileConnectorCredentialsAtLaunch(dataRoot: PersistenceCore.defaultDataRoot())
+        guard !Task.isCancelled else { return }
 
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
@@ -155,7 +152,6 @@ extension AppDelegate {
                     try await runtime.resumeTurn(checkpoint, progress: progress)
                 }
             },
-            repairPresentation: AppMemoryRepairPresentation(),
             momentsEnabled: { MomentsLaneSetting.isEnabled() },
             approvals: .app())
 
@@ -169,28 +165,24 @@ extension AppDelegate {
         // that can disagree with the first, and the outer one is always the one
         // a later refactor forgets. Default is OFF, and an unreadable policy
         // file decodes to OFF, so a fresh install captures nothing.
-        Task { @MainActor in
-            ActivityWatchController.shared.startAtLaunch()
-        }
+        NativeAgentEngine.live.activityWatch.startAtLaunch()
 
         // PATCH-2026-05-06: wkwebview-browser Start browser IPC server on this install's fixed port (8766).
-        Task { @MainActor in
-            BrowserWindowController.shared.startIPCServer()
-        }
+        BrowserWindowController.shared.startIPCServer()
         // ClaudeBridge: localhost HTTP on 8771 so Claude (Claude Code
         // CLI) can query Agent's state, fire chat turns, and run tools
         // without UI click-through. Started
         // in the SAME lifecycle hook so menu-bar/background launches
         // (which never show the main window and never fire SwiftUI .task
-        // modifiers) still bring the bridge up. (Previously wired in
-        // MainWindowContent's .task — silently never fired.) Synchronous
-        // DispatchQueue dispatch (not Task.detached) so the actor isolation
-        // can't defer it past application launch finish.
+        // modifiers) still bring the bridge up. The launch owns this work;
+        // cancellation after either start closes anything it just installed.
         ModuleLog.app("[claude-bootstrap] dispatching ClaudeBridge.startServer on dispatch queue")
-        DispatchQueue.global(qos: .userInitiated).async {
-            ClaudeBridgeRuntime.shared.startSyncForBootstrap()
-            NativeAgentA2AGRPCListener.shared.start()
-        }
+        // A closure written here would inherit main-actor isolation
+        // (DispatchWorkItem's block is not @Sendable) and trap on the global
+        // queue; the nonisolated function reference runs off main as intended.
+        let bridgeWork = DispatchWorkItem(block: Self.startBridgesAtLaunch)
+        Self.bridgeLaunchWork = bridgeWork
+        DispatchQueue.global(qos: .userInitiated).async(execute: bridgeWork)
         let forwarder = ICloudIncomingTurnForwarder(port: EngineICloudIncomingTurnPort(
             engine: .live, client: { AppDelegate.residentIOSChatClient },
             received: { MacChatUnreadSessions.shared.received(in: $0) },
@@ -205,6 +197,17 @@ extension AppDelegate {
             forward: { await forwarder.forwardToSwiftRuntime($0) },
             registerLoginItem: AppDelegate.registerLoginItemInBackground)
 
+    }
+
+    nonisolated private static func startBridgesAtLaunch() {
+        guard !launchStopping.withLock({ $0 }) else { return }
+        ClaudeBridgeRuntime.shared.startSyncForBootstrap()
+        guard !launchStopping.withLock({ $0 }) else { ClaudeBridgeRuntime.shared.stop(); return }
+        NativeAgentA2AGRPCListener.shared.start()
+        if launchStopping.withLock({ $0 }) {
+            NativeAgentA2AGRPCListener.shared.stop()
+            ClaudeBridgeRuntime.shared.stop()
+        }
     }
 
     // PATCH-2026-05-07: app-owned runtime Don't quit when the user closes the
@@ -261,6 +264,7 @@ extension AppDelegate {
     @MainActor
     static func terminateForRestart() {
         restartQuit.withLock { $0 = true }
+        NotificationCenter.default.post(name: NativeAgentEngine.quitRestartWake, object: nil)
         if quitWaitingForTurns { return }
         NSApp.terminate(nil)
         // Reached only when the quit was refused (a modal vetoed it): a later
@@ -302,6 +306,10 @@ extension AppDelegate {
     // before process exit.
     @MainActor
     func applicationWillTerminate(_ notification: Notification) {
+        Self.launchTask?.cancel()
+        Self.launchStopping.withLock { $0 = true }
+        Self.bridgeLaunchWork?.cancel()
+        NativeAgentEngine.stopLaunchWork()
         approvalNotificationTask?.cancel()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         guard NativeAgentAppCoordinator.shared.appModel != nil else { return }
@@ -322,7 +330,7 @@ extension AppDelegate {
 
         NativeAgentEngine.drainResidentWorkForTermination(
             shutdownSenses: { await SensesAssembly.shutdown() },
-            makeActivityWatchDrain: { ActivityWatchController.shared.makeTerminationDrain() })
+            makeActivityWatchDrain: { NativeAgentEngine.live.activityWatch.makeTerminationDrain() })
     }
 
     @objc private func contextFlowWillSleep(_ notification: Notification) {

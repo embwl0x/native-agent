@@ -3,7 +3,9 @@ import AppToolRuntime
 import BackgroundWork
 import AgentWorkspace
 import Agents
-import ChatOrchestration
+import ChatTurnContracts
+import ChatSessionWork
+import ChatToolParsing
 import Connectors
 import DeviceSync
 import Desk
@@ -14,18 +16,18 @@ import MemoryV2
 import PersonaEngine
 import StandingBots
 import Studio
-import MCPDispatcher
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import TrustCenter
 import TrustPersistence
 import ToolExecution
+// Blueprint: | `RuntimeReadProjection+QuietPages.swift` | Quiet page/item formatting and navigation over engine projections: Desk uses the complete retained `DeskFacade.page` and its prepared attention rows, helpers use `botsShelfRead` including followingModel, chat cards and heading use the checked transcript projection; unsupported card states share one person-directed defect naming the card; page indexing takes the live layout; Mac access/grants render `MacIntegrationFacade`; connector items expose secret names without values; shared Trust, provider, inbox and settings read formatting |
 
 @MainActor
 extension RuntimeReadProjection {
-    public static func quietPages(dataRoot: URL, profile: String) -> [QuietToolPage] {
-        let layout = SurfaceLayoutStore.layout(dataRoot: dataRoot)
+    public static func quietPages(layout: SurfaceLayout, profile: String) -> [QuietToolPage] {
         let hidden = Set(["rail", "places"].flatMap { surface in
             (layout.surfaces[surface] ?? []).map(\.name)
                 .filter { !layout.isShown(surface, $0, profile: profile) }.map(AppDoorNames.resolve)
@@ -49,13 +51,42 @@ extension RuntimeReadProjection {
         ])
     }
 
+    /// Failure evidence and its recovery are one structured face, never prose
+    /// clipped by the section's 200-character summary bound.
+    public static func quietPageIssue(_ heading: String, reason: String, detail: String,
+                                      instruction: String, next: [String: JSONValue]? = nil,
+                                      tap: String? = nil, status: String = "unavailable",
+                                      error: (any Error)? = nil) -> JSONValue {
+        let remedy: JSONValue
+        if status == "waiting", let tap {
+            remedy = Repair.why(owner: heading, tap: tap, instruction: instruction)
+        } else {
+            remedy = Repair.remedy(owner: heading,
+                nextCall: next.map { .object(["tool": .string("app"), "input": .object($0)]) },
+                tap: tap, instruction: instruction)
+        }
+        var face: [String: JSONValue] = [
+            "heading": .string(heading), "lines": .array([]),
+            "status": .string(status), "reason": .string(reason), "detail": .string(detail),
+            "remedy": remedy,
+        ]
+        if let error, case .object(let evidence) = ChatToolOutcome.failure(error: error, effects: ToolFailureError.Effects.none) {
+            face.merge(evidence) { _, owned in owned }
+            if evidence["reason"] == .string("dispatch_error") {
+                face["reason"] = .string(reason)
+                face["failure_code"] = .string(reason)
+            }
+        }
+        return .object(face)
+    }
+
     public static func quietCountLine(_ count: Int, _ one: String, _ many: String) -> String {
         count == 1 ? "1 \(one)" : "\(count) \(many)"
     }
 
     public static func quietModelLines(_ members: [ProviderSurfaceMember], routing: ProviderRoutingSnapshot) -> [String] {
         members.map { member in
-            if let issue = routing.unusablePickNotice(for: member.surface) { return "\(member.label): \(issue)" }
+            if routing.unusablePickNotice(for: member.surface) != nil { return "\(member.label): model unavailable" }
             let provider = routing.activeProviders[member.surface] ?? "same as Chat"
             guard let preference = routing.preferences[member.surface] else {
                 return "\(member.label): \(provider) · no model pinned"
@@ -66,12 +97,30 @@ extension RuntimeReadProjection {
         }
     }
 
+    private static func quietModelIssues(_ members: [ProviderSurfaceMember], routing: ProviderRoutingSnapshot) -> [JSONValue] {
+        members.compactMap { member in
+            routing.unusablePickNotice(for: member.surface).map { issue in
+                quietPageIssue(member.label, reason: "provider_pick_unusable", detail: issue,
+                    instruction: "Choose an available account and model in this activity's Providers group.", tap: "Providers")
+            }
+        }
+    }
+
     public static func quietNotifications(_ inbox: InboxFacade) -> [JSONValue] {
         let items = inbox.items
         var sections = [quietPageSection("Notifications", [
             quietCountLine(items.count, "item in the inbox", "items in the inbox"),
             quietCountLine(items.filter { $0.status == "unread" }.count, "unread", "unread"),
         ])]
+        if let error = inbox.loadError {
+            sections.append(quietPageIssue("Notifications", reason: "inbox_read_failed", detail: error,
+                instruction: "Resolve the reported inbox read problem, preserving saved notes, then reload Notifications.",
+                next: ["page": .string("notifications")], status: inbox.hasLoadedSnapshot ? "stale" : "unavailable"))
+        } else if !inbox.hasLoadedSnapshot {
+            sections.append(quietPageIssue("Notifications", reason: "inbox_not_loaded",
+                detail: "The inbox has not loaded.", instruction: "Read Notifications to load the inbox.",
+                next: ["page": .string("notifications")], status: "not_loaded"))
+        }
         if !items.isEmpty {
             sections.append(quietPageSection("Recent", items.prefix(15).map {
                 "\($0.created_at) · \($0.status) · \($0.severity) · \($0.source): \($0.title) — \($0.summary)"
@@ -82,7 +131,9 @@ extension RuntimeReadProjection {
 
     public static func quietTelegram(_ telegram: TelegramFacade) -> [JSONValue] {
         guard let status = telegram.status else {
-            return [quietPageSection("Telegram", ["Telegram's status has not loaded."])]
+            return [quietPageIssue("Telegram", reason: "telegram_status_not_loaded",
+                detail: "Telegram's status has not loaded.", instruction: "Read Telegram to load its status.",
+                next: ["page": .string("telegram")], status: "not_loaded")]
         }
         var lines = [
             "Telegram: \(status.enabled ? "on" : "off") · bot token \(status.tokenConfigured ? "saved" : "not saved")",
@@ -92,34 +143,71 @@ extension RuntimeReadProjection {
             "Model: \(status.model ?? "same as Chat") · Think \(status.reasoningEffort ?? "default")",
         ]
         if let at = status.lastReplyAt { lines.append("Last reply: \(at)") }
-        if let error = status.lastError, !error.isEmpty { lines.append("Last error: \(error)") }
-        return [quietPageSection("Telegram", lines)]
-    }
-
-    public static func quietMCP(servers: [MCPServer]) -> [JSONValue] {
-        var sections = [quietPageSection("MCP", [quietCountLine(servers.count, "server", "servers")])]
-        if !servers.isEmpty {
-            sections.append(quietPageSection("Servers", servers.map {
-                "\($0.name) [\($0.id)]: \($0.status) · \($0.toolCount) tools"
-            }))
+        var sections = [quietPageSection("Telegram", lines)]
+        if !status.tokenConfigured {
+            sections.append(quietPageIssue("Telegram token", reason: "telegram_token_missing",
+                detail: "No bot token is saved.", instruction: "The owner saves the bot token in Telegram, never in chat.",
+                tap: "Connectors → Telegram → Bot token"))
+        } else if !status.enabled {
+            sections.append(quietPageIssue("Telegram", reason: "telegram_disabled",
+                detail: "Telegram is off.", instruction: "Waiting on the owner to enable Telegram if wanted.",
+                tap: "Connectors → Telegram → Telegram is on", status: "waiting"))
+        } else if !status.pollerEnabled {
+            sections.append(quietPageIssue("Telegram poller", reason: "telegram_poller_not_running",
+                detail: "Telegram is enabled, but its poller is not running.",
+                instruction: "Read Doctor's Telegram check to identify what stopped the poller.",
+                next: ["action": .string("doctor.run")]))
+        }
+        if let error = status.lastError, !error.isEmpty {
+            sections.append(.object(["heading": .string("Last Telegram error"), "status": .string("last_reported"),
+                "reason": .string("telegram_last_error"), "detail": .string(error),
+                "remedy": Repair.terminal(instruction: "A last reported error is not proof of a current failure. Read app {page:\"telegram\",item:\"status\"} for current health before acting.")]))
         }
         return sections
     }
 
     public static func quietPairing(_ sync: SyncFacade, dataRoot: URL) async -> [JSONValue] {
         var head = ["iCloud: \(sync.status)"]
-        if let error = sync.pairingError { head.append("Problem: \(error)") }
         let phones = sync.phones.filter { $0.status != .removed }
         head.append(quietCountLine(phones.count, "phone", "phones"))
         var sections = [quietPageSection("iPhone pairing", head)]
+        if let error = sync.pairingError {
+            sections.append(quietPageIssue("iPhone pairing", reason: "pairing_unavailable", detail: error,
+                instruction: "The owner checks iCloud and the pairing status on both devices using the same Apple Account. Keep the pairing key out of chat.",
+                tap: "Connectors → iPhone → Connection"))
+        }
         if !phones.isEmpty {
             sections.append(quietPageSection("Phones", phones.map { "\($0.id): \($0.status.rawValue)" }))
         }
         do {
             let phone = try await SwiftNativeAPNSSender().notificationReadiness(dataRoot: dataRoot)
-            sections.append(quietPageSection("Notifications", [phone.detail]))
+            if phone.supported {
+                sections.append(quietPageSection("Notifications", [phone.detail]))
+            } else {
+                let instruction: String
+                let tap: String?
+                switch phone.status {
+                case "not_paired":
+                    instruction = "The owner opens the companion app, checks the phone's code and chooses Pair on this Mac."
+                    tap = "Connectors → iPhone → Paired devices → Pair"
+                case "not_configured":
+                    instruction = "The owner configures direct push on this Mac before sending phone notifications."
+                    tap = "NativeAgent data folder → config/apns.json"
+                case "needs_token":
+                    instruction = "The owner enables notifications for the companion app and connects it to this Mac."
+                    tap = "iPhone Settings → Notifications → NativeAgent"
+                default:
+                    instruction = "Read Doctor's phone-notification check and the latest delivery evidence before sending another notification."
+                    tap = nil
+                }
+                sections.append(quietPageIssue("Notifications", reason: "phone_notifications_" + phone.status,
+                    detail: phone.detail, instruction: instruction,
+                    next: tap == nil ? ["action": .string("doctor.run")] : nil, tap: tap, status: phone.status))
+            }
         } catch {
-            sections.append(quietPageSection("Notifications", ["Unavailable: \(error.localizedDescription)"]))
+            sections.append(quietPageIssue("Notifications", reason: "phone_notification_evidence_unavailable",
+                detail: error.localizedDescription, instruction: "Inspect Doctor's phone-notification check for the unreadable evidence path; repair that file without deleting delivery history.",
+                next: ["action": .string("doctor.run")], error: error))
         }
         return sections
     }
@@ -127,17 +215,17 @@ extension RuntimeReadProjection {
     /// A Mac app's or connector's page: the Mac app whose access it shows,
     /// and the connectors behind its actions.
     public static let quietServicePages: [String: (mac: String?, connectors: [String])] = [
-        "mail": (MacIntegrationID.mail, ["local_mail", "gmail", "agentmail"]),
-        "calendar": (MacIntegrationID.calendar, ["local_calendar", "google_calendar"]),
+        "mail": (MacIntegrationID.mail, ["local_mail"]),
+        "calendar": (MacIntegrationID.calendar, ["local_calendar"]),
         "reminders": (MacIntegrationID.reminders, ["local_reminders"]),
         "notes": (MacIntegrationID.notes, []), "contacts": (MacIntegrationID.contacts, []),
         "messages": (MacIntegrationID.messages, []), "music": (MacIntegrationID.music, []),
-        "github": (nil, ["github"]), "slack": (nil, ["slack"]), "notion": (nil, ["notion"]), "x": (nil, ["x"]),
+        "slack": (nil, ["slack"]),
     ]
 
     public static func quietMacAccess(_ mac: String, connectors: [ConnectorRecord], dataRoot: URL,
                                       permissions: Result<MacIntegrationPermissionStore.Snapshot, Error>,
-                                      statusText: (ConnectorRecord) -> String, osAccess: (String) -> String) async -> JSONValue {
+                                      systemStatuses: [String: String], statusText: (ConnectorRecord) -> String) async -> JSONValue {
         let routes = AppActions.integrationRoutes(mac).map { route -> JSONValue in
             guard case .object(var row) = route else { return route }
             let ids = quietServicePages.values.filter { $0.mac == mac }.flatMap(\.connectors).map(ConnectorProofLedger.canonicalID)
@@ -150,13 +238,11 @@ extension RuntimeReadProjection {
         var access: [String: JSONValue] = ["integration": .string(mac), "name": .string(MacIntegrationID.displayName(for: mac)),
             "supported_routes": .array(routes), "supported": .bool(!routes.isEmpty),
             "verified_os_access": .string("unverified"), "setting": .string("trust.mac_integration_\(mac)")]
-        access["verified_os_access"] = .string(osAccess(mac))
-        // An Automation-backed app's access is its live grant, the same probe
-        // the macOS grants section reads (0.6.9 night: Mail and Notes said
-        // "unverified" while Automation for both was granted).
+        access["verified_os_access"] = .string(systemStatuses[mac] ?? "unverified")
+        // Automation rows and the macOS grants section share one engine read.
         let appName = MacIntegrationID.displayName(for: mac)
         if SystemAppleScriptAdapter.automationTargetApps.contains(appName) {
-            access["verified_os_access"] = .string(await SystemAppleScriptAdapter.automationStatus(app: appName, ask: false))
+            access["verified_os_access"] = .string(systemStatuses["apple_events_\(appName.lowercased())"] ?? "unknown")
         }
         if mac == MacIntegrationID.notifyMobile {
             do {
@@ -217,19 +303,23 @@ extension RuntimeReadProjection {
     }
 
     public static func quietService(_ page: QuietToolPage, _ service: (mac: String?, connectors: [String]),
-                                    dataRoot: URL, platform: any ConnectorStatusPlatform,
-                                    statusText: (ConnectorRecord) -> String, osAccess: (String) -> String) async -> [JSONValue] {
+                                    connectors owner: ConnectorStatusProjection,
+                                    macIntegration: MacIntegrationFacade,
+                                    statusText: (ConnectorRecord) -> String) async -> [JSONValue] {
+        let dataRoot = owner.root
         var sections: [JSONValue] = []
         var lines: [String] = []
         let connectors: [ConnectorRecord]
-        do { connectors = try await ConnectorStatusProjection.readConnectorRecords(root: dataRoot, platform: platform) }
-        catch { return [quietPageSection(page.title, ["Unavailable: \(error.localizedDescription)"])] }
+        do { connectors = try await owner.refresh().get() }
+        catch { return [quietPageIssue(page.title, reason: "connection_read_failed", detail: error.localizedDescription,
+            instruction: "Inspect Doctor's connector checks and resolve the reported read problem before changing this connection.",
+            next: ["action": .string("doctor.run")], error: error)] }
         if let mac = service.mac {
-            let permissions: Result<MacIntegrationPermissionStore.Snapshot, Error>
-            do { permissions = .success(try await MacIntegrationPermissionStore(dataRoot: dataRoot).snapshotChecked()) }
-            catch { permissions = .failure(error) }
-            sections.append(await quietMacAccess(mac, connectors: connectors, dataRoot: dataRoot,
-                permissions: permissions, statusText: statusText, osAccess: osAccess))
+            await macIntegration.refresh()
+            if let permissions = macIntegration.checkedPermissions {
+                sections.append(await quietMacAccess(mac, connectors: connectors, dataRoot: dataRoot,
+                    permissions: permissions, systemStatuses: macIntegration.systemStatuses, statusText: statusText))
+            }
         }
         for connector in connectors where service.connectors.map(ConnectorProofLedger.canonicalID).contains(ConnectorProofLedger.canonicalID(connector.id)) {
             lines.append("\(connector.name.isEmpty ? connector.id : connector.name): "
@@ -268,7 +358,10 @@ extension RuntimeReadProjection {
                 let routing = try await providers.routing.checkedRoutingSnapshotReadOnly()
                 let members = ProviderSurfaceGroups.all.flatMap(\.members).filter { surfaces.contains($0.surface) }
                 content.append(quietPageSection("Models", quietModelLines(members, routing: routing)))
-            } catch { content.append(quietPageSection("Models", ["Models could not be read: \(error.localizedDescription)"])) }
+                content += quietModelIssues(members, routing: routing)
+            } catch { content.append(quietPageIssue("Models", reason: "provider_routing_unavailable",
+                detail: error.localizedDescription, instruction: "Open Providers and resolve the reported routing problem.",
+                tap: "Providers", error: error)) }
         }
         return content
     }
@@ -284,24 +377,38 @@ extension RuntimeReadProjection {
     private static let virtualPageReads = [
         "files": "Read a folder with files.list {path}; read a file with files.read {path}. File and folder results carry their own versions and next arguments.",
         "shell": "Read repository state with git.status {path}. Run commands with shell.run; a page read runs no command.",
-        "web": "Read a URL with web.read {url}; discover web.search with find. A page read fetches no URL and performs no search.",
+        "web": "Read a URL with web.read {url}; search with web.search {query}. A page read fetches no URL and performs no search.",
         "browser": "Read current browser state with browser.status, then read a tab with the browser or Chrome actions. A page read opens no tab.",
         "mac": "Read the current screen with mac.look, or a document with mac.read. A page read captures no screen and moves no control.",
-        "markets": "Market research uses native routes. Read market.status for configured data sources; use market.watchlists, market.quote or market.tradingview for their results.",
     ]
-    public static func quietConnectors(dataRoot: URL, platform: any ConnectorStatusPlatform,
-                                       workspaceCount: Int, telegramConfigured: Bool, statusText: (ConnectorRecord) -> String) async -> [JSONValue] {
+    public static func quietConnectors(_ owner: ConnectorStatusProjection,
+                                       workspaceCount: Int, statusText: (ConnectorRecord) -> String) async -> [JSONValue] {
+        let connectors: [JSONValue]
         do {
-            return quietConnectors(try await ConnectorStatusProjection.readConnectorRecords(root: dataRoot, platform: platform), workspaceCount: workspaceCount, telegramConfigured: telegramConfigured, statusText: statusText)
-        } catch { return [quietPageSection("Connectors", ["Unavailable: \(error.localizedDescription)"])] }
+            connectors = quietConnectors(try await owner.refresh().get(), workspaceCount: workspaceCount, statusText: statusText)
+        } catch { connectors = [quietPageIssue("Connectors", reason: "connectors_read_failed", detail: error.localizedDescription,
+            instruction: "Inspect Doctor's connector checks and resolve the reported read problem before changing connections.",
+            next: ["action": .string("doctor.run")], error: error)] }
+        // What the keyring keeps, by name and where each may go; never a value.
+        let kept: JSONValue
+        do {
+            // After refresh, the owner has metadata or its checked failure.
+            let entries = try owner.secrets!.get().map { entry in
+                "secret:\(entry.name): " + (entry.hosts + entry.programs.map { "program " + $0.path }).joined(separator: ", ")
+                    + (entry.account.map { " · account \($0)" } ?? "") + " · granted " + entry.at.formatted(.iso8601.year().month().day())
+            }
+            kept = quietPageSection("Kept secrets", entries.isEmpty ? ["None."] : entries)
+        } catch { kept = quietPageIssue("Kept secrets", reason: "secret_metadata_read_failed", detail: error.localizedDescription,
+            instruction: "Resolve the reported credential-metadata read problem in Connectors; keep secret values out of chat.",
+            tap: "Connectors → Secrets", error: error) }
+        return connectors + [kept]
     }
 
     public static func quietConnectors(_ connectors: [ConnectorRecord], workspaceCount: Int,
-                                       telegramConfigured: Bool, statusText: (ConnectorRecord) -> String) -> [JSONValue] {
+                                       statusText: (ConnectorRecord) -> String) -> [JSONValue] {
         var sections = [quietPageSection("Connectors", [
             quietCountLine(connectors.count, "connector", "connectors"),
             quietCountLine(workspaceCount, "workspace", "workspaces"),
-            "Telegram: \(telegramConfigured ? "configured" : "not configured")",
         ])]
         sections.append(quietPageSection("Connector ids", connectors.isEmpty ? ["None."] : connectors.map {
             // The same word the Connectors page shows (Connected / Needs sign-in / Off …),
@@ -313,32 +420,38 @@ extension RuntimeReadProjection {
         return sections
     }
 
-    public static func quietMacIntegration(dataRoot: URL, platform: any ConnectorStatusPlatform,
-                                           workspaceCount: Int, telegramConfigured: Bool,
-                                           statusText: (ConnectorRecord) -> String, osAccess: (String) -> String) async -> [JSONValue] {
+    public static func quietMacIntegration(connectors owner: ConnectorStatusProjection,
+                                           macIntegration: MacIntegrationFacade,
+                                           workspaceCount: Int,
+                                           statusText: (ConnectorRecord) -> String) async -> [JSONValue] {
+        let dataRoot = owner.root
         let connectors: [ConnectorRecord]
-        do { connectors = try await ConnectorStatusProjection.readConnectorRecords(root: dataRoot, platform: platform) }
-        catch { return [quietPageSection("Connection readiness", ["Unavailable: \(error.localizedDescription)"])] }
+        do { connectors = try await owner.refresh().get() }
+        catch { return [quietPageIssue("Connection readiness", reason: "connection_readiness_unavailable", detail: error.localizedDescription,
+            instruction: "Inspect Doctor's connector checks and resolve the reported read problem before changing Mac access.",
+            next: ["action": .string("doctor.run")], error: error)] }
         var capabilities: [JSONValue] = []
-        let permissions: Result<MacIntegrationPermissionStore.Snapshot, Error>
-        do { permissions = .success(try await MacIntegrationPermissionStore(dataRoot: dataRoot).snapshotChecked()) }
-        catch { permissions = .failure(error) }
+        await macIntegration.refresh()
+        guard let permissions = macIntegration.checkedPermissions else {
+            return []
+        }
+        let systemStatuses = macIntegration.systemStatuses
         for mac in MacIntegrationID.all {
             capabilities.append(await quietMacAccess(mac, connectors: connectors, dataRoot: dataRoot,
-                permissions: permissions, statusText: statusText, osAccess: osAccess))
+                permissions: permissions, systemStatuses: systemStatuses, statusText: statusText))
         }
         var overview: [JSONValue] = [.object(["heading": .string("Mac Integration"), "capabilities": .array(capabilities),
-            "note": .string("Supported routes, effective permission, connection readiness and OS access are separate facts. OS access uses live nonprompting status where available; unverified is unknown, not denied. No app or content was probed; no permission was requested.")]),
-            .object(["heading": .string("macOS grants"), "grants": .array(await quietMacOSGrants()),
+            "note": .string("Routes, permission, connection and macOS access are separate. Live OS status is read without prompting where supported; unverified means unknown. No app or content probe; no permission request.")]),
+            .object(["heading": .string("macOS grants"), "grants": .array(quietMacOSGrants(systemStatuses)),
                 "note": .string("Read live from macOS at this page read, without prompting. A grant that is not granted names the one card that asks for it.")])]
-        overview += quietConnectors(connectors, workspaceCount: workspaceCount, telegramConfigured: telegramConfigured, statusText: statusText)
+        overview += quietConnectors(connectors, workspaceCount: workspaceCount, statusText: statusText)
         return overview
     }
 
     /// The macOS grants her Mac work rides on, as macOS holds them now, never a
     /// saved copy: Accessibility, Screen Recording, Full Disk Access, and
     /// Automation per app she scripts.
-    static func quietMacOSGrants() async -> [JSONValue] {
+    static func quietMacOSGrants(_ systemStatuses: [String: String]) -> [JSONValue] {
         func grant(_ name: String, _ state: String, card capability: String) -> JSONValue {
             var row: [String: JSONValue] = ["grant": .string(name), "state": .string(state)]
             if state != SystemPermissionStatus.granted.rawValue {
@@ -347,11 +460,11 @@ extension RuntimeReadProjection {
             return .object(row)
         }
         var grants = [SystemPermissionCapability.accessibility, .screenRecording, .fullDiskAccess].map {
-            grant($0.displayName, SystemPermissionPreflight.status($0).rawValue, card: $0.rawValue)
+            grant($0.displayName, systemStatuses[$0.rawValue] ?? "unknown", card: $0.rawValue)
         }
         for app in SystemAppleScriptAdapter.automationTargetApps {
             guard let bundleID = SystemAppleScriptAdapter.automationTargetBundleIDs[app] else { continue }
-            grants.append(grant("Automation for \(app)", await SystemAppleScriptAdapter.automationStatus(app: app, ask: false),
+            grants.append(grant("Automation for \(app)", systemStatuses["apple_events_\(app.lowercased())"] ?? "unknown",
                                 card: "applescript:" + bundleID))
         }
         return grants
@@ -380,6 +493,7 @@ extension RuntimeReadProjection {
 
     public static func quietPersonality(name: String?, currentPersona: String, documents: [PersonaDocSpec], dataRootOverride: URL?) async -> [JSONValue] {
         var head: [String] = []
+        var selectionIssue: JSONValue?
         if let name { head.append("Name: \(name)") }
         let persona = dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? SwiftNativePersonaEngine()
         let root = await persona.personaRoot
@@ -390,18 +504,27 @@ extension RuntimeReadProjection {
             if id != "canonical" { head.append("Current persona name: \(id).") }
             else if let name { head.append("Current persona name: \(name) (the root persona).") }
             else { head.append("Current persona: the root persona.") }
-        } catch { head.append("Current persona: unavailable: \(error.localizedDescription)") }
+        } catch {
+            selectionIssue = quietPageIssue("Current persona", reason: "persona_selection_unavailable",
+                detail: error.localizedDescription, instruction: "Inspect the persona directory and resolve the reported selection problem without replacing persona documents.",
+                next: ["action": .string("files.list"), "args": .object(["path": .string(root.path)])], error: error)
+        }
         head.append(quietCountLine(documents.count, "document", "documents"))
         var sections = [quietPageSection("Personality", head)]
+        if let selectionIssue { sections.append(selectionIssue) }
         do {
             let names = try PersonaCompiler.customPersonaNames(root: root)
             sections.append(quietPageSection("Custom names for persona.set", names.isEmpty ? ["None."] : names))
-        } catch { sections.append(quietPageSection("Custom personas", ["Unavailable: \(error.localizedDescription)"])) }
+        } catch { sections.append(quietPageIssue("Custom personas", reason: "persona_names_unavailable",
+            detail: error.localizedDescription, instruction: "Resolve the reported persona-directory read problem without changing persona content.",
+            next: ["action": .string("files.list"), "args": .object(["path": .string(root.path)])], error: error)) }
         do {
             let consults = try await SwiftNativeStudioStore(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).listConsults()
             sections.append(quietPageSection("Consult ids for studio.consult_read", consults.isEmpty ? ["None."]
                 : consults.map { "\($0.id): \($0.question) · \($0.descriptionOnly ? "description only" : "has artifacts")" }))
-        } catch { sections.append(quietPageSection("Consults", ["Unavailable: \(error.localizedDescription)"])) }
+        } catch { sections.append(quietPageIssue("Consults", reason: "studio_consults_unavailable",
+            detail: error.localizedDescription, instruction: "Resolve the reported consult-store read problem, preserving saved consults, then reload Personality.",
+            next: ["page": .string("personality")], error: error)) }
         if !documents.isEmpty {
             sections.append(quietPageSection("Documents", documents.map { doc in
                 let first = doc.content.split(whereSeparator: \.isNewline)
@@ -412,25 +535,52 @@ extension RuntimeReadProjection {
         }
         return sections
     }
-    public static func quietChatCards(_ collapsed: InlineInteractionResolver.CollapsedCards, dataRoot: URL) async -> [JSONValue] {
+    public static func quietChatCards(_ read: ChatTranscriptProjection) -> [JSONValue] {
         var sections: [JSONValue] = []
-        let pairs = collapsed.pairs
+        let pairs = read.messages.flatMap { message in
+            message.inlineCards.map { (rowID: message.id, card: $0.model) }
+        }
         guard !pairs.isEmpty else { return sections }
         sections.append(quietPageSection(
             "Cards",
-            [collapsed.heading
+            [read.cardsHeading
                 + " in this conversation. card.answer answers one by its id."]
         ))
         for pair in pairs {
-            let descriptor = InlineInteractionResolver.descriptor(
-                for: pair.interaction, dataRoot: dataRoot
-            )
-            // The same live read as the glass: done elsewhere reads as done.
-            let card = InlineCardProjection.model(
-                await InlineInteractionResolver.liveProjection(pair.interaction, dataRoot: dataRoot),
-                descriptor: descriptor,
-                repeatCount: collapsed.counts[pair.interaction.id] ?? 1
-            )
+            let card = pair.card
+            func cardSection(_ lines: [String]) -> JSONValue {
+                var face: [String: JSONValue] = [
+                    "heading": .string(card.title), "lines": .array(lines.map { .string(bounded($0)) }),
+                    "status": .string(card.state.rawValue),
+                ]
+                if let outcome = card.outcome { face["outcome"] = .string(outcome) }
+                if let meta = card.outcomeMeta { face["outcome_meta"] = .string(meta) }
+                let unsupportedInstruction = "Tell the person: this copy of NativeAgent has no control for card \(card.id) (\(card.title)). Preserve the card; no answer can run here."
+                let unsupported = Repair.remedy(owner: "NativeAgent card controls", nextCall: nil, tap: unsupportedInstruction, instruction: unsupportedInstruction)
+                switch card.state {
+                case .stopped:
+                    face["reason"] = .string(DataRootLife.stoppedReason)
+                    face["remedy"] = Repair.remedy(owner: card.title, nextCall: nil,
+                        tap: "Chat → \(card.title) [\(card.id)] → Resume",
+                        instruction: "The person can use Resume to start this request fresh after the restore.")
+                case .unknown:
+                    face["reason"] = .string("card_unsupported")
+                    face["detail"] = .string(card.outcome ?? "This build has no control for this card.")
+                    face["remedy"] = unsupported
+                case .failed:
+                    face["reason"] = .string(card.canRetry ? "card_action_failed" : "card_unsupported")
+                    face["detail"] = .string(card.outcome ?? card.why)
+                    face["scope"] = .array(card.scopeLines.map(JSONValue.string))
+                    face["remedy"] = card.canRetry
+                        ? Repair.remedy(owner: card.title, nextCall: nil,
+                            tap: "Chat → \(card.title) [\(card.id)] → Try again",
+                            instruction: "Resolve the reported cause; the owner can then use this card's Try again control.")
+                        : unsupported
+                case .pending, .running, .settled, .declined, .superseded:
+                    break
+                }
+                return .object(face)
+            }
             // The glass does not draw a settled card as a card. It draws ONE
             // line — the receipt, the refusal, or "Asked earlier" — and only a
             // card still waiting on the person carries the reason, the scope
@@ -443,7 +593,7 @@ extension RuntimeReadProjection {
                 // "Asked earlier" is the superseded line and ONLY the
                 // superseded line: a newer identical ask took this one's
                 // place, so there is nothing to answer here.
-                sections.append(quietPageSection(card.title, [
+                sections.append(cardSection([
                     // Every other branch leads with the state; this one read as
                     // a bare "Asked earlier." with nothing saying what state
                     // that is (Agent, 2026-09-14).
@@ -462,7 +612,7 @@ extension RuntimeReadProjection {
                 if let meta = card.outcomeMeta { lines.append(meta) }
                 lines.append("Interaction id: \(card.id)")
                 lines.append("On message: \(pair.rowID)")
-                sections.append(quietPageSection(card.title, lines))
+                sections.append(cardSection(lines))
                 continue
             case .declined, .settled:
                 var receipt: [String] = ["State: \(card.state.rawValue)"]
@@ -470,9 +620,9 @@ extension RuntimeReadProjection {
                 if let meta = card.outcomeMeta { receipt.append(meta) }
                 receipt.append("Interaction id: \(card.id)")
                 receipt.append("On message: \(pair.rowID)")
-                sections.append(quietPageSection(card.title, receipt))
+                sections.append(cardSection(receipt))
                 continue
-            case .pending, .running, .failed:
+            case .pending, .running, .failed, .stopped:
                 // A failure settled NOTHING — on the glass it keeps its card,
                 // its explanation, its field and its "Try again" — so it is
                 // projected with those too, not as a receipt.
@@ -486,7 +636,7 @@ extension RuntimeReadProjection {
                 // build, so naming buttons that are not drawn would be a lie.
                 lines.append("There is no control for this on this build, so it can't be answered here.")
             } else {
-                lines.append("Do: \(card.state == .failed ? "Try again" : card.primaryLabel)")
+                lines.append("Do: \(card.state == .stopped ? "Resume" : card.state == .failed ? "Try again" : card.primaryLabel)")
                 // Joined mid-sentence after a dash, so it takes the same
                 // lowercased lead the settled decline line takes — "Not now —
                 // Without Notion…" read as a new sentence beside "Not now —
@@ -513,21 +663,22 @@ extension RuntimeReadProjection {
             if let meta = card.outcomeMeta { lines.append(meta) }
             lines.append("Interaction id: \(card.id)")
             lines.append("On message: \(pair.rowID)")
-            sections.append(quietPageSection(card.title, lines))
+            sections.append(cardSection(lines))
         }
         return sections
     }
 
     public static func quietDesk(desk: DeskFacade) async -> [JSONValue] {
-        let snapshot = await Task.detached(priority: .userInitiated) {
-            await DeskPageSnapshot.load(desk: desk)
-        }.value
+        let snapshot = await desk.loadPage()
         guard snapshot.loaded else {
-            return [quietPageSection("Desk", [snapshot.deskUnavailable ?? "The board could not be read."])]
+            return [quietPageIssue("Desk", reason: "desk_unavailable",
+                detail: snapshot.deskUnavailable ?? "The board could not be read.",
+                instruction: "Inspect Doctor's Desk check and repair the reported board problem without discarding work.",
+                next: ["action": .string("doctor.run")])]
         }
-        let items = snapshot.items
-        let waiting = DeskPageContent.waitingOnOwner(items)
-        let blocked = DeskPageContent.blocked(items)
+        let items = snapshot.boardItems
+        let waiting = snapshot.rows.owner
+        let blocked = snapshot.rows.blocked
         let active = DeskPageContent.active(items)
         // `stuckReason` answers "why is this stuck" and always answers; asking
         // it about a row that is not stuck would print a blocked line over a
@@ -543,25 +694,29 @@ extension RuntimeReadProjection {
         }
         var sections = [quietPageSection("Desk", [
             DeskState(items: items, generatedTs: snapshot.generatedTs ?? "").boardCountSummary,
-            quietCountLine(waiting.count, "item waiting on you", "items waiting on you"),
+            quietCountLine(waiting.count, "item waiting on the owner", "items waiting on the owner"),
             quietCountLine(blocked.count, "item blocked", "items blocked"),
         ])]
-        if !waiting.isEmpty { sections.append(quietPageSection("Waiting on you", rows(waiting, stuck: true))) }
+        if !waiting.isEmpty { sections.append(quietPageSection("Waiting on the owner", rows(waiting, stuck: true))) }
         if !blocked.isEmpty { sections.append(quietPageSection("Blocked", rows(blocked, stuck: true))) }
         if !active.isEmpty { sections.append(quietPageSection("In play", rows(active))) }
         return sections
     }
 
-    public static func quietAgents(dataRoot: URL) -> [JSONValue] {
-        let dispatcher = SwiftToolDispatcher(dataRoot: dataRoot, allowProcessGlobalTools: false)
-        let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
-        guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else {
-            return [quietPageSection("Agents", ["Contacts and trusted switches could not be read."])]
+    public static func quietAgents(_ contacts: ContactListFacade) async -> [JSONValue] {
+        let doors: [AgentContactRow]
+        do { doors = try await contacts.refreshDoors() }
+        catch {
+            return [quietPageIssue("Agents", reason: "agent_contacts_unavailable", detail: error.localizedDescription,
+                instruction: "Inspect Doctor for the contact-store failure before changing contacts or trusted switches.",
+                next: ["action": .string("doctor.run")], error: error)]
         }
-        let rows = AgentContactRow.rows(peers: peers, candidates: [], usable: usable, dataRoot: dataRoot)
+        let rows = doors.filter(\.primary)
+        let peers = doors.compactMap(\.contact)
         var sections = [quietPageSection("Agents", [
             quietCountLine(rows.count, "contact", "contacts"),
-            "Opening this page only reads: contacts and switches; nothing is run. agent.contacts {discover: true} finds agents by what they speak (A2A card, MCP settings, ACP program) and runs each found program's --help and initialize under the rule a send to it uses; its result says what it read and what it ran.",
+            "This page only reads contacts and switches; it runs nothing.",
+            "agent.contacts {discover:true} finds A2A cards, MCP settings and ACP programs; may run --help or initialize under send authority; receipts name reads and runs.",
         ])]
         if !rows.isEmpty {
             sections.append(quietPageSection("Contacts", rows.map { "\($0.displayName): \($0.pillWord) · \($0.status)" }))
@@ -585,18 +740,28 @@ extension RuntimeReadProjection {
         var sections: [JSONValue] = []
         for group in ProviderSurfaceGroups.all {
             sections.append(quietPageSection(group.title, RuntimeReadProjection.quietModelLines(group.members, routing: routing)))
+            sections += quietModelIssues(group.members, routing: routing)
         }
         let accounts = providers.map { info -> String in
             let mode = info.auth_mode.map { " via \($0)" } ?? ""
             return "\(info.display_name): \(info.auth_status.state) — \(info.auth_status.detail)\(mode)"
         }
         sections.append(quietPageSection("Accounts", accounts.isEmpty ? ["No providers listed."] : accounts))
+        for info in providers where !info.auth_status.eligible {
+            sections.append(quietPageIssue(info.display_name, reason: "provider_account_" + info.auth_status.state,
+                detail: info.auth_status.detail, instruction: "Resolve the reported credential problem in this account's Providers controls; keys stay out of chat.",
+                tap: "Providers → \(info.display_name)"))
+        }
         return sections
     }
 
     public static func quietTrust(trust: TrustFacade, dataRoot: URL, presetTitle: (TrustPolicy, String) -> String, guardrailLines: (TrustPolicy, String) -> [String]) -> [JSONValue] {
         guard let policy = trust.policy else {
-            return [quietPageSection("Trust", ["No Trust policy has loaded."])]
+            return [quietPageIssue("Trust", reason: "trust_policy_unavailable",
+                detail: trust.securityStatus?.flags.first(where: { $0.id == "trust_policy_unavailable" })?.detail
+                    ?? trust.securityRefreshError ?? "No Trust policy has loaded.",
+                instruction: "Inspect Doctor's Trust check; repair the reported policy problem without deleting or replacing the saved policy.",
+                next: ["action": .string("doctor.run")])]
         }
         let mode = TrustAccessModeCapabilityCatalog.agentAccessMode(from: policy)
         var head = ["Preset: \(presetTitle(policy, mode))", "Agent access: \(mode)"]
@@ -613,37 +778,37 @@ extension RuntimeReadProjection {
             if !legacy.isEmpty {
                 sections.append(quietPageSection("Legacy daemon backups", legacy.map { "\($0.id): \($0.createdAt) · \($0.reason)" }))
             }
-        } catch { sections.append(quietPageSection("Legacy daemon backups", ["Unavailable: \(error.localizedDescription)"])) }
+        } catch { sections.append(quietPageIssue("Legacy daemon backups", reason: "trust_legacy_backups_unavailable",
+            detail: error.localizedDescription, instruction: "Resolve the reported backup-store read problem before restoring; preserve existing backups.",
+            tap: "Trust → Advanced → Backups", error: error)) }
         return sections
     }
 
-    public static func quietCapabilities(trust: TrustFacade, approvals: ApprovalsFacade, workflowCount: Int, mcpServerCount: Int, actionCount: Int) -> [JSONValue] {
+    public static func quietCapabilities(trust: TrustFacade, approvals: ApprovalsFacade, workflowCount: Int, actionCount: Int) -> [JSONValue] {
         [quietPageSection("Capabilities", [
             quietCountLine(trust.capabilitySummary?.records.count ?? 0, "capability", "capabilities"),
             quietCountLine(workflowCount, "workflow", "workflows"),
-            quietCountLine(mcpServerCount, "MCP server", "MCP servers"),
             quietCountLine(actionCount, "action", "actions"),
             quietCountLine(approvals.records.filter { $0.status.lowercased() == "pending" }.count,
                       "approval waiting", "approvals waiting"),
         ])]
     }
 
-    public static func quietBots(dataRoot: URL, stateWord: (BotsShelfRecord, Bool, Bool) -> String) async -> [JSONValue] {
-        let unattended = await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
-        let loaded = try? await Task.detached(priority: .userInitiated) {
-            (records: try BotsShelfRecord.read(root: dataRoot, unattended: unattended),
-             runs: try BotRunQueue(dataRoot: dataRoot).activeAndQueuedIDs())
-        }.value
-        guard let loaded else {
-            return [quietPageSection("Helpers", ["The shelf could not be read."])]
+    public static func quietBots(engine: NativeAgentEngine) async -> [JSONValue] {
+        var unattended = false
+        let loaded: [BotsShelfRecord]
+        do { loaded = try await engine.botsShelfRead { unattended = $0 } }
+        catch {
+            return [quietPageIssue("Helpers", reason: "helpers_shelf_unavailable", detail: error.localizedDescription,
+                instruction: "Resolve the reported helper-shelf read problem, preserving definitions and run history, then reload Helpers.",
+                next: ["page": .string("bots")], error: error)]
         }
         var sections: [JSONValue] = []
-        var header = [quietCountLine(loaded.records.count, "helper", "helpers") + " on the shelf."]
+        var header = [quietCountLine(loaded.count, "helper", "helpers") + " on the shelf."]
         if !unattended { header.append(BotsShelfUnattended.pageLine) }
         sections.append(quietPageSection("Helpers", header))
-        for record in loaded.records {
-            let state = stateWord(record, loaded.runs.active.contains(record.id), loaded.runs.queued.contains(record.id))
-            var lines: [String] = ["State: \(state)"]
+        for record in loaded {
+            var lines: [String] = ["State: \(record.statusWord)"]
             let brief = record.definition.brief
                 .split(whereSeparator: \.isNewline)
                 .map { $0.trimmingCharacters(in: .whitespaces) }

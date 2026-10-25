@@ -49,6 +49,8 @@ its bearer token.
   sensitive credential, trust, pairing and token paths. File/Mac-control
   mutations retain the protected-system-path floor under Full Mac, enforced
   by `FileSystemActions.swift` and `MacControlSensitivePathFence`.
+  Both raw file routes also preserve the dedicated owners of Mac-control
+  state/audit, their screen, activity capture and experiences; reads keep their scope.
 - **Script bypass:** `AppScriptRunner.swift` gives JavaScript no direct file,
   network or process API. Calls re-enter the app action path under the action's
   ordinary gates, with execution limits.
@@ -68,18 +70,16 @@ started keeps its one card, as above.
 
 | Material | Owner / location |
 |---|---|
-| GitHub PAT and OAuth credentials | `GitHubCredentialStore.swift`, backed by macOS Keychain |
 | Provider API keys | `ProviderAPIKeyStore.swift`, backed by macOS Keychain |
-| Connector OAuth and API credentials | Device-bound Keychain references for supported connectors (`ConnectorCredentialFile.swift`); remaining file-backed stores under `providers/`, `oauth_tokens/` and `connectors/<id>/auth.json` at mode `0600`; see `Connectors+Auth.swift` and `OAuthCredentialDestinations.swift` |
+| Service credentials | The keyring (`Keyring.swift`) for what abilities use; Slack's door tokens in Keychain (`SlackCredentials.swift`). Retired services' credential files and Keychain items stay untouched and unread. |
 | Codex OAuth credentials | App `codex_home/auth.json` and login-mode-dependent credential candidates in `LLMClient+OpenAIOAuthCredentials.swift` |
 | Local agent bridge endpoint/token | `ClaudeBridgeRuntime.swift` publishes the Claude lane's `bridge.json`; `AgentBridgeRuntime.swift` publishes the agent bridge's descriptor under `~/.config/nativeagent-link/` |
-| Browser IPC endpoint/token | `BrowserWindow.swift` publishes `browser_ipc.json` |
+| Browser IPC endpoint/token | `BrowserIPCServer.writeDiscovery` publishes `browser_ipc.json`, the single endpoint/token descriptor; the duplicate `browser_ipc_token` writer is retired |
 | iOS pairing material | `PairingSecretManager.swift` |
 
-Treat file-backed credential stores as sensitive in backups and diagnostics;
-GitHub's Keychain storage does not cover other credentials. Bridge tokens,
-pairing secrets, OAuth tokens, APNS device tokens and provider credentials
-must not be logged. Use redaction, suffixes or hashes when correlation is
+Treat file-backed credential stores as sensitive in backups and diagnostics.
+Bridge tokens, pairing secrets, OAuth tokens, APNS device tokens and provider
+credentials must not be logged. Use redaction, suffixes or hashes when correlation is
 needed; `NativeAgentSecretRedactor.swift` and `TurnSecretRedactor.swift` own
 shared redaction rules.
 
@@ -103,8 +103,9 @@ not protect against provider compromise or provider-side metadata exposure.
 
 Source owners are under `Modules/NativeAgentCore/Sources/`:
 `TrustCenter/`, `ApprovalInbox/`, `DeviceSync/` and `AppToolRuntime/`.
-The loopback listeners and bridge presentation live under
-`Sources/NativeAgentApp/`.
+Loopback runtime owners are core's `Agents/ClaudeBridgeRuntime.swift`,
+`AgentConversations/AgentBridgeRuntime.swift` and `Browser/BrowserIPCServer.swift`;
+app presentation lives under `Sources/NativeAgentApp/`.
 
 Public builds must not include live state, tokens, local identity, or retired
 runtime artifacts. Release checks live in [`script/release.sh`](../script/release.sh)

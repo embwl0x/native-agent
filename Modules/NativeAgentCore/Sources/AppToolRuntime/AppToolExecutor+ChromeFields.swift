@@ -1,10 +1,12 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnContracts
+import AgentWorkspace
 import ChromeControl
 import MacControl
 import PersistenceCore
 import ToolRegistry
 import Senses
+// Blueprint: | `AppToolExecutor+ChromeFields.swift` | `AppToolExecutor`: `resolveChromeTarget`, `chromeFields`, `runChromeFieldsCall` |
 
 /// 2026-09-24 (tools-web): Chrome jobs in one call. A row can be named by its
 /// label, snapshot_id defaults to the last page read on the tab, and a form
@@ -187,8 +189,11 @@ extension AppToolExecutor {
         func refused(_ why: String) -> JSONValue {
             .object(["ok": .bool(false), "error": .string("fields_not_sent"), "reason": .string((head + [why]).joined(separator: "\n"))])
         }
-        guard await chromeFollowUpAllowed("browser.chrome_snapshot", surface: surface) else {
-            return refused("Reading the page needs your approval here, so nothing was filled. Call browser.chrome_snapshot, then fill one row at a time.")
+        let snapshotAdmission = await chromeFollowUpCheck("browser.chrome_snapshot", surface: surface)
+        if case .object(var stop)? = snapshotAdmission.refusal {
+            stop["completed"] = .array(head.map(JSONValue.string))
+            stop["effects"] = .string(head.isEmpty ? "none" : "occurred")
+            return .object(stop)
         }
         var seen = ChromePageMirror.page(tab: tab, session: session)
         func read() async throws -> ChromePageMirror.Page? {
@@ -237,8 +242,9 @@ extension AppToolExecutor {
         var lines: [String] = [], ok = true, last: String?, lastTool = actionId
         var takeover: [String: JSONValue]?
         func act(_ tool: String, target: String, wants: Set<String>, extra: [String: JSONValue], shown: String, submission: Bool = false) async -> Bool {
-            if tool != actionId, await !chromeFollowUpAllowed(tool, surface: surface, enforceAutonomy: submission ? true : nil) {
-                lines.append("✗ " + shown + ": needs your approval here; call " + tool + " for it"); return false
+            if tool != actionId,
+               let stop = await chromeFollowUpCheck(tool, surface: surface, enforceAutonomy: submission ? true : nil).stop {
+                lines.append("✗ " + shown + ": " + stop); return false
             }
             for attempt in 0..<2 {
                 let row: ChromePageMirror.Row

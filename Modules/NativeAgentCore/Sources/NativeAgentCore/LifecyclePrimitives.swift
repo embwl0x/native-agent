@@ -1,6 +1,8 @@
 import Foundation
 import os
 
+// Blueprint: | `LifecyclePrimitives.swift` | `ScopedWaiter`, `OnceByKey` and `BoundedWait`: lifecycle-safe waiter release, keyed single execution and bounded waits |
+
 // Lifecycle primitives — Track C of docs/build_plans/lifecycle-prevention-design.md.
 //
 // 99 of 272 logged NativeAgent bugs (36%) are ONE shape: something was
@@ -9,9 +11,6 @@ import os
 // Reviews catch those one at a time, forever. These types make the release
 // un-skippable BY CONSTRUCTION instead:
 //
-//   * `ScopedSlot`        — a handle whose `deinit` is the ONLY release path.
-//   * `ScopedSlotCounter` — bounded counter; the count is private to the type,
-//                           so nothing can increment without taking a handle.
 //   * `ScopedWaiter`      — a parked continuation that resumes EXACTLY once,
 //                           race-free against a resume that beats the park.
 //   * `OnceByKey`         — run-at-most-once-per-key that does not retain the
@@ -19,92 +18,6 @@ import os
 //   * `BoundedWait`       — every await gets a deadline; expiry throws a TYPED,
 //                           LOGGED timeout naming the reason. Never a silent
 //                           hang, never a bare `catch {}` that erases the class.
-
-/// Shared log target for invariant violations these primitives recover from
-/// rather than crash on. A recovery that is not logged is a silent bug.
-enum LifecycleLog {
-    static let logger = Logger(subsystem: "com.nativeagent.core", category: "lifecycle-primitives")
-}
-
-// MARK: - ScopedSlot
-
-/// An RAII-style handle for one acquired slot / registration.
-///
-/// The release closure runs exactly once, from `deinit`, no matter which path
-/// leaves the scope holding it — normal return, `throw`, `guard` exit, or task
-/// cancellation. There is deliberately NO public `release()`: a second release
-/// path is exactly the drift this type exists to prevent.
-///
-/// Escaping use is explicit and safe: capture the handle in the escaping block
-/// (`{ [slot] in ... }`) and that block now OWNS the release — the slot stays
-/// held until the block's context is torn down.
-public final class ScopedSlot: @unchecked Sendable {
-    private let releaseAction: @Sendable () -> Void
-
-    /// A standalone handle whose only duty is to run `release` when it dies.
-    /// Prefer `ScopedSlotCounter`, which also owns the state
-    /// being guarded; this initializer is for adapting an existing pair.
-    public init(release: @escaping @Sendable () -> Void) {
-        self.releaseAction = release
-    }
-
-    deinit { releaseAction() }
-}
-
-// MARK: - ScopedSlotCounter
-
-/// A bounded concurrency counter whose count is PRIVATE to the type: the only
-/// way to increment is to receive a `ScopedSlot`, and the only way to decrement
-/// is to let that handle die.
-public final class ScopedSlotCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var active = 0
-    public let limit: Int
-    public let name: String
-
-    public init(name: String, limit: Int) {
-        self.name = name
-        self.limit = max(0, limit)
-    }
-
-    /// Slots currently held. Read-only by design — diagnostics, never control.
-    public var activeCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return active
-    }
-
-    /// Returns a handle, or nil when the limit is already reached. The caller
-    /// must keep the handle alive for exactly as long as the work runs.
-    public func acquire() -> ScopedSlot? {
-        lock.lock()
-        guard active < limit else {
-            lock.unlock()
-            return nil
-        }
-        active += 1
-        lock.unlock()
-        return ScopedSlot { [weak self] in self?.releaseOne() }
-    }
-
-    private func releaseOne() {
-        lock.lock()
-        guard active > 0 else {
-            lock.unlock()
-            // Unreachable by construction: the only increment hands out a
-            // handle, and the only decrement is that handle's `deinit`. A
-            // silent `max(0, active - 1)` would have hidden a real double
-            // release; trap in debug, log and no-op in release.
-            assertionFailure("ScopedSlotCounter(\(name)) released with no active slot")
-            LifecycleLog.logger.error(
-                "scoped slot over-release ignored: \(self.name, privacy: .public)"
-            )
-            return
-        }
-        active -= 1
-        lock.unlock()
-    }
-}
 
 // MARK: - ScopedWaiter
 

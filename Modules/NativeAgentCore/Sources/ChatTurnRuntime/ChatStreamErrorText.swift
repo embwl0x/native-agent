@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ChatStreamErrorText.swift` | `ChatStreamErrorText` enum; `normalize` |
 
 public enum ChatStreamErrorText {
     /// The SAME sentence on Mac and iPhone (2026-09-13, first-failure pass).

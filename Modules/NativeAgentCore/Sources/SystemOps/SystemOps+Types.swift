@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 
+// Blueprint: | `SystemOps+Types.swift` | `RoutePlanResult`, `IntentRoutePlan` and `SystemOpsError`: router plan/capability values and explicit SystemOps failures |
+
 // MARK: - Result types
 
 public struct RoutePlanResult: Sendable, Equatable {

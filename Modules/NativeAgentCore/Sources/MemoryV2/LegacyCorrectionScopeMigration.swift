@@ -1,7 +1,8 @@
 // Astra audit 2026-09-11 finding 5 — the legacy correction budget.
 //
-// `CorrectionScopeAtIntake` (2026-09-11) scopes corrections as they ARRIVE and
-// says so in its own docstring: it never edits an atom already in the store.
+// The former `CorrectionScopeAtIntake` (2026-09-11) scoped arriving corrections,
+// never atoms already in the store. It is retired; intake now uses explicit
+// context_topics only (docs/MEMORY_SYSTEM_MAP.md).
 // That left the thing the audit actually measured untouched. The live Context
 // store holds 31 current correction atoms, 13 of them with no `context_topic`
 // entity, and `ContextCorrectionScope.applies` is fail-open — no scoping entity
@@ -22,8 +23,8 @@
 // exactly the key `commit_memory` writes, after which the ordinary projection
 // mints the `context_topic` entities itself (same atom id, new version).
 //
-// WHY A HARD-CODED TABLE AND NOT A CLASSIFIER. `CorrectionScopeAtIntake`
-// deliberately refuses to guess without dispatch evidence from the turn that
+// WHY A HARD-CODED TABLE AND NOT A CLASSIFIER. The former intake
+// deliberately refused to guess without dispatch evidence from the turn that
 // produced the correction, and for a legacy row that evidence is gone. The
 // audit asked for a legacy scope REVIEW, so this is the review: thirteen
 // decisions, made once, by hand, listed here. Seven get a topic. Six stay
@@ -40,7 +41,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `LegacyCorrectionScopeMigration.swift` | Reviewed scope application and its consumed completion marker; no dated write-only audit copies; `runIfNeeded`, `migrationsDir` |
 
+/// Completion marker: local backup/export and memory PrivacyMap, no phone sync.
 public enum LegacyCorrectionScopeMigration {
     static let version = 1
 
@@ -115,8 +118,7 @@ public enum LegacyCorrectionScopeMigration {
         ),
     ]
 
-    /// The six that stay global, and why. Recorded in the receipt so the review
-    /// reads as thirteen decisions rather than seven edits.
+    /// The six that stay global, and why: the source record of the review.
     static let keptGlobal: [(atomPrefix: String, why: String)] = [
         ("atom:34ab290566", "interpersonal — greeting him, and his timezone"),
         ("atom:118f106ff378", "authorization — his quiet-desktop boundary"),
@@ -191,11 +193,21 @@ public enum LegacyCorrectionScopeMigration {
                 "context_topics_origin": .string(originValue),
             ])
             do {
-                guard try await storage.updateMemory(id: row.id, patch: patch) != nil else {
+                guard try await storage.updateMemory(
+                    id: row.id, patch: patch, expectedContent: row.content,
+                    onlyIf: { current in
+                        guard current.status == row.status, current.lifecycle == row.lifecycle,
+                              metadataString(current.metadata, "kind") == "correction" else { return false }
+                        if case .array(let topics)? = metadataValue(current.metadata, "context_topics"), !topics.isEmpty {
+                            return false
+                        }
+                        return true
+                    }
+                ) != nil else {
                     skipped.append(.object([
                         "atom_prefix": .string(entry.atomPrefix),
                         "memory_id": .string(row.id),
-                        "reason": .string("update returned no row"),
+                        "reason": .string("row changed or already scoped"),
                     ]))
                     continue
                 }
@@ -223,20 +235,16 @@ public enum LegacyCorrectionScopeMigration {
             ))
         }
 
-        // The marker means DONE. A skip is an unresolved row, not a resolved one
-        // (review r1): write the receipt so the skip is visible, but no marker,
-        // so the next launch tries those rows again.
-        await writeReceiptAndMarker(
-            dataRoot: dataRoot,
-            applied: applied,
-            skipped: skipped,
-            satisfied: satisfied,
-            correctionsSeen: corrections.count,
-            // 2026-09-22: an install that never had any of the reviewed rows
-            // (every new user) has nothing to retry; without this it wrote a
-            // receipt on every launch forever.
-            complete: skipped.isEmpty || !anyMatched
-        )
+        if skipped.isEmpty || !anyMatched {
+            do {
+                let marker = markerPath(dataRoot: dataRoot)
+                try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try await SwiftNativePersistenceCore().writeDataAtomicDurable(
+                    Data(MemoryStorage.nowISO8601().utf8), to: marker)
+            } catch {
+                nativeLog("[correctionScope] completion marker write failed: %@", String(describing: error))
+            }
+        }
         nativeLog("[correctionScope] legacy scope review: scoped=\(applied.count) already_scoped=\(satisfied.count) skipped=\(skipped.count) kept_global=\(keptGlobal.count)")
     }
 
@@ -251,55 +259,6 @@ public enum LegacyCorrectionScopeMigration {
     static func markerPath(dataRoot: URL) -> URL {
         migrationsDir(dataRoot: dataRoot)
             .appendingPathComponent("correction_scope_review_v\(version).done")
-    }
-
-    // MARK: - Receipt
-
-    private static func writeReceiptAndMarker(
-        dataRoot: URL,
-        applied: [JSONValue],
-        skipped: [JSONValue],
-        satisfied: [JSONValue],
-        correctionsSeen: Int
-    ,
-        complete: Bool
-    ) async {
-        let dir = migrationsDir(dataRoot: dataRoot)
-        let stamp = MemoryStorage.nowISO8601()
-        let receipt: JSONValue = .object([
-            "migration": .string("correction_scope_review"),
-            "version": .int(Int64(version)),
-            "completed_at": .string(stamp),
-            "active_corrections_seen": .int(Int64(correctionsSeen)),
-            "scoped": .array(applied),
-            "already_scoped": .array(satisfied),
-            "skipped": .array(skipped),
-            "kept_global": .array(keptGlobal.map {
-                .object(["atom_prefix": .string($0.atomPrefix), "why": .string($0.why)])
-            }),
-        ])
-        let core = SwiftNativePersistenceCore()
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try await core.writeJSON(
-                receipt,
-                to: dir.appendingPathComponent("correction_scope_review_v\(version)_\(safe(stamp)).json")
-            )
-            // Marker LAST, and only when nothing is UNRESOLVED: a crash before
-            // this re-runs the pass, and every per-row guard above makes the
-            // re-run a no-op. An ambiguous or failed row keeps the pass alive
-            // for the next launch; an already-scoped row does not, because there
-            // is nothing left for the pass to do to it.
-            if complete {
-                try await core.writeDataAtomicDurable(Data(stamp.utf8), to: markerPath(dataRoot: dataRoot))
-            }
-        } catch {
-            nativeLog("[correctionScope] receipt/marker write failed: \(String(describing: error))")
-        }
-    }
-
-    private static func safe(_ stamp: String) -> String {
-        String(stamp.map { $0 == ":" ? "-" : $0 })
     }
 
     // MARK: - Metadata helpers

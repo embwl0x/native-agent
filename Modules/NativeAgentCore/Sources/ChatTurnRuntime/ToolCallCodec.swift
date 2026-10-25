@@ -5,6 +5,8 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 
+// Blueprint: | `ToolCallCodec.swift` | `ToolCallCodec`: provider tool offerings, streamed prose release and native/text-marker call decoding; the turn loop owns dispatch and budgets |
+
 /// How the streaming tool loop offers tools to a provider and reads its output
 /// back as prose + tool calls. The loop owns everything else (budgets, bounces,
 /// dispatch, recovery); the codec owns only the wire encoding of tool calls.
@@ -77,7 +79,7 @@ enum ToolCallCodec: Sendable, Equatable {
         }
         if self == .textMarkers {
             return ToolCallParser.stripProtocolDebris(
-                TextMarkerCodec.releasableProse(holding: &pending, force: false))
+                TextMarkerCodec.releasableProse(holding: &pending))
         }
         // Hold only a tail that could still grow into a marker ("<to",
         // "**tool c"); plain prose goes out now. A fixed 16-character hold
@@ -114,8 +116,8 @@ enum ToolCallCodec: Sendable, Equatable {
 
     /// Prose before the earliest potential call marker — what a stopped,
     /// failed or cut-off turn keeps.
-    func visiblePrefix(in text: String) -> String {
-        ChatRichContentParser.visibleText(ToolCallParser.visiblePrefix(in: text))
+    func visiblePrefix(in text: String, recordShims: Bool = true) -> String {
+        ChatRichContentParser.visibleText(ToolCallParser.visiblePrefix(in: text, recordShims: recordShims))
     }
 
     /// One streamed tool-call event as a call to dispatch; nil for a call
@@ -123,7 +125,7 @@ enum ToolCallCodec: Sendable, Equatable {
     func decode(_ call: LLMStreamToolCall) throws -> ParsedToolCall? {
         // Nothing offered, so nothing streamed is a call.
         if self == .textMarkers { return nil }
-        guard !ToolCallParser.isIgnorableToolName(call.name) else { return nil }
+        guard !ToolCallParser.isIgnorableToolName(call.name, recordShim: true) else { return nil }
         guard let parsed = try? JSONValue.parse(call.inputJSON),
               case .object(let input) = parsed else {
             throw LLMError.providerError(message: "streamed tool batch contains invalid object arguments")
@@ -135,13 +137,13 @@ enum ToolCallCodec: Sendable, Equatable {
     /// recovered from the round's text. `schemas` is the round's catalog,
     /// which marker-argument repair reads.
     func roundCalls(
-        streamed: [ParsedToolCall], text: String, schemas: [LLMToolSchema]
+        streamed: [ParsedToolCall], text: String, schemas: [LLMToolSchema], recordShims: Bool = true
     ) -> [ParsedToolCall] {
         switch self {
         case .native, .none:
-            ToolCallParser.executableCalls(streamed.isEmpty ? ToolCallParser.parse(text) : streamed)
+            ToolCallParser.executableCalls(streamed.isEmpty ? ToolCallParser.parse(text, recordShims: recordShims) : streamed, recordShims: recordShims)
         case .textMarkers:
-            TextMarkerCodec(schemas: schemas, turnActiveTools: []).calls(in: text)
+            TextMarkerCodec(schemas: schemas, turnActiveTools: []).calls(in: text, recordShims: recordShims)
         }
     }
 }

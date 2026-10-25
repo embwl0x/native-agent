@@ -1,6 +1,8 @@
 import Foundation
 import ProviderRouting
 
+// Blueprint: | `ProviderRecoveryPolicy.swift` | `TurnEngineError` provider failure wrapping: preserves interrupted-stream causes and classifies nonempty partial output as work that ran partly |
+
 
 extension TurnEngineError: ProviderFailureWrapping {
     public var providerWorkState: ProviderFailure.WorkState? {

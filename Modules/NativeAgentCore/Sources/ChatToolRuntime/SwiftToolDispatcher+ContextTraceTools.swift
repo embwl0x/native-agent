@@ -5,8 +5,6 @@ import PersistenceCore
 import TurnTrace
 import ToolRegistry
 import MemoryV2
-import MCPDispatcher
-import KnowledgeGraph
 import PersonaEngine
 import ProviderRouting
 import TrustCenter
@@ -15,6 +13,8 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
+import Transcripts
+// Blueprint: | `SwiftToolDispatcher+ContextTraceTools.swift` | `SwiftToolDispatcher`: `impl_context_lookup`, `impl_scratchpad_read`, bounded anchored `impl_recent_trace_summary` pages; receipts span conversations by default, rank non-read actions first and scan complete retained since windows; `trace.usage` and `trace.model_calls` share this route and `TurnTraceRecentReader` for recorded sums, purpose counts and retention coverage; explicit session filters and bound turn refs |
 
 // MARK: - Context, scratchpad, and trace tools
 
@@ -26,7 +26,7 @@ extension SwiftToolDispatcher {
            jsonString(body["id"]) == nil {
             body["type"] = .string("lookup_feature_surface")
         }
-        let client = SwiftNativeContextClient(dataRoot: dataRoot)
+        let client = SwiftNativeContextClient()
         guard let result = await client.lookup(body: body) else {
             return .object([
                 "status": .string("unsupported"),
@@ -59,12 +59,7 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "scratchpad_read invalid session_id")
         }
 
-        let path = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(sessionID, isDirectory: true)
-            .appendingPathComponent("scratch.json")
-        let raw = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .object([:]))
+        let raw = try await ChatSessionScratch.read(dataRoot: dataRoot, sessionID: sessionID)
         guard case .object(let scratch) = raw else {
             return .object([
                 "status": .string("ok"),
@@ -104,7 +99,6 @@ extension SwiftToolDispatcher {
     }
 
     func impl_recent_trace_summary(input: [String: JSONValue]) async throws -> JSONValue {
-        let shapesView = jsonString(input["view"]) == "shapes"
         if jsonString(input["view"]) == "model_calls" {
             return try await TurnTraceRecentReader(dataRootOverride: dataRoot).modelCalls()
         }
@@ -158,9 +152,6 @@ extension SwiftToolDispatcher {
         let turnID = jsonString(input["turn_id"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let trace = jsonString(input["trace"])
-        if shapesView, turnID?.isEmpty != false || trace == nil {
-            throw AutonomyGateError.toolDenied(reason: "shapes requires an exact turn_id and trace day file.")
-        }
         var fields: [String] = []
         if let requested = input["fields"], requested != .null {
             guard (turnID?.isEmpty == false || completedTurns != nil),
@@ -181,8 +172,8 @@ extension SwiftToolDispatcher {
             snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(
                 history: receiptID != nil || completedTurns != nil || turnID?.isEmpty == false,
                 since: since ?? (receiptID != nil && trace == nil ? Date.distantPast : nil),
-                holding: shapesView ? [turnID!] : receiptID != nil ? ["tool.dispatch"] : [],
-                trace: shapesView || receiptID != nil ? trace : nil)
+                holding: receiptID != nil ? ["tool.dispatch"] : [],
+                trace: receiptID != nil ? trace : nil)
         } catch {
             return .object([
                 "status": .string("failed"),
@@ -191,68 +182,6 @@ extension SwiftToolDispatcher {
                 "traces": .array([]),
                 "source": .string("data/turn_traces/<current-day>.jsonl"),
             ])
-        }
-
-        if shapesView {
-            var calls: [JSONValue] = []
-            var incomplete = snapshot.truncated
-            let turn = snapshot.events.sorted(by: { $0.ts < $1.ts }).filter { $0.turnId == turnID && $0.kind == "tool.dispatch" }
-            // Each call answers for itself from its own end receipt: whether it
-            // landed, whether it wrote, and which skill a skill run ran. A list
-            // (actions:[...]) is its members, each traced under it.
-            var ends: [String: [String: JSONValue]] = [:], members: [String: [TurnTraceEvent]] = [:]
-            func id(_ payload: [String: JSONValue]) -> String? {
-                if case .object(let receipt)? = payload["receipt"] { return jsonString(receipt["id"]) }
-                return nil
-            }
-            for event in turn {
-                guard case .object(let payload) = event.payload else { continue }
-                if payload["phase"] == .string("end"), let id = id(payload), case .object(let receipt)? = payload["receipt"] { ends[id] = receipt }
-                if payload["phase"] == .string("begin"), payload["name"] == .string("app"),
-                   let parent = jsonString(payload["parentId"]) { members[parent, default: []].append(event) }
-            }
-            func emit(_ event: TurnTraceEvent) {
-                guard case .object(let payload) = event.payload else { return }
-                if payload["_truncated"] == .bool(true) { incomplete = true; return }
-                let callID = id(payload)
-                if case .array(let keys)? = payload["argKeys"], keys.contains(.string("actions")) {
-                    return (callID.flatMap { members[$0] } ?? []).forEach(emit)
-                }
-                guard case .array(let shapes)? = payload["callShapes"] else { return }
-                let end = callID.flatMap { ends[$0] } ?? [:]
-                let result: [String: JSONValue] = if case .object(let fields)? = end["resultReceipt"] { fields } else { [:] }
-                // A preview ran nothing: it neither landed nor wrote.
-                let landed = end["status"] == .string("ok") && end["resultClass"] != .string("preview")
-                for case .object(var call) in shapes {
-                    call["landed"] = .bool(landed)
-                    call["wrote"] = .bool(landed && result["read_only"] == .bool(false))
-                    if let action = jsonString(call["action"]), ["skill.run", "skill.resume"].contains(action) { call["skill"] = result["skill"] }
-                    call["createdAt"] = .string(event.ts.formatted(.iso8601))
-                    calls.append(.object(call))
-                }
-            }
-            for event in turn {
-                guard case .object(let payload) = event.payload, payload["name"] == .string("app"),
-                      payload["phase"] == .string("begin"), payload["parentId"] == nil else { continue }
-                emit(event)
-            }
-            var page: [JSONValue] = [], pageBytes = 0
-            let remaining = Array(calls.reversed().dropFirst(offset))
-            for call in remaining {
-                let size = try call.serializedData(pretty: false).count
-                guard size <= 24 * 1024 else {
-                    throw AutonomyGateError.toolDenied(reason: "A call shape exceeds the trace page budget.")
-                }
-                if page.count == limit || pageBytes + size > 24 * 1024 { break }
-                page.append(call); pageBytes += size
-            }
-            var next = input.filter { !$0.key.hasPrefix("__") }
-            next["offset"] = .int(Int64(offset + page.count))
-            let more = remaining.count > page.count
-            return .object(["status": .string("ok"), "traces": .array(page), "has_more": .bool(more),
-                "scan_truncated": .bool(incomplete),
-                "next_call": more ? .object(["tool": .string("app"), "input": .object([
-                    "action": .string("trace.recent"), "args": .object(next)])]) : .null])
         }
 
         let sessionTurnIDs: Set<String>

@@ -1,5 +1,6 @@
 import AppIntents
 import Foundation
+// Blueprint: | `MobileAppIntents.swift` | `MobileAskIntent`: `perform` |
 
 struct MobileAgentEntity: AppEntity {
     static let typeDisplayRepresentation: TypeDisplayRepresentation = "Agent"

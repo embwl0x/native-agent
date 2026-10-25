@@ -5,6 +5,7 @@ import Foundation
 import NativeAgentShared
 import ProviderRouting
 import PersistenceCore
+// Blueprint: | `ProviderSettingsView.swift` | `ProviderSettingsView` struct |
 
 /// Keep related choices together, stacking individual fields in narrow panes.
 struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: View {
@@ -113,12 +114,14 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
 
 struct ProviderSettingsView: View {
     @Environment(\.colorScheme) private var colorScheme
-    @State private var explicitSurfaces: Set<String> = []
-    @State private var overrideReadFailed = false
+    private var explicitSurfaces: Set<String> {
+        appModel.engine.providers.settings.map { ProvidersFacade.explicitSurfaces(in: $0.routing) } ?? []
+    }
+    private var overrideReadFailed: Bool { appModel.engine.providers.settingsError != nil }
     /// surface -> why its saved pick cannot be used, from the resolver. The row
     /// says so instead of pretending nothing was ever chosen, and instead of
     /// quietly running on a different model (2026-09-13).
-    @State private var unusablePicks: [String: String] = [:]
+    private var unusablePicks: [String: String] { appModel.engine.providers.settings?.routing.unusablePicks ?? [:] }
     private struct SaveReceipt {
         let id = UUID()
         let text: String
@@ -142,12 +145,7 @@ struct ProviderSettingsView: View {
     /// What one surface currently routes to. Equality across a group's
     /// surfaces is what makes the group's row a single honest choice.
     private func selection(of surface: String) -> ProvidersFacade.SurfaceSelection {
-        ProvidersFacade.SurfaceSelection(
-            provider: activeSurface[surface] ?? "codex",
-            model: surfaceModel[surface] ?? "",
-            reasoningEffort: surfaceReasoningEffort[surface] ?? "",
-            fastMode: surfaceFastMode[surface] ?? false
-        )
+        pendingSelections[surface] ?? appModel.engine.providers.selection(for: surface)
     }
 
     private var surfaceSelections: [String: ProvidersFacade.SurfaceSelection] {
@@ -177,10 +175,6 @@ struct ProviderSettingsView: View {
         if group.id == ProviderSurfaceGroups.chat.id { return "Chat's own route" }
         let chat = selection(of: "chat")
         return group.surfaces.allSatisfy { selection(of: $0) == chat } ? "Same as Chat" : "Built-in default"
-    }
-
-    static func selectionOrigin(isExplicit: Bool) -> String {
-        isExplicit ? "Custom choice" : "Inherited default"
     }
 
     /// "Chat, iPhone, Telegram and Slack" — the group's membership in the
@@ -229,7 +223,7 @@ struct ProviderSettingsView: View {
     }
     private static let fallbackReasoningEfforts = ["low", "medium", "high", "xhigh"]
     @Environment(AppModel.self) private var appModel
-    @State private var providers: [ProviderInfo] = []
+    private var providers: [ProviderInfo] { appModel.engine.providers.connections }
     @State private var isLoading = false
     /// A reload asked for while another was in flight. The `isLoading`
     /// guard drops the second call; this makes it run once afterwards so a
@@ -239,31 +233,34 @@ struct ProviderSettingsView: View {
     /// The refresh control must distinguish an authority-read failure from a
     /// genuinely empty provider catalog. Kept separate from the general
     /// status line because save/configure actions also write that line.
-    @State private var providerLoadError: String?
-    @State private var configureSheet: ProviderInfo? = nil
+    private var providerLoadError: String? { appModel.engine.providers.settingsError }
+    @State private var configureSheet: String? = nil
     // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test
     @State private var statusText = ""
 
-    // Per-surface active provider selection state (surface → provider_id).
-    // Storage stays per surface; a group row writes every surface it covers.
-    @State private var activeSurface: [String: String] = [:]
+    // Only in-flight edits overlay the facade's committed routing.
+    @State private var pendingSelections: [String: ProvidersFacade.SurfaceSelection] = [:]
+    private var activeSurface: [String: String] {
+        (appModel.engine.providers.settings?.activeProviders ?? [:]).merging(pendingSelections.mapValues(\.provider)) { _, pending in pending }
+    }
     @State private var groupSaveTokens: [String: UUID] = [:]
     @State private var groupSaveTasks: [String: Task<Void, Never>] = [:]
     @State private var savingGroups: Set<String> = []
 
-    // PATCH-2026-05-28 (per-surface model): per-surface model selection state.
-    // The model list shown for a surface is scoped to the provider selected
-    // for that surface (so OpenRouter shows its live catalog, Anthropic its Claude
-    // models, etc.). Falls back to the global catalog for providers that
-    // expose no provider-specific list.
-    @State private var surfaceModel: [String: String] = [:]
-    @State private var surfaceReasoningEffort: [String: String] = [:]
-    @State private var surfaceFastMode: [String: Bool] = [:]
-    @State private var catalogModels: [ModelCatalogItem] = []
-    @State private var rowSet = ProviderSurfaceRowSet(
-        surfacePreferenceKeys: [],
-        activeProviderKeys: []
-    )
+    // Per-surface values are derived from the published settings and pending edits.
+    private var surfaceModel: [String: String] {
+        (appModel.engine.providers.settings?.preferences.mapValues(\.model) ?? [:]).merging(pendingSelections.mapValues(\.model)) { _, pending in pending }
+    }
+    private var surfaceReasoningEffort: [String: String] {
+        (appModel.engine.providers.settings?.preferences.mapValues(\.reasoningEffort) ?? [:]).merging(pendingSelections.mapValues(\.reasoningEffort)) { _, pending in pending }
+    }
+    private var surfaceFastMode: [String: Bool] {
+        (appModel.engine.providers.settings?.preferences.mapValues { $0.serviceTier == "priority" } ?? [:]).merging(pendingSelections.mapValues(\.fastMode)) { _, pending in pending }
+    }
+    private var catalogModels: [ModelCatalogItem] { appModel.engine.providers.catalog?.models ?? [] }
+    private var rowSet: ProviderSurfaceRowSet {
+        appModel.engine.providers.settings?.rowSet ?? ProviderSurfaceRowSet(surfacePreferenceKeys: [], activeProviderKeys: [])
+    }
 
     // The visible rows remain the routing registry's canonical order. The
     // store-backed audit below makes an unregistered persisted key visible as
@@ -272,7 +269,7 @@ struct ProviderSettingsView: View {
 
     /// Models offered for a surface, scoped to the provider selected for it.
     private func modelsForSurface(_ surface: String) -> [ProvidersFacade.SurfaceModelChoice] {
-        let pid = activeSurface[surface] ?? "codex"
+        let pid = activeSurface[surface] ?? ""
         var choices = ProvidersFacade.modelsForProvider(pid, providers: providers, catalogModels: catalogModels)
         let current = surfaceModel[surface] ?? ""
         // 2026-09-06: this used to be an OpenRouter-only repair, so every other
@@ -282,8 +279,7 @@ struct ProviderSettingsView: View {
         // selection is always shown; it is only CALLED unavailable on the
         // evidence of a live catalogue for that provider.
         if !current.isEmpty, !choices.contains(where: { $0.id == current }) {
-            let unavailable = ProvidersFacade.savedModelIsKnownAbsent(providerId: pid, model: current, providers: providers,
-                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            let unavailable = pendingSelections[surface] == nil && appModel.engine.providers.settings?.unavailableModels[surface] == true
             choices.insert(ProvidersFacade.SurfaceModelChoice(
                 id: current,
                 name: unavailable ? "\(current) — Unavailable" : current,
@@ -329,7 +325,8 @@ struct ProviderSettingsView: View {
                 // without taking the account column's share of the page.
                 .frame(minWidth: 530)
         }
-        .sheet(item: $configureSheet) { provider in
+        .sheet(isPresented: Binding(get: { configureSheet != nil }, set: { if !$0 { configureSheet = nil } })) {
+            if let provider = providers.first(where: { $0.provider_id == configureSheet }) {
             VStack(alignment: .leading, spacing: 12) {
                 if provider.provider_id == "openai_oauth_direct" || provider.provider_id == "codex" {
                     // User, 2026-09-13, on the fresh-install VM: this was a
@@ -351,18 +348,16 @@ struct ProviderSettingsView: View {
             }
             }
             .environment(appModel)
+            }
         }
         .quietReadTask { await loadProviders() }
-        .onChange(of: appModel.engine.providers.accountModelRevision) { _, _ in
-            Task { await loadProviders() }
-        }
     }
 
     @ViewBuilder
     private func accountRow(_ provider: ProviderInfo) -> some View {
         if !provider.auth_status.eligible {
             Button {
-                configureSheet = provider
+                configureSheet = provider.provider_id
             } label: {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
@@ -411,7 +406,7 @@ struct ProviderSettingsView: View {
                 }
                 Spacer(minLength: 8)
                 Button("Manage") {
-                    configureSheet = provider
+                    configureSheet = provider.provider_id
                 }
                 .buttonStyle(.bordered).controlSize(.small)
                 .accessibilityLabel("Manage \(provider.display_name)")
@@ -687,7 +682,7 @@ struct ProviderSettingsView: View {
                     }
                 }
             } label: {
-                let id = activeSurface[lead] ?? "codex"
+                let id = activeSurface[lead] ?? ""
                 let account = providers.first { $0.provider_id == id }
                 let name = account?.display_name ?? (id.isEmpty ? "Choose an account" : id)
                 let suffix = id.isEmpty || account?.auth_status.eligible == true ? "" : " · not connected"
@@ -780,10 +775,10 @@ struct ProviderSettingsView: View {
             }
             // Below the controls, not inside the Provider field: a caption in
             // the field would push Model, Think and Fast off the baseline.
-            if let caption = ProviderToolCapability.caption(providerID: activeSurface[lead] ?? "codex") {
+            if let caption = ProviderToolCapability.caption(providerID: activeSurface[lead] ?? "") {
                 Text(caption).font(.caption).foregroundStyle(NativeAgentShell.secondary)
             }
-            if let note = providers.first(where: { $0.provider_id == (activeSurface[lead] ?? "codex") })?.models_note {
+            if let note = providers.first(where: { $0.provider_id == (activeSurface[lead] ?? "") })?.models_note {
                 Text(note).font(.caption).foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -838,67 +833,10 @@ struct ProviderSettingsView: View {
     }
 
     private func performProviderLoad(refreshCatalog: Bool) async {
-        // A group whose save is still in flight owns its own rows: its
-        // optimistic values are newer than this snapshot, which was taken
-        // before that write landed. Leave those surfaces alone.
-        let savingSurfaces = Set(
-            surfaceGroups.filter { groupSaveTokens[$0.id] != nil }.flatMap(\.surfaces)
-        )
         switch await appModel.engine.providers.refreshSettings(
             refreshCatalog: refreshCatalog, cause: UserFacingError.cause
         ) {
         case let .loaded(snapshot):
-            do {
-                let routing = snapshot.routing
-                // 2026-09-13 review: the origin caption is derived from what the
-                // RESOLVER answers, never from the raw surfaces.json keys. A key
-                // can name a pick the route no longer carries (the resolver drops
-                // it), and an assignment can repeat Chat's own answer — both used
-                // to read as "Custom choice" when the person had overridden
-                // nothing. A surface is explicit when it holds a pin the resolver
-                // honoured, or when what it actually resolves to differs from
-                // Chat's resolved answer.
-                explicitSurfaces = ProvidersFacade.explicitSurfaces(in: routing)
-                unusablePicks = routing.unusablePicks
-                overrideReadFailed = false
-            }
-            providers = snapshot.providers
-            rowSet = snapshot.rowSet
-            if let catalog = snapshot.catalog {
-                catalogModels = catalog.models
-            }
-            for surface in surfaces where !savingSurfaces.contains(surface) {
-                // An unassigned surface follows CHAT's exact route — the same
-                // answer the resolver gives it. Inferring a provider from the
-                // model id instead could name a route the person never connected
-                // (a bare `gpt-` id reads as ChatGPT even when Chat is on the
-                // OpenAI API key), which showed up as a false "Mixed" on a group
-                // whose members all resolve identically (2026-09-13 review).
-                if let pid = snapshot.activeProviders[surface] {
-                    activeSurface[surface] = pid
-                } else if let chatRoute = snapshot.activeProviders["chat"] {
-                    activeSurface[surface] = chatRoute
-                } else {
-                    // S12a: no route anywhere reads as unchosen, never as one
-                    // inferred from the model — a later save would persist it.
-                    activeSurface[surface] = ""
-                }
-            }
-            // PATCH-2026-05-28 (per-surface model): load the global catalog
-            // (fallback model source) and the live per-surface model picks.
-            for surface in surfaces where !savingSurfaces.contains(surface) {
-                if let preference = snapshot.preferences[surface] {
-                    surfaceModel[surface] = preference.model
-                    surfaceReasoningEffort[surface] = preference.reasoningEffort
-                    surfaceFastMode[surface] = preference.serviceTier == "priority"
-                } else if let choice = modelsForSurface(surface).first {
-                    surfaceModel[surface] = choice.id
-                    surfaceReasoningEffort[surface] = normalizedReasoningEffort(
-                        options: choice.supportedReasoningEfforts, preferred: choice.defaultReasoningEffort, selected: choice.defaultReasoningEffort
-                    )
-                    surfaceFastMode[surface] = false
-                }
-            }
             // User, 2026-09-06: Refresh reloads the model catalog too, and a
             // catalog read that never reached the provider was overwritten
             // here with a flat "Providers loaded". The read says where its
@@ -924,9 +862,7 @@ struct ProviderSettingsView: View {
                 ? "Providers loaded at \(shortTime())"
                 : "Provider settings need repair before every saved activity can be configured."
             statusText = refreshCatalogNote.map { "\(loadedText) — \($0)" } ?? loadedText
-            providerLoadError = nil
         case let .failed(detail):
-            providerLoadError = detail
             statusText = "Couldn't read the accounts. \(detail)"
         }
     }
@@ -977,7 +913,7 @@ struct ProviderSettingsView: View {
             selected: surfaceReasoningEffort[lead] ?? choice.defaultReasoningEffort
         )
         requestSetGroupSelection(group: group, target: ProvidersFacade.SurfaceSelection(
-            provider: activeSurface[lead] ?? "codex",
+            provider: activeSurface[lead] ?? "",
             model: model,
             reasoningEffort: nextEffort,
             fastMode: choice.supportsFast && (surfaceFastMode[lead] ?? false)
@@ -994,7 +930,7 @@ struct ProviderSettingsView: View {
             return
         }
         requestSetGroupSelection(group: group, target: ProvidersFacade.SurfaceSelection(
-            provider: activeSurface[lead] ?? "codex",
+            provider: activeSurface[lead] ?? "",
             model: surfaceModel[lead] ?? "",
             reasoningEffort: effort,
             fastMode: surfaceFastMode[lead] ?? false
@@ -1009,7 +945,7 @@ struct ProviderSettingsView: View {
         guard surfaceFastMode[lead] != enabled || ProvidersFacade.groupIsMixed(group, selections: surfaceSelections, explicitSurfaces: explicitSurfaces) else { return }
         guard selectedModelChoice(for: lead)?.supportsFast == true else { return }
         requestSetGroupSelection(group: group, target: ProvidersFacade.SurfaceSelection(
-            provider: activeSurface[lead] ?? "codex",
+            provider: activeSurface[lead] ?? "",
             model: surfaceModel[lead] ?? "",
             reasoningEffort: surfaceReasoningEffort[lead] ?? "high",
             fastMode: enabled
@@ -1023,14 +959,11 @@ struct ProviderSettingsView: View {
         target: ProvidersFacade.SurfaceSelection,
         providerOnly: Bool = false
     ) {
-        let previous = Dictionary(uniqueKeysWithValues: group.surfaces.map { ($0, selection(of: $0)) })
         for surface in group.surfaces {
-            activeSurface[surface] = target.provider
-            if !providerOnly {
-                surfaceModel[surface] = target.model
-                surfaceReasoningEffort[surface] = target.reasoningEffort
-                surfaceFastMode[surface] = target.fastMode
-            }
+            let prior = selection(of: surface)
+            pendingSelections[surface] = providerOnly
+                ? .init(provider: target.provider, model: prior.model, reasoningEffort: prior.reasoningEffort, fastMode: prior.fastMode)
+                : target
         }
         let token = UUID()
         groupSaveTokens[group.id] = token
@@ -1042,7 +975,6 @@ struct ProviderSettingsView: View {
                 group: group,
                 target: target,
                 providerOnly: providerOnly,
-                previous: previous,
                 token: token
             )
         }
@@ -1052,16 +984,10 @@ struct ProviderSettingsView: View {
         group: ProviderSurfaceGroup,
         target: ProvidersFacade.SurfaceSelection,
         providerOnly: Bool,
-        previous: [String: ProvidersFacade.SurfaceSelection],
         token: UUID
     ) async {
         guard groupSaveTokens[group.id] == token else { return }
         if !providerOnly, target.model.isEmpty {
-            for (surface, prior) in previous {
-                surfaceModel[surface] = prior.model
-                surfaceReasoningEffort[surface] = prior.reasoningEffort
-                surfaceFastMode[surface] = prior.fastMode
-            }
             finishGroupSave(group)
             statusText = "Model settings could not be saved: no model is available for this provider."
             return
@@ -1080,22 +1006,13 @@ struct ProviderSettingsView: View {
             guard let routingGroup = ProviderSurfaceGroups.all.first(where: { $0.id == group.id }) else {
                 throw ProviderRoutingError.invalidRequest
             }
-            let result = try await appModel.saveProviderGroupSelection(
+            _ = try await appModel.saveProviderGroupSelection(
                 group: routingGroup, providerID: target.provider,
                 model: providerOnly ? nil : target.model,
                 reasoningEffort: providerOnly ? nil : target.reasoningEffort,
                 serviceTier: providerOnly ? nil : (target.fastMode ? "priority" : "default")
             )
             guard groupSaveTokens[group.id] == token else { return }
-            for surface in group.surfaces {
-                activeSurface[surface] = result.snapshot.activeProviders[surface] ?? ""
-                if let preference = result.snapshot.preferences[surface] {
-                    surfaceModel[surface] = preference.model
-                    surfaceReasoningEffort[surface] = preference.reasoningEffort
-                    surfaceFastMode[surface] = preference.serviceTier == "priority"
-                }
-            }
-            explicitSurfaces.formUnion(group.surfaces)
             statusText = providerOnly
                 ? "\(group.title) → provider saved"
                 : "\(group.title) → \(target.model) / \(reasoningLabel(target.reasoningEffort))\(target.fastMode ? " / Fast" : "") saved"
@@ -1103,10 +1020,6 @@ struct ProviderSettingsView: View {
                 statusText += " · cleared an old per-app pick"
             }
             inlineReceipts[group.id] = SaveReceipt(text: statusText)
-            // The other groups inherit this one's answer, and the retired-pick
-            // warning was computed before this write. Without a reload they keep
-            // showing the OLD model, and touching their Think control saves that
-            // stale model as a real override (2026-09-13 review).
             let savedText = statusText
             // The row stays in its saving state until the reload finishes: a
             // second edit started mid-await would have its optimistic state
@@ -1126,6 +1039,7 @@ struct ProviderSettingsView: View {
     }
 
     private func finishGroupSave(_ group: ProviderSurfaceGroup) {
+        for surface in group.surfaces { pendingSelections.removeValue(forKey: surface) }
         savingGroups.remove(group.id)
         groupSaveTokens.removeValue(forKey: group.id)
         groupSaveTasks.removeValue(forKey: group.id)

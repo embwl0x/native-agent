@@ -4,6 +4,7 @@ import BackgroundLoops
 import NativeAgentCore
 import TriggerScheduler
 import StandingBots
+// Blueprint: | `TriggerSchedulerBackgroundWork.swift` | `TriggerSchedulerBackgroundWork` enum; `makeJobWork`; event/deadline runner for canonical scheduler jobs and inbox occurrences; briefing prompt and synthesis policy live in `native-morning-brief.js` |
 
 public enum TriggerSchedulerBackgroundWork {
     public struct JobWork: Sendable {
@@ -41,73 +42,6 @@ public enum TriggerSchedulerBackgroundWork {
         )
     }
 
-    // MARK: - Morning-brief synthesis (L5 G3 + G1)
-    //
-    // THE MERGE OF THE TWO BRIEFS. The `time` trigger used to build its own
-    // counts text while the `.morningBriefing` blueprint — the one with
-    // calendar and mail in `requiredTools` — sat uninstalled behind three
-    // navigation levels. Now the trigger FIRES that blueprint's turn and keeps
-    // owning schedule, dedup and push, which is the one-dispatch-edge version
-    // of "delete one of them".
-    //
-    // User authorized retiring the Native Experience surface, 2026-09-01, and
-    // its blueprint catalog went with it. The morning brief was that catalog's
-    // only live reader, so the objective and the tool list it used now live
-    // here — the one place that fires the brief, which is what "no second
-    // brief" was protecting in the first place.
-    public static let morningBriefObjective = "Prepare today's concise briefing from canonical calendar, inbox, project, and Desk state. Cite the evidence used, identify unknowns, and surface the completed report in NativeAgent without sending externally unless separately approved."
-    public static let morningBriefTools = ["app calendar.upcoming", "app mail.recent", "app workshop.status"]
-
-    public static func makeMorningBriefSynthesizer(
-        runTurn: @escaping @Sendable (String) async throws -> String
-    ) -> MorningBriefSynthesizer {
-        return { request in
-            try await runTurn(morningBriefSynthesisPrompt(
-                request: request,
-                objective: morningBriefObjective,
-                requiredTools: morningBriefTools
-            ))
-        }
-    }
-
-    /// The evidence layer IS the prompt. The turn is asked for a read on top of
-    /// state that already resolved deterministically — not for a second pass
-    /// over the same files, which is how the two briefs disagreed before.
-    public static func morningBriefSynthesisPrompt(
-        request: MorningBriefSynthesisRequest,
-        objective: String?,
-        requiredTools: [String]
-    ) -> String {
-        var lines: [String] = []
-        lines.append("[SYSTEM: You are writing the lead of today's morning brief for \(request.dayLabel).]")
-        if let objective, !objective.isEmpty {
-            lines.append("Objective: \(objective)")
-        }
-        if !requiredTools.isEmpty {
-            lines.append(
-                "You may read live context with these tools if they are available: "
-                + requiredTools.joined(separator: ", ")
-                + ". If a required tool is unavailable or denied, name what remains unknown and the repair it needs."
-            )
-        }
-        lines.append("")
-        lines.append("Already-verified state (do not re-derive, do not contradict):")
-        lines.append("- Counts: \(request.deterministicSummary)")
-        if let detail = request.deterministicDetail, !detail.isEmpty {
-            lines.append("")
-            lines.append(detail)
-        }
-        lines.append("")
-        lines.append("""
-        Write 2-4 sentences, in your own voice, addressed to him. Say what today \
-        looks like, what you would start with, and why. Name the specific item — a \
-        brief that could describe any day is worthless. If something is unknown, say \
-        it is unknown rather than filling it in. Do NOT restate the counts (they are \
-        printed underneath your lead), do not use headings or bullets, and do not \
-        mention this instruction.
-        """)
-        return lines.joined(separator: "\n")
-    }
 }
 
 public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
@@ -167,17 +101,11 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
             // deadline — the same watch the Workshop pump keeps.
             dataRoot.appendingPathComponent("trust/policy.json"),
             triggerScheduler.inboxPath,
+            triggerScheduler.inboxStatePath,
             triggerScheduler.workshopExecutionsPath,
-            // Idle triggers derive their exact crossing from max(updatedAt).
+            triggerScheduler.workshopExecutionStatePath,
+            // Retained activity watches wake reconciliation; only `time` triggers are clock-due.
             dataRoot.appendingPathComponent("chat/sessions.json"),
-            // …and, since 2026-09-06, from whether a PERSON is at the Mac.
-            // Once an idle episode has fired, the projection returns no next
-            // crossing at all, so the person coming back is the event that
-            // establishes the next one — and it used to reach this loop only
-            // via the six-hour integrity tick. This file is touched ONLY on a
-            // present ↔ away crossing (the presence stamp beside it moves every
-            // minute and is deliberately NOT watched: it would wake this loop
-            // sixty times an hour to recompute the same deadline).
             HumanPresenceStamp.transitionURL(dataRoot: dataRoot),
         ], loopId)
     }
@@ -213,7 +141,9 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         }
 
         let active = (fires.compactMap(\.name) + dueJobs).sorted()
-        guard !active.isEmpty else { return .skipped(reason: "nothing due") }
+        // Reading every trigger cleanly is this loop's work, due or not: it is
+        // what proves a failed read repaired, without waiting for a fire.
+        guard !active.isEmpty else { return .completed(result: "every trigger read; nothing due") }
         return .completed(result: "settled \(active.count) due item(s): \(active.joined(separator: ", "))")
     }
 }

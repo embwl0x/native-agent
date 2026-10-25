@@ -5,16 +5,14 @@ import NativeAgentShared
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
+// Blueprint: | `ChatOrchestrationClient+Types.swift` | `ChatOrchestrationClient` protocol; `enqueueUserMessage` |
 
 // MARK: - Public types
 
@@ -24,8 +22,6 @@ import CognitiveSubstrate
 public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
     case replyHeldForQuietHours
     case emptyMessage
-    case badAttachments(detail: String)
-    case invalidResponse(status: Int)
     case underlying(String)
     case helperModelChoice(sessionID: String, reason: String, message: String)
 
@@ -34,10 +30,6 @@ public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
         case .replyHeldForQuietHours: return "Reply held for quiet hours."
         case .emptyMessage:
             return "chat: message body must contain non-whitespace content"
-        case .badAttachments(let detail):
-            return "chat: bad attachments — \(detail)"
-        case .invalidResponse(let status):
-            return "chat: runtime returned unexpected status \(status)"
         case .underlying(let message):
             return "chat: \(message)"
         case .helperModelChoice(_, _, let message):
@@ -147,16 +139,6 @@ public struct EnqueuedUserMessage: Sendable {
 // MARK: - Protocol
 
 public protocol ChatOrchestrationClient: Sendable {
-    /// Drain the after-turn memory promotion the last turn started (Astra comb
-    /// 3, lane1 finding 1 / lane2 finding 3, 2026-09-12). A surface that owns
-    /// its own delivery — ClaudeBridge's reply row and `message_out`,
-    /// TelegramPollLoop's `delivery.finalize` — calls this AFTER that milestone,
-    /// so the memory pass is bounded by the request without ever being in front
-    /// of the person. Default no-op: a client with no engine has nothing to
-    /// drain, and a caller that never drains loses nothing (the work is already
-    /// running).
-    func drainDeferredMemoryPromotion() async
-
     /// Ack-on-enqueue (wake-delivery-classification, 2026-07-25): durably
     /// append a user message to the session transcript and return as soon as
     /// the row is on disk. The caller then runs the turn separately with
@@ -264,9 +246,6 @@ public protocol ChatOrchestrationClient: Sendable {
 // requirement — its sole concrete witness implements all of them directly, so
 // no protocol-level chat default is exercised.
 extension ChatOrchestrationClient {
-    /// Nothing to drain unless the client owns a turn engine.
-    public func drainDeferredMemoryPromotion() async {}
-
     public func chatStream(
         message: String,
         sessionId: String?,

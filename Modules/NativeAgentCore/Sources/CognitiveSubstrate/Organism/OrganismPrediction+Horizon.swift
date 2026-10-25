@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `OrganismPrediction+Horizon.swift` | `OrganismPredictiveBody`: `applyingHorizonRefresh` |
 
 extension OrganismPredictiveBody {
     // MARK: - Item 5: the horizon family

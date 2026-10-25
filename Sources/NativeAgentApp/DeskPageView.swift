@@ -1,14 +1,15 @@
 import StandingBots
+
+// Blueprint: | `DeskPageView.swift` | `DeskPageView`: canonical work overview, bounded folds/detail actions and separate store/execution/schedule failure presentation |
 // DeskPageView.swift
 // The primary Desk: canonical work in plain words, with item actions in place.
-// Store, execution, GitHub and schedule lanes retain their own failure states.
+// Store, execution and schedule lanes retain their own failure states.
 
 import SwiftUI
 import AppKit
 import PersistenceCore
 import Desk
-import GitHubConnector
-import SelfImprovement
+import EngineRuntime
 import TriggerScheduler
 import WorkshopExecution
 import Cognition
@@ -29,20 +30,10 @@ enum DeskPageMetrics {
     static let foldRowCap = 60
 }
 
-extension DeskPageContent {
-    static func githubMeta(_ item: GitHubCommandItem, now: Date) -> String {
-        let state = DeskGitHubStatePillPresentation.pill(for: item).label.lowercased()
-        let when = DeskRelativeTimePresentation.text(
-            forISO: item.motorUpdatedAt ?? item.updatedAt, now: now)
-        return "\(item.repository) · #\(item.number) · \(state) · \(when)"
-    }
-}
-
 // MARK: - The page
 
 struct DeskPageView: View {
     @Environment(AppModel.self) private var appModel
-    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(StudioWanderLane.enabledDefaultsKey) private var studioWanderEnabled = false
@@ -55,40 +46,29 @@ struct DeskPageView: View {
     }
 
     @State private var overviewSelection: WorkOverviewRow?
-    @State private var snapshot = DeskPageSnapshot.empty
-    @State private var readCount = 0
-    @State private var now = Date()
+    private var desk: DeskFacade { appModel.engine.desk }
+    private var snapshot: DeskPageSnapshot { desk.page }
+    private var readCount: Int { desk.readCount }
+    private var now: Date { snapshot.now }
     @State private var openFolds: Set<String> = []
-    @State private var projectRows: [DeskPageContent.ProjectRow] = []
+    private var projectRows: [DeskPageContent.ProjectRow] { snapshot.rows.projects }
     @State private var sheet: DeskPageSheet?
     @State private var actionNotice: DeskActionNotice?
     @State private var actionInFlight: String?
     @State private var selectedHandle: String?
     @State private var inspectorMode: DeskPaletteQuery.Verb?
     @State private var showingPalette = false
-    @State private var watcherSelection: String?
     @State private var showingNags = false
-    @State private var nagConfig = DeskNagConfig()
+    private var nagConfig: DeskNagConfig { snapshot.nagConfig }
     @State private var revealCounts: [String: Int] = [:]
-    @State private var herHour: DeskHerHourPresentation.State = .absent
-    @State private var liveUpdateError: String?
-    @State private var liveSubscriberID = UUID()
-    @State private var liveUpdatesMounted = false
-    @State private var watchGeneration: UInt64 = 0
+    private var herHour: DeskHerHourPresentation.State { snapshot.herHour }
+    private var liveUpdateError: String? { desk.liveUpdateError }
     @State private var vetoHandler = WorkshopObservatoryVetoHandler(
         dataRoot: PersistenceCore.defaultDataRoot())
-    /// Only the NEWEST read may publish. `reload()` is called from racing
-    /// places — store events, a route to the root, and every action
-    /// that closes a sheet — and a slow early read landing after a fast later
-    /// one would put stale items back on the board.
-    @State private var loadGate = LatestAsyncRequestGate()
-
-    private var items: [DeskItem] { snapshot.items }
-    private var githubItems: [GitHubCommandItem] { snapshot.github.items }
+    private var items: [DeskItem] { snapshot.boardItems }
     private var selectedItem: DeskItem? { items.first { $0.handle == selectedHandle } }
     private var paletteRows: [DeskPaletteRow] {
         DeskPageContent.active(items).map(DeskPaletteRow.init(item:))
-            + DeskGitHubWaitingRollup.paletteRows(in: githubItems)
     }
     private var liveActivity: DeskLiveActivityPresentation.State {
         DeskLiveActivityPresentation.make(deskItems: laneOfItems, executions: snapshot.executions,
@@ -260,32 +240,19 @@ struct DeskPageView: View {
             CommandPaletteView(
                 isPresented: $showingPalette,
                 desk: DeskPaletteScope(rows: paletteRows, selectedHandle: selectedHandle,
-                                       onSelect: select, onCommand: applyPaletteCommand))
+                                       onSelect: inspect, onCommand: applyPaletteCommand))
         }
         .onReceive(NotificationCenter.default.publisher(for: .openCommandPaletteRequest)) { _ in
             guard !quietOffscreenRead else { return }
             showingPalette = true
         }
-        .onChange(of: showingPalette) { _, open in
-            guard !open, let handle = watcherSelection else { return }
-            withAnimation(NativeAgentMotion.standard) { scroller.scrollTo(handle, anchor: .center) }
-        }
         .task {
             guard !quietOffscreenRead else { return }
-            liveUpdatesMounted = true
             appModel.deskHoldsCommandPalette = true
-            await bindLiveUpdates()
         }
         .onDisappear {
             guard !quietOffscreenRead else { return }
-            liveUpdatesMounted = false
-            watchGeneration &+= 1
             appModel.deskHoldsCommandPalette = false
-            DeskLiveReloader.shared.deactivate(subscriber: liveSubscriberID)
-        }
-        .onChange(of: scenePhase) {
-            guard !quietOffscreenRead else { return }
-            DeskLiveReloader.shared.refreshVisibility(subscriber: liveSubscriberID)
         }
         .onChange(of: studioWanderEnabled) { signalLiveUpdate() }
         .onChange(of: cognitiveSubstrateEnabled) { signalLiveUpdate() }
@@ -304,15 +271,13 @@ struct DeskPageView: View {
             // one place that may give up on a handle — the reload the route
             // asked for has finished, so an item still missing is not coming.
             //
-            // Only the reload that actually PUBLISHED this route's board may
-            // give up. One that was cancelled, or that lost the load gate to a
-            // newer read, proves nothing about what is on the board — and the
-            // handle it would clear may belong to a click newer than itself.
+            // Only a completed engine refresh may give up. A cancelled route
+            // proves nothing about the pending handle it would clear.
             guard published, !Task.isCancelled else { return }
             openPendingDeskItem(scroller, giveUpIfMissing: true)
         }
         .sheet(item: $overviewSelection) { row in
-            MacWorkOverviewDetail(row: row, capturedAt: snapshot.overview?.capturedAt ?? "") {
+            MacWorkOverviewDetail(reference: row.reference) {
                 overviewSelection = nil
                 Task { await reload() }
             }
@@ -331,13 +296,13 @@ struct DeskPageView: View {
         .onChange(of: appModel.pendingDeskHandle) { openPendingDeskItem(scroller) }
         // ...and every load that lands after it. The handle may have been set
         // against a snapshot that did not have the item yet.
-        .onChange(of: loadStamp) { openPendingDeskItem(scroller) }
+        .onChange(of: snapshot.id) { openPendingDeskItem(scroller) }
         }
     }
 
     // MARK: waiting on you
 
-    @State private var ownerItems: [DeskItem] = []
+    private var ownerItems: [DeskItem] { snapshot.rows.owner }
 
     private var headerLine: String? { snapshot.overview?.headline }
 
@@ -410,8 +375,6 @@ struct DeskPageView: View {
     /// The project and the run it spawned were on two different surfaces (and
     /// the run under a second, Workshop-named item); joined by `deskHandle`,
     /// they read as one piece of work again.
-    /// Derived once per load: `body` asked for it several times per redraw,
-    /// and each ask rebuilt every row and parsed every timestamp.
     /// The families projection wants the lane state, not the bare array, so a
     /// failed desk read contributes no families rather than a false calm.
     private var laneOfItems: DeskLaneState<DeskItem> {
@@ -424,9 +387,6 @@ struct DeskPageView: View {
     private enum Fold {
         static let blocked = "blocked"
         static let watching = "watching"
-        static let github = "github"
-        static let githubAttention = "github-attention"
-        static let githubRest = "github-rest"
         static let schedule = "schedule"
         static let parked = "parked"
         static let stale = "stale"
@@ -434,16 +394,16 @@ struct DeskPageView: View {
         static let history = "history"
     }
 
-    @State private var blockedItems: [DeskItem] = []
-    @State private var watchItems: [DeskItem] = []
-    @State private var staleItems: [DeskItem] = []
-    @State private var otherItems: [DeskItem] = []
-    @State private var historyItems: [DeskItem] = []
-    @State private var historyExecutions: [WorkshopExecution.WorkshopExecutionRecord] = []
+    private var blockedItems: [DeskItem] { snapshot.rows.blocked }
+    private var watchItems: [DeskItem] { snapshot.rows.watches }
+    private var staleItems: [DeskItem] { snapshot.rows.stale }
+    private var otherItems: [DeskItem] { snapshot.rows.other }
+    private var historyItems: [DeskItem] { snapshot.rows.history }
+    private var historyExecutions: [WorkshopExecution.WorkshopExecutionRecord] { snapshot.rows.executions }
 
     private var boardIsEmpty: Bool {
         blockedItems.isEmpty && watchItems.isEmpty && otherItems.isEmpty
-            && githubItems.isEmpty && appModel.engine.desk.jobs.isEmpty
+            && snapshot.jobs.isEmpty
     }
 
     // MARK: finished work
@@ -500,17 +460,7 @@ struct DeskPageView: View {
                 label: "\(count) on watch",
                 title: "I'm keeping an eye on \(DeskPageWords.spelledLower(count)) \(DeskPageWords.plural(count, "thing", "things"))"))
         }
-        if !githubItems.isEmpty {
-            let count = githubItems.count
-            let noun = githubItems.allSatisfy { $0.kind == .pullRequest }
-                ? DeskPageWords.plural(count, "pull request", "pull requests")
-                : "pull requests and issues"
-            out.append(FoldCount(
-                id: Fold.github,
-                label: "\(count) \(noun)",
-                title: DeskPageContent.githubHeadline(githubItems)))
-        }
-        let jobs = appModel.engine.desk.jobs
+        let jobs = snapshot.jobs
         let running = jobs.filter(\.enabled).count + timedBots.count
         var timer = running == 0 ? "nothing on a timer" : "\(running) on a timer"
         if !missedBots.isEmpty {
@@ -618,9 +568,7 @@ struct DeskPageView: View {
                     ?? DeskExecutionPresentation.pill(for: execution.status).label
                 // Opens the canonical record, which shows the whole result.
                 Button {
-                    overviewSelection = WorkOverviewRow(reference: .init(kind: .execution, id: execution.id),
-                        title: execution.title, summary: "", detail: Self.resultText(execution),
-                        state: meta, updatedAt: execution.updatedAt)
+                    overviewSelection = WorkOverviewRead.row(for: execution, now: now)
                 } label: {
                     DeskPageDetailRow(title: execution.title, line: Self.resultText(execution), meta: meta)
                         .contentShape(Rectangle())
@@ -648,8 +596,6 @@ struct DeskPageView: View {
                     .contextMenu { Button("Details and actions") { inspect(item.handle) } }
             }
             overflowLine(watchItems.count, key: key)
-        case Fold.github:
-            githubContent
         case Fold.schedule:
             scheduleContent
         case Fold.stale:
@@ -668,51 +614,6 @@ struct DeskPageView: View {
     }
 
     @ViewBuilder
-    private var githubContent: some View {
-        let hands = DeskPageContent.githubNeedsOwner(githubItems)
-            + DeskPageContent.githubNeedingAHand(githubItems)
-        ForEach(cap(hands, key: Fold.github), id: \.itemId) { item in
-            githubRow(item)
-        }
-        overflowLine(hands.count, key: Fold.github)
-        let attention = DeskPageContent.githubAttention(githubItems)
-        if !attention.isEmpty {
-            AliveEyebrow(DeskGitHubBucket.attention.rawValue)
-            ForEach(cap(attention, key: Fold.githubAttention), id: \.itemId) { item in
-                githubRow(item)
-            }
-            overflowLine(attention.count, key: Fold.githubAttention)
-        }
-        let rest = DeskPageContent.githubRest(githubItems)
-        if !rest.isEmpty {
-            let restOpen = openFolds.contains(Fold.githubRest)
-            Button { toggleFold(Fold.githubRest) } label: {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(DeskPageContent.githubRestTitle(rest))
-                        .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
-                        .foregroundStyle(NativeAgentShell.secondary)
-                    Image(systemName: "chevron.right")
-                        .font(ShellType.captionSemibold)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .rotationEffect(.degrees(restOpen ? 90 : 0))
-                        .accessibilityHidden(true)
-                    Spacer(minLength: 0)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(restOpen ? "Open" : "Folded")
-            .accessibilityIdentifier("desk.fold.github-rest")
-            if restOpen {
-                ForEach(cap(rest, key: Fold.githubRest), id: \.itemId) { item in
-                    githubRow(item)
-                }
-                overflowLine(rest.count, key: Fold.githubRest)
-            }
-        }
-    }
-
-    @ViewBuilder
     private var scheduleContent: some View {
         ForEach(timedBots) { bot in
             DeskPageDetailRow(
@@ -726,7 +627,7 @@ struct DeskPageView: View {
                 line: bot.line,
                 meta: BotsShelfRecord.shortDate(bot.dueAt))
         }
-        ForEach(appModel.engine.desk.jobs) { job in
+        ForEach(snapshot.jobs) { job in
             DeskPageDetailRow(
                 title: TodayWords.line(job.name, limit: 110),
                 line: DeskPageContent.scheduleLine(job),
@@ -753,9 +654,6 @@ struct DeskPageView: View {
         if snapshot.executions.unavailableReason != nil {
             out.append("I couldn't read what's running, so \u{201C}what I'm working on\u{201D} may be short.")
         }
-        if snapshot.github.unavailableReason != nil {
-            out.append("I couldn't read the GitHub watcher just now.")
-        }
         return out
     }
 
@@ -780,24 +678,6 @@ struct DeskPageView: View {
     }
 
     // MARK: actions
-
-    private func githubRow(_ item: GitHubCommandItem) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            DeskPageDetailRow(title: DeskPageContent.githubTitle(item),
-                              line: item.blocker.map { "\($0.detail) — \($0.owner)" }
-                                  ?? item.finalReceipt ?? item.workLog.last?.summary ?? "",
-                              meta: DeskPageContent.githubMeta(item, now: now))
-            if let failure = DeskGitHubCallbackFailurePresentation.detail(for: item) {
-                Text(failure.message).font(.caption).foregroundStyle(.red)
-                if let noWork = failure.noWorkObserved {
-                    Text(noWork ? "no work ran — resend safe" : "partial work possible")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-            }
-        }
-        .textSelection(.enabled)
-        .id(DeskGitHubWaitingRollup.paletteHandle(for: item))
-    }
 
     private func itemDetailRow(_ item: DeskItem) -> some View {
         Button { inspect(item.handle) } label: {
@@ -841,21 +721,6 @@ struct DeskPageView: View {
     private func inspect(_ handle: String) {
         inspectorMode = nil
         selectedHandle = handle
-    }
-
-    private func select(_ handle: String) {
-        if DeskGitHubWaitingRollup.isPaletteHandle(handle) {
-            guard !DeskGitHubWaitingRollup.revealKeys(forPaletteHandle: handle, in: githubItems).isEmpty else { return }
-            selectedHandle = handle
-            inspectorMode = nil
-            openFolds.insert(Fold.github)
-            openFolds.insert(Fold.githubRest)
-            revealCounts[Fold.githubRest] = githubItems.count
-            watcherSelection = handle
-        } else {
-            watcherSelection = nil
-            inspect(handle)
-        }
     }
 
     private func applyPaletteCommand(_ verb: DeskPaletteQuery.Verb, handle: String) {
@@ -929,7 +794,7 @@ struct DeskPageView: View {
     /// without the item — consumed the handle and scrolled nowhere, and the
     /// reload that followed published the row to a page no longer looking for
     /// it. So the handle is held until the item is actually on the board:
-    /// every completed load re-checks (`loadStamp`), and only the reload that
+    /// every published revision re-checks, and only the reload that
     /// followed the route gives up (`giveUpIfMissing`) when the item is not
     /// there at all.
     @MainActor
@@ -952,79 +817,18 @@ struct DeskPageView: View {
 
     private func signalLiveUpdate() {
         guard !quietOffscreenRead else { return }
-        DeskLiveReloader.shared.sourceDidChange(subscriber: liveSubscriberID)
+        Task { await desk.signalRefresh() }
     }
 
-    private func bindLiveUpdates() async {
-        guard !quietOffscreenRead, liveUpdatesMounted else { return }
-        watchGeneration &+= 1
-        let generation = watchGeneration
-        do {
-            let paths = try await Task.detached(priority: .utility) {
-                try await DeskFacade(dataRoot: PersistenceCore.defaultDataRoot()).liveUpdatePaths()
-            }.value
-            guard !Task.isCancelled, liveUpdatesMounted, generation == watchGeneration else { return }
-            liveUpdateError = nil
-            DeskLiveReloader.shared.activate(
-                subscriber: liveSubscriberID,
-                paths: paths,
-                reload: { _ = await reload() })
-        } catch {
-            guard !Task.isCancelled, liveUpdatesMounted, generation == watchGeneration else { return }
-            liveUpdateError = UserFacingError.message(error, action: "turn on Desk live updates")
-        }
-    }
-
-    /// Returns true only when this read published its snapshot: a cancelled
-    /// read, or one that lost the load gate, returns false and leaves the
-    /// board — and any pending handle — to whoever did publish.
     @discardableResult
     @MainActor
     private func reload() async -> Bool {
-        readCount += 1
-        defer { readCount -= 1 }
-        // Taken BEFORE the awaits, checked after: a read that lost the race
-        // publishes nothing at all, rather than half-replacing the board.
-        let token = loadGate.begin()
-        _ = await appModel.refreshSchedulerJobs()
-        // The page's own root, the one its actions and bot reads use.
-        let desk = DeskFacade(dataRoot: PersistenceCore.defaultDataRoot())
-        let (loaded, missed, timed, presentationNow, loadedNags, hour, hourUnavailable) = await desk.loadPage()
-        let loadedHour = hourUnavailable
-            ? DeskHerHourPresentation.State.line(text: "Her hour’s saved state is unavailable.", symbol: "exclamationmark.triangle")
-            : DeskHerHourPresentation.state(installed: true, entry: hour, now: presentationNow)
-        let hourExpiry = hour.flatMap { UserDisplayFormatters.parseISOTimestamp($0.at) }
-            .map { DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: presentationNow) }
-        let jobStamps = appModel.engine.desk.jobs.compactMap(\.nextRunAt)
-        let projection = await Task.detached(priority: .userInitiated) {
-            DeskPageContent.project(snapshot: loaded, now: presentationNow, nags: loadedNags,
-                                    timedBots: timed, jobStamps: jobStamps, hourExpiry: hourExpiry)
-        }.value
-        await bindLiveUpdates()
-        guard !Task.isCancelled, loadGate.accepts(token) else { return false }
-        now = presentationNow
-        snapshot = loaded
-        (projectRows, ownerItems, blockedItems, watchItems, staleItems, otherItems, historyItems, historyExecutions, _) = projection
-        nagConfig = loadedNags
-        herHour = loadedHour
-        if !quietOffscreenRead, liveUpdatesMounted {
-            DeskLiveReloader.shared.scheduleRefresh(subscriber: liveSubscriberID, at: projection.8)
-        }
-        missedBots = missed
-        timedBots = timed
-        // A completed publish. A pending banner handle gets another look here.
-        loadStamp &+= 1
-        return true
+        return await desk.refresh()
     }
 
-    /// Bumped once per accepted publish, so a waiting notification handle is
-    /// re-checked against every board that actually lands.
-    @State private var loadStamp = 0
+    private var missedBots: [DeskMissedBot] { snapshot.missedBots }
+    private var timedBots: [DeskTimedBot] { snapshot.timedBots }
 
-    /// Scheduled bot occurrences that never ran, counted apart from the timers.
-    @State private var missedBots: [DeskMissedBot] = []
-    /// Unpaused bots on a schedule, counted with the timers.
-    @State private var timedBots: [DeskTimedBot] = []
 }
 
 // MARK: - Sheets
@@ -1062,15 +866,14 @@ private struct DeskPageSheetHost: View {
 /// title and Done, then the surface itself. The Desk and Today both open
 /// theirs this way.
 struct PageSheetHost<Content: View>: View {
-    let title: String
+    let title: String?
     let onDone: () -> Void
     @ViewBuilder let content: () -> Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text(title)
-                    .font(ShellType.bodySemibold)
+                if let title { Text(title).font(ShellType.bodySemibold) }
                 Spacer(minLength: 0)
                 Button("Done", action: onDone)
                     .keyboardShortcut(.cancelAction)
@@ -1228,117 +1031,6 @@ extension DeskExecutionPresentation {
             return "verification failed"
         case .unverified:
             return "completed; outcome not independently verified"
-        }
-    }
-}
-
-
-/// HER HOUR, on the Desk — personality-depth item 9.
-///
-/// One line, at the bottom, saying what she did with the hour that was hers. It
-/// is a TRACE, not a task: it has no action, no count, no badge, and it never
-/// becomes a row User has to clear. The lane writes no desk ops (Agent's veto —
-/// her aesthetic life is not board work), so this reads the lane's own bounded
-/// file directly and renders its newest entry.
-///
-/// ABSENT when the lane is not installed. Not "off", not a placeholder, not a
-/// zero — absent, exactly the way the lane itself is absent when the switch is
-/// off. A Desk that shows "Her hour: disabled" would be advertising a feature at
-/// a man who turned it off.
-enum DeskHerHourPresentation {
-    enum State: Sendable, Equatable {
-        case absent
-        /// Her own closing line, plus how long ago. Nothing else: no verdict,
-        /// no outcome adjective we chose, no progress.
-        case line(text: String, symbol: String)
-    }
-
-    /// The whole rule. Pure, so the Desk's claim about her hour is testable
-    /// without a running app or an installed lane.
-    static func state(
-        installed: Bool,
-        entry: StudioWanderLane.TraceEntry?,
-        now: Date
-    ) -> State {
-        guard installed, let entry else { return .absent }
-        let words = entry.line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !words.isEmpty else { return .absent }
-        let when = DeskRelativeTimePresentation.text(forISO: entry.at, now: now)
-        return .line(text: "\(bounded(words)) · \(when)", symbol: symbol(entry.outcome))
-    }
-
-    /// Icons, not labels. The three endings are equal in standing — a decline is
-    /// not a lesser outcome — so none of them gets a word here that ranks it.
-    static func symbol(_ outcome: StudioWanderLane.Outcome) -> String {
-        switch outcome {
-        case .chose: return "eye"
-        case .declined: return "moon.zzz"
-        case .noArtifact: return "eye.slash"
-        }
-    }
-
-    static let maximumCharacters = 160
-
-    private static func bounded(_ value: String) -> String {
-        value.truncated(to: maximumCharacters, keeping: maximumCharacters - 1)
-    }
-}
-
-enum DeskGitHubCallbackFailurePresentation {
-    struct Detail: Equatable, Sendable {
-        let message: String
-        let noWorkObserved: Bool?
-    }
-
-    private static let failedStatuses: Set<String> = [
-        "failed", "failure", "error", "stalled", "timeout", "timed_out",
-        "canceled", "cancelled", "completed_without_reply",
-    ]
-    private static let successfulStatuses: Set<String> = ["completed", "ok", "success"]
-
-    static func detail(for item: GitHubCommandItem) -> Detail? {
-        let status = (item.lastCallbackStatus ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let error = nonEmpty(item.lastCallbackErrorMessage)
-        let noWorkObserved = item.lastCallbackNoWorkObserved
-
-        if failedStatuses.contains(status) {
-            return Detail(
-                message: error ?? fallbackMessage(for: status),
-                noWorkObserved: noWorkObserved
-            )
-        }
-
-        // A non-success status paired with an error/resend-safety field is
-        // conflicting callback evidence. Surface it rather than silently
-        // treating an unknown producer spelling as a healthy completion.
-        guard !successfulStatuses.contains(status), error != nil || noWorkObserved != nil else {
-            return nil
-        }
-        let statusText = status.isEmpty ? "no usable status" : "status \(status)"
-        return Detail(
-            message: error ?? "Codex callback returned \(statusText) without an error detail.",
-            noWorkObserved: noWorkObserved
-        )
-    }
-
-    private static func nonEmpty(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func fallbackMessage(for status: String) -> String {
-        switch status {
-        case "completed_without_reply":
-            return "Codex callback ended without a final result."
-        case "stalled":
-            return "Codex callback stalled without an error detail."
-        case "timeout", "timed_out":
-            return "Codex callback timed out without an error detail."
-        default:
-            return "Codex callback failed without an error detail."
         }
     }
 }

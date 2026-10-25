@@ -1,6 +1,8 @@
 import SwiftUI
 import AppKit
 
+// Blueprint: | `NativeAgentFeel.swift` | `NAInteractiveModifier` and `NAButtonStyle`: shared hover/press feedback vocabulary for interactive Mac surfaces |
+
 // Liquid Feel Pass W1 (2026-08-16, docs/build_plans/liquid-feel-pass.md).
 // The ONE shared interaction vocabulary: every clickable surface answers the
 // cursor the same way. No layout or IA changes ride in this file.

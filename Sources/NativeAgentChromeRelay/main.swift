@@ -3,6 +3,8 @@ import Foundation
 import NativeAgentChromeRelayCore
 import PersistenceCore
 
+// Blueprint: | `main.swift` | Chrome relay executable: authenticated browser/app handshake and opaque bounded native-message forwarding over the private socket |
+
 private enum RelayError: Error, LocalizedError {
     case socketPathMustBeAbsolute
     case socketPathTooLong

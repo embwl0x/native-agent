@@ -3,6 +3,7 @@ import CoreGraphics
 import MacControl
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MacScreenPreviewBus.swift` | `MacScreenPreviewBus` enum; preview resizes the source-masked observation |
 
 /// What the agent is looking at, on its way to the chat's working card.
 ///

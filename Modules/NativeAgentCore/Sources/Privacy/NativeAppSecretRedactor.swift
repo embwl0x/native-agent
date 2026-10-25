@@ -1,6 +1,7 @@
 import PersistenceCore
 import Foundation
 import NativeAgentCore
+// Blueprint: | `NativeAppSecretRedactor.swift` | NativeAppSecretRedactor: redactText and string-only redactValue; redactArguments withholds secret-named fields; redactedRemoteErrorDetail owns phone error path projection |
 
 public enum NativeAppSecretRedactor {
     /// App-only privacy extensions layered after the canonical credential
@@ -25,16 +26,8 @@ public enum NativeAppSecretRedactor {
         )
     }
 
-    /// Argument names whose value an approval card never shows (the Mac
-    /// chat card and the copies sent to the phone and Telegram).
-    public static let secretArgMarkers = [
-        "token", "secret", "password", "passwd", "api_key", "apikey",
-        "authorization", "auth", "credential", "private_key", "cookie",
-    ]
-
     public static func isSecretArgName(_ name: String) -> Bool {
-        let lowered = name.lowercased()
-        return secretArgMarkers.contains { lowered.contains($0) }
+        NativeAgentSecretRedactor.isSecretName(name, use: .approval)
     }
 
     /// An approval card's arguments as shown to a person: a secret-named
@@ -52,7 +45,25 @@ public enum NativeAppSecretRedactor {
         }
     }
 
+    /// Pattern-redact strings only; secret-named fields require redactArguments.
     public static func redactValue(_ value: JSONValue) -> JSONValue {
         value.mapStrings(redactText)
+    }
+
+    /// Remote error details reduce absolute paths of two or more segments to
+    /// their leaf. Relative paths and URL schemes are excluded; `path:/…` is not.
+    public static func redactedRemoteErrorDetail(_ value: String) -> String {
+        guard let regex = try? NSRegularExpression(
+            pattern: "(?<![A-Za-z0-9_.~%/-])(?:/[^\\s\"'<>)\\]},;/]+){2,}", options: []
+        ) else { return value }
+        var text = value
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length))
+        for match in matches.reversed() {
+            let path = (text as NSString).substring(with: match.range)
+            let leaf = (path as NSString).lastPathComponent
+            text = (text as NSString).replacingCharacters(in: match.range,
+                with: leaf.isEmpty ? "[redacted path]" : ".../\(leaf)")
+        }
+        return text
     }
 }

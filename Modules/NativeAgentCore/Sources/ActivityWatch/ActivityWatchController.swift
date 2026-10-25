@@ -1,7 +1,9 @@
 #if canImport(AppKit)
 import Foundation
+import Experiences
 import Observation
 import PersistenceCore
+// Blueprint: | `ActivityWatchController.swift` | `ActivityWatchController`, `ActivityCaptureIssue`; capture lifecycle, serialized off-main policy reads/writes and capture-ordered exclusion purges, exact policy-file invalidation and one retention schedule using the runner's completed-run stamp and effective clamped capture policy; issues join their Experience receipts, with injected platform error and notification presentation; Mac permissions, quiet controls and the menu indicator reach this same lifecycle/policy owner through engine.activityWatch |
 
 public struct ActivityCaptureIssue: Identifiable, Equatable, Sendable {
     public enum Severity: Int, Comparable, Equatable, Sendable {
@@ -104,7 +106,7 @@ public final class ActivityWatchController {
                 policy = try await Task.detached(priority: .utility) { try policyStore.loadChecked() }.value
                 return true
             } catch {
-                recordIssue(errorMessage(error, "read the activity policy"), severity: .critical)
+                await recordIssue(errorMessage(error, "read the activity policy"), severity: .critical)
                 return false
             }
         }
@@ -155,10 +157,10 @@ public final class ActivityWatchController {
                   self.policy.captureEnabled else { return }
             let started = await watcher.startBounded()
             guard !Task.isCancelled else { return }
-            if !started {
-                self.recordIssue("Activity capture could not start cleanly. Its partial startup was rolled back.", severity: .critical)
-            }
             self.refreshCapturingFlag()
+            if !started {
+                await self.recordIssue("Activity capture could not start cleanly. Its partial startup was rolled back.", severity: .critical)
+            }
             self.scheduleRetention()
         }
     }
@@ -210,7 +212,7 @@ public final class ActivityWatchController {
                     Task { @MainActor [weak self] in
                         self?.refreshCapturingFlag()
                         if state == .degraded {
-                            self?.recordIssue("Activity capture stopped because its live watcher became unavailable.", severity: .critical)
+                            await self?.recordIssue("Activity capture is unavailable. Its shutdown has not been confirmed.", severity: .critical)
                         }
                     }
                 },
@@ -220,7 +222,7 @@ public final class ActivityWatchController {
             watcher = created
             return created
         } catch {
-            recordIssue(errorMessage(error, "open the activity store"), severity: .critical)
+            await recordIssue(errorMessage(error, "open the activity store"), severity: .critical)
             return nil
         }
     }
@@ -239,10 +241,10 @@ public final class ActivityWatchController {
                 let policyStore = policyStore
                 loaded = try await Task.detached(priority: .utility) { try policyStore.loadChecked() }.value
             } catch {
-                recordIssue(errorMessage(error, "read the activity policy"), severity: .critical)
                 policy = ActivityPolicy()
                 watcher?.updatePolicy(policy)
                 refreshCapturingFlag()
+                await recordIssue(errorMessage(error, "read the activity policy"), severity: .critical)
                 return false
             }
             guard !shuttingDown else { return false }
@@ -302,7 +304,7 @@ public final class ActivityWatchController {
             let policyStore = policyStore
             try await Task.detached(priority: .utility) { try policyStore.save(next) }.value
         } catch {
-            recordIssue(errorMessage(error, "save the activity policy"), severity: .critical)
+            await recordIssue(errorMessage(error, "save the activity policy"), severity: .critical)
             return false
         }
         policy = next
@@ -325,18 +327,6 @@ public final class ActivityWatchController {
         await apply { $0.captureEnabled = enabled }
     }
 
-    public func setCaptureTitles(_ enabled: Bool) async {
-        await apply { $0.captureTitles = enabled }
-    }
-
-    public func setBrowserTitlesEnabled(_ enabled: Bool) async {
-        await apply { $0.browserTitlesEnabled = enabled }
-    }
-
-    public func setAppNameOnlyMode(_ enabled: Bool) async {
-        await apply { $0.appNameOnlyMode = enabled }
-    }
-
     public func setModelAccessEnabled(_ enabled: Bool) async {
         await apply { $0.allowModelAccess = enabled }
     }
@@ -353,20 +343,33 @@ public final class ActivityWatchController {
     /// This is the promise the UI makes before the user confirms, and it is
     /// kept through the store's own purge path — which checkpoints the WAL and
     /// VACUUMs, because rows deleted but still legible in the `-wal` sidecar
-    /// are not deleted, they are hidden.
+    /// are not deleted, they are hidden. The policy slot covers the purge too;
+    /// the watcher orders it after applying the exclusion and older writes.
     public func addExclusion(bundleID: String) async {
         lastPurgedRowCount = nil
         let trimmed = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        // Never purge rows unless the exclusion first became durable.
-        guard await apply({ $0.excludedBundleIDs.insert(trimmed) }) else { return }
-
-        do {
-            // An absent store has no rows; an unavailable store throws.
-            lastPurgedRowCount = try await existingStore()?.purge(bundleID: trimmed) ?? 0
-        } catch {
-            recordIssue("Excluded \(trimmed), but couldn't delete what was already recorded. " + errorCause(error, "delete excluded activity rows"), severity: .critical)
+        let previous = policyTask
+        let task = Task { [self] in
+            _ = await previous?.value
+            var next = policy
+            next.excludedBundleIDs.insert(trimmed)
+            // Never purge rows unless the exclusion first became durable.
+            guard await persist(next) else { return false }
+            do {
+                if let watcher {
+                    lastPurgedRowCount = try await watcher.purgeExcluded(bundleID: trimmed)
+                } else {
+                    // An absent store has no rows; an unavailable store throws.
+                    lastPurgedRowCount = try await existingStore()?.purge(bundleID: trimmed) ?? 0
+                }
+            } catch {
+                await recordIssue("Excluded \(trimmed), but couldn't delete what was already recorded. " + errorCause(error, "delete excluded activity rows"), severity: .critical)
+            }
+            return true
         }
+        policyTask = task
+        _ = await task.value
     }
 
     public func removeExclusion(bundleID: String) async {
@@ -396,7 +399,7 @@ public final class ActivityWatchController {
             return .deleted(rows: removed)
         } catch {
             let message = errorMessage(error, "wipe recorded activity")
-            recordIssue(message, severity: .critical)
+            await recordIssue(message, severity: .critical)
             return .failed(message: message)
         }
     }
@@ -409,9 +412,15 @@ public final class ActivityWatchController {
             while !Task.isCancelled {
                 guard let self else { return }
                 let succeeded = await self.runRetention()
-                let delay = !succeeded && self.isCapturing
-                    ? ActivityWatcher.tickInterval
-                    : ActivityRetentionRunner(dataRoot: self.dataRoot).nextRunDelay()
+                let delay: TimeInterval
+                if !succeeded && self.isCapturing { delay = ActivityWatcher.tickInterval }
+                else {
+                    do { delay = try ActivityRetentionRunner(dataRoot: self.dataRoot).nextRunDelay() }
+                    catch {
+                        await self.recordIssue("Retention cadence state is unreadable; running on the default interval. " + self.errorCause(error, "read retention cadence"), severity: .warning)
+                        delay = ActivityRetentionRunner.defaultInterval
+                    }
+                }
                 do { try await Task.sleep(for: .seconds(delay)) }
                 catch { return }
             }
@@ -425,16 +434,18 @@ public final class ActivityWatchController {
             let policyStore = policyStore
             let current = try await Task.detached(priority: .utility) { try policyStore.loadChecked() }.value
             guard let store = try await existingStore() else { return true }
-            try await runner.runIfDue(
+            if let fault = try await runner.runIfDue(
                 store: store,
                 policy: policy.captureEnabled ? policy : current,
                 now: Date().timeIntervalSince1970
-            )
+            ) {
+                await recordIssue("Retention ran, but its last-run state could not be read: " + fault, severity: .warning)
+            }
             return true
         } catch {
             // Retention failure does not expand collection authority, but it
             // does leave older local rows in place and must stay visible.
-            recordIssue(
+            await recordIssue(
                 "Couldn't remove expired activity rows. " + errorCause(error, "remove expired activity rows"),
                 severity: .warning
             )
@@ -442,15 +453,18 @@ public final class ActivityWatchController {
         }
     }
 
-    public func recordIssue(_ message: String, severity: ActivityCaptureIssue.Severity) {
+    public func recordIssue(_ message: String, severity: ActivityCaptureIssue.Severity) async {
         let issue = ActivityCaptureIssue(id: UUID(), occurredAt: Date(), severity: severity, message: message)
         issues.append(issue)
-        // Discard least-consequential/oldest evidence first. A later benign
-        // notice must not evict a serious capture authority failure.
         if issues.count > 12 { issues = Array(presentationIssues.prefix(12)) }
         if issue.severity == .critical {
             criticalIssueNotifier(issue)
         }
+        await ExperienceStore.record(dataRoot, issue.id.uuidString) { store in
+            try await store.begin(Experience(id: issue.id.uuidString, kind: .run,
+                outcome: .init(domain: "activity_watch", status: "failed", effects: .unknown),
+                face: .init(words: issue.message, artifacts: [])))
+        }.value
     }
 }
 #endif

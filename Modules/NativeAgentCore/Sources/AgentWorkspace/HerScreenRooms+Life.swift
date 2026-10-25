@@ -1,232 +1,91 @@
 import Foundation
 import PersistenceCore
 import ChatSessionWork
+// Blueprint: | `HerScreenRooms+Life.swift` | Native Music target bindings, status/unavailable evidence and rendering; playback narration, track/playlist curation and action labels are removed to `workspace-readout.js`; `lifeRoom` presents a failed nested Music readback with its full cause while retaining the original control receipt on its separate DONE line; `lifePulse`, `opening`; `HerItemPages` caches text without read-side peer lists |
 
-/// Her life rooms (2026-09-24): music, markets, X, Slack, Notion and Google
-/// Calendar open by name like any place (`music`, `x.search`, `markets.2`).
+/// Her life rooms (2026-09-24): music opens by name like any place (`music`).
 /// Each is its owner's own read laid out by the shared text room; opening
 /// one runs that read on demand, home never does. Calendar and reminders were
 /// already places; their changes now come back as the same text room.
 enum AgentWorkspaceLife {
     static let destinations: [AgentWorkspaceDestination] = [
         .init(id: "music", title: "Music", summary: "What's playing, playback, playlists and the library.", tool: "music_now_playing"),
-        .init(id: "markets", title: "Markets", summary: "Watchlists and live quotes. Read-only; nothing trades.", tool: "market_watchlists", input: ["includeSymbols": .bool(false)]),
-        .init(id: "x", title: "X", summary: "X in Chrome first; the paid X API only as a fallback.", tool: nil),
-        .init(id: "slack", title: "Slack", summary: "Channels, message search, and a post staged for approval.", tool: "slack_status"),
-        .init(id: "notion", title: "Notion", summary: "Search and read pages shared with the integration.", tool: "notion_search", input: ["limit": .int(8)]),
-        .init(id: "gcal", title: "Google Calendar", summary: "Choose a calendar, check availability, and schedule with invitations.", tool: "google_calendar_calendars"),
     ]
 
     static let readTools: Set<String> = [
         "music_now_playing", "music_search_library", "music_list_playlists", "music_list_library",
-        "market_status", "market_watchlists", "tradingview_watchlist", "market_quote",
-        "x_status", "x_me", "x_search", "x_timeline", "x_user_tweets",
-        "slack_status", "slack_list_channels", "slack_search_messages",
-        "notion_status", "notion_search", "notion_read_page", "google_calendar_status", "google_calendar_list",
-        "google_calendar_calendars", "google_calendar_free_busy", "google_calendar_read",
     ]
 
     /// The room a tool's reads and receipts show in; nil keeps the old frame.
     /// Detail reads keep their full frame; a room would clip their contents.
     static func room(for tool: String) -> String? {
-        if tool == "notion_read_page" || tool == "mac_reminders_read" { return nil }
+        if tool == "mac_reminders_read" { return nil }
         if tool.hasPrefix("mac_calendar_") { return "calendar" }
         if tool.hasPrefix("mac_reminders_") { return "reminders" }
-        for (prefix, room) in [("music_", "music"), ("market_", "markets"), ("tradingview_", "markets"), ("x_", "x"),
-                               ("slack_", "slack"), ("notion_", "notion"), ("google_calendar_", "gcal")] where tool.hasPrefix(prefix) {
-            return room
-        }
-        return nil
+        return tool.hasPrefix("music_") ? "music" : nil
     }
 
-    static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
-        guard room(for: tool) != nil, !tool.hasPrefix("mac_") else { return nil }
+    static func project(tool: String, input: [String: JSONValue], result: JSONValue, dataRoot: URL) async -> AgentWorkspaceProjection {
         let row = object(result)
-        var content: [String: JSONValue] = ["status": row["status"] ?? (row["ok"] == .bool(false) ? .string("failed") : .string("ok"))]
-        for key in ["connected", "detail", "fix"] { content[key] = row[key] }
-        if let problem = problem(row) { content["error"] = .string(problem) }
-        var items: [AgentWorkspaceItem] = [], actions: [AgentWorkspaceButton] = []
-        switch tool {
-        case "google_calendar_calendars":
-            for value in array(row["calendars"]) {
-                let calendar = object(value)
-                guard let id = text(calendar["calendarId"]) else { continue }
-                var buttons = [read("Events", tool: "google_calendar_list", input: ["calendar_id": .string(id)]),
-                    configure("Check availability", tool: "google_calendar_free_busy", input: ["calendar_ids": .array([.string(id)])])]
-                if ["owner", "writer"].contains(text(calendar["accessRole"]) ?? "") {
-                    let bound: [String: JSONValue] = ["calendar_id": .string(id),
-                        "event_id": .string(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())]
-                    buttons.append(configure("Schedule a meeting", tool: "google_calendar_send_invitations", input: bound))
-                }
-                items.append(.init(title: text(calendar["title"]) ?? id, content: .object(calendar), actions: buttons))
-            }
-            if case .object(let next)? = row["next"] { actions.append(read("More calendars", tool: tool, input: next)) }
-        case "google_calendar_free_busy", "google_calendar_send_invitations", "google_calendar_read":
-            content = row
-            if let problem = problem(row) { content["error"] = .string(problem) }
-            if let calendarID = text(row["calendarId"]) {
-                actions = [read("Events", tool: "google_calendar_list", input: ["calendar_id": .string(calendarID)])]
-                if let eventID = text(object(row["event"] ?? .null)["id"]) ?? text(row["eventId"]) {
-                    actions.append(read("Read meeting", tool: "google_calendar_read", input: ["calendar_id": .string(calendarID), "event_id": .string(eventID)]))
-                }
-            }
-        case "music_now_playing", "music_control", "music_search_library", "music_list_playlists", "music_list_library":
-            let now = tool == "music_control" ? object(row["now_playing"] ?? .null) : row
-            if tool == "music_now_playing" || tool == "music_control", content["error"] == nil { content["message"] = .string(playing(now)) }
-            for value in array(row["results"]) + array(row["tracks"]) {
-                let track = object(value)
-                guard let name = text(track["name"]) else { continue }
-                items.append(.init(title: name, content: .object(["who": track["artist"] ?? .null, "summary": track["album"] ?? .null]),
-                    actions: [effect("Play", tool: "music_control", input: ["action": .string("play"), "track": .string(name),
-                                                                            "artist": track["artist"] ?? .string("")])]))
-            }
-            if items.isEmpty, content["message"] == nil, let why = text(row["reason"]) { content["message"] = .string(why) }
-            var counts: Set<Int> = []
-            for value in array(row["playlists"]) {
-                let list = object(value)
-                guard let name = text(list["name"]) else { continue }
-                // Music's built-in whole-library lists repeat one another (Library, Music).
-                let tracks = int(list["track_count"])
-                if let tracks, text(list["special_kind"]).map({ $0 != "none" }) == true, !counts.insert(tracks).inserted { continue }
-                let summary = tracks.map { "\($0) track\($0 == 1 ? "" : "s")" } ?? "Track count unknown"
-                items.append(.init(title: name, content: .object(["summary": .string(summary)]),
-                    actions: [effect("Play", tool: "music_control", input: ["action": .string("play"), "playlist": .string(name)])]))
-            }
-            actions = [effect("Play", tool: "music_control", input: ["action": .string("play")]),
-                       effect("Pause", tool: "music_control", input: ["action": .string("pause")]),
-                       effect("Next track", tool: "music_control", input: ["action": .string("next")]),
-                       effect("Previous track", tool: "music_control", input: ["action": .string("previous")]),
-                       typed("Play a playlist", tool: "music_control", input: ["action": .string("play")], field: "playlist", effect: true),
-                       typed("Play a song", tool: "music_control", input: ["action": .string("play")], field: "track", effect: true),
-                       typed("Find in library", tool: "music_search_library", field: "query"),
-                       read("Playlists", tool: "music_list_playlists", input: ["limit": .int(24)])]
-        case "market_status", "market_watchlists", "tradingview_watchlist", "market_quote":
-            if row["status"] == .string("missing_config") { content["message"] = .string("No market sources are set up yet; quotes still work for plain symbols.") }
-            // Local lists come as watchlists, TradingView's as its payload.
-            for value in array(row["watchlists"]) + array(row["payload"]) {
-                let list = object(value)
-                guard let id = text(list["name"]) ?? text(list["id"]) else { continue }
-                let count = int(list["symbol_count"]) ?? int(list["symbols_count"]) ?? array(list["symbols"]).count
-                items.append(.init(title: id, content: .object(["summary": .string("\(count) symbols")]),
-                    actions: tool == "tradingview_watchlist" ? [] : [typed("Quote", tool: "market_quote", input: ["watchlist": .string(id)], field: nil)]))
-            }
-            for value in array(row["quotes"]) {
-                let quote = object(value)
-                guard let symbol = text(quote["symbol"]) ?? text(quote["name"]) else { continue }
-                let price = number(quote["close"] ?? quote["regularMarketPrice"])
-                let change = number(quote["change"] ?? quote["regularMarketChangePercent"])
-                var line = [symbol, price.map { String(format: "%.2f", $0) }, change.map { String(format: "%+.2f%%", $0) }].compactMap { $0 }.joined(separator: " ")
-                // How old the price is, and TradingView's delay ("delayed_streaming_900").
-                if let at = text(quote["as_of"]).flatMap(HerScreen.date) { line += " · as of " + HerScreen.age(Date().timeIntervalSince(at)) + " ago" }
-                if let mode = text(quote["update_mode"]), mode.hasPrefix("delayed") {
-                    line += Int(mode.split(separator: "_").last ?? "").map { " (\($0 / 60)m delayed)" } ?? " (delayed)"
-                }
-                items.append(.init(title: line, content: .object(["summary": quote["description"] ?? quote["shortName"] ?? .null]), actions: []))
-            }
-            // Symbols the provider returned nothing for still show, flagged.
-            if let missing = text(row["not_found"])?.components(separatedBy: " — ").first {
-                for symbol in missing.components(separatedBy: ", ") where !symbol.isEmpty {
-                    items.append(.init(title: symbol + " · not quoted", content: .object(["summary": .string("try the exchange prefix, e.g. NASDAQ:AAPL")]), actions: []))
-                }
-            }
-            actions = [typed("Quote symbols", tool: "market_quote", field: "symbol"),
-                       read("TradingView watchlists", tool: "tradingview_watchlist", input: ["includeSymbols": .bool(false)]),
-                       read("Local watchlists", tool: "market_watchlists", input: ["includeSymbols": .bool(false)])]
-        case "x_status", "x_me", "x_search", "x_timeline", "x_user_tweets":
-            // User, 2026-09-24: X is read in Chrome, not on his paid API key.
-            if tool == "x_status" {
-                content["message"] = .string("Read X in Chrome: x.open, or browser.go https://x.com/<handle> or x.com/search?q=<words>.")
-                if AgentWorkspaceReadiness.ready(tool: "x_search") {
-                    content["note"] = .string("The (API) verbs spend the paid X API; use them only if the person asks or Chrome can't.")
-                }
-                // A real status read (x.status) says how the API stands; the room itself reads nothing.
-                if row["room"] == nil { content["detail"] = content["error"] ?? .string("The X API is connected.") }
-            }
-            if tool == "x_me", case .object(let me)? = row["data"], let handle = text(me["username"]) {
-                let metrics = object(me["public_metrics"] ?? .null)
-                content["message"] = .string("@\(handle) · \(int(metrics["followers_count"]) ?? 0) followers · \(int(metrics["tweet_count"]) ?? 0) posts")
-            }
-            let by = text(row["username"])
-            for value in array(row["tweets"]) {
-                let tweet = object(value)
-                guard let words = text(tweet["text"]) else { continue }
-                let who = text(tweet["author"]) ?? by
-                items.append(.init(title: words, content: .object(["from": who.map { .string("@" + $0) } ?? .null, "when": tweet["created_at"] ?? .null]), actions: []))
-            }
-            if case .string(let next)? = object(row["meta"] ?? .null)["next_token"], tool == "x_search", case .string(let query)? = input["query"] {
-                actions.append(read("Next page of results", tool: "x_search", input: ["query": .string(query), "next_token": .string(next)]))
-            }
-            actions.insert(effect("Open x.com in Chrome", tool: "browser.chrome_navigate", input: ["url": .string("https://x.com/home")]), at: 0)
-            actions += [typed("Search posts (API)", tool: "x_search", field: "query"),
-                        read("Following timeline (API)", tool: "x_timeline", input: ["max": .int(20)]),
-                        typed("Posts by an account (API)", tool: "x_user_tweets", field: "username"),
-                        read("My profile (API)", tool: "x_me"), read("Status (API)", tool: "x_status")]
-        case "slack_status", "slack_list_channels", "slack_search_messages":
-            let response = object(row["response"] ?? .null)
-            if tool == "slack_status", content["error"] == nil, let team = text(response["team"]) {
-                content["message"] = .string("Connected to \(team)" + (text(response["user"]).map { " as \($0)" } ?? "") + ".")
-            }
-            for value in array(response["channels"]) {
-                let channel = object(value)
-                guard let id = text(channel["id"]) else { continue }
-                let direct = text(channel["kind"])?.contains("DM") == true
-                items.append(.init(title: text(channel["name"]).map { direct ? $0 : "#" + $0 } ?? id, content: .object(["kind": channel["kind"] ?? .null]),
-                    actions: [configure("Post here", tool: "slack_post_message", input: ["channel": .string(id)])]))
-            }
-            for value in array(object(response["messages"] ?? .null)["matches"]) {
-                let match = object(value)
-                guard let words = text(match["text"]) else { continue }
-                items.append(.init(title: words, content: .object(["from": match["from"] ?? .null, "when": match["when"] ?? .null]), actions: []))
-            }
-            actions = [read("Channels", tool: "slack_list_channels", input: ["limit": .int(200)]),
-                       typed("Search messages", tool: "slack_search_messages", field: "query"),
-                       configure("Post a message", tool: "slack_post_message")]
-        case "notion_status", "notion_search", "google_calendar_status", "google_calendar_list":
-            for value in array(row["results"]) {
-                let page = object(value)
-                guard let id = text(page["id"]) else { continue }
-                items.append(.init(title: text(page["title"]) ?? "Untitled", content: .object(["kind": page["object"] ?? .null, "updated": page["lastEditedTime"] ?? .null]),
-                    actions: [read("Read", tool: "notion_read_page", input: ["id": .string(id)], title: text(page["title"]) ?? "Notion page")]))
-            }
-            for value in array(row["events"]) {
-                let event = object(value)
-                items.append(.init(title: text(event["summary"]) ?? "Event", content: .object(event), actions: []))
-            }
-            actions = tool.hasPrefix("notion") ? [typed("Search pages", tool: "notion_search", field: "query")]
-                : [read("Choose calendar", tool: "google_calendar_calendars"),
-                   read("Next 7 days", tool: "google_calendar_list", input: ["limit": .int(16), "calendar_id": row["calendarId"] ?? .string("primary")]),
-                   typed("One day", tool: "google_calendar_list", input: ["calendar_id": row["calendarId"] ?? .string("primary")], field: "day")]
-            if case .object(let next)? = row["next"] {
-                actions.append(read("More results", tool: tool, input: next))
-            }
-        default:
-            break
+        var native: [String: JSONValue] = ["status": row["status"] ?? (row["ok"] == .bool(false) ? .string("failed") : .string("ok"))]
+        for key in ["connected", "detail", "fix", "reason", "failure_code", "error_code", "effects", "remedy", "hint", "next_call", "tap"] { native[key] = row[key] }
+        if problem(row) != nil {
+            native = row
+            if native["status"] == nil { native["status"] = .string("failed") }
         }
-        return .init(title: destinations.first { $0.id == room(for: tool) }?.title ?? "Workspace", content: .object(content), items: items, actions: actions)
-    }
-
-    /// "Playing: Song — Artist · Album · 1:02 of 3:40", or why nothing is.
-    static func playing(_ row: [String: JSONValue]) -> String {
-        if row["playerState"] == .string("not_running") { return "Music isn't open. music.play starts it." }
-        let track = object(row["track"] ?? .null)
-        guard let name = text(track["name"]) else { return "Nothing playing." }
-        func clock(_ value: JSONValue?) -> String? {
-            guard let seconds = number(value), seconds > 0 else { return nil }
-            return String(format: "%d:%02d", Int(seconds) / 60, Int(seconds) % 60)
+        let required = ["music_search_library":"results","music_list_library":"tracks","music_list_playlists":"playlists"][tool]
+        if let required, row[required]?.arrayValue == nil, problem(native) == nil, native["error"] == nil {
+            native["status"] = .string("unavailable")
+            native["error"] = .string("Music source did not supply its " + required + " array.")
         }
-        let state = row["isPlaying"] == .bool(true) ? "Playing" : text(row["playerState"])?.capitalized ?? "Paused"
-        var parts = [name + (text(track["artist"]).map { " — " + $0 } ?? "")]
-        if let album = text(track["album"]) { parts.append(album) }
-        if let at = clock(track["position_seconds"]), let of = clock(track["duration_seconds"]) { parts.append(at + " of " + of) }
-        return state + ": " + parts.joined(separator: " · ")
+        if ["music_now_playing", "music_control"].contains(tool), problem(native) == nil, native["error"] == nil {
+            let playback = tool == "music_control" ? row["now_playing"]?.objectValue : result.objectValue
+            let track = playback?["track"]
+            let explicitTrack = track == .null || text(track?.objectValue?["name"]) != nil
+            if let failure = playback.flatMap(problem) {
+                // The read failed; the original control receipt still owns
+                // its separate DONE line in lifeRoom.
+                native["status"] = .string("failed")
+                native["message"] = .string("Couldn't read what's playing: " + failure)
+                native["source"] = result
+            } else if playback?["playerState"]?.stringValue == nil || !explicitTrack {
+                native["status"] = .string("unavailable")
+                native["error"] = .string("Music source did not supply a playback state and explicit track.")
+                native["source"] = result
+            }
+        }
+        var items: [String: AgentWorkspaceItem] = [:], actions: [String: AgentWorkspaceButton] = [:]
+        let tracks = array(row["results"]) + array(row["tracks"])
+        for (index,value) in tracks.enumerated() {
+            let track = object(value), key = "track:" + String(index)
+            if let name = text(track["name"]) {
+                items[key] = .init(title:name,content:.object(["who":track["artist"] ?? .null,"summary":track["album"] ?? .null]),actions:[])
+                actions[key+":play"] = effect("play",tool:"music_control",input:["action":.string("play"),"track":.string(name),"artist":track["artist"] ?? .string("")])
+            }
+        }
+        for (index,value) in array(row["playlists"]).enumerated() {
+            let list = object(value), key = "playlist:" + String(index)
+            if let name = text(list["name"]) {
+                items[key] = .init(title:name,content:value,actions:[])
+                actions[key+":play"] = effect("play",tool:"music_control",input:["action":.string("play"),"playlist":.string(name)])
+            }
+        }
+        for verb in ["play","pause","next","previous"] { actions[verb] = effect(verb,tool:"music_control",input:["action":.string(verb)]) }
+        actions["playlist"] = typed("playlist",tool:"music_control",input:["action":.string("play")],field:"playlist",effect:true)
+        actions["track"] = typed("track",tool:"music_control",input:["action":.string("play")],field:"track",effect:true)
+        actions["find"] = typed("find",tool:"music_search_library",field:"query")
+        actions["playlists"] = read("playlists",tool:"music_list_playlists",input:["limit":.int(24)])
+        let failed = problem(native) != nil || native["error"] != nil
+        return await WorkspaceReadout.project(input:.object(["mode":.string("music"),"tool":.string(tool),"state":.string(failed ? "unavailable" : "available"),
+            "result":result,"failed":.bool(failed)]),dataRoot:dataRoot,items:items,actions:actions,native:native)
     }
 
     /// The one sentence that says why a read or change did not work.
     static func problem(_ row: [String: JSONValue]) -> String? {
-        let failed = row["not_run_status"] != nil || row["ok"] == .bool(false) || ["failed", "error", "denied", "unavailable", "needs_setup", "needs_authentication", "outcome_unknown", "cancelled"].contains(text(row["status"]) ?? "")
+        let failed = row["not_run_status"] != nil || row["ok"] == .bool(false) || ["failed", "error", "denied", "refused", "rejected", "blocked", "unavailable", "needs_setup", "needs_authentication", "outcome_unknown", "cancelled", "canceled", "timeout", "timed_out"].contains(text(row["status"]) ?? "")
             || row["needs"] != nil
         guard failed else { return nil }
-        return ["fix", "hint", "detail", "reason", "error", "message"].lazy.compactMap { text(row[$0]) }.first ?? "The read did not complete."
+        return HerScreen.failureFace(.object(row))
     }
 
     private static func read(_ label: String, tool: String, input: [String: JSONValue] = [:], title: String? = nil) -> AgentWorkspaceButton {
@@ -241,60 +100,45 @@ enum AgentWorkspaceLife {
         .init(label: label, action: .perform(tool: tool, input: input, title: label, textField: nil, isEffect: true))
     }
 
-    private static func configure(_ label: String, tool: String, input: [String: JSONValue] = [:]) -> AgentWorkspaceButton {
-        .init(label: label, action: .configure(tool: tool, input: input, title: label))
-    }
-
-    static func object(_ value: JSONValue) -> [String: JSONValue] { if case .object(let row) = value { return row }; return [:] }
-    private static func array(_ value: JSONValue?) -> [JSONValue] { if case .array(let rows)? = value { return rows }; return [] }
+    static func object(_ value: JSONValue) -> [String: JSONValue] { value.objectValue ?? [:] }
+    private static func array(_ value: JSONValue?) -> [JSONValue] { value?.arrayValue ?? [] }
     private static func text(_ value: JSONValue?) -> String? {
-        guard case .string(let text)? = value else { return nil }
+        guard let text = value?.stringValue else { return nil }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
     private static func int(_ value: JSONValue?) -> Int? { number(value).map { Int($0) } }
-    private static func number(_ value: JSONValue?) -> Double? {
-        switch value {
-        case .int(let n)?: return Double(n)
-        case .double(let n)?: return n
-        case .string(let s)?: return Double(s)
-        default: return nil
-        }
-    }
+    private static func number(_ value: JSONValue?) -> Double? { value?.numberValue(coercingStrings: true, finiteOnly: false) }
 }
 
 extension HerScreen {
     /// A read or a change in a life room as that room's text, with what the
     /// change did on the line under the header. Nil keeps the old frame.
-    static func lifeRoom(_ place: AgentWorkspaceLocation, projection: AgentWorkspaceProjection, frame: JSONValue, dataRoot: URL) -> String? {
+    static func lifeRoom(_ place: AgentWorkspaceLocation, projection: AgentWorkspaceProjection, frame: JSONValue, dataRoot: URL) async -> String? {
         let tool: String, receipt: JSONValue?
         var shown = projection
-        var watchlist: String?
         switch place {
-        case .record(let name, let input, _):
+        case .record(let name, _, _):
             tool = name
-            if case .string(let list)? = input["watchlist"] { watchlist = list }
             receipt = AgentWorkspaceLife.object(projection.content)["action_receipt"]
         case .receipt(let name, _, let value, _):
             tool = name; receipt = value
-            if let own = AgentWorkspaceLife.project(tool: name, input: [:], result: value) { shown = own }
-        case .area("gcal"): tool = "google_calendar_calendars"; receipt = nil
+            if AgentWorkspaceLife.room(for: name) == "music" { shown = await AgentWorkspaceLife.project(tool: name, input: [:], result: value, dataRoot: dataRoot) }
         case .page(let inner, _):
-            return lifeRoom(inner, projection: projection, frame: frame, dataRoot: dataRoot)
+            return await lifeRoom(inner, projection: projection, frame: frame, dataRoot: dataRoot)
         default: return nil
         }
         guard let room = AgentWorkspaceLife.room(for: tool) else { return nil }
         // A calendar or reminder change keeps its old receipt frame unless
         // its list was read back (the record carries the receipt).
         if case .receipt = place, tool.hasPrefix("mac_") { return nil }
-        var lines = textRoom(room, place: place, projection: shown, frame: frame, dataRoot: dataRoot).components(separatedBy: "\n")
-        // A quoted watchlist is titled by its name.
-        if let watchlist, let first = lines.first, first.hasPrefix("MARKETS") {
-            lines[0] = "MARKETS · " + clip(watchlist.uppercased(), 30) + first.dropFirst(7)
+        var readFrame = frame
+        if tool == "music_control", case .object(var fields) = readFrame,
+           let status = AgentWorkspaceLife.object(shown.content)["status"] {
+            fields["status"] = status
+            readFrame = .object(fields)
         }
-        if room == "gcal", let first = lines.first, first.hasPrefix("GCAL") {
-            lines[0] = "GCAL · Google Calendar (separate from your Mac calendar)" + first.dropFirst(4)
-        }
+        var lines = textRoom(room, place: place, projection: shown, frame: readFrame, dataRoot: dataRoot).components(separatedBy: "\n")
         if let receipt {
             let row = AgentWorkspaceLife.object(receipt)
             let what = ["title", "action_performed", "playlist", "track"].lazy.compactMap { key -> String? in
@@ -306,16 +150,15 @@ extension HerScreen {
             case .succeeded:
                 label = "DONE"; said = "✓ " + (what.map { "done: " + $0 } ?? "done")
             case .failed, .refused, .cancelled, .timeout:
-                label = "RESULT"; said = "✗ " + (AgentWorkspaceLife.problem(row) ?? outcome.rawValue)
+                label = "RESULT"; said = failureFace(receipt)
             case .unknown:
                 label = "STATUS"
-                let status: String = if case .string(let value)? = row["status"] { value } else { "unconfirmed" }
-                said = status.replacingOccurrences(of: "_", with: " ") + (what.map { ": " + $0 } ?? "")
+                said = failureFace(receipt)
             }
-            lines.insert(pad(label, 10) + clip(said, 100), at: min(1, lines.count))
+            lines.insert(pad(label, 10) + (outcome == .succeeded ? clip(said, 100) : said), at: min(1, lines.count))
         }
-        if tool.hasPrefix("google_calendar_") || ["mac_calendar_calendars", "mac_calendar_free_busy"].contains(tool) {
-            let details: JSONValue = if !shown.items.isEmpty, ["google_calendar_calendars", "google_calendar_list", "mac_calendar_calendars", "mac_calendar_free_busy"].contains(tool) {
+        if ["mac_calendar_calendars", "mac_calendar_free_busy"].contains(tool) {
+            let details: JSONValue = if !shown.items.isEmpty {
                 .array(shown.items.dropFirst(shown.page * 8).prefix(8).map(\.content))
             } else { shown.content }
             if let text = try? details.serialize(pretty: true) { lines.append("Calendar details:\n" + text) }
@@ -345,32 +188,25 @@ extension HerScreen {
 /// of its verbs instead, as long as her names last (`HerRoomCache`).
 final class HerItemPages: @unchecked Sendable {
     static let shared = HerItemPages()
-    struct Page: Sendable { let text: String; let peers: [String] }
+    struct Page: Sendable { let text: String; let speech: [ContactThread.Line] }
     private let cache = HerRoomCache<Page>(lasting: true)
 
     func keep(_ root: URL, _ pages: [String: String], room: String? = nil, scope: String? = nil,
-              peers: [String: [String]] = [:]) {
+              speech: [String: [ContactThread.Line]] = [:]) {
         cache.keep(root, Dictionary(uniqueKeysWithValues: pages.map {
-            ($0.key, Page(text: $0.value, peers: peers[$0.key] ?? []))
+            ($0.key, Page(text: $0.value, speech: speech[$0.key] ?? []))
         }), room: room, scope: scope)
     }
 
     func page(_ root: URL, _ name: String) -> String? {
         guard let page = cache.value(root, name) else { return nil }
-        if !HerScreen.previewing { for peer in page.peers { AgentWorkspacePorts.current.tools.markConsumed(peer: peer) } }
+        if !HerScreen.previewing {
+            for row in page.speech { ContactThread.consume(row, mark: { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) }) }
+        }
         return page.text
     }
 
     func removeSession(_ key: String) { cache.removeSession(key) }
-}
-
-extension HerScreen {
-    /// The x room without touching the API (User: X is read in Chrome): the
-    /// Chrome-first header and the verbs, API ones marked as the fallback.
-    static func xRoom(dataRoot: URL) -> String? {
-        guard let projection = AgentWorkspaceLife.project(tool: "x_status", input: [:], result: .object(["status": .string("ok"), "room": .bool(true)])) else { return nil }
-        return textRoom("x", place: .area("x"), projection: projection, frame: .object(["status": .string("ok")]), dataRoot: dataRoot)
-    }
 }
 
 /// The latest calendar-today and reminders-due counts, noted as those reads

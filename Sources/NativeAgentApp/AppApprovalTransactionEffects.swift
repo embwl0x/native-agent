@@ -9,9 +9,11 @@ import NativeAgentShared
 import NativeAgentCore
 import ApprovalTransactions
 import ApprovalInbox
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import TrustCenter
 import WorkshopExecution
+// Blueprint: | `AppApprovalTransactionEffects.swift` | `AppApprovalTransactionEffects` struct and `ApprovalTransactionCoordinator.app`: app-bound approval factory and live executor/platform bindings; `AppApprovalTransactionEffects` struct; `ApprovalTransactionCoordinator.app` |
 
 extension ApprovalTransactionCoordinator {
     /// The approval coordinator over this app's effects, for one root.
@@ -46,24 +48,21 @@ struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
         try await NativeSkillRegistryActions.disableSkill(name: name, dataRoot: dataRoot)
     }
 
-    func enableSkill(name: String, reviewedDigest: String?, admitScript: Bool) async throws {
+    func enableSkill(name: String, reviewedDigest: String?) async throws {
         try await NativeSkillRegistryActions.enableSkill(
             name: name, dataRoot: dataRoot,
-            reviewedDigest: reviewedDigest, admitScript: admitScript
+            reviewedDigest: reviewedDigest
         )
-    }
-
-    var externalSendDependencies: ExternalSendExecutionDependencies { .production }
-
-    func observeMotorActionState(_ state: MotorActionReadModel) async {
-        await NativeAgentEngine.cognitionRuntime(for: dataRoot).observeMotorActionState(state)
     }
 
     func runConnectorAction(descriptor: ConnectorActionDescriptor, dryRun: Bool, input: [String: JSONValue],
                             approvedReplayApprovalID: String, dataRoot: URL) async throws -> ApprovalConnectorActionResult {
-        let receipt = try await ConnectorActions(platform: AppConnectorActionPlatform(dataRoot: self.dataRoot))
-            .runConnectorAction(descriptor: descriptor, dryRun: dryRun, input: input,
-                                approvedReplayApprovalID: approvedReplayApprovalID, dataRoot: dataRoot)
+        let engine = NativeAgentEngine.forRoot(dataRoot)
+        let receipt = try await engine.tools.withPartDoor(envelope: .native("approval:connector_action:" + approvedReplayApprovalID)) {
+            try await ConnectorActions(platform: AppConnectorActionPlatform(engine: engine))
+                .runConnectorAction(descriptor: descriptor, dryRun: dryRun, input: input,
+                                    approvedReplayApprovalID: approvedReplayApprovalID, dataRoot: dataRoot)
+        }
         return ApprovalConnectorActionResult(id: receipt.id, status: receipt.status)
     }
 

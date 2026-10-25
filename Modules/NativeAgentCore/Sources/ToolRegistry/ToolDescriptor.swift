@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import os
+// Blueprint: | `ToolDescriptor.swift` | `ToolDescriptor`, `ToolExecutor`, `AppActionBinding`: composed action calls, effect declarations (class, reach, capabilities; each form supplies the common case) and executable ownership registration |
 
 // MARK: - Tool descriptors (S9, 2026-09-26)
 
@@ -11,7 +12,6 @@ import os
 /// means a new dispatcher case cannot quietly fall into a presentation
 /// catch-all without its category being reviewed.
 public enum ChatToolCatalogBucket: String, CaseIterable, Sendable {
-    case mcp
     case shell
     case system
     case macControl = "mac-control"
@@ -24,7 +24,6 @@ public enum ChatToolCatalogBucket: String, CaseIterable, Sendable {
 
     public var title: String {
         switch self {
-        case .mcp: return "MCP (External Servers)"
         case .shell: return "Shell / Build"
         case .system: return "System"
         case .macControl: return "Mac Control"
@@ -39,7 +38,6 @@ public enum ChatToolCatalogBucket: String, CaseIterable, Sendable {
 
     public var systemImage: String {
         switch self {
-        case .mcp: return "link"
         case .shell: return "terminal"
         case .system: return "cpu"
         case .macControl: return "macwindow"
@@ -99,20 +97,22 @@ public struct AppActionBinding: Sendable {
     public let lifecycle: CapabilityLifecycle.Action?
     /// What the action is when it does not read (`read`/`readWhen` say when it does).
     public let toolClass: ToolClass
-    /// For one of her parts: whether it reaches User's side, from the same
-    /// manifest and dependencies its class reads. Nil for every other action.
-    public let reachesHim: Bool?
+    public let reach: ToolReach
+    public let capabilities: Set<String>
 
     public init(isHis: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:],
                 lifecycle: CapabilityLifecycle.Action? = nil,
                 tool: String = "", fixedInput: [String: JSONValue] = [:], rename: [String: String] = [:],
-                folded: Bool = false, descriptor: ToolDescriptor? = nil, toolClass: ToolClass = .write, reachesHim: Bool? = nil) {
+                folded: Bool = false, descriptor: ToolDescriptor? = nil, toolClass: ToolClass = .write,
+                reach: ToolReach = .hers, capabilities: Set<String>? = nil) {
         self.tool = tool; self.fixedInput = fixedInput; self.rename = rename; self.folded = folded; self.descriptor = descriptor
         self.isHis = isHis; self.irreversible = irreversible; self.read = read
         self.secretArgs = secretArgs; self.readWhen = readWhen
         self.lifecycle = lifecycle
         self.toolClass = toolClass
-        self.reachesHim = reachesHim
+        self.reach = reach
+        // A door action writes the app's own data unless it says otherwise.
+        self.capabilities = capabilities ?? (toolClass == .read ? toolClass.baseCapabilities : toolClass.baseCapabilities.union(["app_data_write"]))
     }
 
     public func readOnly(args: [String: JSONValue]) -> Bool {
@@ -174,6 +174,10 @@ public struct AppActionBinding: Sendable {
         registry.withLock { $0.tools[tool]?.schema.toolClass }
     }
 
+    public static func declaredSchema(_ tool: String) -> LLMToolSchema? {
+        registry.withLock { $0.tools[tool]?.schema }
+    }
+
     /// The catalog bucket a registered tool is filed under.
     public static func declaredBucket(_ tool: String) -> ChatToolCatalogBucket? {
         registry.withLock { $0.tools[tool]?.bucket }
@@ -189,10 +193,7 @@ public struct AppActionBinding: Sendable {
         else if let action = ToolNameAliases.appAction(tool, input: input) { id = action }
         else { return nil }
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard var policy = binding(key) else {
-            return tool == "app" && ToolNameAliases.appFindQuery(input) != nil
-                ? AppActionBinding(isHis: false, irreversible: false, read: true, secretArgs: []) : nil
-        }
+        guard var policy = binding(key) else { return nil }
         let args: [String: JSONValue] = if tool == "app", case .object(let args)? = input["args"] { args } else { input }
         policy.read = policy.readOnly(args: args)
         return policy

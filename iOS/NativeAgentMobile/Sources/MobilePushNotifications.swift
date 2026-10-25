@@ -5,6 +5,7 @@ import UIKit
 import NativeAgentShared
 #if canImport(CloudKit)
 import CloudKit
+// Blueprint: | `MobilePushNotifications.swift` | `NativeAgentPushTokenSyncCache` struct; `load`, `shouldSync` |
 #endif
 
 struct NativeAgentPushTokenSyncCache {

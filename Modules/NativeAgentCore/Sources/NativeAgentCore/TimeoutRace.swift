@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `TimeoutRace.swift` | `TimeoutRaceLatch` and `raceAgainstTimeout`: first-wins operation/deadline coordination with explicit parent-cancellation outcome |
+
 /// Outcome of racing an async operation against a wall-clock deadline.
 public enum TimeoutRaceOutcome<T: Sendable>: Sendable {
     case value(T)
@@ -47,8 +49,20 @@ private actor TimeoutRaceLatch<T: Sendable> {
 /// body lingers in the background but never blocks the caller. Exposed at file
 /// scope (not actor-isolated) so it is directly unit-testable with a scripted
 /// closure.
+/// Timeout bounds only the response: execution exclusion/resources belong to
+/// the body's actual exit (`onBodyExit`), never to the returned timeout receipt.
 public func raceAgainstTimeout<T: Sendable>(
     seconds: Double,
+    onBodyExit: @escaping @Sendable () -> Void = {},
+    _ operation: @escaping @Sendable () async throws -> T
+) async -> TimeoutRaceOutcome<T> {
+    await raceAgainstTimeout(nanoseconds: UInt64(max(0, seconds * 1_000_000_000).rounded()),
+                             onBodyExit: onBodyExit, operation)
+}
+
+/// The same hard race for callers that already own duration conversion.
+public func raceAgainstTimeout<T: Sendable>(
+    nanoseconds: UInt64,
     onBodyExit: @escaping @Sendable () -> Void = {},
     _ operation: @escaping @Sendable () async throws -> T
 ) async -> TimeoutRaceOutcome<T> {
@@ -68,9 +82,8 @@ public func raceAgainstTimeout<T: Sendable>(
             await latch.resolve(.failure(error.localizedDescription))
         }
     }
-    let deadlineNanos = UInt64(max(0, seconds * 1_000_000_000).rounded())
     let timerTask = Task {
-        do { try await Task.sleep(nanoseconds: deadlineNanos) } catch { return }
+        do { try await Task.sleep(nanoseconds: nanoseconds) } catch { return }
         // Claim the receipt before cancellation can trigger a body completion,
         // but set the body's cancellation flag before waking the caller.
         await latch.resolve(.timedOut) { bodyTask.cancel() }

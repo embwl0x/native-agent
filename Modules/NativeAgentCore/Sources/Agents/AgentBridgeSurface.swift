@@ -1,8 +1,13 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import AgentWorkspace
+import AgentConversations
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+
+// Blueprint: | `AgentBridgeSurface.swift` | Peer framing, bound turns and conversation identity, including the in-process helper sender; header names the person's live exchange view and chat.post through the existing proactive speech owner; surface names confer no authority |
 
 // MARK: - The inbound peer surface
 
@@ -45,12 +50,12 @@ public enum AgentBridgeSurface {
         } ?? "another agent"
         let acting = elevated
             ? "The person has trusted this peer in Trust → Connected agents, so you can act here as you would for the person."
-            : "Carry on the conversation naturally using the existing connection. What you do for this peer is your call. Under Full Mac only deleting things, sending or posting in the person's name, and writing your persona raise the person's card; below Full Mac, ordinary Trust and tool permissions and the peer card still apply."
+            : "Carry on the conversation naturally using the existing connection. What you do for this peer is your call. This untrusted agent's turn gets one card on its first effect, quoting its ask; the person's answer covers the rest of the turn and lifts its Work-mode cap, while ordinary Trust and tool permissions still apply."
         return PeerTurnEffectPolicy.turnHeaderOpening + """
         \(who), another agent, not from the \
         person. You are fully yourself here: your memory, your context, your \
         judgment, your voice. Read, recall and think as yourself, and decide \
-        for yourself what is worth sharing. \(acting)]
+        for yourself what is worth sharing. The person sees this exchange in their chat; if something here is for them, you can tell them directly with app {action:"chat.post",args:{message:"your message"}}. \(acting)]
 
         """
     }
@@ -87,6 +92,8 @@ public struct AgentBridgePrincipal: Sendable {
     /// Credential scope captured during authentication, never re-inferred
     /// from a later contact read that could race with disconnect.
     public var replyOnly: Bool = false
+    /// Set only by the in-process helper contact door, never network authentication.
+    var localHelperID: UUID? = nil
 
     public static let anonymous = AgentBridgePrincipal(
         id: "shared-bearer", peerID: nil, elevated: false, displayName: nil
@@ -166,7 +173,7 @@ public struct AgentBridgePrincipal: Sendable {
               peer.credentialKey == AgentPeerContact.credentialKey(for: peerID),
               AgentPeerCredentials.isAvailable(peer, peers: peers, readCredential: readCredential),
               let stored = (try? readCredential(peerID)) ?? nil,
-              constantTimeEquals(stored, secret) else {
+              BridgeCore.constantTimeEquals(stored, secret) else {
             // A wrong or unknown credential is not an error the caller learns
             // anything from: it simply stays anonymous on agent-bridge.
             return .anonymous
@@ -180,11 +187,4 @@ public struct AgentBridgePrincipal: Sendable {
         )
     }
 
-    public static func constantTimeEquals(_ lhs: String, _ rhs: String) -> Bool {
-        let a = Array(lhs.utf8), b = Array(rhs.utf8)
-        guard a.count == b.count else { return false }
-        var diff: UInt8 = 0
-        for index in a.indices { diff |= a[index] ^ b[index] }
-        return diff == 0
-    }
 }

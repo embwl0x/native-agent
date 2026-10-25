@@ -2,6 +2,7 @@ import AuthoredCapabilities
 import Foundation
 import MacControl
 import PersistenceCore
+// Blueprint: | `MacAppleScriptBridge+Runtime.swift` | `MacAppleScriptBridge`: delegates `runAppleScript` to MacControl, skill hand-back and integration envelopes; `deniedEnvelope`; Music recipe/parsers live in the editable `Resources/abilities/music-library.js` and `music.js` seeds, called through L0 `Parts.call` by MacIntegrationDeliveryActions; the playback receipt and effects survive failed readback as a separate `now_playing` fact, and exact title/artist selection uses Unicode full case folding |
 
 extension MacAppleScriptBridge {
     // MARK: - AppleScript invocation
@@ -14,16 +15,6 @@ extension MacAppleScriptBridge {
             if SkillRunContext.handsBack { throw SkillRunContext.HandBack("Automation of \(app)") }
             throw AppleScriptError.permissionDenied(app: app)
         }
-    }
-
-    static func isMusicNoCurrentTrackError(_ msg: String) -> Bool {
-        let lowered = msg.lowercased()
-        return lowered.contains("current track")
-            || lowered.contains("class ptrk")
-            || (lowered.contains("track") && lowered.contains("can't get"))
-            || (lowered.contains("track") && lowered.contains("can’t get"))
-            || (lowered.contains("track") && lowered.contains("can't make"))
-            || (lowered.contains("track") && lowered.contains("can’t make"))
     }
 
     // MARK: - Envelopes
@@ -68,41 +59,8 @@ extension MacAppleScriptBridge {
         ]
         // A refusal or a miss before the change; a send Mail declined may still sit in its Outbox.
         if reason != "mail_refused_send" { envelope["effects"] = .string("none") }
-        if let message = failureWords[reason] { envelope["message"] = .string(message) }
         return .object(envelope)
     }
-
-    /// What to do next, one plain sentence per reason code (2026-09-24).
-    static let failureWords: [String: String] = [
-        "missing_query": "Nothing to search for: give a word or phrase in query.",
-        "missing_to": "Say who it goes to in to (an email address).",
-        "missing_subject": "Say which message: its message_id and expected_message_id from mail_list_recent, or its subject.",
-        "missing_body": "Nothing to send or save: put the text in body.",
-        "missing_title": "Give the note's title.",
-        "invalid_message_locator": "message_id needs the expected_message_id from the same mail_list_recent row.",
-        "message_not_in_inbox": "That message is no longer in the inbox; list it again with mail_list_recent and use the new message_id.",
-        "message_changed_or_moved_refresh_inbox": "That message moved or changed; list the inbox again with mail_list_recent and use the new message_id.",
-        "message_changed_or_ambiguous_refresh_inbox": "That message moved, changed, or its subject matches several; list the inbox again and reply by message_id.",
-        "no_matching_message": "No inbox message matches; list the inbox with mail_list_recent and pass its message_id. An archived message is no longer in the inbox, so delete or mark it before archiving.",
-        "mail_refused_send": "Mail refused to send it (no account can send, or it is offline); nothing went out.",
-        "no_archive_mailbox": "Mail has no Archive mailbox, so nothing moved; leave it or use mail_delete.",
-        "mail_delete_no_match": "No indexed message matches in Mail, including archived mail; nothing moved to Trash.",
-        "mail_delete_target_changed": "The indexed message moved or changed before deletion; nothing moved to Trash. Locate it again before trying again.",
-        "no_trash_mailbox": "Mail has no Trash mailbox for this message's account; nothing was deleted.",
-        "message_already_in_trash": "That message is already in Trash; it was left there and was not permanently deleted.",
-        "mail_lookup_timed_out": "Mail did not answer in time; nothing changed. Read it again, and if it repeats, look at Mail itself.",
-        "mail_index_unavailable": "Mail's message index could not be read (NativeAgent may need macOS Full Disk Access); nothing was listed or changed.",
-        "thread_not_found": "That conversation is not in Messages now; list threads again with messages_recent_threads.",
-        "invalid_history_cursor": "before_message_id works only with the same thread_id, using older_before_message_id from the last read.",
-        "choose_recipient_or_thread": "Give one of to (a phone number or email) or thread_id, not both.",
-        "read_thread_before_reply": "Open the thread first (messages_recent_threads with its thread_id) and pass its participant handles as expected_participants.",
-        "invalid_expected_participants": "expected_participants must be the handles from the latest thread read, each once.",
-        "participants_changed_read_thread_again": "The people in that thread changed; open it again and reply with the new participants. Nothing was sent.",
-        "no_matching_note": "No note has that exact id or title; find it with notes_search and copy its full id or title.",
-        "invalid_note_body_offset": "Use body_offset with the same note id and next_body_offset from its last read; the offset must be within the current text.",
-        "missing_body_append_or_new_title": "Say what to change: body (replace), append, or new_title.",
-        "body_and_append_mutually_exclusive": "Use body to replace or append to add, not both.",
-    ]
 
     static func notConfiguredEnvelope(integration: String, fix: String) -> JSONValue {
         .object([
@@ -226,97 +184,6 @@ extension MacAppleScriptBridge {
         }
         // Fall back to raw; downstream just gets the locale string.
         return trimmed
-    }
-
-    /// Parse `name|||artist|||album|||duration###...` into music track records.
-    static func parseMusicTrackRecords(_ raw: String) -> [JSONValue] {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        var out: [JSONValue] = []
-        for entry in trimmed.components(separatedBy: "###") {
-            let e = entry.trimmingCharacters(in: .whitespacesAndNewlines)
-            if e.isEmpty { continue }
-            let parts = e.components(separatedBy: "|||")
-            let name = parts.indices.contains(0) ? parts[0] : ""
-            let artist = parts.indices.contains(1) ? parts[1] : ""
-            let album = parts.indices.contains(2) ? parts[2] : ""
-            let durationRaw = parts.indices.contains(3) ? parts[3] : ""
-            let duration = Double(durationRaw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-            out.append(.object([
-                "name": .string(name),
-                "artist": .string(artist),
-                "album": .string(album),
-                "duration_seconds": .double(duration),
-            ]))
-        }
-        return out
-    }
-
-    static func parseMusicPagedTrackRecords(
-        _ raw: String,
-        offset: Int,
-        limit: Int
-    ) -> (total: Int, tracks: [JSONValue]) {
-        let parts = raw.components(separatedBy: ":::PAGE:::")
-        let total = Int(parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
-        let recordsRaw = parts.dropFirst().joined(separator: ":::PAGE:::")
-        let trimmed = recordsRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return (total, []) }
-        var tracks: [JSONValue] = []
-        tracks.reserveCapacity(limit)
-        for entry in trimmed.components(separatedBy: "###") {
-            let e = entry.trimmingCharacters(in: .whitespacesAndNewlines)
-            if e.isEmpty { continue }
-            let parts = e.components(separatedBy: "|||")
-            let index = Int(parts.indices.contains(0) ? parts[0] : "") ?? (offset + tracks.count + 1)
-            let name = parts.indices.contains(1) ? parts[1] : ""
-            let artist = parts.indices.contains(2) ? parts[2] : ""
-            let album = parts.indices.contains(3) ? parts[3] : ""
-            let durationRaw = parts.indices.contains(4) ? parts[4] : ""
-            let persistentID = parts.indices.contains(5) ? parts[5] : ""
-            let duration = Double(durationRaw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-            tracks.append(.object([
-                "index": .int(Int64(index)),
-                "name": .string(name),
-                "artist": .string(artist),
-                "album": .string(album),
-                "duration_seconds": .double(duration),
-                "persistent_id": .string(persistentID),
-            ]))
-        }
-        return (total, tracks)
-    }
-
-    static func parseMusicPlaylistRecords(
-        _ raw: String,
-        offset: Int,
-        limit: Int
-    ) -> (total: Int, playlists: [JSONValue]) {
-        let parts = raw.components(separatedBy: ":::PAGE:::")
-        let total = Int(parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
-        let recordsRaw = parts.dropFirst().joined(separator: ":::PAGE:::")
-        let trimmed = recordsRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return (total, []) }
-        var playlists: [JSONValue] = []
-        playlists.reserveCapacity(limit)
-        for entry in trimmed.components(separatedBy: "###") {
-            let e = entry.trimmingCharacters(in: .whitespacesAndNewlines)
-            if e.isEmpty { continue }
-            let parts = e.components(separatedBy: "|||")
-            let index = Int(parts.indices.contains(0) ? parts[0] : "") ?? (offset + playlists.count + 1)
-            let name = parts.indices.contains(1) ? parts[1] : ""
-            let trackCount = Int64(parts.indices.contains(2) ? parts[2] : "").flatMap { $0 >= 0 ? $0 : nil }
-            let persistentID = parts.indices.contains(3) ? parts[3] : ""
-            let specialKind = parts.indices.contains(4) ? parts[4] : ""
-            playlists.append(.object([
-                "index": .int(Int64(index)),
-                "name": .string(name),
-                "track_count": trackCount.map(JSONValue.int) ?? .string("unknown"),
-                "persistent_id": .string(persistentID),
-                "special_kind": .string(specialKind),
-            ]))
-        }
-        return (total, playlists)
     }
 
     static func parseNoteRecords(_ raw: String) throws -> (total: Int64, notes: [JSONValue]) {

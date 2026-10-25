@@ -2,12 +2,16 @@ import Foundation
 import PersistenceCore
 import Desk
 import SwarmRuns
+// Blueprint: | `HerScreenRooms+Agents.swift` | `HerScreen`: `agentsTarget`, `crewsRoom`, `delegationsRoom`; crews reuse HerScreen's crew rows and canonical SwarmCrew liveness, counting unknown separately from running |
 
 /// Her screen, agents slice (2026-09-24, User: "get it all in her workspace").
 /// Crews (every swarm, not only a live one), delegations (the jobs Claude,
 /// Codex and Omp ran for her) and a helper's pause/resume, each by a stable
 /// name. Local file reads on open only; nothing here runs on home.
 extension HerScreen {
+    static let crewStoreRemedy = Repair.remedy(owner: "SwarmRuns", nextCall: nil, tap: nil,
+        instruction: "Inspect only the reported swarm-store file; restore access or repair its data, preserving original bytes and worker results.")
+
     /// `crews`, `delegations`, `job.N`, `<helper>.pause` / `.resume`; nil for any other name.
     static func agentsTarget(_ name: String, dataRoot: URL) async -> Target? {
         switch name {
@@ -30,29 +34,18 @@ extension HerScreen {
 
     // MARK: Crews
 
-    /// Every crew, live first, then the newest finished runs: task, state,
-    /// workers, age. `crew.N` opens one (crewPage reads live and finished alike).
+    /// Every crew, unsettled first, then the newest finished runs: task, state,
+    /// workers, age. Unknown liveness stays explicit; `crew.N` opens one.
     static func crewsRoom(dataRoot: URL, now: Date = Date()) -> String {
         let all: [[String: Any]]
         do { all = try SwiftNativeSwarmRunsReader(runsPath: dataRoot.appendingPathComponent("swarms/runs.json")).readCrews() }
-        catch { return "CREWS unavailable: \(error.localizedDescription)" }
-        let live = all.filter { $0["pid"] != nil }
-        let liveIDs = Set(live.compactMap { $0["id"] as? String })
-        let lines: [String] = withNames(dataRoot) { book in
-            all.prefix(10).compactMap { row -> String? in
-                guard let id = row["id"] as? String else { return nil }
-                let workers = row["workers"] as? [[String: Any]] ?? []
-                let working = workers.filter { ($0["status"] as? String ?? "working") == "working" }.count
-                let status = liveIDs.contains(id) ? "\(working) of \(workers.count) working" : crewState(row, fallback: "done") + " · \(workers.count) workers"
-                let at = (row["completedAt"] as? String ?? row["createdAt"] as? String).flatMap(date)
-                let n = book.number("crew", id: id) { Set(all.compactMap { $0["id"] as? String }) }
-                return pad("crew.\(n)", 10) + clip(firstLine(row["objective"] as? String ?? "A task"), 44) + " · " + status
-                    + (at.map { " · " + age(now.timeIntervalSince($0)) } ?? "")
-            }
-        }
-        return screen(["CREWS", "\(live.count) running", "\(all.count) in the record"] + (all.count > 10 ? ["10 newest shown"] : []),
+        catch { return readFailure(error, reason: "crew_records_unavailable", remedy: crewStoreRemedy) }
+        let live = all.filter { SwarmCrew.liveness(of: $0) == .running }, unknown = all.filter { SwarmCrew.liveness(of: $0) == .unknown }
+        let lines = crewRows(all, dataRoot: dataRoot, now: now)
+        return screen(["CREWS", "\(live.count) running"] + (unknown.isEmpty ? [] : ["\(unknown.count) unknown"])
+            + ["\(all.count) in the record"] + (all.count > 10 ? ["10 newest shown"] : []),
             [lines.isEmpty ? ["no crews yet"] : lines],
-            verbs: [("crew.N", "open one: its task, each worker's state and words"), ("agent_swarm", "start a new crew (tool)")])
+            verbs: [("crew.N", "open its task, worker states and words"), ("app {find:\"agent.swarm\"}", "arguments for starting a crew")])
     }
 
     // MARK: Delegations
@@ -68,16 +61,16 @@ extension HerScreen {
     }
 
     static func jobState(_ job: DelegationJobProjection, now: Date) -> String {
-        let stalled = job.stalled(at: now)
-        if deliveredLive(job), let done = job.completedAt.flatMap(date) { return "✓ delivered live " + age(now.timeIntervalSince(done)) }
-        guard let done = job.completedAt.flatMap(date) else {
-            let started = (job.startedAt ?? job.claimedAt ?? job.createdAt).flatMap(date)
-            return (stalled ? "✗ stalled" : "⟳ running") + (started.map { " " + age(now.timeIntervalSince($0)) } ?? "")
+        let state = job.runStatus ?? job.status ?? job.state ?? "not recorded"
+        var parts = ["execution: " + (deliveredLive(job) ? "not recorded (live handoff)" : state)]
+        if job.executionError != nil { parts.append("execution error recorded") }
+        if let delivery = job.deliveryOutcome { parts.append("delivery: " + delivery) }
+        if deliveredLive(job) { parts.append("handoff: delivered live") }
+        if job.stalled(at: now) { parts.append("stalled") }
+        if let at = (job.completedAt ?? job.startedAt ?? job.claimedAt ?? job.createdAt).flatMap(date) {
+            parts.append(age(now.timeIntervalSince(at)))
         }
-        let failed = job.executionError != nil || job.deliveryOutcome == "failed_before_answer"
-            || ["failed", "failed_before_answer", "error", "interrupted", "failed_hung", "stalled", "spawn_failed", "timed_out", "timeout", "cancelled", "canceled"].contains((job.runStatus ?? job.status ?? job.state ?? "").lowercased())
-        return (stalled ? "✗ stalled " : failed ? "✗ failed " : "✓ done ") + age(now.timeIntervalSince(done))
-            + (job.deliveryOutcome == "lost" ? " · reply lost" : ["unknown", "sent_unconfirmed"].contains(job.deliveryOutcome ?? "") ? " · delivery unconfirmed" : "")
+        return parts.joined(separator: " · ")
     }
 
     private static func jobTitle(_ job: DelegationJobProjection) -> String {
@@ -108,14 +101,6 @@ extension HerScreen {
     /// A built-in lane's last exchanges both ways, from its own job records
     /// (what she asked, what came back), oldest first; for a record with no
     /// saved exchange history.
-    /// A job's cached reply, read under the route its ledger entry records
-    /// (the app wrote it from that lane): unattested only when it records none.
-    private static func consumeReply(_ reply: String, route: String) {
-        ContactThread.consume(mine: false, source: route.isEmpty ? nil : route, steeredBy: [], text: reply) { peer, _ in
-            AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
-        }
-    }
-
     static func laneTalk(_ agent: String, slug: String, now: Date = Date()) -> [String] {
         let mine = DelegationStatusProjector().recentJobs(now: now, limit: 30).filter { $0.agent == agent }.prefix(3).reversed()
         return mine.flatMap { job -> [String] in
@@ -126,10 +111,16 @@ extension HerScreen {
                 pad(at.map { age(now.timeIntervalSince($0)) } ?? "", 5) + pad(clip(who, 20), 10) + clip(sentence(text), 80)
             }
             let sent = nonEmpty(job.requestTextHead).map { [row(asked, "me", $0)] } ?? []
-            if let reply { consumeReply(reply, route: job.agent); return sent + [row(back, slug, reply)] }
+            if let reply {
+                ContactThread.consume(.init(text: reply, stamp: .init(source: job.agent.isEmpty ? nil : job.agent, steeredBy: [], contact: true)),
+                    mark: { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) })
+                return sent + [row(back, slug, reply)]
+            }
             // No words back: the send's own outcome, not words from them.
-            let outcome = nonEmpty(job.executionError).map { "✗ " + failureReason($0) } ?? jobState(job, now: now)
-            return (sent.isEmpty ? [row(asked, "me", "(message text not kept)")] : sent) + [row(back, "", outcome)]
+            if let error = nonEmpty(job.executionError) {
+                return (sent.isEmpty ? [row(asked, "me", "(message text not kept)")] : sent) + [jobFailure(job, error: error)]
+            }
+            return (sent.isEmpty ? [row(asked, "me", "(message text not kept)")] : sent) + [row(back, "", jobState(job, now: now))]
         }
     }
 
@@ -137,27 +128,40 @@ extension HerScreen {
         guard let job = jobs(dataRoot: dataRoot, now: now).first(where: { $0.id == id }) else { return nil }
         let asked = nonEmpty(job.requestTextHead).map { plainLines($0).prefix(3).map { clip($0, 100) } } ?? [clip(jobTitle(job), 100)]
         let replyText = nonEmpty(job.agentReplyText) ?? nonEmpty(job.agentReplyTextHead) ?? nonEmpty(job.completionTextHead)
-        if let replyText { consumeReply(replyText, route: job.agent) }
+        if let replyText {
+            ContactThread.consume(.init(text: replyText, stamp: .init(source: job.agent.isEmpty ? nil : job.agent, steeredBy: [], contact: true)),
+                mark: { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) })
+        }
         var reply = replyText.map { plainLines($0).prefix(5).map { clip($0, 100) } } ?? [job.completedAt == nil ? "not back yet" : "no reply text retained"]
         if replyText == nil, deliveredLive(job) {
-            reply = ["Waiting in \(job.agent.capitalized)'s inbox until its next turn; no one is answering yet."]
+            reply = ["Delivered to \(job.agent)'s live session; this job retains no reply. Open the agent's conversation."]
             let done = job.completedAt.flatMap(date) ?? .distantPast
             if let chat = bridgeChats(dataRoot: dataRoot).filter({ $0.who == job.agent && $0.at >= done }).last {
                 let n = withNames(dataRoot) { $0.number("chat", id: chat.id) { [chat.id] } }
-                reply.append("answer: chat.\(n) " + clip(chat.title, 60) + " · " + age(now.timeIntervalSince(chat.at)))
+                reply.append("later conversation: chat.\(n) " + clip(chat.title, 60) + " · " + age(now.timeIntervalSince(chat.at)))
             }
         }
         if job.agentReplyTruncated { reply.append("(reply cut; the full text: app agent.read agent \(job.agent))") }
         var about: [String] = []
-        if let error = nonEmpty(job.executionError) { about.append("error: " + clip(error, 100)) }
+        if let error = nonEmpty(job.executionError) { about.append(jobFailure(job, error: error)) }
         if let handle = job.deskHandle, let desk = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState(),
            let item = desk.items.first(where: { $0.handle == handle }) {
             about.append("desk." + item.alias + " " + clip(item.title, 60))
         }
         let took = job.elapsedSeconds.flatMap { $0 > 0 && !deliveredLive(job) ? $0 : nil }.map { (job.completedAt == nil ? "running " : "took ") + age(TimeInterval($0)) }
         return screen([name, job.agent, jobState(job, now: now)] + (took.map { [$0] } ?? []),
-            [section("ASKED", asked), section("REPLY", reply), section("ABOUT", about)],
+            [section("STATUS", [jobState(job, now: now)]), section("ASKED", asked), section("REPLY", reply), section("ABOUT", about)],
             verbs: [(job.agent + ".say", "follow up (text)"), (job.agent, "the whole conversation"), ("delegations", "every job")],
             back: "Back: home · delegations.")
+    }
+
+    private static func jobFailure(_ job: DelegationJobProjection, error: String) -> String {
+        var args: [String: JSONValue] = ["agent": .string(job.agent)]
+        args["message_id"] = job.acceptedMessageIDs.sorted().first.map(JSONValue.string)
+        return failureFace(.object(["status": .string(job.runStatus ?? job.status ?? "failed"), "reason": .string("agent_execution_error"),
+            "detail": .string(error), "effects": .string("unknown"),
+            "remedy": Repair.reconcile(instruction: "Read execution and delivery evidence before sending more work.",
+                nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("agent.jobs"),
+                    "args": .object(args)])]))]))
     }
 }

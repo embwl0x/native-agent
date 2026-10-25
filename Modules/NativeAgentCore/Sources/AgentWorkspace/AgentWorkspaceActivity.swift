@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceActivity.swift` | Native Calendar/Reminders and shelf adapters; Today supplies checked reads and bound item/action keys to `workspace-readout.js`; helper selection/copy is owned by that part, not a Swift bot projection |
 
 /// Native views over work, helpers and communication owners. Only typed fields
 /// at known owner boundaries create actions; prose and embedded recipes do not.
@@ -20,7 +21,7 @@ enum AgentWorkspaceActivity {
 
     static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
         switch tool {
-        case "bot_list": return bots(input: input, result)
+        case "bot_list": return nil
         case "shelf_read": return replies(input: input, result: result)
         case "shelf_entry": return reply(input: input, result: result)
         case "desk_read":
@@ -51,80 +52,52 @@ enum AgentWorkspaceActivity {
         }
     }
 
-    private static func bots(input: [String: JSONValue], _ result: JSONValue) -> AgentWorkspaceProjection {
-        let selected = uuid(input["id"])
-        var projection = list(title: "My helpers", result: result, key: "bots", actions: [
-            configure("Create a helper", tool: "bot_create"), read("Saved replies", tool: "shelf_read", input: ["limit": .int(16), "include_read": .bool(true), "newest_first": .bool(true)])
-        ]) { row in
-            let name = text(row["name"]) ?? "Helper"
-            var buttons: [AgentWorkspaceButton] = []
-            // Definitions expose UUIDs; names can collide or change.
-            if let id = uuid(row["id"]) {
-                let agent = "bot:" + id
-                buttons = [
-                    read("Open helper", tool: "bot_list", input: ["id": .string(id)], title: name),
-                    .init(label: "Talk", action: .message(agent: agent, conversation: nil, name: name), needsText: true),
-                    read("Open conversation", tool: "agent_read", input: ["agent": .string(agent)], title: name),
-                    effect("Run once", tool: "bot_run_once", input: ["id": .string(id)]),
-                    configure("Settings", tool: "bot_update", input: ["id": .string(id)])
-                ]
-                if case .bool(let paused)? = row["paused"] {
-                    buttons.append(effect(paused ? "Resume schedule" : "Pause schedule", tool: "bot_pause", input: ["id": .string(id), "paused": .bool(!paused)]))
-                }
-            }
-            if selected != nil { buttons.removeAll { if case .open(.record("bot_list", _, _)) = $0.action { return true }; return false } }
-            return .init(title: name, content: .object(row.filter { !["actions", "session_id", "cadence"].contains($0.key) }), actions: buttons)
-        }
-        if selected != nil, let helper = projection.items.first {
-            projection.title = helper.title
-            projection.actions = helper.actions + [read("All helpers", tool: "bot_list")]
-            projection.content = helper.content
-            projection.items = []
-        }
-        return projection
-    }
-
     /// A joined view over two existing readers. Selecting Today is the only
     /// trigger; no background observer, model, scan or extra work ledger.
-    static func today(perform: AgentWorkspace.Perform) async throws -> AgentWorkspaceProjection {
-        var sections: [JSONValue] = []
-        var items: [AgentWorkspaceItem] = []
-        var overdue: [Date] = []
-        for (name, tool, input) in [
-            ("Calendar", "mac_calendar_list_upcoming", ["day": JSONValue.string("today"), "limit": .int(8)]),
-            // The owner's most (100), oldest due first: overdue rows come off
-            // below, so a small limit let old ones crowd out today's (Sol, walk 6).
-            ("Reminders", "mac_reminders_list_due_today", ["limit": JSONValue.int(100)])
+    static func today(dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> AgentWorkspaceProjection {
+        var sections: [JSONValue] = [], facts: [JSONValue] = []
+        var items: [String: AgentWorkspaceItem] = [:], actions: [String: AgentWorkspaceButton] = [:]
+        for (area,tool,input) in [
+            ("Calendar","mac_calendar_list_upcoming",["day":JSONValue.string("today"),"limit":.int(8)]),
+            ("Reminders","mac_reminders_list_due_today",["limit":JSONValue.int(100)])
         ] {
-            let value: JSONValue
-            do { value = try await perform(tool, input) }
+            var value: JSONValue
+            do { value = try await perform(tool,input) }
             catch is CancellationError { throw CancellationError() }
-            catch { value = .object(["status": .string("unavailable"), "detail": .string(error.localizedDescription)]) }
-            guard let view = project(tool: tool, input: input, result: value) else { continue }
-            sections.append(.object(["area": .string(name), "result": view.content, "shown": .int(Int64(view.items.count))]))
-            // Overdue is one plain line, not rows of today's plan (walk 6: June's
-            // reminders listed as today). The reminders room still lists them.
-            items += view.items.compactMap { item -> AgentWorkspaceItem? in
-                if case .object(let row) = item.content, row["due_status"] == .string("overdue") {
-                    overdue.append(text(row["dueAt"]).flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date())
-                    return nil
+            catch { value = .object(["status":.string("unavailable"),"detail":.string(error.localizedDescription)]) }
+            let field = area == "Calendar" ? "events" : "reminders"
+            if value.objectValue?[field]?.arrayValue == nil {
+                value = .object(["status": .string("unavailable"),
+                    "detail": .string(area + " source did not supply its " + field + " array."), "source": value])
+            }
+            let available = ["completed", "ok"].contains(value.objectValue?["status"]?.stringValue ?? "")
+            if let view = project(tool:tool,input:input,result:value) {
+                let state = available ? (view.items.isEmpty ? "empty" : "available") : "unavailable"
+                sections.append(.object(["area":.string(area),"state":.string(state),"result":view.content,"shown":.int(Int64(view.items.count))]))
+                for (index,item) in view.items.enumerated() {
+                    let key=area+":"+String(index), row=item.content.objectValue ?? [:]
+                    items[key]=item
+                    let keys=item.actions.enumerated().map { offset,button -> JSONValue in
+                        let id=key+":"+String(offset); actions[id]=button; return .string(id)
+                    }
+                    let due=row["dueAt"]?.stringValue.flatMap { ISO8601DateFormatter().date(from:$0) }
+                    let month=DateFormatter()
+                    month.dateFormat=due.map { Calendar.current.isDate($0,equalTo:Date(),toGranularity:.year) } == true ? "MMMM" : "MMMM yyyy"
+                    facts.append(.object(["key":.string(key),"area":.string(area),"title":.string(item.title),
+                        "overdue":.bool(row["due_status"] == .string("overdue")),
+                        "due":due.map { .double($0.timeIntervalSince1970) } ?? .null,
+                        "month":due.map { .string(month.string(from:$0)) } ?? .null,"actions":.array(keys)]))
                 }
-                var item = item; item.title = name + ": " + item.title; return item
-            }.prefix(8)
+            }
         }
-        var content: [String: JSONValue] = ["status": .string("ok"), "sections": .array(sections),
-            "scope": .string("At most eight appointments today and eight incomplete reminders due today; overdue ones are counted, not listed. Empty and unavailable sections are different. Open each area for more.")]
-        if let oldest = overdue.min() {
-            let month = DateFormatter()
-            month.dateFormat = Calendar.current.isDate(oldest, equalTo: Date(), toGranularity: .year) ? "MMMM" : "MMMM yyyy"
-            content["message"] = .string("\(overdue.count) overdue reminder\(overdue.count == 1 ? "" : "s"), oldest from \(month.string(from: oldest)) · today.due lists them")
-        }
-        return .init(title: "Today", content: .object(content),
-            items: items, actions: [read("Today's calendar", tool: "mac_calendar_list_upcoming", input: ["day": .string("today"), "limit": .int(16)]),
-                read("All due reminders", tool: "mac_reminders_list_due_today", input: ["limit": .int(16)]),
-                // It opens the Desk room: named for what it opens (walk 4: `today.ongoing` landed on DESK).
-                .init(label: "Desk (work in progress)", action: .open(.area("ongoing"))),
-                .init(label: "Refresh today", action: .open(.area("today")))])
+        actions["calendar"]=read("calendar",tool:"mac_calendar_list_upcoming",input:["day":.string("today"),"limit":.int(16)])
+        actions["due"]=read("due",tool:"mac_reminders_list_due_today",input:["limit":.int(16)])
+        actions["desk"] = .init(label:"desk",action:.open(.area("ongoing")))
+        actions["refresh"] = .init(label:"refresh",action:.open(.area("today")))
+        let unavailable = sections.filter { $0.objectValue?["state"] == .string("unavailable") }.count
+        let status = unavailable == 0 ? "ok" : unavailable == sections.count ? "unavailable" : "partial"
+        return await WorkspaceReadout.project(input:.object(["mode":.string("today"),"sections":.array(sections),"rows":.array(facts)]),
+            dataRoot:dataRoot,items:items,actions:actions,native:["status":.string(status),"sources":.array(sections)])
     }
 
     private static func replies(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {

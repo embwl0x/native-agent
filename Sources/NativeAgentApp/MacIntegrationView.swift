@@ -1,11 +1,10 @@
 import Connectors
 import TrustCenter
-// PATCH-2026-06-07: mac-integration-tab — per-integration READ/WRITE permission
-// toggles for Calendar, Reminders, Contacts, Mail, Messages, Notes, Music,
-// Notifications (mac + mobile), Spotlight, Scheduler. Binds against the W1
-// substrate (MacIntegrationPermissionStore.shared). Changes persist to
-// <dataRoot>/security/mac_integration_permissions.json.
+
+// Blueprint: | `MacIntegrationView.swift` | `MacIntegrationView`: checked integration read/write controls, actual permission probes and truthful System Settings handoff outcomes |
+// Per-integration read/write controls render this engine's checked projection.
 import SwiftUI
+import EngineRuntime
 import MacIntegration
 import MacControl
 import AVFoundation
@@ -36,38 +35,6 @@ enum MacIntegrationSystemPermissionPresentation {
         statusKeys.allSatisfy { statuses[$0] == "granted" || statuses[$0] == "authorized" }
     }
 
-    static func cachedAppleEventStatuses(from raw: [String: Any]) -> [String: String] {
-        raw.reduce(into: [:]) { result, item in
-            guard item.key.hasPrefix("apple_events_"), let status = item.value as? String else { return }
-            result[item.key] = status
-        }
-    }
-
-    static func appleEventStatusesForCache(_ statuses: [String: String]) -> [String: String] {
-        statuses.filter { $0.key.hasPrefix("apple_events_") }
-    }
-
-    static func loadAppleEventStatuses(from defaults: UserDefaults, key: String) -> [String: String] {
-        cachedAppleEventStatuses(from: defaults.dictionary(forKey: key) ?? [:])
-    }
-
-    static func saveAppleEventStatuses(
-        _ statuses: [String: String],
-        to defaults: UserDefaults,
-        key: String
-    ) {
-        defaults.set(appleEventStatusesForCache(statuses), forKey: key)
-    }
-
-    /// The cached paint is only a cold-start placeholder. A completed passive
-    /// TCC probe owns the final visible truth, even when it changes a prior
-    /// grant to a denial.
-    static func mergingCachedAppleEvents(
-        _ cached: [String: String],
-        withProbed probed: [String: String]
-    ) -> [String: String] {
-        cached.merging(probed) { _, probeValue in probeValue }
-    }
 }
 
 /// The only System Settings launch boundary for the Mac Integration panel.
@@ -189,7 +156,7 @@ enum MacIntegrationPermissionFailurePresentation {
 
     static func registrationFailureMessage(for permission: MacIntegrationFrameworkPermission) -> String {
         if permission == .calendar {
-            return "macOS rejected the Calendar permission request. Quit and reopen NativeAgent, then try Grant once more. If it still fails, reinstall the current signed build; hardened-runtime builds must include Apple's Calendar entitlement."
+            return "macOS rejected NativeAgent's Calendar permission request. Tell the person about this permission failure and preserve the reported error."
         }
         return "macOS did not register the \(permission.label) permission request. Keep NativeAgent in the foreground and try Grant once more."
     }
@@ -199,22 +166,18 @@ struct MacIntegrationView: View {
     /// Trust's one Mac tab: Chrome control and Mac control lead, the per-app
     /// grants follow. Off where this view stands alone.
     var showsMacControl = false
+    @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
-    @State private var permissions: [String: MacIntegrationPermission] = [:]
-    @State private var isLoading: Bool = true
-    @State private var permissionLoadError: String?
-    /// Refreshes can overlap on scene activation and the toolbar. Only the
-    /// newest read may change what this safety panel claims about the store.
-    @State private var permissionLoadGeneration = 0
-    // gpt-5.5 review NEEDS_FIX: surface persistence errors instead of silently
-    // swallowing them via try?. If set() throws, the toggle rolls back and the
-    // alert tells the user what failed.
+    private var projection: MacIntegrationFacade { appModel.engine.macIntegration }
+    private var permissions: [String: MacIntegrationPermission] { projection.permissions }
+    private var isLoading: Bool { projection.isLoading }
+    private var permissionLoadError: String? { projection.permissionLoadError }
+    private var tccStatuses: [String: String] { projection.systemStatuses }
     @State private var persistenceError: String?
 
     // PATCH-2026-06-07: TCC permission wizard. Lets the user do the system-prompt
     // dance once up front instead of one-at-a-time when Agent first tries each
     // tool. Keys: "calendar" | "reminders" | "contacts" | "apple_events".
-    @State private var tccStatuses: [String: String] = [:]
     @State private var isRequestingAll: Bool = false
     @State private var requestingFramework: MacIntegrationFrameworkPermission? = nil
     @State private var permissionRequestError: String?
@@ -349,19 +312,13 @@ struct MacIntegrationView: View {
             .padding(.bottom, 32)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .liveTask {
-            await loadPermissions()
-        }
         .liveTask(id: scenePhase) {
             guard scenePhase == .active else { return }
-            await loadInitialTCCStatuses()
+            await loadPermissions()
         }
-        // A screenshot's offscreen copy reads the same two states — both are
-        // reads, and the TCC probes never prompt — minus the cache write.
-        // Without it every permission drew "Unknown" over a loading line.
+        // Offscreen rendering uses the same engine publication, without prompts.
         .quietReadTask(live: false) {
             await loadPermissions()
-            await loadInitialTCCStatuses(savesCache: false)
         }
         // TCC changes happen outside NativeAgent in System Settings. Returning
         // to the app produces a real scene activation edge, so reread then
@@ -371,7 +328,6 @@ struct MacIntegrationView: View {
                 Button("Refresh", systemImage: "arrow.clockwise") {
                     Task {
                         await loadPermissions()
-                        await loadInitialTCCStatuses()
                     }
                 }
                 .help("Check permissions again after changing them in System Settings.")
@@ -469,24 +425,7 @@ struct MacIntegrationView: View {
     // MARK: - State
 
     private func loadPermissions() async {
-        permissionLoadGeneration &+= 1
-        let generation = permissionLoadGeneration
-        isLoading = true
-        do {
-            // Only a missing store receives bootstrap defaults. Existing
-            // damaged authority state is shown as unavailable while every hot
-            // tool gate remains denied.
-            let loadedPermissions = try await MacIntegrationPermissionStore.shared.currentChecked()
-            guard generation == permissionLoadGeneration else { return }
-            permissions = loadedPermissions
-            permissionLoadError = nil
-        } catch {
-            guard generation == permissionLoadGeneration else { return }
-            permissions = [:]
-            permissionLoadError = UserFacingError.message(error, action: "load the saved Mac Integration permissions")
-        }
-        guard generation == permissionLoadGeneration else { return }
-        isLoading = false
+        await projection.refresh()
     }
 
     private func binding(for id: String, mode: MacIntegrationPermissionMode) -> Binding<Bool> {
@@ -499,24 +438,10 @@ struct MacIntegrationView: View {
                 }
             },
             set: { newValue in
-                let previous = permissions[id] ?? MacIntegrationID.defaultPermission(for: id)
-                var current = previous
-                switch mode {
-                case .read:  current.read = newValue
-                case .write: current.write = newValue
-                }
-                permissions[id] = current
-                // Optimistically update, then roll back and surface any
-                // persistence failure.
                 Task { @MainActor in
                     do {
-                        try await MacIntegrationPermissionStore.shared.set(
-                            integrationId: id,
-                            read: current.read,
-                            write: current.write
-                        )
+                        try await projection.set(id, mode: mode, allowed: newValue)
                     } catch {
-                        permissions[id] = previous
                         persistenceError = UserFacingError.message(error, action: "save the \(MacIntegrationID.displayName(for: id)) permission")
                     }
                 }
@@ -625,85 +550,6 @@ struct MacIntegrationView: View {
         .frame(minHeight: 48)
     }
 
-    // 2026-06-07: persist AppleEvents per-app probe results across app
-    // restarts. The OS-level TCC grants themselves are persistent — once
-    // user clicks Allow on the macOS prompt, Mail/Messages/Notes/Music
-    // stay authorized forever. But our UI badges are in-memory @State,
-    // so they reset to "unknown" on every launch. We can't auto-probe at
-    // launch because the probe IS the TCC prompt for never-asked apps,
-    // and surprising the user with 4 prompts when they open the tab is
-    // bad UX. Instead: cache the last-known result to UserDefaults and
-    // restore it on launch. Stays accurate enough; user can hit Refresh
-    // or Grant All to force a fresh probe any time.
-    private static let aeStatusDefaultsKey = "nativeAgent.macIntegration.appleEvents.statusCache.v1"
-
-    private static func loadCachedAppleEventsStatuses() -> [String: String] {
-        MacIntegrationSystemPermissionPresentation.loadAppleEventStatuses(
-            from: .standard,
-            key: aeStatusDefaultsKey
-        )
-    }
-
-    private static func saveCachedAppleEventsStatuses(_ statuses: [String: String]) {
-        // Filter to ONLY apple_events_* keys — don't persist the framework
-        // ones (those re-read from the OS on every launch, so caching them
-        // would just be stale).
-        MacIntegrationSystemPermissionPresentation.saveAppleEventStatuses(
-            statuses,
-            to: .standard,
-            key: aeStatusDefaultsKey
-        )
-    }
-
-    private func loadInitialTCCStatuses(savesCache: Bool = true) async {
-        // Cold-start cache improves the initial paint but cannot become the
-        // truth source: the passive probes below overwrite it as they finish.
-        let cachedAppleEvents = Self.loadCachedAppleEventsStatuses()
-        tccStatuses.merge(cachedAppleEvents) { _, cachedValue in cachedValue }
-        // Pure status queries; no prompts fired here. The three framework
-        // backends (Calendar/Reminders/Contacts) are safe to query at any
-        // time without triggering prompts.
-        // Speech / Microphone: class-level READS only (SFSpeechRecognizer
-        // .authorizationStatus / AVCaptureDevice.authorizationStatus). Neither
-        // prompts, so they are safe on every appear and refresh tick.
-        // Each read asks the permission daemon: all five in one hop off the main actor.
-        let frameworks = await Task.detached(priority: .userInitiated) {
-            [
-                MacIntegrationSystemPermissionPresentation.speechRecognitionKey: Self.badgeKey(
-                    SystemPermissionPreflight.status(.speechRecognition)),
-                MacIntegrationSystemPermissionPresentation.microphoneKey: Self.badgeKey(
-                    SystemPermissionPreflight.status(.microphone)),
-                MacIntegrationSystemPermissionPresentation.calendarKey: LocalPIMConnectorActions.currentCalendarAuthorizationStatus(),
-                MacIntegrationSystemPermissionPresentation.remindersKey: LocalPIMConnectorActions.currentReminderAuthorizationStatus(),
-                MacIntegrationSystemPermissionPresentation.contactsKey: MacContactsExecutor.currentAuthorizationStatus(),
-            ]
-        }.value
-        tccStatuses.merge(frameworks) { _, read in read }
-
-        // 2026-06-07: AppleEvents per-app is now probed PASSIVELY here
-        // using AEDeterminePermissionToAutomateTarget(askUserIfNeeded:
-        // false) — that API checks the TCC state without firing a prompt,
-        // so we can refresh on every view appear + auto-poll tick. The
-        // probe returns the real state (granted / denied / not_determined
-        // / unknown for apps not installed) every time. No more "unknown
-        // until you click Grant All."
-        var probedAppleEvents: [String: String] = [:]
-        for app in SystemAppleScriptAdapter.automationTargetApps {
-            let key = "apple_events_\(app.lowercased())"
-            probedAppleEvents[key] = await SystemAppleScriptAdapter.automationStatus(app: app, ask: false)
-        }
-        tccStatuses.merge(
-            MacIntegrationSystemPermissionPresentation.mergingCachedAppleEvents(
-                cachedAppleEvents,
-                withProbed: probedAppleEvents
-            )
-        ) { _, probeValue in probeValue }
-        // Still persist the latest values so a cold launch shows correct
-        // state even before the first probe completes (the cache acts as
-        // a faster initial paint while the real probes run).
-        if savesCache { Self.saveCachedAppleEventsStatuses(tccStatuses) }
-    }
-
     private func requestFrameworkGrant(_ permission: MacIntegrationFrameworkPermission) async {
         requestingFramework = permission
         defer { requestingFramework = nil }
@@ -729,7 +575,7 @@ struct MacIntegrationView: View {
                 ? "granted"
                 : Self.badgeKey(SystemPermissionPreflight.status(.microphone))
         }
-        tccStatuses[permission.rawValue] = status
+        await projection.refresh()
 
         if status == "denied" || status == "restricted" {
             // A resolved denial cannot be re-prompted. Say so AND open the pane,
@@ -767,24 +613,19 @@ struct MacIntegrationView: View {
         // it is the grant with no other acquisition path in the whole app.
         let speech = Self.badgeKey(
             await SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined())
-        tccStatuses["speech_recognition"] = speech
 
         // Microphone
         let micGranted = await AVCaptureDevice.requestAccess(for: .audio)
         let mic = micGranted ? "granted" : Self.badgeKey(SystemPermissionPreflight.status(.microphone))
-        tccStatuses["microphone"] = mic
 
         // Calendar
         let cal = await LocalPIMConnectorActions.requestCalendarAccess()
-        tccStatuses["calendar"] = cal
 
         // Reminders
         let rem = await LocalPIMConnectorActions.requestReminderAccess()
-        tccStatuses["reminders"] = rem
 
         // Contacts
         let con = await MacContactsExecutor.requestAccess()
-        tccStatuses["contacts"] = con
 
         let unresolvedFrameworks = [
             ("Speech Recognition", speech),
@@ -796,7 +637,7 @@ struct MacIntegrationView: View {
             (status == "not_determined" || status == "unknown") ? label : nil
         }
         if !unresolvedFrameworks.isEmpty {
-            permissionRequestError = "macOS did not register: \(unresolvedFrameworks.joined(separator: ", ")). Keep NativeAgent in the foreground and use the individual Grant button. If Calendar remains unresolved, reinstall the current signed build."
+            permissionRequestError = "macOS did not register: \(unresolvedFrameworks.joined(separator: ", ")). Keep NativeAgent in the foreground and use the individual Grant button. If Calendar remains unresolved, tell the person about the permission failure."
         }
 
         // AppleEvents — request each target app independently so macOS creates
@@ -807,15 +648,10 @@ struct MacIntegrationView: View {
             await ensureAppleEventsTargetLaunched(app)
             let s = await Self.requestAppleEventApp(app)
             aeStatuses[app] = s
-            tccStatuses["apple_events_\(app.lowercased())"] = s
         }
         let anyAEDenied = aeStatuses.values.contains("denied")
 
-        // Persist the probe results so the badges survive app restart.
-        // OS-level TCC grants are persistent; we just need to remember
-        // what the last probe told us so the badges show real state
-        // without forcing a re-prompt on every launch.
-        Self.saveCachedAppleEventsStatuses(tccStatuses)
+        await projection.refresh()
 
         // 2026-06-07 the user caught "I hit grant all permissions now it does
         // nothing." Root cause: macOS only fires the TCC prompt when
@@ -882,9 +718,8 @@ struct MacIntegrationView: View {
         requestingApp = app
         defer { requestingApp = nil }
         await ensureAppleEventsTargetLaunched(app)
-        let status = await Self.requestAppleEventApp(app)
-        tccStatuses["apple_events_\(app.lowercased())"] = status
-        Self.saveCachedAppleEventsStatuses(tccStatuses)
+        _ = await Self.requestAppleEventApp(app)
+        await projection.refresh()
     }
 
     private func ensureAppleEventsTargetLaunched(_ app: String) async {

@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Photos
+// Blueprint: | `AppToolExecutor+Photos.swift` | `AppToolExecutor`: `runPhotosRead`; read-only PhotoKit counts and recent asset metadata, with action-time macOS authorization |
 
 extension AppToolExecutor {
     @MainActor

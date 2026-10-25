@@ -1,5 +1,7 @@
 import CognitiveSubstrate
 
+// Blueprint: | `LivingAttentionPolicy.swift` | `LivingAttentionPolicy.organismNeedsAttention`: shared body-attention projection for Mac and phone; Desk owns needs-person attention |
+
 /// "Is her body in trouble?", as the Mac's living status panel and the
 /// phone's living-status snapshot both read it. "Does she need User?" is the
 /// Desk overview's Needs you (OwnerAttentionPolicy through WorkOverviewRead).
@@ -14,6 +16,5 @@ public enum LivingAttentionPolicy {
             || !body.memoryHealthy
             || !body.dreamHealthy
             || !body.approvalChannelsOpen
-            || body.resourcePressure != .nominal
     }
 }

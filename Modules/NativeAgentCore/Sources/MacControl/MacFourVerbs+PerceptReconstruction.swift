@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MacFourVerbs+PerceptReconstruction.swift` | `MacFourVerbs`: `percept`, `partition`, `supplementalDuplicateIndex` |
 
 extension MacFourVerbs {
     // MARK: - Percept reconstruction
@@ -290,10 +291,7 @@ extension MacFourVerbs {
 
     // MARK: - JSON primitives
 
-    static func object(_ value: JSONValue?) -> [String: JSONValue] {
-        guard case .object(let object)? = value else { return [:] }
-        return object
-    }
+    static func object(_ value: JSONValue?) -> [String: JSONValue] { value?.objectValue ?? [:] }
 
     static func visionValueTexts(_ detail: [String: JSONValue]) -> Set<String>? {
         let source = detail["vision_effect_value_text"] ?? detail["vision_value_text"]
@@ -301,36 +299,11 @@ extension MacFourVerbs {
         return Set(values.compactMap { string($0) }.map(normalize))
     }
 
-    static func array(_ value: JSONValue?) -> [JSONValue] {
-        guard case .array(let array)? = value else { return [] }
-        return array
-    }
-
-    static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let text)? = value else { return nil }
-        return text
-    }
-
-    static func int(_ value: JSONValue?) -> Int64? {
-        switch value {
-        case .int(let number)?: return number
-        case .double(let number)?: return Int64(exactly: number.rounded(.towardZero))
-        default: return nil
-        }
-    }
-
-    static func number(_ value: JSONValue?) -> Double? {
-        switch value {
-        case .int(let number)?: return Double(number)
-        case .double(let number)? where number.isFinite: return number
-        default: return nil
-        }
-    }
-
-    static func bool(_ value: JSONValue?) -> Bool? {
-        guard case .bool(let value)? = value else { return nil }
-        return value
-    }
+    static func array(_ value: JSONValue?) -> [JSONValue] { value?.arrayValue ?? [] }
+    static func string(_ value: JSONValue?) -> String? { value?.stringValue }
+    static func int(_ value: JSONValue?) -> Int64? { value?.integerValue }
+    static func number(_ value: JSONValue?) -> Double? { value?.numberValue(coercingStrings: false, finiteOnly: true) }
+    static func bool(_ value: JSONValue?) -> Bool? { value?.boolValue }
 
     static func frame(_ value: JSONValue?) -> MacAXFrame? {
         let value = object(value)

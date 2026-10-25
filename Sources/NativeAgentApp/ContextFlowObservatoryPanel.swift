@@ -3,6 +3,8 @@ import ContextFlow
 import Foundation
 import SwiftUI
 
+// Blueprint: | `ContextFlowObservatoryPanel.swift` | `ContextFlowObservatoryPanel`: health rows preserve off, unreadable and failed states instead of a reassuring zero table |
+
 /// The Context Flow health projection deliberately keeps "no health was
 /// readable", "configured off", and "reported an error" separate. The
 /// Observatory must not turn any of those into the same reassuring zero-value

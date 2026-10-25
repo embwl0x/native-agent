@@ -1,7 +1,8 @@
 import Foundation
+// Blueprint: | `BotRunner.swift` | `BotRunner` actor; `run`, `ask` |
 
-/// The app supplies the ordinary persisted chat client; StandingBots owns only
-/// scheduling, serialization, accounting and the dated shelf projection.
+/// The app supplies the helper's own turn runner; StandingBots owns its
+/// scheduling, serialization, accounting and dated shelf projection.
 public typealias BotRunnerSession = @Sendable (BotDefinition, String) async throws -> BotTurnReply
 
 public struct BotTurnReply: Sendable {
@@ -106,7 +107,7 @@ public actor BotRunner {
     /// The last line the helper is asked to end a conditioned run with.
     static let conditionMarker = "TELL:"
 
-    /// The ordinary chat client consumes the verdict before saving the reply.
+    /// The helper turn runner consumes the verdict before saving the reply.
     @TaskLocal package static var conditionVerdict: ConditionVerdict?
     package final class ConditionVerdict: @unchecked Sendable {
         let sessionID: String
@@ -219,8 +220,9 @@ public actor BotRunner {
         // A refused daily reservation means the turn never started: it is a run
         // that did not happen, not a failed run, so it throws instead of
         // appending a shelf entry. The scheduler records the occurrence missed.
-        try queue.reserveDailySpend(tokens: bot.budget.tokens, bot: bot.id,
-            ceiling: bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens)
+        if let ceiling = bot.dailyTokenCeiling {
+            try queue.reserveDailySpend(tokens: bot.budget.tokens, bot: bot.id, ceiling: ceiling)
+        }
         var outcome: BotTurnReply
         let verdict = judgesCondition ? ConditionVerdict(sessionID: bot.sessionID) : nil
         do {
@@ -241,7 +243,7 @@ public actor BotRunner {
                 }
             }
         } catch {
-            outcome = BotTurnReply(reply: "", status: error is CancellationError || error is BotRunnerError ? .interrupted : .failed,
+            outcome = BotTurnReply(reply: "", status: error is CancellationError ? .stopped : error is BotRunnerError ? .interrupted : .failed,
                 detail: String(describing: error))
         }
         let met = outcome.status == .completed && verdict?.met == true
@@ -266,7 +268,7 @@ public actor BotRunner {
         case .failed: health = .failed
         // Waiting on a person is not damage: the run did its part and stopped
         // on an answer only a person can give. Same health as an approval.
-        case .interrupted, .waitingForApproval, .waitingOnPerson: health = .partial
+        case .stopped, .interrupted, .waitingForApproval, .waitingOnPerson: health = .partial
         }
         var entry = ShelfEntry(id: requestID, botId: bot.id, briefVersion: bot.briefVersion,
             runAt: start, coverageStart: start, coverageEnd: start,

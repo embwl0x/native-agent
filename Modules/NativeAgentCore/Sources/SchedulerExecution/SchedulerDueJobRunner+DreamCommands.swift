@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import TriggerScheduler
+// Blueprint: | `SchedulerDueJobRunner+DreamCommands.swift` | canonical recurring-dream command selection and job receipts |
 
 extension SchedulerDueJobRunner {
     public func createIntegrationJob(input: [String: JSONValue], writer: any SchedulerJobWriter, createJob: @Sendable ([String: JSONValue]) async throws -> JSONValue) async throws -> JSONValue {
@@ -26,17 +27,20 @@ extension SchedulerDueJobRunner {
     }
 
     private func nightlyDreamJob(writer: any SchedulerJobWriter) async throws -> JSONValue {
-        let id = "nativeagent-nightly-dream"
-        func current() async throws -> [String: JSONValue]? {
-            for case .object(let job) in try await writer.listJobs() where job["id"] == .string(id) { return job }
-            return nil
-        }
-        let before = try await current()
-        _ = try await ensureDefaultCycleJobs(now: Date(), reactivateCancelled: true)
-        guard let after = try await current() else {
+        let prior = try await writer.listJobs()
+        let resolved = try await ensureDefaultCycleJobs(now: Date(), reactivateCancelled: true).nightlyDream
+        guard case .object(let saved) = resolved, let id = saved["id"]?.stringValue,
+              case .object(let after)? = try await writer.listJobs().first(where: {
+                  guard case .object(let job) = $0 else { return false }
+                  return job["id"] == .string(id)
+              }) else {
             throw NSError(domain: "NativeAgentMacIntegrationBridge", code: -500, userInfo: [
                 NSLocalizedDescriptionKey: "The nightly reflection job was not saved; nothing was added. app schedule.list shows what the scheduler holds.",
             ])
+        }
+        let before = prior.first { row in
+            guard case .object(let job) = row else { return false }
+            return job["id"] == .string(id)
         }
         let operation: String
         var detail: String
@@ -45,7 +49,7 @@ extension SchedulerDueJobRunner {
             detail = "The nightly reflection job exists and is paused; nothing was added. Resume it with app schedule.resume, job_id \(id)."
         } else if before == nil {
             operation = "added"; detail = "Nightly reflection added."
-        } else if before == after {
+        } else if before == .object(after) {
             operation = "already_present"; detail = "Nightly reflection is already scheduled; nothing was added."
         } else {
             operation = "reactivated"; detail = "Nightly reflection is scheduled again on its existing job; nothing was duplicated."

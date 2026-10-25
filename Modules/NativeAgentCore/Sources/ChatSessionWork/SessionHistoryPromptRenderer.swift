@@ -6,6 +6,7 @@ import os
 import PersistenceCore
 import Transcripts
 import ProviderRouting
+// Blueprint: | `SessionHistoryPromptRenderer.swift` | `SessionHistoryPromptRenderer` enum; `renderDetailed`, `recallQuery` |
 
 public enum SessionHistoryPromptRenderer {
     static let recallQueryCharCap = 1_200
@@ -206,7 +207,7 @@ public enum SessionHistoryPromptRenderer {
                 inputCap: compactionNormalizationInputCharacterCap
             )
         } else {
-            content = normalize(message.content)
+            content = normalize(message.content, inputCap: role == "assistant" ? .max : normalizationInputCharacterCap)
         }
         // Third-pass (conversation): the flattened body above is what identity,
         // scoring have always seen — unchanged. Structured replay additionally
@@ -215,7 +216,7 @@ public enum SessionHistoryPromptRenderer {
         // Python snippet survive replay. Same redaction, same input cap.
         var structured = isTool || isCompactionSummary
             ? ""
-            : normalizePreservingStructure(message.content)
+            : normalizePreservingStructure(message.content, inputCap: role == "assistant" ? .max : normalizationInputCharacterCap)
         if structured == content { structured = "" }
         // Vision wave (2026-06-11 review catch): image turns persist base64-
         // free attachment metadata; an image-only turn has EMPTY content and
@@ -238,7 +239,7 @@ public enum SessionHistoryPromptRenderer {
             historyIdentity: message.historyIdentity(
                 renderedRole: isCompactionSummary ? "summary" : role, renderedContent: content),
             originLabel: role == "user" && !isCompactionSummary
-                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(metadata?["origin"]) : nil,
+                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(extrasObject ?? [:], role: role) : nil,
             incompleteReplyLabel: role == "assistant" && !isCompactionSummary
                 ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: extrasObject, metadata: metadata) : nil,
             timestamp: message.timestamp,
@@ -384,14 +385,8 @@ public enum SessionHistoryPromptRenderer {
         message.historyIdentity
     }
 
-    /// The budgeted history line for one admitted row. The message projection
-    /// uses this length with the same role caps as the replayed text.
-    static func renderedHistoryLine(_ msg: Renderable, budget: Budget) -> String {
-        "[\(msg.role)] \(cap(msg.displayContent, capForRole(msg, budget: budget)))"
-    }
-
-    /// The capped row text the projection replays; the message role carries
-    /// the role prefix.
+    /// The capped row text the projection replays, and what admission budgets;
+    /// the message role carries the role prefix.
     static func projectedHistoryText(_ msg: Renderable, budget: Budget) -> String {
         cap(msg.structuredDisplayContent, capForRole(msg, budget: budget))
     }
@@ -403,7 +398,8 @@ public enum SessionHistoryPromptRenderer {
         if message.isCompactionSummary { return budget.compactionSummaryCap }
         switch message.role {
         case "user": return budget.userCap
-        case "assistant": return budget.assistantCap
+        // Her own words reach her whole; the history window drops whole rows, never part of one.
+        case "assistant": return .max
         case "system", "summary": return budget.systemCap
         default: return 900
         }
@@ -461,6 +457,7 @@ public enum SessionHistoryPromptRenderer {
     ) -> String {
         let name = string(metadata?["toolName"]) ?? string(metadata?["tool_name"]) ?? "tool"
         let input = string(metadata?["inputJSON"]).flatMap { try? JSONValue.parse(Data($0.utf8)) }
+        let inputNote = object(input) == nil ? " The arguments this call ran with were not saved readably; its effect is recorded, its inputs are unknown." : ""
         var call = name
         if name == "app", case .object(let args)? = input {
             if let action = string(args["action"]), !action.isEmpty { call += " " + action }
@@ -478,7 +475,7 @@ public enum SessionHistoryPromptRenderer {
             // Approval resolution and supersession can update the row's status.
             // The durable row remains the authority over the earlier projection.
             evidence["status"] = .string(string(metadata?["resultStatus"]) ?? recordedStatus ?? string(evidence["status"]) ?? fallbackStatus)
-            return receiptValue(.object(restoringReceiptBoundaries(evidence)))
+            return receiptValue(.object(restoringReceiptBoundaries(evidence))) + inputNote
         }
         if let result, call == "app script" || string(metadata?["resultBody"]) != nil,
            case .object(var evidence) = receiptEvidence(call: call, result: result) {
@@ -486,14 +483,14 @@ public enum SessionHistoryPromptRenderer {
             if let sources = object(metadata?["receiptEvidence"])?["peer_sources"] {
                 evidence["peer_sources"] = sources
             }
-            return receiptValue(.object(restoringReceiptBoundaries(evidence)))
+            return receiptValue(.object(restoringReceiptBoundaries(evidence))) + inputNote
         }
         let status = recordedStatus ?? result.flatMap { receiptField("status", in: $0) }.flatMap { string($0) }
             ?? fallbackStatus
         let effects = string(metadata?["resultEffects"])
             ?? result.flatMap { receiptField("effects", in: $0) }.map(receiptValue)
         let returnedID = string(metadata?["resultReturnedID"]) ?? result.flatMap(returnedIdentifier)
-        return toolResultProjection(call: call, status: status, effects: effects, returnedID: returnedID)
+        return toolResultProjection(call: call, status: status, effects: effects, returnedID: returnedID) + inputNote
     }
 
     /// Small returned facts, kept on the existing transcript row before its

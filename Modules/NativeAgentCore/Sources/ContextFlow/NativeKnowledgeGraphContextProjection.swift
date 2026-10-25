@@ -1,9 +1,10 @@
 import Context
 import Foundation
-import KnowledgeGraph
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
+
+// Blueprint: | `NativeKnowledgeGraphContextProjection.swift` | `NativeKnowledgeGraphContextProjection`: rebuildable graph atoms, support and triggers with canonical-source verification |
 
 /// The knowledge graph, made REACHABLE instead of dark.
 ///

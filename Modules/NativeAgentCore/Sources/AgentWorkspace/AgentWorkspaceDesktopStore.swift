@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import Darwin
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceDesktopStore.swift` | `AgentWorkspaceDesktopStore` struct; `load`, `save` |
 
 struct AgentWorkspaceSavedDesktop: Sendable, Equatable {
     var id: String = UUID().uuidString
@@ -131,7 +132,6 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "chat_conversations": keys = ["conversation_session_id"]; required = []
             case "desk_read": keys = ["handle", "query", "updated_on"]; required = []
             case "work_context": keys = ["query", "session_id"]; required = ["query"]
-            case "read_skill": keys = ["name"]; required = keys
             case "read_page": keys = ["url"]; required = keys
             case "read_chat_message": keys = ["message_id", "session_id"]; required = keys
             case "recall_memory", "recall_search": keys = ["memory_id", "query"]; required = []
@@ -147,7 +147,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "mac_calendar_list_upcoming": keys = ["day", "calendar_name", "calendar_id"]; required = []
             case "mac_reminders_read": keys = ["id"]; required = keys
             case "mac_reminders_query": keys = ["query", "list_name", "due_start", "due_end", "undated_only", "include_completed"]; required = []
-            case "list_skills", "agent_contacts",
+            case "agent_contacts",
                  "mac_reminders_list_due_today",
                  "inner_state", "agent_introspect": keys = []; required = []
             default: return nil

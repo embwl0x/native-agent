@@ -1,11 +1,12 @@
 import ApprovalInbox
 import Context
 import Foundation
-import KnowledgeGraph
+import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Studio
 import TrustCenter
+// Blueprint: | `SwiftToolDispatcher+StudioCanonTools.swift` | `SwiftToolDispatcher`: `impl_studio_canon`, `impl_studio_canon_resolve`; native evidence reads and transactional staging consume studio-canon proposals, retain pending/pass caps, fingerprint dedupe and agent-only decision authority; unavailable sources throw, never become an empty tending pass |
 
 // MARK: - The canon lane (desk 903 phase 4) — earned by recurrence, tended by her
 //
@@ -17,7 +18,7 @@ import TrustCenter
 //
 // ── THE INVERTED CARD ────────────────────────────────────────────────────────
 // Every other approval card in this app asks the OWNER to sign off on something
-// the agent proposed. This one is upside down: the machinery proposes, and only
+// the agent proposed. This one is upside down: her canon part proposes, and only
 // SHE may resolve it. `StudioCanonSeat` is the gate, checked in three places on
 // purpose — the tool, the executor, and the store's own append — because the
 // sole-approver rule is the feature, not a policy wrapped around it.
@@ -28,8 +29,8 @@ import TrustCenter
 // swallowed.
 //
 // ── NO AUTO-CANONIZATION, STRUCTURALLY ───────────────────────────────────────
-// `StudioCanonLaw` (PersistenceCore) can only return PROPOSALS: it holds no
-// store, no inbox and no clock. This file can only STAGE them. The single code
+// studio-canon.js can only return PROPOSALS, bound to native facts by
+// `StudioCanonLaw`. This file can only STAGE them. The single code
 // path that appends a canon row is `appendCanonRow`, and it throws unless the
 // row carries her seat. There is no path from evidence to canon that does not
 // pass through a card she resolved.
@@ -299,7 +300,7 @@ public enum StudioCanonProposal {
             action: action, workTitle: title, workCreator: creator,
             evidenceKind: evidenceKind, evidenceEntryIDs: entryIDs,
             recurrenceCount: int("recurrenceCount"), recallHits: int("recallHits"),
-            lastActivityAt: lastActivity
+            lastActivityAt: lastActivity, reasonLine: record.reason
         )
     }
 
@@ -354,7 +355,7 @@ public enum StudioCanonProposal {
             standing: standing,
             workTitle: draft.workTitle,
             workCreator: draft.workCreator,
-            decidedAt: StudioClock.nowISO(now),
+            decidedAt: NativeTimestampFormat.sixDigitUTCOffset(now),
             decidedBy: StudioCanonSeat.agent,
             decidedOnSurface: provenance.surface,
             decidedInTurn: provenance.turnID,
@@ -397,20 +398,21 @@ public enum StudioCanonTending {
     public static func run(
         dataRoot: URL,
         inbox: (any ApprovalInboxProtocol)? = nil,
-        now: Date = Date()
+        now: Date = Date(),
+        decide: @Sendable (JSONValue) async throws -> JSONValue
     ) async throws -> StudioCanonTendingReport {
         let store = SwiftNativeStudioStore(dataRoot: dataRoot)
         // 2026-09-06: hot PLUS shelf — canon is an argument about everything
         // she has met, and the archived encounters are part of that record.
-        guard let entries = try? await store.journalEntriesIncludingArchive(),
-              !entries.isEmpty else {
+        let entries = try await store.journalEntriesIncludingArchive()
+        guard !entries.isEmpty else {
             return .idle
         }
-        guard let indexer = try? SwiftNativeKnowledgeGraphIndexer(
+        let indexer = try SwiftNativeKnowledgeGraphIndexer(
             memorySQLitePath: dataRoot
                 .appendingPathComponent("memory/memory.sqlite")
                 .standardizedFileURL
-        ) else { return .idle }
+        )
 
         // The guard first: canon evidence is read off the same edges, so an
         // inconsistent graph is worth knowing about before it is trusted. It
@@ -418,19 +420,13 @@ public enum StudioCanonTending {
         let audit = (try? await indexer.auditStudioRelations(entries)) ?? .unavailable
 
         let recall = try await store.recallPullCounts()
-        guard let evidence = try? await indexer.studioCanonEvidence(
+        let evidence = try await indexer.studioCanonEvidence(
             entries: entries, recallCounts: recall
-        ) else {
-            return StudioCanonTendingReport(
-                evaluatedWorks: 0, proposalsConsidered: 0, stagedApprovalIDs: [],
-                duplicatesSkipped: 0, pendingCapReached: false, audit: audit
-            )
-        }
+        )
         do {
             let membership = try await store.canonMembership()
-            let drafts = StudioCanonLaw.proposals(
-                evidence: evidence, membership: membership, now: now
-            )
+            let drafts = try await StudioCanonLaw.project(
+                evidence: evidence, membership: membership, now: now, decide: decide).drafts
             guard !drafts.isEmpty else {
                 return StudioCanonTendingReport(
                     evaluatedWorks: evidence.count, proposalsConsidered: 0,
@@ -470,24 +466,20 @@ public enum StudioCanonTending {
                 pendingCapReached: capReached,
                 audit: audit
             )
-        } catch {
-            nativeLog("[StudioCanon] Tending deferred: %@", error.localizedDescription)
-            return .idle
         }
     }
 
-    /// `<dataRoot>/studio/journal/relation_audit.json` — the studio's own health
-    /// file, beside the backfill receipt the lane already keeps. The Doctor/
-    /// health path reads state from disk here; the cognition lane turns a
-    /// CHANGE in it into a `studio.relations_inconsistent` receipt.
+    /// JSON audit artifact linked by cognition's inconsistency receipt, which
+    /// uses the in-memory report. No Doctor content reader. Local evidence,
+    /// off-disk backup only; no local backup/export/phone sync; PrivacyMap: studio.
     public static func auditHealthPath(dataRoot: URL) -> URL {
         SwiftNativeStudioStore(dataRoot: dataRoot).studioRoot
             .appendingPathComponent("journal", isDirectory: true)
             .appendingPathComponent("relation_audit.json")
     }
 
-    /// Write the guard's verdict where health can see it. Fail-loud on a
-    /// mismatch (NSLog + a file that says so); never repair, never block.
+    /// Persist the report linked by cognition's receipt and log mismatches.
+    /// Never repair or block journal/recall work.
     public static func recordAudit(
         _ report: StudioRelationAuditReport,
         dataRoot: URL,
@@ -498,7 +490,7 @@ public enum StudioCanonTending {
         try? FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        var payload: [String: JSONValue] = ["checked_at": .string(StudioClock.nowISO(now))]
+        var payload: [String: JSONValue] = ["checked_at": .string(NativeTimestampFormat.sixDigitUTCOffset(now))]
         if case .object(let fields) = report.toJSON() {
             for (key, value) in fields { payload[key] = value }
         }

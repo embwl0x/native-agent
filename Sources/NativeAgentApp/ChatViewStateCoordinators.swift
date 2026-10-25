@@ -3,6 +3,8 @@ import Foundation
 import Observation
 import SwiftUI
 
+// Blueprint: | `ChatViewStateCoordinators.swift` | Chat view coordinators: viewport/follow state and occurrence-preserving composer toast queue independent of transcript layout |
+
 /// Scroll offsets are deliberately excluded: following the bottom must not
 /// trigger another layout-follow request merely because the viewport moved.
 struct ChatScrollLayoutExtent: Equatable {

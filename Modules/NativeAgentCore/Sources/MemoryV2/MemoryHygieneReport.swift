@@ -1,3 +1,4 @@
+// Blueprint: | `MemoryHygieneReport.swift` | `MemoryHygieneReport` struct |
 public struct MemoryHygieneReport: Codable, Hashable {
     public var id: String?
     public var status: String?

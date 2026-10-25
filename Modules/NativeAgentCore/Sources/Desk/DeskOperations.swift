@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `DeskOperations.swift` | `DeskOpBody` enum; `updateTitle` optionally replaces refs with the same replayable summary update |
 
 // MARK: - Ops (DeskOp) — one event each; compact() folds into DeskState
 

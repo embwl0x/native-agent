@@ -19,6 +19,8 @@
 import SwiftUI
 import TrustCenter
 
+// Blueprint: | `TrustGuardrailSummary.swift` | `TrustGuardrailSummary`: derived plain-language effective file/autonomy/backup/Mac/send reach, never another saved policy |
+
 /// How alarming a summary row should look. Purely presentational.
 enum TrustGuardrailTone: String, Hashable, Sendable {
     /// Conservative default — the safe end of this setting.

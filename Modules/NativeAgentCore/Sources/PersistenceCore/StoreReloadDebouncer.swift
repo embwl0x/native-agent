@@ -1,15 +1,50 @@
 import Foundation
 
+// Blueprint: | `StoreReloadDebouncer.swift` | `StoreReloadDebouncer`: visibility-gated trailing-edge reloads with one in flight; exclusion lasts until actual reload exit |
+
 /// Trailing-edge event debounce with visibility gating and one reload in flight.
 public actor StoreReloadDebouncer {
+    /// Actor-owned trailing-edge sleeper. Domain state stays with the caller.
+    public struct Timer: Sendable {
+        private var generation: UInt64 = 0
+        private var pending: Task<Void, Never>?
+        public init() {}
+        public var isPending: Bool { pending != nil }
+
+        public mutating func schedule(delay: Duration, fire: @escaping @Sendable (UInt64) async -> Void) {
+            cancel()
+            let expected = generation
+            pending = Task {
+                do { try await Task.sleep(for: delay) } catch { return }
+                await fire(expected)
+            }
+        }
+
+        /// Consume only the currently armed generation on the owning actor.
+        public mutating func take(_ expected: UInt64) -> Bool {
+            guard expected == generation, pending != nil else { return false }
+            pending = nil
+            return true
+        }
+
+        @discardableResult
+        public mutating func cancel() -> Task<Void, Never>? {
+            generation &+= 1
+            let task = pending
+            pending = nil
+            task?.cancel()
+            return task
+        }
+    }
+
     public typealias Reload = @Sendable () async -> Void
     private let delay: Duration
     private let reload: Reload
     private var visible = false
     private var dirty = false
-    private var loading = false
-    private var generation: UInt64 = 0
-    private var pending: Task<Void, Never>?
+    private var activeReload: Task<Void, Never>?
+    private var activeGeneration: UInt64?
+    private var timer = Timer()
 
     public init(delay: Duration = .milliseconds(500), reload: @escaping Reload) {
         self.delay = delay
@@ -18,43 +53,50 @@ public actor StoreReloadDebouncer {
 
     public func signal() {
         dirty = true
-        if visible && !loading { schedule() }
+        if visible && activeReload == nil { schedule() }
     }
 
     public func setVisible(_ value: Bool) {
         visible = value
         if !value {
-            pending?.cancel()
-            pending = nil
-        } else if dirty && !loading {
+            timer.cancel()
+        } else if dirty && activeReload == nil {
             schedule()
         }
     }
 
     public func cancel() {
-        pending?.cancel()
-        pending = nil
+        timer.cancel()
         dirty = false
         visible = false
+        // Keep exclusion until reload actually exits, including work that
+        // ignores cancellation. A subsequent visible lifecycle waits for it.
+        activeReload?.cancel()
     }
 
+    deinit { timer.cancel(); activeReload?.cancel() }
+
     private func schedule() {
-        generation &+= 1
-        let expected = generation
-        pending?.cancel()
-        pending = Task { [weak self, delay] in
-            do { try await Task.sleep(for: delay) } catch { return }
+        timer.schedule(delay: delay) { [weak self] expected in
             await self?.fire(expected)
         }
     }
 
-    private func fire(_ expected: UInt64) async {
-        guard expected == generation, visible, dirty, !loading else { return }
-        pending = nil
+    private func fire(_ expected: UInt64) {
+        guard timer.take(expected), visible, dirty, activeReload == nil else { return }
         dirty = false
-        loading = true
-        await reload()
-        loading = false
+        activeGeneration = expected
+        activeReload = Task { [weak self, reload] in
+            if !Task.isCancelled { await reload() }
+            await self?.reloadFinished(expected)
+        }
+    }
+
+    private func reloadFinished(_ expected: UInt64) {
+        guard activeGeneration == expected else { return }
+        activeReload = nil
+        activeGeneration = nil
+        // Only current visibility and edges may admit a follow-up reload.
         if dirty && visible { schedule() }
     }
 }

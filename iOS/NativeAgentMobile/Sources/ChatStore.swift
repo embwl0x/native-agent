@@ -16,7 +16,7 @@ final class MobileLocalStorage: @unchecked Sendable {
         return URL.applicationSupportDirectory.appendingPathComponent("chat/attachments/\(id.uuidString).caf")
     }
 
-    /// Audio stays on this phone, independently of the rolling transcript cache.
+    /// Audio stays on this phone, independently of the Mac transcript.
     static func retainRecording(_ attachment: MultimodalAttachment) throws -> URL {
         let url = try recordingURL(id: attachment.id)
         guard let bytes = Data(base64Encoded: attachment.base64), !bytes.isEmpty else {
@@ -34,8 +34,6 @@ final class MobileLocalStorage: @unchecked Sendable {
     private let defaults: UserDefaults
     private let queue = DispatchQueue(label: "nativeagent.mobile.defaults", qos: .utility)
     private var errors: [String: Error] = [:]
-    private var transcripts: [String: ChatStore.CachedTranscript] = [:]
-    private var transcriptRecency: [String] = []
 
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
@@ -62,7 +60,6 @@ final class MobileLocalStorage: @unchecked Sendable {
             do {
                 let payload = value()
                 defaults.set(try JSONEncoder().encode(payload), forKey: key)
-                if let transcript = payload as? ChatStore.CachedTranscript { cache(transcript, key: key) }
                 errors[key] = nil
             } catch { errors[key] = error; onError(error) }
         }
@@ -94,65 +91,6 @@ final class MobileLocalStorage: @unchecked Sendable {
                 } catch { continuation.resume(throwing: error) }
             }
         }
-    }
-
-    @MainActor func checkpointReply(_ reply: ChatMessage, key: String, legacyKey: String, sessionID: String?) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            queue.async { [self] in
-                do {
-                    let saved = try loadTranscript(key: key, legacyKey: legacyKey, sessionID: sessionID)
-                    var rows = saved?.messages ?? []
-                    if let index = rows.firstIndex(where: { $0.id == reply.id }) { rows[index] = reply }
-                    else { rows.append(reply) }
-                    let envelope = ChatStore.CachedTranscript(schemaVersion: 2, sessionID: sessionID,
-                        messages: ChatStore.cachedTranscriptRows(rows),
-                        appliedTranscriptGeneration: saved?.appliedTranscriptGeneration)
-                    defaults.set(try JSONEncoder().encode(envelope), forKey: key)
-                    cache(envelope, key: key)
-                    errors[key] = nil
-                    guard defaults.synchronize() else { throw DeviceSyncError.underlying(message: "Could not save chat reply") }
-                    continuation.resume()
-                } catch { continuation.resume(throwing: error) }
-            }
-        }
-    }
-
-    private func cache(_ transcript: ChatStore.CachedTranscript, key: String) {
-        transcripts[key] = transcript
-        transcriptRecency.removeAll { $0 == key }
-        transcriptRecency.append(key)
-        if transcriptRecency.count > 4 { transcripts.removeValue(forKey: transcriptRecency.removeFirst()) }
-    }
-
-    @MainActor func readTranscript(key: String, legacyKey: String, sessionID: String?) async throws -> ChatStore.CachedTranscript? {
-        try await withCheckedThrowingContinuation { continuation in
-            queue.async { [self] in
-                do { continuation.resume(returning: try loadTranscript(key: key, legacyKey: legacyKey, sessionID: sessionID)) }
-                catch { continuation.resume(throwing: error) }
-            }
-        }
-    }
-
-    private func loadTranscript(key: String, legacyKey: String, sessionID: String?) throws -> ChatStore.CachedTranscript? {
-        if let hit = transcripts[key] { cache(hit, key: key); return hit }
-        let exact = defaults.data(forKey: key)
-        guard let data = exact ?? defaults.data(forKey: legacyKey) else { return nil }
-        let decoder = JSONDecoder()
-        let envelope: ChatStore.CachedTranscript
-        if let saved = try? decoder.decode(ChatStore.CachedTranscript.self, from: data),
-           saved.schemaVersion == 2, ChatStore.cleanSessionID(saved.sessionID) == sessionID {
-            envelope = saved
-        } else if exact != nil, key != legacyKey || sessionID == nil {
-            envelope = ChatStore.CachedTranscript(schemaVersion: 2, sessionID: sessionID,
-                messages: try decoder.decode([ChatMessage].self, from: data))
-        } else if exact == nil { return nil }
-        else { throw CocoaError(.coderReadCorrupt) }
-        let normalized = ChatStore.CachedTranscript(schemaVersion: 2, sessionID: sessionID,
-            messages: envelope.messages.map { var row = $0; row.isStreaming = false; return row },
-            appliedTranscriptGeneration: envelope.appliedTranscriptGeneration)
-        if exact == nil { defaults.set(try JSONEncoder().encode(normalized), forKey: key) }
-        cache(normalized, key: key)
-        return normalized
     }
 
     @MainActor func read<Value: Decodable & Sendable>(_ type: Value.Type, key: String) async throws -> Value? {
@@ -194,25 +132,17 @@ struct QueuedChatSend: Identifiable, Codable, Sendable {
 final class ChatStore {
     /// The scene and cold App Intents must settle the same durable exchanges.
     static let shared = ChatStore()
-    struct CachedTranscript: Codable, Sendable {
-        let schemaVersion: Int
-        let sessionID: String?
-        let messages: [ChatMessage]
-        /// 2026-09-06: the newest Mac transcript version these rows were
-        /// reconciled against. It rides WITH the rows because it only means
-        /// anything about them: an empty transcript is allowed to wipe this
-        /// cache exactly when it is newer than this. Held only in memory, a
-        /// relaunch forgot it and the next stale empty snapshot wiped a
-        /// rebuilt chat. nil for envelopes written before this field existed.
-        var appliedTranscriptGeneration: Int? = nil
-    }
-
-    var messages: [ChatMessage] = [] {
-        didSet {
-            noteMessageArrivals(previous: oldValue, current: messages)
-            persistMessages()
+    /// Snapshots, history pages and bridge updates all write this shared projection.
+    var messages: [ChatMessage] {
+        get { iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey]?.messages ?? [] }
+        set {
+            var transcript = iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey]
+                ?? .init(records: [], messages: [], generation: nil)
+            transcript.messages = newValue
+            iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey] = transcript
         }
     }
+    var transcriptSessionKey: String { selectedSessionID ?? Self.nilQueueSessionKey }
     var isLoading = false {
         didSet {
             if !isLoading { loadingPlaceholderID = nil }
@@ -313,7 +243,7 @@ final class ChatStore {
     // are dropped on the dispatcher.
     var maxDeltaSeqByCorrelation: [String: Int] = [:]
     private(set) var selectedSessionID: String?
-    private(set) var mainSessionID: String?
+    var mainSessionID: String? { iCloudSyncEngine.shared.chatAnchor?.cleanSessionId }
     /// A phone-created main session remains locally authoritative until the
     /// Mac publishes that exact identity. Session-list snapshots can lag the
     /// first send, so treating absence as removal can otherwise roll the UI
@@ -323,16 +253,11 @@ final class ChatStore {
     // PATCH-2026-05-11: unified-session-v1 — drop stale iOS-only session ID on first launch
     // so the Mac app resolves to the shared mobile session via sourceKey.
     private static let selectedSessionIDKey = "NativeAgentMobile.chatSessionID"
-    private static let mainSessionIDKey = "NativeAgentMobile.mainChatSessionID"
     private static let locallyCreatedSessionIDKey = "NativeAgentMobile.locallyCreatedChatSessionID"
-    let transcriptKey = "NativeAgentMobile.chatMessages"
-    let transcriptPrefix = "NativeAgentMobile.chatMessages.session."
-    var suppressMessagePersistence = false
     /// One session switch owns the composer lock. The generation prevents a
     /// cancelled/late history read from releasing a newer switch.
     var sessionSwitchGeneration: UInt64 = 0
     var sessionSwitchTask: Task<Void, Never>?
-    var sessionCacheLoadTask: Task<Void, Never>?
     @ObservationIgnored var restorationTask: Task<Void, Never>?
 
     init(
@@ -345,22 +270,14 @@ final class ChatStore {
         self.iCloudReplyTimeoutSeconds = iCloudReplyTimeoutSeconds
         if !defaults.bool(forKey: "NativeAgent.unifiedSession.v1") {
             defaults.removeObject(forKey: Self.selectedSessionIDKey)
-            defaults.removeObject(forKey: Self.mainSessionIDKey)
             defaults.set(true, forKey: "NativeAgent.unifiedSession.v1")
         }
-        let savedMain = Self.cleanSessionID(defaults.string(forKey: Self.mainSessionIDKey))
         // A launch opens main. History is only selected by an explicit action
         // in this launch, never by restoring yesterday's open history thread.
-        let savedSelected = savedMain
+        let savedSelected: String? = nil
         let savedLocal = Self.cleanSessionID(defaults.string(forKey: Self.locallyCreatedSessionIDKey))
         selectedSessionID = savedSelected
-        mainSessionID = savedMain
-        if savedLocal == savedSelected, savedLocal == savedMain {
-            locallyCreatedSessionID = savedLocal
-        } else {
-            locallyCreatedSessionID = nil
-            defaults.removeObject(forKey: Self.locallyCreatedSessionIDKey)
-        }
+        locallyCreatedSessionID = savedLocal
         if restoreQueuedSends, let restoredPaused = defaults.array(forKey: pausedQueueSessionKeysKey) as? [String] {
             pausedQueueSessionKeys = Set(restoredPaused)
         }
@@ -381,13 +298,8 @@ final class ChatStore {
                     pendingExchanges = Dictionary(exchanges.map { ($0.correlationID, $0) }, uniquingKeysWith: { _, newer in newer })
                 } catch { failures.append(error.localizedDescription) }
             }
-            let cached = await loadCachedMessages(for: savedSelected ?? savedMain)
             guard sessionSwitchGeneration == 0 else { return }
-            suppressMessagePersistence = true
-            messages = cached
-            suppressMessagePersistence = false
-            for row in cached { localArrivalDates[row.id] = .distantPast }
-            restorePendingExchanges(for: savedSelected ?? savedMain)
+            restorePendingExchanges(for: savedSelected)
             if !failures.isEmpty { errorBanner = "Chat could not be restored: " + failures.joined(separator: "\n") }
         }
     }
@@ -399,24 +311,12 @@ final class ChatStore {
 
     func setSelectedSessionID(_ value: String?) {
         let clean = Self.cleanSessionID(value)
-        // A switch reloads from the capped cache, which may have dropped the
-        // older pages: whether the start is reached is asked again.
         if clean != selectedSessionID { historyExhaustedSessionIDs.removeAll() }
         selectedSessionID = clean
         if let clean {
             defaults.set(clean, forKey: Self.selectedSessionIDKey)
         } else {
             defaults.removeObject(forKey: Self.selectedSessionIDKey)
-        }
-    }
-
-    func replaceMainSessionID(_ value: String?) {
-        let clean = Self.cleanSessionID(value)
-        mainSessionID = clean
-        if let clean {
-            defaults.set(clean, forKey: Self.mainSessionIDKey)
-        } else {
-            defaults.removeObject(forKey: Self.mainSessionIDKey)
         }
     }
 
@@ -436,41 +336,6 @@ final class ChatStore {
         guard let local = locallyCreatedSessionID, sessionIDs.contains(local) else { return }
         acknowledgePublishedSession(local)
     }
-
-    func rememberMainSessionIDIfNeeded(_ value: String?) {
-        guard mainSessionID == nil, let clean = Self.cleanSessionID(value) else { return }
-        mainSessionID = clean
-        defaults.set(clean, forKey: Self.mainSessionIDKey)
-    }
-
-    func transcriptStorageKey(for sessionID: String?) -> String {
-        guard let clean = Self.cleanSessionID(sessionID) else { return transcriptKey }
-        return transcriptPrefix + clean
-    }
-
-    func loadCachedMessages(for sessionID: String?, fallback: [ChatMessage]? = nil) async -> [ChatMessage] {
-        let session = Self.cleanSessionID(sessionID)
-        let key = transcriptStorageKey(for: session)
-        do {
-            let saved = try await storage.readTranscript(key: key, legacyKey: transcriptKey, sessionID: session)
-            noteCachedTranscriptGeneration(saved?.appliedTranscriptGeneration, for: session)
-            return saved?.messages ?? fallback ?? []
-        } catch {
-            errorBanner = "The cached transcript for this chat was unreadable. Refreshing from the Mac."
-            return fallback ?? []
-        }
-    }
-
-    /// 2026-09-06: restore the persisted clear-watermark for a session as its
-    /// cache is read back. Without this the in-memory watermark starts empty
-    /// every launch, and the first stale empty snapshot to arrive is treated as
-    /// newer than everything — which is how a rebuilt transcript got wiped.
-    private func noteCachedTranscriptGeneration(_ generation: Int?, for sessionID: String?) {
-        guard let sessionID, let generation else { return }
-        if let applied = appliedTranscriptGenerations[sessionID], generation <= applied { return }
-        appliedTranscriptGenerations[sessionID] = generation
-    }
-
 
     /// Set by ChatView after init; called with each assistant reply text so
     /// VoiceOutputController can speak it without the store importing AVFoundation.
@@ -520,48 +385,40 @@ final class ChatStore {
     /// only ever by the person, through `sendNow` (2026-09-13).
     var expiredPendingIds: [String: UUID] = [:]
     var resolvedICloudReplyIds: Set<String> = []
-    /// 2026-09-06: the message ids of the newest Mac transcript snapshot this
-    /// session has adopted. A bridge-resolved reply keeps the phone's
-    /// placeholder UUID forever (finishPlaceholder), so only these ids name a
-    /// row the Mac can actually find — regenerate replaces exactly one
-    /// persisted row by id and throws when the id names none.
-    var macPublishedMessageIDs: Set<UUID> = []
+    var macPublishedMessageIDs: Set<UUID> {
+        Set(iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey]?.records.compactMap { UUID(uuidString: $0.id) } ?? [])
+    }
     /// 2026-09-06: assistant ids removed locally for a regenerate. They are
     /// deliberately absent until the Mac's replacement lands, which is exactly
     /// the shape snapshot reply selection reads as "the awaited
     /// reply" — a stale snapshot would otherwise complete the regeneration
     /// with the answer being replaced.
-    var regeneratedAwayAssistantIDs: Set<UUID> = []
+    var regeneratedAwayAssistantIDs: Set<UUID> {
+        get { iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey]?.regeneratedAwayIDs ?? [] }
+        set {
+            guard var transcript = iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey] else { return }
+            transcript.regeneratedAwayIDs = newValue
+            iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey] = transcript
+        }
+    }
     /// Turns another door started in this conversation, by run id, and the
     /// bubble each one streams into (`receiveLiveTurn`).
     var liveTurnBubbles: [String: UUID] = [:]
-    /// Rows fetched from the Mac above the snapshot's window. The merge keeps
-    /// them: the snapshot never carries them.
-    var pagedHistoryIDs: Set<UUID> = []
+    /// Mac history rows retained in the shared transcript beyond its snapshot window.
+    var pagedHistoryIDs: Set<UUID> {
+        iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey]?.historyIDs ?? []
+    }
     var isLoadingHistory = false
     var historyExhaustedSessionIDs: Set<String> = []
     /// Sessions opened from a Mac page (no published transcript) whose page
     /// said there is more before it.
     var pagedSessionsWithOlder: Set<String> = []
-    /// 2026-09-06: the newest Mac transcript version applied per session. An
-    /// EMPTY published transcript is authority to clear the visible chat, so it
-    /// must be provably newer than what is on screen — two overlapping snapshot
-    /// reads can finish out of order, and the older one must not be allowed to
-    /// wipe a live transcript. Seeded from the persisted cache envelope on
-    /// load, so the watermark survives a relaunch.
-    var appliedTranscriptGenerations: [String: Int] = [:]
     /// 2026-09-06: the store the visible chat is bound to, so the notification
     /// delegate can tell a reply the user is already reading from one worth
     /// alerting about. Nil whenever no chat surface is on screen.
     static weak var visibleStore: ChatStore?
 
-    static let resolvedPreserveWindowSeconds: TimeInterval = 15 * 60
     static let snapshotTruncationMarker = "[truncated for iPhone snapshot]"
-
-    /// When each message id first appeared locally. Maintained from the messages
-    /// didSet so every append path (send, bridge resolve, snapshot apply, cache
-    /// load) is covered without instrumenting each call site. Internal for tests.
-    var localArrivalDates: [UUID: Date] = [:]
 
     /// Timestamp of the last successful (or in-progress) refresh attempt.
     /// Used as a throttle guard — skips if a refresh happened within 2 seconds.

@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ContextSecretContentPolicy.swift` | Shared derived-context secret policy; linear nested percent decoding and ordered URL extraction with authoritative whole-text and query-assignment redaction before and after news composition; Context compiler, native news and JavaScript helper use this same owner |
 
 /// One fail-closed secret-shape policy for material entering derived context.
 public enum ContextSecretContentPolicy {

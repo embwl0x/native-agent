@@ -1,4 +1,5 @@
-import ChatOrchestration
+import ChatTurnContracts
+import ChatToolRuntime
 import Cognition
 import CognitiveSubstrate
 import Foundation
@@ -8,6 +9,7 @@ import PersonaEngine
 import PersistenceCore
 import Studio
 import TrustCenter
+// Blueprint: | `AppToolExecutor+QuietMind.swift` | quiet mind commands and decision receipts |
 
 public typealias QuietMindOutcome = (ok: Bool, detail: String, fields: [String: JSONValue])
 

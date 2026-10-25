@@ -9,20 +9,15 @@ import PersistenceCore
 import NativeAgentCore
 import MemoryV2
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
 import ToolExecution
 import PersonaEngine
-import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
+import EngineRuntime
 import Research
 import MultimodalTTS
 import TriggerScheduler
@@ -34,11 +29,11 @@ import TelegramBot
 import Dispatcher
 import MacControl
 import Onboarding
-import MacAssistantStatus
+import MacIntegration
 import WorkflowOrchestration
-import Skills
 import Connectors
 import Browser
+// Blueprint: | `AppModel+MemoryActions.swift` | `AppModel`: `pinMemory`, `deleteMemory`, `consolidateMemory`, `applyMemoryConsolidationResult`, `runMemoryHygiene` |
 
 /// The Memory actions menu has one explicit receipt vocabulary. A completed
 /// maintenance run, a staged approval, a refusal, and an unavailable writer
@@ -132,13 +127,6 @@ enum MemoryRowEditorPinOutcome: Equatable {
     var isAdverse: Bool {
         if case .failed = self { return true }
         return false
-    }
-
-    var systemImage: String {
-        switch self {
-        case .applied: return "checkmark.circle"
-        case .failed: return "exclamationmark.triangle.fill"
-        }
     }
 }
 

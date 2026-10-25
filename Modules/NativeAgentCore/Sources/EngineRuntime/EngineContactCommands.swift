@@ -1,12 +1,14 @@
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import AgentConversations
 import Foundation
 import Agents
 import Cognition
 import ContextFlow
-import GitHubConnector
 import GrokLink
 import PersonaEngine
 import PersistenceCore
+// Blueprint: | `EngineContactCommands.swift` | Person-initiated sends, verified-session stop commands and held-message withdrawal through engine dispatch; Contact sends/stops and core bridge/A2A construction over the injected engine |
 
 /// The person's own message to a contact, from its thread: the same
 /// agent_message machinery the agent uses (peer resolution, transports,
@@ -75,9 +77,8 @@ extension NativeAgentEngine {
 
 extension NativeAgentEngine {
     public static func makeAgentBridge(engine: @escaping @Sendable () -> NativeAgentEngine,
-                                        grpcPort: @escaping @Sendable () -> UInt16?,
-                                        gitHubCommand: @escaping @Sendable () -> GitHubCommandRuntime) -> ClaudeBridgeRuntime {
-        ClaudeBridgeRuntime(port: EngineClaudeBridgePort(engine: engine, readGRPCPort: grpcPort, gitHubCommand: gitHubCommand))
+                                        grpcPort: @escaping @Sendable () -> UInt16?) -> ClaudeBridgeRuntime {
+        ClaudeBridgeRuntime(port: EngineClaudeBridgePort(engine: engine, readGRPCPort: grpcPort))
     }
     public static func makeA2AListener(engine: @escaping @Sendable () -> NativeAgentEngine,
                                        bridge: @escaping @Sendable () -> ClaudeBridgeRuntime) -> NativeAgentA2AGRPCListener {
@@ -90,7 +91,6 @@ extension NativeAgentEngine {
 private struct EngineClaudeBridgePort: ClaudeBridgeRuntimePort {
     let engine: @Sendable () -> NativeAgentEngine
     let readGRPCPort: @Sendable () -> UInt16?
-    let gitHubCommand: @Sendable () -> GitHubCommandRuntime
     var dataRoot: URL { engine().dataRoot }
     var cognition: NativeCognitionRuntime { engine().cognition! }
     var contextFlow: NativeContextFlowRuntime { engine().contextFlow }
@@ -111,10 +111,5 @@ private struct EngineClaudeBridgePort: ClaudeBridgeRuntimePort {
     }
     func publishChatTurnCompleted(sessionID: String?) async {
         await MainActor.run { NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID) }
-    }
-    func handleCodexCompletion(messageIds: [String], codexStatus: String, summary: String,
-                               threadId: String?, turnId: String?, errorMessage: String?, noWorkObserved: Bool?) async {
-        await gitHubCommand().handleCodexCompletion(messageIds: messageIds, codexStatus: codexStatus,
-            summary: summary, threadId: threadId, turnId: turnId, errorMessage: errorMessage, noWorkObserved: noWorkObserved)
     }
 }

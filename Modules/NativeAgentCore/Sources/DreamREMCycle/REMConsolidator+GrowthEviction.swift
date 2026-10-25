@@ -1,9 +1,10 @@
 import Foundation
 import CryptoKit
-import KnowledgeGraph
+import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+// Blueprint: | `REMConsolidator+GrowthEviction.swift` | `REMConsolidator`: `runGrowthEviction` |
 
 extension REMConsolidator {
     // MARK: GROWTH.md eviction-to-KG
@@ -65,7 +66,8 @@ extension REMConsolidator {
         // authored above the first approved lesson (Core, Reflexes, Identity)
         // is preamble whatever its heading, so the file reads top to bottom —
         // who she is, then what she learned, newest last (User 10-10).
-        let evictableStart = max(preambleEnd, lessonStarts.first ?? body.endIndex)
+        let firstLesson = lessonStarts.first ?? body.endIndex
+        let evictableStart = preambleEnd == body.endIndex ? firstLesson : max(preambleEnd, firstLesson)
         guard evictableStart < body.endIndex else { return nil }
 
         // Walk headings and approved lesson starts from the evictable region until we
@@ -313,7 +315,7 @@ extension REMConsolidator {
     private func distillToKGNode(_ text: String) async throws -> KGNode {
         let prompt = """
         Distill the following evicted GROWTH-doc slice into ONE compressed
-        knowledge-graph node summary (<=400 chars). Return plain text only.
+        knowledge-graph node summary (<=400 chars).
 
         ---
         \(text)
@@ -324,7 +326,7 @@ extension REMConsolidator {
         // spent the Work group's account on a memory task (2026-09-13 review).
         let pickedModel = await router.modelStringForSurface("rem")
         let raw = try await llm.complete(
-            prompt: prompt, system: "This is a weekly memory consolidation step. Follow the request exactly and return only what it asks for.",
+            prompt: prompt, system: "This is a weekly memory consolidation step.",
             model: pickedModel, surface: "rem", purpose: "rem"
         )
         let summary = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -355,7 +357,8 @@ extension REMConsolidator {
             // retained-passage record, but a compressed node whose pointer is an
             // unwritten convention is a node nobody expands — so it says where
             // the full passage is, in both the SQLite and legacy-JSON paths.
-            summary: summary + "\n\n" + REMGrowthEvictionHistory.pointer(id: id),
+            // The 400-character bound is the summary's; the pointer after it stays whole.
+            summary: String(summary.prefix(400)) + "\n\n" + REMGrowthEvictionHistory.pointer(id: id),
             sourceLines: text.split(separator: "\n").count,
             createdAt: isoNow()
         )

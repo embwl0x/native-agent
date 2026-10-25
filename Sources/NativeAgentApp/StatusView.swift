@@ -16,6 +16,8 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+// Blueprint: | `StatusView.swift` | `StatusView`: living system status and latest chronological activity projection with raw malformed-time evidence retained |
+
 enum StatusActivityPresentation {
     enum State: Equatable {
         case loading
@@ -77,13 +79,17 @@ struct StatusView: View {
                 // Desk, approvals and dream it reads — first, above the app's.
                 LivingStatusPanel()
                 NativePanel(title: "The app", systemImage: "server.rack") {
-                    Label(appModel.statusText, systemImage: appModel.engine.doctor.health?.ok == true ? "checkmark.circle.fill" : "xmark.octagon")
-                        .foregroundStyle(appModel.engine.doctor.health?.ok == true ? .green : .red)
+                    let status = appModel.engine.doctor.runtimeStatus(lastRefreshError: appModel.lastRefreshError)
+                    Label(status.text, systemImage: status.systemImage)
+                        .foregroundStyle(status.tone == .success ? .green : status.tone == .warning ? .orange : status.tone == .failure ? .red : .secondary)
+                    if let detail = status.detail {
+                        Text(detail).font(.caption).foregroundStyle(.orange)
+                    }
                     if let health = appModel.engine.doctor.health {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
                             MetricTile(title: "Version", value: health.version, systemImage: "number")
                             MetricTile(title: "Uptime", value: "\(Int(health.uptimeSeconds))s", systemImage: "timer")
-                            MetricTile(title: "Runs", value: "\(appModel.runs.count)", systemImage: "play.rectangle")
+                            MetricTile(title: "Runs", value: "\(appModel.engine.runs.rows.count)", systemImage: "play.rectangle")
                             MetricTile(title: "Sessions", value: "\(appModel.engine.transcripts.sessions.count)", systemImage: "bubble.left.and.bubble.right")
                         }
                         Text(UserDisplayFormatters.tildifyPath(health.dataDir))
@@ -112,8 +118,8 @@ struct StatusView: View {
 
                 NativePanel(title: "Recent activity", systemImage: "clock.arrow.circlepath") {
                     switch StatusActivityPresentation.state(
-                        events: appModel.activityEvents,
-                        refresh: appModel.panelRefreshStatus[.diagnostics]
+                        events: appModel.engine.doctor.activityEvents,
+                        refresh: appModel.engine.doctor.activityRefresh
                     ) {
                     case .loading:
                         ProgressView("Loading activity…")

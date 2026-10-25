@@ -5,6 +5,7 @@ import NativeAgentCore
 #if canImport(Vision) && canImport(ApplicationServices)
 import Vision
 import ApplicationServices
+// Blueprint: | `MacAppWindowText.swift` | `MacAppWindowText` enum; one positional-redacting on-device recognizer for current app-window capture and ephemeral whole-window shots before text-only retention |
 #endif
 
 /// The independent app view is text recognized on-device from that window's

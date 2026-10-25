@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MacSyncActionRouter+Helpers.swift` | `MacSyncActionRouter`: `helpersAction` |
 
 extension MacSyncActionRouter {
     func helpersAction(_ action: String, payload: [String: String]) async throws -> [String: String] {

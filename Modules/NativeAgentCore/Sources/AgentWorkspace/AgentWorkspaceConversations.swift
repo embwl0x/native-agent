@@ -3,6 +3,7 @@ import Foundation
 import NativeAgentCore
 import CryptoKit
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceConversations.swift` | `AgentWorkspaceConversations` enum; `project` |
 
 /// The conversation owner's bookmarks, presented as recognizable windows.
 /// This is not another inbox or transcript: opening a window still enters
@@ -272,16 +273,14 @@ struct AgentWorkSession {
             } else {
                 return nil
             }
-            guard let row = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-                  row["role"] as? String == "user" else { continue }
-            let metadata = row["metadata"] as? [String: Any]
-            let origin = metadata?["origin"] as? [String: Any]
-            let envelope = metadata?["envelope"] as? [String: Any]
-            guard let surface = origin?["surface"] as? String ?? envelope?["surface"] as? String,
-                  surface.hasSuffix("-bridge"),
-                  let sender = ContactThread.stamp(id: row["id"] as? String ?? "", metadata: metadata).source,
-                  let content = row["content"] as? String else { return nil }
-            let topic = String(ContactThread.bridgedText(content).prefix(60))
+            guard case .object(let row)? = try? JSONValue.parse(Data(line)) else { continue }
+            let speech = ContactThread.Line(row)
+            guard speech.role == "user" else { continue }
+            let origin = HumanConversationIndex.object(speech.metadata["origin"])
+            let envelope = HumanConversationIndex.object(speech.metadata["envelope"])
+            guard let surface = HumanConversationIndex.string(origin["surface"]) ?? HumanConversationIndex.string(envelope["surface"]),
+                  surface.hasSuffix("-bridge"), let sender = speech.source else { return nil }
+            let topic = String(ContactThread.project([speech], style: .thread).first!.text.prefix(60))
             return (sender, topic)
         }
     }
@@ -306,7 +305,7 @@ struct AgentWorkSession {
     }
 
     static func people(dataRoot: URL) -> [(agent: String, name: String)] {
-        HerScreen.contacts(identity: AgentContactIdentity(dataRoot: dataRoot), usable: []).map { ($0.id, $0.name) }
+        HerScreen.contacts(identity: AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot), usable: []).map { ($0.id, $0.name) }
     }
 
     /// The one person this sender is, or nil when none or several match.
@@ -318,7 +317,7 @@ struct AgentWorkSession {
 
     static func sessions(with agent: String, dataRoot: URL) -> [Self] {
         let people = people(dataRoot: dataRoot)
-        let identity = AgentContactIdentity(dataRoot: dataRoot)
+        let identity = AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)
         return all(dataRoot: dataRoot).filter { identity.canonical($0.sender) == identity.canonical(agent)
             && people.contains(where: { identity.canonical($0.agent) == identity.canonical(agent) }) }
     }

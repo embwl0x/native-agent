@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+// Blueprint: | `ChatCompletionsMessageEncoding.swift` | `chatCompletionsMessages` |
 
 /// Chat Completions block encoding shared by OpenAI, OpenRouter, Moonshot,
 /// and xAI. Tool-use messages precede their tool results; image parts are

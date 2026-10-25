@@ -4,6 +4,7 @@ import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+// Blueprint: | `FluidContextToolScope.swift` | `FluidContextToolScope` enum; expanded memory pages retain stored untrusted sources |
 
 package enum FluidContextToolScope {
     @TaskLocal package static var current: ContextPreparedTurn?

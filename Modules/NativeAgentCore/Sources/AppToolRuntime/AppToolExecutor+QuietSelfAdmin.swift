@@ -1,5 +1,6 @@
-import AppToolRuntime
-import ChatOrchestration
+import ChatTurnContracts
+import ChatToolRuntime
+import ChatToolParsing
 import Dispatcher
 import Foundation
 import NativeAgentCore
@@ -8,6 +9,7 @@ import PersistenceCore
 import ProviderRouting
 import Privacy
 import TrustCenter
+// Blueprint: | `AppToolExecutor+QuietSelfAdmin.swift` | `AppToolExecutor`: `performMacSelfAppRoute` propagates self-window look outcomes; only independently verified navigation retains its success with a supplementary observation; `quietPosture`, `freshQuietPosture` |
 
 /// The `app` door's posture, page read and setting set.
 ///
@@ -29,10 +31,10 @@ extension AppToolExecutor {
               next["tool"] == .string("app"),
               case .object(let input) = next["input"] else { return result }
         let outcome = await run(input)
-        // Page inspection is supplementary after a verified app focus. Its
-        // availability must not turn completed navigation into a retry.
-        if input["action"] == nil, payload["ok"] == .bool(true) {
+        // Only a verified navigation keeps its success when its subsequent look fails.
+        if input["action"] == nil, case .object(let navigation)? = detail["navigation"], navigation["ok"] == .bool(true) {
             var response = payload
+            response["ok"] = .bool(true)
             response["in_process_observation"] = outcome
             var observationDetail = detail
             observationDetail.removeValue(forKey: "next_action")
@@ -152,11 +154,9 @@ extension AppToolExecutor {
     }
 
     public static func unknownPageFailure(_ raw: String, pages: [String]) -> JSONValue {
-        failure(
-            "unknown_page",
-            "No page is called that.",
-            extra: ["requested": .string(raw), "pages": .array(pages.map { .string($0) })]
-        )
+        doorRefusal("unknown_page", "No page is called that.", remedy: "read_index",
+            "Read the page index, then select a listed page id.", next: [:],
+            extra: ["requested": .string(raw), "pages": .array(pages.map { .string($0) })])
     }
 
     private static func text(_ value: JSONValue?) -> String {
@@ -200,7 +200,9 @@ extension AppToolExecutor {
                                                dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         let answer = await host.runChatSession(verb: verb, input: input, reachesUser: reachesUser)
         guard case .object(var body) = answer else {
-            return Self.failure("chat_session_failed", "The app gave no answer for that verb.", extra: ["effects": .string("unknown")])
+            return Self.doorRefusal("handler_result_missing", "The conversation handler returned no structured result; its effects are unknown.",
+                remedy: "inspect", "Read the conversation's current state before another change.",
+                next: ["page": .string("chat"), "item": input["session_id"] ?? .string("")], extra: ["effects": .string("unknown"), "verb": .string(verb)])
         }
         body["verb"] = .string(verb)
         body["trust_mode"] = .string(posture.name)
@@ -229,8 +231,8 @@ extension AppToolExecutor {
         let current = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "current"
         guard let page = current ? presentation.currentPage : presentation.page(named: requested) else {
             if current {
-                return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("app_window_unavailable"),
-                                "detail": .string("No app window is showing a page right now; name the page instead of current.")])
+                return Self.doorRefusal("app_window_unavailable", "No app window is showing a page right now.",
+                    remedy: "select_page", "Read the page index and name a page instead of current.", next: [:])
             }
             return Self.unknownPageFailure(requested, pages: presentation.pages.map(\.id))
         }

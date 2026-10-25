@@ -1,4 +1,6 @@
 import Foundation
+import PersistenceCore
+// Blueprint: | `TrustAccessModeCapabilityCatalog+Read.swift` | Trust projections; effective Full Mac uses MacControlGate's admitted-call projection and PermissionLaw's Full Mac posture: no category approval prompts; saved restricted-mode approval metadata remains unchanged |
 
 extension TrustAccessModeCapabilityCatalog {
     public enum FileChangeState {
@@ -20,9 +22,29 @@ extension TrustAccessModeCapabilityCatalog {
 
     /// Full Mac's effective grants leave the saved restricted-mode settings intact.
     public static func effectiveMacControlPolicy(_ policy: TrustPolicy) -> TrustMacControlPolicy? {
-        fullMacGrantIsActive(policy)
-            ? macControlPolicy(for: "full", developerMode: true)
-            : policy.macControlPolicy
+        guard fullMacGrantIsActive(policy) else { return policy.macControlPolicy }
+        let root: [String: JSONValue] = [
+            "permissionLevel": .string(policy.permissionLevel),
+            "filePolicy": .object(["outsideWorkspaceDefault": .string(policy.filePolicy?.outsideWorkspaceDefault ?? "")]),
+            "macControlPolicy": .object((policy.macControlPolicy ?? TrustMacControlPolicy()).wireValue
+                .mapValues { JSONValue(fromFoundation: $0) }),
+        ]
+        let effective = MacControlGate.policyForAdmittedFullMac(.fromTrustPolicyObject(root), admitted: true)
+        return TrustMacControlPolicy(
+            enabled: effective.enabled,
+            applesScriptAllowed: effective.categoryAllowed["applescript_allowed"] == true,
+            jxaAllowed: effective.categoryAllowed["jxa_allowed"] == true,
+            shortcutsAllowed: effective.categoryAllowed["shortcuts_allowed"] == true,
+            accessibilityAllowed: effective.categoryAllowed["accessibility_allowed"] == true,
+            systemControlAllowed: effective.categoryAllowed["system_control_allowed"] == true,
+            fileOpsAllowed: effective.categoryAllowed["file_ops_allowed"] == true,
+            shellAllowed: effective.categoryAllowed["shell_allowed"] == true,
+            notificationsAllowed: effective.categoryAllowed["notifications_allowed"] == true,
+            spotlightAllowed: effective.categoryAllowed["spotlight_allowed"] == true,
+            // PermissionLaw's Full Mac posture admits ordinary category writes.
+            // Saved approval metadata is not an effective approval boundary.
+            approvalRequiredFor: [],
+            remoteFromIosAllowed: effective.remoteFromIOSAllowed)
     }
 
     public static func grantedMacCategories(_ mac: TrustMacControlPolicy) -> [String] {

@@ -1,18 +1,8 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `SecurityCenter+JSONUtilities.swift` | Trust JSON primitives and workspace roots; byte-exact containment of resolved paths; transport policy decoding belongs to TransportAllowlist in PersistenceCore |
 
 extension SwiftNativeSecurityCenter {
-    static func maxDecision(_ lhs: SecurityToolDecision, _ rhs: SecurityToolDecision) -> SecurityToolDecision {
-        func rank(_ d: SecurityToolDecision) -> Int {
-            switch d {
-            case .allow: return 0
-            case .ask: return 1
-            case .block: return 2
-            }
-        }
-        return rank(lhs) >= rank(rhs) ? lhs : rhs
-    }
-
     static func object(_ value: JSONValue?) -> [String: JSONValue] {
         if case .object(let obj)? = value { return obj }
         return [:]
@@ -41,12 +31,6 @@ extension SwiftNativeSecurityCenter {
         }
     }
 
-    static func stringSet(_ value: JSONValue?) -> Set<String> {
-        guard case .array(let array)? = value else { return [] }
-        return Set(array.compactMap { string($0)?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty })
-    }
-
     static func stringArray(_ value: JSONValue?) -> [String] {
         guard case .array(let array)? = value else { return [] }
         return array.compactMap { string($0)?.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -62,7 +46,9 @@ extension SwiftNativeSecurityCenter {
 
         func appendRoots(from obj: [String: JSONValue]) {
             for key in ["workspaceRoots", "workspace_roots", "trustedWorkspaceRoots", "trustedRoots"] {
-                for raw in stringArray(obj[key]) {
+                guard case .array(let values)? = obj[key] else { continue }
+                for value in values {
+                    guard case .string(let raw) = value else { continue }
                     let expanded = HomePath.expand(raw)
                     guard expanded.hasPrefix("/") else { continue }
                     roots.append(URL(fileURLWithPath: expanded))
@@ -103,9 +89,11 @@ extension SwiftNativeSecurityCenter {
     }
 
     static func isSelfOrAncestor(rootPath: String, candidatePath: String) -> Bool {
-        if candidatePath == rootPath { return true }
+        // Swift String equality/prefix matching folds canonically equivalent
+        // Unicode spellings; filesystem containment compares the actual bytes.
+        if candidatePath.utf8.elementsEqual(rootPath.utf8) { return true }
         let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
-        return candidatePath.hasPrefix(prefix)
+        return candidatePath.utf8.starts(with: prefix.utf8)
     }
 
 }

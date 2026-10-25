@@ -1,7 +1,6 @@
 // Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
 
 import Foundation
-import ChatOrchestration
 import CognitiveSubstrate
 import Context
 import NativeAgentCore
@@ -9,6 +8,8 @@ import PersonaEngine
 import PersistenceCore
 import ProviderRouting
 import TurnTrace
+
+// Blueprint: | `NativeCognitionRuntime+ProviderEvidence.swift` | `NativeCognitionRuntime` provider evidence: bounded lifecycle history restored from canonical traces and durable capability projection |
 
 extension NativeCognitionRuntime {
     public nonisolated static func providerPathEvidence(

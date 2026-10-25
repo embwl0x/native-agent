@@ -2,6 +2,8 @@ import AppToolRuntime
 import SwiftUI
 import NativeAgentShared
 
+// Blueprint: | `AppShellMenuPresentation.swift` | `NavigateMenuPresentation` and `MenuBarStatusPresentation`: menu order/shortcuts projected from the rail and one canonical status line |
+
 /// D7: the Navigate menu is a PROJECTION of the rail, not a second list kept
 /// by hand. It numbered the old primary list, which lacked the Helpers row the rail
 /// adds at six, so ⌘6–⌘9 each opened the page one below. It reads the rail's

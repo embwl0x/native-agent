@@ -3,12 +3,13 @@ import AppToolRuntime
 import Foundation
 import ToolRegistry
 import SwiftUI
-import ChatOrchestration
+import ChatTurnRuntime
 import ChatSessionWork
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `ChatShellPresentation.swift` | `ChatShellTrustPhrase`, `ChatShellStatus`, `ChatShellCopy`; trust/status projections and composer/greeting copy |
 
 // ui-simplify 2026-09-02 (Lane A): value-only presentation rules for the new
 // shell. Everything here is a pure projection of state the app already owns —

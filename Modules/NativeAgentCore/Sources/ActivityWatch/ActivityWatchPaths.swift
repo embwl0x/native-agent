@@ -1,16 +1,14 @@
 import Foundation
 
+// Blueprint: | `ActivityWatchPaths.swift` | `ActivityWatchPaths`: one directory and file vocabulary for private ambient history, separate from activity event feeds |
+
 /// The ONE place the watcher's on-disk home is named.
 ///
 /// **Why it is not `<dataRoot>/activity/`** (which is what v0 used): that
 /// directory already belongs to a different, older feature — the app's activity
-/// *events* feed (`activity/events.jsonl`, traces, receipts, runtime audit
-/// rows). It is declared `exportable: true` in the Trust Center privacy map, it
-/// is copied verbatim into support bundles
-/// (`ProductionExport.supportBundleRelativePaths`), and a user
-/// clicking "export my data" gets it. Dropping a record of every window the
-/// human looked at into that directory would have opted the whole feature into
-/// three egress paths W6 explicitly forbids, silently, by filename collision.
+/// *events* feed (`activity/events.jsonl`) and its runtime receipts. Support
+/// bundles select that feed; data exports do not.
+/// Ambient window history must stay outside that selected feed.
 ///
 /// So the watcher gets its own directory, and that directory appears in NO
 /// backup, export, support-bundle, or iCloud/CloudKit snapshot list.

@@ -12,6 +12,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `CognitiveSubstrate+SemanticAppraisal.swift` | `SemanticAppraisal`: meaning-weighted event appraisal against outcomes, concerns and standing views |
+
 /// The appraised MEANING of one event, all dims computable without suspension.
 struct SemanticAppraisal: Sendable, Equatable {
     var goalRelevance = 0.0          // 0…1  — does this matter to what she's doing

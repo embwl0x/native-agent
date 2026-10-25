@@ -2,6 +2,8 @@ import Darwin
 import Foundation
 import Security
 
+// Blueprint: | `ChromeHostIdentity.swift` | `ChromeHostIdentity`: native messaging browser/relay process identity, allowed-origin checks and private refusal evidence |
+
 /// 2026-09-06: who is allowed to be on either end of the Chrome control link.
 ///
 /// The relay is a native messaging host: Chrome launches it and speaks to it

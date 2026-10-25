@@ -1,5 +1,6 @@
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `MobileAgentsView.swift` | Agent list and ID-resolved conversation from the sync owner's shared readbacks; local message drafts and submission state |
 
 struct MobileAgentsView: View {
     private let sync = iCloudSyncEngine.shared
@@ -16,7 +17,7 @@ struct MobileAgentsView: View {
                 if let snapshot = sync.helpersSnapshot {
                     if snapshot.agents.isEmpty { Text("No connected agents yet.").aliveRow() }
                     ForEach(snapshot.agents) { agent in
-                        NavigationLink { MobileAgentThreadView(agent: agent) } label: {
+                        NavigationLink { MobileAgentThreadView(id: agent.id) } label: {
                             AliveRow(agent.name, detail: agent.lastExchange.isEmpty ? agent.via : agent.lastExchange) { AliveChevron() }
                         }.aliveRowButtonStyle()
                         AliveDivider()
@@ -35,23 +36,24 @@ struct MobileAgentsView: View {
     }
 }
 
-private struct MobileAgentThreadView: View {
-    let agent: MobileAgentRow
+struct MobileAgentThreadView: View {
+    let id: String
     private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairing: PairingStore
     @Environment(ChatStore.self) private var chatStore
-    @State private var thread: MobileAgentThread?
     @State private var draft = ""
     @State private var message: String?
     @State private var busy = false
     @State private var error: String?
+    private var thread: MobileAgentThread? { sync.agentThreads[id] }
+    private var agent: MobileAgentRow? { sync.helpersSnapshot?.agents.first { $0.id == id } }
 
     private var sendRestriction: String? {
-        (thread?.agent ?? agent).sendRestriction
+        agent?.sendRestriction
     }
 
     var body: some View {
-        AlivePage(title: agent.name, line: thread?.agent.status ?? agent.via) {
+        AlivePage(title: agent?.name ?? "Agent", line: agent?.status ?? "") {
             if let error { AliveSection("Couldn’t complete the request") { Text(error).aliveRow() } }
             AliveSection("Conversation") {
                 if let thread {
@@ -71,16 +73,16 @@ private struct MobileAgentThreadView: View {
                     Text(restriction).aliveRow()
                 } else {
                     if let message { Text(message).aliveRow() }
-                    TextField("Message \(agent.name)", text: $draft, axis: .vertical).lineLimit(2...8).aliveRow()
+                    TextField("Message \(agent?.name ?? "agent")", text: $draft, axis: .vertical).lineLimit(2...8).aliveRow()
                     Button("Send") { Task { await refresh(send: true) } }.aliveRow()
-                        .disabled(busy || !pairing.isPaired || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(busy || !pairing.isPaired || agent == nil || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
             if busy { ProgressView("Waiting for Mac…").aliveRow() }
         }
         .task { await refresh() }
         .refreshable { await refresh() }
-        .onChange(of: sync.helpersSnapshot?.agents.first { $0.id == agent.id }) { _, _ in
+        .onChange(of: agent) { _, _ in
             Task { await refresh() }
         }
     }
@@ -91,7 +93,7 @@ private struct MobileAgentThreadView: View {
         let sentDraft = draft
         defer { busy = false }
         do {
-            thread = try await sync.agentThreadAction(id: agent.id, text: send ? sentDraft : nil,
+            _ = try await sync.agentThreadAction(id: id, text: send ? sentDraft : nil,
                                                      sessionID: chatStore.selectedSessionID ?? chatStore.mainSessionID)
             if send {
                 if draft == sentDraft { draft = "" }

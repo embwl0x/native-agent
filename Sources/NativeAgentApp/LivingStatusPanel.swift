@@ -6,6 +6,7 @@ import NativeAgentShared
 import PersistenceCore
 import DeviceSync
 import DreamREMCycle
+// Blueprint: | `LivingStatusPanel.swift` | `LivingStatusPanel` struct |
 
 struct LivingStatusPanel: View {
     @Environment(AppModel.self) private var appModel

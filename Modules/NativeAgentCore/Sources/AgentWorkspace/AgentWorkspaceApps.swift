@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceApps.swift` | `AgentWorkspaceApps` enum; `quickAction`, `project` |
 
 /// Views of the file, Mac and browser owners. This adapter performs no I/O,
 /// scans no prose for instructions and never interprets a page as a tool plan.
@@ -10,7 +11,7 @@ enum AgentWorkspaceApps {
         // The environment resolves this destination to the canonical workspace
         // root. A relative dot can mean a source checkout on developer installs.
         .init(id: "files", title: "Files", summary: "Browse the workspace and open its documents.", tool: "list_dir", input: ["path": .string("$workspace"), "max_entries": .int(12)], tools: ["list_dir", "read_file", "write_file"]),
-        .init(id: "create", title: "Create", summary: "Make a document, image or other artifact using available capabilities.", tool: nil, tools: ["write_file", "image_generate", "save_skill"]),
+        .init(id: "create", title: "Create", summary: "Make a document, image or other artifact using available capabilities.", tool: nil, tools: ["write_file", "image_generate"]),
     ]
 
     static let readTools: Set<String> = ["list_dir", "screen", "menu", "read", "browser.chrome_status", "browser.chrome_snapshot", "browser.read_text", "browser.read_links"]
@@ -239,7 +240,7 @@ enum AgentWorkspaceApps {
             return !projectedIDs.contains(id)
         })
         metadata["workspace_actionable_count"] = .int(Int64(items.count))
-        if object(row["rendering"] ?? .null)["readyState"] == .string("loading") {
+        if object(row["rendering"] ?? .null)["loaded"] == .bool(false) {
             metadata["workspace_state"] = .string("loading")
             metadata["workspace_detail"] = .string("This is the page observed while it is still loading. Read page again for more; opening the tab is not proof that search results or replies have finished loading.")
         }

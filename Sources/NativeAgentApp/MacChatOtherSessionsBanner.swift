@@ -1,6 +1,8 @@
 import EngineRuntime
 import SwiftUI
 
+// Blueprint: | `MacChatOtherSessionsBanner.swift` | `MacChatOtherSessionsBanner`: affordance projection and navigation to work running in other sessions |
+
 /// 658.14 — the "work is running somewhere else" banner, and the way to get to
 /// it.
 ///

@@ -1,5 +1,7 @@
 import Foundation
 import PersistenceCore
+import CryptoKit
+// Blueprint: | `ModelCatalogTTLCache.swift` | shared live fetch and TTL/backoff state machine; only the current per-path refresh with unchanged credentials commits cache/backoff; `ModelCatalogDecodeCache` memoizes each provider's decoded rows and authority stamps by canonical file path and mtime |
 
 /// Shared 24h-TTL + failed-refresh-backoff machinery for the provider model
 /// catalogs (R-M3). Moonshot and OpenRouter both maintain a bounded offline
@@ -15,7 +17,7 @@ import PersistenceCore
 ///    stamp. A dead network under one data root can no longer suppress the
 ///    refresh under another (e.g. a test's isolated root vs. the live default).
 ///  - R-L5 (b): an explicit `refresh: true` that SUCCEEDS now clears any prior
-///    failure stamp (`noteStaleRefreshSucceeded`). Previously a stale failure
+///    failure stamp at its owned commit. Previously a stale failure
 ///    stamp survived an explicit successful refresh and kept suppressing the
 ///    passive stale-path refresh until the 15-minute backoff elapsed.
 /// Where a catalog read's list actually came from (User, 2026-09-06).
@@ -179,8 +181,9 @@ struct ModelCatalogTTLCache: Sendable {
     var endpoint: URL
     /// Decode rows and authority stamps together (`nil` when absent/empty).
     var readCache: @Sendable (URL) -> DecodedModelCatalog?
+    var providerConfigFile: String
     /// Fetch the live list; throws on any failure (network/credentials).
-    var fetchLive: @Sendable (URL, URLSession) async throws -> ModelCatalogFetch
+    var fetchLive: @Sendable (String?, URLSession) async throws -> ModelCatalogFetch
 
     // R-L5 (a): backoff state keyed per cache-file path. One dict serves both
     // catalogs because the cache filenames differ per provider. S12a: the
@@ -188,6 +191,7 @@ struct ModelCatalogTTLCache: Sendable {
     // why its list is last-known.
     private static let backoffLock = NSLock()
     nonisolated(unsafe) private static var lastFailedByPath: [String: (at: Date, reason: String)] = [:]
+    nonisolated(unsafe) private static var refreshByPath: [String: UUID] = [:]
 
     private func backoffKey(_ dataRoot: URL) -> String {
         cachePath(dataRoot).standardizedFileURL.path
@@ -211,6 +215,11 @@ struct ModelCatalogTTLCache: Sendable {
     func noteStaleRefreshFailed(dataRoot: URL, reason: String = "the refresh failed", now: Date = Date()) {
         let key = backoffKey(dataRoot)
         Self.backoffLock.lock()
+        defer { Self.backoffLock.unlock() }
+        Self.noteFailureLocked(key: key, reason: reason, now: now)
+    }
+
+    private static func noteFailureLocked(key: String, reason: String, now: Date = Date()) {
         Self.lastFailedByPath[key] = (now, reason)
         // Bound the per-path dict: entries otherwise clear only on a SUCCESSFUL
         // refresh of the same path, so many transient roots (tests, secondary
@@ -221,7 +230,6 @@ struct ModelCatalogTTLCache: Sendable {
            let oldest = Self.lastFailedByPath.min(by: { $0.value.at < $1.value.at }) {
             Self.lastFailedByPath.removeValue(forKey: oldest.key)
         }
-        Self.backoffLock.unlock()
     }
 
     func noteStaleRefreshSucceeded(dataRoot: URL) {
@@ -290,9 +298,6 @@ struct ModelCatalogTTLCache: Sendable {
         }
         switch await attemptLiveRefresh(dataRoot: dataRoot, session: session) {
         case .success(let live):
-            // R-L5 (b): a successful refresh clears any stale failure stamp so
-            // the passive stale path isn't still backed off.
-            noteStaleRefreshSucceeded(dataRoot: dataRoot)
             // User, 2026-09-06: a partial page is still a live read — it is
             // labelled `liveIncomplete` rather than `cached`, which claimed
             // no network had happened. Only `.live` grants the standing to
@@ -301,7 +306,13 @@ struct ModelCatalogTTLCache: Sendable {
                 models: live.models,
                 freshness: live.isComplete ? .live : .liveIncomplete)
         case .failure(let failure):
-            noteStaleRefreshFailed(dataRoot: dataRoot, reason: failure.reason)
+            if failure.superseded {
+                // Never publish the old request's rows or its captured fallback.
+                let current = readCache(dataRoot)
+                return ModelCatalogRead(
+                    models: current?.models ?? [], freshness: current == nil ? .unavailable : .cached,
+                    failure: failure.reason, fetchedAt: current?.fetchedAt)
+            }
             guard let cached else {
                 return ModelCatalogRead(models: [], freshness: .unavailable, failure: failure.reason)
             }
@@ -319,31 +330,74 @@ struct ModelCatalogTTLCache: Sendable {
         dataRoot: URL,
         session: URLSession
     ) async -> Result<ModelCatalogFetch, FetchFailure> {
+        let key = backoffKey(dataRoot)
+        let configPath = dataRoot.appendingPathComponent("providers/\(providerConfigFile)")
+        let generation = UUID()
+        let credential: String?
         do {
-            let fetched = try await fetchLive(dataRoot, session)
-            guard !fetched.models.isEmpty else {
-                return .failure(FetchFailure("the provider returned no models"))
+            credential = try CredentialFileLock.withLock(configPath) {
+                Self.backoffLock.lock()
+                defer { Self.backoffLock.unlock() }
+                Self.refreshByPath[key] = generation
+                return LLMCredentialResolver.resolveAPIKey(providerConfigFile: providerConfigFile, dataRoot: dataRoot)
             }
+        } catch { return .failure(FetchFailure(error.localizedDescription)) }
+        let fingerprint = SHA256.hash(data: Data((credential ?? "").utf8))
+        let result: Result<ModelCatalogFetch, FetchFailure>
+        do {
+            let fetched = try await fetchLive(credential, session)
             // User, 2026-09-06: an incomplete list IS cached and stamped.
             // Withholding it meant a partial answer was re-fetched on every
             // single read — no TTL ever started — while the completeness
             // verdict no longer depends on the cached row count, so there is
             // no baseline to ratchet. What incompleteness costs is the
             // standing to prune, which lives in the freshness label.
-            writeCache(fetched.models, dataRoot: dataRoot, isComplete: fetched.isComplete)
-            return .success(fetched)
+            result = fetched.models.isEmpty
+                ? .failure(FetchFailure("the provider returned no models")) : .success(fetched)
         } catch LLMError.notConfigured {
-            return .failure(FetchFailure("no API key is saved for this provider"))
+            result = .failure(FetchFailure("no API key is saved for this provider"))
         } catch ProviderRoutingError.invalidResponse(let status) {
-            return .failure(FetchFailure("the provider answered HTTP \(status)"))
+            result = .failure(FetchFailure("the provider answered HTTP \(status)"))
         } catch {
+            result = .failure(FetchFailure(error.localizedDescription))
+        }
+        do {
+            // Credential writes share this file lock. The existing backoff
+            // lock owns refresh generations, cache publication and backoff as
+            // one step; no lock is held during the network await.
+            return try CredentialFileLock.withLock(configPath) {
+                Self.backoffLock.lock()
+                defer { Self.backoffLock.unlock() }
+                guard Self.refreshByPath[key] == generation else { return .failure(.supersededRefresh) }
+                defer { Self.refreshByPath.removeValue(forKey: key) }
+                let current = LLMCredentialResolver.resolveAPIKey(providerConfigFile: providerConfigFile, dataRoot: dataRoot)
+                guard SHA256.hash(data: Data((current ?? "").utf8)) == fingerprint else { return .failure(.supersededRefresh) }
+                switch result {
+                case .success(let fetched):
+                    writeCache(fetched.models, dataRoot: dataRoot, isComplete: fetched.isComplete)
+                    Self.lastFailedByPath.removeValue(forKey: key)
+                case .failure(let failure):
+                    Self.noteFailureLocked(key: key, reason: failure.reason)
+                }
+                return result
+            }
+        } catch {
+            Self.backoffLock.withLock {
+                if Self.refreshByPath[key] == generation { Self.refreshByPath.removeValue(forKey: key) }
+            }
             return .failure(FetchFailure(error.localizedDescription))
         }
     }
 
     struct FetchFailure: Error {
         let reason: String
+        var superseded = false
         init(_ reason: String) { self.reason = reason }
+        static var supersededRefresh: FetchFailure {
+            var failure = FetchFailure("The model refresh was superseded by a newer request or changed credentials.")
+            failure.superseded = true
+            return failure
+        }
     }
 
     /// User, 2026-09-06: the completeness verdict is PERSISTED alongside the

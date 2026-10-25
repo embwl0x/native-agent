@@ -3,17 +3,16 @@ import Observation
 import NativeAgentShared
 import PersistenceCore
 import TriggerScheduler
-import SelfImprovement
-import MCPDispatcher
+import EngineRuntime
 import MemoryV2
 import DoctorChecks
+
+// Blueprint: | `TrainingImprovementModels.swift` | `HarnessBenchmarkRun.run(dataRoot:)`: app binding of authored-tool count, embedding availability and Doctor statuses to the shared benchmark owner |
 
 extension HarnessBenchmarkRun {
     static func run(dataRoot: URL) async -> HarnessBenchmarkRun {
         await run(
-            dataRoot: dataRoot,
             authoredToolCount: { try await ToolsFacade(dataRoot: dataRoot).listAuthored().count },
-            mcpServerCount: { try await makeMCPDispatcher().listServers().count },
             embeddingRuntimeAvailable: { await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot() != nil },
             doctorStatuses: { try? await makeDoctorChecks().runAll().map(\.status) }
         )

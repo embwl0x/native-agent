@@ -1,8 +1,8 @@
 import Foundation
 import BackgroundLoops
-import ChatOrchestration
 import PersistenceCore
-import SlackConnector
+import TrustCenter
+// Blueprint: | `SlackSocketModeConfig.swift` | Socket configuration and throwing ingress/toggle readers consume TransportAllowlist's checked Slack metadata and strict string-only union; UI callers retain unavailable authority as a failure |
 
 public struct SlackSocketModeConfig: Sendable, Equatable {
     public static func parseIDs(_ raw: String) -> Set<String> {
@@ -20,8 +20,7 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
     let historyPollEnabled: Bool
     let historyPollInterval: TimeInterval
     let historyConversationRefreshInterval: TimeInterval
-    // Transport policy mirrors SecurityCenter's union of the two Slack token
-    // stores. An empty allowlist is deliberately unavailable, never open.
+    // TransportAllowlist owns the checked policy union. Empty is never open.
     let allowedChannelIds: Set<String>
     let allowedUserIds: Set<String>
     let requireMention: Bool
@@ -37,20 +36,15 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
 
     public static func loadIngressPolicy(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> SlackIngressPolicy {
-        parseIngressPolicy(tokenObjects(dataRoot: dataRoot))
+    ) throws -> SlackIngressPolicy {
+        try parseIngressPolicy(TransportAllowlist.slackPolicyObjects(dataRoot: dataRoot))
     }
 
-    private static func parseIngressPolicy(_ objects: [[String: Any]]) -> SlackIngressPolicy {
+    private static func parseIngressPolicy(_ objects: [[String: JSONValue]]) throws -> SlackIngressPolicy {
+        let allowed = try TransportAllowlist.slack(objects: objects)
         return SlackIngressPolicy(
-            allowedChannelIds: firstStringSet(
-                keys: ["allowed_channel_ids", "allowedChannelIds", "allowed_chat_ids", "allowedChatIds"],
-                in: objects
-            ),
-            allowedUserIds: firstStringSet(
-                keys: ["allowed_user_ids", "allowedUserIds"],
-                in: objects
-            ),
+            allowedChannelIds: allowed.chatIds,
+            allowedUserIds: allowed.userIds,
             requireMention: firstBool(keys: ["require_mention", "requireMention"], in: objects) ?? true,
             botUserId: firstString(keys: ["user_id", "bot_user_id", "bot_id"], in: objects)
         )
@@ -59,8 +53,14 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
     /// Nil when Slack is not connected; throws when its tokens could not be
     /// read, which is a fault, never "not connected".
     static func load(dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> SlackSocketModeConfig? {
-        let objects = tokenObjects(dataRoot: dataRoot)
-        let ingress = parseIngressPolicy(objects)
+        try SlackCredentials.withSnapshot(dataRoot: dataRoot) {
+            try loadSnapshot(dataRoot: dataRoot)
+        }
+    }
+
+    private static func loadSnapshot(dataRoot: URL) throws -> SlackSocketModeConfig? {
+        let objects = try TransportAllowlist.slackPolicyObjects(dataRoot: dataRoot)
+        let ingress = try parseIngressPolicy(objects)
         // The tokens are Keychain's (SlackCredentials); the files say the rest.
         let botToken = try SlackCredentials.read(.bot, dataRoot: dataRoot)
         let appToken = try SlackCredentials.read(.app, dataRoot: dataRoot)
@@ -102,51 +102,14 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
     private static let socketModeKeys = ["socket_mode_enabled", "inbound_enabled"]
 
     /// Switched off in the saved Slack config, whatever the tokens say.
-    static func socketModeSwitchedOff(dataRoot: URL) -> Bool {
-        firstBool(keys: socketModeKeys, in: tokenObjects(dataRoot: dataRoot)) == false
+    public static func socketModeSwitchedOff(dataRoot: URL) throws -> Bool {
+        firstBool(keys: socketModeKeys, in: try TransportAllowlist.slackPolicyObjects(dataRoot: dataRoot)) == false
     }
 
-    private static func tokenObjects(dataRoot: URL) -> [[String: Any]] {
-        let paths = [
-            dataRoot
-                .appendingPathComponent("connectors", isDirectory: true)
-                .appendingPathComponent("slack", isDirectory: true)
-                .appendingPathComponent("auth.json"),
-            dataRoot
-                .appendingPathComponent("oauth_tokens", isDirectory: true)
-                .appendingPathComponent("slack.json"),
-        ]
-        return paths.compactMap { path in
-            guard let data = try? Data(contentsOf: path),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return nil
-            }
-            return obj
-        }
-    }
-
-    private static func firstStringSet(keys: [String], in objects: [[String: Any]]) -> Set<String> {
-        // UNION across all files and aliases (2026-07-21 gpt-5.5 review):
-        // SecurityCenter's slack allowlist unions the same sources — the
-        // transport gate must not be stricter than the trust root (first-
-        // non-empty previously let one file shadow another's channels).
-        var result: Set<String> = []
+    private static func firstString(keys: [String], in objects: [[String: JSONValue]]) -> String? {
         for object in objects {
             for key in keys {
-                if let array = object[key] as? [String] {
-                    result.formUnion(array.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
-                } else if let array = object[key] as? [Any] {
-                    result.formUnion(array.compactMap { $0 as? String }.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
-                }
-            }
-        }
-        return result
-    }
-
-    private static func firstString(keys: [String], in objects: [[String: Any]]) -> String? {
-        for object in objects {
-            for key in keys {
-                guard let value = object[key] as? String else { continue }
+                guard case .string(let value)? = object[key] else { continue }
                 let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty { return trimmed }
             }
@@ -154,11 +117,14 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
         return nil
     }
 
-    private static func firstBool(keys: [String], in objects: [[String: Any]]) -> Bool? {
+    private static func firstBool(keys: [String], in objects: [[String: JSONValue]]) -> Bool? {
         for object in objects {
             for key in keys {
-                if let value = object[key] as? Bool { return value }
-                if let value = object[key] as? String {
+                if case .bool(let value)? = object[key] { return value }
+                // Preserve the saved Foundation scalar semantics of this reader.
+                if case .int(let value)? = object[key], let flag = NSNumber(value: value) as? Bool { return flag }
+                if case .double(let value)? = object[key], let flag = NSNumber(value: value) as? Bool { return flag }
+                if case .string(let value)? = object[key] {
                     switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
                     case "1", "true", "yes", "on": return true
                     case "0", "false", "no", "off": return false
@@ -170,12 +136,13 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
         return nil
     }
 
-    private static func firstDouble(keys: [String], in objects: [[String: Any]]) -> Double? {
+    private static func firstDouble(keys: [String], in objects: [[String: JSONValue]]) -> Double? {
         for object in objects {
             for key in keys {
-                if let value = object[key] as? Double { return value }
-                if let value = object[key] as? Int { return Double(value) }
-                if let value = object[key] as? String,
+                if case .bool(let value)? = object[key] { return value ? 1 : 0 }
+                if case .double(let value)? = object[key] { return value }
+                if case .int(let value)? = object[key] { return Double(value) }
+                if case .string(let value)? = object[key],
                    let parsed = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
                     return parsed
                 }

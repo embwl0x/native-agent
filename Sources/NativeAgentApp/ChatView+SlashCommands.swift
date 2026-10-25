@@ -3,11 +3,12 @@ import Foundation
 import ToolRegistry
 import SwiftUI
 import NativeAgentShared
-import ChatOrchestration
+import ChatSessionWork
 import PersistenceCore
 import Privacy
 import TurnTrace
 import Dispatcher
+// Blueprint: | `ChatView+SlashCommands.swift` | `ChatView`: `send`, `handleSlashCommand`, `dispatchSlashCommandTool` |
 
 extension ChatView {
     func send() {
@@ -69,15 +70,11 @@ extension ChatView {
                       text == message,
                       pendingAttachments == attachments
                 else { return }
-                text = ""
-                // H5: the composer's draft is view-local @State now, so clearing
-                // `text` does not clear the persisted copy automatically.
                 appModel.clearChatDraftAfterSend(
                     message,
                     sessionId: acceptedSessionId,
                     editedAt: messageEditedAt
                 )
-                draftAdoptedText = ""
                 pendingAttachments = []
                 // 2026-09-06: the composer's words have been sent, but the
                 // recognizer's transcript is cumulative and its pre-dictation
@@ -118,8 +115,6 @@ extension ChatView {
             switch route {
             case .new:
                 text = ""
-                appModel.commitChatDraft("", sessionId: appModel.activeChatSessionId)
-                draftAdoptedText = ""
                 Task { await appModel.newChatSession() }
                 return
             case .clear: clearConfirmation.request(sessionId: appModel.activeChatSessionId)
@@ -144,17 +139,13 @@ extension ChatView {
         }
         // The command was taken. Only now does the composer lose its text.
         text = ""
-        appModel.commitChatDraft("", sessionId: appModel.activeChatSessionId)
-        draftAdoptedText = ""
     }
 
     func clearSuccessfulSlashCommandDraft(_ command: String, sessionId: String, editedAt: Date) {
         guard appModel.activeChatSessionId == sessionId,
               draftSessionId == sessionId,
               text == command else { return }
-        text = ""
         appModel.clearChatDraftAfterSend(command, sessionId: sessionId, editedAt: editedAt)
-        draftAdoptedText = ""
     }
 
     @MainActor

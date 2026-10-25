@@ -5,6 +5,8 @@ import CognitiveSubstrate
 import Context
 import PersistenceCore
 
+// Blueprint: | `CognitionObservatoryView+ThoughtSeeds.swift` | Observatory thought seed/suggestion panels and bounded overflow labels |
+
 extension CognitionObservatoryView {
 
     @ViewBuilder

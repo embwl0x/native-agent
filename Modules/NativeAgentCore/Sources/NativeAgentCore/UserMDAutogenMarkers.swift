@@ -16,6 +16,8 @@
 
 import Foundation
 
+// Blueprint: | `UserMDAutogenMarkers.swift` | `UserMDAutogenMarkers`: one USER.md section marker vocabulary and shared prompt/pinned-section handling |
+
 public enum UserMDAutogenMarkers {
     /// Opens the human-edited preamble that generation must preserve.
     public static let preambleStart = "<!-- USER_PREAMBLE_START -->"
@@ -32,6 +34,21 @@ public enum UserMDAutogenMarkers {
 
     public static func promptText(_ document: String, pinnedCore: [String]?) -> String {
         guard let pinnedCore else { return document }
+        let carried = carry(document, pinnedCore: pinnedCore)
+        return ([carried.preamble].filter { !$0.isEmpty } + carried.facts.map { "- " + $0 })
+            .joined(separator: "\n\n")
+    }
+
+    /// The pinned facts `promptText` carries (same order, same cap), as their
+    /// own section for the turn's dynamic tail. The stable segment holds only
+    /// what changes when her documents change; what memory adds rides after.
+    public static func pinnedSection(_ document: String, pinnedCore: [String]?) -> String {
+        guard let pinnedCore else { return "" }
+        let facts = carry(document, pinnedCore: pinnedCore).facts
+        return facts.isEmpty ? "" : "# USER (pinned)\n" + facts.map { "- " + $0 }.joined(separator: "\n\n")
+    }
+
+    private static func carry(_ document: String, pinnedCore: [String]) -> (preamble: String, facts: [String]) {
         let preamble: String
         if let start = document.range(of: preambleStart),
            let end = document.range(of: preambleEnd, range: start.upperBound..<document.endIndex) {
@@ -43,6 +60,7 @@ public enum UserMDAutogenMarkers {
         }
         let budget = promptByteCap - "# USER\n".utf8.count
         var result = ""
+        var facts: [String] = []
         var bytes = 0
         for character in preamble.trimmingCharacters(in: .whitespacesAndNewlines) {
             let size = String(character).utf8.count
@@ -51,11 +69,11 @@ public enum UserMDAutogenMarkers {
             bytes += size
         }
         for fact in pinnedCore {
-            let line = (result.isEmpty ? "" : "\n\n") + "- " + fact
-            guard bytes + line.utf8.count <= budget else { break }
-            result += line
-            bytes += line.utf8.count
+            let size = (result.isEmpty && facts.isEmpty ? 0 : 2) + "- ".utf8.count + fact.utf8.count
+            guard bytes + size <= budget else { break }
+            facts.append(fact)
+            bytes += size
         }
-        return result
+        return (result, facts)
     }
 }

@@ -30,7 +30,9 @@
 // the timing above and nothing else; no prompt ever reads them. Absence only
 // ever makes a moment considerate; it never makes a candidate.
 
-import ChatOrchestration
+import ChatTurnRuntime
+import AgentWorkspace
+import AgentConversations
 import CognitiveSubstrate
 import Desk
 import Foundation
@@ -39,6 +41,8 @@ import PersistenceCore
 import PersonaEngine
 import Transcripts
 import TurnTrace
+
+// Blueprint: | `NativeCognitionRuntime+Reach.swift` | `ReachLedger` and runtime reach: one considerate initiative path, durable offer/answer accounting and exact delivery deadlines |
 
 /// One thing worth sharing, and why.
 struct ReachCandidate: Sendable, Equatable {
@@ -156,7 +160,7 @@ struct ReachLedger: Codable, Equatable {
             "callbacks_repeated": .int(Int64(subjects.values.filter { $0 > 1 }.count)),
         ]
         if let lastUserTurn { out["last_user_turn"] = .double(lastUserTurn.timeIntervalSince1970) }
-        if let last = offers.compactMap(\.sentAt).max() { out["last_outreach"] = .double(last.timeIntervalSince1970) }
+        if let last = offers.filter(\.isSent).compactMap(\.sentAt).max() { out["last_outreach"] = .double(last.timeIntervalSince1970) }
         return out
     }
 }
@@ -263,6 +267,7 @@ enum Reach {
     static func decide(_ c: ReachCandidate, timing t: Timing, ledger: ReachLedger, rejectedSources: [String]) -> Verdict {
         let gate = timing(t, ledger: ledger)
         guard gate == .offer else { return gate }
+        if case .plan = c.kind, c.at > t.now { return .stale }
         if rejectedSources.contains(where: { c.subject == $0 || c.subject.hasPrefix($0 + ":") }) { return .rejected }
         if ledger.offers.contains(where: {
             $0.subject == c.subject && $0.outcome != "withheld" && t.now.timeIntervalSince($0.offeredAt) < subjectCooldown
@@ -312,28 +317,8 @@ enum Reach {
     }
 }
 
-/// Single flight and the disk-read interval. Memory only: the facts that
+/// Runtime-owned single flight and source-read limits. Memory only: the facts that
 /// must survive a restart are in the ledger.
-private actor ReachGate {
-    static let shared = ReachGate()
-    private var inFlight = false
-    private var lastScan: Date?
-
-    func begin(_ body: @escaping @Sendable () async -> Void) {
-        guard !inFlight else { return }
-        inFlight = true
-        Task { await body(); self.finish() }
-    }
-
-    private func finish() { inFlight = false }
-
-    func claimScan(at now: Date) -> Bool {
-        if let lastScan, now.timeIntervalSince(lastScan) < Reach.scanInterval { return false }
-        lastScan = now
-        return true
-    }
-}
-
 extension NativeCognitionRuntime {
 
     func withdrawReachIfDisabled() {
@@ -351,9 +336,18 @@ extension NativeCognitionRuntime {
     /// Rides `rescheduleResidualRepairDeadline`, where the shoulder tap rode:
     /// no timer, no loop, no budget of its own.
     func considerReach() {
-        guard reachEnabled else { return }
-        let runtime = self
-        Task { await ReachGate.shared.begin { await runtime.runReachPass() } }
+        guard !isFlushedForTermination, sourceWakes.reachReady, reachEnabled, reachTask == nil else { return }
+        if let due = sourceWakes.reachNextAt, due <= now() { sourceWakes.reachDirty = true }
+        guard sourceWakes.reachDirty else { return }
+        reachTask = Task {
+            await self.runReachPass()
+            await self.finishReachPass()
+        }
+    }
+
+    private func finishReachPass() async {
+        reachTask = nil
+        await rescheduleResidualRepairDeadline()
     }
 
     /// Claude's worklog is read only when `withClaude` is asked for.
@@ -373,11 +367,14 @@ extension NativeCognitionRuntime {
             return
         }
         let instant = now()
+        sourceWakes.reachDirty = false
+        sourceWakes.reachNextAt = nil
         var timing = await reachTiming(at: instant)
         // Each read-modify-write of the ledger below is one synchronous
         // segment on this actor: no await between the read and the write, so
         // a delivery's `sending` row can never be overwritten by a stale copy.
         guard var ledger = ReachLedger.read(dataRoot) else { return }
+        projectReachDeadline(timing: timing, ledger: ledger, candidates: [])
         var changed = ledger.settleAnswers(lastUserTurn: timing.lastUserTurn, now: instant)
         // An offer still waiting for her wake whose moment has passed (he came
         // back, quiet hours began) is taken back before it costs a turn.
@@ -387,14 +384,19 @@ extension NativeCognitionRuntime {
             changed = true
         }
         if changed { ledger.write(dataRoot) }
-        guard Reach.timing(timing, ledger: ledger) == .offer,
-              await ReachGate.shared.claimScan(at: instant) else { return }
+        guard Reach.timing(timing, ledger: ledger) == .offer else { return }
+        if let last = sourceWakes.reachLastScanAt, instant.timeIntervalSince(last) < Reach.scanInterval {
+            sourceWakes.reachNextAt = last.addingTimeInterval(Reach.scanInterval)
+            return
+        }
+        sourceWakes.reachLastScanAt = instant
         timing = await reachTiming(at: instant, withClaude: true)
         let rejected = await substrate.associationSuppressionSnapshot().map(\.source)
         let candidates = await reachCandidates(at: instant)
+        projectReachDeadline(timing: timing, ledger: ledger, candidates: candidates)
         guard candidates.contains(where: {
             Reach.decide($0, timing: timing, ledger: ledger, rejectedSources: rejected) == .offer
-        }), case .allowed = await backgroundCognitionGate(reason: "reach_out") else { return }
+        }) else { return }
         guard reachEnabled else {
             withdrawReachIfDisabled()
             return
@@ -419,6 +421,57 @@ extension NativeCognitionRuntime {
             "source": .string(pick.source), "why": .string(pick.why),
             "counters": .object(ledger.counters(lastUserTurn: timing.lastUserTurn, now: instant)),
         ]))
+    }
+
+    private func projectReachDeadline(timing: Reach.Timing, ledger: ReachLedger, candidates: [ReachCandidate]) {
+        let at = timing.now
+        let relevant = candidates.filter { candidate in
+            let life: TimeInterval = if case .plan = candidate.kind { 86_400 } else { Reach.freshness }
+            return candidate.at.addingTimeInterval(life) >= at
+        }
+        let plans = pursuitCandidates.filter { !$0.status.isTerminal && $0.origin == .owner }
+            .compactMap { $0.deferUntil.flatMap(DeskSequencing.parseDeferStamp) }.filter { $0 > at.addingTimeInterval(-86_400) }
+        let deferred = plans.filter { $0 > at }
+        var boundaries = deferred + relevant.flatMap { candidate -> [Date] in
+            let life: TimeInterval = if case .plan = candidate.kind { 86_400 } else { Reach.freshness }
+            return [candidate.at, Self.afterInclusiveBoundary(candidate.at.addingTimeInterval(life))]
+        }
+        boundaries += ledger.offers.flatMap { offer in
+            [offer.offeredAt.addingTimeInterval(Reach.subjectCooldown)] + (offer.sentAt.map {
+                [$0.addingTimeInterval(Reach.minimumSpacing), Self.afterInclusiveBoundary($0.addingTimeInterval(Reach.answerWindow))]
+            } ?? [])
+        }
+        let pending = ledger.offers.contains { $0.outcome == "offered" || ($0.outcome == "sent" && $0.sentAt.map { $0.addingTimeInterval(Reach.answerWindow) >= at } == true) }
+        let current = relevant.contains { $0.at <= at } || plans.contains { $0 <= at }
+        if pending || current {
+            if let last = timing.lastUserTurn { boundaries.append(last.addingTimeInterval(Reach.activeWindow)) }
+            if let last = timing.lastClaude { boundaries.append(last.addingTimeInterval(Reach.activeWindow)) }
+            if let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: at)) { boundaries.append(nextDay) }
+            if let quiet = TurnQuietHoursWindow.read(dataRoot: dataRoot) {
+                for hour in [quiet.startHour, quiet.endHour] {
+                    if let next = Calendar.current.nextDate(after: at, matching: DateComponents(hour: hour, minute: 0, second: 0), matchingPolicy: .nextTime) { boundaries.append(next) }
+                }
+            }
+        }
+        // A timing gate can defer the candidate read itself. Its eligibility
+        // boundary must survive even when no candidates have been read yet.
+        let timingBoundary: Date? = switch Reach.timing(timing, ledger: ledger) {
+        case .quietHours:
+            TurnQuietHoursWindow.read(dataRoot: dataRoot)?.end(after: at)
+        case .userActive:
+            timing.lastUserTurn?.addingTimeInterval(Reach.activeWindow)
+        case .withClaude:
+            timing.lastClaude?.addingTimeInterval(Reach.activeWindow)
+        case .dailyCap:
+            timing.calendar.date(byAdding: .day, value: 1, to: timing.calendar.startOfDay(for: at))
+        case .spacing:
+            ledger.offers.filter(\.mayHaveReachedHim).compactMap(\.sentAt).max()?.addingTimeInterval(Reach.minimumSpacing)
+        case .offer, .awaitingUser, .subjectCooldown, .alreadySeen, .rejected, .stale:
+            nil
+        }
+        let sourceBoundary = (pending || !relevant.isEmpty || !plans.isEmpty)
+            ? boundaries.filter { $0 > at }.min() : nil
+        sourceWakes.reachNextAt = [sourceBoundary, timingBoundary].compactMap { $0 }.filter { $0 > at }.min()
     }
 
     /// Her wake answered. A pass, or a gate that no longer holds, sends
@@ -548,7 +601,7 @@ extension NativeCognitionRuntime {
                 guard Reach.deskProvenanceTrusted(item, trusts: { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) }),
                       let raw = item.deferUntil?.trimmingCharacters(in: .whitespacesAndNewlines),
                       let until = DeskSequencing.parseDeferStamp(raw),
-                      until <= instant, instant.timeIntervalSince(until) <= 86_400 else { continue }
+                      instant.timeIntervalSince(until) <= 86_400 else { continue }
                 out.append(ReachCandidate(
                     kind: .plan, subject: "desk:\(item.handle)", source: "\(person)'s Desk (item \(item.alias))",
                     why: "something \(person) said you might do, and it has come due",

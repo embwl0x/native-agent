@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TelegramPollLoop+QueuedTurnControls.swift` | `TelegramPollLoop`: `handleQueuedTurnControlCallback` |
 
 extension TelegramPollLoop {
     func handleQueuedTurnControlCallback(
@@ -35,7 +36,7 @@ extension TelegramPollLoop {
         switch parsed.action {
         case .remove:
             do {
-                let completed = try await TelegramUpdateInbox(offsetURL: offsetURL).transition(
+                let completed = try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).transition(
                     updateId: parsed.updateId,
                     from: [.queued],
                     to: .completed

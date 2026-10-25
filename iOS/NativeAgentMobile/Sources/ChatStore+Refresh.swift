@@ -3,150 +3,24 @@ import UIKit
 import NativeAgentShared
 
 extension ChatStore {
-    // MARK: - Foreground history refresh (PATCH-2026-05-11: foreground-refresh)
-
-    /// Timestamp of the last successful (or in-progress) refresh attempt.
-    /// Used as a throttle guard — skips if a refresh happened within 2 seconds.
-
-    /// Throttle interval (seconds). Refreshes closer together than this are skipped.
-
-    /// Pull the full chat transcript from the iCloud snapshot and merge it into local state.
-    /// - Best-effort: errors and nil returns are silently ignored.
-    /// - Throttled: no-ops if called again within `refreshThrottleSeconds`.
-    /// - Merge: snapshot is authoritative; in-flight optimistic messages (isStreaming or
-    ///   the last user message with no paired assistant reply yet during an active send)
-    ///   are kept visible until the snapshot contains the equivalent user turn.
-    func refresh(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {
+    /// Snapshot ingestion owns versions and reconciliation before any surface reads it.
+    func refresh(using client: MacBridgeClient) {
         guard Date().timeIntervalSince(lastRefreshAt) >= refreshThrottleSeconds else { return }
         lastRefreshAt = Date()
         let requestedSessionID = Self.cleanSessionID(selectedSessionID ?? mainSessionID)
         Task { @MainActor [weak self] in
             guard let self else { return }
             let read = await client.readChatTranscript(sessionID: requestedSessionID)
-            guard read != .unavailable else {
-                guard Self.cleanSessionID(self.selectedSessionID ?? self.mainSessionID) == requestedSessionID else {
-                    return
-                }
-                if self.messages.isEmpty, let fallbackMessages, !fallbackMessages.isEmpty {
-                    self.messages = fallbackMessages
-                }
-                return
-            }
             self.applyMacTranscriptRead(read, sessionID: requestedSessionID)
         }
     }
 
-    /// 2026-09-06: same merge owner, now told whether an empty transcript is
-    /// the Mac's statement about this session or merely nothing to read.
     func applyMacTranscriptRead(_ read: MacTranscriptRead, sessionID: String?) {
-        let requestedSessionID = Self.cleanSessionID(sessionID)
-        guard sessionCacheLoadTask == nil,
-              requestedSessionID == Self.cleanSessionID(selectedSessionID ?? mainSessionID),
-              case .published(let macMessages, let generation) = read else { return }
-        guard !macMessages.isEmpty else {
-            applyAuthoritativeEmptyTranscript(generation: generation, sessionID: requestedSessionID)
-            return
-        }
-        // 2026-09-06: a non-empty snapshot BUILT BEFORE the watermark is stale,
-        // and applying it resurrects exactly the rows a newer empty just
-        // cleared — permanently, because the Mac has no reason to publish that
-        // session again. The empty path already refuses an older generation;
-        // this is the same rule for the rows. A snapshot with no generation
-        // (legacy publisher) proves nothing either way and still applies.
-        if let generation, let requestedSessionID,
-           let applied = appliedTranscriptGenerations[requestedSessionID],
-           generation < applied {
-            return
-        }
-        let generationAdvanced = noteAppliedTranscriptGeneration(generation, for: requestedSessionID)
-        noteMacPublishedMessageIDs(macMessages)
-
-        // Preserve any in-flight optimistic messages (streaming placeholder +
-        // the user message that triggered it) so an external completion cannot
-        // clobber the local stream.
-        if resolvePendingReplyFromMac(macMessages) {
-            return
-        }
-
-        let merged = mergedMacMessagesPreservingPending(macMessages)
-        guard merged != messages else {
-            // 2026-09-06: the rows did not change but the watermark did, and
-            // the watermark only reaches disk through persistMessages. Without
-            // this the relaunched app restores the OLDER generation, and a
-            // delayed empty N+1 built before this publication then looks newer
-            // than everything and wipes real rows.
-            if generationAdvanced { persistMessages() }
-            return
-        }
-        messages = merged
-    }
-
-    /// 2026-09-06: the Mac says this session's transcript is empty. Acting on
-    /// that word is the point — a chat cleared on the Mac has to clear here —
-    /// but a wrongly-applied empty destroys a real conversation, so it counts
-    /// only for the visible session and only when its transcript version is
-    /// strictly greater than the last one applied for that session. A version
-    /// the Mac never wrote (nil) proves nothing and clears nothing. Rows the
-    /// pending machinery still owns (an in-flight user message and its
-    /// streaming placeholder) were never in the Mac's transcript to begin with
-    /// and stay. Returns whether the empty was applied.
-    @discardableResult
-    func applyAuthoritativeEmptyTranscript(generation: Int?, sessionID: String?) -> Bool {
-        guard noteAppliedTranscriptGeneration(generation, for: sessionID) else { return false }
-        noteMacPublishedMessageIDs([])
-        let pendingPlaceholderIDs = Set(pendingICloudPlaceholders.values)
-        let pendingUserIDs = Set(pendingSendArgs.values.compactMap(\.appendedUserId))
-        let retainedIDs = retainedSendMessageIDs
-        let kept = messages.filter {
-            $0.isStreaming || $0.awaitingMacTranscript || pendingPlaceholderIDs.contains($0.id) || pendingUserIDs.contains($0.id) || retainedIDs.contains($0.id)
-        }
-        guard kept != messages else {
-            // Nothing to remove, but the watermark moved — persist it so the
-            // relaunched app still refuses an older empty.
-            persistMessages()
-            return true
-        }
-        messages = kept
-        return true
-    }
-
-    /// Record the version of a transcript actually adopted, so a later empty
-    /// read built BEFORE it cannot claim to be newer. Persisted with the rows.
-    /// Returns whether the watermark actually moved, so a caller that changes
-    /// nothing else still knows it owes the cache a write.
-    @discardableResult
-    func noteAppliedTranscriptGeneration(_ generation: Int?, for sessionID: String?) -> Bool {
-        guard let sessionID, let generation else { return false }
-        if let applied = appliedTranscriptGenerations[sessionID], generation <= applied { return false }
-        appliedTranscriptGenerations[sessionID] = generation
-        return true
-    }
-
-    /// 2026-09-06: remember exactly which ids the newest Mac snapshot carries.
-    /// Replaced, not accumulated: the snapshot is a suffix window and the only
-    /// consumer (regenerate) names the transcript tail.
-    func noteMacPublishedMessageIDs(_ macMessages: [ChatMessage]) {
-        macPublishedMessageIDs = Set(macMessages.map(\.id))
-    }
-
-    nonisolated static func cachedTranscriptRows(_ rows: [ChatMessage]) -> [ChatMessage] {
-        let settled = rows.filter { !$0.isStreaming }
-        let recentIDs = Set(settled.suffix(200).map(\.id))
-        // The ordinary cache cap cannot discard a receipt awaiting publication.
-        return settled.filter { $0.awaitingMacTranscript || recentIDs.contains($0.id) }
-    }
-
-    func persistMessages() {
-        guard !suppressMessagePersistence else { return }
-        let ownerSessionID = Self.cleanSessionID(selectedSessionID ?? mainSessionID)
-        let rows = messages
-        let generation = ownerSessionID.flatMap { appliedTranscriptGenerations[$0] }
-        storage.save(key: transcriptStorageKey(for: ownerSessionID), value: {
-            return CachedTranscript(schemaVersion: 2, sessionID: ownerSessionID,
-                messages: Self.cachedTranscriptRows(rows),
-                appliedTranscriptGeneration: generation)
-        }) { [weak self] error in
-            Task { @MainActor in self?.errorBanner = "Chat could not be saved: \(error.localizedDescription)" }
-        }
+        guard Self.cleanSessionID(sessionID) == Self.cleanSessionID(selectedSessionID ?? mainSessionID),
+              case .published(let rows, _) = read else { return }
+        for run in liveTurnBubbles.keys where rows.contains(where: {
+            $0.runId == run && ($0.isTerminalReply || $0.completionState == "failed")
+        }) { liveTurnBubbles.removeValue(forKey: run) }
+        _ = resolvePendingReplyFromMac(rows)
     }
 }

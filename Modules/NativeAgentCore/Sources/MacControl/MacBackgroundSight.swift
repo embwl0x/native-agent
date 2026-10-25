@@ -4,6 +4,8 @@
 
 import Foundation
 
+// Blueprint: | `MacBackgroundSight.swift` | `MacBackgroundSight.resolve`: pure running-app matching without activation; missing, ambiguous and self targets remain distinct |
+
 public enum MacBackgroundSight {
     /// What naming an app resolved to. Every non-match is its own case because
     /// they lead to different next moves: launch it, disambiguate, or stop.

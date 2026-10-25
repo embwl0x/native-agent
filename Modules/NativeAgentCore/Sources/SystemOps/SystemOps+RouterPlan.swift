@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 
+// Blueprint: | `SystemOps+RouterPlan.swift` | `SwiftNativeRouterPlanClient`: context capability route selection and policy projection for proposed next actions |
+
 // MARK: - SwiftNative — RouterPlan
 
 public struct SwiftNativeRouterPlanClient: Sendable {
@@ -51,33 +53,6 @@ public struct SwiftNativeRouterPlanClient: Sendable {
             "documentation",
         ])
 
-        // FIX 2 / B1.2: connector-target detection. A github (or other
-        // connector) -shaped request was falling through to `chat`/`minimal`,
-        // so the plan surfaced no connector capabilities and — worse — a
-        // MUTATING connector action inherited the chat default of risk=low with
-        // no approval hint. Route these to a `connector` goal on a `capability`
-        // context (the capability matcher surfaces connector_action records in
-        // that mode), and below give mutations their real risk tier. This is a
-        // routing HINT only — TrustCenter already gates github_mutate as
-        // `confirm`; SecurityCenter/TrustCenter are untouched. Detection is
-        // deliberately conservative (bare "github"/"gh" token or the exact
-        // "pull request" phrase) so ordinary local-git and build turns keep
-        // their existing routes.
-        let connectorTargetRequest = tokens.contains("github") ||
-            // keywordTokens drops words under three characters, so "gh" is
-            // matched on the lowercased text at a word boundary (2026-09-07).
-            lower.range(of: #"\bgh\b"#, options: .regularExpression) != nil ||
-            lower.contains("pull request") ||
-            lower.contains("pull-request")
-        // Mutating connector verbs. "open"/"request"/"update" are deliberately
-        // OMITTED — they collide with read phrasings ("open PRs", "the pull
-        // request"), and under-tagging a mutation as read is a safer miss than
-        // over-tagging a read as a high-risk mutation (the plan caveat below).
-        let connectorMutateRequest = connectorTargetRequest && !tokens.isDisjoint(with: [
-            "create", "merge", "close", "comment", "approve", "reopen",
-            "delete", "edit", "assign", "label", "push", "rename",
-        ])
-
         if !tokens.isDisjoint(with: ["approve", "approval", "deny", "permission", "gate"]) {
             goalType = "approval"
         } else if !tokens.isDisjoint(with: ["telegram", "bot", "group", "chatid", "slash"]) {
@@ -94,12 +69,6 @@ public struct SwiftNativeRouterPlanClient: Sendable {
         } else if !tokens.isDisjoint(with: ["control", "mac", "shortcut", "spotlight", "window", "screen", "file", "folder"]) &&
                   (tokens.contains("mac") || tokens.contains("shortcut") || tokens.contains("spotlight") || tokens.contains("screen")) {
             goalType = "mac_control"
-        } else if connectorTargetRequest {
-            // Ahead of research so "search github issues" routes to the connector
-            // (github.search) rather than the web research lab. A bare github URL
-            // carries no standalone "github" token, so it still falls to research
-            // via webAddressRequest below.
-            goalType = "connector"
         } else if webAddressRequest || !tokens.isDisjoint(with: ["research", "search", "source", "find", "web"]) {
             goalType = "research"
         } else if !tokens.isDisjoint(with: ["workflow", "automate", "steps", "repeat"]) {
@@ -137,7 +106,6 @@ public struct SwiftNativeRouterPlanClient: Sendable {
             case "self_improvement": return "ops"
             case "personality": return "personality"
             case "file_work": return "capability"
-            case "connector": return "capability"
             case "chat": return "minimal"
             default: return "capability"
             }
@@ -160,10 +128,6 @@ public struct SwiftNativeRouterPlanClient: Sendable {
         case "mac_control":
             risk = "medium"; requiresApproval = true
         case "approval":
-            risk = "low"; requiresApproval = false
-        case "connector":
-            // Read-only connector actions (list/get/status/search) are low risk;
-            // a mutation override below raises writes to their real tier.
             risk = "low"; requiresApproval = false
         default:
             break
@@ -188,14 +152,6 @@ public struct SwiftNativeRouterPlanClient: Sendable {
             risk = "high"
             requiresApproval = true
         }
-        // FIX 2 / B1.2(b): a MUTATING connector action (merge/close/comment/…)
-        // carries a real write risk tier and an approval hint — it must not
-        // inherit the connector read default of risk=low/no-approval. Mirrors
-        // the communication/calendar-mutation override above.
-        if connectorMutateRequest {
-            risk = "high"
-            requiresApproval = true
-        }
 
         let recommendedSurface: String = {
             switch goalType {
@@ -209,7 +165,6 @@ public struct SwiftNativeRouterPlanClient: Sendable {
             case "memory_update": return "memories"
             case "mac_control": return "mac_control"
             case "build_task": return "chat"
-            case "connector": return "chat"
             default: return "chat"
             }
         }()
@@ -266,8 +221,6 @@ public struct SwiftNativeRouterPlanClient: Sendable {
             return ["Check Telegram config and allowed chat IDs", "Use local transcription for voice", "Record Telegram receipt"]
         case "self_improvement":
             return ["Review weekly self-improvement digest", "Review runtime proposals in Desk", "Apply an approved runtime change"]
-        case "connector":
-            return ["Confirm the connector is authorized", "Read current state first (list/get/status)", "Record a connector receipt for any action"]
         default:
             if hasMatch {
                 return ["Load matched capability only for this turn", "Record usage metadata"]

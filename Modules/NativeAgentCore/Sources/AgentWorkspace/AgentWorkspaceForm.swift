@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceForm.swift` | `AgentWorkspaceForm` struct; `readingHelperSettings`, `withSchemaIssue` |
 
 /// A form for one currently advertised owner schema. Bound target fields are
 /// supplied by the selected card and cannot be replaced by form values.
@@ -373,7 +374,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
     /// Explicit input owners only. Generic capability forms, browser page snapshots,
     /// credentials and approval/connection payloads deliberately stay resident.
     var canPersist: Bool {
-        let allowed: Set<String> = ["write_file", "save_skill", "commit_memory", "recall_memory", "mail_search",
+        let allowed: Set<String> = ["write_file", "commit_memory", "recall_memory", "mail_search",
             "desk_note", "desk_update_item", "desk_set_status", "desk_add_ref", "desk_add_item",
             "mail_send", "mail_reply", "messages_send", "chat_reply", "agent_message",
             "mac_calendar_create_event", "mac_reminders_create", "mac_reminders_query", "mac_reminders_update", "image_generate", "bot_create", "bot_update"]

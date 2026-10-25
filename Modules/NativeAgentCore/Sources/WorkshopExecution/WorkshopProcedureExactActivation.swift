@@ -4,6 +4,8 @@ import NativeAgentCore
 import PersistenceCore
 import Procedures
 
+// Blueprint: | `WorkshopProcedureExactActivation.swift` | `WorkshopProcedureExactActivationQualifier` and coordinator: event-driven qualification from immutable terminal evidence and exact procedure ledger identity |
+
 /// Event-driven qualification of the one native procedure implementation that
 /// currently exists. It reads canonical Workshop records plus the existing
 /// procedure ledger only after terminal evidence; it owns no timer, candidate
@@ -278,12 +280,12 @@ public enum WorkshopProcedureExactActivationCoordinator {
     }
 }
 
-/// One-time launch repair for the v1 → v2 procedure identity bump. Each
-/// original-v1 artifact is recompiled from exactly what it was reviewed on —
-/// its source Workshop runs and the owner's approved review card — and handed
-/// to the store's revalidation, which compares every field. Nothing is
-/// activated, approved, or rewritten here; an artifact that cannot be
-/// reproduced stays off, and the returned line says why.
+/// One-time launch revalidation of original-v1 artifacts against exact Workshop
+/// trajectories and approved review; the store compares every field. No artifact
+/// is activated, approved or rewritten. Unreproducible artifacts stay off with reasons.
+/// Owns migrations/legacy-revalidation-v1.done: UTF-8 refusal lines, existence-read.
+/// Off-disk backup carries this marker; local backup, export and phone sync do not.
+/// PrivacyMap lists it at living_fabric/procedures/migrations.
 public enum WorkshopProcedureLegacyRevalidation {
     public static func runIfNeeded(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -302,7 +304,7 @@ public enum WorkshopProcedureLegacyRevalidation {
             if let reason = outcome.refusal {
                 refusals.append(
                     "A procedure approved \(artifact.reviewerDecision.decidedAt.prefix(10)) stays off: "
-                        + "\(reason). Agent does that task the ordinary way instead "
+                        + "\(reason). The agent does that task the ordinary way instead "
                         + "(artifact \(artifact.id.prefix(12)))."
                 )
             }

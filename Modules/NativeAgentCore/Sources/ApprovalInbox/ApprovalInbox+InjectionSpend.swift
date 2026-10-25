@@ -1,8 +1,11 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ApprovalInbox+InjectionSpend.swift` | `SwiftNativeApprovalInbox`: `consumeInjectionApproval`, `loadSpends` |
 
 // MARK: - Durable single-use spend for injection approvals
+// The versioned spend object is locally backed up and exported, never phone
+// synced, and inventoried under PrivacyMap's Approvals category.
 
 /// Outcome of a durable spend attempt.
 ///

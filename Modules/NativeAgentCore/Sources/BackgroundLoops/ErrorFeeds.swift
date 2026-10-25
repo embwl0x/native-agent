@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `ErrorFeeds.swift` | `ErrorFeeds`: shared live error-feed inventory and bounded recent-burst scans for heartbeat and weekly improvement |
+
 /// The live error sinks the heartbeat and the weekly self-improvement pass
 /// read. A burst across them is `errorBurstThreshold` rows inside
 /// `errorBurstWindow`.
@@ -12,11 +14,9 @@ public enum ErrorFeeds {
     /// The recency window for the burst count, short enough that the count
     /// reflects a CURRENT cluster, not errors the feeds retain for days.
     public static let errorBurstWindow: TimeInterval = 10 * 60
-    /// A watched feed with no write in this long carries NO signal. It is not
-    /// evidence of health: `logs/errors.jsonl` reported "0 recent errors … ok"
-    /// for three months after its only writer (the retired Python daemon) went
-    /// away. 7 days is longer than any real quiet stretch on a live sink and
-    /// short enough to catch a writer that silently stopped.
+    /// A watched live feed with no write in this long carries no current signal,
+    /// rather than evidence of health. Seven days catches a silent writer
+    /// without treating an ordinary quiet stretch as failure.
     public static let feedSilentAfter: TimeInterval = 7 * 24 * 60 * 60
 
     // MARK: - Watched error feeds
@@ -40,19 +40,11 @@ public enum ErrorFeeds {
         }
     }
 
-    /// The error sinks the heartbeat watches.
-    ///
-    /// `logs/errors.jsonl` used to be the ONLY one, and it has had no Swift
-    /// writer since the Python daemon was retired — last row 2026-06-02, while
-    /// thirteen readers kept treating its emptiness as health. The live sinks
-    /// are the surface error feeds and the background-loop failure receipts.
-    /// The dead file stays listed so a returning writer is still seen, but the
-    /// `feedSilentAfter` guard now reports it as "no signal", never "clean".
+    /// Live surface error feeds and background-loop failure receipts.
     public static let errorFeeds: [ErrorFeed] = [
         ErrorFeed(label: "telegram", relativePath: "telegram/errors.jsonl"),
         ErrorFeed(label: "slack", relativePath: "slack/errors.jsonl"),
         ErrorFeed(label: "loops", relativePath: "logs/background_loop_failures.jsonl"),
-        ErrorFeed(label: "legacy", relativePath: "logs/errors.jsonl"),
     ]
 
     /// Bounded recent evidence from one watched feed.

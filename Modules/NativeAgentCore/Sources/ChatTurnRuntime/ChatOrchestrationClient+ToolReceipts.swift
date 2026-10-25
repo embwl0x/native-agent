@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
+// Blueprint: | `ChatOrchestrationClient+ToolReceipts.swift` | `SwiftNativeChatOrchestrationClient`: `persistToolReceipt` |
 
 /// One tool receipt on its way to the transcript, fully redacted at the
 /// point of production so the writer can drain the queue off the dispatch

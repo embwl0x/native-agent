@@ -1,6 +1,8 @@
 import Foundation
 import SwiftUI
 
+// Blueprint: | `SystemToastBar.swift` | `SystemToastCenter` and notice lane: replace-by-ID notices, owned auto-dismiss tasks and room-scoped positioning |
+
 @MainActor
 public struct SystemToast: Identifiable, Sendable, Equatable {
     public let id: UUID

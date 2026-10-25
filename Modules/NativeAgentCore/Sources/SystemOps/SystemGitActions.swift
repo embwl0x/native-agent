@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `SystemGitActions.swift` | `SystemGitActions` enum; `processDetail` |
 
 /// Process receipt formatting; the host executes the process.
 public enum SystemGitActions {

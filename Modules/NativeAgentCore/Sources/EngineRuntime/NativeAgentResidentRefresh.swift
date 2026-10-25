@@ -4,6 +4,8 @@ import ContextFlow
 import Onboarding
 import PersonaEngine
 
+// Blueprint: | `NativeAgentResidentRefresh.swift` | `NativeAgentEngine` onboarding/resident refresh: profile transitions defer mind/context reload until admitted turns drain |
+
 public extension NativeAgentEngine {
     @MainActor
     func bindResidentPresentation(
@@ -21,7 +23,11 @@ public extension NativeAgentEngine {
             guard #available(macOS 27, *) else { return }
             Task { await publishWorkStatus() }
         }
-        trust.policyDidChange = policyChanged
+        macIntegration.observePermissionChanges()
+        trust.policyDidChange = { [macIntegration] in
+            policyChanged()
+            Task { await macIntegration.refresh() }
+        }
         memory.proposalsDidChange = memoryProposalsChanged
     }
 

@@ -13,12 +13,13 @@ import ProviderRouting
 import SlackBot
 import TelegramBot
 import TrustCenter
-import MCPDispatcher
+
+// Blueprint: | `AppQuietLowerOnly.swift` | `AppQuietSettingsHost` and `AppQuietToolHost`: app connector/permission command bindings with Full Mac ownership limits and visible decisions |
 
 extension AppQuietSettingsHost {
     var statusForAgent: String { appModel.statusForAgent }
-    var activityCaptureEnabled: Bool { ActivityWatchController.shared.policy.captureEnabled }
-    var activityModelAccessEnabled: Bool { ActivityWatchController.shared.policy.allowModelAccess }
+    var activityCaptureEnabled: Bool { appModel.engine.activityWatch.policy.captureEnabled }
+    var activityModelAccessEnabled: Bool { appModel.engine.activityWatch.policy.allowModelAccess }
     var restartQuietTelegram: @Sendable () async -> Void {
         { [loops = appModel.backgroundLoopsManager] in _ = await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: loops) }
     }
@@ -27,8 +28,8 @@ extension AppQuietSettingsHost {
     }
     func saveChromeControlEnabled(_ enabled: Bool) async { await appModel.saveChromeControlEnabled(enabled) }
     func saveKillSwitchEnabled(_ enabled: Bool) async -> Bool { await appModel.saveKillSwitchEnabled(enabled) }
-    func setActivityCaptureEnabled(_ enabled: Bool) async { await ActivityWatchController.shared.setCaptureEnabled(enabled) }
-    func setActivityModelAccessEnabled(_ enabled: Bool) async { await ActivityWatchController.shared.setModelAccessEnabled(enabled) }
+    func setActivityCaptureEnabled(_ enabled: Bool) async { await appModel.engine.activityWatch.setCaptureEnabled(enabled) }
+    func setActivityModelAccessEnabled(_ enabled: Bool) async { await appModel.engine.activityWatch.setModelAccessEnabled(enabled) }
     func configureQuietTelegram(chats: [String], users: [String], mention: Bool, enabled: Bool) async throws {
         try await appModel.engine.telegram.configureTelegram(
             token: "", allowedChatIds: chats, allowedUserIds: users, requireMention: mention,
@@ -36,12 +37,12 @@ extension AppQuietSettingsHost {
     }
     func refreshQuietTelegram() async { _ = await appModel.refreshTelegram() }
     func slackIsEnabled() async -> Bool {
-        (try? await ConnectorStatusProjection.readConnectorRecords(root: appModel.engine.dataRoot, platform: AppConnectorStatusPlatform()))?
+        (try? await appModel.engine.connectors.refresh().get())?
             .first(where: { $0.id == "slack" })?.enabled == true
     }
     func refreshQuietConnectors() async { _ = await appModel.refreshForSidebarItem(.connectors) }
-    func slackIngressPolicy(dataRoot: URL) -> (allowedChannelIds: Set<String>, allowedUserIds: Set<String>, requireMention: Bool) {
-        let policy = SlackSocketModeConfig.loadIngressPolicy(dataRoot: dataRoot)
+    func slackIngressPolicy(dataRoot: URL) throws -> (allowedChannelIds: Set<String>, allowedUserIds: Set<String>, requireMention: Bool) {
+        let policy = try SlackSocketModeConfig.loadIngressPolicy(dataRoot: dataRoot)
         return (policy.allowedChannelIds, policy.allowedUserIds, policy.requireMention)
     }
     func afterCurrentSlackHandling(_ operation: @escaping @Sendable () async -> Void) async -> Bool {
@@ -58,7 +59,7 @@ extension AppQuietSettingsHost {
 // MARK: - connections
 
 extension AppQuietToolHost {
-    /// The connections pages' buttons; MCP commands return their own result.
+    /// The connections pages' buttons.
     func connections(verb: String, input: [String: JSONValue]) async -> JSONValue {
         func text(_ key: String) -> String {
             AppToolExecutor.inputString(input[key])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -79,9 +80,9 @@ extension AppQuietToolHost {
             // On is User's below Full Mac; the door refuses it there.
             let on = verb == "connector_on"
             let wanted = text("id").lowercased()
-            let connectors = (try? await ConnectorStatusProjection.readConnectorRecords(
-                root: appModel.engine.dataRoot, platform: AppConnectorStatusPlatform()
-            )) ?? appModel.connectors
+            let connectors: [ConnectorRecord]
+            do { connectors = try await appModel.engine.connectors.refresh().get() }
+            catch { return ChatToolOutcome.failure(error: error, tool: "app") }
             guard let connector = connectors.first(where: { $0.id.lowercased() == wanted || $0.name.lowercased() == wanted }) else {
                 return AppToolExecutor.failure("unknown_connector",
                     "No connector is called \(wanted.isEmpty ? "that" : wanted). Pass id, one of the ids below.",
@@ -113,9 +114,9 @@ extension AppQuietToolHost {
         case "connector_disconnect":
             // The phone's Connectors → Disconnect: the credential is revoked.
             let wanted = text("id").lowercased()
-            let connectors = (try? await ConnectorStatusProjection.readConnectorRecords(
-                root: appModel.engine.dataRoot, platform: AppConnectorStatusPlatform()
-            )) ?? appModel.connectors
+            let connectors: [ConnectorRecord]
+            do { connectors = try await appModel.engine.connectors.refresh().get() }
+            catch { return ChatToolOutcome.failure(error: error, tool: "app") }
             guard let connector = connectors.first(where: { $0.id.lowercased() == wanted || $0.name.lowercased() == wanted }) else {
                 return AppToolExecutor.failure("unknown_connector",
                     "No connector is called \(wanted.isEmpty ? "that" : wanted). Pass id, one of the ids below.",
@@ -164,12 +165,6 @@ extension AppQuietToolHost {
             decided("pairing.remove \(phone.id)")
             return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(phone.id),
                             "detail": .string("Removed the phone: it no longer decides approvals. Pairing it again is the owner's.")])
-        case "mcp_repair":
-            do {
-                return try await appModel.engine.tools.mcp.repairRegistry(records: input["records"] ?? .null, expectedSHA256: text("expected_sha256"))
-            } catch {
-                return ChatToolOutcome.failure(error: error, tool: "app")
-            }
         case "telegram_repair":
             do {
                 return try await TelegramUpdateInbox.repair(dataRoot: appModel.engine.dataRoot, inbox: text("inbox"))
@@ -179,7 +174,7 @@ extension AppQuietToolHost {
         case "telegram_test":
             await appModel.testTelegram()
             return outcome(appModel.statusForAgent)
-        case "telegram_clear_logs":
+        default: // telegram_clear_logs
             await appModel.clearTelegramLogs()
             switch appModel.telegramClearLogsOutcome {
             case .completed(let receipt)?:
@@ -190,19 +185,6 @@ extension AppQuietToolHost {
                 return AppToolExecutor.failure("clear_logs_failed", line + " The logs are as they were; retry, or read \(AppToolExecutor.doorDoctor).", extra: ["effects": .string("unknown")])
             case nil:
                 return AppToolExecutor.failure("clear_logs_busy", "A clear is already running; read app {page:\"telegram\"} in a moment.")
-            }
-        default: // mcp_warm, mcp_restart, mcp_refresh
-            if appModel.mcpServers.isEmpty { _ = await appModel.refreshForSidebarItem(.mcp) }
-            let wanted = text("server_id").lowercased()
-            guard let server = appModel.mcpServers.first(where: { $0.id.lowercased() == wanted || $0.name.lowercased() == wanted }) else {
-                return AppToolExecutor.failure("unknown_server",
-                    "No MCP server is called \(wanted.isEmpty ? "that" : wanted). Pass server_id, one of the ids below.",
-                    extra: ["ids": .array(appModel.mcpServers.map { .string($0.id) })])
-            }
-            switch verb {
-            case "mcp_warm": return await appModel.runMCPCommand(.warm, server: server)
-            case "mcp_restart": return await appModel.runMCPCommand(.restart, server: server)
-            default: return await appModel.runMCPCommand(.refresh, server: server)
             }
         }
     }

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `ProviderConnectionProbe.swift` | provider connection probes |
 
 public extension SwiftNativeProviderRouting {
     static func probeAPIProvider(_ id: String, dataRoot: URL, draftKey: String?) async throws -> NativeAgentShared.ProviderTestResult {

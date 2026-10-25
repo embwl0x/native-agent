@@ -18,6 +18,10 @@ contract is in [Tool loading](TOOL_LOADING.md).
 - Recover a failed provider call within the existing conversation, keeping
   completed tool results.
 - Preserve visible partial prose when a stream fails or the person presses Stop.
+- Follow [Stop](STOP.md): cancel the effect, then join its one `settle` to save
+  produced output, write its terminal and release its registrations. The outer
+  rescue catch, nested terminal writers and partial-writer dedup scan are gone.
+  Save errors are reported; terminal and registration settlement still run.
 - Treat a timeout or interrupted action as uncertain effects; inspect the
   receipt and current state before repeating it.
 - Keep cancellation distinct from failure. Recovery does not grant permission
@@ -45,12 +49,12 @@ driver-change stream. Returning control continues from the recorded results;
 task cancellation or the run-tagged Stop flag releases the wait. A waiting turn
 keeps the return-control action reachable under Full Mac.
 
-### 2. Progress and the circling question
+### 2. Progress
 
-`ToolLoopNoProgressGuard` keeps its evidence and hands it to them: from eight
-identical tool rounds, or four identical failures even when arguments change,
-every round of the streak carries a note with the count. It never stops or
-suspends the turn; whether to go on is theirs.
+Tool results reach their unchanged by repetition coaching. L17/L18/L19's
+no-progress detectors, model nudges and canned person-facing notice were
+retired on 2026-10-22 after the reported four-day silent receipt window.
+Whether to continue from the results is theirs.
 
 ### 3. Tool dispatch deadline
 
@@ -87,12 +91,24 @@ launch, joined by each live call's `ttftMs`, nothing written). Under 100 calls
 it is unmeasured and only the wall stands; buffered kinds record no `ttftMs`,
 so idle and wall bound them.
 The cut text says the seconds waited, what arrived, and that evidence.
+The request's progress writer wakes deadline evaluation, registered before the
+state read; no interval samples it. Termination closes activity admission and
+cancels the request's forwarding and deadline tasks. The owner retains their
+handles through actual exit without joining a noncooperative producer.
+Wall-off streams retain their existing behavior without a deadline worker.
+Error-body diagnostics use their byte writer's wake with the same idle threshold
+and absolute cap, return partial bytes on read timeout, and preserve user cancellation.
+
+Buffered Anthropic lanes and interactive Codex still send operation-owned
+synthetic keep-alives. They hold the idle guard open while those calls cannot
+produce incremental output; they prove neither provider progress nor first
+output. Removal remains gated on a guard-visible buffered-call lifecycle.
 
 `ProviderRouting/LLMClient+Real.swift` wraps streams with the configured
 per-call guard and uses `withCompletionWall` for buffered calls. A guard cut
 is input to recovery, never a whole-turn deadline: their turn part asks again
-once when nothing ran and no repair is owed, and says the failure if the same
-cut follows.
+once only when `retry_now` permits it, the wire has not redialed, nothing ran
+and no repair is owed. Otherwise it says the failure.
 
 ### 5. In-loop provider recovery
 
@@ -108,9 +124,9 @@ The learned first-output deadline bounds only a wire with nothing on it; a
 live wire is bounded by idle silence and the wall. A recoverable cut after they
 said something or called a tool is the round's `interrupted` boundary: complete
 calls run, their words stay, and they continues after them. A cut where nothing
-ran or nothing was sent, with no repair owed, is their turn part's next input
-once (the stem's `provider_failure` notice is the nudge); the same cut again
-becomes their words to the person.
+ran or nothing was sent, with no repair owed, reaches their turn part as
+`provider_failure`; only `retry_now` with no wire redial permits one more
+model call. Otherwise the failure becomes their words to the person.
 
 Streaming adapters report max-token limits as `toolBoundary(.outputLimit)`;
 buffered adapters carry the answer prefix in `outputLengthLimit(partial:)`.
@@ -124,7 +140,8 @@ identical read in one reply is a boundary even when other reads intervene.
 Line-density and inline short-unit rules and harness notices are removed.
 
 Authentication, missing configuration/routing and unavailable-model errors
-remain repair waits. Standalone `complete()` overload retries retain their
+still name the needed repair; a thrown turn ends failed rather than persisting
+a wait with no waiter. Standalone `complete()` overload retries retain their
 own ten-attempt bound and deadlines.
 
 ### 6. Surface ownership
@@ -225,6 +242,10 @@ Pending checkpoints with no redelivery owner retire at launch with one
 turn.checkpoint_retired trace row; bridge responses and internal helper turns
 leave no pending checkpoint. Scheduled helpers settle through BotRunner.
 Terminal persistence awaits its own append, without draining process-wide telemetry.
+Live terminal deduplication matches decoded rows by turn and status; unrelated
+malformed or torn rows do not prevent the known terminal from landing. The
+canonical JSONL writer closes a torn tail before appending the new row. Recovery
+still requires clean trace coverage before concluding that a turn is settled.
 An existing Desk journal stays attached to its original item; its scheduler
 does not compete with checkpoint recovery. Ordinary turns acquire no Desk item.
 There is no process-resume count limit or new timer.
@@ -245,16 +266,7 @@ HTTP 202 `still_working` without cancelling the turn. Recover its receipt
 using the original request ID (and session ID for `/agent/reply`); do not
 resend merely because the response is pending.
 
-### 11. MCP implementation pinning
-
-`MCPDispatcher/MCPNPMIdentity.swift` leaves all recognized npm exec/npx
-launches unpinned, including exact versions: version labels do not authenticate
-executable bytes and dependencies. `ChatToolRuntime/SwiftToolDispatcher+MCP.swift`
-refuses unresolved implementations, including under Full Mac. When pinning is
-refused, configure a directly resolved executable/script and explicitly grant
-consent again.
-
-### 12. Mobile action uncertainty
+### 11. Mobile action uncertainty
 
 The repository's `iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Actions.swift`
 retains signed CloudKit action envelopes before submission. Retries of an

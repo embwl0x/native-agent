@@ -18,6 +18,7 @@ import AppKit
 // Secure keyboard entry (`IsSecureEventInputEnabled`) lives in HIToolbox and
 // nowhere else — ApplicationServices does not re-export it.
 import Carbon.HIToolbox
+// Blueprint: | `MacAccessibilityActuator.swift` | `MacAccessibilityActuator` enum; `act`; exact-element native actions and attributes share driver checks and mutation recording with resolved actions; native admission failures remain separate from actual AX return codes; `CGEventSink` owns native key/click preparation and HID emission; `SystemMacAXActSource.activate` and `raise` share measured app activation, driver checks and Automation diagnostics; app-only activation reads no AX windows and preserves the self-AX fence; `MacAXActSource.windowPresence` checks the owning process's AXWindows plus focused/main windows, distinguishing unreadable inventory from confirmed absence |
 #endif
 
 // 2026-09-06: screen reads restore the observed scrollbar value, never the
@@ -588,14 +589,14 @@ public struct CGEventSink: MacEventSink {
     public func post(key event: MacKeyEvent, toPid pid: Int32) -> Bool {
         guard pid > 0, pid != getpid(), let cg = keyEvent(event) else { return false }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
+        MacPersonInput.noteHerPost(targeted: true)
         cg.postToPid(pid)
         return true
     }
 
     public func post(key event: MacKeyEvent) {
         guard let cg = keyEvent(event) else { return }
-        NativeAgentMotorEpoch.notePostedHIDEvent()
-        cg.post(tap: .cghidEventTap)
+        postNative(cg)
     }
 
     private func keyEvent(_ event: MacKeyEvent) -> CGEvent? {
@@ -619,12 +620,39 @@ public struct CGEventSink: MacEventSink {
         return cg
     }
 
+    /// Prepare both halves before a native client changes the clipboard or
+    /// composer. Emission stays under that operation's original driver binding.
+    package func keyEvents(_ code: CGKeyCode, flags: CGEventFlags = []) -> [CGEvent]? {
+        guard let down = keyEvent(MacKeyEvent(keyCode: code, down: true)),
+              let up = keyEvent(MacKeyEvent(keyCode: code, down: false)) else { return nil }
+        down.flags = flags; up.flags = flags
+        return [down, up]
+    }
+
+    package func clickEvents(at point: CGPoint) -> [CGEvent]? {
+        guard let down = mouseEvent(MacMouseEvent(phase: .down, button: .left, x: point.x, y: point.y)),
+              let up = mouseEvent(MacMouseEvent(phase: .up, button: .left, x: point.x, y: point.y)) else { return nil }
+        return [down, up]
+    }
+
+    package func postNative(_ event: CGEvent) {
+        NativeAgentMotorEpoch.notePostedHIDEvent()
+        event.post(tap: .cghidEventTap)
+    }
+
     public func post(mouse event: MacMouseEvent) {
         let point = CGPoint(x: event.x, y: event.y)
         // Her own pointer: the person's mouse is unhooked for her action and
         // their cursor goes back where it was after it.
         AgentPointerHold.begin(warpTo: nil)
         defer { AgentPointerHold.posted(phase: event.phase, at: point) }
+        guard let cg = mouseEvent(event) else { return }
+        PersonOnlyWindows.beforeAgentPointer(at: point)
+        postNative(cg)
+    }
+
+    private func mouseEvent(_ event: MacMouseEvent) -> CGEvent? {
+        let point = CGPoint(x: event.x, y: event.y)
         let type: CGEventType
         let button: CGMouseButton
         switch (event.phase, event.button) {
@@ -641,7 +669,7 @@ public struct CGEventSink: MacEventSink {
             mouseType: type,
             mouseCursorPosition: point,
             mouseButton: button
-        ) else { return }
+        ) else { return nil }
         cg.setIntegerValueField(
             .eventSourceUserData,
             value: NativeAgentMacEventIdentity.sourceUserData
@@ -659,9 +687,7 @@ public struct CGEventSink: MacEventSink {
         // motor output; consumers separate it from human input by comparing the
         // two ages, not by leaving our own events unrecorded.
         // Routed by location: her pointer passes through Shotgun.
-        PersonOnlyWindows.beforeAgentPointer(at: point)
-        NativeAgentMotorEpoch.notePostedHIDEvent()
-        cg.post(tap: .cghidEventTap)
+        return cg
     }
 
     public func post(scroll event: MacScrollEvent) {
@@ -684,8 +710,7 @@ public struct CGEventSink: MacEventSink {
         )
         cg.flags.formUnion(flags(event.modifiers))
         PersonOnlyWindows.beforeAgentPointer(at: cg.location)
-        NativeAgentMotorEpoch.notePostedHIDEvent()
-        cg.post(tap: .cghidEventTap)
+        postNative(cg)
     }
 }
 
@@ -710,6 +735,7 @@ enum AgentPointerHold {
     private nonisolated(unsafe) static var buttonsDown = 0
     private nonisolated(unsafe) static var startedAt = 0.0
     private nonisolated(unsafe) static var lastPost = 0.0
+    private nonisolated(unsafe) static var releaseTimer: DispatchSourceTimer?
 
     static var lastAgentPoint: CGPoint? {
         lock.lock()
@@ -727,6 +753,7 @@ enum AgentPointerHold {
         lock.lock()
         lastPost = now
         guard !held else {
+            scheduleReleaseLocked()
             let current = agentPoint
             lock.unlock()
             return current
@@ -734,13 +761,17 @@ enum AgentPointerHold {
         guard let current = CGEvent(source: nil)?.location else { lock.unlock(); return nil }
         held = true
         generation &+= 1
-        let chain = generation
         personPoint = current
         startedAt = now
-        lock.unlock()
         CGAssociateMouseAndMouseCursorPosition(0)
         if let point { CGWarpMouseCursorPosition(point) }
-        scheduleRelease(chain: chain, after: settle)
+        let chain = generation
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInteractive))
+        timer.setEventHandler { releaseIfIdle(chain: chain) }
+        releaseTimer = timer
+        scheduleReleaseLocked()
+        timer.resume()
+        lock.unlock()
         return point ?? current
     }
 
@@ -752,31 +783,37 @@ enum AgentPointerHold {
         agentPoint = point
         if phase == .down { buttonsDown += 1 }
         if phase == .up { buttonsDown = max(0, buttonsDown - 1) }
+        scheduleReleaseLocked()
         lock.unlock()
         PersonOnlyWindows.noteAgentPointer(at: point, pressed: phase == .down)
     }
 
-    private static func scheduleRelease(chain: Int, after delay: TimeInterval) {
-        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) {
-            releaseIfIdle(chain: chain)
-        }
+    /// Posts move the one deadline. A held button waits for its up event or
+    /// the original cap; it never asks a timer whether the button is still down.
+    private static func scheduleReleaseLocked() {
+        guard held else { return }
+        let due = buttonsDown > 0 ? startedAt + cap : min(startedAt + cap, lastPost + settle)
+        releaseTimer?.schedule(deadline: .now() + max(0, due - ProcessInfo.processInfo.systemUptime))
     }
 
     /// The action is over: the person's cursor goes back and their mouse is
-    /// hooked up again. Otherwise look again when it could be.
+    /// hooked up again. A callback queued before a post re-arms only to the
+    /// new exact deadline, never a sampling interval.
     private static func releaseIfIdle(chain: Int) {
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
         guard held, chain == generation else { lock.unlock(); return }
         let idle = now - lastPost
         if now - startedAt < cap, buttonsDown > 0 || idle < settle {
+            scheduleReleaseLocked()
             lock.unlock()
-            scheduleRelease(chain: chain, after: max(0.05, settle - idle))
             return
         }
         // Under the lock: a new action of hers can't begin between the
         // person's cursor going back and their mouse being hooked up again.
         held = false
+        releaseTimer?.cancel()
+        releaseTimer = nil
         buttonsDown = 0
         CGWarpMouseCursorPosition(personPoint)
         CGAssociateMouseAndMouseCursorPosition(1)
@@ -950,6 +987,9 @@ public protocol MacAXActSource: Sendable {
     /// truthful for a one-window source (which every synthetic source is), and
     /// what makes the identity match a no-op there rather than a fabrication.
     func windows(pid: Int32) -> [MacAXWindowRef]
+    /// Exact presence in the owning process's window inventory. Nil is an
+    /// unreadable inventory, never evidence that a window was removed.
+    func windowPresence(_ window: MacAXWindowRef) -> Bool?
     /// Resolve a child-index chain from THAT window, not from whichever window
     /// of the app is focused now. `[]` is the window itself.
     func resolve(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution
@@ -1040,6 +1080,7 @@ public protocol MacAXActSource: Sendable {
 }
 
 public extension MacAXActSource {
+    func windowPresence(_ window: MacAXWindowRef) -> Bool? { nil }
     func uniqueTarget(role: String, label: String, labelSource: String, inWindow window: MacAXWindowRef) -> MacAXActTarget? { nil }
 
     func uniqueTarget(role: String, label: String, labelSource: String, ancestorPath: [Int], inWindow window: MacAXWindowRef) -> MacAXActTarget? {
@@ -1129,6 +1170,17 @@ enum MacAXExecutionLane {
 }
 
 #if canImport(ApplicationServices) && os(macOS)
+
+package enum MacNativeActionFailure: Error, LocalizedError {
+    case driver, selfTarget
+
+    package var errorDescription: String? {
+        switch self {
+        case .driver: "The Mac driver does not permit foreground input. Return control to NativeAgent before continuing; the Accessibility action did not run."
+        case .selfTarget: "NativeAgent does not act on its own app through Accessibility."
+        }
+    }
+}
 
 /// Live `AXUIElement` actuator. This is the only type in the module that calls
 /// `AXUIElementPerformAction` / `AXUIElementSetAttributeValue`.
@@ -1239,6 +1291,29 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         MacAXExecutionLane.sync { windowsOnExecutionLane(pid: pid) }
     }
 
+    public func windowPresence(_ window: MacAXWindowRef) -> Bool? {
+        MacAXExecutionLane.sync {
+            let pid = window.identity.pid
+            guard pid != getpid(), let target = element(window.handle) else { return nil }
+            guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return false }
+            let appElement = AXUIElementCreateApplication(pid)
+            // copyElementArray intentionally collapses read failures to [].
+            // Absence is proof here, so require a successful, typed AXWindows read.
+            guard let raw = MacAXAttributeRead.copyRaw(appElement, kAXWindowsAttribute),
+                  CFGetTypeID(raw) == CFArrayGetTypeID() else { return nil }
+            let elements = raw as! CFArray as [AnyObject]
+            guard elements.allSatisfy({ CFGetTypeID($0) == AXUIElementGetTypeID() }) else { return nil }
+            let listed = elements.map { $0 as! AXUIElement }
+            let windows = MacAXWindowInventory.union(
+                listed: listed,
+                focused: MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute),
+                main: MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute),
+                equal: { CFEqual($0, $1) }
+            )
+            return windows.contains { CFEqual($0, target) }
+        }
+    }
+
     private func windowsOnExecutionLane(pid: Int32) -> [MacAXWindowRef] {
         #if canImport(AppKit)
         // Same self-process fence as `resolveOnExecutionLane(path:pid:)`.
@@ -1327,32 +1402,8 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         }
         guard let raiseStatus else { return .invalidTarget }
 
-        // Half two — app ordering. THE OUTCOME IS MEASURED, NEVER ASSUMED.
-        //
-        // Round 9 CROSS-APP FAIL (Agent, envelope 7FCDC92E): this returned
-        // `.performed` for a raise that did not happen. Three mechanisms were
-        // probed live from a background process with Chrome frontmost, and two
-        // of the three RETURN SUCCESS AND DO NOTHING:
-        //
-        //   NSRunningApplication.activate()          → true,        no effect
-        //   AXFrontmost = true on the app element    → kAXErrorSuccess (0),
-        //                                              no effect
-        //   Apple Event `activate` to the bundle id  → Finder came to front
-        //
-        // macOS will not let a background process reorder the front app on its
-        // own say-so; the only sanctioned path is asking the TARGET to activate
-        // ITSELF, which is what the Apple Event does. So: try the cheap call,
-        // then the one that works, and in both cases believe only the window
-        // server's own answer.
-        if isFrontAndFocused(app: app, window: window) { return .performed }
-        _ = MacAXExecutionLane.sync {
-            guard MacDriverContext.binding?.allowsEmission == true else { return false }
-            return app.activate()
-        }
-        if awaitFrontAndFocused(app: app, window: window) { return .performed }
-        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
-        activateViaAppleEvent(app)
-        if awaitFrontAndFocused(app: app, window: window) { return .performed }
+        guard let front = activateAndMeasure(app: app, window: window) else { return .failed }
+        if front { return .performed }
 
         // Not raised. Which half failed is worth distinguishing for the
         // receipt, but neither is a success and neither may be reported as one
@@ -1369,11 +1420,26 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         #endif
     }
 
-    /// Why the last `raise` did not take, when there is something to say beyond
+    /// App ordering alone, using the same measured activation as `raise`.
+    /// No AX window read: this can also restore our own app without crossing
+    /// the self-process AX fence. The async entry keeps waits and Apple Events
+    /// off the main/AX lane while inheriting the caller's driver binding.
+    public func activate(pid: Int32) async -> MacAXActOutcome {
+        #if canImport(AppKit)
+        setRaiseDiagnostic(nil)
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return .invalidTarget }
+        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
+        return activateAndMeasure(app: app, window: nil) == true ? .performed : .failed
+        #else
+        return .unsupported
+        #endif
+    }
+
+    /// Why the last `raise` or `activate` did not take, when there is something to say beyond
     /// "it did not" — an Automation (Apple Events) consent denial, which is the
     /// one failure a person can actually fix and the one a bare `failed` hides
     /// completely, or any other Apple Event error by number. Cleared at the top
-    /// of every `raise`, so it always describes the most recent one.
+    /// of every `raise` or `activate`, so it always describes the most recent one.
     public var raiseDiagnostic: String? {
         lock.lock()
         defer { lock.unlock() }
@@ -1387,15 +1453,50 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
 
     #if canImport(AppKit)
-    /// The window server's own answer to "is this exact window key right now?"
-    /// — the app is frontmost AND the app's focused window is THIS element.
+    /// The app-ordering half of a raise. nil means the driver refused further
+    /// emission; false means activation was attempted but not confirmed.
+    private func activateAndMeasure(app: NSRunningApplication, window: MacAXWindowRef?) -> Bool? {
+        // THE OUTCOME IS MEASURED, NEVER ASSUMED.
+        //
+        // Round 9 CROSS-APP FAIL (Agent, envelope 7FCDC92E): this returned
+        // `.performed` for a raise that did not happen. Three mechanisms were
+        // probed live from a background process with Chrome frontmost, and two
+        // of the three RETURN SUCCESS AND DO NOTHING:
+        //
+        //   NSRunningApplication.activate()          → true,        no effect
+        //   AXFrontmost = true on the app element    → kAXErrorSuccess (0),
+        //                                              no effect
+        //   Apple Event `activate` to the bundle id  → Finder came to front
+        //
+        // macOS will not let a background process reorder the front app on its
+        // own say-so; the only sanctioned path is asking the TARGET to activate
+        // ITSELF, which is what the Apple Event does. So: try the cheap call,
+        // then the one that works, and in both cases believe only the window
+        // server's own answer.
+        if isFrontAndFocused(app: app, window: window) { return true }
+        _ = MacAXExecutionLane.sync {
+            guard MacDriverContext.binding?.allowsEmission == true else { return false }
+            // A window raise already recorded its AXRaise. App-only activation
+            // records its first emission here, once, after the driver check.
+            if window == nil { NativeAgentMotorEpoch.noteAgentMotorEvent() }
+            return app.activate()
+        }
+        if awaitFrontAndFocused(app: app, window: window) { return true }
+        guard MacDriverContext.binding?.allowsEmission == true else { return nil }
+        activateViaAppleEvent(app)
+        return awaitFrontAndFocused(app: app, window: window)
+    }
+
+    /// The app is frontmost; when a window is supplied, it is also focused.
+    /// App-only activation never reads AX, including when the target is us.
     /// `CFEqual`, not handle equality: this is the identity comparison, and it
     /// is measured against a freshly copied `AXFocusedWindow` every call.
-    private func isFrontAndFocused(app: NSRunningApplication, window: MacAXWindowRef) -> Bool {
+    private func isFrontAndFocused(app: NSRunningApplication, window: MacAXWindowRef?) -> Bool {
         MacAXExecutionLane.sync {
-            guard let element = element(window.handle) else { return false }
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
             else { return false }
+            guard let window else { return true }
+            guard let element = element(window.handle) else { return false }
             let appElement = AXUIElementCreateApplication(app.processIdentifier)
             guard let focused = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute) else { return false }
             return CFEqual(focused, element)
@@ -1409,7 +1510,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     ///
     /// The SLEEP IS OFF THE AX LANE. Only `isFrontAndFocused` hops onto it, one
     /// short read at a time; the main queue must remain available during the wait.
-    private func awaitFrontAndFocused(app: NSRunningApplication, window: MacAXWindowRef) -> Bool {
+    private func awaitFrontAndFocused(app: NSRunningApplication, window: MacAXWindowRef?) -> Bool {
         for _ in 0..<12 {
             if isFrontAndFocused(app: app, window: window) { return true }
             Thread.sleep(forTimeInterval: 0.025)
@@ -1476,11 +1577,8 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
 
     private func automationDeniedNote(_ app: NSRunningApplication, bundleID: String) -> String {
-        "macOS has not granted NativeAgent permission to control \(app.localizedName ?? bundleID) "
-        + "(Automation / Apple Events). Without it this app cannot bring \(bundleID) to the front at "
-        + "all, because a background process may only ask the target to activate ITSELF — every "
-        + "other mechanism (NSRunningApplication.activate, AXFrontmost) reports success and moves "
-        + "nothing. Grant it in System Settings → Privacy & Security → Automation."
+        "automation_not_trusted: macOS denied NativeAgent's activation request to \(app.localizedName ?? bundleID) (\(bundleID)). "
+        + "Ask the owner to enable System Settings > Privacy & Security > Automation > NativeAgent > \(app.localizedName ?? bundleID)."
     }
     #endif
 
@@ -1625,12 +1723,33 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         return status
     }
 
+    /// Native clients already holding an exact element use the same mutation
+    /// owner and driver authority as resolved actions, retaining the AX status.
+    package func performNative(_ element: AXUIElement, action: String) -> Result<AXError, MacNativeActionFailure> {
+        MacAXExecutionLane.sync {
+            guard MacDriverContext.binding?.allowsAction == true else { return .failure(.driver) }
+            NativeAgentMotorEpoch.noteAgentMotorEvent()
+            return .success(recordMutationStatus(AXUIElementPerformAction(element, action as CFString)))
+        }
+    }
+
+    package func setNativeAttribute(_ element: AXUIElement, attribute: String, value: CFTypeRef) -> Result<AXError, MacNativeActionFailure> {
+        MacAXExecutionLane.sync {
+            guard MacDriverContext.binding?.allowsAction == true else { return .failure(.driver) }
+            NativeAgentMotorEpoch.noteAgentMotorEvent()
+            return .success(recordMutationStatus(AXUIElementSetAttributeValue(element, attribute as CFString, value)))
+        }
+    }
+
+    package func enableManualAccessibility(pid: Int32) -> Result<AXError, MacNativeActionFailure> {
+        guard pid != getpid() else { return .failure(.selfTarget) }
+        return setNativeAttribute(AXUIElementCreateApplication(pid), attribute: "AXManualAccessibility", value: kCFBooleanTrue)
+    }
+
     private func performOnExecutionLane(_ target: MacAXActTarget, action: String) -> MacAXActOutcome {
         guard let element = element(target.handle) else { return .invalidTarget }
         guard target.actions.contains(action) else { return .unsupported }
-        guard MacDriverContext.binding?.allowsAction == true else { return .failed }
-        NativeAgentMotorEpoch.noteAgentMotorEvent()
-        let status = recordMutationStatus(AXUIElementPerformAction(element, action as CFString))
+        guard case .success(let status) = performNative(element, action: action) else { return .failed }
         switch status {
         case .success: return .performed
         case .actionUnsupported: return .unsupported
@@ -1857,7 +1976,12 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             // Same name rule as perception, or a caption-named field ("Save
             // As") fails the drift guard as `handle_drifted` on every act.
             title: MacAXAttributeRead.copyLabel(element, role: role),
-            value: MacAXAttributeRead.copyRaw(element, kAXValueAttribute).flatMap(SystemMacAXElementSource.stringifiedValue),
+            value: MacAXAttributeRead.copyRaw(element, kAXValueAttribute).flatMap {
+                // Action readback preserves the complete AXValue, including an
+                // empty string; the display projection may omit empty values.
+                if CFGetTypeID($0) == CFStringGetTypeID() { return $0 as! CFString as String }
+                return SystemMacAXElementSource.stringifiedValue($0)
+            },
             enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute) ?? true,
             frame: MacAXAttributeRead.copyFrame(element),
             actions: MacAXAttributeRead.copyActions(element)

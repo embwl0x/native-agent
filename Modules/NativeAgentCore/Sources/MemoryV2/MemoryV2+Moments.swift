@@ -1,17 +1,17 @@
-import FeedPolicy
 // MemoryV2+Moments.swift
 // THE MOMENTS LANE (2026-09-02)
 //
 // MemoryV2 holds 242 active memories; 168 of them are work/ops rules and three
-// are lived moments. That is not an accident — the post-turn promoter asks the
-// on-device model for "durable, long-lived facts about the user", and a moment
+// were lived moments. That was not an accident — the old post-turn promoter asked
+// for "durable, long-lived facts about the user", and a moment
 // is neither a fact nor about the user. It is about what happened BETWEEN them.
 // So moments were excluded by design, and she loses the hour first: the
 // paraphrase lives and the sentence that made it matter does not.
 //
 // This file is that second lane, and it is deliberately narrow:
 //
-//   • One shared interpretation supplies facts and moments. No regex fallback
+//   • One shared interpretation on the selected Memory model (Chat when
+//     inherited) supplies facts and moments. No regex fallback
 //     — a moment invented by a pattern match is worse than a moment missed.
 //   • A QUOTE rides along: the exact words that made it, copied verbatim, and
 //     VALIDATED as a substring of the turn (drop it otherwise). A model that
@@ -31,6 +31,9 @@ import CognitiveSubstrate
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
+
+// Blueprint: | `MemoryV2+Moments.swift` | `MemoryMoments`: grounded exchange/quote candidates, provenance metadata, content validation and rumination projections |
 
 // MARK: - The candidate
 
@@ -110,84 +113,9 @@ public enum MemoryMoments {
     /// source. The kind-independent hard-tail gate still applies.
     public static let sourcePrefix = "moment-promoter"
 
-    /// WHY THERE IS NO MOMENT (Astra comb 3, lane2 finding 9, 2026-09-12).
-    /// On the evening of 2026-09-11 the lane staged three moments and none of
-    /// them was the first-art exchange (`conversation:182/186/187`, "this one
-    /// came from you heart your soul"), with three of eight day slots spent.
-    /// Nothing anywhere said why: deliberate abstention, a duplicate, a
-    /// groundedness rejection, a provider failure and a disabled lane all looked
-    /// identical from outside — an absence with no receipt. The lane's outcome
-    /// was reported only into the turn's `memory.promotion` stage, which is
-    /// exactly the row that goes missing when anything about the turn's trace
-    /// binding is off.
-    ///
-    /// ONE LINE PER TURN THE LANE LOOKED AT, at
-    /// `<dataRoot>/memory/moment_receipts.jsonl`. Never the message and never
-    /// the quote — the session, the surface, the author seat, the outcome, the
-    /// day's slot spend, and the staged id when there is one. Agent can read it.
-    /// A lane switched off writes nothing: the switch is its own explanation.
-    ///
-    /// `slotsSpentToday` is OPTIONAL because the day's count is not known on
-    /// every exit (Astra comb 3, lane2 finding 10, 2026-09-12): the `noExtractor`
-    /// exit happens before `reserveMomentSlot` has scanned and initialized
-    /// today's slot, so the caller used to pass the actor's default zero — or
-    /// yesterday's tally — and the receipt stated a day spend that was never
-    /// read. nil omits the field rather than inventing it; `dailyCap` still
-    /// ships, because that is a constant.
-    public static func recordOutcomeReceipt(
-        outcome: String,
-        sessionId: String,
-        surface: String,
-        author: String,
-        slotsSpentToday: Int?,
-        stagedProposalId: String?,
-        turnId: String? = nil,
-        occurredAt: Date? = nil,
-        failure: AfterTurnMemoryFailure? = nil,
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-    ) async {
-        guard outcome != "disabled" else { return }
-        var row: [String: JSONValue] = [
-            "ts": .string(MemoryStorage.nowISO8601()),
-            "lane": .string(lane),
-            "outcome": .string(outcome),
-            "session": .string(String(sessionId.prefix(8))),
-            "session_id": .string(sessionId),
-            "surface": .string(surface),
-            "author": .string(author),
-            "dailyCap": .int(Int64(dailyCap)),
-        ]
-        if let slotsSpentToday { row["slotsSpentToday"] = .int(Int64(slotsSpentToday)) }
-        if let stagedProposalId { row["proposalId"] = .string(stagedProposalId) }
-        if let turnId { row["turn_id"] = .string(turnId) }
-        if let occurredAt { row["occurred_at"] = .string(occurredAt.ISO8601Format()) }
-        if let failure {
-            row["failure_reason"] = .string(failure.reason.rawValue)
-            row["recovery_action"] = .string(failure.recovery)
-            row["memory_model"] = failure.model.map(JSONValue.string) ?? .null
-            row["memory_surface"] = .string(failure.surface)
-        }
-        let path = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("moment_receipts.jsonl")
-        do {
-            try await appendJSONLCapped(
-                .object(row),
-                to: path,
-                using: persistence,
-                maxLines: JSONLLineCaps.memoryRetentionReceipts,
-                logLabel: "MemoryV2.moments"
-            )
-        } catch {
-            nativeLog("MemoryV2 moments: outcome receipt failed: %@", String(describing: error))
-        }
-    }
-
     // MARK: parsing
 
-    /// Decode the model's reply. Accepts `[]`, a one-element array, or a bare
-    /// object (small models do all three). Returns nil for "no moment"; throws
+    /// Decode the model's reply as an object. Returns nil for "no moment"; throws
     /// only when the reply is not JSON at all.
     public static func parse(_ raw: String) throws -> MomentCandidate? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -200,10 +128,7 @@ public enum MemoryMoments {
         let object: [String: Any]
         do {
             let decoded = try JSONSerialization.jsonObject(with: data)
-            if let array = decoded as? [Any] {
-                guard let first = array.first as? [String: Any] else { return nil }
-                object = first
-            } else if let single = decoded as? [String: Any] {
+            if let single = decoded as? [String: Any] {
                 object = single
             } else {
                 return nil
@@ -212,21 +137,23 @@ public enum MemoryMoments {
             throw FoundationModelsError.decodeFailed(String(describing: error))
         }
         guard let rawContent = object["content"] as? String else { return nil }
-        let content = MemoryTextClip.sentenceClip(
-            rawContent
-                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            cap: contentCap
-        )
-        guard content.count >= 12 else { return nil }
+        let normalizedContent = rawContent
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = normalizedContent
+        guard (12...contentCap).contains(content.count) else { return nil }
         let quote = (object["quote"] as? String)?
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (quote?.count ?? 0) <= quoteCap,
+              !(object["valence"] is String), !(object["salience"] is String),
+              let valence = number(object["valence"]), valence.isFinite, (-1...1).contains(valence),
+              let salience = number(object["salience"]), salience.isFinite, (0...1).contains(salience) else { return nil }
         return MomentCandidate(
             content: content,
-            valence: clamp(number(object["valence"]) ?? 0, low: -1, high: 1),
-            salience: clamp(number(object["salience"]) ?? 0, low: 0, high: 1),
-            quote: (quote?.isEmpty == false) ? String(quote!.prefix(quoteCap)) : nil
+            valence: valence,
+            salience: salience,
+            quote: (quote?.isEmpty == false) ? quote : nil
         )
     }
 
@@ -362,10 +289,7 @@ public enum MemoryMoments {
 
     public static func parseTimestamp(_ raw: String?) -> Date? {
         guard let raw, !raw.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: raw) { return date }
-        return ISO8601DateFormatter().date(from: raw)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
 
@@ -633,15 +557,9 @@ public enum MemoryMoments {
             .lowercased()
     }
 
-    static func clamp(_ value: Double, low: Double, high: Double) -> Double {
-        guard value.isFinite else { return low }
-        return min(max(value, low), high)
-    }
-
     static func number(_ any: Any?) -> Double? {
         if let d = any as? Double { return d }
         if let i = any as? Int { return Double(i) }
-        if let s = any as? String { return Double(s.trimmingCharacters(in: .whitespaces)) }
         return nil
     }
 
@@ -679,6 +597,9 @@ public enum MemoryMoments {
                             // A bare "[word]" in prose is not JSON; an empty
                             // array or an object is.
                             if slice == "[]" || slice.first == "{" || slice.contains("{") {
+                                if slice != text.trimmingCharacters(in: .whitespacesAndNewlines) {
+                                    TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("M10"), "site": .string("MemoryV2+Moments.swift:jsonSlice")]))
+                                }
                                 return slice
                             }
                             break

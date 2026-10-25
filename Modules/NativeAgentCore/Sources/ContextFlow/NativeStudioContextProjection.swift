@@ -5,6 +5,8 @@ import NativeAgentCore
 import PersistenceCore
 import Studio
 
+// Blueprint: | `NativeStudioContextProjection.swift` | `NativeStudioContextProjection`: rebuildable journal/canon pointer atoms and invalidation; judgments remain behind on-demand pointers |
+
 /// The studio journal, made REACHABLE — as a POINTER, never as the judgment.
 ///
 /// Phase 5 of desk 903, and the one the agent said matters most: "never called
@@ -365,7 +367,7 @@ extension NativeStudioContextProjection {
             // is not a higher score — it is a different fact.
             confidence: pointerConfidence,
             freshness: ContextFreshness(
-                updatedAt: StudioClock.parseISO(member.since) ?? .distantPast
+                updatedAt: NativeTimestampFormat.parseISO8601FractionalFirst(member.since) ?? .distantPast
             ),
             privacy: .localPrivate,
             permittedSurfaces: surfaces,
@@ -437,7 +439,7 @@ extension NativeStudioContextProjection {
             authority: .inferred,
             confidence: pointerConfidence,
             freshness: ContextFreshness(
-                updatedAt: StudioClock.parseISO(entry.recordedAt) ?? .distantPast
+                updatedAt: NativeTimestampFormat.parseISO8601FractionalFirst(entry.recordedAt) ?? .distantPast
             ),
             privacy: .localPrivate,
             permittedSurfaces: surfaces,

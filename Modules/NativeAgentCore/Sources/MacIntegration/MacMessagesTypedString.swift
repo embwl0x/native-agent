@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MacMessagesTypedString.swift` | bounded attributed-body archive decoding |
 
 /// Independently implemented from wire-format facts documented by the format's
 /// reverse engineer, Christopher Sardegna:

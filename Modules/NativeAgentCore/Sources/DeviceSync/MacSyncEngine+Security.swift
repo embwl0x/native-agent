@@ -4,14 +4,13 @@
 // InboxWatcher: NSMetadataQuery on `inbox/`. When iOS drops an action JSON, dispatch to
 //   the in-process Swift runtime, write response to `responses/<msg_id>.json`, touch KVS `inbox_response_<msg_id>`.
 
-import CommonCrypto
-import CryptoKit
 import AppKit
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
-import KnowledgeGraph
+import MemoryV2
 import PersistenceCore
+// Blueprint: | `MacSyncEngine+Security.swift` | MacSyncEngine pairing rotation and signed responses; complete signed CloudKit action-record budgeting before terminal ledger settlement; oversized readbacks return an explicit processed-action error; BridgeMessage owns HMAC, constant-time comparison and inner-action verification; outer signatures remain case-sensitive |
 
 extension MacSyncEngine {
     // C.1: HMAC pairing secret — loaded lazily on first use via PairingSecretManager (single source of truth).
@@ -53,19 +52,34 @@ extension MacSyncEngine {
         }
     }
 
-    /// Compute HMAC-SHA256 over `body` using the pairing secret.
-    private func hmacSHA256(body: Data) throws -> String {
-        let key = SymmetricKey(data: try pairingSecret())
-        let mac = HMAC<SHA256>.authenticationCode(for: body, using: key)
-        return Data(mac).map { String(format: "%02x", $0) }.joined()
-    }
-
     func actionResponse(_ response: [String: String], for action: InboxAction) throws -> [String: String] {
         var body = response
         body["msgId"] = action.msgId
         body["transactionId"] = action.transactionId ?? action.msgId
         body["action"] = action.action
         return try signedResponse(body)
+    }
+
+    /// Budget the complete signed record before it becomes the terminal ledger
+    /// response. Oversized readbacks settle explicitly; delivery never replays
+    /// an undeliverable response or repeats its already-processed action.
+    func deliverableActionResponse(_ response: [String: String], for action: InboxAction) throws -> [String: String] {
+        let signed = try actionResponse(response, for: action)
+        let message = try sync.bridge.cloudKitActionResponseMessage(signed, correlationID: action.msgId)
+        do {
+            _ = try NAChatMessageCodec.encode(message)
+            return signed
+        } catch DeviceSyncError.payloadTooLarge {
+            var terminal = ["status": "error", "ok": "false", "code": "action_readback_too_large",
+                "message": "The Mac processed this action, but its readback exceeds the delivery limit. Refresh the page to read its current state. Do not repeat the action."]
+            for key in ["approvalId", "resolvedProposalId", "memoryId", "inboxItemId", "decisionAccepted", "decisionStatus", "approvalReadbackRevision", "inboxReadbackRevision", "memoryReadbackRevision"] {
+                terminal[key] = response[key].map { String($0.prefix(512)) }
+            }
+            terminal["effectStatus"] = response["status"].map { String($0.prefix(80)) }
+            let bounded = try actionResponse(terminal, for: action)
+            _ = try NAChatMessageCodec.encode(sync.bridge.cloudKitActionResponseMessage(bounded, correlationID: action.msgId))
+            return bounded
+        }
     }
 
     func signedResponse(_ response: [String: String]) throws -> [String: String] {
@@ -78,14 +92,14 @@ extension MacSyncEngine {
                 userInfo: [NSLocalizedDescriptionKey: "response could not be canonicalized"]
             )
         }
-        body["signature"] = try hmacSHA256(body: canonical)
+        body["signature"] = BridgeMessage.hmacHex(of: canonical, secret: try pairingSecret())
         return body
     }
 
     func authenticateInboxResponse(_ response: [String: String]) -> Bool {
         guard let signature = response["signature"],
               let expected = try? signedResponse(response)["signature"] else { return false }
-        return constantTimeEqual(signature.lowercased(), expected)
+        return BridgeMessage.constantTimeEqual(signature.lowercased(), expected)
     }
 
     @discardableResult
@@ -153,17 +167,6 @@ extension MacSyncEngine {
         } catch {
             return error.localizedDescription
         }
-    }
-
-    /// N32: Constant-time string comparison to guard against timing attacks.
-    /// Returns true iff a == b, without short-circuiting on the first differing byte.
-    private func constantTimeEqual(_ a: String, _ b: String) -> Bool {
-        let aBytes = Array(a.utf8)
-        let bBytes = Array(b.utf8)
-        guard aBytes.count == bBytes.count else { return false }
-        var diff: UInt8 = 0
-        for i in 0..<aBytes.count { diff |= aBytes[i] ^ bBytes[i] }
-        return diff == 0
     }
 
     /// The ±5-minute window on its own, separated from authenticity (2026-09-06)
@@ -236,33 +239,6 @@ extension MacSyncEngine {
             return "missing signature — upgrade response written for iOS client"
         }
 
-        // S.11: reject obviously wrong-format signatures before computing HMAC.
-        let hexChars = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
-        if sig.count != 64 || sig.unicodeScalars.contains(where: { !hexChars.contains($0) }) {
-            return "signature wrong format (expected 64 hex chars, got \(sig.count) chars)"
-        }
-
-        // Reconstruct canonical body: re-encode with sorted keys, signature excluded.
-        guard let original = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return "cannot re-parse JSON for HMAC"
-        }
-        var withoutSig = original
-        withoutSig.removeValue(forKey: "signature")
-        guard let canonical = try? JSONSerialization.data(withJSONObject: withoutSig, options: [.sortedKeys]) else {
-            return "cannot re-serialize for HMAC"
-        }
-        let expected: String
-        do {
-            expected = try hmacSHA256(body: canonical)
-        } catch {
-            return "pairing secret unavailable: \(error.localizedDescription)"
-        }
-        // N32: lowercase before compare (hmacSHA256 already produces lowercase hex;
-        // guard against iOS sending uppercase) and use constant-time compare.
-        let sigLower = sig.lowercased()
-        if !constantTimeEqual(sigLower, expected) {
-            return "HMAC mismatch — possible tampering or wrong pairing secret"
-        }
-        return nil // valid
+        return BridgeMessage.innerActionSignatureError(data: data, signature: sig, secret: pairingSecret)
     }
 }

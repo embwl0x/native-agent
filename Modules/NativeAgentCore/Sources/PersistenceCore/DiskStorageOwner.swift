@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+// Blueprint: | `DiskStorageOwner.swift` | `DiskStorageOwner`: owner retention plans and execution, contained identity-checked moves to Trash and logical-byte outcomes; no history deletion |
 
 /// Owners declare policy and execute only the candidates saved on the card.
 public struct DiskStorageOwner: Sendable {

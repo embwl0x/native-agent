@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ChatSessionDirective.swift` | `ChatSessionDirective` enum; `safeComponent`, `recordURL`; seven-day delivery eligibility leaves expired/delivered records on disk |
 
 // MARK: - A one-shot system directive bound to ONE chat session
 //
@@ -21,8 +22,9 @@ import Foundation
 // the one the person is typing in.
 //
 // One shot, like the note: stamped delivered after provider acceptance.
-// Retention bounds a directive whose session was abandoned; nothing else cleans
-// these up.
+// Expiry bounds delivery eligibility; existing records remain on disk.
+// Storage: local backup, data export and phone sync exclude these records;
+// off-disk backup includes them. PrivacyMap: context. No automatic deletion.
 public struct ChatSessionDirectiveRecord: Codable, Equatable, Sendable {
     public var createdAt: String
     public var directive: String
@@ -55,9 +57,7 @@ public struct ChatSessionDirectiveRecord: Codable, Equatable, Sendable {
 
 public enum ChatSessionDirective {
 
-    /// Long enough that someone who answers the next morning still gets the
-    /// behavior, short enough that an abandoned session's directive does not
-    /// sit on disk forever.
+    /// Seven-day delivery window; expiry returns nil without changing the file.
     public static let retentionSeconds: TimeInterval = 7 * 24 * 60 * 60
 
     /// Session ids reach this from a stored key, so the path component is

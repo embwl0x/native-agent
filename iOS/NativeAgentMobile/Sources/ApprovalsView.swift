@@ -8,6 +8,7 @@
 import SwiftUI
 import NativeAgentShared
 import UserNotifications
+// Blueprint: | `ApprovalsView.swift` | Approval presentation and submission state; rows read the shared sync projection, including Mac-resolved decision and time |
 
 // MARK: - Model
 
@@ -28,14 +29,6 @@ enum ApprovalDecisionRoute: Equatable {
         case .approve: return "approve"
         case .reject: return "reject"
         case .cancel: return "cancel"
-        }
-    }
-
-    var finalDecision: String {
-        switch self {
-        case .approve: return "approved"
-        case .reject: return "denied"
-        case .cancel: return "canceled"
         }
     }
 
@@ -105,9 +98,6 @@ enum ApprovalBannerPresentation {
     static let pendingDecisionMessage =
         "Decision unconfirmed. Reconnect, then refresh to check the result. If still pending, retry the decision."
 
-    static func warning(hasPendingLocalDecision: Bool) -> String? {
-        hasPendingLocalDecision ? "Decision accepted. Waiting for the updated list from your Mac." : nil
-    }
 }
 
 /// Pure notification policy for approval snapshots. Keeping the policy apart
@@ -149,8 +139,8 @@ enum ApprovalPendingNotificationPresentation {
 
 @MainActor
 final class ApprovalsStore: ObservableObject {
-    @Published var approvals: [PendingApproval] = []
-    @Published private(set) var hasLoadedSnapshot = false
+    var approvals: [PendingApproval] { iCloudSyncEngine.shared.approvals }
+    var hasLoadedSnapshot: Bool { iCloudSyncEngine.shared.approvalsSnapshotLoaded }
     @Published var isLoading = false
     @Published var bannerError: String? = nil
     @Published var bannerWarning: String? = nil
@@ -160,7 +150,6 @@ final class ApprovalsStore: ObservableObject {
     var isVisible = false
     private var hasLoadedApprovals = false
     private var notifiedPendingIDs = Set<String>()
-    private var locallyFinalizedApprovals: [String: (decision: String, resolvedAt: String)] = [:]
 
     // MARK: - Fetch
 
@@ -168,7 +157,6 @@ final class ApprovalsStore: ObservableObject {
         guard pairingStore.usesICloudTransport else {
             bannerWarning = nil
             bannerError = "Pair to view"
-            withAnimation(AppMotion.snappy) { approvals = [] }
             return
         }
         await iCloudSyncEngine.shared.refreshApprovalsSnapshot()
@@ -176,22 +164,13 @@ final class ApprovalsStore: ObservableObject {
     }
 
     func applySyncedApprovalsFromSnapshot(animated: Bool = true, notifyNewPending: Bool = true) {
-        let merged = mergeLocalFinalDecisions(iCloudSyncEngine.shared.approvals)
         if notifyNewPending {
-            notifyForNewPendingApprovals(merged)
+            notifyForNewPendingApprovals(approvals)
         } else {
-            rememberPendingApprovals(merged)
+            rememberPendingApprovals(approvals)
         }
-        if animated {
-            withAnimation(AppMotion.snappy) { approvals = merged }
-        } else {
-            approvals = merged
-        }
-        bannerWarning = ApprovalBannerPresentation.warning(
-            hasPendingLocalDecision: !locallyFinalizedApprovals.isEmpty
-        )
+        bannerWarning = nil
         bannerError = nil
-        if iCloudSyncEngine.shared.approvalsSnapshotLoaded { hasLoadedSnapshot = true }
     }
 
     // MARK: - Decide
@@ -215,22 +194,15 @@ final class ApprovalsStore: ObservableObject {
             } else {
                 _ = try await iCloudSyncEngine.shared.rejectApproval(id: id)
             }
-            markApprovalFinal(id: id, decision: route.finalDecision)
-            await refresh(client: client, pairingStore: pairingStore)
+            applySyncedApprovalsFromSnapshot()
         } catch {
             if iCloudSyncEngine.isMacResponseTimeout(error) {
                 await refresh(client: client, pairingStore: pairingStore)
                 bannerWarning = ApprovalBannerPresentation.pendingDecisionMessage
                 bannerError = nil
             } else {
-                locallyFinalizedApprovals.removeValue(forKey: id)
-                // Rebuild from transport truth while preserving any other
-                // concurrently submitted local decisions. Restoring the whole
-                // pre-call array would resurrect sibling cards that succeeded.
-                let merged = mergeLocalFinalDecisions(iCloudSyncEngine.shared.approvals)
-                withAnimation(AppMotion.snappy) { approvals = merged }
                 bannerWarning = nil
-                bannerError = "Failed to record decision: \(error.localizedDescription)"
+                bannerError = error.localizedDescription
             }
         }
     }
@@ -245,31 +217,6 @@ final class ApprovalsStore: ObservableObject {
 
     func finishDecision(id: String) {
         decidingApprovalIDs.remove(id.trimmingCharacters(in: .whitespacesAndNewlines))
-    }
-
-    /// Hold a confirmed local final decision until the Mac snapshot reflects
-    /// it, so a card cannot be offered again in the handoff window.
-    func markApprovalFinal(id: String, decision: String) {
-        let resolvedAt = ISO8601DateFormatter().string(from: Date())
-        locallyFinalizedApprovals[id] = (decision: decision, resolvedAt: resolvedAt)
-        notifiedPendingIDs.insert(id)
-        let merged = mergeLocalFinalDecisions(iCloudSyncEngine.shared.approvals)
-        withAnimation(AppMotion.snappy) { approvals = merged }
-    }
-
-    private func mergeLocalFinalDecisions(_ source: [PendingApproval]) -> [PendingApproval] {
-        source.map { approval in
-            guard let final = locallyFinalizedApprovals[approval.id] else { return approval }
-            if approval.status.lowercased() != "pending" {
-                locallyFinalizedApprovals.removeValue(forKey: approval.id)
-                return approval
-            }
-            var resolved = approval
-            resolved.status = final.decision
-            resolved.decision = final.decision
-            resolved.resolvedAt = final.resolvedAt
-            return resolved
-        }
     }
 
     private func rememberPendingApprovals(_ next: [PendingApproval]) {

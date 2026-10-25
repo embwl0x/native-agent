@@ -1,12 +1,13 @@
 import Foundation
+// Blueprint: | `NativeOAuthFlow+Configs.swift` | ProviderOAuthConfig owns provider client identities and token endpoints; buildAuthURL, exchangeCode |
 
 // MARK: - Provider config
 
-struct ProviderOAuthConfig: @unchecked Sendable {
+public struct ProviderOAuthConfig: @unchecked Sendable {
     let providerId: String
-    let clientId: String
+    public let clientId: String
     let authorizationEndpoint: String
-    let tokenEndpoint: String
+    public let tokenEndpoint: String
     let scope: String
     /// Pre-registered custom-scheme redirect URI (nativeagent://oauth/<name>).
     let redirectURI: String
@@ -53,36 +54,12 @@ struct ProviderOAuthConfig: @unchecked Sendable {
             "code_verifier": verifier,
         ]
         for (k, v) in extraTokenParams(state) { body[k] = v }
-
-        var req = URLRequest(url: URL(string: tokenEndpoint)!)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 20
-        switch tokenBodyFormat {
-        case .form:
-            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-            req.httpBody = NativeOAuthSupport.formEncode(body).data(using: .utf8)
-        case .json:
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        }
-
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
-            let snippet = String(data: data.prefix(400), encoding: .utf8) ?? ""
-            throw NSError(domain: "NativeOAuthFlow", code: http.statusCode,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "HTTP \(http.statusCode): \(NativeOAuthSupport.redact(snippet))"])
-        }
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw NSError(domain: "NativeOAuthFlow", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Token endpoint returned non-JSON."])
-        }
-        return obj
+        return try await NativeOAuthSupport.postToken(tokenEndpoint, body, json: tokenBodyFormat == .json)
     }
 
     // MARK: Provider catalog
 
-    static let openai = ProviderOAuthConfig(
+    public static let openai = ProviderOAuthConfig(
         providerId:            "openai_oauth_direct",
         clientId:              "app_EMoamEEZ73f0CkXaXp7hrann",
         authorizationEndpoint: "https://auth.openai.com/oauth/authorize",
@@ -175,7 +152,7 @@ struct ProviderOAuthConfig: @unchecked Sendable {
         extraTokenParams: { _ in [:] }
     )
 
-    static let anthropic = ProviderOAuthConfig(
+    public static let anthropic = ProviderOAuthConfig(
         providerId:            "anthropic_oauth_direct",
         clientId:              "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
         authorizationEndpoint: "https://claude.ai/oauth/authorize",
@@ -191,4 +168,7 @@ struct ProviderOAuthConfig: @unchecked Sendable {
         },
         extraTokenParams: { state in ["state": state] }
     )
+
+    public static let xaiClientID = "b1a00492-073a-47ea-816f-4c329264a828"
+    public static let xaiTokenEndpoint = "https://auth.x.ai/oauth/token"
 }

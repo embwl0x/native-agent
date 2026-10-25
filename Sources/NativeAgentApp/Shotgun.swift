@@ -1,4 +1,6 @@
 import AttentionRouting
+
+// Blueprint: | `Shotgun.swift` | `ShotgunController`: person-only floating chat/window lifecycle while the agent drives, with step-aside, resume and saved placement |
 // Shotgun (User, 2026-10-04): when the agent starts driving the Mac in the chat
 // on screen, the main window steps aside and this small floating glass chat
 // takes its place — she drives, User rides shotgun. User's rulings:
@@ -495,9 +497,13 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         return panel
     }
 
+    func applyAppearance(_ appearance: NSAppearance?) {
+        panel?.appearance = appearance
+    }
+
     private func show(from start: NSRect?, makeKey: Bool) {
         let panel = makePanel()
-        panel.appearance = DetachedChatWindowController.preferredAppearance()
+        applyAppearance(AppearanceController.shared.appearance)
         if isShown {
             panel.orderFrontRegardless()
             if makeKey { panel.makeKey() }

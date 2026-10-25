@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import Experiences
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+Persistence.swift` | `CognitiveSubstrate`: `persistSnapshot`, `recordReceipt` |
 
 extension CognitiveSubstrate {
     public func persistSnapshot() async throws {

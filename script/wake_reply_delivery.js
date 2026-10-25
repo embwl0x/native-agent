@@ -21,6 +21,7 @@ function createCodexReplyDelivery({
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
+const { dataRootLife, lifeOf } = require("./wake_worker_common.js");
 
 function formatCodexReplyForNativeAgent(job, turnResult) {
   const entries = Array.isArray(job.entries) ? job.entries : [];
@@ -148,6 +149,7 @@ function shouldSuppressCompletionDelivery(entries, turnResult) {
 }
 
 function postBridgeMessage(text, sessionId, config, metadata = {}) {
+  if (lifeOf(metadata.lifeID) !== dataRootLife()) return Promise.resolve({ status: "stopped", reason: "restored" });
   if (process.env.NATIVE_AGENT_CODEX_REPLY_DRY_RUN === "1") {
     return Promise.resolve({
       status: "dry_run",
@@ -177,6 +179,7 @@ function postBridgeMessage(text, sessionId, config, metadata = {}) {
   const timeoutMs = numberSetting(config, "bridgeReplyTimeoutMs", "NATIVE_AGENT_CODEX_BRIDGE_REPLY_TIMEOUT_MS", 11 * 60 * 1000);
   const body = JSON.stringify({
     text,
+    lifeID: metadata.lifeID,
     sender: "codex",
     ...(metadata.deliveryId ? { deliveryId: metadata.deliveryId } : {}),
     ...(sessionId ? { sessionId } : {}),

@@ -4,6 +4,8 @@ import PersistenceCore
 import PersonaEngine
 import NativeAgentCore
 
+// Blueprint: | `DreamREMCycle+HeavyLogic.swift` | REM stateless helpers: persona reads, durable denial tombstones and old-diary archival; caller retains proposal persistence and approval gating |
+
 // Heavy logic for the REM consolidation pipeline:
 //   - .rem_tombstones exclusion of denied proposals
 //   - 14-day archival of old dream_diary entries
@@ -13,7 +15,7 @@ import NativeAgentCore
 // gating remain with the caller — these are stateless helpers / file actors.
 
 /// Use the live compiler's checked active-persona selection while preserving
-/// Dream/REM's full-document rendering and GROWTH hygiene.
+/// Dream/REM's selected SOUL, VOICE, GROWTH and AGENTS documents and USER projection.
 func readDreamPersonaDocs(
     dataRoot: URL, personaRoot: URL, surface: String
 ) async throws -> [String: String] {
@@ -40,7 +42,14 @@ func readDreamPersonaDocs(
 /// import MemoryV2, so the app installs the reader at cognition bootstrap. Nil
 /// (never installed) keeps the whole document, exactly as before.
 public enum DreamUserCore {
-    nonisolated(unsafe) public static var provider: (@Sendable (URL) async -> [String]?)?
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var storedProvider: (@Sendable (URL) async -> [String]?)?
+
+    /// Copy under the lock; callers invoke the copy after the getter releases it.
+    public static var provider: (@Sendable (URL) async -> [String]?)? {
+        get { lock.withLock { storedProvider } }
+        set { lock.withLock { storedProvider = newValue } }
+    }
 }
 
 // MARK: - REMTombstoneStore
@@ -258,29 +267,18 @@ public actor DreamArchiver {
         self.dataRoot = dataRoot
     }
 
-    // Same stem pattern the readers use: legacy `YYYY-MM-DD.md` AND the
-    // older session-suffixed `YYYY-MM-DD_<session>.md`. The old
-    // `^(\d{4})-(\d{2})-(\d{2})$`
-    // matched only the legacy form, so every Swift-written entry was skipped
-    // and 14-day archival was a permanent no-op (dream_diary/ grew unbounded).
-    private static let stemRegex: NSRegularExpression = {
-        try! NSRegularExpression(pattern: "^(\\d{4}-\\d{2}-\\d{2})(?:_.+)?$")
-    }()
-
     public func archiveOlderThan(daysOld: Int = 14, now: Date = Date()) async throws -> Int {
         let diary = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
         guard fm.fileExists(atPath: diary.path) else { return 0 }
         let cutoff = now.addingTimeInterval(TimeInterval(-daysOld * 86_400))
-        let names = (try? fm.contentsOfDirectory(atPath: diary.path)) ?? []
+        let files = (try? FileBackedDreamDiary(dataRoot: dataRoot).discover(in: .active, matching: .dated)) ?? []
         let dateFmt = ISO8601DateFormatter()
         dateFmt.formatOptions = [.withFullDate]
         var moved = 0
-        for name in names where name.hasSuffix(".md") {
-            let stem = (name as NSString).deletingPathExtension
-            let ns = stem as NSString
-            let m = Self.stemRegex.firstMatch(in: stem, options: [], range: NSRange(location: 0, length: ns.length))
-            guard let m else { continue }
-            let dateStr = ns.substring(with: m.range(at: 1))
+        for file in files where file.name.hasSuffix(".md") {
+            let name = file.name
+            let stem = file.stem
+            let dateStr = file.day!
             guard let parsed = dateFmt.date(from: dateStr) else { continue }
             if parsed >= cutoff { continue }
             let year = String(dateStr.prefix(4))
@@ -290,9 +288,16 @@ public actor DreamArchiver {
                 try fm.createDirectory(at: archiveDir, withIntermediateDirectories: true)
             }
             let src = diary.appendingPathComponent(name)
-            let dst = archiveDir.appendingPathComponent(name)
+            var dst = archiveDir.appendingPathComponent(name)
             if fm.fileExists(atPath: dst.path) {
-                try? fm.removeItem(at: dst)
+                if try Data(contentsOf: src) == Data(contentsOf: dst) {
+                    try fm.removeItem(at: src)
+                    moved += 1
+                    continue
+                }
+                // A restored copy may be older than the archive. Keep both
+                // readable under their original date; never replace writing.
+                dst = archiveDir.appendingPathComponent("\(stem)_\(UUID().uuidString).md")
             }
             try fm.moveItem(at: src, to: dst)
             moved += 1

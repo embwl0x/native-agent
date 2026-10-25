@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ReviewedMomentAcceptance.swift` | `ReviewedMomentAcceptance`: prepared moment wording and embedding admitted together by canonical transaction |
+
 /// Prepared wording and embedding, admitted together by the canonical transaction.
 public struct ReviewedMomentAcceptance: Sendable {
     public let expectedContent: String

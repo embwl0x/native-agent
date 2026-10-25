@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import Network
 import Security
+// Blueprint: | `BridgeCore.swift` | Shared HTTP framing, bearer comparison, loopback/authentication admission and response transport |
 
 /// Identity-gated state for one accepted connection's exact request-read
 /// deadline. The token prevents a late deadline work item from cancelling a

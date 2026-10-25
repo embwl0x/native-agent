@@ -15,6 +15,7 @@ import CoreSpotlight
 #endif
 #if canImport(CloudKit)
 import CloudKit
+// Blueprint: | `ChatComposerChrome.swift` | `ComposerTabKeyHandler` struct; `makeNSView`, `updateNSView` |
 #endif
 
 /// Intercept Tab and open slash suggestions while this draft owns the editor.
@@ -110,20 +111,6 @@ struct AttachmentChip: View {
     }
 }
 
-// D1 (2026-08-28): a blank chat on a machine with no connected provider used
-// to invite a first message ("Say something to …") that could only dead-end in
-// "No reply came back". The blank slate now branches: with a provider, the D6
-// capability chips; without one, the connect prompt — the same honest guidance
-// `missingProviderChatGuidance()` gives AFTER a failed send, moved to before it.
-enum ChatEmptyStateMode: Equatable, Sendable {
-    case connectProvider
-    case suggestions
-
-    static func mode(hasUsableProvider: Bool) -> Self {
-        hasUsableProvider ? .suggestions : .connectProvider
-    }
-}
-
 struct ChatProviderConnectEmptyState: View {
     static let title = "Connect an AI provider to start chatting"
     static let detail = """
@@ -166,14 +153,10 @@ enum ChatEmptyStateSuggestionAction {
     static func apply(
         _ suggestion: String,
         model: AppModel,
-        activeSessionID: String,
-        draftText: inout String,
-        draftSessionID: inout String
+        activeSessionID: String
     ) {
         guard !activeSessionID.isEmpty else { return }
-        model.injectChatDraft(suggestion, sessionId: activeSessionID)
-        draftText = suggestion
-        draftSessionID = activeSessionID
+        model.composerDraft(for: activeSessionID).edit(suggestion)
     }
 }
 
@@ -539,26 +522,12 @@ enum NextGenActionChipsPresentation {
         ids.contains(actionID) || ids.contains(normalizedID(actionID))
     }
 
-    /// This is the same executor-backed filter used by the full Capabilities
-    /// surface. A chat chip is an executable promise, so catalog-only,
-    /// completed, or non-dry-run rows cannot enter this presentation.
-    static func eligibleActions(summary: NextGenSummary?) -> [NextGenAction] {
-        var seenIDs = Set<String>()
-        return (summary?.actions ?? []).filter { action in
-            let actionID = normalizedID(action.id)
-            return action.dryRunAvailable == true
-                && action.status?.lowercased() != "completed"
-                && NativeAgentEngine.isNextGenActionBacked(actionID)
-                && seenIDs.insert(actionID).inserted
-        }
+    static func visibleActions(snapshot: NextGenStatusProjection.Snapshot?) -> [NextGenAction] {
+        Array((snapshot?.eligibleActions ?? []).prefix(maxVisible))
     }
 
-    static func visibleActions(summary: NextGenSummary?) -> [NextGenAction] {
-        Array(eligibleActions(summary: summary).prefix(maxVisible))
-    }
-
-    static func hasMore(summary: NextGenSummary?) -> Bool {
-        eligibleActions(summary: summary).count > maxVisible
+    static func hasMore(snapshot: NextGenStatusProjection.Snapshot?) -> Bool {
+        (snapshot?.eligibleActions.count ?? 0) > maxVisible
     }
 
     static func canRun(
@@ -567,10 +536,7 @@ enum NextGenActionChipsPresentation {
         completedIDs: Set<String>,
         isGlobalActionRunning: Bool
     ) -> Bool {
-        let id = normalizedID(actionID)
-        return !id.isEmpty
-            && NativeAgentEngine.isNextGenActionBacked(id)
-            && !isGlobalActionRunning
+        !isGlobalActionRunning
             && !isTracked(actionID, in: runningIDs)
             && !isTracked(actionID, in: completedIDs)
     }
@@ -625,7 +591,7 @@ struct ChatComposerTray: View {
             attachments: attachments.map(\.id),
             others: otherRunning,
             actions: NextGenActionChipsPresentation.visibleActions(
-                summary: appModel.nextGenSummary).map(\.id)
+                snapshot: appModel.engine.nextGen.current).map(\.id)
         )
     }
 
@@ -713,11 +679,11 @@ struct NextGenActionChipsRow: View {
     @State private var completedIds: Set<String> = []
 
     private var visibleActions: [NextGenAction] {
-        NextGenActionChipsPresentation.visibleActions(summary: appModel.nextGenSummary)
+        NextGenActionChipsPresentation.visibleActions(snapshot: appModel.engine.nextGen.current)
     }
 
     private var hasMore: Bool {
-        NextGenActionChipsPresentation.hasMore(summary: appModel.nextGenSummary)
+        NextGenActionChipsPresentation.hasMore(snapshot: appModel.engine.nextGen.current)
     }
 
     var body: some View {

@@ -4,6 +4,7 @@ import NativeAgentShared
 import PersistenceCore
 import MacIntegration
 import MacControl
+// Blueprint: | `SwiftToolDispatcher+InlineInteraction.swift` | `SwiftToolDispatcher`: `impl_request_interaction` |
 
 extension SwiftToolDispatcher {
     /// Agent raising a need HERSELF, before hitting a wall.
@@ -143,12 +144,25 @@ extension SwiftToolDispatcher {
                         where (access == nil || access?.rawValue == mode.rawValue || access == .readWrite)
                             && (mode == .read ? MacIntegrationID.supportsRead(capability) : MacIntegrationID.supportsWrite(capability)) {
                             if let refusal = permissions.readiness.refusal(integration: capability, mode: mode) {
-                                return failed("operator_permission_off", refusal)
+                                return ChatToolOutcome.failure(error: ToolFailureError(refusal, effects: .none,
+                                    owner: "security/mac_integration_permissions.json \(capability).\(mode.rawValue)",
+                                    tap: "Trust > Mac > Apps and features > \(MacIntegrationID.displayName(for: capability)) > \(mode.rawValue.capitalized)",
+                                    personDecides: true, code: "operator_permission_off", status: .refused,
+                                    instruction: "Only the owner can enable this switch."), tool: InlineInteractionWire.toolName)
                             }
                             if !permissions.allows(capability, mode: mode) { integrationAllowed = false }
                         }
                     }
-                } catch { return failed("permission_settings_unavailable", "Mac permission settings could not be read; the saved switch must be available before requesting access.") }
+                } catch {
+                    let file = dataRoot.appendingPathComponent("security/mac_integration_permissions.json")
+                    return ChatToolOutcome.failure(error: ToolFailureError(
+                        "Saved Mac Integration permissions could not be read: \(error.localizedDescription)",
+                        effects: .none, owner: file.path,
+                        code: "permission_settings_unavailable",
+                        instruction: ToolFailureError.fileRepairInstruction(file,
+                            shape: "The store is a JSON object: known integration entries are objects and any saved read/write axis must be Boolean; _operatorOverrides holds explicit per-axis choices and _mutationReceipts is an array of provenance receipts. Preserve all entries, grants, revocations and receipts; never invent a value, fill an absent axis or grant a missing permission.") + " Repair the saved permission store from its retained bytes before requesting access; preserve the owner's choices."),
+                        tool: InlineInteractionWire.toolName)
+                }
             }
             for capability in capabilities {
                 guard let bundleID = SystemAppleScriptAdapter.automationTarget(capability) else { continue }
@@ -184,6 +198,70 @@ extension SwiftToolDispatcher {
                 scopedToThisRequest: text("scope_noun"),
                 declineConsequence: declineConsequence
             )
+        case .apiKey where target.hasPrefix("secret:"):
+            let name = String(target.dropFirst("secret:".count))
+            func list(_ key: String) -> [String] {
+                if case .array(let rows)? = input[key] { return rows.compactMap { if case .string(let text) = $0 { text } else { nil } } }
+                return []
+            }
+            // A program is granted as the file that runs, never a name another file could take.
+            let hosts = list("hosts").compactMap(Keyring.host), programs = list("programs").compactMap(AgentHostCommandLines.resolveCommand)
+            if input["remove"] == .bool(true) {
+                let kept: Keyring.Entry?
+                do { kept = try Keyring.entry(name) } catch {
+                    return failed("unavailable", "The keyring could not be read, so whether \(name) is kept is unknown. Try again.")
+                }
+                guard kept != nil else {
+                    return .object(["status": .string("ok"), "already_done": .bool(true), "effects": .string("none"),
+                                    "summary": .string("No secret named \(name) is kept; nothing to remove.")])
+                }
+                interaction = InlineInteractionRegistry.secret(name, ask: .init(hosts: [], programs: [], remove: true),
+                                                               why: why, declineConsequence: declineConsequence)
+                break
+            }
+            guard Keyring.validName(name), !(hosts.isEmpty && programs.isEmpty),
+                  hosts.count == list("hosts").count, programs.count == list("programs").count else {
+                return failed("missing_target", "A secret is target secret:<name> (lowercase letters, digits, . _ -) with where it may go: "
+                    + "hosts [\"api.example.com\"] a request may carry it to and/or programs [\"npx\"] (a name on the login PATH or an executable's path) it may be handed to.")
+            }
+            var signIn: InlineInteraction.SecretAsk.SignIn?
+            if case .object(let fields)? = input["sign_in"] {
+                let given = JSONValue.object(fields).stringFields
+                guard fields["client_secret"] == nil else {
+                    return failed("missing_target", "A client secret never goes through you: leave it out, and the person types it on the card if the service issued one.")
+                }
+                // The card shows each address's host, and the flow goes to exactly those.
+                guard (given["authorize"] == nil) != (given["device"] == nil), let token = given["token"], let client = given["client_id"],
+                      [given["authorize"], given["device"], token].allSatisfy({ $0.map { URL(string: $0)?.scheme == "https" && URL(string: $0)?.host?.isEmpty == false } ?? true }) else {
+                    return failed("missing_target", "sign_in takes authorize (or device, for a device sign-in), token and client_id (https addresses and the service's client id), "
+                        + "and optionally scopes, redirect (a registered http://127.0.0.1:<port>/<path>) and client_auth.")
+                }
+                guard [nil, "body", "basic"].contains(given["client_auth"]) else {
+                    return failed("missing_target", "client_auth is body (the default) or basic.")
+                }
+                signIn = .init(authorize: given["authorize"], device: given["device"], token: token, clientID: client, scopes: given["scopes"], redirect: given["redirect"],
+                               clientAuth: given["client_auth"] == "basic" ? "basic" : nil)
+            }
+            let kept: Keyring.Entry?
+            do { kept = try Keyring.entry(name) } catch {
+                return failed("unavailable", "The keyring could not be read, so whether \(name) is kept is unknown. Try again.")
+            }
+            // The card shows the whole grant, which is kept exactly: where it already goes stays on it, unless
+            // only:true narrows it to what she named, and then the card says what stops.
+            let keptHosts = kept?.hosts ?? [], keptPrograms = kept?.programs.map(\.path) ?? []
+            let only = input["only"] == .bool(true)
+            let stops = only ? keptHosts.filter { !hosts.contains($0) } + keptPrograms.filter { !programs.contains($0) }.map { "program " + $0 } : []
+            // Expired, revoked or unwanted: replace asks again; the kept value stays until the new one is.
+            if input["replace"] != .bool(true), stops.isEmpty, Keyring.granted(name, hosts: hosts, programs: programs) {
+                return .object(["status": .string("ok"), "already_done": .bool(true), "effects": .string("none"),
+                    "summary": .string("Secret \(name) is already kept for \((hosts + programs.map { "program " + $0 }).joined(separator: ", "))"
+                        + "\(kept?.account.map { " (account \($0))" } ?? ""); no card is needed. "
+                        + "If it stopped working (expired, revoked) or the person wants a new one, ask again with replace:true.")])
+            }
+            interaction = InlineInteractionRegistry.secret(name, ask: .init(hosts: only ? hosts : hosts + keptHosts.filter { !hosts.contains($0) },
+                                                                            programs: only ? programs : programs + keptPrograms.filter { !programs.contains($0) },
+                                                                            signIn: signIn, stops: stops),
+                                                           why: why, declineConsequence: declineConsequence)
         case .apiKey:
             guard !target.isEmpty else {
                 return failed("missing_target", "Name the provider.")

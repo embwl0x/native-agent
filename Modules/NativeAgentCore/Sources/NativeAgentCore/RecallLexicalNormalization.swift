@@ -1,3 +1,5 @@
+// Blueprint: | `RecallLexicalNormalization.swift` | `RecallLexicalNormalization`: shared retrieval-only inflections and question-word vocabulary; canonical text and authority remain verbatim |
+
 /// Lightweight English inflection normalization for retrieval only. Never use
 /// this for canonical text, identifiers, authorization, or exact-match tools.
 /// Both sides of lexical matching use the same form; embeddings stay verbatim.

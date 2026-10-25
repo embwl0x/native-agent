@@ -5,6 +5,8 @@ import Transcripts
 import CognitiveSubstrate
 import Studio
 
+// Blueprint: | `DreamProvenance.swift` | `DreamEntryProvenance` and `DreamSourceRef`: per-claim dream support, source resolution and section-aware peer provenance |
+
 /// An original row, its known exchange, or a consolidated stretch.
 public struct DreamSourceRef: Sendable, Equatable {
     public var kind: String
@@ -40,10 +42,17 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
     private static let prefix = "<!-- claim-sources "
     private static let peersPrefix = "<!-- dream-peers "
 
+    /// A day's entry holds one peers line per dream section; the day's peers
+    /// are their union, and unknown when any section's are.
     static func peerIds(in content: String) -> [String]? {
-        guard let line = content.components(separatedBy: "\n").last(where: { $0.hasPrefix(peersPrefix) }),
-              line.hasSuffix(" -->") else { return nil }
-        return try? JSONDecoder().decode([String].self, from: Data(line.dropFirst(peersPrefix.count).dropLast(4).utf8))
+        let lines = content.components(separatedBy: "\n").filter { $0.hasPrefix(peersPrefix) }
+        // One marker per dream of the night: a dream without one leaves the
+        // whole day's peers unknown.
+        guard !lines.isEmpty, lines.count >= max(1, DreamNight(content).dreams.count) else { return nil }
+        return CognitiveReflectionCause.unionPeerIds(lines.map { line in
+            guard line.hasSuffix(" -->") else { return nil }
+            return try? JSONDecoder().decode([String].self, from: Data(line.dropFirst(peersPrefix.count).dropLast(4).utf8))
+        })
     }
 
     static func peerBlock(_ peers: [String]?) throws -> String {
@@ -107,32 +116,64 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         return material
     }
 
-    static func renderBlock(_ claims: [Self], content: String, sources: [DreamSourceRef]) throws -> String {
-        guard !content.contains("<!-- claim-sources"), !content.contains("<!-- dream-peers") else {
-            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "dream prose contains reserved claim metadata"))
-        }
-        let allowed = Set(sources.map(\.reference))
-        var result = ""
-        for claim in claims {
-            guard !claim.quote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  content.contains(claim.quote), Set(claim.sourceRefs).isSubset(of: allowed) else {
-                throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "dream claim has unbound source lineage"))
+    /// A source reference without its `@<lived date>` tail.
+    static func undated(_ reference: String) -> String {
+        reference.lastIndex(of: "@").map { String(reference[..<$0]) } ?? reference
+    }
+
+    /// Text as words: curly quotes read as straight ones and runs of whitespace as one space.
+    static func plain(_ text: String) -> String {
+        let straight = text.map { char -> Character in
+            switch char {
+            case "\u{201C}", "\u{201D}", "\u{201E}", "\u{00AB}", "\u{00BB}": return "\""
+            case "\u{2018}", "\u{2019}", "\u{201A}", "\u{2032}": return "'"
+            default: return char
             }
-            let data = try JSONEncoder().encode(claim)
+        }
+        return String(straight).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    /// The claims her prose backs, as lineage lines. A claim the prose or the dream's reading
+    /// does not back is left without lineage and named in `dropped`; it never costs the night.
+    static func renderBlock(_ claims: [Self], content: String, sources: [DreamSourceRef], dropped: inout [String]) throws -> String {
+        guard !content.contains("<!-- claim-sources"), !content.contains("<!-- dream-peers") else {
+            throw NSError(domain: "NativeAgent.DreamEntryProvenance", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                "The dream's claim check refused the model's reply: its prose contains the reserved markers <!-- claim-sources or <!-- dream-peers. Nothing was written; the night stays owed and the next run retries it."])
+        }
+        // The model cites a source by its identity; the @date tail it may leave
+        // off or misquote. What is kept is the dream's own reference and date.
+        let canonical = Dictionary(sources.map { (undated($0.reference), $0.reference) }, uniquingKeysWith: { first, _ in first })
+        var result = ""
+        for (index, claim) in claims.enumerated() {
+            let quote = "claims[\(index)] \"" + String(claim.quote.prefix(80)) + "\""
+            guard !claim.quote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { dropped.append("claims[\(index)] has an empty quote"); continue }
+            // A quote is the same words whatever the typography: curly or straight quotes, spacing.
+            guard plain(content).contains(plain(claim.quote)) else { dropped.append(quote + " is not in the dream's prose"); continue }
+            let unbound = claim.sourceRefs.filter { canonical[undated($0)] == nil }
+            guard unbound.isEmpty else {
+                dropped.append(quote + " cites sources this dream did not read: " + unbound.prefix(5).joined(separator: ", "))
+                continue
+            }
+            var admitted = claim
+            admitted.sourceRefs = claim.sourceRefs.compactMap { canonical[undated($0)] }
+            let data = try JSONEncoder().encode(admitted)
             result += "\(prefix)\(String(decoding: data, as: UTF8.self)) -->\n"
         }
         return result
     }
 
+    /// Each dream section of a day's entry (split at its `## ` heading) ends
+    /// with its own claim lines; only that trailing block of each is read.
     static func sources(for quote: String? = nil, in content: String) -> [String] {
         var refs = Set<String>()
-        for line in content.trimmingCharacters(in: .newlines).components(separatedBy: "\n").reversed() {
-            guard line.hasPrefix(prefix), line.hasSuffix(" -->") else { break }
-            let json = line.dropFirst(prefix.count).dropLast(4)
-            guard let claim = try? JSONDecoder().decode(Self.self, from: Data(json.utf8)),
-                  quote == nil || claim.quote.trimmingCharacters(in: .whitespacesAndNewlines)
-                    == quote?.trimmingCharacters(in: .whitespacesAndNewlines) else { continue }
-            refs.formUnion(claim.sourceRefs)
+        for section in content.components(separatedBy: "\n## ") {
+            for line in section.trimmingCharacters(in: .newlines).components(separatedBy: "\n").reversed() {
+                guard line.hasPrefix(prefix), line.hasSuffix(" -->") else { break }
+                let json = line.dropFirst(prefix.count).dropLast(4)
+                guard let claim = try? JSONDecoder().decode(Self.self, from: Data(json.utf8)),
+                      quote == nil || plain(claim.quote) == quote.map(plain) else { continue }
+                refs.formUnion(claim.sourceRefs)
+            }
         }
         // Historical diary-wide refs recover material, never support a quoted claim.
         if quote == nil {

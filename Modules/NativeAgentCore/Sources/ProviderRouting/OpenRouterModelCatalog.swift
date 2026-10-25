@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `OpenRouterModelCatalog.swift` | `OpenRouterModelCatalog`: live-backed model availability, capability parsing and checked catalog cache through shared TTL machinery |
+
 public struct ProviderModelDescriptor: Sendable, Equatable {
     public var id: String
     public var name: String
@@ -74,7 +76,8 @@ public enum OpenRouterModelCatalog {
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
         readCache: { readDecodedCache(dataRoot: $0) },
-        fetchLive: { try await fetchLiveModels(dataRoot: $0, session: $1) }
+        providerConfigFile: "openrouter.json",
+        fetchLive: { try await fetchLiveModels(key: $0, session: $1) }
     )
 
     public static func models(
@@ -189,7 +192,7 @@ public enum OpenRouterModelCatalog {
     }
 
     private static func fetchLiveModels(
-        dataRoot: URL,
+        key: String?,
         session: URLSession
     ) async throws -> ModelCatalogFetch {
         var request = URLRequest(url: endpoint)
@@ -197,10 +200,7 @@ public enum OpenRouterModelCatalog {
         request.timeoutInterval = 10
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("NativeAgent", forHTTPHeaderField: "X-Title")
-        if let key = LLMCredentialResolver.resolveAPIKey(
-            providerConfigFile: "openrouter.json",
-            dataRoot: dataRoot
-        ) {
+        if let key {
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }
 

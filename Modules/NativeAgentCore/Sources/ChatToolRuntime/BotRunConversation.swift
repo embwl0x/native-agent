@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import StandingBots
+// Blueprint: | `BotRunConversation.swift` | `BotRunConversation` enum; `enqueueRequestedCheck`, `dispatch` |
 
 /// A return address for a deliberately requested check, not a bot scheduler or
 /// second conversation. The canonical queue and shelf remain execution truth.

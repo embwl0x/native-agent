@@ -1,5 +1,6 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import os
 import ApprovalInbox
 import Cognition
@@ -12,6 +13,7 @@ import PersistenceCore
 import Desk
 import ProviderRouting
 import Transcripts
+// Blueprint: | `MacSyncActionRouter.swift` | `MacSyncActionRouter` struct; `surfaceSelection`; approval, memory and inbox mutations return affected canonical records/removals for the shared phone projection; no complete inbox or memory lists in action replies; readback revisions are captured on the Mac before the canonical read |
 
 @MainActor
 struct MacSyncActionRouter {
@@ -62,6 +64,7 @@ struct MacSyncActionRouter {
             "status": "ok",
             "ok": "true",
             "surface": surface,
+            "surfaces": ProviderSurfaceGroups.members(of: surface).joined(separator: ","),
             "provider_id": providerID,
             "model": model,
             "reasoning_effort": reasoningEffort,
@@ -188,6 +191,10 @@ struct MacSyncActionRouter {
             || ["cancelApproval", "inboxAction", "app_settings", "app_setting_set", "chat_history_page", "set_trust_policy", "pairDevice", "disconnect_telegram", "set_telegram_settings", "set_mac_integration_permission"].contains(action.action)
             || ["get_helper", "save_helper", "pause_helper", "run_helper", "get_agent_thread", "send_agent_message", "steerChat"].contains(action.action)
             || ["configure_provider_secret", "start_provider_sign_in", "interaction_action", "registerPushToken"].contains(action.action)
+            || ["createDeskItem", "setDeskItemStatus", "appendDeskItemNote", "submitWorkshopTask", "submitMission", "deleteMemory"].contains(action.action)
+            || ["registerWorkActivity", "recordNotificationReceipt", "cancelChat", "unpinChatSession", "mac_control"].contains(action.action)
+            || ["configure_provider", "test_provider", "clear_provider", "set_active_provider", "set_surface_model", "configure_surface_selection"].contains(action.action)
+            || ["set_connector_enabled", "disconnect_connector"].contains(action.action)
         if let message = await sync.pairedPhones.authorize(action, requiresPairing: requiresDevice) {
             sync.engine.syncError = message
             return ["status": "error", "ok": "false", "code": "device_not_verified", "message": message]
@@ -344,25 +351,19 @@ struct MacSyncActionRouter {
             case "approveMemoryProposal":
                 let proposalId = payload["proposalId"] ?? ""
                 let record = try await api.acceptMemoryProposal(proposalID: proposalId)
-                var result: [String: Any] = [
-                    "ok": true, "id": record.id, "text": record.text, "createdAt": record.createdAt,
-                ]
-                if let v = record.layer { result["layer"] = v }
-                if let v = record.updatedAt { result["updatedAt"] = v }
-                if let v = record.status { result["status"] = v }
-                if let v = record.sourceRunId { result["sourceRunId"] = v }
-                return stringifyResponse(result, fallbackStatus: "ok")
+                return try await memoryActionResponse(["ok": "true", "status": "ok"],
+                    memoryID: record.id, proposalID: proposalId, api: api)
 
             case "rejectMemoryProposal":
                 let proposalId = payload["proposalId"] ?? ""
                 try await api.rejectMemoryProposal(proposalID: proposalId, reason: "Rejected via iOS")
-                return observed(stringifyResponse(["ok": true, "id": proposalId, "status": "rejected"], fallbackStatus: "ok"))
+                return observed(try await memoryActionResponse(["ok": "true", "status": "rejected"], proposalID: proposalId, api: api))
 
             case "deleteMemory":
                 let memoryId = payload["memoryId"] ?? payload["id"] ?? ""
                 guard !memoryId.isEmpty else { return observed(["status": "error", "message": "Missing memoryId"]) }
                 try await api.deleteMemory(id: memoryId)
-                return observed(stringifyResponse(["status": "ok"], fallbackStatus: "ok"))
+                return observed(try await memoryActionResponse(["status": "ok", "ok": "true"], memoryID: memoryId, api: api))
 
             case "approvePromotion", "rejectPromotion":
                 return observed(["status": "error", "message": "Training promotion is no longer available."])
@@ -378,7 +379,7 @@ struct MacSyncActionRouter {
                         decidedBy: "ios_signed_operator"
                     )
                 )
-                return approvalActionResponse(approvalRecordToDict(row), approvalId: approvalId, fallbackStatus: "approved")
+                return try await approvalActionResponse(row, approvalId: approvalId, fallbackStatus: "approved")
 
             case "rejectApproval":
                 let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
@@ -391,7 +392,7 @@ struct MacSyncActionRouter {
                         decidedBy: "ios_signed_operator"
                     )
                 )
-                return observed(approvalActionResponse(approvalRecordToDict(row), approvalId: approvalId, fallbackStatus: "rejected"))
+                return observed(try await approvalActionResponse(row, approvalId: approvalId, fallbackStatus: "rejected"))
 
             case "cancelApproval":
                 let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
@@ -404,7 +405,7 @@ struct MacSyncActionRouter {
                         decidedBy: "ios_signed_operator"
                     )
                 )
-                return observed(approvalActionResponse(approvalRecordToDict(row), approvalId: approvalId, fallbackStatus: "canceled"))
+                return observed(try await approvalActionResponse(row, approvalId: approvalId, fallbackStatus: "canceled"))
 
             case "interaction_action":
                 guard action.payload.count == 1,
@@ -423,14 +424,11 @@ struct MacSyncActionRouter {
                 guard !itemId.isEmpty else { return ["status": "error", "message": "Missing inbox item id"] }
                 guard !actionId.isEmpty else { return ["status": "error", "message": "Missing inbox action"] }
                 if itemId.hasPrefix("interaction:"), actionId == "act" {
-                    return try await api.interactionAction(payload: ["action": "open", "itemID": itemId],
+                    let response = try await api.interactionAction(payload: ["action": "open", "itemID": itemId],
                         actionID: action.msgId, clientID: action.clientId)
+                    return try await inboxActionResponse(response, itemID: itemId, api: api)
                 }
-                let nativeActions: Set<String> = ["read", "archive", "dismiss", "act", "reply", "approve", "reject", "repair", "open_approvals"]
-                let normalizedAction = actionId == "deny" ? "reject" : actionId
-                let endpointAction = nativeActions.contains(normalizedAction)
-                    || (itemId.hasPrefix("interaction:") && normalizedAction.hasPrefix("interaction_choice_"))
-                    ? normalizedAction : "act"
+                let endpointAction = InboxActionVocabulary.routedAction(actionId, itemID: itemId)
                 if (endpointAction == "approve" || endpointAction == "reject"), !itemId.hasPrefix("interaction:") {
                     let row = try await api.resolveApproval(
                         id: itemId,
@@ -440,19 +438,19 @@ struct MacSyncActionRouter {
                             decidedBy: "ios_signed_operator"
                         )
                     )
-                    return observed(approvalActionResponse(
-                        approvalRecordToDict(row),
+                    return observed(try await inboxActionResponse(approvalActionResponse(
+                        row,
                         approvalId: itemId,
                         fallbackStatus: endpointAction == "approve" ? "approved" : "rejected"
-                    ))
+                    ), itemID: itemId, api: api))
                 }
                 try await api.inboxAction(itemId, action: endpointAction)
-                return observed([
+                return observed(try await inboxActionResponse([
                     "status": "ok",
                     "ok": "true",
                     "itemId": itemId,
                     "actionId": actionId,
-                ])
+                ], itemID: itemId, api: api))
 
             case "inboxReply":
                 // Compatibility boundary for older iOS builds/cards only.
@@ -579,16 +577,16 @@ struct MacSyncActionRouter {
                     }
                     // A Stop that names its runs is the Mac's own Stop when one
                     // of them is in flight here, from whichever door started it:
-                    // the shared turn owner stops the runs in flight on the
-                    // session (never a later one). A named run not yet here is
-                    // held against its id — registration cancels it — and that
-                    // is said as pending, never as a stop that happened.
+                    // the shared turn owner keeps those exact requested ids
+                    // through the marker write (never a later run). A named
+                    // run not yet here is held against its id — registration
+                    // cancels it — and that is said as pending, never as a stop that happened.
                     let runIDs = Self.cancelChatRunIDs(from: payload)
                     let cancelOutcome = cancelChatTask(safeSessionId, runIDs)
                     let stopsHere = runIDs.isEmpty
                         ? cancelOutcome == .cancelled || cancelOutcome == .noActiveTask
                         : !ChatCancelFlag.inFlightRunIDs().isDisjoint(with: runIDs)
-                    if stopsHere { _ = try await api.cancelChatSession(sessionId: safeSessionId) }
+                    if stopsHere { _ = try await api.cancelChatSession(sessionId: safeSessionId, runIDs: runIDs) }
                     guard stopsHere || cancelOutcome == .cancelled || runIDs.isEmpty else {
                         return observed([
                             "status": "pending",
@@ -754,13 +752,15 @@ struct MacSyncActionRouter {
                         "Surface selection did not recover a complete tuple"
                     )
                 }
-                return observed(Self.canonicalSurfaceSelectionResponse(
+                var response = Self.canonicalSurfaceSelectionResponse(
                     surface: request.surface,
                     providerID: providerID,
                     model: preference.model,
                     reasoningEffort: preference.reasoningEffort,
                     serviceTier: preference.serviceTier
-                ))
+                )
+                response["modelReadbackRevision"] = String(recovered.revision)
+                return observed(response)
 
             case "mac_control":
                 return try await api.remoteMacControl(payload: payload)
@@ -799,6 +799,28 @@ struct MacSyncActionRouter {
             out["status"] = out["status"] ?? fallbackStatus
         }
         return out
+    }
+
+    private func inboxActionResponse(_ response: [String: String], itemID: String, api: any DeviceSyncHost) async throws -> [String: String] {
+        var response = response
+        response["inboxReadbackRevision"] = String(Date().timeIntervalSince1970)
+        let read = await api.workOverview()
+        response["inboxItemId"] = itemID
+        response["inboxItemJSON"] = String(decoding: try JSONEncoder().encode(read.inbox.get().first { $0.id == itemID }), as: UTF8.self)
+        return response
+    }
+
+    private func memoryActionResponse(_ response: [String: String], memoryID: String? = nil,
+                                      proposalID: String? = nil, api: any DeviceSyncHost) async throws -> [String: String] {
+        var response = response
+        response["memoryReadbackRevision"] = String(Date().timeIntervalSince1970)
+        response["resolvedProposalId"] = proposalID
+        if let memoryID {
+            let row = try await api.activeMemories().first { $0.id == memoryID }.map(MemoryRecord.init(phoneRow:))
+            response["memoryId"] = memoryID
+            response["memoryJSON"] = String(decoding: try JSONEncoder().encode(row), as: UTF8.self)
+        }
+        return response
     }
 
     private func approvalRecordToDict(_ row: ApprovalRecord) -> [String: Any] {
@@ -846,8 +868,13 @@ struct MacSyncActionRouter {
         return dict
     }
 
-    private func approvalActionResponse(_ result: [String: Any], approvalId: String, fallbackStatus: String) -> [String: String] {
+    private func approvalActionResponse(_ row: ApprovalRecord, approvalId: String, fallbackStatus: String) async throws -> [String: String] {
+        let result = approvalRecordToDict(row)
         var out = stringifyResponse(result, fallbackStatus: fallbackStatus)
+        out["approvalReadbackRevision"] = String(Date().timeIntervalSince1970)
+        let projection = await sync.host.workOverview()
+        let canonical = try projection.approvals.get().first { $0.id == approvalId }
+        out["approvalJSON"] = String(decoding: try JSONEncoder().encode(canonical), as: UTF8.self)
         out["approvalId"] = approvalId
         if let error = result["error"] as? String, !error.isEmpty {
             out["message"] = error

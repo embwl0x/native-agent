@@ -4,6 +4,7 @@ import GRPCNIOTransportHTTP2TransportServices
 import GRPCProtobuf
 import SwiftProtobuf
 import PersistenceCore
+// Blueprint: | `AgentA2AGRPC.swift` | `AgentA2AGRPC` enum; `send`; each streaming request retains its live-update forwarder and closes/cancels it on exit or cancellation |
 
 /// The protobuf binding projects the existing canonical ProtoJSON requests and
 /// receipts. Task ownership, continuation and stream recovery stay with A2A.
@@ -99,15 +100,20 @@ enum AgentA2AGRPC {
     ) async throws -> AgentPeerHTTP.Response {
         guard let interface = request.streamInterface else { throw AgentPeerHTTP.TransportError.invalidRequest }
         let liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?
+        let forwarder: Task<Void, Never>?
         if let liveUpdate {
             let (updates, feed) = AsyncStream.makeStream(of: AgentA2AStream.LiveUpdate.self, bufferingPolicy: .bufferingNewest(1))
             liveFeed = feed
-            Task {
-                for await update in updates { await liveUpdate(update) }
+            forwarder = Task {
+                for await update in updates {
+                    guard !Task.isCancelled else { return }
+                    await liveUpdate(update)
+                }
             }
-        } else { liveFeed = nil }
-        defer { liveFeed?.finish() }
-        return try await client.serverStreaming(request: ClientRequest(message: Input(jsonString: json), metadata: metadata),
+        } else { liveFeed = nil; forwarder = nil }
+        defer { liveFeed?.finish(); forwarder?.cancel() }
+        return try await withTaskCancellationHandler {
+          try await client.serverStreaming(request: ClientRequest(message: Input(jsonString: json), metadata: metadata),
             descriptor: descriptor(method), serializer: ProtobufSerializer<Input>(),
             deserializer: ProtobufDeserializer<Lf_A2a_V1_StreamResponse>(), options: options) { response in
                 var bytes = 0
@@ -130,5 +136,9 @@ enum AgentA2AGRPC {
                 }
                 return AgentPeerHTTP.Response(statusCode: 200, json: nil, receipt: .success(accumulator.receipt))
             }
+        } onCancel: {
+            liveFeed?.finish()
+            forwarder?.cancel()
+        }
     }
 }

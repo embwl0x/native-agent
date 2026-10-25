@@ -1,6 +1,8 @@
 import AppToolRuntime
 import SwiftUI
 
+// Blueprint: | `ThinkingGlow.swift` | `ThinkingGlow`: leaf-layer working shimmer and composer rim driven by turn state, fading when reply text begins |
+
 // "Alive glass" (User, 2026-09-23): while she is working on a turn and has not
 // started her reply, light moves in the glass — a caustic shimmer in the
 // composer and the rail, and a line of light travelling round the composer's

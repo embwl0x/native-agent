@@ -2,6 +2,7 @@ import Foundation
 import PersistenceCore
 import NativeAgentShared
 import TelegramBot
+// Blueprint: | `EngineTelegram+Reply.swift` | Telegram reply delivery and result models |
 
 public struct TelegramTestResponse: Codable, Hashable, Sendable {
     public var ok: Bool

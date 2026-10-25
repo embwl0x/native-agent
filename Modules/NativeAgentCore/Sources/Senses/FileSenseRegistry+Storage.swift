@@ -2,6 +2,7 @@ import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `FileSenseRegistry+Storage.swift` | Registry validation, candidate/version-folder source resolution, bounded code manifests and path/symlink fences |
 
 extension FileSenseRegistry {
     static func decode(_ value: JSONValue) throws -> Store {
@@ -87,7 +88,7 @@ extension FileSenseRegistry {
               record.createdAt.timeIntervalSince1970.isFinite,
               record.enabledAt?.timeIntervalSince1970.isFinite != false,
               record.lastUsedAt?.timeIntervalSince1970.isFinite != false,
-              record.disabledBy == nil || ["owner", "agent"].contains(record.disabledBy!),
+              record.disabledBy == nil || CapabilityLifecycle.offActors.contains(record.disabledBy!),
               let corner = SenseCorner(key: record.corner.key), corner == record.corner,
               version.files.count <= 128,
               Set(version.files.map { $0.precomposedStringWithCanonicalMapping.lowercased() }).count == version.files.count else {

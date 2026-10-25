@@ -1,9 +1,12 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import CognitiveSubstrate
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import Desk
+// Blueprint: | `CognitionHost.swift` | Native cognition reach, including the sender-owned phone notification target count and root-bound pure readout-face invocation; domain facts and canonical commits remain outside editable code |
 
 /// Concrete tool and chat clients composed by the app for a Studio hour.
 public protocol StudioWanderClientPort: Sendable {
@@ -23,6 +26,8 @@ public protocol BackgroundWorkLeasing: Sendable {
 /// background LLM client and trust gate, the dream action, the scheduler's
 /// jobs file, morning briefs and her Studio hour.
 public protocol CognitionHost: Sendable {
+    func phoneNotificationTargetCount(dataRoot: URL) async throws -> Int
+    func readoutFace(id: String, input: JSONValue, version: String, dataRoot: URL) async -> PartCallResult<PartFace>
     /// The user's declared quiet hours, as the attention router reads them.
     func inQuietHours(at date: Date, dataRoot: URL) -> Bool
     /// Routes one informational shoulder tap; the delivery it knocked by, or
@@ -45,4 +50,6 @@ public protocol CognitionHost: Sendable {
     func archiveSupersededMorningBriefs(dataRoot: URL) async
     /// The platform-backed clients her Core-owned Studio hour calls.
     func studioWanderClient(dataRoot: URL, usesLiveAppBody: Bool) -> any StudioWanderClientPort
+    /// Native source selection enters the engine's ordinary originating door.
+    func callReadPart(id: String, input: JSONValue, actions: Set<String>, dataRoot: URL, origin: String) async throws -> JSONValue
 }

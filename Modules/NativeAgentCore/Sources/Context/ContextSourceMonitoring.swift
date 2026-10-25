@@ -1,6 +1,7 @@
-import Darwin
-import Dispatch
 import Foundation
+import PersistenceCore
+
+// Blueprint: | `ContextSourceMonitoring.swift` | `ContextSourceRegistry`, monitor and coalescer: explicit source allowlists, owner inventories and bounded directory invalidations |
 
 public struct ContextSourceRegistration: Sendable, Equatable {
     public let descriptor: ContextSourceDescriptor
@@ -189,53 +190,6 @@ public struct ContextDirectoryEvent: Sendable, Equatable {
         self.observedAt = observedAt
     }
 
-    public var requiresRearm: Bool {
-        let flags = DispatchSource.FileSystemEvent(rawValue: rawFlags)
-        return !flags.intersection([.delete, .rename, .revoke]).isEmpty
-    }
-}
-
-private final class ContextDirectoryWatch: @unchecked Sendable {
-    let directory: URL
-    private let source: DispatchSourceFileSystemObject
-    private let descriptor: Int32
-
-    init(
-        directory: URL,
-        queue: DispatchQueue,
-        handler: @escaping @Sendable (ContextDirectoryEvent) -> Void
-    ) throws {
-        let descriptor = open(directory.path, O_EVTONLY)
-        guard descriptor >= 0 else {
-            throw CocoaError(.fileReadNoSuchFile)
-        }
-        self.directory = directory
-        self.descriptor = descriptor
-        self.source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: descriptor,
-            eventMask: [.write, .delete, .rename, .extend, .attrib, .link, .revoke],
-            queue: queue
-        )
-        source.setEventHandler { [weak source] in
-            guard let source else { return }
-            handler(ContextDirectoryEvent(
-                directory: directory,
-                rawFlags: source.data.rawValue
-            ))
-        }
-        source.setCancelHandler {
-            close(descriptor)
-        }
-        source.resume()
-    }
-
-    func cancel() {
-        source.cancel()
-    }
-
-    deinit {
-        source.cancel()
-    }
 }
 
 /// Process-owned directory watcher group. It emits only dirty-directory
@@ -243,30 +197,37 @@ private final class ContextDirectoryWatch: @unchecked Sendable {
 public actor ContextSourceMonitor {
     public typealias EventHandler = @Sendable (ContextDirectoryEvent) async -> Void
 
-    private let queue = DispatchQueue(label: "NativeAgent.ContextSourceMonitor", qos: .utility)
     private let handler: EventHandler
-    private var watches: [URL: ContextDirectoryWatch] = [:]
+    private var watches: [URL: FileChangeWatcher] = [:]
+    private let events: AsyncStream<ContextDirectoryEvent>
+    private let continuation: AsyncStream<ContextDirectoryEvent>.Continuation
+    private var delivery: Task<Void, Never>?
+    private var stopped = false
 
     public init(handler: @escaping EventHandler) {
         self.handler = handler
+        (events, continuation) = AsyncStream.makeStream()
     }
 
     public func setDirectories(_ directories: [URL]) {
+        guard !stopped else { return }
+        if delivery == nil {
+            delivery = Task { [events, handler] in
+                for await event in events {
+                    guard !Task.isCancelled else { return }
+                    await handler(event)
+                }
+            }
+        }
         let desired = Set(directories.map { $0.standardizedFileURL.resolvingSymlinksInPath() })
         for (directory, watch) in watches where !desired.contains(directory) {
             watch.cancel()
             watches[directory] = nil
         }
         for directory in desired.sorted(by: { $0.path < $1.path }) where watches[directory] == nil {
-            guard FileManager.default.fileExists(atPath: directory.path) else { continue }
-            guard let watch = try? ContextDirectoryWatch(
-                directory: directory,
-                queue: queue,
-                handler: { [handler] event in
-                    Task { await handler(event) }
-                }
-            ) else { continue }
-            watches[directory] = watch
+            watches[directory] = FileChangeWatcher(paths: [directory], eventHandler: { [continuation] path, flags in
+                continuation.yield(ContextDirectoryEvent(directory: path, rawFlags: flags.rawValue))
+            })
         }
     }
 
@@ -274,14 +235,15 @@ public actor ContextSourceMonitor {
         watches.keys.sorted { $0.path < $1.path }
     }
 
-    public func invalidateWatch(for directory: URL) {
-        let directory = directory.standardizedFileURL
-        watches.removeValue(forKey: directory)?.cancel()
-    }
-
-    public func stop() {
+    public func stop() async {
+        stopped = true
         for watch in watches.values { watch.cancel() }
         watches.removeAll()
+        continuation.finish()
+        let active = delivery
+        active?.cancel()
+        await active?.value
+        delivery = nil
     }
 }
 
@@ -289,11 +251,12 @@ public actor ContextSourceMonitor {
 public actor ContextSourceEventCoalescer {
     public typealias FlushHandler = @Sendable (Set<URL>) async -> Void
 
-    private let delayNanoseconds: UInt64
+    private let delay: Duration
     private let handler: FlushHandler
     private var dirtyDirectories: Set<URL> = []
-    private var pendingFlush: Task<Void, Never>?
-    private var flushGeneration: UInt64 = 0
+    private var timer = StoreReloadDebouncer.Timer()
+    private var activeFlush: Task<Void, Never>?
+    private var closed = false
 
     public init(
         delay: Duration = .milliseconds(150),
@@ -304,54 +267,54 @@ public actor ContextSourceEventCoalescer {
         let attoseconds = max(0, components.attoseconds)
         let nanosFromSeconds = UInt64(clamping: seconds) * 1_000_000_000
         let nanosFromAttoseconds = UInt64(clamping: attoseconds / 1_000_000_000)
-        self.delayNanoseconds = nanosFromSeconds &+ nanosFromAttoseconds
+        self.delay = .nanoseconds(nanosFromSeconds &+ nanosFromAttoseconds)
         self.handler = handler
     }
 
     public func enqueue(_ directory: URL) {
+        guard !closed else { return }
         dirtyDirectories.insert(directory.standardizedFileURL)
-        flushGeneration &+= 1
-        let expectedGeneration = flushGeneration
-        pendingFlush?.cancel()
-        let delayNanoseconds = self.delayNanoseconds
-        pendingFlush = Task { [weak self] in
-            if delayNanoseconds > 0 {
-                do {
-                    try await Task.sleep(nanoseconds: delayNanoseconds)
-                } catch {
-                    return
-                }
-            }
-            guard !Task.isCancelled else { return }
+        timer.schedule(delay: delay) { [weak self] expectedGeneration in
             await self?.scheduledFlushFired(expectedGeneration)
         }
     }
 
     public func flush() async {
-        flushGeneration &+= 1
-        let scheduledFlush = pendingFlush
-        pendingFlush = nil
-        scheduledFlush?.cancel()
-        await deliverDirtyDirectories()
+        guard !closed else { return }
+        timer.cancel()
+        await activeFlush?.value
+        deliverDirtyDirectories()
+        await activeFlush?.value
     }
 
-    private func scheduledFlushFired(_ expectedGeneration: UInt64) async {
-        guard expectedGeneration == flushGeneration else { return }
-        pendingFlush = nil
-        await deliverDirtyDirectories()
+    private func scheduledFlushFired(_ expectedGeneration: UInt64) {
+        guard !closed, timer.take(expectedGeneration) else { return }
+        // A running build finishes; these directories go right after it.
+        deliverDirtyDirectories()
     }
 
-    private func deliverDirtyDirectories() async {
+    private func deliverDirtyDirectories() {
+        guard !closed, activeFlush == nil else { return }
         let directories = dirtyDirectories
         dirtyDirectories.removeAll()
         guard !directories.isEmpty else { return }
-        await handler(directories)
+        // Retain the handler after the debounce fires. A newer burst waits for
+        // it and goes next; only shutdown cancels a running build.
+        activeFlush = Task {
+            if !Task.isCancelled { await handler(directories) }
+            activeFlush = nil
+            if !timer.isPending { deliverDirtyDirectories() }
+        }
     }
 
-    public func cancel() {
-        flushGeneration &+= 1
-        pendingFlush?.cancel()
-        pendingFlush = nil
+    public func cancel() async {
+        closed = true
+        let pending = timer.cancel()
+        let active = activeFlush
+        active?.cancel()
         dirtyDirectories.removeAll()
+        await pending?.value
+        await active?.value
+        activeFlush = nil
     }
 }

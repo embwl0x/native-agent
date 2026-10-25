@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `SomaticSignalValence.swift` | `SomaticSignalKind` intrinsic valence: one per-kind table shared by signal adaptation and organism field defaults |
+
 /// Single source of truth for a signal kind's intrinsic valence.
 ///
 /// Two per-kind valence tables used to drift (audit C10): the event→signal

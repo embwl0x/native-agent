@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `REMGrowthEvictionHistory.swift` | `REMGrowthEvictionHistory`: durable original approved-growth eviction records, proposal references and pending reconciliation |
+
 // MARK: - GROWTH eviction history (item 5)
 //
 // GROWTH.md eviction used to be a one-way door: the oldest ~5,000 characters of

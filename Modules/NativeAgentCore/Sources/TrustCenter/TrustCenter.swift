@@ -1,10 +1,13 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TrustCenter.swift` | Checked policy object and preserved damaged-policy bytes, with backup/export/live-policy phone/Trust privacy decisions; `getTrust`, `applyPolicyPatchChecked` |
 
 // MARK: - Subsystem #12: TrustCenter
 //
-// Swift-native implementation owns the trust policy store.
+// Owns trust/policy.json (checked JSON object) and byte-preserved
+// policy.unavailable-<UUID>.json recovery evidence. Both are backed up and
+// exported; phone sync carries only the live policy. PrivacyMap lists Trust.
 //
 // TrustCenter is the Swift-owned permission and policy store. It governs
 // surface-specific autonomy (Full Mac, Telegram, Slack, iOS remote, shell,

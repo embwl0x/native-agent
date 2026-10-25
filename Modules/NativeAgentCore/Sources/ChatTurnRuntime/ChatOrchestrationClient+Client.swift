@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import ChatToolParsing
 import Foundation
 import CryptoKit
@@ -6,36 +7,30 @@ import PersistenceCore
 import TurnTrace
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
+// Blueprint: | `ChatOrchestrationClient+Client.swift` | `SwiftNativeChatOrchestrationClient` actor; `chat`, `chatExecution`; `StructuredChatExecution` carries the response and typed success/failure; `withCurrentChatModel` admits the current Chat pick at a wake's `model.call`, so a run that never thinks needs no model; `withModelContext` binds the same client/provider/model/effort/tier for turns and wakes |
 
 // MARK: - SwiftNative impl
 
 struct StructuredChatExecution: Sendable {
-    let response: ChatResponse
-    let turn: TurnEngineResult
+    var response: ChatResponse
+    let turn: Result<TurnEngineResult, any Error>
+
+    func responseOrThrow() throws -> ChatResponse {
+        _ = try turn.get()
+        return response
+    }
 }
 
 /// SwiftNative ChatOrchestrationClient — composes the in-process Swift
 /// building blocks into a single chat()/chatStream() surface.
 public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
-    /// See the protocol requirement: the turn started the promotion after its
-    /// assistant append; the surface that delivered the reply drains it here.
-    /// OPTIONAL, and starts nothing — no ticket, so this only awaits what is
-    /// already running and can never adopt a concurrent turn's pending capture
-    /// (Astra comb 3 review, findings 1 and 2, 2026-09-12).
-    public func drainDeferredMemoryPromotion() async {
-        await engine.awaitDeferredMemoryPromotion()
-    }
-
     let engine: SwiftNativeTurnEngine
     let tools: any ToolDispatchClient
     let llm: any LLMClient
@@ -54,11 +49,18 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
     let autocompactionConfig: ChatSessionAutocompactionConfig
     let clock: @Sendable () -> Date
 
-    /// Parts waking between turns use the same client and checked Chat pick.
+    /// Parts waking between turns use the same client and checked Chat pick,
+    /// read at each `model.call`: a run that never thinks needs no model.
     public func withCurrentChatModel<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
+        // A wake inherits no turn's model: it is chosen fresh at its model.call.
         try await ProviderTurnChoice.$current.withValue(nil) {
-        let admission = try await engine.checkedRouteAdmission(for: "chat")
-        return try await withModelContext(admission, surface: "chat", body)
+        try await LLMCallContext.$admittedModel.withValue(nil) {
+        try await LLMCallContext.$surface.withValue("chat") {
+        try await SkillRunContext.$admitModel.withValue({ call in
+            try await self.withModelContext(try await self.engine.checkedRouteAdmission(for: "chat"), surface: "chat", call)
+        }, operation: body)
+        }
+        }
         }
     }
 
@@ -94,10 +96,10 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
     ) {
         // Reuse the executable parser; malformed or unknown calls remain actions.
         RunawayOutputDetector.registerReadOnlyCalls { block in
-            let calls = ToolCallParser.parse(block, parseInvoke: true)
+            let calls = ToolCallParser.parse(block, parseInvoke: true, recordShims: false)
             guard calls.count == 1, let call = calls.first, call.undeclaredKeys.isEmpty else { return false }
             if call.name == "app" { return RunawayOutputDetector.isAppReadOnly(call.input) }
-            return ParallelToolDispatch.isParallelSafe(internalToolName: call.name)
+            return ParallelToolDispatch.isParallelSafe(internalToolName: call.name, input: call.input)
         }
         self.engine = engine
         self.tools = tools
@@ -158,13 +160,13 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         surface: String,
         suppressUserAppend: Bool
     ) async throws -> ChatResponse {
-        return try await _chat(
+        return try await chatExecution(
             message: message, sessionId: sessionId, model: model,
             reasoningEffort: reasoningEffort, fileAccess: fileAccess,
             attachments: attachments, persona: persona, surface: surface,
             suppressUserAppend: suppressUserAppend,
             progress: nil
-        )
+        ).responseOrThrow()
     }
 
     public func chat(
@@ -179,13 +181,13 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         suppressUserAppend: Bool,
         progress: ChatOrchestrationProgressHandler?
     ) async throws -> ChatResponse {
-        return try await _chat(
+        return try await chatExecution(
             message: message, sessionId: sessionId, model: model,
             reasoningEffort: reasoningEffort, fileAccess: fileAccess,
             attachments: attachments, persona: persona, surface: surface,
             suppressUserAppend: suppressUserAppend,
             progress: progress
-        )
+        ).responseOrThrow()
     }
 
     public func chat(
@@ -198,16 +200,16 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         persona: String?,
         suppressUserAppend: Bool
     ) async throws -> ChatResponse {
-        return try await _chat(
+        return try await chatExecution(
             message: message, sessionId: sessionId, model: model,
             reasoningEffort: reasoningEffort, fileAccess: fileAccess,
             attachments: attachments, persona: persona, surface: "chat",
             suppressUserAppend: suppressUserAppend,
             progress: nil
-        )
+        ).responseOrThrow()
     }
 
-    private func _chat(
+    func chatExecution(
         message: String,
         sessionId: String?,
         model: String,
@@ -218,7 +220,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         surface: String,
         suppressUserAppend: Bool,
         progress: ChatOrchestrationProgressHandler?
-    ) async throws -> ChatResponse {
+    ) async throws -> StructuredChatExecution {
         // A turn that parks on a card has to be able to RECORD that it did, or
         // the tool loop's `waitForInteraction` writes to nil, the waiting
         // terminal is unreachable, and the turn ends with no final at all —
@@ -226,15 +228,11 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         // final reply" while the card sat in the conversation (2026-09-13).
         // The bot entry binds its own before calling in; a nested call keeps
         // the outer turn's execution, so this binds at most once per turn.
-        // The peer-provenance box has exactly this turn's lifetime — see
-        // PeerDataTaint. It is entered INDEPENDENTLY of the execution: piggy-
-        // backing it on the `ChatTurnExecution == nil` branch meant any caller
-        // that bound an execution first (the bot overload does) ran the whole
-        // turn with no taint box at all, so `markConsumed` latched onto
-        // nothing and the fence below it never closed.
+        // Origin steering and the answered set share this turn's lifetime,
+        // independently of whether its execution is already bound.
         if PeerDataTaint.current == nil {
             return try await PeerDataTaint.withScope {
-                try await _chat(
+                try await chatExecution(
                     message: message, sessionId: sessionId, model: model,
                     reasoningEffort: reasoningEffort, fileAccess: fileAccess,
                     attachments: attachments, persona: persona, surface: surface,
@@ -244,7 +242,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         }
         guard ChatTurnExecution.current != nil else {
             return try await ChatTurnExecution.$current.withValue(ChatTurnExecution()) {
-                try await _chat(
+                try await chatExecution(
                     message: message, sessionId: sessionId, model: model,
                     reasoningEffort: reasoningEffort, fileAccess: fileAccess,
                     attachments: attachments, persona: persona, surface: surface,
@@ -261,7 +259,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         let prefixTelemetrySink = ConversationPrefixTelemetrySink()
         return try await ConversationPrefixTelemetry.$sink.withValue(prefixTelemetrySink) {
         try await withModelContext(admission, surface: surface) {
-            let execution = try await executeStructuredChatStreaming(
+            var execution = try await executeStructuredChatStreaming(
                 message: message,
                 sessionId: sessionId,
                 model: admission.modelId,
@@ -278,10 +276,9 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
                 progress: progress,
                 noticeSink: { kind, text in await progress?(.notice(kind: kind, text: text)) }
             )
-            var response = execution.response
             let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
-            response.requestedModel = requested.isEmpty ? nil : requested
-            return response
+            execution.response.requestedModel = requested.isEmpty ? nil : requested
+            return execution
         }
         }
         }

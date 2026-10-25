@@ -3,6 +3,7 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `NativeOAuthFlow.swift` | `NativeOAuthFlow` enum; `validateSignInDestination`, `startOAuthFlow`, Anthropic setup-token normalization/admission/write |
 
 // MARK: - NativeOAuthFlow
 //
@@ -56,7 +57,7 @@ public enum NativeOAuthFlow {
         switch normalizedOAuthProviderId(providerId) {
         case "openai_oauth_direct": path = openAIAppOwnedAuthPath(dataRoot: dataRoot)
         case "anthropic_oauth_direct": path = anthropicTokenPath(dataRoot: dataRoot)
-        case "xai_oauth_direct": path = OAuthCredentialDestinations.xAIProvider(dataRoot: dataRoot)
+        case "xai_oauth_direct": path = XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot)
         default: throw ProviderRoutingError.providerNotFound
         }
         do {

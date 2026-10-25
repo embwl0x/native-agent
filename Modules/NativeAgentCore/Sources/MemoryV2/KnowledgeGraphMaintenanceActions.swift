@@ -1,6 +1,7 @@
 import Foundation
-import KnowledgeGraph
 import PersistenceCore
+
+// Blueprint: | `KnowledgeGraphMaintenanceActions.swift` | `KnowledgeGraphMaintenanceActions`: canonical orphan-sweep preview/apply; apply requires exactly the reviewed candidate set |
 
 /// The action boundary behind the Knowledge Graph's explicit orphan-sweep
 /// controls and the agent's `rebuild_knowledge_graph mode: sweep_orphans`.
@@ -42,18 +43,7 @@ public struct KnowledgeGraphMaintenanceActions: Sendable {
 
     private func liveIndexerAndFacts() async throws -> (SwiftNativeKnowledgeGraphIndexer, [KnowledgeGraphMemoryFact]) {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        let memories = try await storage.listMemories(persona: nil, status: nil, limit: nil)
-        let facts = memories.map {
-            KnowledgeGraphMemoryFact(
-                id: $0.id,
-                content: $0.content,
-                source: $0.source,
-                status: $0.status,
-                createdAt: $0.createdAt,
-                updatedAt: $0.updatedAt,
-                metadata: $0.projectionMetadata
-            )
-        }
+        let facts = try await MemoryConsolidationHygiene.listGCFacts(storage)
         let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path)
         return (indexer, facts)
     }

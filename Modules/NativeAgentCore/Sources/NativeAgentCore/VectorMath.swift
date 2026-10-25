@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `VectorMath.swift` | `VectorMath.cosine`: shared finite-checked Double cosine core for recall, consolidation and context |
+
 /// Shared vector math for the recall / consolidation / context surfaces.
 ///
 /// Before this existed, three separate `cosine` implementations had drifted:

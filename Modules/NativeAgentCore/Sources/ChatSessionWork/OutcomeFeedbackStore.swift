@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `OutcomeFeedbackStore.swift` | `OutcomeFeedbackStore` struct; `record`, `recordConversationContinuation`; the locked validation supplies physical rows and append bytes to shared retention |
 
 public enum OutcomeFeedbackError: Error, Sendable, Equatable {
     case invalidSessionID
@@ -32,6 +33,8 @@ public struct OutcomeReactionEvidenceKey: Sendable, Hashable {
 /// second transcript or outcome owner. It stores no content, persona, path,
 /// prompt, or provider output. Regenerate remains a separate canonical
 /// transcript reaction.
+/// Storage: feedback.jsonl is excluded from local backup, data export and
+/// phone sync; included in off-disk backup and PrivacyMap's context category.
 public struct OutcomeFeedbackStore: Sendable {
     public static let schema = "response.feedback.v2"
     public static let continuationSchema = "response.reaction.v2"

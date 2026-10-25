@@ -3,6 +3,7 @@ import NativeAgentCore
 import Darwin
 import PersistenceCore
 import TriggerScheduler
+// Blueprint: | `StandingBotsDisk.swift` | `StandingBotsDisk` struct; `validatePath`, `locked` |
 
 /// Both stores share one short, synchronous cross-process transaction boundary.
 struct StandingBotsDisk: Sendable {
@@ -88,16 +89,16 @@ struct StandingBotsDisk: Sendable {
     func validate(_ bot: BotDefinition, validateCron: Bool = false) throws {
         guard !bot.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !bot.brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              bot.briefVersion > 0, bot.budget.tokens > 0, (bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens) > 0,
+              bot.briefVersion > 0, bot.budget.tokens > 0, (bot.dailyTokenCeiling ?? 1) > 0,
               bot.budget.seconds.isFinite, bot.budget.seconds > 0,
               bot.createdAt.timeIntervalSince1970.isFinite, bot.updatedAt.timeIntervalSince1970.isFinite else {
             throw StandingBotsError.invalidValue("definition")
         }
         if let trigger = bot.eventTrigger {
             guard !trigger.filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw StandingBotsError.invalidValue("An event trigger needs a repository or a channel ID.")
+                throw StandingBotsError.invalidValue("An event trigger needs a channel ID.")
             }
-            if trigger.source == .slack, !BotEventTrigger.isChannelID(trigger.filter) {
+            if !BotEventTrigger.isChannelID(trigger.filter) {
                 throw StandingBotsError.invalidValue("A Slack trigger needs the channel ID, such as C0123ABCD.")
             }
         }
@@ -109,23 +110,24 @@ struct StandingBotsDisk: Sendable {
                 throw ToolFailureError("The agent's bot cadence must be at least \(floor / 60) minutes.",
                     argumentPath: "$.cadence.interval.seconds", accepted: "A finite number of seconds at least \(floor).", effects: .none)
             }
-        case .cron(let expression, let zone):
-            guard !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  zone.map({ TimeZone(identifier: $0) != nil }) ?? true else { throw StandingBotsError.invalidValue("cron") }
+        case .cron(let expression):
+            guard !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw StandingBotsError.invalidValue("cron") }
             if validateCron { _ = try Self.nextOccurrence(bot, after: bot.updatedAt) }
         }
     }
 
+    /// `due` is the occurrence a run claimed: its civil minute is spent, so a
+    /// fall-back hour never hands a daily 01:59 the second 01:59 (the
+    /// scheduler's `nextRunEpochAfterNow(beyond:)`).
     static func nextOccurrence(_ bot: BotDefinition, after date: Date,
-                               lastRunAt: Date? = nil,
+                               lastRunAt: Date? = nil, beyond due: Date? = nil,
                                minimumInterval: TimeInterval = BotRunLimits.minimumInterval) throws -> Date {
         switch bot.cadence {
         case .manual: return .distantFuture
         case .interval(let seconds): return date.addingTimeInterval(max(seconds, minimumInterval))
-        case .cron(let expression, let zone):
-            // No stored zone: "local", the scheduler's own word for following the Mac.
+        case .cron(let expression):
             let value: JSONValue = .object(["schedule": .object([
-                "type": .string("cron"), "expression": .string(expression), "timezone": .string(zone ?? "local")
+                "type": .string("cron"), "expression": .string(expression)
             ])])
             do {
                 // Configuration time is not a run. Space cron occurrences only
@@ -133,8 +135,8 @@ struct StandingBotsDisk: Sendable {
                 let after = max(date.timeIntervalSince1970,
                     lastRunAt.map { $0.addingTimeInterval(minimumInterval).timeIntervalSince1970.nextDown }
                         ?? date.timeIntervalSince1970)
-                guard let epoch = try SchedulerJobRuntime.nextRunEpoch(for: value,
-                    afterEpoch: after) else {
+                guard let epoch = try SchedulerJobRuntime.nextRunEpochAfterNow(for: value,
+                    beyond: due?.timeIntervalSince1970, now: { Date(timeIntervalSince1970: after) }) else {
                     throw StandingBotsError.invalidValue("cron has no next occurrence")
                 }
                 return Date(timeIntervalSince1970: epoch)

@@ -32,6 +32,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { AsyncLocalStorage } = require("async_hooks");
+const { dataRootLife } = require("./wake_worker_common.js");
 const heldCapacitySlot = new AsyncLocalStorage();
 
 function pendingKey(payload, threadId) {
@@ -271,6 +272,7 @@ async function appendPending(payload, threadId, options = {}) {
       };
     }
     const entry = {
+      lifeID: dataRootLife(),
       id: crypto.randomUUID(),
       key,
       threadId: canonicalThread,

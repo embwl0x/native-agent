@@ -4,6 +4,7 @@ import AgentWorkspace
 import Desk
 import Transcripts
 import TurnTrace
+// Blueprint: | `ChatTurnSteering.swift` | `ChatTurnSteering` actor; open turns and turn-activity clock; atomic resident claim/reservation under the common free-time law; person admission opens immediately |
 
 /// A message sent while she works goes straight to the turn already working
 /// in that conversation (User 2026-10-18, on every door; it replaces the
@@ -114,6 +115,7 @@ public actor ChatTurnSteering {
         let token = TurnAdmission.token ?? UUID()
         open[sessionId] = OpenTurn(token: token, turnId: turnId, dataRoot: dataRoot, door: door, persist: persist)
         noteTurnActivity(for: dataRoot, at: Date())
+        HerOpened.shared.began(sessionId)
         return token
     }
 
@@ -123,6 +125,7 @@ public actor ChatTurnSteering {
         noteTurnActivity(for: turn.dataRoot, at: Date())
         open.removeValue(forKey: sessionId)
         ResidentWake.shared.turnEnded(dataRoot: turn.dataRoot)
+        HerOpened.shared.ended(sessionId, dataRoot: turn.dataRoot)
         for offer in delivered.removeValue(forKey: sessionId) ?? [] {
             if let handler = deliveryHandlers.removeValue(forKey: offer.id) { _ = await handler(offer, true) }
         }

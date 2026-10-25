@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+// Blueprint: | `PersonaTemplates.swift` | `PersonaTemplates` enum; `generate` |
 
 // MARK: - Persona template generator
 

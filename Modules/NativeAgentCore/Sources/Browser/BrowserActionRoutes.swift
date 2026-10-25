@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import Privacy
 import ApprovalInbox
+// Blueprint: | `BrowserActionRoutes.swift` | `BrowserActionRoutes` struct; `observeBrowserMotorAction`, `runBrowser`, direct dry-run/cancel commands to the canonical operation store, task-local `retainRead` delivery of the exact visible read capture |
 
 /// Browser operation orchestration. The canonical reducer remains the sole
 /// owner of persisted transitions and derived native-action receipts.
@@ -100,6 +101,7 @@ public struct BrowserActionRoutes: Sendable {
         captureScreenshot: Bool,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> JSONValue {
+        try Task.checkCancellation()
         var status = "succeeded"
         var opened = false
         var screenshotReceipt: JSONValue = .null
@@ -121,7 +123,13 @@ public struct BrowserActionRoutes: Sendable {
             deadlineSeconds: 30
         )
         let requestDigest = SwiftNativeBrowserClient.browserRequestDigest(for: start)
-        _ = try await browser.executeBrowserOperation(.start(start))
+        let claim = try await browser.executeBrowserOperation(.start(start))
+        // Only the canonical start claimant may attach cancellation, execute
+        // effects or settle this run. A duplicate reports the original row.
+        guard claim.didTransition else {
+            guard let existing = claim.run else { throw BrowserOperationStoreError.runNotFound }
+            return existing
+        }
 
         let navigation = await effects.beginNavigation(
             parsed.url, runID: runID, captureSource: captureSource, captureScreenshot: captureScreenshot,
@@ -182,6 +190,9 @@ public struct BrowserActionRoutes: Sendable {
         } catch {
             status = "failed"
             sourceReceipt["openError"] = .string(error.localizedDescription)
+            if (error as? BrowserError)?.hasUnknownOutcome == true {
+                sourceReceipt["outcomeKind"] = .string("outcome_unknown")
+            }
         }
 
         let terminalState: BrowserOperationTerminalState
@@ -198,7 +209,8 @@ public struct BrowserActionRoutes: Sendable {
             sourceReceipt: .object(sourceReceipt),
             screenshotReceipt: screenshotReceipt
         )
-        guard let committed = try await browser.executeBrowserOperation(.complete(completion)).run else {
+        // Settlement outlives the caller's cancellation: a retired connection never leaves its run running.
+        guard let committed = try await Task { try await browser.executeBrowserOperation(.complete(completion)) }.value.run else {
             throw NSError(domain: "NativeAgentBrowser", code: 500, userInfo: [
                 NSLocalizedDescriptionKey: "Browser canonical completion returned no run"
             ])
@@ -252,10 +264,15 @@ public struct BrowserActionRoutes: Sendable {
         } catch is CancellationError { state = .canceled } catch {
             state = .failed
             receipt["error"] = .string(error.localizedDescription)
+            if (error as? BrowserError)?.hasUnknownOutcome == true {
+                receipt["outcomeKind"] = .string("outcome_unknown")
+            }
         }
-        guard let committed = try await browser.executeBrowserOperation(.complete(BrowserOperationCompletion(
+        // Settlement outlives the caller's cancellation, as for a navigation.
+        let completion = BrowserOperationCompletion(
             id: runID, requestDigest: SwiftNativeBrowserClient.browserRequestDigest(for: start),
-            state: state, opened: false, sourceReceipt: .object(receipt)))).run else {
+            state: state, opened: false, sourceReceipt: .object(receipt))
+        guard let committed = try await Task { try await browser.executeBrowserOperation(.complete(completion)) }.value.run else {
             throw NSError(domain: "NativeAgentBrowser", code: 500, userInfo: [
                 NSLocalizedDescriptionKey: "Browser canonical completion returned no run"
             ])

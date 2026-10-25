@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MobileTelegramSnapshot.swift` | `MobileTelegramSnapshot` struct |
 
 /// The same trust-widening confirmation on Mac and phone.
 public enum TelegramAccessConfirmation {

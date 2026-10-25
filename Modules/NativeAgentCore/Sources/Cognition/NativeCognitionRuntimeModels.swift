@@ -1,5 +1,4 @@
 import Foundation
-import ChatOrchestration
 import CognitiveSubstrate
 import Context
 import MemoryV2
@@ -7,6 +6,7 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import ProviderRouting
+// Blueprint: | `NativeCognitionRuntimeModels.swift` | `CognitiveObservatoryDetail` and runtime read models; shared affect validity and organism sample freshness/validity |
 
 public struct CognitiveObservatoryDetail: Sendable {
     public var configuration: CognitiveConfiguration
@@ -251,12 +251,6 @@ public struct CognitiveMicrocycleTelemetry: Sendable, Equatable {
             runtimeInitializedAt: now
         )
     }
-}
-
-// internal for +Reflection extension (move-only Wave C)
-public enum CognitiveBackgroundGate: Sendable, Equatable {
-    case allowed
-    case skipped(String)
 }
 
 extension CognitiveAffectState {

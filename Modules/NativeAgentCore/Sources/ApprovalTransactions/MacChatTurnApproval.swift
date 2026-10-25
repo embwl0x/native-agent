@@ -1,8 +1,9 @@
 import Privacy
 import Foundation
 import ApprovalInbox
-import ChatOrchestration
+import ChatTurnRuntime
 import NativeAgentShared
+// Blueprint: | `MacChatTurnApproval.swift` | canonical turn approval projection, card visibility and inline authority state |
 
 /// A turn's approval projected from the canonical inbox, with only proven
 /// decisions represented as approved or denied.
@@ -259,8 +260,6 @@ public enum InlineApprovalPresentation {
 
     public static func state(
         approvalID: String,
-        locallyResolved: Bool,
-        localDecision: String,
         externalStatus: String?,
         externalDecision: String?
     ) -> State {
@@ -270,9 +269,6 @@ public enum InlineApprovalPresentation {
         let status = externalStatus?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        if locallyResolved {
-            return .resolved(decision: localDecision)
-        }
         guard let status, !status.isEmpty, status != "pending" else {
             return .pending
         }

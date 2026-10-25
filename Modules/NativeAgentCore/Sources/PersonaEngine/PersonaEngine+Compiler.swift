@@ -3,6 +3,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
+// Blueprint: | `PersonaEngine+Compiler.swift` | `PersonaCompiler`: `compile`, `fingerprint`, `renderPrompt`; batched context surfaces share canonical persona documents and identity, with separate surface overrides; USER core projection |
 
 // MARK: - PersonalityPacket
 //
@@ -179,17 +180,12 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
             rigor: 0.86, autonomy: 0.82, creativity: 0.58, brevity: 0.74
         ),
         examples: [
-            "Lead with the useful answer, then show only the context needed to act.",
             "When tools are involved, be explicit about what was actually done.",
         ],
         forbiddenPatterns: [
-            "Corporate filler.",
             "Claiming tool or file actions that did not happen.",
-            "Over-explaining simple outcomes.",
         ],
         instincts: [
-            "Prefer action over prolonged discussion when the task is executable.",
-            "State uncertainty plainly and then check it.",
             "Keep self-improvement autonomous but contained to app-owned paths.",
         ],
         boundaries: [
@@ -199,7 +195,6 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
         ],
         surfaceOverrides: [
             "chat": "",
-            "telegram": "Keep Telegram replies shorter and preserve the same persona without long setup context.",
             "dream": "Reflect like an internal agent maintenance pass: specific lessons, memory candidates, eval ideas, and improvement targets.",
             "autonomy": "Operate as a careful self-improvement engineer inside the app-owned worktree.",
         ],
@@ -213,6 +208,9 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
 /// persona root the SwiftNativePersonaEngine sees (so the resolver chain
 /// from PersonaEngine.swift is honored — env var, stamped repo, dev repo,
 /// legacy fallback).
+/// Optional active.json, selected persona documents, MEMORY.md and surface
+/// overrides remain accepted file inputs. Local/off-disk backup and data export
+/// include the persona root; phone sync excludes it; PrivacyMap: persona.
 public actor PersonaCompiler {
     private struct ResolvedCompilation {
         let packet: PersonalityPacket
@@ -220,9 +218,7 @@ public actor PersonaCompiler {
         let activePersonaDirectory: URL?
     }
 
-    /// Internal so `PersonaEngine+CompiledPacket.swift` (same module,
-    /// separate file) can reach the engine's personaRoot + dataRoot when
-    /// building the daemon-equivalent `/v1/personality/compiled` packet.
+    /// Source engine for this compiler's persona and data roots.
     internal let engine: SwiftNativePersonaEngine
     private let fileManager: FileManager
 
@@ -230,9 +226,8 @@ public actor PersonaCompiler {
     /// prompt. Carve order (fix 5):
     ///   SOUL → VOICE → USER → GROWTH → MEMORY (if present) → AGENTS
     /// MEMORY.md is injected after GROWTH and before AGENTS when the file
-    /// exists on disk. It carries REM-distilled durable memory facts that
-    /// the agent should treat as higher-priority than recall hits. The file
-    /// is optional — missing MEMORY.md is silently omitted (no effect on
+    /// exists on disk as an optional file input; no runtime writer generates it.
+    /// Missing MEMORY.md is silently omitted (no effect on
     /// fingerprint or any other doc). AGENTS is always last so operating-
     /// manual instructions land freshest in the context window.
     /// Surface guidance is appended after AGENTS.
@@ -268,11 +263,6 @@ public actor PersonaCompiler {
             userMemoryCore: userMemoryCore,
             identityRequired: identityRequired
         ).packet
-    }
-
-    /// Identity-only read for persona-scoped procedural recall before selection.
-    public func selectedPersonaID(personaOverride: String?) async throws -> String {
-        try Self.selectedPersonaID(root: await engine.personaRoot, personaOverride: personaOverride, fileManager: fileManager)
     }
 
     public static func selectedPersonaID(root: URL, personaOverride: String?, fileManager: FileManager = .default) throws -> String {

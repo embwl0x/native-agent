@@ -8,22 +8,18 @@
 // Runs weekly (Sun 3am local) under NSBackgroundActivityScheduler from
 // NativeAgentApp; can also be invoked inline from the debug menu.
 //
-// U3 WAVE-2 ITEM 7 (2026-06-10): consolidate() is now NON-DESTRUCTIVE.
-// The public entry point routes through MemoryConsolidationGate — the
-// mutation pipeline (consolidateDestructively, module-internal) only ever
-// runs against a CANDIDATE copy of the store; the live store changes only
-// when the staged `memory.consolidation.swap` approval card is approved
-// and the gate's swap executor applies it. Every legacy caller
-// (AppModel.memoryHygieneReport, MemoryConsolidationHygiene.runOnce, the
-// debug menu) inherits the probe-set gate through this seam with no
-// signature change — the ConsolidationReport they receive now describes
-// the PLANNED ops carried on the staged card, not applied mutations.
+// New consolidation operations run only against a candidate and need swap
+// approval before application. Entry also backfills live tombstone vectors
+// and reconciles prior approved swaps. The returned plan describes the new
+// candidate, not those earlier live-store effects.
 
 import Foundation
 import GRDB
 import NativeAgentCore
 import OSLog
 import PersistenceCore
+
+// Blueprint: | `MemoryV2+Consolidator.swift` | `MemoryConsolidator`: gated pending-proposal consolidation, duplicate/supersession handling and active-memory archival |
 
 // MARK: - ConsolidationReport
 
@@ -73,12 +69,10 @@ public let memoryConsolidationDuplicateThreshold: Double = 0.92
 /// Active memories older than this with zero recall hits get archived.
 public let memoryConsolidationStaleAgeSeconds: TimeInterval = 365 * 24 * 60 * 60
 
-/// Active-memory semantic duplicate cleanup. 2026-09-22: was 0.995 cosine +
-/// 0.80 Jaccard + same kind, which never fired (live paraphrase triples sat at
-/// 0.93-0.98 cosine, 0.49-0.72 Jaccard, across decision/correction). Any kind
-/// now; the word-overlap floor keeps distinct dates/numbers apart. A
-/// correction survives over a non-correction, else the newest row wins.
-/// Still archives, never deletes.
+/// Active-memory semantic cleanup requires the same kind, quantity/polarity,
+/// embedding epoch and disclosure scope, plus cosine and word-overlap floors.
+/// Same-kind keeper selection prefers pins, then newer rows.
+/// Archives, never deletes; exact-text grouping is independent of kind.
 public let memoryConsolidationActiveDuplicateThreshold: Double = 0.95
 public let memoryConsolidationActiveDuplicateJaccardFloor: Double = 0.45
 
@@ -364,26 +358,20 @@ public actor MemoryConsolidator {
         against actives: [StoredMemory]
     ) -> StoredMemory? {
         guard let pe = proposal.embedding, !pe.isEmpty else { return nil }
-        let qn = Self.l2norm(pe)
-        guard qn > 0 else { return nil }
         // User, 2026-09-06: a proposal may only merge into a memory in its OWN
         // persona and disclosure scope, and only when both vectors come from
         // the same stamped embedding epoch (see the notes on
         // `disclosureScopeKey` and `comparableEpochs`).
-        let proposalScope = Self.disclosureScopeKey(
+        let proposalScope = MemoryStorage.disclosureScopeKey(
             personaId: proposal.personaId, metadata: proposal.metadata)
         var best: (StoredMemory, Double)? = nil
         for m in actives {
-            guard Self.comparableEpochs(proposal.embeddingEpoch, m.embeddingEpoch) else { continue }
-            guard Self.disclosureScopeKey(
+            guard MemoryStorage.comparableEpochs(proposal.embeddingEpoch, m.embeddingEpoch) else { continue }
+            guard MemoryStorage.disclosureScopeKey(
                 personaId: m.personaId, metadata: m.metadata) == proposalScope else { continue }
             guard let e = m.embedding, e.count == pe.count else { continue }
-            let mn = Self.l2norm(e)
-            guard mn > 0 else { continue }
-            var dot: Float = 0
-            for i in 0..<e.count { dot += e[i] * pe[i] }
-            let sim = Double(dot) / (Double(qn) * Double(mn))
-            if sim >= memoryConsolidationDuplicateThreshold {
+            let sim = VectorMath.cosine(e, pe)
+            if MemoryStorage.semanticDuplicate(proposal.content, m.content, similarity: sim, mode: .proposal) {
                 if best == nil || sim > best!.1 {
                     best = (m, sim)
                 }
@@ -424,7 +412,7 @@ public actor MemoryConsolidator {
             if case .object(let meta)? = m.metadata, meta["owner_restored"] != nil { continue }
             guard let kind = MemoryRecallScoring.kind(of: m.metadata),
                   memorySupersessionSingleValuedKinds.contains(kind) else { continue }
-            let key = Self.disclosureScopeKey(personaId: m.personaId, metadata: m.metadata)
+            let key = MemoryStorage.disclosureScopeKey(personaId: m.personaId, metadata: m.metadata)
                 + "|" + kind
             byScopeAndKind[key, default: []].append(m)
         }
@@ -444,21 +432,14 @@ public actor MemoryConsolidator {
                 // User, 2026-09-06: cosine across two different (or unstamped)
                 // embedding epochs is a number, not a similarity — see
                 // `comparableEpochs`. No comparable vectors, no supersession.
-                guard Self.comparableEpochs(newest.embeddingEpoch, older.embeddingEpoch) else { continue }
-                guard Self.cosine(newest.embedding, older.embedding) >= memorySupersessionCosineFloor else { continue }
+                guard MemoryStorage.comparableEpochs(newest.embeddingEpoch, older.embeddingEpoch) else { continue }
+                guard VectorMath.cosine(newest.embedding, older.embedding) >= memorySupersessionCosineFloor else { continue }
                 _ = try await storage.archiveSuperseded(
                     id: older.id, by: newest.id,
                     expectedContentHash: MemoryStorage.contentFingerprint(older.content),
                     expectedReplacementContentHash: MemoryStorage.contentFingerprint(newest.content))
             }
         }
-    }
-
-    // Single source of truth: VectorMath.cosine (raw, finiteness-guarded,
-    // equal-length required). Consolidation compares the raw value against a
-    // supersession/duplicate threshold, so no post-clamp here.
-    private static func cosine(_ a: [Float]?, _ b: [Float]?) -> Double {
-        VectorMath.cosine(a, b)
     }
 
     // MARK: - active-memory semantic hygiene
@@ -509,8 +490,8 @@ public actor MemoryConsolidator {
         // User, 2026-09-06: group WITHIN a persona and disclosure scope, not
         // across every row in the store (see `disclosureScopeKey`).
         for group in Dictionary(grouping: actives, by: { memory in
-            Self.disclosureScopeKey(personaId: memory.personaId, metadata: memory.metadata)
-                + "|" + Self.normalizedContentKey(memory.content)
+            MemoryStorage.disclosureScopeKey(personaId: memory.personaId, metadata: memory.metadata)
+                + "|" + MemoryStorage.comparisonKey(memory.content, mode: .canonical)
         }).values where group.count > 1 {
             let keeper = Self.preferredKeeper(in: group)
             for memory in group where memory.id != keeper.id {
@@ -530,7 +511,7 @@ public actor MemoryConsolidator {
         // O(n^2) over 384-dimensional cosines and must not grow a string build
         // per comparison.
         let scopeKeys = remaining.map {
-            Self.disclosureScopeKey(personaId: $0.personaId, metadata: $0.metadata)
+            MemoryStorage.disclosureScopeKey(personaId: $0.personaId, metadata: $0.metadata)
         }
         for i in remaining.indices {
             let left = remaining[i]
@@ -548,11 +529,11 @@ public actor MemoryConsolidator {
                 // Same persona + disclosure scope, and vectors from the same
                 // stamped epoch — otherwise this is not a comparison.
                 guard scopeKeys[i] == scopeKeys[j] else { continue }
-                guard MemoryRecallScoring.kind(of: left.metadata) == MemoryRecallScoring.kind(of: right.metadata) else { continue }
-                guard MemorySemanticDuplicateGuard.sameQuantityAndNegation(left.content, right.content) else { continue }
-                guard Self.comparableEpochs(left.embeddingEpoch, right.embeddingEpoch) else { continue }
-                guard Self.cosine(left.embedding, right.embedding) >= memoryConsolidationActiveDuplicateThreshold else { continue }
-                guard Self.lexicalJaccard(left.content, right.content) >= memoryConsolidationActiveDuplicateJaccardFloor else { continue }
+                guard MemoryStorage.comparableEpochs(left.embeddingEpoch, right.embeddingEpoch) else { continue }
+                guard MemoryStorage.semanticDuplicate(
+                    left.content, right.content, similarity: VectorMath.cosine(left.embedding, right.embedding),
+                    mode: .hygiene, kinds: (MemoryRecallScoring.kind(of: left.metadata), MemoryRecallScoring.kind(of: right.metadata))
+                ) else { continue }
                 let keeper = Self.semanticKeeper(left, right)
                 let duplicate = keeper.id == left.id ? right : left
                 if try await archiveActiveMemory(
@@ -587,67 +568,12 @@ public actor MemoryConsolidator {
         return updated?.status == "archived"
     }
 
-    /// User, 2026-09-06: consolidation must not merge across the boundaries the
-    /// read path enforces. Every hygiene pass lists with `persona: nil`, so a
-    /// key of normalised text alone put every persona's rows — and rows with
-    /// different privacy tiers and permitted surfaces — into one bucket. The
-    /// keeper then carried the WRONG disclosure for the rows it swallowed:
-    /// either a `local_private` fact survived as the `public_safe` twin (a leak
-    /// onto slack) or the reverse (a fact silently gone from a surface that was
-    /// allowed to see it). This key is the scope the disclosure policy would
-    /// compute, so rows only ever dedupe against rows that are readable in
-    /// exactly the same places.
-    ///
-    /// `status`/`lifecycle` are deliberately fixed here: scope is about WHERE a
-    /// row may be read, not whether it is currently recall-eligible.
-    private static func disclosureScopeKey(
-        personaId: String,
-        metadata: JSONValue?
-    ) -> String {
-        let persona = personaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard let classification = MemoryRecordDisclosurePolicy.classify(
-            personaID: personaId,
-            status: "active",
-            lifecycle: nil,
-            tags: metadataTags(metadata),
-            metadata: metadata
-        ) else {
-            // Disclosable nowhere at all — one scope of its own, per persona.
-            return "\(persona)|undisclosable"
-        }
-        return "\(persona)|\(classification.privacy.rawValue)|"
-            + classification.permittedSurfaces.sorted().joined(separator: ",")
-    }
-
-    private static func metadataTags(_ metadata: JSONValue?) -> [String]? {
-        guard case .object(let object)? = metadata,
-              case .array(let values)? = object["tags"] else { return nil }
-        let tags = values.compactMap { value -> String? in
-            guard case .string(let tag) = value else { return nil }
-            return tag
-        }
-        return tags.isEmpty ? nil : tags
-    }
-
-    /// User, 2026-09-06: an embedding epoch names ONE immutable vector space.
-    /// Cosine between two vectors from different spaces — or from an unstamped
-    /// legacy row whose space is unknown — is an arbitrary number, and
-    /// consolidation was letting that number archive memories and merge
-    /// proposals. Recall already refuses rows outside the active epoch
-    /// (MemoryV2+Storage recall candidate scan); consolidation now refuses the
-    /// same comparisons — the pair is skipped, not rerouted. Only the exact-text
-    /// grouping, which never looks at a vector, still reaches such a row.
-    private static func comparableEpochs(_ left: String?, _ right: String?) -> Bool {
-        guard let left, let right, !left.isEmpty, !right.isEmpty else { return false }
-        return left == right
-    }
-
     private static func semanticKeeper(_ left: StoredMemory, _ right: StoredMemory) -> StoredMemory {
         let leftPinned = isPinned(left)
         let rightPinned = isPinned(right)
         if leftPinned != rightPinned { return leftPinned ? left : right }
-        let leftCorrection = MemoryRecallScoring.kind(of: left.metadata) == "correction"
-        let rightCorrection = MemoryRecallScoring.kind(of: right.metadata) == "correction"
+        let leftCorrection = MemoryRecallScoring.isExplicitCorrection(left.metadata)
+        let rightCorrection = MemoryRecallScoring.isExplicitCorrection(right.metadata)
         if leftCorrection != rightCorrection { return leftCorrection ? left : right }
         let leftDate = parseISO8601(left.createdAt) ?? .distantPast
         let rightDate = parseISO8601(right.createdAt) ?? .distantPast
@@ -673,30 +599,6 @@ public actor MemoryConsolidator {
     private static func isPinned(_ memory: StoredMemory) -> Bool {
         guard case .object(let metadata)? = memory.metadata else { return false }
         return metadata["pinned"] == .bool(true)
-    }
-
-    // Internal (not private): MemoryV2.store's write-time exact-duplicate
-    // guard shares this exact normalization so "duplicate" means the same
-    // thing at write time and at weekly hygiene time.
-    static func normalizedContentKey(_ content: String) -> String {
-        content
-            .replacingOccurrences(of: "’", with: "'")
-            .replacingOccurrences(of: "‘", with: "'")
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:\"'` "))
-            .lowercased()
-    }
-
-    static func lexicalJaccard(_ left: String, _ right: String) -> Double {
-        func tokens(_ text: String) -> Set<String> {
-            Set(text.lowercased().split { !($0.isLetter || $0.isNumber) }.map(String.init))
-        }
-        let leftTokens = tokens(left)
-        let rightTokens = tokens(right)
-        guard !leftTokens.isEmpty, !rightTokens.isEmpty else { return 0 }
-        return Double(leftTokens.intersection(rightTokens).count)
-            / Double(leftTokens.union(rightTokens).count)
     }
 
     // MARK: - stale eviction
@@ -737,12 +639,6 @@ public actor MemoryConsolidator {
 
     // MARK: - helpers
 
-    private static func l2norm(_ v: [Float]) -> Float {
-        var s: Float = 0
-        for x in v { s += x * x }
-        return s.squareRoot()
-    }
-
     private static func iso8601(_ d: Date) -> String {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -750,10 +646,6 @@ public actor MemoryConsolidator {
     }
 
     private static func parseISO8601(_ s: String) -> Date? {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f.date(from: s) { return d }
-        f.formatOptions = [.withInternetDateTime]
-        return f.date(from: s)
+        NativeTimestampFormat.parseISO8601FractionalFirst(s)
     }
 }

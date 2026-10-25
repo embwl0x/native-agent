@@ -40,6 +40,14 @@ join the active tick rather than running a second copy. Event/deadline runners
 can wake on owner changes or their next meaningful deadline; their periodic
 interval is an integrity backstop.
 
+Event debounces own their pending delay. A firing debounce transfers its task
+into execution ownership; events during that work coalesce into one follow-up
+after it exits. A firing deadline likewise transfers its task out of the sleep
+slot before execution, so completion projects its successor without cancelling
+itself. A deadline joining an active pass retains one follow-up reconciliation
+after that pass exits, so age crossings during the pass are assessed. Stop and
+replacement cancel pending waits and retained loop tasks.
+
 A tick returns `LoopTickOutcome.completed`, `skipped` or `failed`.
 A health-neutral skip preserves an existing failure streak. Durable clocks
 survive restart, and timing accounts for time already elapsed rather than
@@ -56,7 +64,7 @@ Inspect these together:
 - `logs/background_loop_state.json` and
   `logs/background_loop_failures.jsonl`: durable clocks and failure evidence.
 - `pulses` in that state file: work that runs outside a loop (iCloud drain,
-  MCP sweeps, launch reconcilers) stamps each pass with `OrganPulse.record`.
+  launch reconcilers) stamps each pass with `OrganPulse.record`.
   Doctor's `live.pulses` row lists them; an organ with a declared cadence is
   overdue once it misses a whole beat since launch. A failed pass leaves no
   pulse; an organ whose clock stopped on purpose records `off: <reason>` and
@@ -68,16 +76,33 @@ enabled state and next deadline matter more than a blanket freshness threshold.
 ## 3. Doctor — the health authority
 
 `DoctorChecks/DoctorChecks.swift` defines `SwiftNativeDoctorChecks.defaultChecks`:
-16 checks covering storage, runtime JSON, run-ledger and turn-trace integrity,
-sessions and identity, prompt-prefix health, subconscious vitals, messages,
-persona, memory, embeddings, ability files, iCloud, operation logs and OAuth
-expiry. The app adds live checks, including background-loop health; the visible
-report is not a fixed 16-row checklist.
+17 checks covering storage, runtime JSON, run-ledger and turn-trace integrity,
+sessions and identity, prompt-prefix health, subconscious vitals, model
+compensations, messages, persona, memory, embeddings, ability files, iCloud,
+operation logs and OAuth expiry. The app adds live checks, including
+background-loop health; the visible report is not a fixed 17-row checklist.
+`Model compensations` (`model.shims`) is a read-only count of `shim.fired`
+receipts by census ID in a bounded measurement window, excluded from heartbeat
+sweeps.
+
+Saved-provider read failures and failed native provider probes report `fail`;
+an unhealthy provider path reports `warn`. A stale probe retains an adverse
+registry verdict and otherwise reports `unmeasured`; a readable compensation
+scan without a v2 turn is also `unmeasured`. `off` and `not needed` remain
+distinct non-fault states, not evidence of healthy work.
+
+`detail` stays evidence prose; remedies and executable calls have their own
+fields. Instructions for the Repair button say “Press Repair in Diagnostics →
+Health checks to …”; the shared recognizer also accepts legacy cached
+“Run Repair Safe Issues” instructions.
 
 `app {"page":"diagnostics","item":"doctor"}` reads the saved report
 (`Sources/NativeAgentApp/AppToolPlatform.swift`) and names the run it shows;
 `doctor.run` measures afresh, and `doctor.repair` is a separate action, not a
-read-only probe.
+read-only probe. Runtime JSON, persona and transcript checks only inspect;
+Doctor never creates or resets runtime stores, seeds identity or rewrites
+transcripts. Missing runtime stores begin through their canonical owners;
+malformed saved bytes remain available for the owning repair.
 
 The configured `doctor_auto_run` lane runs once at launch, off their turn's path
 (`EngineLaunch` ticks it once), then on its configured interval (at least an
@@ -86,10 +111,15 @@ permissions it cannot do itself. Its `doctor/latest.json` contains:
 
 - `measuredAt`: when measurement began;
 - `runAt`: when the snapshot was published;
-- `report_completed_at`, `run_in_progress`: which run the page shows and
-  whether one is still running;
+- `launchID`: the process launch that measured the snapshot;
 - `checks`: the findings. An off or not-needed reading settles an owed repair;
   an unreadable config is a fault with its file, never "off".
+
+The runtime page envelope adds `report_completed_at` and, while a run is active,
+`run_in_progress` to identify the report shown and the newer run still in flight.
+Health-cache reuse requires the current `launchID` and a `runAt` age from zero
+to less than 60 seconds; a fresh core reading never merges rows from an earlier
+launch.
 
 An empty set is not persisted as a clean bill of health. Some behavioral
 checks memoize, so publication time alone does not establish freshness.
@@ -105,8 +135,8 @@ event deadlines, backoff and saved configuration determine actual work.
 |---|---|---|
 | `doctor_auto_run` | Launch, ok→adverse health reading, weekly; configured intervals at least 1h | Repair, publish Doctor snapshot, file one sign-in/permission ask. |
 | `turn_trace_retention` | 6h | Prune expired trace data, lock sidecars and excess transcript backups. |
-| `offdisk_backup` | Daily | Create an off-disk backup when due or identity changed; skip alternate roots and unavailable iCloud Drive. |
-| `data_root_disk_hygiene` | Hourly, with daily reservation | Detect oversized state and file a notice; the scan does not delete it. |
+| `offdisk_backup` | Identity-file changes + persisted daily deadline; daily integrity | Create an off-disk backup when due or identity changed; skip alternate roots and unavailable iCloud Drive. |
+| `data_root_disk_hygiene` | Persisted daily boundary; hourly retry while unreserved; daily integrity | Detect oversized state and file a notice; the scan does not delete it. |
 | `memory_consolidation` | Weekly | Run MemoryV2 consolidation and hygiene. |
 | `self_improvement_sweep` | Weekly | Stage runtime improvement approval cards; requires its switch and unattended-work authority. |
 | `trigger_scheduler_due_work` | Events/deadlines; 6h repair | Run due scheduler jobs. |
@@ -115,10 +145,9 @@ event deadlines, backoff and saved configuration determine actual work.
 | `cognition_maintenance` | Daily | Substrate maintenance. |
 | `cognition_replay` | Daily | Episodic replay. |
 | `cognition_reflection` | Daily | Budgeted cognitive reflection. |
-| `heartbeat` | 12h | Assess health; surface stable anomaly cards. Clean assessments skip the model. |
+| `heartbeat` | Assessment-input changes + age deadlines; 12h integrity | Assess health; surface stable anomaly cards. Clean assessments skip the model. |
 | `desk_notify` | Events/deadlines; daily repair | Notify about eligible tracked Desk changes. |
 | `delegation_outcome` | Events/deadlines; 6h repair | Reconcile terminal delegation jobs and their notifications. |
-| `github_tracking` | Events/deadlines; 6h repair | Refresh configured tracking and reconcile its consumers. |
 | `telegram_poll` | Long-poll transport | Admit configured Telegram messages. |
 | `slack_socket_mode` | Socket transport | Admit configured Slack messages. |
 
@@ -126,11 +155,23 @@ Telegram and Slack remain registered when unconfigured, using a placeholder
 that reports a skip and performs no remote work. A registration is therefore
 not proof that the connector is configured.
 
+Heartbeat retains its 12-hour integrity sweep for nested records outside its
+initial nonrecursive file subscriptions and error rows whose bounded evidence
+is too short to project an expiry.
+
+Stopping background scheduling closes bot admission. A helper's seconds limit
+cancels its work and joins settlement, retaining its output and crossing report
+before releasing the claim. Explicit session cancellation remains separate.
+
 ### Scheduled Dream and REM
 
 The calendar jobs `nativeagent-nightly-dream` and
 `nativeagent-weekly-rem` run through `SchedulerDueJobRunner`; there are no
 separate periodic Dream or REM wrappers in the loop manifest.
+Recognized legacy jobs retain their existing IDs; creation receipts read back
+the job resolved by bootstrap rather than assuming the default ID.
+Phone and agent creation share recurring-dream admission: a repeating reflection
+uses that one nightly job, preserving pauses and reactivating cancellations.
 
 `DreamREMCycle/DreamREMCycle.swift` owns the default schedule: Dream at
 03:30 daily and REM at 04:30 Sunday, in the Mac's current time zone.
@@ -141,11 +182,19 @@ The nightly diary entry uses the previous local calendar day's key. Inspect
 the job outcome and file modification time; absence of a file named for today
 is not evidence of failure. REM stages growth proposals through the approval
 path rather than directly treating a dream as permission to rewrite persona.
+Each saved dream section carries its consumed-message cutoff. Under the run
+reservation, the next pass reconciles `.dream_state.json` from the diary,
+including archived entries, before gathering new material. A crash between
+saving a section and advancing the mark therefore does not dream it again.
+Archival removes an identical top-level duplicate only after comparing its
+bytes; differing same-name entries are both retained, with a unique suffix
+on the incoming copy. Existing archived writing is never replaced.
 
 ## 5. MacSync / iCloud bridge (Mac ⇄ iPhone)
 
 `DeviceSync/MacSyncEngine` receives signed commands, checks their identity,
 dispatches through the Mac and publishes responses and snapshots.
+The Mac stamps `mac_time_zone`, its current time zone identifier, into the scheduler snapshot so the phone can show job times in the Mac's zone.
 
 The local bookkeeping under `icloud/` is distinct from the transport's
 container. `DeviceSync/State/ICloudSyncStatePaths.swift` defines:
@@ -172,6 +221,10 @@ attempting a retry. A transport write is not Mac-owned completion.
 `MemoryV2/MemoryV2+UserMDGen.swift` regenerates `USER.md` in the active
 persona root from eligible active memories. It respects onboarding and
 preserves a damaged existing document rather than silently replacing it.
+The generator owns the 30-second trailing deadline through regeneration;
+termination cancels a sleeping deadline and flushes accepted requests after
+draining storage-owned pokes. Accepted canonical writes are not cancelled;
+writes after projection closure are reconciled on the next launch.
 
 Workshop execution records are excluded by their `workshop:` source prefix.
 Repair the canonical memory or generator when the projection is wrong; a manual
@@ -206,8 +259,9 @@ Start with the smallest evidence relevant to the reported problem:
 2. Read the relevant app page or Doctor's non-repair report.
 3. For a loop, compare its result, successful-work clock, listener health and
    failure receipts with its configuration and deadline.
-4. For a scheduled job, inspect its persisted enabled state, next run and last
-   outcome in `scheduler/jobs.json`.
+4. For a scheduled job, inspect enabled state and last outcome, and use
+   `SchedulerJobRuntime.scheduledEpoch`: unclaimed wall-clock work follows its
+   civil occurrence in the current zone; claims and retry floors keep their instant.
 5. For a turn, inspect its terminal trace; for a mobile command or approval,
    inspect that transaction's outcome.
 

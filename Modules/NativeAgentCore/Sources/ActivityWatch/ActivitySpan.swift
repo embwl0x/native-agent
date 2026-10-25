@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ActivitySpan.swift` | `ActivitySpan` and `ActivityCloseReason`: persisted activity intervals, redacted titles and close vocabulary |
+
 /// Why an activity span stopped.
 ///
 /// v0 keeps the full v1 vocabulary (docs/build_plans/ambient-activity-watcher.md

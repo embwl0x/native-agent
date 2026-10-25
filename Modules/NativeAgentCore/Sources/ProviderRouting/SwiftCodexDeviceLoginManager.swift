@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `SwiftCodexDeviceLoginManager.swift` | `SwiftCodexDeviceLoginManager` enum; CLI executable readiness |
 
 public enum SwiftCodexDeviceLoginManager {
     static var executableSearchDirectories: [String] {

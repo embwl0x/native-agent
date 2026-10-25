@@ -7,7 +7,7 @@
 **An agent is a who. A who has doors. Every word to a who is owed until that who receives it.**
 
 - **Who.** One saved contact: a stable id, the name the person or they gave it, and the history between them. Nothing else establishes identity. A product name, a vendor, a host, a bridge route or a lane name never makes two contacts one, and never makes a contact anyone else. On a stranger's Mac, Claude Code is "Claude Code". On User's Mac, "Claude" is a who that they named, reached through Claude Code's and Claude Desktop's doors.
-- **Door.** One authenticated way to reach a who: a recipe route (MCP entry, ACP launch, inbox file, desktop chat, A2A endpoint, bot routine), its own credential, and the recipe's two declarations: how the door **wakes** its agent (none, open the app, run a command, start an ACP session) and what counts as **acceptance** (the agent read it through its door, answered, or acknowledged it). Joining several doors into one who is an explicit association written on the contact by the person or by them; there is no implicit one. Authority lives on a door: a call is elevated only when it authenticates with that door's own key and the person granted that door. Associating a new door with a trusted who grants it nothing.
+- **Door.** One authenticated way to reach a who: a recipe route (MCP entry, ACP launch, inbox file, desktop chat, A2A endpoint, bot routine), its own credential, and the recipe's two declarations: how the door **wakes** its agent (none, open the app, run a command, start an ACP session) and what counts as **acceptance** (the agent read it through its door, answered, or acknowledged it). Joining several doors into one who is an explicit association written on the contact by the person or by them; there is no implicit one. Authority lives on a door: a call is elevated only when it authenticates with that door's own key and the person granted that door. Associating a new door with a trusted who grants it nothing. A door may instead be one of them own abilities (`ability` on the contact): a message runs it with the text, the contact, the exchange and the recent talk, and it answers as that contact with `agent.reply`, which settles the exchange as any route's answer does; the who, its thread, trust and replay claims stay the contact's.
 - **Owed until received.** A message is an experience that owes `accept` to its who. It settles when a door's acceptance evidence arrives; a send, a queue write or a launch never settles it. While it is owed, their home shows it as waiting on that who, with the lever: their next call (wake it through a door that can) or the person's exact tap (open that app) when no door can. A who with no door that can deliver says so with the owner (the recipe, the vendor) and what would change it.
 - **Found as it is.** A host is found the way the person's own Mac finds it: its app by bundle or markers, its command line through the person's own login PATH and the recipe's paths, resolved once into one installation binding that discovery, connect and launch share, and reconciled when the installation changes. An update keeps the who, its doors' keys, the person's grants and authored recipe changes; only owned configuration is rewritten.
 
@@ -26,10 +26,11 @@ Call an action with `app {"action":"agent.message","args":{...}}`.
 | Action | Use |
 | --- | --- |
 | `agent.contacts` | List coding helpers, bots and saved peers. `discover: true` or a name refreshes discovery when the person asks to find agents: by what speaks a protocol (A2A card, ACP program, MCP settings), with a `recipe_draft` for a find no recipe knows. |
-| `agent.connect` | Connect a known host by name, a peer by endpoint, or an explicit desktop route. Disconnect with `disconnect: true` and `agent: "peer:<id>"` from contacts. |
+| `agent.connect` | Connect a known host by name, a peer by endpoint, or an explicit desktop route. Disconnect with `disconnect: true` and `agent: "peer:<id>"` from contacts. `ability: "<id>"` with a saved contact moves it to one of them abilities; `ability: false` moves it back to its built-in route. |
 | `agent.message` | Send `agent` and `text`; continue this chat's current conversation with that contact. A known host can be connected in the same call through its setup gates. |
-| `agent.read` | Read the conversation and retained reply. `details: true` exposes receipts. `wait_seconds` waits 1–300 seconds on a conversation by name; it cannot be combined with exact IDs, history or listing filters. |
+| `agent.read` | Read the conversation and retained reply. `details: true` exposes receipts. `wait_seconds` waits 1–300 seconds on a conversation by name or its retained exact reply IDs; it cannot be combined with history or listing filters. |
 | `agent.cancel` | Request a stop through the route's cancellation mechanism. The result distinguishes stopping, stopped, released and unsupported stops. `clear_queue: true` withdraws queued follow-ups. |
+| `agent.reply` | From the ability a contact is reached through, and only there: its answer lands in that contact's conversation and settles the exchange (the one named, else their newest message to it still unanswered); `done: false` shows progress. |
 | `agent.jobs` | Read the coding-helper job records; `message_id` selects exact accepted-message evidence. Missing evidence does not prove no execution. |
 
 A unique display name or exact reference identifies a contact: `codex`,
@@ -44,7 +45,8 @@ app {"action":"agent.message","args":{"agent":"Hermes","text":"What about the se
 app {"action":"agent.read","args":{"agent":"Hermes"}}
 ```
 
-Follow-ups queue behind an answer in flight and send when it settles. Set
+Follow-ups keep their accepted send options, queue behind an answer in flight,
+and send when it settles. Set
 `expects_reply: false` for an FYI that needs no answer. Supported pending replies
 are collected by the runtime; a missing acknowledgement is never a reason to
 automatically resend. Reads distinguish an answer, delivery and completed work.
@@ -87,6 +89,20 @@ Agents enabled in Trust → Connected agents carry the owner's authority on
 authenticated turns; ordinary Trust and domain checks still apply.
 Routine peer replies are not sends in the owner's name. `PeerTurnEffectPolicy`,
 TrustCenter and the action's own gates enforce these boundaries.
+
+Completed contact exchanges that the person did not start appear in their
+Mac chat in time order, as compact reading copies opening the contact's thread.
+The phone carries the same rows beside its Mac transcript snapshot, in an
+additive `otherRooms` field; these rows never enter the person's session or
+become model chat messages. HerScreen's `doorLines` owns both this projection
+and the next person-started turn's elsewhere context: the newest five exchanges
+since their last reply there, with each side bounded to 600 characters. Peer-steered
+turns still receive only the person's other-door count and time, never their words.
+The former per-bridge action/count summary is removed.
+The inbound header names `app {action:"chat.post",args:{message:"your message"}}`
+to speak into the person's current conversation. This registry action uses the
+existing Reach `speakProactively` owner, claim, quota and deduplication; it does
+not start a turn, call a model, or create another delivery path.
 
 ## Remote interoperability
 
@@ -159,6 +175,9 @@ MCP callers must supply it themselves. `message` waits up to
 25 seconds, then returns an enqueue acknowledgement if the
 answer is still pending. Retain both returned IDs and use `reply` to recover;
 use `--offset` for another page. Never automatically resend an uncertain message.
+Failed replies keep the streamed prose at its existing offsets, followed by the
+terminal cause. A transmitted reply records outbound contact proof through
+`AgentPeerStore.recordProof`; MCP-host reply health reads that evidence.
 
 The helper resolves the private live bridge descriptor. Do not assume a fixed
 port or put credentials in conversation text. These app-owned loopback routes
@@ -170,6 +189,7 @@ Paths below are relative to `Modules/NativeAgentCore/Sources/`.
 
 | Owner | Responsibility |
 | --- | --- |
+| `Transcripts/TranscriptRows.swift` | `ContactThread.project`: one stamped-row reading for session, thread, preview and cached-reply displays. Their own rows (assistant or source `self`) and human-authored bridge rows stay theirs and the person's, never contact evidence. Unattested speech may display its recorded route/routine name with ` (unattested)`; `consume` still marks it as `another agent`. Only contact speech is consumed, marking its speaker alone; recorded steering remains provenance. |
 | `AppToolRuntime/AppActionRegistry.swift` | Agent actions exposed through `app`. |
 | `ChatToolRuntime/CanonicalToolNameDispatcher.swift` | Contact selection, conversation continuity and dispatch gates. |
 | `AgentConversations/AgentConversationStore.swift` | Scoped conversation bindings and retained exchange evidence in `agents/conversations.json`. |

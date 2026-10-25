@@ -4,6 +4,8 @@ import PersistenceCore
 import Desk
 import WorkshopExecution
 
+// Blueprint: | `NativeResidentWorkContextProjection.swift` | `NativeResidentWorkContextProjection` and `ResidentWorkDecisionNeed`: provenance-bearing Desk/Workshop context, without scheduling or transition authority |
+
 /// Deterministic answer to "does resident work need cognition now?" This is a
 /// read model, not a scheduler or permission. The Desk and Workshop reducers
 /// remain the only owners allowed to transition work.
@@ -309,17 +311,7 @@ private extension NativeResidentWorkContextProjection {
             // 2026-09-23: words in nearly every turn; they matched desk items to everything.
             "user", "claude", "agent", "requested", "test",
         ]
-        var seen: Set<String> = []
-        var values: [String] = []
-        for token in text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
-            let value = String(token)
-            guard value.count >= 3, !stop.contains(value), seen.insert(value).inserted else {
-                continue
-            }
-            values.append(NativeContextProjectionText.bounded(value, to: 64))
-            if values.count == 12 { break }
-        }
-        return values
+        return NativeContextProjectionText.triggers(text, minimumLength: 3, excluding: stop)
     }
 
     static func cleanOptional(_ value: String?) -> String? {

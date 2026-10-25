@@ -23,6 +23,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `MemoryV2+ProbeRunner.swift` | `MemoryProbeRunner`: existing known-answer recall scoring/comparison through canonical storage and embedding epochs |
+
 // MARK: - Score shapes
 
 public struct MemoryProbeMiss: Sendable, Equatable {
@@ -113,7 +115,7 @@ public enum MemoryProbeRunner {
         embedder: any EmbeddingProvider
     ) async throws -> MemoryEmbeddingBatch {
         guard !probes.isEmpty else { throw ProbeRunnerError.emptyProbeSet }
-        let batch = try await embedder.embedWithEpoch(probes.map(\.question))
+        let batch = try await embedder.embedQueriesWithEpoch(probes.map(\.question))
         guard batch.vectors.count == probes.count else {
             throw ProbeRunnerError.vectorCountMismatch(expected: probes.count, got: batch.vectors.count)
         }

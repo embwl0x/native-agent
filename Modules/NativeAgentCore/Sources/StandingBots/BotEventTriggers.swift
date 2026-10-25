@@ -1,23 +1,21 @@
 import Foundation
 
-/// Event waking (0.4.12). A bot already wakes on a schedule or on Run once;
-/// a trigger lets an outside event wake it. Only sources the app already
-/// receives are offered: the GitHub connector's tracking refresh and the Slack
-/// socket-mode runner. StandingBots owns matching, admission and the record of
-/// what woke a bot; the listeners live where the data already arrives.
-public enum BotEventSource: String, Codable, Sendable, CaseIterable {
-    case github, slack
+// Blueprint: | `BotEventTriggers.swift` | `BotEventRouter` and `BotEventStore`: Slack event matching/admission and durable wake records from already received events |
 
-    public var label: String {
-        switch self {
-        case .github: return "GitHub"
-        case .slack: return "Slack"
-        }
-    }
+/// Event waking (0.4.12). A bot already wakes on a schedule or on Run once;
+/// a trigger lets an outside event wake it. Only a source the app already
+/// receives is offered: the Slack socket-mode runner. StandingBots owns
+/// matching, admission and the record of what woke a bot; the listener lives
+/// where the data already arrives. GitHub events were one until 10-21 (see
+/// `BotDefinition.githubTriggerOff`).
+public enum BotEventSource: String, Codable, Sendable, CaseIterable {
+    case slack
+
+    public var label: String { "Slack" }
 }
 
-/// Persisted on the definition. `filter` is the repository (owner/repo) or the
-/// Slack channel; `keyword` is optional and must appear in the event text.
+/// Persisted on the definition. `filter` is the Slack channel; `keyword` is
+/// optional and must appear in the event text.
 public struct BotEventTrigger: Codable, Equatable, Sendable {
     public var source: BotEventSource
     public var filter: String
@@ -30,7 +28,7 @@ public struct BotEventTrigger: Codable, Equatable, Sendable {
         self.keyword = (trimmed?.isEmpty ?? true) ? nil : trimmed
     }
 
-    /// "GitHub · owner/repo" or "Slack · C0123ABCD", with the keyword appended.
+    /// "Slack · C0123ABCD", with the keyword appended.
     public var label: String {
         let base = "\(source.label) · \(filter.trimmingCharacters(in: .whitespacesAndNewlines))"
         guard let keyword else { return base }
@@ -73,7 +71,7 @@ public struct BotEventTrigger: Codable, Equatable, Sendable {
 /// text the run reads.
 public struct BotIncomingEvent: Sendable, Equatable {
     public let source: BotEventSource
-    /// owner/repo, or the Slack channel id the runner received.
+    /// The Slack channel id the runner received.
     public let target: String
     public let summary: String
     public let detail: String
@@ -120,8 +118,21 @@ public struct BotEventStore: Sendable {
     public init(dataRoot: URL) { disk = StandingBotsDisk(dataRoot: dataRoot) }
     private var path: URL { disk.root.appendingPathComponent("last-events.json") }
 
+    /// The saved records; one a GitHub event wrote (before 10-21) drops on
+    /// read, as its bot no longer waits on one.
+    private func records() throws -> [String: BotEventRecord] {
+        struct Saved: Decodable {
+            let record: BotEventRecord?
+            init(from decoder: Decoder) throws {
+                struct Source: Decodable { let source: String }
+                record = try Source(from: decoder).source == "github" ? nil : BotEventRecord(from: decoder)
+            }
+        }
+        return try disk.read([String: Saved].self, at: path)?.compactMapValues(\.record) ?? [:]
+    }
+
     public func lastEvents() throws -> [UUID: BotEventRecord] {
-        let saved = try disk.locked { try disk.read([String: BotEventRecord].self, at: path) ?? [:] }
+        let saved = try disk.locked { try records() }
         return Dictionary(saved.compactMap { key, value in
             UUID(uuidString: key).map { ($0, value) }
         }, uniquingKeysWith: { first, _ in first })
@@ -132,7 +143,7 @@ public struct BotEventStore: Sendable {
     /// it is the one that changes — nothing here invents an event.
     func hold(bot id: UUID, detail: String) throws {
         try disk.locked {
-            var saved = try disk.read([String: BotEventRecord].self, at: path) ?? [:]
+            var saved = try records()
             guard var record = saved[id.uuidString], record.outcome == .queued else { return }
             record.outcome = .held
             record.detail = detail
@@ -143,7 +154,7 @@ public struct BotEventStore: Sendable {
 
     func record(_ record: BotEventRecord, bot id: UUID) throws {
         try disk.locked {
-            var saved = try disk.read([String: BotEventRecord].self, at: path) ?? [:]
+            var saved = try records()
             saved[id.uuidString] = record
             try disk.write(saved, at: path)
         }

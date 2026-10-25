@@ -4,6 +4,9 @@ import Darwin
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Transcripts
+import TurnTrace
+// Blueprint: | `MacChatTurnLifecycle.swift` | `MacChatTurnTerminalEvidence`; queue persistence stamps new requests and projects work from another life (no stamp is the first life) stopped through DataRootLife; restoreCarry/installRestoreCarry and their current-work overlay are deleted |
 
 /// Why a terminal phase is trustworthy. The value is deliberately closed and
 /// payload-free so a presentation state can explain its confidence without
@@ -399,6 +402,20 @@ public struct MacChatTurnLifecycleFileStorage: Sendable {
     public init(fileURL: URL) { self.fileURL = fileURL }
 
     public func load() async throws -> Envelope {
+        var envelope = try read()
+        let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        let life = try DataRootLife.current(in: root)
+        envelope.queuedTurns = envelope.queuedTurns?.mapValues { turns in
+            turns.map { turn in
+                var turn = turn
+                if DataRootLife.life(of: turn.lifeID) != life { turn.stoppedReason = DataRootLife.stoppedReason }
+                return turn
+            }
+        }
+        return envelope
+    }
+
+    private func read() throws -> Envelope {
         var info = stat()
         let result = fileURL.path.withCString { lstat($0, &info) }
         if result != 0 {
@@ -419,11 +436,16 @@ public struct MacChatTurnLifecycleFileStorage: Sendable {
     }
 
     public func save(_ envelope: Envelope) async throws {
+        try write(envelope)
+    }
+
+    private func write(_ envelope: Envelope) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(envelope)
-        try await SwiftNativePersistenceCore().writeDataAtomicDurable(data, to: fileURL)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
     }
+
 }
 
 public enum MacChatTurnLifecycleStoreError: Error, Sendable, Equatable {
@@ -578,16 +600,18 @@ public actor MacChatTurnLifecycleStore {
         defer { releaseMutation() }
         var state = try await currentState()
         var saved = turns
+        let known = Set((state.queuedTurns ?? [:]).values.flatMap { $0 }.map(\.id))
+        let life = try DataRootLife.current(in: storage.fileURL.deletingLastPathComponent().deletingLastPathComponent())
         for (session, queue) in turns {
             for (index, turn) in queue.enumerated() {
+                if !known.contains(turn.id) { saved[session]?[index].lifeID = life }
                 for (attachmentIndex, attachment) in turn.attachments.enumerated() where !attachment.base64.isEmpty {
                     guard NativeAgentChatSessionID.normalizedPathComponent(turn.id) != nil,
                           let bytes = Data(base64Encoded: attachment.base64) else {
                         throw MacChatTurnLifecycleStoreError.invalidRecord
                     }
-                    let path = storage.fileURL.deletingLastPathComponent()
-                        .appendingPathComponent("attachments/\(turn.id)/\(attachmentIndex)")
-                    try await SwiftNativePersistenceCore().writeDataAtomicDurable(bytes, to: path)
+                    let path = try await SwiftNativeChatOrchestrationClient.persistAttachment(bytes,
+                        chatRoot: storage.fileURL.deletingLastPathComponent(), runId: turn.id, index: attachmentIndex)
                     saved[session]?[index].attachments[attachmentIndex].base64 = ""
                     saved[session]?[index].attachments[attachmentIndex].path = path.path
                 }
@@ -671,15 +695,35 @@ public actor MacChatTurnTranscriptProofReader: MacChatTurnTranscriptProofReading
     public func proof(
         for identity: MacChatTurnIdentity
     ) async throws -> MacChatTurnTranscriptTerminalProof {
+        let path = try Self.path(for: identity, dataRoot: dataRoot)
+        return try await persistence.withFileLock(path) {
+            try Self.readLocked(path: path, identity: identity)
+        }
+    }
+
+    /// The safety snapshot is immutable and has no live transcript writer.
+    fileprivate nonisolated static func proof(
+        for identity: MacChatTurnIdentity, dataRoot: URL
+    ) throws -> MacChatTurnTranscriptTerminalProof {
+        try readLocked(path: path(for: identity, dataRoot: dataRoot), identity: identity)
+    }
+
+    private nonisolated static func path(for identity: MacChatTurnIdentity, dataRoot: URL) throws -> URL {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(
             identity.sessionId
         ) else {
             throw MacChatTurnTranscriptProofReaderError.invalidEvidence
         }
-        let path = dataRoot
+        return dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeSessionId).jsonl")
+    }
+
+    private nonisolated static func readLocked(
+        path: URL,
+        identity: MacChatTurnIdentity
+    ) throws -> MacChatTurnTranscriptTerminalProof {
         var info = stat()
         let result = path.path.withCString { lstat($0, &info) }
         if result != 0 {
@@ -694,15 +738,6 @@ public actor MacChatTurnTranscriptProofReader: MacChatTurnTranscriptProofReading
             // trustworthy negative receipt.
             throw MacChatTurnTranscriptProofReaderError.invalidEvidence
         }
-        return try await persistence.withFileLock(path) {
-            try Self.readLocked(path: path, identity: identity)
-        }
-    }
-
-    private nonisolated static func readLocked(
-        path: URL,
-        identity: MacChatTurnIdentity
-    ) throws -> MacChatTurnTranscriptTerminalProof {
         let values = try path.resourceValues(forKeys: [
             .isRegularFileKey,
             .isSymbolicLinkKey,

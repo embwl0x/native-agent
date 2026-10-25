@@ -3,6 +3,8 @@ import SwiftUI
 import Sparkle
 import SystemOps
 
+// Blueprint: | `UpdateController.swift` | `UpdateController`: configured Sparkle lifecycle, version probes and explicit unavailable/update presentation |
+
 // RELEASE-2026-05-06: thin Sparkle 2.x wrapper — Task 4.3
 // Sparkle is enabled only for release bundles with a complete updater config.
 // Developer installs intentionally omit SUFeedURL/SUPublicEDKey; starting Sparkle

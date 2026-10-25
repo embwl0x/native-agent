@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+// Blueprint: | `ContextSelection.swift` | `ContextSelector` struct; `select`, `commonEligibilityFailure` shared with expansion; correction scope/conflict resolution remain selection policy |
 
 // MARK: - Deterministic hybrid selector
 
@@ -90,6 +91,17 @@ public struct ContextSelector: Sendable {
             throw ContextSelectionError.mandatoryUnavailable(unavailableMandatory)
         }
 
+        // Budget expansion must not pay for a scoring pass it will discard.
+        let mandatoryAtoms = mandatoryIDs.compactMap { atomByID[$0] }.sorted(by: mandatoryOrder)
+        let mandatoryCharacters = mandatoryAtoms.reduce(0) { $0 + $1.draft.body.count }
+        let mandatoryLimit = min(need.characterBudget, need.mandatoryCharacterBudget)
+        guard mandatoryCharacters <= mandatoryLimit else {
+            throw ContextSelectionError.mandatoryBudgetExceeded(
+                required: mandatoryCharacters,
+                limit: mandatoryLimit
+            )
+        }
+
         let groupByAtom = Dictionary(groups.flatMap { group in
             group.memberAtomIDs.map { ($0, group.id) }
         }, uniquingKeysWith: { first, _ in first })
@@ -126,15 +138,6 @@ public struct ContextSelector: Sendable {
         var selectedItems: [ContextPacketItem] = []
         var selectedIDs = Set<ContextAtomID>()
         var selectionOrdinals: [ContextAtomID: Int] = [:]
-        let mandatoryAtoms = mandatoryIDs.compactMap { atomByID[$0] }.sorted(by: mandatoryOrder)
-        let mandatoryCharacters = mandatoryAtoms.reduce(0) { $0 + $1.draft.body.count }
-        let mandatoryLimit = min(need.characterBudget, need.mandatoryCharacterBudget)
-        guard mandatoryCharacters <= mandatoryLimit else {
-            throw ContextSelectionError.mandatoryBudgetExceeded(
-                required: mandatoryCharacters,
-                limit: mandatoryLimit
-            )
-        }
         for atom in mandatoryAtoms {
             selectedItems.append(ContextPacketItem(
                 atom: atom,
@@ -152,9 +155,6 @@ public struct ContextSelector: Sendable {
             .filter { !need.precoveredSourceIDs.contains($0.draft.sourceID) }
             .filter { relevance(of: scores[$0.draft.id]) >= configuration.minimumRelevance }
             .sorted { rankedBefore($0, $1, scores: scores) }
-        let boundedCandidates = Array(rankedCandidates.prefix(configuration.maximumCandidates))
-        let candidateIDs = Set(boundedCandidates.map(\.draft.id))
-
         // MEMORY SEMANTIC FLOOR (see `memorySemanticFloors`). Ranking alone has
         // no notion of "not relevant enough to be worth a row": a saturated
         // memory quota is filled by whatever ranks next, however far down the
@@ -166,7 +166,7 @@ public struct ContextSelector: Sendable {
         let queryIsComparable = !(need.queryEmbedding?.isEmpty ?? true)
             && need.queryEmbeddingModelFingerprint != nil
         let flooredMemoryIDs: Set<ContextAtomID> = floor != 0 && queryIsComparable
-            ? Set(boundedCandidates.lazy.filter { atom in
+            ? Set(rankedCandidates.lazy.filter { atom in
                 guard atom.draft.kind == .memory || atom.draft.kind == .correction,
                       let embedding = atom.draft.embedding,
                       embedding.modelFingerprint == need.queryEmbeddingModelFingerprint,
@@ -199,16 +199,6 @@ public struct ContextSelector: Sendable {
             return min(need.memoryAtomRowLimit ?? short, short)
         }()
 
-        // Admission, not candidacy: `candidateIDs` (score receipts, conflict
-        // receipts) keeps every ranked atom, while unit construction sees only
-        // what may actually enter the packet. Feeding the broader set to
-        // `makeSelectionUnits` let a floored atom ride back in as a member of
-        // an unresolved conflict unit, which bypasses the quotas by design.
-        // Conflict completeness holds among ADMITTED atoms; a sub-floor memory
-        // row is not evidence of a contradiction worth spending a row on.
-        let admittedCandidates = boundedCandidates.filter {
-            !flooredMemoryIDs.contains($0.draft.id)
-        }
         // PERSONAL LANE (Phase 5 C3). What happened between them is not ranked
         // against ops rulings: personal atoms leave the ordinary competition
         // and ONE is picked on its own, or none (none is normal). It ranks on
@@ -216,13 +206,15 @@ public struct ContextSelector: Sendable {
         // everything else she knows (its baseline). Raw cosine let a memory
         // that mentions Claude answer every turn that does. Nothing else
         // (friction, importance, recency) can lift one over a better fit. It
-        // takes one memory row below, never an extra one.
+        // takes one memory row below, never an extra one. Pick before the
+        // ordinary candidate cutoff so ops cannot crowd this lane out.
         let personalLane = configuration.personalRecallFloor > 0
         let personalPick: ContextStoredAtom? = {
             guard personalLane, queryIsComparable, let fingerprint = need.queryEmbeddingModelFingerprint else { return nil }
-            let personal = admittedCandidates.filter {
+            let personal = rankedCandidates.filter {
                 $0.draft.contentRole == .personal && $0.draft.injectionPolicy != .onDemand
                     && $0.draft.embedding?.modelFingerprint == fingerprint
+                    && !flooredMemoryIDs.contains($0.draft.id)
             }
             guard !personal.isEmpty else { return nil }
             let baselines = Self.personalBaselines(generation.atoms, fingerprint: fingerprint)
@@ -235,6 +227,16 @@ public struct ContextSelector: Sendable {
                 return lhs.draft.id > rhs.draft.id
             }
         }()
+        let boundedCandidates = Array(rankedCandidates.filter {
+            !(personalLane && $0.draft.contentRole == .personal)
+        }.prefix(configuration.maximumCandidates)) + [personalPick].compactMap { $0 }
+        let candidateIDs = Set(boundedCandidates.map(\.draft.id))
+
+        // Admission, not candidacy: score/conflict receipts keep floored atoms,
+        // but conflict units cannot carry them back into the packet.
+        let admittedCandidates = boundedCandidates.filter {
+            !flooredMemoryIDs.contains($0.draft.id)
+        }
         var units = makeSelectionUnits(
             candidates: admittedCandidates.filter {
                 $0.draft.injectionPolicy != .onDemand
@@ -377,9 +379,7 @@ public struct ContextSelector: Sendable {
         // atom. This adds at most one pointer per bounded selected item.
         var pointers: [ContextAtomPointer] = []
         var published: Set<ContextAtomID> = []
-        for item in selectedItems where item.representation == .deterministicSummary
-            || (need.packetAtomExpandThresholdChars > 0
-                && item.text.count > need.packetAtomExpandThresholdChars) {
+        for item in selectedItems where item.isExpandable(thresholdChars: need.packetAtomExpandThresholdChars) {
             guard published.insert(item.pointer.atomID).inserted else { continue }
             pointers.append(item.pointer)
         }
@@ -419,8 +419,9 @@ public struct ContextSelector: Sendable {
                 selectionOrdinal: selectionOrdinals[atomID]
             )
         }.sorted { $0.atomID < $1.atomID }
+        let needFingerprint = need.deterministicFingerprint
         let receiptID = ContextStableID.digest(parts: [
-            need.deterministicFingerprint,
+            needFingerprint,
             String(generation.generation.id),
             generation.generation.sourceFingerprint,
         ] + selectedIDList.map(\.rawValue) + pointerIDList.map(\.rawValue))
@@ -440,7 +441,7 @@ public struct ContextSelector: Sendable {
         }()
         let receipt = ContextSelectionReceipt(
             id: receiptID,
-            needFingerprint: need.deterministicFingerprint,
+            needFingerprint: needFingerprint,
             generationID: generation.generation.id,
             sourceFingerprint: generation.generation.sourceFingerprint,
             selectionTimeBucket: need.selectionTimeBucket,
@@ -476,6 +477,40 @@ public struct ContextSelector: Sendable {
 }
 
 // MARK: - Selection internals
+
+extension ContextSelector {
+    /// Shared admission, in selection-policy order. Expansion keeps pointer checks.
+    static func commonEligibilityFailure(
+        for atom: ContextStoredAtom, generationID: Int64,
+        source: ContextStoredSource, need: NeedSignal
+    ) -> (reason: ContextEligibilityReason, expansionError: ContextExpansionError)? {
+        let id = atom.draft.id, sourceID = source.descriptor.id
+        guard atom.validFromGeneration <= generationID,
+              atom.validToGeneration.map({ $0 >= generationID }) ?? true else {
+            return (.generationMismatch, .atomGenerationMismatch(id))
+        }
+        guard source.validFromGeneration <= generationID,
+              source.validToGeneration.map({ $0 >= generationID }) ?? true else {
+            return (.generationMismatch, .sourceGenerationMismatch(sourceID))
+        }
+        if need.deletedAtomIDs.contains(id) { return (.deleted, .deleted(id)) }
+        if need.tombstonedAtomIDs.contains(id) { return (.tombstoned, .tombstoned(id)) }
+        if source.health == .removed { return (.sourceRemoved, .sourceRemoved(sourceID)) }
+        if !need.authorization.allowedOrigins.contains(need.origin) { return (.originDenied, .originDenied(need.origin)) }
+        if !need.authorization.allowedSourceIDs.contains(sourceID) { return (.permissionDenied, .sourcePermissionDenied(sourceID)) }
+        if let allowed = need.authorization.allowedAtomIDs, !allowed.contains(id) { return (.permissionDenied, .atomPermissionDenied(id)) }
+        if !source.descriptor.permittedSurfaces.contains(need.surface) { return (.surfaceDenied, .sourceSurfaceDenied(source: sourceID, surface: need.surface)) }
+        if !atom.draft.permittedSurfaces.contains(need.surface) { return (.surfaceDenied, .atomSurfaceDenied(atom: id, surface: need.surface)) }
+        if !need.authorization.allowedPrivacy.contains(source.descriptor.privacy) { return (.privacyDenied, .sourcePrivacyDenied(source: sourceID, privacy: source.descriptor.privacy)) }
+        if !need.authorization.allowedPrivacy.contains(atom.draft.privacy) { return (.privacyDenied, .atomPrivacyDenied(atom: id, privacy: atom.draft.privacy)) }
+        if atom.draft.injectionPolicy == .neverInject { return (.neverInject, .atomNotExpandable(policy: .neverInject)) }
+        if source.descriptor.injectionPolicy == .neverInject { return (.neverInject, .sourceInjectionDenied(sourceID)) }
+        if atom.draft.freshness.isExpired(at: need.evaluationTime) { return (.expired, .expired(id)) }
+        if need.staleRuntimeAtomIDs.contains(id) { return (.staleRuntime, .staleRuntime(id)) }
+        if need.secretBearingAtomIDs.contains(id) { return (.secretBearing, .secretBearing(id)) }
+        return nil
+    }
+}
 
 private extension ContextSelector {
     struct ScoreContext {
@@ -519,43 +554,12 @@ private extension ContextSelector {
         resolutionReason: ContextEligibilityReason?
     ) -> ContextEligibilityReason? {
         guard let source else { return .missingSource }
-        guard atom.validFromGeneration <= generationID,
-              atom.validToGeneration.map({ $0 >= generationID }) ?? true,
-              source.validFromGeneration <= generationID,
-              source.validToGeneration.map({ $0 >= generationID }) ?? true else {
-            return .generationMismatch
-        }
-        if need.deletedAtomIDs.contains(atom.draft.id) { return .deleted }
+        let failure = Self.commonEligibilityFailure(for: atom, generationID: generationID, source: source, need: need)
+        if let failure, failure.reason == .generationMismatch || failure.reason == .deleted { return failure.reason }
         if !ContextCorrectionScope.applies(atom.draft, message: need.message, recentTurns: need.recentTurns) {
             return .outsideContextScope
         }
-        if need.tombstonedAtomIDs.contains(atom.draft.id) { return .tombstoned }
-        if source.health == .removed { return .sourceRemoved }
-        if !need.authorization.allowedOrigins.contains(need.origin) { return .originDenied }
-        if !need.authorization.allowedSourceIDs.contains(atom.draft.sourceID) {
-            return .permissionDenied
-        }
-        if let allowedAtoms = need.authorization.allowedAtomIDs,
-           !allowedAtoms.contains(atom.draft.id) {
-            return .permissionDenied
-        }
-        if !atom.draft.permittedSurfaces.contains(need.surface)
-            || !source.descriptor.permittedSurfaces.contains(need.surface) {
-            return .surfaceDenied
-        }
-        if !need.authorization.allowedPrivacy.contains(atom.draft.privacy)
-            || !need.authorization.allowedPrivacy.contains(source.descriptor.privacy) {
-            return .privacyDenied
-        }
-        if atom.draft.injectionPolicy == .neverInject
-            || source.descriptor.injectionPolicy == .neverInject {
-            return .neverInject
-        }
-        if atom.draft.freshness.isExpired(at: need.evaluationTime) { return .expired }
-        if need.staleRuntimeAtomIDs.contains(atom.draft.id) { return .staleRuntime }
-        if need.secretBearingAtomIDs.contains(atom.draft.id) { return .secretBearing }
-        if let resolutionReason { return resolutionReason }
-        return nil
+        return failure?.reason ?? resolutionReason
     }
 
     func score(
@@ -616,22 +620,25 @@ private extension ContextSelector {
         // this feature cannot be diluted by recent turns or attention terms —
         // it is the one signal that tracks what the user just said.
         //
-        // Short-message damp: on a 1-3 token message coverage is quantized so
-        // coarsely (one shared token = 0.33-1.0) that it can out-vote the
-        // semantic feature on paraphrase queries — the exact regression the
-        // semanticQueryRecoversAParaphrase pin caught at weight 1.5. Scale by
-        // min(1, tokens/4) so tiny queries lean on semantics/overlap while
-        // 4+-token messages get the full evidenced weight.
+        // Coverage reaches full weight at the same short-message boundary
+        // that limits the memory lane; tiny queries lean on semantics/overlap.
         let messageCoverage: Double = {
             guard !context.messageTokens.isEmpty else { return 0 }
             let hit = context.matchedWeight(context.messageTokens, in: lexicalEntry.searchableTokens)
             let raw = hit / Double(context.messageTokens.count)
-            let lengthDamp = min(1.0, Double(context.messageTokens.count) / 4.0)
+            let lengthDamp = min(1.0, Double(context.messageTokens.count)
+                / Double(ContextSelectionConfiguration.shortMessageTokenCount))
             return raw * lengthDamp
         }()
+        // Meaning on the model's own scale: its floor reads as unrelated, 1 as
+        // the same thought. Raw bge cosine bunches every memory between 0.5
+        // and 0.66, so a paraphrase moved a score by tenths while two shared
+        // incidental words moved it by whole points (10-21, live).
+        let semanticFloor = min(0.99, max(0, configuration.memorySemanticFloor(forModel: need.queryEmbeddingModelID) ?? 0))
+        let meaning = max(0, semantic - semanticFloor) / (1 - semanticFloor)
         let total = (w.lexicalExact * exact)
             + (w.tokenOverlap * overlap)
-            + (w.semanticCosine * semantic)
+            + (w.semanticCosine * meaning)
             + (w.sharedIdentifiers * shared)
             + (w.activation * activation)
             + (w.authority * authority)

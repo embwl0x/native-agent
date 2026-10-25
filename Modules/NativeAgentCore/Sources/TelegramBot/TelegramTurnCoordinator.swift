@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `TelegramTurnCoordinator.swift` | `TelegramTurnCoordinator`: active/queued turn ownership, durable update recovery exclusion, control claims and Stop/idle settlement |
+
 public struct TelegramLastUserMessage: Sendable, Equatable {
     public let chatId: Int
     public let text: String
@@ -103,100 +105,6 @@ public actor TelegramTurnCoordinator {
 
     public init() {}
 
-    // MARK: - Chat-only convenience
-    //
-    // 2026-09-06: the coordinator now keys on (chat, forum topic) so two
-    // topics in one supergroup are two conversations. These take the whole
-    // chat, which is what a caller with no topic in hand means.
-
-    public func recordLastUserMessage(chatId: Int, text: String) {
-        recordLastUserMessage(destination: .chat(chatId), text: text)
-    }
-
-    public func lastUserMessage(chatId: Int) -> TelegramLastUserMessage? {
-        lastUserMessage(destination: .chat(chatId))
-    }
-
-    public func beginTurn(chatId: Int, text: String, task: Task<Void, Never>) -> UUID? {
-        beginTurn(destination: .chat(chatId), text: text, task: task)
-    }
-
-    public func startTurn(
-        chatId: Int,
-        text: String,
-        priority: TaskPriority? = nil,
-        operation: @escaping @Sendable () async -> Void
-    ) -> (id: UUID, task: Task<Void, Never>)? {
-        startTurn(destination: .chat(chatId), text: text, priority: priority, operation: operation)
-    }
-
-    public func startTrackedTurn(
-        chatId: Int,
-        text: String,
-        priority: TaskPriority? = nil,
-        operation: @escaping @Sendable (_ turnId: UUID) async -> Void
-    ) -> (id: UUID, task: Task<Void, Never>)? {
-        startTrackedTurn(destination: .chat(chatId), text: text, priority: priority, operation: operation)
-    }
-
-    @discardableResult
-    func enqueueTrackedTurn(
-        updateId: Int,
-        chatId: Int,
-        text: String,
-        acknowledgementMessageId: Int?,
-        operation: @escaping @Sendable (_ turnId: UUID) async -> Void,
-        onStart: @escaping @Sendable (_ acknowledgementMessageId: Int?) async -> Void
-    ) -> Int? {
-        enqueueTrackedTurn(
-            updateId: updateId,
-            destination: .chat(chatId),
-            text: text,
-            acknowledgementMessageId: acknowledgementMessageId,
-            operation: operation,
-            onStart: onStart
-        )
-    }
-
-    @discardableResult
-    func enqueueApprovalContinuation(
-        chatId: Int,
-        text: String,
-        operation: @escaping @Sendable (_ turnId: UUID) async -> Void
-    ) -> Int {
-        enqueueApprovalContinuation(destination: .chat(chatId), text: text, operation: operation)
-    }
-
-    func queuedTurn(chatId: Int, updateId: Int) -> TelegramQueuedTurnSnapshot? {
-        queuedTurn(destination: .chat(chatId), updateId: updateId)
-    }
-
-    @discardableResult
-    func promoteQueuedTurn(chatId: Int, updateId: Int) -> TelegramQueuedTurnSnapshot? {
-        promoteQueuedTurn(destination: .chat(chatId), updateId: updateId)
-    }
-
-    @discardableResult
-    func attachCard(
-        _ card: TelegramTurnProgressCardDriver,
-        chatId: Int,
-        turnId: UUID
-    ) -> Bool {
-        attachCard(card, destination: .chat(chatId), turnId: turnId)
-    }
-
-    func activeTurnID(chatId: Int) -> UUID? {
-        activeTurnID(destination: .chat(chatId))
-    }
-
-    public func finishTurn(chatId: Int, turnId: UUID) {
-        finishTurn(destination: .chat(chatId), turnId: turnId)
-    }
-
-    public func snapshot(chatId: Int) -> TelegramTurnSnapshot {
-        snapshot(destination: .chat(chatId))
-    }
-
     public func beginUpdateProcessing(_ updateId: Int) {
         inFlightUpdateIds.insert(updateId)
     }
@@ -222,33 +130,6 @@ public actor TelegramTurnCoordinator {
 
     public func lastUserMessage(destination: TelegramDestination) -> TelegramLastUserMessage? {
         lastMessages[destination]
-    }
-
-    public func beginTurn(destination: TelegramDestination, text: String, task: Task<Void, Never>) -> UUID? {
-        guard !isShuttingDown, activeTurns[destination] == nil else { return nil }
-        let id = UUID()
-        activeTurns[destination] = ActiveTurn(
-            id: id,
-            task: task,
-            startedAt: _tgNowString(),
-            promptPreview: Self.preview(text),
-            card: nil
-        )
-        return id
-    }
-
-    public func startTurn(
-        destination: TelegramDestination,
-        text: String,
-        priority: TaskPriority? = nil,
-        operation: @escaping @Sendable () async -> Void
-    ) -> (id: UUID, task: Task<Void, Never>)? {
-        startTrackedTurn(
-            destination: destination,
-            text: text,
-            priority: priority,
-            operation: { _ in await operation() }
-        )
     }
 
     /// Starts and owns a turn whose body needs its immutable turn id (for
@@ -507,10 +388,12 @@ public actor TelegramTurnCoordinator {
         return true
     }
 
-    public func finishTurn(destination: TelegramDestination, turnId: UUID) {
+    public func finishTurn(destination: TelegramDestination, turnId: UUID) async {
         guard activeTurns[destination]?.id == turnId else { return }
+        let card = activeTurns[destination]?.card
         activeTurns[destination] = nil
         startNextQueuedTurn(destination: destination)
+        await card?.close()
     }
 
     private func startNextQueuedTurn(destination: TelegramDestination) {
@@ -560,7 +443,7 @@ public actor TelegramTurnCoordinator {
             // task's receipt-writing tail — a confirmed stop must never leave
             // snapshot(destination:).isRunning true. The task's own finishTurn call
             // becomes a no-op (same-id guard).
-            finishTurn(destination: destination, turnId: active.id)
+            await finishTurn(destination: destination, turnId: active.id)
             return commands.contains(where: { commandTasks[$0] != nil }) ? .outcomeUnknown : .confirmed
         }
         await card.transition(

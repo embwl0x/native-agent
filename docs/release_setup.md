@@ -63,11 +63,10 @@ no separate model or delta asset.
 
 ### Separate-download override
 
-The explicit `separate-download` override packages the same resources as
-`NativeAgent-<version>.embedding.zip`, generates a descriptor with SHA-256,
-size and versioned HTTPS URL, and embeds that descriptor in the app. Use the
-same distribution setting for packaging and publishing. This is an opt-in
-alternative to the bundled default.
+The supported `separate-download` override does not satisfy
+[NORTHSTAR's public-release law](NORTHSTAR.md#clause-7--as-simple-as-possible-alive-means-easy-to-live-with).
+It packages `NativeAgent-<version>.embedding.zip` with a SHA-256, size and
+versioned HTTPS URL descriptor; packaging and publishing must use the same setting.
 
 The release writes `NativeAgent-<version>.embedding.json` beside the DMG and
 copies it to the signed bundle's `Contents/Resources/embedding-download.json`,

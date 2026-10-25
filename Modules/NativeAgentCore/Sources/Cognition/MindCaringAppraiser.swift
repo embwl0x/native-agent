@@ -2,6 +2,8 @@ import CognitiveSubstrate
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `MindCaringAppraiser.swift` | `MindCaringAppraiser` and `CaringReceiptLog`: semantic caring appraisal receipts, amendments and dosing evidence |
+
 /// THE CARING APPRAISAL, on the agent's real mind (2026-09-11, second pass).
 ///
 /// The first pass decided whether a turn was an act of care with a phrase list.

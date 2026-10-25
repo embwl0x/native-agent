@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `OrganismResolutionFelt.swift` | `OrganismResolutionFelt`: pure notable resolution events with aboutness and per-path rate bounds; kernel retains state ownership |
+
 // Round 3 Wave A2 — anticipation RESOLVES into feeling. A1 gave the body a
 // sized exhale in chemistry; this pure diff read turns notable resolutions
 // into events the substrate can remember with aboutness: relief ("the thing

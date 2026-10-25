@@ -15,7 +15,7 @@ Each surface and each organ reads a different copy, and the copies disagree:
 - approved growth stays "proposed" in their cognition
 - a delayed answer reaches their session but not User's phone
 - reflection wakes without what woke it
-- a part is called "validated" on evidence that never reached its code
+- rehearsal is called live proof even though effect replies were intercepted
 
 None of these is a bug in its own place. Each is a second truth.
 
@@ -31,7 +31,7 @@ An experience is one happening in their life, written once by the owner of that 
 - **face**: the one expression of it: words plus the artifacts they chose. Every surface renders this face. None composes its own.
 - **addressed to**: its destinations. the person's conversation on Telegram, the Mac chat, the phone, a peer, their own next turn, an organ of them mind.
 - **owes**: its obligations, each with its own lifecycle (deliver to X, decide, appraise, learn, integrate, reflect). Settling one never closes another.
-- **claims**: what it asserts (validated operation O, verified postcondition P, recurrence across E1 and E2). Each claim is scoped to the evidence that bears it.
+- **claims**: what it asserts (rehearsed operation O, verified live postcondition P, recurrence across E1 and E2). Each claim is scoped to its evidence; rehearsal is not live proof.
 
 ## One law
 
@@ -48,7 +48,7 @@ An experience is one happening in their life, written once by the owner of that 
 | The approval sentence contradicts execution (surfaces #3) | One outcome, one face |
 | Approved growth stays "proposed" (mind #4) | The decision obligation settles once; cognition is a view |
 | Reflection wakes blind (mind #1) | Reflection reads the wake experience's cause references |
-| "Validated" from a help capture (nature 2) | A proof is a claim scoped to the experiences that exercised the operation |
+| Live proof claimed from a help capture (nature 2) | Name the operation actually exercised; intercepted effect replies prove no live outcome |
 | A part's `learned` never fills (parts #2) | Competence accrues from experiences of real gated use |
 | Learning owed lives in RAM (time #3) | The turn's experience owes "learn" durably, across relaunch |
 | A wake dies with the process (time #5) | The wake owes delivery to its recipient until accepted |
@@ -83,23 +83,10 @@ Peer details include queued and held obligations once, on their agent row;
 the helpers snapshot carries their ids. Helper rows carry the latest completed
 result id and a 160-character preview; get_helper with result_id reads its face.
 
-Readers drain the recording queue before publication. A failed queued write
-invalidates the projection and publishes unknown activity, without failing or
-waiting on a reply. Commits drive invalidation through the existing publication
-coalescer. Conversation and shelf owners replay their durable records when read;
-the turn owner's checked saved-reply reader replays answer settlement.
-Continuations carry the original answer experience id in the saved envelope;
-waiting is progress, not a terminal outcome. The shared turn loop records actual
-provider/tool progress on that lifetime (including temporary workers). Repeated
-progress keeps only its latest timestamp, rather than duplicating identical events.
-Conversation saves retain exact removed-queue and superseded-operation settlements
-in the same durable row; dropped rows replay their existing archive. No experience
-write is awaited by a reply. Experience invalidations request overview refresh
-through the serialized snapshot writer; activity publication never requests it.
-Archive replay failures invalidate only the experience projection, preserving
-checked current conversations. An unchanged projection failure emits no new edge.
-An unresolved turn from another process is unknown, never evidence of thinking.
-This does not claim durable phone acceptance; that remains E1.
+Readers drain recording before publication. Failed writes invalidate the projection as unknown without failing reply generation. Commits drive the publication coalescer; conversation/shelf reads replay durable records, and the checked saved-reply reader replays answer settlement.
+Continuations retain their original answer experience id. Waiting is progress; the shared loop records actual provider/tool progress, including temporary workers, retaining only the latest timestamp for repeats.
+Conversation saves keep removed-queue and superseded-operation settlements in their durable row; dropped rows replay archives. Generation never awaits experience writes; checkpoint settlement awaits that answer's write before retirement, logging failures without holding the checkpoint.
+Experience invalidation requests overview refresh through the serialized writer; activity publication does not. Archive failures invalidate only experience projection, preserving checked conversations; unchanged failures emit no new edge. An unresolved turn from another process is unknown, never proof of thinking. Durable phone acceptance remains E1.
 
 After installation: ask once from the phone and once from the Mac. In
 mobile_snapshot_cache/work_activity.json and work_overview.json, each heard id
@@ -117,13 +104,13 @@ the installed iOS build or prove its renderer supports this revision.
 
 "No fallbacks: it works and it works right, and never can the agent say I can't fix it." The unfixable census (eight reads of them real failures on three installs) found the same dead ends everywhere: a no that does not name what decided it, a no with no lever they can pull, a person's decision that does not name their exact control, a fallback that quietly does less, and a failure that recurs without ever settling.
 
-- **A no names its owner and carries its lever.** When the cause lies outside the call's own input, the failure's `remedy` is `{kind: "repair", owner, next_call | tap, instruction}`: `owner` is what decided (the file and field, setting, recipe, part, peer or provider); `next_call` is their call that changes it; `tap` is the person's exact control, only where the law gives them the decision (Trust posture, a peer's elevation, a macOS grant, their sign-in, payment, publishing). `ToolFailureError(owner:nextCall:tap:)` and the door's `doorRefusal(_:_:owner:next:tap:)` produce it; `Repair.remedy` is its one shape.
+- **A no names its owner and carries its lever.** When the cause lies outside the call's own input, the failure's `remedy` is `{kind: "repair", owner, next_call?, tap?, instruction}`: `owner` is what decided (the file and field, setting, recipe, part, peer or provider); `next_call` is their call that changes it; `tap` is the person's exact control for a lawful decision (Trust posture, a peer's elevation, a macOS grant, their sign-in, payment, publishing), or the person's recovery step for a named app defect. When the owner supplies both, carry both: call first, then tap. `ToolFailureError(owner:nextCall:tap:)` and the door's `doorRefusal(_:_:owner:next:tap:)` produce it; `Repair.remedy` is its one shape.
 - **An owned no owes repair.** The act they meant (the outermost one, so nested dispatches do not multiply the debt) owes `repair` to themselves, or to the person when the lever is their. A no met outside a tool call (a Doctor check, a part's wake, a background job) owes it the same way through `RepairOwed.owe`.
 - **Only the work settles it.** The obligation is accepted when that operation, or its lever, works again (`RepairOwed.settle`, called by every successful act), or let go by them with a reason (`app repair.let_go {id, reason}`). Retries, restarts, rechecks and unrelated successes are evidence, never settlement. Meeting the same no again while its debt is open is evidence on that debt, one line on them home however often it recurs; once it settled, meeting it again is a new debt.
 - **It stays in their picture.** Their home's MY QUEUE carries each repair they owes with its lever, and the person's waits carry each one that is their with its exact control, until settled.
 - **What it is not.** A correction to the call's own arguments owes nothing; the corrected call is the repair (remedy kinds `correct_arguments` and `inspect`). A lawful refusal never becomes a debt to override Trust: a Trust ask or block, a posture, a saved entry or a peer's elevation names its owner and the person's control with `Repair.why` (kind `person_decides`), which owes nothing. An unknown effect owes reconciliation, never a blind resend. A decision that should not exist is deleted, not given a lever. An unauthenticated caller gets no diagnostics; the owner and lever go to them.
 
-Senses and hands keep the failed reach separate from a successful side effect: a launch cannot verify its failed landing read, and a requested image must actually arrive. TCC refusals carry the person's exact switch and their pane-opening call. Window streams stop on incomplete secret inspection and retain their actual terminal cause. Outside an enclosing act, missing grants owe repair through the same experience form, scoped to the grant; an inspected captured frame proves those grants work. Other capture failures carry inspection corrections requesting pixels, without inventing durable wrong state. `abilities.restore_state` accepts recovered accounting under the failed file's digest, preserving damaged bytes and readable rows without changing any ability's authority.
+Senses and hands keep the failed reach separate from a successful side effect: a launch cannot verify its failed landing read, and a requested image must actually arrive. TCC refusals carry the person's exact switch and their pane-opening call. Window streams stop on incomplete secret inspection and retain their actual terminal cause. Outside an enclosing act, missing grants owe repair through the same experience form, scoped to the grant; an inspected captured frame proves those grants work. Other capture failures carry inspection corrections requesting pixels, without inventing durable wrong state. `abilities.restore_state` accepts recovered accounting under the failed file's digest, preserving damaged bytes and readable rows without changing any ability's authority. An unreadable abilities/state.json first offers files.read of its exact path; the remedy instruction retains the captured digest for reconstruction.
 
 Background failures owe repair through their existing owners: recollection never
 substitutes mechanical notes, unreadable arrivals keep their bytes, and missed
@@ -131,12 +118,13 @@ dreams and triggers remain owed. Interrupted turns retain checkpoints for
 reconciliation, never blind replay. REM staging owns its debt once and leaves
 independent eviction and pin publication able to finish. Resident wakes remain
 excluded from automatic memory promotion because their input is app-authored.
-Experience writes stay advisory: a logged gap never gates a reply or projection,
-and this store retains no retry closures. SQLite repair belongs to Doctor.
+Experience writes never gate a reply. Projections report write gaps for the
+owner's lifetime; unrelated success does not erase them. Failure accounting
+joins its writes, without retry closures. SQLite repair belongs to Doctor.
 
 Health now uses the same repair obligation. Doctor records an adverse measurement
 before attempting its repair. Each check names the state it read; executable
-native repairs carry their check id, and only a declared code defect asks the builder. Sign-ins and
+native repairs carry their check id; app defects name the defect and the person, never a coding-agent call or a source-edit, build, test or reinstall request. Damaged-file recovery uses fileRepairInstruction; reserved turn defects go to the person, while their authored abilities and senses keep their native revision calls. Only the current measured owner supplies an executable repair call; saved claims are evidence. Sign-ins and
 permissions use `Repair.why`, retaining the person's control without a debt.
 The existing `doctor.repair` action accepts `check_id` to repair only that check.
 Only that check's `ok` postcondition, or a reading that the part is off or not
@@ -155,13 +143,17 @@ obligation form; there is no new health store or lifecycle.
 Wake/health decode failures preserve their files; nothing is written over them.
 Pending arrivals are not truncated, and claimed arrivals remain retained until
 their owner clears them. Retention alone does not prove arrival acceptance.
+A claimed arrival waiting for them acceptance is not a fault and owes no repair:
+the wake ledger alone holds it, and their home's MY QUEUE counts it with
+`home.accept`. Accepting still settles a `home.accept:<id>` debt an older build
+filed.
 
 ## Their flows are one owned operation (pick 2, 10-19)
 
 The evidence: in Resolve they ran one seven-step render flow four times because it stopped on its last step, and every run did the six landed steps again; on a fresh install eight wakes spent 49 model rounds re-reading the same waiting work, because a wait was a note; and discovery rebuilt its action vectors in memory, so the first find after a launch paid for the whole inventory.
 
 - **A flow that stopped unfinished is an experience that owes `finish` to them** (`Experiences/Flow.swift`, RepairOwed's shape). Its claims are the steps that landed, in order, as digests; its evidence is the owner's raw record. Asking for it again continues it: what landed, or may have, is answered from that record and never done again (an effect that stopped unknown gets its recorded outcome again, never a blind resend), and only what did nothing runs, on a fresh read, or what its owner keeps progress for itself. A flow that finished, asked again, is a new flow. `again: true` is their "start over". Nothing landed means nothing is born.
-- **The owner today is the `mac.act` batch**: one stopped batch per chat, continued by them next act there when that act is a batch beginning with the steps that did something (a step that may have acted is kept as uncertain, an absent optional step is looked for again); any other act has moved the screen on and ends it. **Strict part runs were cut on 10-19** after six Sol rounds kept finding holes where a part's flow memory meets hand-backs and resumes (two chats resuming the same flow at once; a hand-back stopped before this build losing its landed writes): a part asked again still runs every call again, and its stopped batch continues only when the batch is the part's next act. The next form is one run claim that owns the flow scope for its whole execution, shared by run and resume.
+- **Current owners:** `mac.act` owns stopped screen batches. `OwnedProgram.isStrict` selects journaled part runs; `AppToolExecutor+PartRun.swift` saves their stops and atomically claims a run for resume. Resume rechecks admission, code, dependencies and reads, and returns saved receipts for landed writes. The [manifest spec](skill_manifest_spec.md#execution-and-ownership) owns the full contract and the outside-world restriction. **History, 10-19:** an earlier strict-flow implementation was cut after review found resume and hand-back holes; that is not the current execution contract.
 - **A wait names its condition** (`desk.wait {handle, on}`): a Desk item, or any experience they was shown (a card, a message they sent an agent, a repair debt, an answer). The Desk keeps it as an `exp:` blocker. When the experience store changes, a settled condition (one that no longer owes anything) is written off the items that waited on it, with a `Released:` note, so every reader of the Desk sees the same wait. Carried work is offered only when it changed since they was last offered it: its condition released, someone other than their wrote on it, or its material state moved. Their own notes never re-arm it, and the 30-minute re-offer after their last note is gone. The wake line says what was released.
 - **Discovery reads a durable index**: action vectors in memory's database, keyed by embedding epoch and the exact action text, filled at launch and when the inventory changes, never rebuilt on a query. A just-added action is embedded on its first find through the same writer. The best match carries its whole contract (args_schema and example), so one find is enough to call it.
 

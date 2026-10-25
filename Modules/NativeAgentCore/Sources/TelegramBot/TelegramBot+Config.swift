@@ -2,6 +2,8 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
+// Blueprint: | `TelegramBot+Config.swift` | Saved shape validation, exact positive `voice_max_bytes` and TransportAllowlist's normalized integer IDs. Model/effort fields are legacy routing metadata; voice model metadata does not select recognition. Loads can remove retired credentials and migrate plaintext to Keychain. Conditional saves resolve kept tokens under the config lock and advance revisions, including disconnect |
 
 /// Credential-free configuration for management surfaces. Runtime configuration
 /// remains authoritative; a surface may supply its resolved routing selection.
@@ -31,8 +33,23 @@ public struct TelegramConfigurationSummary: Sendable, Equatable {
 // `<dataRoot>/config/config.json["telegram"]` block is retired: only its
 // plaintext credential fields are removed, never imported or used for routing.
 // See docs/canonical_data_paths.md.
+// Local backup includes this configuration object; export excludes it. Phone
+// sync projects Telegram status/configuration without credentials. PrivacyMap
+// lists Telegram as nonexportable.
 
 public struct TelegramConfig: Sendable, Equatable {
+    public struct SavedRevision: Sendable, Equatable {
+        fileprivate let bytes: Data?
+    }
+
+    public static func savedRevision(dataRoot: URL) throws -> SavedRevision {
+        let path = dataRoot.appendingPathComponent("telegram/config.json")
+        return try CredentialFileLock.withLock(path) {
+            do { return SavedRevision(bytes: try Data(contentsOf: path)) }
+            catch CocoaError.fileReadNoSuchFile { return SavedRevision(bytes: nil) }
+        }
+    }
+
     private static let tokenReferenceField = "bot_token_keychain_ref"
     private static let tokenService = "NativeAgent.telegram-bot"
     public static let defaultVoiceTranscriptionEnabled = true
@@ -53,13 +70,12 @@ public struct TelegramConfig: Sendable, Equatable {
     }
     public let requireMention: Bool
     public let enabled: Bool
-    /// Optional per-bot model override. When set, the chat-orchestration path
-    /// passes this model directly instead of resolving the telegram surface
-    /// via the picker. Empty → use surface picker.
+    /// Legacy routing metadata migrated into ProviderRouting by settings saves; never a turn override.
     public let model: String?
     public let reasoningEffort: String?
     public let voiceTranscriptionEnabled: Bool
     public let voiceTranscriptionBackend: String
+    /// Legacy saved metadata; recognition uses Apple Speech and reports `apple-speech`.
     public let voiceTranscriptionModel: String
     public let voiceMaxBytes: Int
 
@@ -96,9 +112,8 @@ public struct TelegramConfig: Sendable, Equatable {
         self.voiceMaxBytes = max(1, voiceMaxBytes)
     }
 
-    /// Read the on-disk Telegram config only from the canonical Swift-native
-    /// location: `<dataRoot>/telegram/config.json`. Returns nil when no config
-    /// exists or the token is empty.
+    /// Loads canonical settings, removes retired credentials and migrates plaintext into Keychain.
+    /// Returns nil on failure, missing settings or an empty token unless disconnected is included.
     public static func loadFromDisk(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         includeDisconnected: Bool = false
@@ -113,7 +128,7 @@ public struct TelegramConfig: Sendable, Equatable {
 
     /// Management callers distinguish missing settings from unavailable grants.
     /// Explicit replacement or disconnect reads validated metadata without
-    /// requiring the credential it is replacing.
+    /// requiring the credential it is replacing; retired credential cleanup still runs.
     public static func loadSavedConfiguration(
         dataRoot: URL,
         includeDisconnected: Bool = true,
@@ -142,18 +157,28 @@ public struct TelegramConfig: Sendable, Equatable {
     /// disk by hand.
     public static func saveToDisk(
         _ cfg: TelegramConfig,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        expectedRevision: SavedRevision? = nil,
+        keepExistingToken: Bool = false
     ) throws {
         let dir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("config.json")
         try CredentialFileLock.withLock(url) {
             try validateSavedConfiguration(dataRoot: dataRoot)
+            if let expectedRevision, try savedRevision(dataRoot: dataRoot) != expectedRevision {
+                throw PersistenceCoreError.ioFailure("Telegram settings changed while saving. The token was not saved.")
+            }
+            // Resolve a blank draft only after the revision check, while the
+            // same lock excludes disconnect and every other config writer.
+            let token = keepExistingToken
+                ? (try loadSavedConfiguration(dataRoot: dataRoot)?.botToken ?? "") : cfg.botToken
             var payload: [String: Any] = [
+                "configuration_revision": UUID().uuidString,
                 "allowed_chat_ids": cfg.allowedChatIds.sorted().map { NSNumber(value: $0) },
                 "allowed_user_ids": cfg.allowedUserIds.sorted().map { NSNumber(value: $0) },
                 "require_mention": cfg.requireMention,
-                "enabled": cfg.enabled,
+                "enabled": cfg.enabled && !token.isEmpty,
             ]
             if let m = cfg.model, !m.isEmpty { payload["model"] = m }
             if let e = cfg.reasoningEffort, !e.isEmpty { payload["reasoning_effort"] = e }
@@ -161,7 +186,7 @@ public struct TelegramConfig: Sendable, Equatable {
             payload["voice_transcription_backend"] = cfg.voiceTranscriptionBackend
             payload["voice_transcription_model"] = cfg.voiceTranscriptionModel
             payload["voice_max_bytes"] = cfg.voiceMaxBytes
-            try writePayload(payload, token: cfg.botToken, to: url)
+            try writePayload(payload, token: token, to: url)
         }
     }
 
@@ -301,7 +326,7 @@ public struct TelegramConfig: Sendable, Equatable {
                 throw PersistenceCoreError.ioFailure("Saved Telegram Keychain reference must be a UUID string")
             }
         }
-        for field in ["bot_token", "token", "model", "reasoning_effort", "reasoningEffort",
+        for field in ["configuration_revision", "bot_token", "token", "model", "reasoning_effort", "reasoningEffort",
                       "voice_transcription_backend", "voice_backend", "voice_transcription_model", "voice_model"] {
             guard let value = fields[field] else { continue }
             guard case .string = value else {
@@ -314,20 +339,17 @@ public struct TelegramConfig: Sendable, Equatable {
                 throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a boolean")
             }
         }
-        for field in ["allowed_chat_ids", "allowed_user_ids"] {
-            guard let value = fields[field] else { continue }
-            guard case .array(let ids) = value, ids.allSatisfy({ value in
-                switch value {
-                case .int: return true
-                case .string(let raw): return Int64(raw) != nil
-                default: return false
-                }
-            }) else {
-                throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must contain integer IDs")
-            }
-        }
+        _ = try TransportAllowlist.telegram(fields: fields)
         for field in ["voice_max_bytes", "voice_max_mb"] {
             guard let value = fields[field] else { continue }
+            if field == "voice_max_bytes" {
+                switch value {
+                case .int(let bytes) where bytes > 0: continue
+                case .double(let bytes) where Int(exactly: bytes).map({ $0 > 0 }) == true: continue
+                case .string(let bytes) where Int(bytes).map({ $0 > 0 }) == true: continue
+                default: throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a positive size")
+                }
+            }
             let number: Double?
             switch value {
             case .int(let value): number = Double(value)
@@ -336,7 +358,7 @@ public struct TelegramConfig: Sendable, Equatable {
             default: number = nil
             }
             guard let number, number.isFinite, number > 0,
-                  Int(exactly: (number * (field == "voice_max_mb" ? 1_048_576 : 1)).rounded(.towardZero)) != nil else {
+                  Int(exactly: (number * 1_048_576).rounded(.towardZero)).map({ $0 > 0 }) == true else {
                 throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a positive size")
             }
         }
@@ -362,8 +384,7 @@ public struct TelegramConfig: Sendable, Equatable {
         // so the UI's saved-disabled toggle survives a restart.
         if token.isEmpty && !includeDisconnected { return nil }
         let enabled = (obj["enabled"] as? Bool) ?? true
-        let chatIds = extractChatIds(obj["allowed_chat_ids"])
-        let userIds = extractChatIds(obj["allowed_user_ids"])
+        let allowed = try TransportAllowlist.telegram(fields: obj.mapValues { JSONValue(fromFoundation: $0) })
         let requireMention = (obj["require_mention"] as? Bool) ?? false
         let model = (obj["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let effort = (obj["reasoning_effort"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -371,8 +392,8 @@ public struct TelegramConfig: Sendable, Equatable {
         let voice = parseVoiceOptions(obj)
         return TelegramConfig(
             botToken: token,
-            allowedChatIds: chatIds,
-            allowedUserIds: userIds,
+            allowedChatIds: Set(allowed.chatIds.compactMap(Int64.init)),
+            allowedUserIds: Set(allowed.userIds.compactMap(Int64.init)),
             requireMention: requireMention,
             enabled: enabled,
             model: (model?.isEmpty == false) ? model : nil,
@@ -419,48 +440,44 @@ public struct TelegramConfig: Sendable, Equatable {
         }
     }
 
-    /// A restore rolls settings back, but never rolls back the current grant
-    /// (including an explicit disconnect) to a retired Keychain item.
-    public static func preserveCredential(safetyRoot: URL, destinationRoot: URL) throws {
+    /// Carry a readable current grant (including disconnect); return the source
+    /// failure for the restore receipt, while installation write failures throw.
+    public static func preserveCredential(safetyRoot: URL, destinationRoot: URL) throws -> String? {
         let source = safetyRoot.appendingPathComponent("telegram/config.json")
         let destination = destinationRoot.appendingPathComponent("telegram/config.json")
-        try CredentialFileLock.withLock(destination) {
-            try validateSavedConfiguration(dataRoot: safetyRoot)
+        return try CredentialFileLock.withLock(destination) {
+            let current: [String: Any]?
+            do {
+                try validateSavedConfiguration(dataRoot: safetyRoot)
+                current = FileManager.default.fileExists(atPath: source.path)
+                    ? try JSONSerialization.jsonObject(with: Data(contentsOf: source)) as? [String: Any] : nil
+                if let reference = current?[tokenReferenceField] as? String {
+                    guard let bytes = try DeviceSecretKeychain.read(service: tokenService, account: reference),
+                          let token = String(data: bytes, encoding: .utf8), !token.isEmpty else {
+                        throw DeviceSecretKeychain.Failure.unavailable
+                    }
+                }
+            } catch { return error.localizedDescription }
             try validateSavedConfiguration(dataRoot: destinationRoot)
-            let current = FileManager.default.fileExists(atPath: source.path)
-                ? try JSONSerialization.jsonObject(with: Data(contentsOf: source)) as? [String: Any] : nil
             let restored = FileManager.default.fileExists(atPath: destination.path)
                 ? try JSONSerialization.jsonObject(with: Data(contentsOf: destination)) as? [String: Any] : current
-            guard var payload = restored else { return }
+            guard var payload = restored else { return nil }
             payload.removeValue(forKey: "bot_token")
             payload.removeValue(forKey: "token")
             payload[tokenReferenceField] = current?[tokenReferenceField]
-            if let reference = current?[tokenReferenceField] as? String {
-                guard let bytes = try DeviceSecretKeychain.read(service: tokenService, account: reference),
-                      let token = String(data: bytes, encoding: .utf8), !token.isEmpty else {
-                    throw DeviceSecretKeychain.Failure.unavailable
-                }
-            } else if let token = (current?["bot_token"] as? String) ?? (current?["token"] as? String), !token.isEmpty {
+            if !(current?[tokenReferenceField] is String),
+               let token = (current?["bot_token"] as? String) ?? (current?["token"] as? String), !token.isEmpty {
                 // Legacy safety snapshots keep their bytes; migrate only the destination.
                 try writePayload(payload, token: token, to: destination)
-                _ = try parseFlat(destination, includeDisconnected: true, resolveCredential: true)
-                return
+                _ = try parseFlat(destination, includeDisconnected: true, resolveCredential: false)
+                return nil
             }
             let bytes = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
             try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: destination)
             guard try Data(contentsOf: destination) == bytes else { throw DeviceSecretKeychain.Failure.unavailable }
-            _ = try parseFlat(destination, includeDisconnected: true, resolveCredential: true)
+            _ = try parseFlat(destination, includeDisconnected: true, resolveCredential: false)
+            return nil
         }
-    }
-
-    private static func extractChatIds(_ raw: Any?) -> Set<Int64> {
-        guard let arr = raw as? [Any] else { return [] }
-        var out: Set<Int64> = []
-        for v in arr {
-            if let n = v as? NSNumber { out.insert(n.int64Value); continue }
-            if let s = v as? String, let n = Int64(s) { out.insert(n) }
-        }
-        return out
     }
 
     private static func parseVoiceOptions(_ obj: [String: Any]) -> (

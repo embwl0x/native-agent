@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ContextMemoryLead.swift` | `ContextMemoryLead`: memory age, provenance and stored untrusted-source extraction |
 
 /// How a memory record came to be known, as the agent should read it back.
 ///

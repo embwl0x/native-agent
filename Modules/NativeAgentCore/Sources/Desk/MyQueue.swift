@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `MyQueue.swift` | `MyQueue` enum; `entries`, `add`, `isReady`; `Entry.owedToPerson` derives reply obligation from recorded origin, independent of readiness and taint |
 
 /// MY QUEUE (Wave 2 #7/#8): what she said she would do later, kept as Desk
 /// items of hers until she marks each done or dropped. A step's `DeskStep`
@@ -12,8 +13,8 @@ public enum MyQueue {
         public let step: DeskStep
         /// Her name for it, as home and `item` use it.
         public var name: String { "desk." + item.alias }
-        /// Queued on a turn a peer steered. Opening it re-latches that peer on
-        /// the turn (`desk_read`), so a floor act it leads to still cards User.
+        /// Queued on a turn a peer steered. Its steer applies only where this
+        /// step resumes; reading it on the Desk carries none of it.
         public var peerBorn: Bool { !(step.peers.isEmpty && step.elevated.isEmpty) }
         public var owedToPerson: Bool { step.owedToPerson }
     }
@@ -114,6 +115,7 @@ public enum MyQueue {
     }
 
     public static func isReady(_ entry: Entry, _ context: Context) -> Bool {
+        guard entry.step.status != "stopped" else { return false }
         switch when(entry) {
         case .nextTurn: return true
         case .ownTurn, .quiet: return context.ownTurn
@@ -157,9 +159,16 @@ public enum MyQueue {
         return stale.count
     }
 
-    /// Done or dropped: the item closes and leaves MY QUEUE.
+    public struct Superseded: Error, LocalizedError, Sendable {
+        public var errorDescription: String? { "The queued step changed or closed before settlement; the newer state was kept." }
+    }
+
+    /// Done or dropped: only the unchanged snapshot closes and leaves MY QUEUE.
     public static func finish(_ entry: Entry, dropped: Bool, why: String, store: SwiftNativeDeskStore) async throws {
-        try await store.closeItem(entry.item.handle, outcomeSummary: why, canceled: dropped)
+        guard try await store.closeItemIfUnchanged(entry.item.handle, expectedUpdatedAt: entry.item.updatedAt,
+                                                   outcomeSummary: why, canceled: dropped) else {
+            throw Superseded()
+        }
     }
 
     /// A skill run still stopped at turn end (skills-as-code PR 3) waits here

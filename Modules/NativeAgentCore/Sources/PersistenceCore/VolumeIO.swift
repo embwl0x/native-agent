@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `VolumeIO.swift` | The one owner of blocking file work that can touch a File Provider or network volume (iCloud Drive): one serial queue off the cooperative pool, awaited by its callers |
 
 /// Blocking file work that can touch a File Provider or network volume:
 /// iCloud Drive above all, where a dataless file or folder blocks its reader

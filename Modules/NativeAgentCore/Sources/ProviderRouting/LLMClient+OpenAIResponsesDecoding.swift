@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `LLMClient+OpenAIResponsesDecoding.swift` | `OpenAIOAuthDirectAdapter`: `consumeResponsesStream`, `incompleteReasonText`, `incompleteNote` |
 
 extension OpenAIOAuthDirectAdapter {
     /// Shared Responses SSE execution; authentication and HTTP retries stay with each lane.

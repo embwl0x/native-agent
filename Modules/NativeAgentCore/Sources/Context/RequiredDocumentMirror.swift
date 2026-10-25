@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `RequiredDocumentMirror.swift` | `RequiredDocumentMirror` and `StablePromptKernel`: persona-slot/source naming, required document reads and deterministic logical byte accounting |
+
 public struct RequiredDocumentID: RawRepresentable, Hashable, Comparable, Sendable, Codable {
     public let rawValue: String
 

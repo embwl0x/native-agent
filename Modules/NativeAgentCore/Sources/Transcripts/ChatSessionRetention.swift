@@ -3,6 +3,7 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ChatSessionRetention.swift` | Canonical archive-index schema, manual archive transaction and durable append, shared by discovery/restoration; retention row removal delegates to ChatSessionIndexFile; locked pruning/enforcement snapshot, nonblocking transcript admission and exact acknowledged-version guard; retains all chat storage including the history index during disk cleanup |
 
 public struct ChatSessionRetentionPolicy: Sendable, Equatable {
     public var maxActiveSessions: Int
@@ -46,8 +47,8 @@ public struct ChatSessionRetentionReport: Sendable, Equatable {
 
 /// Bounds the hot chat session index without hard-deleting conversations.
 ///
-/// Caller should hold the shared `chat/sessions.json` lock when running this
-/// against the live data root. Archived rows are appended to
+/// `enforce`'s caller holds the shared `chat/sessions.json` lock against the
+/// live data root; `archiveSession` owns its transaction locks. Rows append to
 /// `chat/archive/sessions.jsonl`; transcript files move from `chat/messages/`
 /// to `chat/archive/messages/`.
 ///
@@ -57,11 +58,17 @@ public struct ChatSessionRetentionReport: Sendable, Equatable {
 /// lock to update the index. No writer may hold those locks in the reverse
 /// order. If the nonblocking transcript lock is contended, that session stays
 /// hot for a later pass.
+/// Storage: archive rows and transcripts are in local/off-disk backups and
+/// PrivacyMap/chat; data export and phone sync exclude the raw archive files.
 public enum ChatSessionRetention {
     public static let diskStorageOwner = DiskStorageOwner.retained(id: "chat", roots: ["chat"],
         policy: "Transcripts, archives and compaction backups are memory; Clean Up keeps them. The history search index belongs to chat and is kept because launch rebuilds it. chat.archive organizes conversations without reclaiming transcript bytes. No history erasure control is provided by this cleanup.")
 
     public static let macPinnedSessionIdsDefaultsKey = "NativeAgent.pinnedChatSessionIds"
+
+    // Storage: pinned_session_ids.json mirrors the Mac preference for retention.
+    // Local backup/data export exclude it; off-disk backup includes it. Phone
+    // pins project the host preference, not this file. PrivacyMap: chat.
 
     /// The concrete outcome of a pinned-tab close request. Keeping refusal
     /// separate from success lets the mounted control show an honest outcome
@@ -202,12 +209,7 @@ public enum ChatSessionRetention {
         // The caller holds the sessions lock. Checkpoint each removal while
         // archive still holds the transcript lock, before deleting hot history.
         func removeArchivedRowFromIndex(_ row: [String: JSONValue]) throws {
-            guard let index = indexedRows.firstIndex(of: row) else { return }
-            var next = indexedRows
-            next.remove(at: index)
-            let out = try ChatSessionIndexFile.serializedData(for: next)
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(out, to: sessionsPath)
-            indexedRows = next
+            try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath)
         }
         var report = ChatSessionRetentionReport()
         var staleEmptyAborts = 0
@@ -288,6 +290,36 @@ public enum ChatSessionRetention {
                 "\(context): ChatSessionRetention.enforce failed at \(dataRoot.path): \(error)"
             )
             return nil
+        }
+    }
+
+    /// Manual archive keeps the transcript in place and commits its row to the
+    /// archive before removing it from the hot index. Both archive writers use
+    /// the same checked schema and durable append under the archive lock.
+    public static func archiveSession(id: String, dataRoot: URL) async throws -> [String: JSONValue]? {
+        guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { return nil }
+        let index = dataRoot.appendingPathComponent("chat/sessions.json")
+        let archive = dataRoot.appendingPathComponent("chat/archive/sessions.jsonl")
+        let persistence = SwiftNativePersistenceCore()
+        return try await persistence.withFileLock(index) {
+            var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: index)
+            guard let position = rows.firstIndex(where: { $0["id"] == .string(id) }) else { return nil }
+            var archived = rows[position]
+            archived["archived"] = .bool(true)
+            archived["archivedBy"] = .string("mac_chat")
+            archived["archivedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
+            let row = archived
+            try await persistence.withFileLock(archive) {
+                var latest = try archiveIndexRows(dataRoot: dataRoot).last { $0["id"] == .string(id) }
+                // Ignore only this operation's timestamp when recognizing a retry.
+                latest?["archivedAt"] = row["archivedAt"]
+                if latest != row { try appendJSONL(.object(row), to: archive) }
+            }
+            // The archived claim survives an index failure, so a retry only
+            // removes the hot row rather than appending another archive record.
+            rows.remove(at: position)
+            try ChatSessionIndexFile.write(rows, to: index, removeWhenEmpty: true)
+            return archived
         }
     }
 
@@ -414,11 +446,7 @@ public enum ChatSessionRetention {
             // The atomic copy may have succeeded before the caller's index
             // commit failed. Its exact prefix also survives later appends.
             if !archivedBytes.isEmpty, hot.starts(with: archivedBytes) { return }
-            try FileManager.default.createDirectory(
-                at: messagesPath.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try (archivedBytes + hot).write(to: messagesPath, options: .atomic)
+            try ContactThread.replace(archivedBytes + hot, to: messagesPath)
         }
         for key in ["archivedBy", "retentionArchivedAt", "retentionReason", "messagesArchivePath"] {
             row.removeValue(forKey: key)
@@ -673,7 +701,7 @@ public enum ChatSessionRetention {
                     safeSessionId: safeSessionId,
                     now: now
                 )
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(contentsOf: messagesPath), to: destination)
+                try ContactThread.replace(Data(contentsOf: messagesPath), to: destination)
                 archivedMessagesPath = destination
             }
 

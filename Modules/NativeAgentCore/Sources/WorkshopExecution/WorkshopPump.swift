@@ -4,14 +4,14 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import CognitiveSubstrate
+// Blueprint: | `WorkshopPump.swift` | `WorkshopPump` struct; `tick`, `hasLiveAttempt`; live and recovered receipts settle through Desk's ops lock, changing status only for the latest reservation on a nonterminal item; receipt-only recovery requires its unchanged commit revision; WorkshopReceiptLog owns the receipts feed’s session/directed_task variants, both append routes, handoff marker writes and bounded raw read |
 
 // Wave B — the pump (H3, H4, M8). The only new moving part, and it does ZERO
 // LLM work itself: a quiet day (nothing due) makes ZERO provider calls.
 //
 // On each Desk/body event or exact two-hour Workshop window the pump:
-//   1. GATE (H4): run only when the organism posture is `normal` — workshop is
-//      EXPENSIVE, stricter than backgroundCognitionAllowed's conserve/sleep
-//      string-match. Plus enableAutonomy, low-power, and thermal checks.
+//   1. GATE (H4): run when autonomy is enabled and her organism is on. She is
+//      always on while the Mac is on (User 10-24): no power, heat or tiredness gate.
 //   2. SELECT one due item from a pure read of SwiftNativeDeskStore.liveState() — self-
 //      pursuits (origin=agent) within budget, least-recently-worked first;
 //      else owner cadence items. A real selection scorer is Wave C (seam below).
@@ -98,7 +98,6 @@ public struct WorkshopPump: Sendable {
         /// say whether the body is absent or actively withholding work.
         case organismUnavailable
         case postureNotNormal   // organism not in a green window (H4)
-        case resourcePressure   // low power / thermal
         case quiet              // nothing due — ZERO dispatch
         case unavailable(String) // canonical storage could not be read or settled
         case leaseHeld          // background-work lease already spent this window (H4)
@@ -175,20 +174,10 @@ public struct WorkshopPump: Sendable {
         // ---- 2. NEW-WORK GATES ----
         guard await isEnabled() else { return .disabled }
 
-        let process = ProcessInfo.processInfo
-        if process.isLowPowerModeEnabled { return .resourcePressure }
-        switch process.thermalState {
-        case .serious, .critical: return .resourcePressure
-        default: break
-        }
-
         guard let posture = await posture() else {
             return .organismUnavailable
         }
-        guard posture.enabled,
-              posture.loopBudget == .normal else {
-            return .postureNotNormal
-        }
+        guard posture.enabled else { return .postureNotNormal }
 
         // isDue already leaves these out of selection; the pass names them.
         unknownTiming = Self.unreadableCadences(in: state)
@@ -270,38 +259,8 @@ public struct WorkshopPump: Sendable {
         // Close the reserved slot with a compact receipt on the pursuit, and
         // append the M8 per-session row. Best-effort: a store hiccup must not
         // wedge the loop.
-        let receiptLine = "[\(receipt.status.rawValue)] \(receipt.summary)"
         do {
-            if candidate.isPursuit {
-                let disposition: DeskWorkDisposition = receipt.disposition == .goalSatisfied &&
-                    !verifyArtifactRefs(receipt.artifactPaths, handle: candidate.handle)
-                    ? .progress
-                    : receipt.disposition
-                _ = try await store.completeWorkSession(
-                    candidate.handle,
-                    reservationId: reservationId,
-                    receipt: receiptLine,
-                    disposition: disposition,
-                    artifactRefs: receipt.artifactPaths
-                )
-                try await settlePursuitDisposition(receipt, disposition: disposition)
-            } else {
-                _ = try await store.completeWorkAttempt(
-                    candidate.handle,
-                    attemptId: reservationId,
-                    receipt: receiptLine,
-                    disposition: receipt.disposition
-                )
-                // 2026-09-22: a blocked owner cadence re-ran on schedule with the
-                // same "blocked" (Desk 618, 4x). Park it only when its own clean
-                // workshop_progress report said blocked (.completed); timeouts,
-                // failures and missing reports keep retrying. setBlockedOn takes
-                // item handles only, so the prose goes in blockedReason.
-                if receipt.disposition == .blocked, receipt.status == .completed {
-                    _ = try? await store.setStatus(candidate.handle, status: .blocked,
-                                                   blockedReason: String(receipt.summary.prefix(600)))
-                }
-            }
+            try await settleSessionReceipt(receipt, isPursuit: candidate.isPursuit)
             deskSettled = true
         } catch {
             nativeLog("[workshop] terminal Desk settlement failed for %@/%@: %@",
@@ -337,28 +296,17 @@ public struct WorkshopPump: Sendable {
         return refs.allSatisfy { reader.isReadable(relativePath: $0) }
     }
 
-    private func settlePursuitDisposition(_ receipt: WorkshopSessionReceipt, disposition: DeskWorkDisposition) async throws {
-        if disposition == .blocked, receipt.status == .completed {
-            _ = try await store.setStatus(receipt.handle, status: .blocked,
-                                          blockedReason: String(receipt.summary.prefix(600)))
-        }
-        guard disposition == .goalSatisfied || disposition == .abandon else { return }
-        let state = try await store.liveState()
-        guard let item = state.items.first(where: { $0.handle == receipt.handle }),
-              !item.status.isTerminal else { return }
-        let closed: Bool
-        if disposition == .abandon {
-            closed = try await store.closeItemIfUnchanged(
-                item.handle, expectedUpdatedAt: item.updatedAt,
-                outcomeSummary: receipt.summary, canceled: true)
-        } else {
-            closed = try await store.closePursuitIfGoalSatisfied(
-                item.handle, reservationId: receipt.reservationId,
-                expectedUpdatedAt: item.updatedAt, outcomeSummary: receipt.summary)
-        }
-        guard closed else {
-            throw WorkshopExecutionError.persistenceFailure("Pursuit changed before settlement")
-        }
+    private func settleSessionReceipt(_ receipt: WorkshopSessionReceipt, isPursuit: Bool) async throws {
+        let disposition: DeskWorkDisposition = isPursuit && receipt.disposition == .goalSatisfied &&
+            !verifyArtifactRefs(receipt.artifactPaths, handle: receipt.handle) ? .progress : receipt.disposition
+        // Park only a clean workshop_progress report of blocked (.completed).
+        // Timeouts, failures and missing reports keep their existing retry policy.
+        try await store.settleWorkshopSession(
+            receipt.handle, reservationId: receipt.reservationId,
+            receipt: "[\(receipt.status.rawValue)] \(receipt.summary)", disposition: disposition,
+            artifactRefs: receipt.artifactPaths, outcomeSummary: receipt.summary,
+            blockedReason: disposition == .blocked && receipt.status == .completed
+                ? String(receipt.summary.prefix(600)) : nil)
     }
 
     private func reconcileAttempts(from state: DeskState) async throws {
@@ -414,38 +362,7 @@ public struct WorkshopPump: Sendable {
                         throw WorkshopExecutionError.persistenceFailure("Workshop recovery result \(attemptId) could not be persisted; restore Workshop storage before continuing work")
                     }
                 }
-                let line = "[\(receipt.status.rawValue)] \(receipt.summary)"
-                if !attempt.completed {
-                    if attempt.ownerCadence {
-                        _ = try await store.completeWorkAttempt(
-                            item.handle,
-                            attemptId: attemptId,
-                            receipt: line,
-                            disposition: receipt.disposition
-                        )
-                    } else {
-                        _ = try await store.completeWorkSession(
-                            item.handle,
-                            reservationId: attemptId,
-                            receipt: line,
-                            disposition: receipt.disposition == .goalSatisfied &&
-                                !verifyArtifactRefs(receipt.artifactPaths, handle: item.handle)
-                                ? .progress
-                                : receipt.disposition,
-                            artifactRefs: receipt.artifactPaths
-                        )
-                    }
-                }
-                if attempt.ownerCadence, receipt.disposition == .blocked, receipt.status == .completed {
-                    _ = try await store.setStatus(item.handle, status: .blocked,
-                                                  blockedReason: String(receipt.summary.prefix(600)))
-                }
-                if !attempt.ownerCadence {
-                    let disposition: DeskWorkDisposition = receipt.disposition == .goalSatisfied &&
-                        !verifyArtifactRefs(receipt.artifactPaths, handle: item.handle)
-                        ? .progress : receipt.disposition
-                    try await settlePursuitDisposition(receipt, disposition: disposition)
-                }
+                try await settleSessionReceipt(receipt, isPursuit: !attempt.ownerCadence)
                 guard await receiptLog.append(receipt) else {
                     throw WorkshopExecutionError.persistenceFailure("Workshop receipt \(item.handle)/\(attemptId) could not be persisted; restore Workshop storage before continuing work")
                 }
@@ -814,6 +731,8 @@ public enum WorkshopReservationDurability {
 /// + workshop can't all fire in one window. Persisted so the guard survives a
 /// mid-window restart. Keyed only by window: once a window is taken, a repeat
 /// acquire for the SAME window fails regardless of release.
+/// background_lease.json: local backup/export include workshop/; no phone sync;
+/// PrivacyMap lists Workshop.
 public actor BackgroundWorkLease {
     private let path: URL
     private let persistence: SwiftNativePersistenceCore
@@ -919,11 +838,12 @@ public actor BackgroundWorkLease {
 
 }
 
-// MARK: - Compact per-session receipt log (M8)
+// MARK: - Workshop receipt feed
 
-/// Appends one compact JSONL row per session, keyed by (handle, reservationId).
-/// Deliberately NOT the weekly WorkshopOutcomeScoreboard (O(all Workshop executions) per
-/// tick) — a small, append-only feed.
+/// Owns workshop/receipts.jsonl: untagged session and directed_task variants.
+/// Shared fields: handle, reservationId, status, model, artifactCount, summary, ts.
+/// Local backup/export include workshop/; no raw phone sync; PrivacyMap lists it.
+/// Handoff markers retain the directed variant; each variant keeps its evidence.
 public actor WorkshopReceiptLog {
     private let path: URL
     private let persistence: SwiftNativePersistenceCore
@@ -936,6 +856,85 @@ public actor WorkshopReceiptLog {
     }
 
     public var receiptsPath: URL { path }
+
+    public nonisolated static func readRecent(at path: URL, limit: Int) async throws -> SwiftNativePersistenceCore.JSONLTailReadReceipt {
+        try await SwiftNativePersistenceCore().tailJSONLReadReceipt(path, limit: limit, maxBytes: 1_048_576)
+    }
+
+    nonisolated static func directedJSON(_ receipt: WorkshopDirectedTaskReceipt) -> JSONValue {
+        .object([
+            "kind": .string("directed_task"),
+            "handle": .string(receipt.handle),
+            "reservationId": .string(receipt.executionId),
+            "executionId": .string(receipt.executionId),
+            "status": .string(receipt.status),
+            "model": .null,
+            "artifactCount": .int(0),
+            "summary": .string(String(receipt.summary.prefix(600))),
+            "ts": .string(receipt.completedAt),
+            "createdAt": .string(receipt.createdAt),
+            "totalSteps": .int(Int64(receipt.totalSteps)),
+            "completedSteps": .int(Int64(receipt.completedSteps)),
+            "rerunCount": .int(Int64(receipt.rerunCount)),
+            "triggerSource": .string(receipt.triggerSource),
+            "wasStub": .bool(receipt.wasStub),
+            "verificationStatus": receipt.verificationStatus.map { .string($0.rawValue) } ?? .null,
+        ])
+    }
+
+    nonisolated static func directedReceipt(from value: JSONValue) -> WorkshopDirectedTaskReceipt? {
+        guard case .object(let object) = value,
+              case .string("directed_task")? = object["kind"] else { return nil }
+        func string(_ key: String) -> String? {
+            if case .string(let value)? = object[key] { return value }
+            return nil
+        }
+        func int(_ key: String) -> Int {
+            switch object[key] ?? .null {
+            case .int(let value): return Int(value)
+            case .double(let value): return Int(exactly: value.rounded(.towardZero)) ?? 0
+            default: return 0
+            }
+        }
+        guard let handle = string("handle"), !handle.isEmpty,
+              let executionId = string("executionId") ?? string("reservationId"), !executionId.isEmpty,
+              let status = string("status"),
+              let completedAt = string("ts") else { return nil }
+        return WorkshopDirectedTaskReceipt(
+            handle: handle,
+            executionId: executionId,
+            status: status,
+            summary: string("summary") ?? "",
+            createdAt: string("createdAt") ?? completedAt,
+            completedAt: completedAt,
+            totalSteps: int("totalSteps"),
+            completedSteps: int("completedSteps"),
+            rerunCount: int("rerunCount"),
+            triggerSource: string("triggerSource") ?? "manual",
+            wasStub: object["wasStub"] == .bool(true),
+            verificationStatus: string("verificationStatus")
+                .flatMap(WorkshopVerificationStatus.init(rawValue:))
+        )
+    }
+
+    public func directedReceipts() async throws -> [WorkshopDirectedTaskReceipt] {
+        try await persistence.readJSONL(path).compactMap(Self.directedReceipt)
+    }
+
+    func append(_ receipt: WorkshopDirectedTaskReceipt, handoffPath: URL) async throws {
+        let row = Self.directedJSON(receipt)
+        try await persistence.withFileLock(path) {
+            if try await persistence.readJSON(handoffPath, ifMissing: .null) == row { return }
+            let existing = try await persistence.readJSONL(path).compactMap(Self.directedReceipt)
+            if !existing.contains(where: {
+                $0.executionId == receipt.executionId && $0.status == receipt.status
+                    && $0.verificationStatus == receipt.verificationStatus
+            }) {
+                try await persistence.appendJSONLDurable(row, to: path)
+            }
+            try await persistence.writeJSON(row, to: handoffPath)
+        }
+    }
 
     public func reservationIdsByHandle() async throws -> [String: Set<String>] {
         try await persistence.withFileLock(path) {
@@ -971,7 +970,7 @@ public actor WorkshopReceiptLog {
                 if FileManager.default.fileExists(atPath: path.path) {
                     let rows = try await persistence.readJSONL(path)
                     let exists = try rows.contains { value in
-                        guard case .object(let object) = value,
+                        guard case .object(let object) = value, object["kind"] != .string("directed_task"),
                               case .string(let handle)? = object["handle"],
                               case .string(let id)? = object["reservationId"] else { return false }
                         guard handle == receipt.handle && id == receipt.reservationId else { return false }
@@ -997,7 +996,7 @@ public actor WorkshopReceiptLog {
     }
 
     private static func isReceiptRow(_ value: JSONValue) -> Bool {
-        guard case .object(let object) = value,
+        guard case .object(let object) = value, object["kind"] != .string("directed_task"),
               case .string(let status)? = object["status"], WorkshopSessionStatus(rawValue: status) != nil,
               case .string? = object["summary"],
               case .int(let artifactCount)? = object["artifactCount"], artifactCount >= 0,

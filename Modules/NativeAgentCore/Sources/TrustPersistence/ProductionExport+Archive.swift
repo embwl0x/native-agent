@@ -5,6 +5,7 @@ import PersistenceCore
 import MemoryV2
 import Privacy
 import SystemOps
+// Blueprint: | `ProductionExport+Archive.swift` | Production archives consume PrivacyMap.productionExportRelativePaths; production, support and local backup input scopes are complete allowlists with unselected scopes excluded; the backup owner's recursive copier snapshots nested memory SQLite and omits lock/journal sidecars; canonical memory backup and persona root, credential exclusions with actual skipped paths; support bundles keep their separate selection and registry rows |
 
 extension ProductionExport {
     public typealias ArtifactProcessRunner = @Sendable (String, [String], URL, TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String)
@@ -34,11 +35,21 @@ extension ProductionExport {
         try TrustBackupPersistence.writeCodableJSON(PrivacyMap(dataRoot: root, generatedAt: SwiftNativeManifestSigner.isoTimestamp(Date())), to: stageDir.appendingPathComponent("privacy_map.json"))
 
         let dataDir = stageDir.appendingPathComponent("data", isDirectory: true)
+        var excluded: [String] = []
         var copied = try TrustBackupPersistence.copySelectedDataPaths(
             root: root,
             destinationRoot: dataDir,
-            relativePaths: Self.productionExportRelativePaths.filter { $0 != "memory" }
+            relativePaths: PrivacyMap.productionExportRelativePaths.filter { $0 != "memory" && $0 != "persona" },
+            excluded: &excluded
         )
+        // The live persona root (`defaultPersonaRoot`: a checkout's sits beside data/).
+        if try TrustBackupPersistence.copyExistingItem(
+            from: PersistenceCore.defaultPersonaRoot(dataRoot: root),
+            to: dataDir.appendingPathComponent("persona", isDirectory: true),
+            relative: "persona", excluded: &excluded
+        ) {
+            copied.append("persona")
+        }
         let memoryDir = root.appendingPathComponent("memory", isDirectory: true)
         if fm.fileExists(atPath: memoryDir.path) {
             let destination = dataDir.appendingPathComponent("memory", isDirectory: true)
@@ -46,7 +57,8 @@ extension ProductionExport {
             let databaseNames: Set<String> = ["memory.sqlite", "memory.sqlite-wal", "memory.sqlite-shm", "memory.sqlite-journal"]
             for source in try fm.contentsOfDirectory(at: memoryDir, includingPropertiesForKeys: nil)
                 where !databaseNames.contains(source.lastPathComponent) {
-                _ = try TrustBackupPersistence.copyExistingItem(from: source, to: destination.appendingPathComponent(source.lastPathComponent))
+                _ = try TrustBackupPersistence.copyExistingItem(from: source, to: destination.appendingPathComponent(source.lastPathComponent),
+                    relative: "memory/" + source.lastPathComponent, excluded: &excluded)
             }
             if fm.fileExists(atPath: memoryDir.appendingPathComponent("memory.sqlite").path) {
                 try await MemoryStorage.createConsistentBackup(
@@ -63,7 +75,7 @@ extension ProductionExport {
             createdAt: now,
             scope: scope,
             copied: copied,
-            redactions: Self.productionRedactions,
+            redactions: excluded,
             host: host
         )
         try TrustBackupPersistence.writeJSONValue(manifest, to: stageDir.appendingPathComponent("manifest.json"))
@@ -112,10 +124,12 @@ extension ProductionExport {
         try TrustBackupPersistence.writeCodableJSON(try health(), to: stageDir.appendingPathComponent("health.json"))
 
         let dataDir = stageDir.appendingPathComponent("data", isDirectory: true)
+        var excluded: [String] = []
         let copied = try TrustBackupPersistence.copySelectedDataPaths(
             root: root,
             destinationRoot: dataDir,
-            relativePaths: Self.supportBundleRelativePaths
+            relativePaths: Self.supportBundleRelativePaths,
+            excluded: &excluded
         )
         var scope = TrustBackupPersistence.scopeNames(for: copied)
         if !scope.contains("diagnostics") { scope.insert("diagnostics", at: 0) }
@@ -126,7 +140,7 @@ extension ProductionExport {
             createdAt: now,
             scope: scope,
             copied: copied,
-            redactions: Self.supportRedactions,
+            redactions: excluded,
             host: host
         )
         try TrustBackupPersistence.writeJSONValue(manifest, to: stageDir.appendingPathComponent("manifest.json"))
@@ -147,24 +161,9 @@ extension ProductionExport {
         return record
     }
 
-    private static let productionExportRelativePaths: [String] = [
-        "trust",
-        "memory",
-        "workshop",
-        "skills",
-        "abilities",
-        "workflows",
-        "catalog/registry.json",
-        "catalog/sources/sources.json",
-        "catalog/trust/roots.json",
-        "capabilities",
-        "persona",
-        "scheduler/jobs.json",
-        "connectors/registry.json",
-        "connectors/workspaces.json",
-        "mcp/consent/ledger.json",
-    ]
 
+    /// Complete support copy inputs: all unselected data-root scopes are
+    /// excluded. Generated diagnostics/health reports are separate inputs.
     private static let supportBundleRelativePaths: [String] = [
         "doctor",
         "runtime",
@@ -177,34 +176,6 @@ extension ProductionExport {
         "mcp/consent/ledger.json",
         "telegram/state.json",
         "cutover",
-    ]
-
-    private static let productionRedactions: [String] = [
-        "senses/ledger/*",
-        "senses/news/*",
-        "mcp/servers.json",
-        "config/*",
-        "secrets/*",
-        "oauth_tokens/*",
-        "providers/*",
-        "codex_home/*",
-        "codex_child_home/*",
-        "catalog/.pack_signing_key",
-        "raw logs",
-    ]
-
-    private static let supportRedactions: [String] = [
-        "senses/ledger/*",
-        "senses/news/*",
-        "config/*",
-        "secrets/*",
-        "oauth_tokens/*",
-        "providers/*",
-        "codex_home/*",
-        "codex_child_home/*",
-        "catalog/.pack_signing_key",
-        "chat transcripts",
-        "memory database",
     ]
 
     private static func artifactManifest(

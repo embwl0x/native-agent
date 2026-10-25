@@ -4,6 +4,8 @@ import Combine
 import DeviceSync
 import NativeAgentShared
 import TrustCenter
+import NativeAgentCore
+// Blueprint: | `EngineSync.swift` | `SyncFacade` class; `observeStatus`, `setStatus`; pairing-key snapshot reads publish through `LatestRead`, and rotation advances the same boundary |
 
 /// Settings' observable projection of the engine's canonical device-sync owner.
 /// Combine subscriptions bridge the core's published values without wire models.
@@ -22,7 +24,7 @@ public final class SyncFacade {
     public var pairingError: String?
     @ObservationIgnored private var subscriptions: Set<AnyCancellable> = []
     @ObservationIgnored private var isRotatingSecret = false
-    @ObservationIgnored private var secretRevision: UInt64 = 0
+    @ObservationIgnored private let secretRead = LatestRead()
 
     public nonisolated init(owner: DeviceSync?) {
         self.owner = owner
@@ -57,20 +59,20 @@ public final class SyncFacade {
     }
 
     public func loadSecret(quiet: Bool) async {
-        guard !isRotatingSecret else { return }
-        let revision = secretRevision
+        guard !Task.isCancelled, !isRotatingSecret else { return }
         guard owner != nil else {
-            secretBase64 = ""
-            pairingError = "Pairing is unavailable."
+            secretRead.write { secretBase64 = ""; pairingError = "Pairing is unavailable." }
             return
         }
+        _ = await secretRead.read({
         let result = await Task.detached(priority: .utility) { () -> (String?, String?) in
             do {
                 if quiet { return (try PairingSecretManager.existingSecretBase64() ?? "", nil) }
                 return (try PairingSecretManager.currentSecretBase64(), nil)
             } catch { return (nil, error.localizedDescription) }
         }.value
-        guard !Task.isCancelled, !isRotatingSecret, revision == secretRevision else { return }
+        return result
+        }, publish: { result in
         if let secret = result.0 {
             pairingError = nil
             secretBase64 = secret
@@ -78,12 +80,13 @@ public final class SyncFacade {
             pairingError = "Pairing is unavailable. \(result.1 ?? "The Mac pairing key could not be loaded.")"
             secretBase64 = ""
         }
+        })
     }
 
     public func regenerateSecret() async {
         guard let owner, !isRotatingSecret else { return }
         isRotatingSecret = true
-        secretRevision &+= 1
+        secretRead.write {}
         defer { isRotatingSecret = false }
         // Close admission before changing durable signing bytes, and reopen
         // with exactly the read-back key before either publication awaits.
@@ -106,7 +109,9 @@ public final class SyncFacade {
         async let kvsPublished = PairingSecretManager.publishMaterialToKVS(persistedSecret)
         async let cloudKitPublished = owner.bridge.publishPairingSecret(persistedSecret)
         _ = await (kvsPublished, cloudKitPublished)
-        pairingError = nil
-        secretBase64 = persistedSecret.base64EncodedString()
+        secretRead.write {
+            pairingError = nil
+            secretBase64 = persistedSecret.base64EncodedString()
+        }
     }
 }

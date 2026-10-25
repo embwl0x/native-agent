@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentPeerHTTP.swift` | `AgentPeerHTTP` enum; `send`, `get`; each exchange retains its live-update forwarder and closes/cancels it on settlement, cancellation or deinit |
 
 /// One bounded exchange. This layer never retries a potentially accepted send.
 public enum AgentPeerHTTP {
@@ -148,19 +149,25 @@ public enum AgentPeerHTTP {
         /// Display and final evidence share the accumulator; only complete
         /// frames advance the capture offset.
         private let liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?
+        private let liveForwarder: Task<Void, Never>?
         private var liveOffset = 0
         private var accumulator: AgentA2AStream.Accumulator?
 
         init(streaming: Bool, liveUpdate: LiveUpdateHandler?, accumulator: AgentA2AStream.Accumulator?) {
             self.streaming = streaming
             self.accumulator = accumulator
-            guard streaming, accumulator != nil, let liveUpdate else { liveFeed = nil; return }
+            guard streaming, accumulator != nil, let liveUpdate else { liveFeed = nil; liveForwarder = nil; return }
             let (updates, feed) = AsyncStream.makeStream(of: AgentA2AStream.LiveUpdate.self, bufferingPolicy: .bufferingNewest(1))
             liveFeed = feed
-            Task {
-                for await update in updates { await liveUpdate(update) }
+            liveForwarder = Task {
+                for await update in updates {
+                    guard !Task.isCancelled else { return }
+                    await liveUpdate(update)
+                }
             }
         }
+
+        deinit { liveFeed?.finish(); liveForwarder?.cancel() }
 
         private func forwardLive() {
             guard let liveFeed, eventStream, let status, (200..<300).contains(status) else { return }
@@ -199,6 +206,9 @@ public enum AgentPeerHTTP {
         }
         func cancel() {
             lock.lock(); cancelled = true; lock.unlock()
+            // Cancellation may arrive before start() attaches its continuation.
+            liveFeed?.finish()
+            liveForwarder?.cancel()
             finish(.failure(TransportError.cancelled))
         }
         private func finish(_ result: Swift.Result<Response, Error>) {
@@ -211,6 +221,7 @@ public enum AgentPeerHTTP {
             self.task = nil
             lock.unlock()
             liveFeed?.finish()
+            liveForwarder?.cancel()
             session?.invalidateAndCancel()
             continuation.resume(with: result)
         }

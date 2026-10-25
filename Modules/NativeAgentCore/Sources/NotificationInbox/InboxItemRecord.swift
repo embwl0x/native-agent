@@ -3,6 +3,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Desk
+// Blueprint: | `InboxItemRecord.swift` | `InboxSourceReadState`, `InboxItemRecord`, `InboxRelatedGroup`; latest stable-card identity and OwnerAttentionPolicy projection |
 
 /// The inbox reader deliberately keeps cards with a bad optional source rather
 /// than dropping the whole record. Preserve why the source is unavailable so

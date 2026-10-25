@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MacChatTurnStreamConsumer.swift` | `MacChatTurnPresentationPort`: `consumeMacChatStream` |
 
 public extension MacChatTurnPresentationPort {
     /// Only changed frames cross to the app; lifecycle and exact generation

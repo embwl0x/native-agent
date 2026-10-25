@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SenseDoor.swift` | Registry-first reads, bundled-kind ownership, exact served provenance and file-material envelopes; the admitted request owns/cancels its shared raw flight, and cancelled reads cannot cache late material; captured views retain the turn's growth refusal, discarding refused file bytes while preserving screen/site read and action snapshots; distinct private web/visible browser/group-owned Chrome provenance, same-corner act verification without re-entry, wrong-version reporting, captured native/JS site action material, Chrome envelope continuations and native screen continuation snapshots |
 
 /// The door's read adapter. The original reader still clears its own fences;
 /// its result is retained for a failure or a request for the raw view.
@@ -311,9 +312,7 @@ public enum SenseDoor {
     }
 
     private static func recordRead(_ record: SenseRecord, registry: (any SenseRegistry)?) async throws {
-        if let manager = registry as? any SenseRegistryManaging {
-            try await manager.recordUse(senseID: record.id, version: record.version)
-        } else { await registry?.recordUse(senseID: record.id) }
+        try await registry?.recordUse(senseID: record.id, version: record.version)
     }
 
     private static func isSuccessfulRaw(_ result: JSONValue) -> Bool {
@@ -382,9 +381,14 @@ public enum SenseDoor {
 
     private static func fallback(_ failure: SenseFailure, record: SenseRecord, address: String?, source: DoorSource) async throws -> JSONValue {
         let result = try await $readingRaw.withValue(true) { try await source.rawResult() }
+        let read = JSONValue.object(["tool": .string("app"), "input": .object(["action": .string("sense.versions"),
+            "args": .object(["sense_id": .string(record.id)])])])
+        let remedy = failure.remedy ?? Repair.remedy(owner: "sense \(record.id) v\(record.version)", nextCall: read, tap: nil,
+            instruction: "Read this sense's retained versions and failure. Reread the original place with raw:true, then revise its code with sense.make for place \(record.corner.key); inspect the trial's page, then keep that exact trial_id and digest with keep:true. Do not turn an owner-disabled sense on yourself.")
         return signedRaw(.object(["ok": .bool(false), "status": .string("failed"),
-            "error_code": .string(failure.code), "error": .string(failure.message), "raw": result,
-            "remedy": failure.remedy ?? .null]),
+            "reason": .string(failure.code), "error_code": .string(failure.code), "error": .string(failure.message), "raw": result,
+            "sense_id": .string(record.id), "sense_version": .int(Int64(record.version)),
+            "remedy": remedy]),
             line: "raw view · sense \(record.id) v\(record.version) unavailable: \(failure.code); no sense page served")
     }
 }
@@ -404,6 +408,8 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
          material: @escaping @Sendable (JSONValue) async throws -> SenseMaterial) {
         self.corner = corner; self.input = input; self.address = address; self.raw = raw; convert = material
     }
+
+    deinit { result?.cancel() }
 
     nonisolated func fresh() -> DoorSource { DoorSource(corner: corner, input: input, address: address, raw: raw, material: convert) }
 
@@ -483,11 +489,19 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
         return completePage
     }
 
+    /// This admitted read owns its shared raw flight through actual exit.
+    /// Cancellation propagates to it and prevents late material publication.
     func rawResult() async throws -> JSONValue {
-        if let result { return try await result.value }
-        let task = Task { try await SenseDoor.$readingRaw.withValue(true) { try await raw() } }
-        result = task
-        return try await task.value
+        try Task.checkCancellation()
+        let task: Task<JSONValue, Error>
+        if let result { task = result }
+        else {
+            task = Task { try await SenseDoor.$readingRaw.withValue(true) { try await raw() } }
+            result = task
+        }
+        let value = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+        try Task.checkCancellation()
+        return value
     }
 
     func material(for corner: SenseCorner, address: String?) async throws -> SenseMaterial {
@@ -505,8 +519,10 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
             material = try await provider.material(for: corner, address: readAddress())
         } else { material = try await convert(rawResult()) }
         if case .app(let bundle) = corner, case .accessibility(let tree) = material {
+            try Task.checkCancellation()
             SenseAppReadCapture.current?.record(bundleID: bundle, tree: tree)
         }
+        try Task.checkCancellation()
         captured = material
         return material
     }

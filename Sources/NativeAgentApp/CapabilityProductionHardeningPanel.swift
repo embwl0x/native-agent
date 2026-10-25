@@ -1,4 +1,5 @@
 import SwiftUI
+// Blueprint: | `CapabilityProductionHardeningPanel.swift` | `CapabilityProductionHardeningPanel` struct |
 
 /// The hardening report is an externalized runtime authority, not a local
 /// inference. Keep its missing and unavailable states explicit so an export
@@ -37,7 +38,7 @@ struct CapabilityProductionHardeningPanel: View {
 
     var body: some View {
         AdvancedSection(title: "Release checks") {
-            if let hardening = appModel.productionHardening {
+            if let hardening = appModel.engine.doctor.productionHardening {
                 HStack(spacing: 8) {
                     AdvancedStatusWord(status: hardening.status)
                     if let doctor = hardening.doctorStatus?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -76,7 +77,7 @@ struct CapabilityProductionHardeningPanel: View {
                         .accessibilityIdentifier("capabilities.hardening.export-receipt")
                 }
 
-                if let latest = appModel.productionExports.first {
+                if let latest = appModel.engine.doctor.productionExports.first {
                     CapabilityDetailRow(
                         title: (latest.kind ?? "export").capitalized,
                         detail: "\(latest.path) · \(latest.sizeBytes ?? 0) bytes",

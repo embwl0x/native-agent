@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `LLMCompatibilityPrompt.swift` | `llmCompatibilityPrompt` |
 
 /// Serializes compatibility prose; callers retain role semantics and image handling.
 package func llmCompatibilityPrompt(

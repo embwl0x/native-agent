@@ -42,6 +42,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `CognitiveSubstrate+InnerState.swift` | `CognitiveSubstrate.innerStateReading`: record-backed mind/body introspection, selection reasons and felt/rumination/toward projections |
+
 // MARK: - The reading
 
 /// One bounded, payload-free projection of what her organs are currently

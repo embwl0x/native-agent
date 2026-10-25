@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import SQLite3
 import PersistenceCore
+// Blueprint: | `MacMessagesHistory.swift` | protected Messages-directory access probe, bounded SQLite reads and folded matching |
 
 /// A small, read-only window into Messages' own conversations and history.
 /// No transcript cache, database copy, background scan or archived-object instantiation.

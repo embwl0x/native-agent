@@ -1,7 +1,7 @@
 import Foundation
-import PersonaEngine
 import NativeAgentShared
 import MacControl
+// Blueprint: | `MacChatTurnPresentationPort.swift` | `MacChatTurnPresentationPort` protocol; `chatHasConversationRows`, `captureMacWorkContinuation` |
 
 public enum MacChatTurnPresentationEvent: Sendable {
     case status(String)
@@ -9,7 +9,6 @@ public enum MacChatTurnPresentationEvent: Sendable {
     case moveDraft(from: String, to: String)
     case selectMigratedSession(String)
     case workingCommentary(sessionId: String, bubbleId: String, characters: Int)
-    case profileCompiled(CompiledPersonalityWire?)
     case clearPreview(String)
     case movePreview(from: String, to: String)
     case moveReplying(from: String, to: String)

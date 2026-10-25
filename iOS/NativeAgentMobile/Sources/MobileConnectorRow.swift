@@ -1,17 +1,17 @@
 import SwiftUI
+// Blueprint: | `MobileConnectorRow.swift` | `MobileConnectorRow` struct; connector receipts update the sync projection |
 
 struct MobileConnectorRow: View {
     let connector: ConnectorRecord
     @EnvironmentObject private var pairingStore: PairingStore
     @ObservedObject private var bridge = iCloudBridge.shared
     @EnvironmentObject private var bridgeClient: MacBridgeClient
-    @State private var recovered: ConnectorRecord?
     @State private var isSaving = false
     @State private var saveError: String?
     @State private var showEnable = false
     @State private var showDisconnect = false
 
-    private var row: ConnectorRecord { recovered ?? connector }
+    private var row: ConnectorRecord { connector }
     private var canSend: Bool {
         pairingStore.isICloudSigned && bridge.available && bridgeClient.bridgeStatus != .deviceOffline
     }
@@ -27,7 +27,7 @@ struct MobileConnectorRow: View {
                 }
                 Spacer(minLength: 8)
                 Text(ConnectorHealthPresentation.resolve(
-                    enabled: row.enabled, status: row.authState ?? row.status, healthStatus: row.healthStatus
+                    enabled: row.enabled, status: row.authState, healthStatus: row.healthStatus
                 ).displayText)
                     .font(.subheadline)
                     .foregroundStyle(AlivePalette.secondary)
@@ -78,15 +78,6 @@ struct MobileConnectorRow: View {
         } message: {
             Text("This removes the saved credential and disables this connector until new credentials are saved.")
         }
-        .onChange(of: connector) { _, snapshot in
-            guard let recovered else { return }
-            // An older snapshot cannot undo a signed owner receipt. Once the
-            // snapshot catches up, it owns this row again, including Mac edits.
-            if (snapshot.enabled == recovered.enabled && snapshot.authState == recovered.authState)
-                || (snapshot.updatedAt ?? "") > (recovered.updatedAt ?? "") {
-                self.recovered = nil
-            }
-        }
     }
 
     private func update(enabled: Bool?) {
@@ -97,9 +88,9 @@ struct MobileConnectorRow: View {
             defer { isSaving = false }
             do {
                 if let enabled {
-                    recovered = try await iCloudSyncEngine.shared.setConnectorEnabled(id: connector.id, enabled: enabled)
+                    _ = try await iCloudSyncEngine.shared.setConnectorEnabled(id: connector.id, enabled: enabled)
                 } else {
-                    recovered = try await iCloudSyncEngine.shared.disconnectConnector(id: connector.id)
+                    _ = try await iCloudSyncEngine.shared.disconnectConnector(id: connector.id)
                 }
             } catch {
                 saveError = "Could not change \(connector.name): \(error.localizedDescription)"

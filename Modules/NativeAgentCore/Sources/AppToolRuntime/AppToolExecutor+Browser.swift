@@ -2,7 +2,10 @@ import Foundation
 import AppKit
 import ChromeControl
 import Browser
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import AgentWorkspace
+import ChatToolParsing
 import Cognition
 import CognitiveSubstrate
 import MacControl
@@ -13,6 +16,7 @@ import ToolRegistry
 import Senses
 import SQLite3
 import TrustCenter
+// Blueprint: | `AppToolExecutor+Browser.swift` | `AppToolExecutor`: `runBrowserTool`, `freshChromePage`, `chromeFollowUpAllowed`, `runChromeHistory`; history reads a private SQLite copy of Chrome's Default profile under Full Mac/file-read authority, with bounded rows and query deadline; `RetainedBrowserRead` keeps the visible read's full capture and receipt beside its rejected view; scroll readback carries the tab-bound viewport observation, with no timed delta retries |
 
 /// The browser family: Chrome through the extension, and the visible
 /// NativeAgent browser. Every page act rereads the page on the same tab and
@@ -201,10 +205,6 @@ extension AppToolExecutor {
                 }
             }
             let read = id == "browser.chrome_snapshot" && !dryRun ? try await ChromePageText.readDocument(result) : result
-            if !dryRun, id == "browser.chrome_snapshot", case .object(let page) = read,
-               case .string? = page["snapshotId"], case .array? = page["nodes"] {
-                PeerDataTaint.markConsumed(peer: "web content")
-            }
             return read
         }
         // Direct calls include the fresh page; workspace calls keep structured results.
@@ -334,25 +334,19 @@ extension AppToolExecutor {
         scrollCursor: JSONValue? = nil,
         run: (String, [String: JSONValue]) async throws -> JSONValue
     ) async -> String {
-        guard await chromeFollowUpAllowed("browser.chrome_snapshot", surface: surface) else {
-            return "No page attached: reading the page needs your approval here. Call browser.chrome_snapshot."
-        }
-        var settled = false
+        let followUp = await chromeFollowUpCheck("browser.chrome_snapshot", surface: surface)
+        if let stop = followUp.stop { return "No page attached: " + stop }
         if Self.chromeMayNavigate.contains(actionId),
            await chromeFollowUpAllowed("browser.chrome_wait", surface: surface) {
             // Twice at most: a quiet window can close before a slow load starts.
+            // The read itself waits for the load and says when it had not finished.
             for _ in 0..<2 {
                 let waited = try? await run("browser.chrome_wait", [
                     "tab_id": .int(tab), "expected_user_sequence": sequence ?? .null,
                     "condition": .string("navigation_settled"), "settle_ms": .int(400), "timeout_ms": .int(8_000),
                 ])
-                guard case .object(let wait)? = waited else { break }
-                settled = wait["outcome"] == .string("succeeded")
-                guard wait["outcome"] == .string("not_settled") else { break }
+                guard case .object(let wait)? = waited, wait["outcome"] == .string("not_settled") else { break }
             }
-        }
-        if actionId == "browser.chrome_navigate", !settled {
-            return "No page attached: navigation has not settled. Call browser.chrome_snapshot."
         }
         do {
             // Read the page's semantic content by default, or the named scope.
@@ -372,7 +366,8 @@ extension AppToolExecutor {
             var snapshot = try await readPage()
             // 09-24 (X profile): a first read that is only a spinner waits for
             // real content, 3 s at most.
-            for _ in 0..<4 where actionId != "browser.chrome_scroll" && Self.chromeStillLoading(snapshot) {
+            for _ in 0..<4 where actionId != "browser.chrome_scroll" && Self.chromeStillLoading(snapshot)
+                && !ChromePageText.loadUnfinished(snapshot) {
                 try? await Task.sleep(nanoseconds: 750_000_000)
                 snapshot = try await readPage()
             }
@@ -449,9 +444,6 @@ extension AppToolExecutor {
             } else {
                 throw SenseFailure(code: "source_unavailable", message: "The visible browser read did not retain its captured material.")
             }
-            if case .string(let text)? = document["text"], !text.isEmpty {
-                PeerDataTaint.markConsumed(peer: "web content")
-            }
             retained = .object(document)
         } else { retained = snapshot }
         if !visibleBrowser { await NativeChromeNews.shared.read(snapshot, chrome: chrome()) }
@@ -468,13 +460,32 @@ extension AppToolExecutor {
     /// A read the app makes on her behalf clears the same Trust gate her own
     /// call would; anything that would ask or is blocked is simply not made.
     public func chromeFollowUpAllowed(_ tool: String, surface: String, enforceAutonomy: Bool? = nil) async -> Bool {
+        await chromeFollowUpCheck(tool, surface: surface, enforceAutonomy: enforceAutonomy).stop == nil
+    }
+
+    func chromeFollowUpCheck(_ tool: String, surface: String, enforceAutonomy: Bool? = nil) async -> (stop: String?, refusal: JSONValue?) {
         let envelope = await securityCenter.evaluateTool(
             tool: tool, input: [:], origin: AppChatToolDispatcher.securityOrigin(surface: surface),
             enforceAutonomy: enforceAutonomy ?? enforceAutonomySecurity)
         try? await securityCenter.record(envelope)
-        if enforceAutonomy == true,
-           AutonomyGate.map(level: envelope.autonomyLevel, toolName: tool) != .allow { return false }
-        return envelope.decision != .block && !envelope.requiresApproval
+        let autonomy = enforceAutonomy == true ? AutonomyGate.map(level: envelope.autonomyLevel, toolName: tool) : .allow
+        let autonomyBlocked: String? = if case .deny(let reason) = autonomy { envelope.autonomyReason ?? reason } else { nil }
+        let autonomyApproval: String? = if case .requireApproval(let reason) = autonomy { envelope.autonomyReason ?? reason } else { nil }
+        if envelope.decision == .block || autonomyBlocked != nil {
+            let cause = envelope.decision == .block ? envelope.primaryReason : autonomyBlocked ?? envelope.primaryReason
+            let instruction = "Ask the owner to review this block in Trust; no follow-up ran."
+            let stop = "browser_follow_up_blocked: \(cause) \(instruction)"
+            return (stop, Self.failure("browser_follow_up_blocked", cause, extra: ["remedy": envelope.remedy
+                ?? Repair.why(owner: tool, tap: "Trust", instruction: instruction)]))
+        }
+        if envelope.requiresApproval || autonomyApproval != nil {
+            let cause = autonomyApproval ?? envelope.primaryReason
+            let instruction = "Call \(tool) explicitly to request approval; no follow-up ran."
+            return ("browser_follow_up_approval_required: \(cause) \(instruction)",
+                Self.doorRefusal("browser_follow_up_approval_required", cause,
+                    remedy: "request_approval", instruction, next: ["action": .string(ToolNameAliases.appAction(tool) ?? tool)]))
+        }
+        return (nil, nil)
     }
 
     public static func providerAlias(for name: String) -> String {

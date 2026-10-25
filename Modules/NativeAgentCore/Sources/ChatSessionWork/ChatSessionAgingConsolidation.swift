@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+// Blueprint: | `ChatSessionAgingConsolidation.swift` | `ChatSessionAgingConsolidation` struct; `scheduleTranscriptAgingIfNeeded`, `runTranscriptAging`; coordinator retains bodies and 300-second cancellation deadlines, releases claims only at body exit, closes admission at engine termination |
 
 // Continuous consolidation — NORTHSTAR clause 4, sweep item 45 (2026-09-01).
 //
@@ -29,55 +30,6 @@ import ProviderRouting
 // distill held User's next message, because the pass wrote its row pending
 // first and the turn waited for it).
 
-/// Verdict from the host's background-cognition gate.
-public enum BackgroundConsolidationGateDecision: Sendable, Equatable {
-    case allowed
-    case deferred(String)
-}
-
-/// The seam through which the aging lane inherits the SAME throttle every other
-/// background-cognition lane respects (low power, thermal pressure, organism
-/// loop budget). The gate itself lives in the app runtime — the only place that
-/// can see the host and the organism — and is installed once at launch.
-/// Uninstalled (tests, CLI, headless tools) → allowed, so the lane is testable
-/// without a body.
-public final class BackgroundConsolidationGate: @unchecked Sendable {
-    public typealias Gate = @Sendable (_ reason: String) async -> BackgroundConsolidationGateDecision
-
-    public static let shared = BackgroundConsolidationGate()
-
-    private let lock = NSLock()
-    private var gate: Gate?
-
-    public init() {}
-
-    public func install(_ gate: @escaping Gate) {
-        lock.lock()
-        self.gate = gate
-        lock.unlock()
-    }
-
-    /// Test seam: drop an installed gate so a suite cannot leak one into the next.
-    public func uninstall() {
-        lock.lock()
-        gate = nil
-        lock.unlock()
-    }
-
-    public func evaluate(reason: String) async -> BackgroundConsolidationGateDecision {
-        guard let installed = installedGate() else { return .allowed }
-        return await installed(reason)
-    }
-
-    // Read the installed gate OUTSIDE the async context: NSLock is unavailable
-    // from one, and the gate must not be held across the await anyway.
-    private func installedGate() -> Gate? {
-        lock.lock()
-        defer { lock.unlock() }
-        return gate
-    }
-}
-
 /// One aging pass per session at a time. Three lanes (text-compat, structured,
 /// structured-stream) and rapid consecutive turns all reach the same transcript;
 /// without this, two passes would queue on the file lock and the second would
@@ -85,37 +37,52 @@ public final class BackgroundConsolidationGate: @unchecked Sendable {
 actor ChatTranscriptAgingCoordinator {
     static let shared = ChatTranscriptAgingCoordinator()
 
-    private var inFlight: Set<String> = []
-    private var lastDeferralReason: [String: String] = [:]
+    private struct Flight {
+        let body: Task<Void, Never>
+        let deadline: Task<Void, Never>
+    }
+    private var inFlight: [String: Flight] = [:]
+    private var stopped = false
 
-    func claim(_ sessionId: String) -> Bool {
-        inFlight.insert(sessionId).inserted
+    func stop() {
+        stopped = true
+        for flight in inFlight.values {
+            flight.body.cancel()
+            flight.deadline.cancel()
+        }
     }
 
-    func release(_ sessionId: String) {
-        inFlight.remove(sessionId)
+    func start(_ sessionId: String, work: @escaping @Sendable () async -> Void) {
+        guard !stopped, inFlight[sessionId] == nil else { return }
+        let body = Task(priority: .background) {
+            await work()
+            self.release(sessionId)
+        }
+        let deadline = Task {
+            do { try await Task.sleep(for: .seconds(ChatSessionAgingConsolidation.agingPassDeadlineSeconds)) }
+            catch { return }
+            guard !Task.isCancelled, !stopped, inFlight[sessionId] != nil else { return }
+            body.cancel()
+            FileHandle.standardError.write(Data(
+                "ChatSessionAging: pass exceeded \(Int(ChatSessionAgingConsolidation.agingPassDeadlineSeconds))s for \(sessionId); cancellation requested, claim held until exit\n".utf8
+            ))
+        }
+        inFlight[sessionId] = Flight(body: body, deadline: deadline)
+    }
+
+    private func release(_ sessionId: String) {
+        inFlight.removeValue(forKey: sessionId)?.deadline.cancel()
     }
 
     func isInFlight(_ sessionId: String) -> Bool {
-        inFlight.contains(sessionId)
-    }
-
-    /// A deferral is the normal case while the Mac is hot or conserving, and it
-    /// re-decides on every append past the boundary. Only a CHANGE is worth a
-    /// receipt — otherwise the honest record of "not now" drowns the feed it
-    /// belongs in. (Same reasoning as the pressure-dream lane's quiet decisions.)
-    func shouldRecordDeferral(_ sessionId: String, reason: String) -> Bool {
-        guard lastDeferralReason[sessionId] != reason else { return false }
-        lastDeferralReason[sessionId] = reason
-        return true
-    }
-
-    func clearDeferral(_ sessionId: String) {
-        lastDeferralReason.removeValue(forKey: sessionId)
+        inFlight[sessionId] != nil
     }
 }
 
 public struct ChatSessionAgingConsolidation: Sendable {
+    public static func stop() async {
+        await ChatTranscriptAgingCoordinator.shared.stop()
+    }
     let dataRoot: URL
     let autocompactionConfig: ChatSessionAutocompactionConfig
     let llm: any LLMClient
@@ -134,10 +101,8 @@ public struct ChatSessionAgingConsolidation: Sendable {
     }
 
     static let agingTrigger = "aging_boundary"
-    static let agingGateReason = "transcript_aging:reflection"
-    /// Wall-clock bound on ONE aging pass (backup + replace + one distillation
-    /// call). Generous — this is a watchdog for a wedged pass, not a latency
-    /// budget; a background pass that has taken this long is not coming back.
+    /// Cancellation deadline for one aging pass. A non-cooperative body keeps
+    /// its session claim until actual exit; expiry never admits a second pass.
     static let agingPassDeadlineSeconds: Double = 300
 
     /// EVENT-DRIVEN entry: called on the turn's append, right after the
@@ -177,31 +142,19 @@ public struct ChatSessionAgingConsolidation: Sendable {
         let clock = self.clock
         let llm = self.llm
         Task.detached(priority: .background) {
-            guard await ChatTranscriptAgingCoordinator.shared.claim(safeSessionId) else { return }
-            var exceededDeadline = false
-            do {
-                try await TurnDeadline.withThrowingDeadline(seconds: Self.agingPassDeadlineSeconds) {
-                    await Self.runTranscriptAging(
-                        sessionId: safeSessionId,
-                        model: model,
-                        surface: surface,
-                        runId: runId,
-                        providerID: providerID,
-                        boundaryTokens: boundaryTokens,
-                        dataRoot: dataRoot,
-                        config: config,
-                        llm: llm,
-                        now: clock
-                    )
-                }
-            } catch {
-                exceededDeadline = error is TurnDeadline.DeadlineExceeded
-            }
-            await ChatTranscriptAgingCoordinator.shared.release(safeSessionId)
-            if exceededDeadline {
-                FileHandle.standardError.write(Data(
-                    "ChatSessionAging: pass exceeded \(Int(Self.agingPassDeadlineSeconds))s for \(safeSessionId); claim released\n".utf8
-                ))
+            await ChatTranscriptAgingCoordinator.shared.start(safeSessionId) {
+                await Self.runTranscriptAging(
+                    sessionId: safeSessionId,
+                    model: model,
+                    surface: surface,
+                    runId: runId,
+                    providerID: providerID,
+                    boundaryTokens: boundaryTokens,
+                    dataRoot: dataRoot,
+                    config: config,
+                    llm: llm,
+                    now: clock
+                )
             }
         }
     }
@@ -221,27 +174,10 @@ public struct ChatSessionAgingConsolidation: Sendable {
         now: @escaping @Sendable () -> Date
     ) async {
         let coordinator = ChatTranscriptAgingCoordinator.shared
-        switch await BackgroundConsolidationGate.shared.evaluate(reason: agingGateReason) {
-        case .deferred(let why):
-            // Not a failure: the body is hot, asleep or conserving. The next
-            // append past the boundary asks again.
-            if await coordinator.shouldRecordDeferral(sessionId, reason: why) {
-                await emitAgingTrace(
-                    sessionId: sessionId,
-                    surface: surface,
-                    model: model,
-                    runId: runId,
-                    status: "deferred",
-                    detail: why,
-                    boundaryTokens: boundaryTokens,
-                    dataRoot: dataRoot,
-                    now: now
-                )
-            }
-            return
-        case .allowed:
-            await coordinator.clearDeferral(sessionId)
-        }
+        guard !Task.isCancelled else { return }
+        // No power or budget gate (User 10-24): this work happens anyway, and a
+        // deferral only moved it onto her turn as the backstop.
+        guard !Task.isCancelled else { return }
 
         let compactor = ChatSessionAutocompactor(dataRoot: dataRoot, config: config, now: now)
         let start: ChatSessionAutocompactor.AgingStart
@@ -264,6 +200,7 @@ public struct ChatSessionAgingConsolidation: Sendable {
             return
         }
         let distiller = makeAgingDistiller(dataRoot: dataRoot, llm: llm, now: now)
+        guard !Task.isCancelled else { return }
         switch start {
         case .nothing:
             return
@@ -297,7 +234,8 @@ public struct ChatSessionAgingConsolidation: Sendable {
                 runId: runId,
                 stillCurrent: { try await compactor.agingFoldIsCurrent(fold) },
                 commit: { text, distillModel in
-                    try await compactor.commitAging(
+                    try Task.checkCancellation()
+                    return try await compactor.commitAging(
                         fold,
                         recollection: text,
                         distillModel: distillModel,
@@ -308,6 +246,8 @@ public struct ChatSessionAgingConsolidation: Sendable {
                     ).compacted
                 }
             )
+            // A landed commit must invalidate readers even if cancellation
+            // arrived with its result. No new consolidation is admitted here.
             if committed {
                 await ChatCompactionDistiller.publishTranscriptChange(
                     sessionId: sessionId, dataRoot: dataRoot, persistence: compactor.persistence

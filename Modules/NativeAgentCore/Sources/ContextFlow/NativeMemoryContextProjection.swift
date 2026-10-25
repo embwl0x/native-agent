@@ -3,9 +3,10 @@ import Foundation
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `NativeMemoryContextProjection.swift` | `NativeMemoryContextProjection`: canonical memory projection, including immutable untrusted-source entities and source hashes |
 
 private enum NativeMemoryContextProjectionLimits {
-    static let maximumRecords = 2_000
+    static let maximumRecords = memoryStoredRowCap
     static let maximumTextUTF8Bytes = 16 * 1_024
     static let maximumEmbeddingBatchSize = 32
     static let maximumTagsPerRecord = 32
@@ -353,7 +354,7 @@ private extension NativeMemoryContextProjection {
             embeddingText, record: record, maximumUTF8Bytes: NativeMemoryContextProjectionLimits.maximumTextUTF8Bytes
         )
 
-        let correction = isCorrection(record, tags: tags)
+        let correction = MemoryRecallScoring.isCorrection(record, tags: tags)
         let pinned = record.pinned == true
         let authority: ContextAuthority = correction
             ? .explicitCorrection
@@ -528,25 +529,6 @@ private extension NativeMemoryContextProjection {
         return Array(Set(valid).sorted().prefix(NativeMemoryContextProjectionLimits.maximumTagsPerRecord))
     }
 
-    static func isCorrection(_ record: MemoryRecord, tags: [String]) -> Bool {
-        if record.memoryKind?.lowercased() == "correction" || tags.contains("correction") {
-            return true
-        }
-        guard let correction = record.correction ?? objectValue(record.extras, key: "correction") else {
-            return false
-        }
-        switch correction {
-        case .null, .bool(false): return false
-        case .object(let object):
-            if case .bool(let current)? = object["current"] { return current }
-            if case .bool(let active)? = object["active"] { return active }
-            return !object.isEmpty
-        case .array(let values): return !values.isEmpty
-        case .string(let value): return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        case .bool(true), .int, .double: return true
-        }
-    }
-
     static func provenanceText(_ record: MemoryRecord, limit: Int) -> String? {
         var components: [String] = []
         if let source = record.sourceRunId?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -681,23 +663,11 @@ extension NativeMemoryContextProjection {
         normalizedID(value)
     }
 
-    /// Shared by the knowledge-graph projection too. Two formatters for the
-    /// process: a pass over every memory used to build two per memory.
-    /// Reconciliations can overlap, so the formatters are used under a lock.
+    /// Shared by the knowledge-graph projection too; trims projection input.
     static func parseDate(_ raw: String?) -> Date? {
         guard let raw else { return nil }
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
-        isoLock.lock(); defer { isoLock.unlock() }
-        return fractionalISO.date(from: value) ?? plainISO.date(from: value)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(value)
     }
-
-    private static let isoLock = NSLock()
-    // Only touched under `isoLock`.
-    nonisolated(unsafe) private static let fractionalISO: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-    nonisolated(unsafe) private static let plainISO = ISO8601DateFormatter()
 }

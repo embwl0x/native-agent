@@ -5,6 +5,7 @@ import PersistenceCore
 import TurnTrace
 import Transcripts
 import ChatToolRuntime
+// Blueprint: | `ChatOrchestrationClient+HumanConversationReply.swift` | `SwiftNativeChatOrchestrationClient`: `appendHumanConversationReply` |
 
 extension SwiftNativeChatOrchestrationClient {
     /// Explicit tool-authored assistant reply. No user turn, provider run, or proactive timer.

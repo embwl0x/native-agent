@@ -1,12 +1,19 @@
 import Foundation
 
-/// One-shot, RAM-only handoff for an optional query embedding. A turn reads it
-/// as it stands (`valueIfReady`) and never waits on it; a vector that cannot
-/// come says why (`unavailable`), so the turn knows it ranks by words alone.
+// Blueprint: | `ContextTurnRuntime.swift` | `ContextPreparedTurn`, request and embedding ticket: generation lease, bounded query-vector handoff and turn feedback/delivery accounting |
+
+/// One-shot, RAM-only handoff for an optional query embedding. A turn waits a
+/// bounded moment for it (`value(within:)`); a vector that cannot come says
+/// why (`unavailable`), so the turn knows it ranks by words alone.
 public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
     private let lock = NSLock()
     private var value: ContextQueryEmbeddingValue?
     private var failure: String?
+    private struct Waiter {
+        let continuation: CheckedContinuation<ContextQueryEmbeddingValue?, Never>
+        let deadline: Task<Void, Never>
+    }
+    private var waiters: [UUID: Waiter] = [:]
 
     public init() {}
 
@@ -16,13 +23,57 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
         fail(cause)
     }
 
-    public var valueIfReady: ContextQueryEmbeddingValue? { lock.withLock { value } }
+    /// The vector once it lands, or nil when none is coming or `nanoseconds`
+    /// pass first. Read at the start of a turn, a vector still on its way
+    /// would always miss it.
+    public func value(within nanoseconds: UInt64) async -> ContextQueryEmbeddingValue? {
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.withLock {
+                    if Task.isCancelled { continuation.resume(returning: nil); return }
+                    if let value { continuation.resume(returning: value); return }
+                    if failure != nil || nanoseconds == 0 { continuation.resume(returning: nil); return }
+                    // Register and read under the writer's lock: completion
+                    // cannot fall between the initial read and subscription.
+                    let deadline = Task { [weak self] in
+                        do { try await Task.sleep(nanoseconds: nanoseconds) }
+                        catch { return }
+                        self?.finishWaiter(id)
+                    }
+                    waiters[id] = Waiter(continuation: continuation, deadline: deadline)
+                }
+            }
+        } onCancel: {
+            self.finishWaiter(id)
+        }
+    }
+
+    private func finishWaiter(_ id: UUID) {
+        let waiter = lock.withLock { waiters.removeValue(forKey: id) }
+        waiter?.deadline.cancel()
+        waiter?.continuation.resume(returning: nil)
+    }
+
+    private func resume(_ waiters: [Waiter], with value: ContextQueryEmbeddingValue?) {
+        for waiter in waiters {
+            waiter.deadline.cancel()
+            waiter.continuation.resume(returning: value)
+        }
+    }
 
     /// Why no vector is coming; nil while one may still land.
     public var unavailable: String? { lock.withLock { failure } }
 
     public func fail(_ cause: String) {
-        lock.withLock { if value == nil, failure == nil { failure = cause } }
+        let pending: [Waiter] = lock.withLock {
+            guard value == nil, failure == nil else { return [] }
+            failure = cause
+            let pending = Array(waiters.values)
+            waiters.removeAll()
+            return pending
+        }
+        resume(pending, with: nil)
     }
 
     public func publish(
@@ -39,15 +90,19 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
         let alternateVector = alternate.flatMap {
             !$0.isEmpty && $0.allSatisfy(\.isFinite) && $0.count == embedding.count ? $0 : nil
         }
-        lock.withLock {
-            guard value == nil, failure == nil else { return }
+        let (pending, landed): ([Waiter], ContextQueryEmbeddingValue?) = lock.withLock {
+            guard value == nil, failure == nil else { return ([], nil) }
             value = ContextQueryEmbeddingValue(
                 values: embedding,
                 alternateValues: alternateVector,
                 modelFingerprint: fingerprint,
                 modelID: modelID
             )
+            let pending = Array(waiters.values)
+            waiters.removeAll()
+            return (pending, value)
         }
+        resume(pending, with: landed)
     }
 }
 
@@ -267,6 +322,7 @@ public final class ContextPreparedTurn: @unchecked Sendable {
     private let verifier: (@Sendable ([ContextStoredAtom]) async -> ContextTurnExclusion)?
     private var memoryRecordProvenance: [String]?
     private var atomMemoryRecords: [ContextAtomID: String] = [:]
+    private var listedMemoryRecords: [ContextAtomID: String] = [:]
     private var correctedRecordIDs: Set<String> = []
 
     public init(
@@ -319,9 +375,10 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         feedbackLock.withLock { memoryRecordProvenance ?? [] }
     }
 
-    /// Phase 5 B0: the memory record behind one selected atom, once attached.
+    /// Phase 5 B0: the memory record behind one atom the selection scored,
+    /// selected or not, once attached: the why receipt's source, never use.
     public func memoryRecordID(for atomID: ContextAtomID) -> String? {
-        feedbackLock.withLock { atomMemoryRecords[atomID] }
+        feedbackLock.withLock { listedMemoryRecords[atomID] }
     }
 
     public func attachMemoryRecordProvenance(
@@ -336,6 +393,7 @@ public final class ContextPreparedTurn: @unchecked Sendable {
             atomMemoryRecords = atomRecords.filter {
                 selected.contains($0.key) && acceptedRecords.contains($0.value)
             }
+            listedMemoryRecords = atomRecords
         }
     }
 

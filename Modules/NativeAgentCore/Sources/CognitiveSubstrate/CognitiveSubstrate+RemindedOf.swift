@@ -29,6 +29,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `CognitiveSubstrate+RemindedOf.swift` | `CognitiveSubstrate` unbidden moment association: cadence, selection revalidation and bounded served-moment affect accounting |
+
 /// One felt MOMENT as the substrate needs it — the projection of a MemoryV2
 /// record of kind `moment`, with the store's own vocabulary left at the door.
 /// The substrate never learns what a memory store is; the wiring hands it these.

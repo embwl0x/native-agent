@@ -2,6 +2,7 @@ import ChatSessionWork
 import Foundation
 import PersistenceCore
 import NativeAgentCore
+// Blueprint: | `DelegationStatusProjection.swift` | `DelegationDeliveryCache` class; `read`; consumes lifecycle decisions with their known principal and source; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
 
 /// Process-local read acceleration only. The ledger remains authoritative.
 /// One lock covers stamp validation, append reads and publication across tool
@@ -146,55 +147,11 @@ final class DelegationFileCache: @unchecked Sendable {
     }
 }
 
-// MARK: - Delegation status projection (W2, upgrade campaign 2026-08 Track A)
-//
-// THE PROBLEM this closes: Agent delegates repo work to Claude (Claude Code)
-// and Codex via the thread-wakeup bridges, but between "enqueued" and the
-// terminal completion event she was BLIND. The whole job lifecycle is already
-// durably on disk as JSON — she just had no Swift reader for it, so she
-// computed deadlines by hand and filed stuck-job reports that the job files
-// themselves refuted.
-//
-// This file is the read-only projection over the supported bridge stores. It is
-// deliberately a pure value transform: directory URLs and the clock are
-// INJECTED, so the tests are hermetic and never touch the live ~/.config.
-//
-// ── PREMISE VERIFICATION (2026-08-11, read from the JS writers, not assumed) ──
-// The stores do NOT share a record shape. That mattered enough to write down,
-// because the naive assumption (one field set, several directories) would
-// have produced a projection that silently reports `null` for every codex job.
-//
-// Claude — script/claude_thread_wakeup.js
-//   dir:   ~/.config/claude-bridge/wake-jobs/*.json   (WAKE_JOBS_DIR, L35)
-//   claim: O_EXCL create per messageId (claimJob, L422) — the file IS the
-//          dedup marker, so records survive past completion.
-//   shape: messageId, createdAt, claimedAt, startedAt, deadlineAt,
-//          heartbeatAt (runner liveness), progressAt/progressCpuMs (CHILD
-//          liveness — deliberately distinct, L1372), state, status, runStatus,
-//          runReason, completedAt, deliveryLost, completionText, stallSeconds,
-//          timeoutSeconds, topicSlug, pid, bridgeStatus, commitPolicy.
-//
-// Codex — script/codex_thread_wakeup.js
-//   dir:   ~/.config/codex-nativeagent-bridge/reply-jobs/*.json  (L26-27)
-//          plus the `undelivered/` subdirectory and sibling
-//          `reply-deliveries.jsonl`. A delivered job is unlinked
-//          (finalizeReplyJobFile), but the delivery ledger durably preserves
-//          its originating messageIds, terminal turn result, and bridge
-//          receipt. An undeliverable job is preserved under `undelivered/`.
-//   shape: id, phase, createdAt, threadId, turnId, clientUserMessageId,
-//          entries[].payload.topic, boundAt, lastWait.observedAt,
-//          completedExecution.turnResult{status, completedAt, message, ...}.
-//   stallProbe carries measured rollout mtime, idleThresholdMs and activity.
-//   lastWait.observedAt proves watcher activity only, never execution progress.
-//   Legacy jobs without measured evidence retain stall_basis: "none".
-//
-// OMP — script/omp_thread_wakeup.js
-//   dir:   ~/.config/omp-bridge/wake-jobs/*.json
-//   shape: messageId, payload.topic, state, status, createdAt, startedAt,
-//          lastActivityAt, updatedAt, completedAt, bridge.status, and retained
-//          completionText/reply/stderrTail.
-//
-// This projection only reads; the completion owner appends job settlements.
+// MARK: - Delegation status projection
+// The bridge writers own their distinct record shapes; this reader joins job
+// state, accepted-message identities and durable delivery receipts. Runner
+// heartbeat proves watcher activity, never child progress. Cross-life work is
+// stopped; terminal delivery evidence remains retained.
 
 /// One job's projected lifecycle, normalized across the bridge stores.
 /// Every timestamp is the RAW string from the record (already ISO-8601 from
@@ -552,12 +509,22 @@ public struct DelegationStatusProjector: Sendable {
     /// while the historical array APIs still return every readable job.
     package func readSnapshot(now: Date, limit: Int? = nil, offset: Int = 0,
                       agent: String? = nil, messageID: String? = nil) -> DelegationStatusReadSnapshot {
+        let life: String
+        do { life = try DataRootLife.current(in: dataRoot) }
+        catch { return .init(jobs: [], sources: [.init(source: "life-id", agent: "self", status: "unavailable")], matchedCount: 0) }
+        func inLife(_ original: DelegationJobProjection, _ job: [String: JSONValue]) -> DelegationJobProjection {
+            guard DataRootLife.life(of: Self.string(job, "lifeID")) != life, original.deliveryOutcome != "delivered" else { return original }
+            var row = original
+            row.state = "stopped"; row.status = "stopped"; row.deliveryOutcome = "stopped"
+            row.deliveryReason = DataRootLife.stoppedReason; row.stalled = false; row.stallBasis = .terminal; row.stallDeadline = nil
+            return row
+        }
         var rows: [DelegationJobProjection] = []
         var sources: [DelegationSourceAvailability] = []
         let claude = Self.readDirectory(claudeJobsDirectory, source: "claude_jobs", agent: "claude")
         sources.append(claude.availability)
         for (url, object) in claude.objects {
-            if let row = Self.projectClaude(url: url, now: now, object: object) { rows.append(row) }
+            if let row = Self.projectClaude(url: url, now: now, object: object) { rows.append(inLife(row, object)) }
         }
         // A live-session reply has a linked receipt, but no wake job. Exact
         // reads must include that receipt without inventing a runner.
@@ -587,7 +554,7 @@ public struct DelegationStatusProjector: Sendable {
             sources.append(read.availability)
             for (url, object) in read.objects {
                 if let row = Self.projectCodex(url: url, undelivered: undelivered, now: now, object: object) {
-                    codexRows[row.id] = row
+                    codexRows[row.id] = inLife(row, object)
                 }
             }
         }
@@ -623,7 +590,7 @@ public struct DelegationStatusProjector: Sendable {
         let omp = Self.readDirectory(ompJobsDirectory, source: "omp_jobs", agent: "omp")
         sources.append(omp.availability)
         for (url, object) in omp.objects {
-            if let row = Self.projectOMP(url: url, now: now, object: object) { rows.append(row) }
+            if let row = Self.projectOMP(url: url, now: now, object: object) { rows.append(inLife(row, object)) }
         }
         func matches(_ row: DelegationJobProjection) -> Bool {
             (agent == nil || row.agent == agent) && (messageID == nil || row.acceptedMessageIDs.contains(messageID!))
@@ -652,7 +619,7 @@ public struct DelegationStatusProjector: Sendable {
             var lifecycles = Self.readDirectory(directory, source: "completion_lifecycle", agent: "self")
             for (url, fields) in lifecycles.objects {
                 guard let state = try? JSONDecoder().decode(CodexCompletionLifecycleProjection.self,
-                    from: JSONValue.object(fields).serializedData(pretty: false)) else {
+                    from: JSONValue.object(fields).serializedData(pretty: false)).reading(in: dataRoot) else {
                     lifecycles.availability.status = "unreadable"
                     continue
                 }
@@ -669,7 +636,7 @@ public struct DelegationStatusProjector: Sendable {
                     stallBasis: terminal ? .terminal : .none, deliveryLost: nil, deliveryOutcome: nil, completionTextHead: nil)
                 row.completionDeliveryID = id
                 row.recordKind = "completion_lifecycle"
-                row.recoveryNote = url.path
+                row.recoveryNote = status == "stopped" ? DataRootLife.stoppedReason : url.path
                 row.recencyKey = Self.firstDate(state.updatedAt)
                 if matches(row) { rows.append(row) }
             }
@@ -683,9 +650,10 @@ public struct DelegationStatusProjector: Sendable {
             guard let id = rows[index].completionDeliveryID, let lifecycle = states[id] else { continue }
             let state = lifecycle.state
             if let status = state.status,
-               !["delivered", "owed", "failed_before_answer", "legacy_before_receipts", "let_go"].contains(rows[index].deliveryOutcome ?? "") {
+               status == "stopped" || !["delivered", "owed", "failed_before_answer", "legacy_before_receipts", "let_go"].contains(rows[index].deliveryOutcome ?? "") {
                 rows[index].deliveryOutcome = status
                 rows[index].state = status == "delivered" ? "settled" : status
+                if status == "stopped" { rows[index].recoveryNote = DataRootLife.stoppedReason }
                 if status == "failed_before_answer" {
                     rows[index].recoveryNote = lifecycle.path.path
                     rows[index].completedAt = rows[index].completedAt ?? state.updatedAt

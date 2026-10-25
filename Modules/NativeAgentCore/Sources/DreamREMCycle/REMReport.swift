@@ -5,6 +5,7 @@ import Foundation
 /// Summary the weekly REM run returns to its caller (scheduler / debug menu).
 public struct REMReport: Sendable, Codable, Equatable {
     public var proposalsGenerated: Int
+    /// Historical wire name: the floor applies to supporting experiences OR dream dates.
     public var evidenceDatesMin: Int
     public var tombstoneSkips: Int
     public var growthMDEvicted: Int
@@ -107,6 +108,15 @@ extension REMRunReportPayload {
     public static func validatedManualCompletion(
         response: [String: Any]
     ) -> Result<(proposals: Int, archivedEntries: Int, nothingToConsolidate: Bool), NSError> {
+        if let skipReason = response["skipReason"] as? String,
+           !skipReason.isEmpty, skipReason != "nothing_to_consolidate" {
+            return .failure(NSError(domain: "NativeAgent.REMCompletion", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: skipReason == "already_running"
+                    ? "REM consolidation is already running; this request was skipped."
+                    : "REM consolidation was skipped; this request did not run a pass.",
+                "skipReason": skipReason,
+            ]))
+        }
         guard let ok = bool(response["ok"]), ok else {
             return .failure(NSError(domain: "NativeAgent.REMCompletion", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "REM consolidation did not report a successful completion."
@@ -164,3 +174,4 @@ extension REMRunReportPayload {
     }
 }
 import CognitiveSubstrate
+// Blueprint: | `REMReport.swift` | `REMReport`, `REMRunReportPayload`; manual completion validates counters and refuses skipped passes as completion |

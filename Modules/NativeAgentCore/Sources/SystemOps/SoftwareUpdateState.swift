@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `SoftwareUpdateState.swift` | `SoftwareUpdateState` |
 
 /// Persisted updater evidence; the host supplies Sparkle's version comparison.
 @MainActor

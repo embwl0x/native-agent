@@ -27,6 +27,8 @@
 
 import Foundation
 
+// Blueprint: | `DeviceSyncTransport.swift` | `DeviceSyncTransport`: shared transport seam, role/message codecs, account/recovery outcomes and transport resolution |
+
 /// A background recovery caller can bound reads without changing the transport
 /// protocol. Foreground callers retain their ordinary per-operation budgets.
 public enum NADeviceSyncRecoveryBudget {
@@ -394,10 +396,9 @@ public protocol DeviceSyncTransport: Sendable {
     /// True while another Mac on this Apple Account holds the pairing.
     var pairingHeldElsewhere: Bool { get }
 
-    /// Observe the peer device's published pairing secret.
-    /// The handler returns true only after the canonical pairing owner has
-    /// durably accepted the secret. A false result keeps the record eligible
-    /// for a later drain (for example, while Keychain is temporarily locked).
+    /// Observe the peer device's published pairing secret. Every drain offers
+    /// the record to the handler, which returns true only when the canonical
+    /// pairing owner durably installed a key different from the one it held.
     func observePairing(onChange: @escaping @Sendable (Data) async -> Bool) async
 
     /// Set a short status/progress value. Mirrors `iCloudBridge.sendShortStatus`.
@@ -408,10 +409,9 @@ public protocol DeviceSyncTransport: Sendable {
 
     /// 2026-09-06: the ACKNOWLEDGING form. The handler returns true only once
     /// the value has been durably applied; a false result leaves the peer's
-    /// record eligible for a later drain, exactly as `observePairing` already
-    /// works. The unacknowledged form above claims the record's modification
-    /// date BEFORE the handler runs, so a snapshot the phone failed to store
-    /// was never redelivered.
+    /// record eligible for a later drain. The unacknowledged form above claims
+    /// the record's modification date BEFORE the handler runs, so a snapshot
+    /// the phone failed to store was never redelivered.
     func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async
     func observeStatus(key: String, onApply: @escaping @Sendable (String, Date?) async -> Bool) async
 
@@ -426,7 +426,7 @@ public protocol DeviceSyncTransport: Sendable {
     @discardableResult
     func drainIncoming() async -> DeviceSyncDrainResult
 
-    /// Pull the peer's pairing singleton now; returns true if the handler fired.
+    /// Pull the peer's pairing singleton now; returns true if it installed a new key.
     @discardableResult
     func drainPairing() async -> Bool
 

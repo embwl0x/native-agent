@@ -1,10 +1,11 @@
-import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import TurnTrace
 import Transcripts
+
+// Blueprint: | `TelegramSessionStore.swift` | `TelegramSessionStore`: locked session mint/adoption and delivery mapping; the shared anchor selects the owner's ordinary conversation |
 
 public struct TelegramSessionStatus: Sendable, Equatable {
     public let chatId: Int
@@ -51,13 +52,13 @@ public enum TelegramSessionStoreError: LocalizedError, Sendable, Equatable {
     public var errorDescription: String? {
         switch self {
         case .sessionStorageUnavailable:
-            return "Telegram conversation storage is unavailable. Repair or restore session_map.json before retrying; existing bindings have been preserved."
+            return "telegram_conversation_store_unavailable: Conversation bindings cannot be read. Repair telegram/session_map.json before using /resume; inspect the conversation list before changing bindings."
         case .missingSessionId:
-            return "/resume requires a session id."
+            return "telegram_conversation_id_required: Send /sessions, then /resume <id> with a conversation ID."
         case .sessionNotFound(let id):
-            return "No chat session matched '\(id)'."
+            return "telegram_conversation_not_found: No conversation matches '\(id)'. Send /sessions, then /resume <id> with a listed ID."
         case .ambiguousSessionPrefix(let prefix, let matches):
-            return "Session prefix '\(prefix)' is ambiguous: \(matches.prefix(5).joined(separator: ", "))."
+            return "telegram_conversation_ambiguous: '\(prefix)' matches \(matches.prefix(5).joined(separator: ", ")). Send /resume with a longer conversation ID."
         }
     }
 }
@@ -67,10 +68,6 @@ public struct TelegramSessionStore: Sendable {
 
     public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         self.dataRoot = dataRoot
-    }
-
-    public func activeSessionId(chatId: Int) async throws -> String {
-        try await activeSessionId(destination: .chat(chatId))
     }
 
     public func activeSessionId(destination: TelegramDestination) async throws -> String {
@@ -141,10 +138,6 @@ public struct TelegramSessionStore: Sendable {
             resolvedBy: adopted ? .adopted : .minted
         )
         return resolved
-    }
-
-    public func startNewSession(chatId: Int) async throws -> String {
-        try await startNewSession(destination: .chat(chatId))
     }
 
     public func startNewSession(destination: TelegramDestination) async throws -> String {
@@ -219,10 +212,6 @@ public struct TelegramSessionStore: Sendable {
         return trimmed
     }
 
-    public func status(chatId: Int) async throws -> TelegramSessionStatus {
-        try await status(destination: .chat(chatId))
-    }
-
     public func status(destination: TelegramDestination) async throws -> TelegramSessionStatus {
         let sessionId = try await activeSessionId(destination: destination)
         let persona = try await persona(destination: destination) ?? "NativeAgent"
@@ -262,10 +251,6 @@ public struct TelegramSessionStore: Sendable {
         return Array(sessions.prefix(cappedLimit))
     }
 
-    public func bindSession(chatId: Int, requestedSessionId rawSessionId: String, fromUserId: Int? = nil) async throws -> TelegramSessionStatus {
-        try await bindSession(destination: .chat(chatId), requestedSessionId: rawSessionId, fromUserId: fromUserId)
-    }
-
     public func bindSession(
         destination: TelegramDestination,
         requestedSessionId rawSessionId: String,
@@ -292,53 +277,8 @@ public struct TelegramSessionStore: Sendable {
             throw TelegramBotError.invalidRequest
         }
         let sessionId = try await activeSessionId(destination: destination)
-        let path = sessionDir(sessionId: sessionId).appendingPathComponent("scratch.json")
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            let current = try await persistence.readJSON(path, ifMissing: .object([:]))
-            var root: [String: JSONValue]
-            if case .object(let obj) = current { root = obj } else { root = [:] }
-            root[cleanedKey] = .string(cleanedValue)
-            try await persistence.writeJSON(.object(root), to: path)
-        }
+        try await ChatSessionScratch.write(dataRoot: dataRoot, sessionID: sessionId, key: cleanedKey, value: cleanedValue)
         return sessionId
-    }
-
-    public func appendNote(text: String, kind: String, source: String, persona: String = "NativeAgent") async throws -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw TelegramBotError.invalidRequest
-        }
-        let noteId = UUID().uuidString.lowercased()
-        let notesPath = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent(persona, isDirectory: true)
-            .appendingPathComponent("notes.jsonl")
-        let record: JSONValue = .object([
-            "id": .string(noteId),
-            "ts": .string(Self.nowString()),
-            "persona": .string(persona),
-            "kind": .string(kind.isEmpty ? "note" : kind),
-            "text": .string(trimmed),
-            "tags": .array([.string("telegram")]),
-            "source_run": .string(source),
-            "confidence": .double(0.8),
-            "importance": .double(0.5),
-        ])
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(notesPath) {
-            // P-L4 (tightness round 2): bare append grew notes.jsonl unbounded —
-            // route through the shared capped appender under the same flock.
-            try await appendJSONLCapped(
-                record,
-                to: notesPath,
-                using: persistence,
-                maxLines: JSONLLineCaps.telegramNotes,
-                logLabel: "TelegramSessionStore.notes",
-                takeLock: false
-            )
-        }
-        return noteId
     }
 
     /// The conversation a private chat is in now, or nil.
@@ -490,14 +430,14 @@ public struct TelegramSessionStore: Sendable {
                 "messageCount": .int(0),
             ]
             rows.insert(row, at: 0)
-            try await persistence.writeJSON(.array(rows.map(JSONValue.object)), to: sessionsPath)
+            try ChatSessionIndexFile.write(rows, to: sessionsPath)
             do {
                 try await commitBinding()
             } catch {
                 // Keep the index lock through map publication and rollback so
                 // another index writer cannot adopt or modify the unused row.
                 rows.removeFirst()
-                try await persistence.writeJSON(.array(rows.map(JSONValue.object)), to: sessionsPath)
+                try ChatSessionIndexFile.write(rows, to: sessionsPath)
                 throw error
             }
             ChatSessionRetention.enforceBestEffort(
@@ -555,13 +495,6 @@ public struct TelegramSessionStore: Sendable {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(sessionId).jsonl")
-    }
-
-    private func sessionDir(sessionId: String) -> URL {
-        dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(sessionId, isDirectory: true)
     }
 
     private static func chatKey(_ destination: TelegramDestination) -> String {

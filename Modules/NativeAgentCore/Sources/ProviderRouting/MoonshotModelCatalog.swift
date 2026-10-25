@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `MoonshotModelCatalog.swift` | `MoonshotModelCatalog`: authenticated model parsing/capabilities and checked offline cache, using shared TTL state machinery |
+
 /// Authenticated Moonshot/Kimi model discovery with a bounded offline cache.
 /// Capability flags come from Moonshot's `/v1/models` response; NativeAgent's
 /// own adapter capabilities (streaming, tools, JSON, and supported Think
@@ -15,7 +17,8 @@ public enum MoonshotModelCatalog {
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
         readCache: { readDecodedCache(dataRoot: $0) },
-        fetchLive: { ModelCatalogFetch(models: try await fetchLiveModels(dataRoot: $0, session: $1), isComplete: true) }
+        providerConfigFile: "moonshot.json",
+        fetchLive: { ModelCatalogFetch(models: try await fetchLiveModels(key: $0, session: $1), isComplete: true) }
     )
 
     public static func models(
@@ -89,11 +92,8 @@ public enum MoonshotModelCatalog {
         FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.supportedReasoningEfforts ?? ["none"]
     }
 
-    private static func fetchLiveModels(dataRoot: URL, session: URLSession) async throws -> [ProviderModelDescriptor] {
-        guard let key = LLMCredentialResolver.resolveAPIKey(
-            providerConfigFile: "moonshot.json",
-            dataRoot: dataRoot
-        ), !key.isEmpty else {
+    private static func fetchLiveModels(key: String?, session: URLSession) async throws -> [ProviderModelDescriptor] {
+        guard let key, !key.isEmpty else {
             throw LLMError.notConfigured(provider: "moonshot")
         }
         var request = URLRequest(url: endpoint)

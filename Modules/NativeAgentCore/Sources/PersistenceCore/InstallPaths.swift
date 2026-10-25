@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `InstallPaths.swift` | Install-owned paths, public release preparation and login-item location admission |
 
 /// 2026-09-18: one owner for install-owned paths outside the data root. The
 /// shipped installs keep their established rendezvous; only other bundle ids
@@ -68,6 +69,10 @@ public struct InstallPaths: Sendable {
         (secondary ? "nativeagent-" + bundleIdentifier : name("nativeagent"))
             .replacingOccurrences(of: "_", with: "__").replacingOccurrences(of: ".", with: "_d")
     }
+    /// Bridge protocol owners keep private inboxes/jobs, quarantine bytes and
+    /// worktree pointers here; excluded from app backup/export/phone file sync.
+    /// Contact status and canonical transcript projections are separate.
+    /// PrivacyMap resolves each bridge directory through this same root.
     public func bridgeConfigRoot(dataRoot: URL, defaultRoot: URL? = nil,
                                  secondary: Bool = UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall")) -> URL {
         // Relocated test/dev roots still stay self-contained, including readers.

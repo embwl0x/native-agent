@@ -23,7 +23,7 @@ The `bash` tool applies a heuristic deny-list for dangerous patterns. It is **no
 
 ## Sensitive data storage
 
-The GitHub connector PAT is stored in the macOS Keychain. Its JSON files contain non-secret metadata only and migrate legacy plaintext only after a verified Keychain write. Other file-backed OAuth tokens, pairing secrets, and sensitive config files are stored at filesystem mode `0600`. Tokens are never written to logs.
+Ability secrets use the keyring (`Keyring.swift`) in the macOS Keychain; Slack's door tokens use `SlackCredentials.swift`. Retired services' credential files and Keychain items stay untouched and unread. Other file-backed OAuth tokens, pairing secrets, and sensitive config files are stored at filesystem mode `0600`. Tokens are never written to logs.
 
 ## Scope
 

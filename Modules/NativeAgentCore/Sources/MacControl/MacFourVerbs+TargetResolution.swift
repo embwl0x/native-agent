@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MacFourVerbs+TargetResolution.swift` | `MacFourVerbs`: `resolve`, `answers`, `bareNumberNote` |
 
 // Pure name, role, ordinal, motion-identity, and aim-point resolution for the
 // already observed targets. Observation and dispatch stay in MacFourVerbs.swift.

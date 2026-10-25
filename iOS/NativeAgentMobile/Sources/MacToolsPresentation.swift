@@ -1,4 +1,5 @@
 import SwiftUI
+// Blueprint: | `MacToolsPresentation.swift` | `MacSystemQuickAction` enum |
 
 enum MacSystemQuickAction: String, CaseIterable, Sendable {
     case lockScreen = "lock_screen"
@@ -106,16 +107,6 @@ enum MacToolsPolicyGatePresentation {
         guard let policy else { return .snapshotUnavailable }
         guard policy.enabled else { return .macControlDisabled }
         return policy.remoteFromIosAllowed ? .enabled : .iosRemoteDisabled
-    }
-
-    /// A failed targeted refresh must not reuse an older, cached policy to
-    /// unlock privileged controls. Until this exact snapshot is proven current,
-    /// the safe presentation is the same as an unavailable policy.
-    static func policyForGate(
-        snapshotLoaded: Bool,
-        refreshedPolicy: TrustMacControlPolicy?
-    ) -> TrustMacControlPolicy? {
-        snapshotLoaded ? refreshedPolicy : nil
     }
 
     static func disabledDescription(for policy: TrustMacControlPolicy?) -> String {

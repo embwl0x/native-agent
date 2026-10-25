@@ -2,7 +2,10 @@ import Dispatcher
 import SwiftUI
 import ToolRegistry
 import AppKit
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatSessionWork
+
+// Blueprint: | `ChatComposerInput.swift` | `ChatComposerInput`: draft-local text entry, slash menu, recipient chip and command-key handling |
 
 /// The composer: the text field, its slash menu, and the control strip around
 /// it.
@@ -52,7 +55,7 @@ struct ChatComposerInput: View {
     let onSend: () -> Void
     let onSlashCommand: (String) -> Void
     let onDrop: ([NSItemProvider]) -> Void
-    let composeVoiceDraft: (String) -> String
+    let composeVoiceDraft: (String) -> Void
 
     // The slash menu is composer-local state; nothing outside this view reads
     // it, so it no longer invalidates the chat.
@@ -167,7 +170,7 @@ struct ChatComposerInput: View {
                 // to (2026-09-06).
                 guard voiceSessionId == activeSessionId else { return }
                 if ChatTranscriptPresentation.hasVisibleText(newVal) {
-                    draft.edit(composeVoiceDraft(newVal))
+                    composeVoiceDraft(newVal)
                 }
             }
             .onChange(of: draft.text) { _, newVal in

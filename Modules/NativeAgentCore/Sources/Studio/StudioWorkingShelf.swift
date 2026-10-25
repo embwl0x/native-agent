@@ -1,6 +1,7 @@
 import Foundation
 import NaturalLanguage
 import PersistenceCore
+// Blueprint: | `StudioWorkingShelf.swift` | `StudioWorkingShelf` struct; `decodeSlots`, `selections` |
 
 /// Explicit selections beside the additive journal. No cached artifacts or usage state.
 public struct StudioWorkingShelf: Sendable {

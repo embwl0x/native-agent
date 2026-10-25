@@ -2,8 +2,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
-import MCPDispatcher
-import KnowledgeGraph
 import PersonaEngine
 import ProviderRouting
 import TrustCenter
@@ -12,6 +10,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
+// Blueprint: | `SwiftToolDispatcher+KnowledgeGraphTools.swift` | `SwiftToolDispatcher`: `impl_search_kg`, `kgSeenDate` |
 
 // MARK: - Knowledge graph tools
 
@@ -45,11 +44,9 @@ extension SwiftToolDispatcher {
                 reason: "search_kg needs 'query' (text to search for), 'entity_id' (an id from a search result), or a 'type' or 'since' filter to browse."
             )
         }
-        guard MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) else {
-            return .object([
-                "status": .string("disabled"),
-                "reason": .string(MemoryPolicyGate.knowledgeGraphOffMessage),
-            ])
+        // Off and damaged Trust are different causes with different levers.
+        if let failure = MemoryPolicyGate.knowledgeGraphFailure(dataRoot: dataRoot) {
+            return ChatToolOutcome.failure(error: failure, tool: "search_kg")
         }
         let disclosedIDs = Set(try await memoryV2.listMemory(kind: nil).filter {
             MemoryRecordDisclosurePolicy.classify($0)?.permits(surface: surface, personaID: nil) == true

@@ -1,6 +1,8 @@
 import AppKit
 import SwiftUI
 
+// Blueprint: | `NativeSearchField.swift` | `NativeSearchField`: NSSearchField bridge with native clear/escape/return behavior and explicit focus tokens |
+
 /// The Mac's own search field (NSSearchField): magnifier, placeholder, clear
 /// button, Escape-to-clear and the system look in every appearance (User
 /// 09-27: all controls Mac native).

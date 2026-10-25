@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `TelegramOffsetCursor.swift` | `TelegramOffsetCursor`: monotonic durable getUpdates cursor; only missing state bootstraps and corrupt state cannot replay commands |
+
 /// The durable Telegram `getUpdates` cursor.
 ///
 /// This is a security-sensitive boundary: treating corrupt bytes as offset zero
@@ -108,13 +110,13 @@ public enum TelegramOffsetCursorError: Error, Sendable, Equatable, LocalizedErro
     public var errorDescription: String? {
         switch self {
         case .unreadable(let detail):
-            return "Telegram offset cursor is unreadable: \(detail)"
+            return "telegram_cursor_unreadable: \(detail). Restore read access to this bot's last_offset.json; do not reset it to zero, which can replay actions."
         case .oversized(let actualBytes, let maximumBytes):
-            return "Telegram offset cursor is too large (\(actualBytes) bytes; maximum \(maximumBytes))"
+            return "telegram_cursor_oversized: Cursor is \(actualBytes) bytes; limit \(maximumBytes). Repair this bot's last_offset.json with its confirmed offset; resetting to zero can replay actions."
         case .malformed:
-            return "Telegram offset cursor is malformed"
+            return "telegram_cursor_malformed: Cursor is malformed. Repair this bot's last_offset.json as {\"offset\":N} using its confirmed offset; resetting to zero can replay actions."
         case .invalidOffset:
-            return "Telegram offset cursor must be a non-negative whole number"
+            return "telegram_cursor_invalid: Offset must be a nonnegative whole number. Repair this bot's last_offset.json using its confirmed offset; resetting to zero can replay actions."
         }
     }
 }

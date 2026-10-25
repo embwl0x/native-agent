@@ -4,14 +4,13 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `Browser.swift` | Browser status delegates run decoding to the operation owner and retains its existing malformed-feed error; operation/capture paths and status projection; WebKit owns website data, with no advertised data-root profile |
 
 public struct SwiftNativeBrowserClient: Sendable {
     /// Absolute path to `<dataRoot>/native_power/browser/runs.json`.
     public let runsPath: URL
     /// Absolute path to `<dataRoot>/native_power/browser/receipts.jsonl`.
     public let receiptsPath: URL
-    /// Absolute path to `<dataRoot>/native_power/browser/profile`.
-    public let profileDir: URL
     /// Absolute path to `<dataRoot>/native_power/browser/sources`.
     public let sourcesDir: URL
     /// Absolute path to `<dataRoot>/native_power/browser/screenshots`.
@@ -21,6 +20,8 @@ public struct SwiftNativeBrowserClient: Sendable {
     let persistence: any PersistenceCoreProtocol
     let now: @Sendable () -> Date
 
+    /// Shared NativeActionReceipt JSONL, capped through appendPathOwnedJSONL.
+    /// Off-disk backup only; no archive inputs/phone copy; PrivacyMap: native_actions.
     public var nativeActionsReceiptsPath: URL {
         runsPath.deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("actions/receipts.jsonl")
@@ -34,7 +35,6 @@ public struct SwiftNativeBrowserClient: Sendable {
     public init(
         runsPath: URL,
         receiptsPath: URL,
-        profileDir: URL,
         sourcesDir: URL,
         screenshotsDir: URL,
         trustPolicyPath: URL,
@@ -43,7 +43,6 @@ public struct SwiftNativeBrowserClient: Sendable {
     ) {
         self.runsPath = runsPath
         self.receiptsPath = receiptsPath
-        self.profileDir = profileDir
         self.sourcesDir = sourcesDir
         self.screenshotsDir = screenshotsDir
         self.trustPolicyPath = trustPolicyPath
@@ -51,14 +50,8 @@ public struct SwiftNativeBrowserClient: Sendable {
         self.now = now
     }
 
-    /// Resolve the paths the daemon uses:
-    ///   self.browser_runs_path        = root / "native_power" / "browser" / "runs.json"
-    ///   self.browser_actions_path     = root / "native_power" / "browser" / "receipts.jsonl"
-    ///   self.browser_profile_dir      = root / "native_power" / "browser" / "profile"
-    ///   self.browser_sources_dir      = root / "native_power" / "browser" / "sources"
-    ///   self.browser_screenshots_dir  = root / "native_power" / "browser" / "screenshots"
-    /// where `root` is the data root. PersistenceCore.defaultDataRoot() mirrors
-    /// the daemon's data-root resolution.
+    /// Resolve the browser operation and capture files under the data root.
+    /// WebKit owns its website data; this client has no profile directory.
     public static func defaultClient(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
@@ -69,7 +62,6 @@ public struct SwiftNativeBrowserClient: Sendable {
         return SwiftNativeBrowserClient(
             runsPath: browser.appendingPathComponent("runs.json"),
             receiptsPath: browser.appendingPathComponent("receipts.jsonl"),
-            profileDir: browser.appendingPathComponent("profile", isDirectory: true),
             sourcesDir: browser.appendingPathComponent("sources", isDirectory: true),
             screenshotsDir: browser.appendingPathComponent("screenshots", isDirectory: true),
             trustPolicyPath: dataRoot
@@ -81,17 +73,11 @@ public struct SwiftNativeBrowserClient: Sendable {
 
     public func browserStatus() async throws -> JSONValue {
         // Only a missing run feed is empty; malformed content is unavailable.
-        async let runsRead = persistence.readJSON(runsPath, ifMissing: .array([]))
+        async let runsRead = Self.readCanonicalRuns(at: runsPath, using: persistence,
+            malformed: PersistenceCoreError.ioFailure("The browser run feed is malformed."))
         async let receiptsRead = persistence.tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
         async let domainsRead = approvedBrowserDomains()
-        let runsRaw = try await runsRead
-        guard case .array(let runs) = runsRaw,
-              runs.allSatisfy({
-                  if case .object(let row) = $0, case .string? = row["status"] { return true }
-                  return false
-              }) else {
-            throw PersistenceCoreError.ioFailure("The browser run feed is malformed.")
-        }
+        let runs = try await runsRead
 
         // active = [run for run in runs if run.get("status") in {"running","waiting_approval"}]
         let activeRuns: [JSONValue] = runs.filter { run in
@@ -125,7 +111,6 @@ public struct SwiftNativeBrowserClient: Sendable {
         // browser_status() emits createdAt = now_iso() (response timestamp).
         return .object([
             "status": .string("ready"),
-            "profilePath": .string(profileDir.path),
             "sourcePath": .string(sourcesDir.path),
             "screenshotPath": .string(screenshotsDir.path),
             "approvedDomains": .array(approved.map { .string($0) }),

@@ -1,5 +1,6 @@
 import ApprovalInbox
-import ChatOrchestration
+import ChatTurnContracts
+import ChatToolParsing
 import ChatToolRuntime
 import Desk
 import Foundation
@@ -8,6 +9,7 @@ import NativeAgentShared
 import NotificationInbox
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `QuietInboxCommands.swift` | `QuietInboxHost`: inbox fences and commands |
 
 @MainActor public protocol QuietInboxHost: QuietToolHost {
     var inboxDataRoot: URL { get }
@@ -157,7 +159,7 @@ extension QuietInboxHost {
                     "This inbox item has no owner-review approval record. A peer-steered turn cannot supply the person's consent.",
                     extra: ["remedy": Repair.why(owner: "inbox item \(item.id)", tap: "Today > \(item.title) > Approve")]))
             }
-            // Two cards are a person's under Full Mac too: a skill script's Install
+            // Two cards are a person's under Full Mac too: an executable keep
             // (approving admits the script as his) and a destructive call's (User,
             // 10-17: what cannot be undone on his side waits for a human's tap, one
             // card every time). Her own approve never stands in for his.
@@ -168,7 +170,7 @@ extension QuietInboxHost {
                     return refuse(AppToolExecutor.failure("approval_unavailable",
                         "workflows/approvals/requests.json card \(approvalID) could not be read: \(error.localizedDescription). No consent was supplied."))
                 }
-                let install = record.action == SwiftNativeApprovalInbox.skillScriptInstallAction
+                let install = record.requiresExecutableReview
                 if peerSteered,
                    !SwiftNativeApprovalInbox.ownerReviewActions.contains(record.action) {
                     return refuse(AppToolExecutor.failure("owners_call",
@@ -264,8 +266,9 @@ extension QuietInboxHost {
             do {
                 try await self.withdrawApproval(id: approvalID, decidedBy: "agent_withdraw")
             } catch {
-                return AppToolExecutor.failure("withdraw_failed",
-                    "\(error.localizedDescription) The approval is unchanged; read the note again, then retry.", extra: ["effects": .string("unknown")])
+                return AppToolExecutor.ownedFailure(error, code: "withdraw_failed", owner: "approval \(approvalID)",
+                    instruction: "Read this approval note before another change; withdrawal was not verified.",
+                    next: ["page": .string("inbox"), "item": .string(ids[0])], effects: .unknown)
             }
             await self.refreshInboxSurfaces()
             return .object(["status": .string("ok"), "verb": .string(verb), "id": .string(ids[0]),
@@ -276,8 +279,9 @@ extension QuietInboxHost {
             do {
                 try await self.performInboxAction(item.id, action: action, metadata: [:], quiet: true, dataRootOverride: self.dataRootOverride)
             } catch {
-                return AppToolExecutor.failure("act_failed", error.localizedDescription,
-                    extra: ["id": .string(item.id), "action": .string(action), "effects": .string("unknown")])
+                return AppToolExecutor.ownedFailure(error, code: "inbox_act_failed", owner: "inbox \(item.id) action \(action)",
+                    instruction: "Read this note's current state and resolve the reported cause before acting again.",
+                    next: ["page": .string("inbox"), "item": .string(item.id)], effects: .unknown)
             }
             await self.refreshInboxSurfaces()
             if target.decided {

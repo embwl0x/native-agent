@@ -4,6 +4,7 @@ import PersistenceCore
 import TrustCenter
 #if canImport(CoreGraphics)
 import CoreGraphics
+// Blueprint: | `MacControl+DirectInput.swift` | `SwiftNativeMacControl`: `handleKeystroke`, `handleClick`, `handleScroll` |
 #endif
 
 extension SwiftNativeMacControl {

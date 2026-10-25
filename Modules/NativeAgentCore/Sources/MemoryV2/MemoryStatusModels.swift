@@ -1,29 +1,5 @@
 import Foundation
-
-public struct MemoryVectorStatus: Codable, Hashable {
-    public var status: String
-    public var provider: String?
-    public var providerModel: String?
-    public var providerConfigured: Bool?
-    public var providerReason: String?
-    public var dimensions: Int?
-    public var nodeCount: Int?
-    public var entityCount: Int?
-    public var updatedAt: String?
-    public var createdAt: String?
-    public init(status: String, provider: String? = nil, providerModel: String? = nil, providerConfigured: Bool? = nil, providerReason: String? = nil, dimensions: Int? = nil, nodeCount: Int? = nil, entityCount: Int? = nil, updatedAt: String? = nil, createdAt: String? = nil) {
-        self.status = status
-        self.provider = provider
-        self.providerModel = providerModel
-        self.providerConfigured = providerConfigured
-        self.providerReason = providerReason
-        self.dimensions = dimensions
-        self.nodeCount = nodeCount
-        self.entityCount = entityCount
-        self.updatedAt = updatedAt
-        self.createdAt = createdAt
-    }
-}
+// Blueprint: | `MemoryStatusModels.swift` | MemoryV2 counts, embedding and after-turn recovery wire models |
 
 public struct MemoryV2Status: Codable, Hashable {
     public var status: String

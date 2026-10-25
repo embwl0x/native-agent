@@ -1,5 +1,6 @@
 import Foundation
 import TrustCenter
+// Blueprint: | `MacSyncRemoteMacControlPort.swift` | `MacSyncRemoteMacControlPort` protocol; `loadTrustPolicy`, `run` |
 
 /// The app route's unchanged response, before device-sync interpretation.
 public struct MacSyncRemoteMacControlResult {

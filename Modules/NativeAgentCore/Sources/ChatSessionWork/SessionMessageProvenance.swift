@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `SessionMessageProvenance.swift` | `SessionMessageProvenance` |
 
 /// Closed interpretation of recorded ingress; unknown origins remain automated.
 public enum SessionMessageProvenance: Sendable, Equatable {

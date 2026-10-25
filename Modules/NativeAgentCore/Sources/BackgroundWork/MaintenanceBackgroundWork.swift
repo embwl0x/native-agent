@@ -1,13 +1,12 @@
 import Foundation
 import NativeAgentCore
 import BackgroundLoops
-import ChatOrchestration
+import ChatSessionWork
 import Context
 import DoctorChecks
 import PersistenceCore
 import TurnTrace
 import ApprovalInbox
-import WorkshopExecution
 import NotificationInbox
 import MemoryV2
 import DreamREMCycle
@@ -17,6 +16,9 @@ import AttentionRouting
 import Privacy
 import ProviderRouting
 import Experiences
+import ToolRegistry
+import Cognition
+// Blueprint: | `MaintenanceBackgroundWork.swift` | `MaintenanceBackgroundWork` struct; Doctor and loop failures owe repair through DoctorStatusProjection; Doctor ask grouping and storage card narration live in Resources/abilities/maintenance-assistance.js; native ask eligibility, disk accounting, unavailable plan reads, saved executable cleanup scope, cleanup receipts and acknowledgment by finding identity stay here; no JS under the publication lock; Resources/abilities/backup-cadence.js selects off-disk freshness and identity-change timing, with native volume/metadata observations, root protection and backup execution; canceled deadline reads return without a backup outcome, canceled ticks skip; actual cadence failures name the part, cause and repair/restore lever in offdisk_backup's failed scheduler receipts and Doctor/maintenance health, never a not-due skip or substitute cadence; unavailable observations never become empty inputs; the weekly Workshop digest is supplied by EngineLaunch through the ordinary maintenance part door, with unavailable evidence failing the pass; weekly signals use chat, live error feeds and Doctor health, without the retired Python sink or skill registry; self-improvement captures the checked part row's full review and digest in enable cards, deduplicated by finding and exact version; retention, backup work and manual weekly-run token lifecycle; DoctorFacade owns observed digest reads |
 
 // MARK: - Maintenance Loops
 
@@ -60,9 +62,9 @@ public struct MaintenanceBackgroundWork: Sendable {
     public func fileDoctorAsk(dataRoot: URL, rows: [CheckResult]) async -> Bool {
         let cardID = "doctor-ask"
         let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        let asks = Set(rows.filter(DoctorSafeRepairPolicy.isUserAsk).compactMap { row in
-            row.human_action.map { "• \(row.title): \($0)" }
-        }).sorted()
+        let asks: [JSONValue] = rows.filter(DoctorSafeRepairPolicy.isUserAsk).compactMap { row in
+            row.human_action.map { .object(["title": .string(row.title), "action": .string($0)]) }
+        }
         do {
             guard !asks.isEmpty else {
                 // Cleared whatever User did with the card (read, archived or
@@ -77,9 +79,11 @@ public struct MaintenanceBackgroundWork: Sendable {
                 }
                 return true
             }
-            let detail = asks.joined(separator: "\n")
+            let content = try await port.assistanceCard(dataRoot: dataRoot,
+                input: .object(["kind": .string("doctor"), "asks": .array(asks)]))
+            let detail = content.detail
             let now = ISO8601DateFormatter().string(from: Date())
-            let title = asks.count == 1 ? "Doctor needs one thing from you" : "Doctor needs \(asks.count) things from you"
+            let title = content.title
             let newOccurrence = try await inbox.upsert(id: cardID) { existing in
                 var card: [String: JSONValue] = [
                     "id": .string(cardID),
@@ -87,7 +91,7 @@ public struct MaintenanceBackgroundWork: Sendable {
                     "source": .string("doctor_ask"),
                     "severity": .string("actionable"),
                     "title": .string(title),
-                    "summary": .string("Sign-ins and permissions Doctor cannot do itself."),
+                    "summary": .string(content.summary),
                     "detail": .string(detail),
                     "related_mission_id": .null,
                     "related_approval_id": .null,
@@ -147,8 +151,8 @@ public struct MaintenanceBackgroundWork: Sendable {
         )
     }
 
-    /// Off-disk backup into iCloud Drive every 24 hours; identity (persona)
-    /// writes are included at the next daily wake. See `OffDiskBackupRunner`.
+    /// Off-disk backup into iCloud Drive at its daily deadline and after
+    /// identity-file changes. See `OffDiskBackupRunner`.
     public func makeOffDiskBackupLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> some LoopRunner {
@@ -170,7 +174,8 @@ public struct MaintenanceBackgroundWork: Sendable {
 
     public func makeWeeklySelfImprovementLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        llm: any LLMClient
+        llm: any LLMClient,
+        workshopOutcomes: @escaping @Sendable () async throws -> String
     ) -> WeeklySelfImprovementLoop {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         return WeeklySelfImprovementLoop(
@@ -187,6 +192,41 @@ public struct MaintenanceBackgroundWork: Sendable {
                 return await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
             },
             stageProposal: { proposal in
+                var apply: [String: JSONValue] = ["op": .string(proposal.applyOp ?? ""),
+                                                  "target": .string(proposal.applyTarget ?? "")]
+                var preview: String = {
+                    switch (proposal.applyOp, proposal.applyTarget) {
+                    case ("disable_skill"?, let target?): return "Turn off the \(target) skill. "
+                    case ("enable_skill"?, let target?): return "Turn on the \(target) skill. "
+                    case ("run_memory_hygiene"?, _): return "Approving runs memory hygiene: duplicates merge and test noise clears. "
+                    case (let op?, _) where !op.isEmpty:
+                        return "Approving runs: " + op.replacingOccurrences(of: "_", with: " ") + ". "
+                    default: return ""
+                    }
+                }() + String(proposal.proposedChange.prefix(180))
+                if proposal.applyOp == "enable_skill" {
+                    let target = proposal.applyTarget ?? ""
+                    let tools = try await SwiftNativeToolRegistry(root: dataRoot).listTools(filter: .all)
+                    guard let tool = tools.first(where: { $0.id.caseInsensitiveCompare(target) == .orderedSame })
+                        ?? tools.first(where: { $0.name.caseInsensitiveCompare(target) == .orderedSame }) else {
+                        throw ToolRegistryError.invalidRequest("Cannot stage approval: \(target) is unavailable.")
+                    }
+                    apply["target"] = .string(tool.id)
+                    if let digest = tool.reviewedKeepDigest, let review = tool.keepReview {
+                        // Persist the identity of the code shown NOW, never one
+                        // reread when this card is eventually approved or replayed.
+                        apply["reviewedDigest"] = .string(digest)
+                        preview += "\n\nApprove keeps only this exact version; a changed version is refused.\n"
+                            + (try JSONValue.object(review).serialize(pretty: true))
+                    } else {
+                        guard (tool.candidateDigest ?? tool.codeFingerprint) == nil,
+                              tool.activePath.map({ URL(fileURLWithPath: $0).pathExtension == "md" }) == true else {
+                            throw ToolRegistryError.invalidRequest("Cannot stage approval without \(target)'s exact code and digest.")
+                        }
+                        apply["reviewedDigest"] = .null
+                        preview += "\nMarkdown guidance only; this approval cannot enable executable code."
+                    }
+                }
                 // SKIP-IF-PRESENT (2026-09-06). A sweep that failed partway
                 // rolls its weekly marker back, so the next tick re-runs the
                 // whole pass — and every proposal that HAD staged got a second
@@ -200,7 +240,12 @@ public struct MaintenanceBackgroundWork: Sendable {
                 ), let card = existing.first(where: { record in
                     guard case .object(let payload) = record.payload,
                           case .string(let staged)? = payload["findingId"] else { return false }
-                    return staged == findingId
+                    guard staged == findingId else { return false }
+                    if proposal.applyOp == "enable_skill" {
+                        guard case .object(let saved)? = payload["apply"] else { return false }
+                        return saved["target"] == apply["target"] && saved["reviewedDigest"] == apply["reviewedDigest"]
+                    }
+                    return true
                 }) {
                     return card.id
                 }
@@ -212,27 +257,12 @@ public struct MaintenanceBackgroundWork: Sendable {
                         "findingId": .string(findingId),
                         "evidence": .string(proposal.evidence),
                         "proposedChange": .string(proposal.proposedChange),
-                        "apply": .object([
-                            "op": .string(proposal.applyOp ?? ""),
-                            "target": .string(proposal.applyTarget ?? ""),
-                        ]),
+                        "apply": .object(apply),
                     ]),
                     // WHAT one tap will do, in words: the op slug
                     // ("[run_memory_hygiene]") stays in the payload, never on
                     // the card (User, 2026-09-25). A skill op names its skill.
-                    "payloadPreview": .string(
-                        {
-                            switch (proposal.applyOp, proposal.applyTarget) {
-                            case ("disable_skill"?, let target?): return "Turn off the \(target) skill. "
-                            case ("enable_skill"?, let target?): return "Turn on the \(target) skill. "
-                            case ("run_memory_hygiene"?, _): return "Approving runs memory hygiene: duplicates merge and test noise clears. "
-                            // Any other op still says what the tap runs, in words.
-                            case (let op?, _) where !op.isEmpty:
-                                return "Approving runs: " + op.replacingOccurrences(of: "_", with: " ") + ". "
-                            default: return ""
-                            }
-                        }() + String(proposal.proposedChange.prefix(180))
-                    ),
+                    "payloadPreview": .string(preview),
                 ])
                 do {
                     return try await inbox.create(body).id
@@ -258,16 +288,7 @@ public struct MaintenanceBackgroundWork: Sendable {
                     source: .sweep
                 ), dataRoot: dataRoot)
             },
-            // MEASURE leg (north-star, 2026-06-15): feed the real week-over-week
-            // execution-outcome trend into the weekly analysis so the improvement
-            // brain sees whether Agent is actually completing more jobs in fewer
-            // steps — not just chat/error/doctor proxies. Read-only runner bound
-            // to the same dataRoot (the scoreboard only scans mission.json; the
-            // planner/executor are unused, hence the bare default construction).
-            workshopOutcomes: {
-                let runner = SwiftNativeWorkshopRunner(root: dataRoot)
-                return WorkshopOutcomeScoreboard.formatForPrompt(await runner.weeklyOutcomeStats())
-            },
+            workshopOutcomes: workshopOutcomes,
             // The sweep learns from itself: this week's misses by lesson against
             // last week's, and what became of the previous pass's cards.
             learning: { previousCards in
@@ -384,12 +405,6 @@ public struct MaintenanceBackgroundWork: Sendable {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> DataRootDiskHygieneCheck {
         DataRootDiskHygieneCheck(
-            // A4.8 ride-along: the scheduler sleeps `interval` BEFORE the first
-            // tick, so a bare 24h interval starves under frequent deploys (the
-            // restart resets the sleep — disk_hygiene_last_run sat 3 days stale
-            // by 2026-07-24). Hourly tick + the existing once-per-day
-            // reservation = runs once a day, robust to restarts.
-            interval: 60 * 60,
             dataRoot: dataRoot,
             fileNotice: { report in await fileDiskHygieneNotice(dataRoot: dataRoot, report: report) }
         )
@@ -439,13 +454,15 @@ public struct MaintenanceBackgroundWork: Sendable {
             }
         }
         var plans: [DiskStorageOwner.Plan] = []
-        var notes: [String] = []
+        var planReads: [JSONValue] = []
         for owner in diskStorageOwners(dataRoot: dataRoot) {
-            do { plans.append(try await owner.plan()) }
-            catch { notes.append("\(owner.id) kept: \(error.localizedDescription)") }
-        }
-        if report.truncated || report.depthTruncated || report.readFailed {
-            notes.append("Storage accounting is incomplete; usage may be undercounted or required assets unclassified. Cleanup amounts come from complete owner plans.")
+            do {
+                plans.append(try await owner.plan())
+                planReads.append(.object(["owner": .string(owner.id), "status": .string("available")]))
+            } catch {
+                planReads.append(.object(["owner": .string(owner.id), "status": .string("unavailable"),
+                                          "error": .string(error.localizedDescription)]))
+            }
         }
         var usage = report.storageBytes.filter { !$0.key.contains("/") }
         for plan in plans {
@@ -467,21 +484,14 @@ public struct MaintenanceBackgroundWork: Sendable {
             + plans.filter { !$0.candidates.isEmpty }.map { "reclaim:\($0.owner)" }.sorted()
             + ["reclaim-tier:\(reclaimable / DataRootDiskHygiene.defaultDirectoryThreshold)"])
             .joined(separator: "|")
-        var lines = [
-            "Measured dynamic storage: \(DataRootDiskHygiene.humanSize(report.dynamicBytes)) / \(DataRootDiskHygiene.humanSize(DataRootDiskHygiene.defaultTotalThreshold)) budget (includes backups and derived data).",
-            "Required embedding model: \(DataRootDiskHygiene.humanSize(report.staticModelBytes)), outside that budget."
-        ]
-        for (owner, bytes) in usage.sorted(by: { $0.value > $1.value }) where bytes > 0 {
+        let usageRows: [JSONValue] = usage.map { owner, bytes in
             let plan = plans.first { $0.owner == owner }
             let reclaim = plan?.candidates.values.reduce(Int64(0)) { $0 + $1.sizeBytes } ?? 0
-            let policy = plan?.policy ?? "Kept: app state without a recoverable cleanup policy."
-            lines.append("• \(owner): \(DataRootDiskHygiene.humanSize(bytes)); reclaimable \(DataRootDiskHygiene.humanSize(reclaim)). \(policy)")
+            return .object(["owner": .string(owner), "bytes": .int(bytes),
+                            "size": .string(DataRootDiskHygiene.humanSize(bytes)),
+                            "reclaimSize": .string(DataRootDiskHygiene.humanSize(reclaim)),
+                            "policy": plan.map { .string($0.policy) } ?? .null])
         }
-        lines += plans.flatMap(\.notes) + notes
-        lines.append(reclaimable > 0
-            ? "Clean Up will move \(DataRootDiskHygiene.humanSize(reclaimable)) out of app storage to Trash, recoverably. Disk space remains occupied until you empty the Trash."
-            : "Nothing is safely reclaimable. All storage above is kept for the reasons shown; no Clean Up is offered.")
-        let summary = "Dynamic storage \(DataRootDiskHygiene.humanSize(report.dynamicBytes)); reclaimable \(DataRootDiskHygiene.humanSize(reclaimable))"
         var actions: [JSONValue] = []
         if reclaimable > 0 {
             actions.append(.object(["id": .string("act"), "label": .string("Clean Up"),
@@ -492,11 +502,22 @@ public struct MaintenanceBackgroundWork: Sendable {
             .object(["id": .string("dismiss"), "label": .string("Dismiss"), "description": .string("Dismiss this card")])
         ]
         do {
+            let content = try await port.assistanceCard(dataRoot: dataRoot, input: .object([
+                "kind": .string("storage"), "usage": .array(usageRows), "planReads": .array(planReads),
+                "plans": .array(plans.map { .object(["notes": .array($0.notes.map(JSONValue.string))]) }),
+                "reclaimable": .int(reclaimable),
+                "dynamicSize": .string(DataRootDiskHygiene.humanSize(report.dynamicBytes)),
+                "budgetSize": .string(DataRootDiskHygiene.humanSize(DataRootDiskHygiene.defaultTotalThreshold)),
+                "modelSize": .string(DataRootDiskHygiene.humanSize(report.staticModelBytes)),
+                "reclaimSize": .string(DataRootDiskHygiene.humanSize(reclaimable)),
+                "accounting": .object(["status": .string(report.truncated || report.depthTruncated || report.readFailed ? "partial" : "available"),
+                    "truncated": .bool(report.truncated), "depthTruncated": .bool(report.depthTruncated), "readFailed": .bool(report.readFailed)])
+            ]))
             let card: JSONValue = .object([
                 "id": .string(diskHygieneCardId), "created_at": .string(Date().ISO8601Format()),
                 "source": .string("disk_hygiene"), "severity": .string(reclaimable > 0 ? "actionable" : "info"),
-                "title": .string("Disk usage is piling up"), "summary": .string(summary),
-                "detail": .string(lines.joined(separator: "\n")), "finding_identity": .string(finding),
+                "title": .string(content.title), "summary": .string(content.summary),
+                "detail": .string(content.detail), "finding_identity": .string(finding),
                 "cleanup_plans": try JSONValue.fromEncodable(plans), "actions": .array(actions),
                 "related_paths": .array([]), "related_groups": .array([]),
                 "related_mission_id": .null, "related_approval_id": .null,
@@ -505,7 +526,7 @@ public struct MaintenanceBackgroundWork: Sendable {
                 scanStartedAt: report.startedAt) else { return false }
             if notify {
                 await port.notifyIfAttentionWorthy(dataRoot: dataRoot, itemId: diskHygieneCardId,
-                    title: "Disk usage is piling up", summary: summary, source: "disk_hygiene",
+                    title: content.title, summary: content.summary, source: "disk_hygiene",
                     severity: reclaimable > 0 ? "actionable" : "info")
             }
             return true
@@ -518,24 +539,31 @@ public struct MaintenanceBackgroundWork: Sendable {
     /// Both the card and inbox.clean_up execute this saved plan, never a larger fresh one.
     public func cleanUpDiskHygiene(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> String {
         let inboxPath = dataRoot.appendingPathComponent("notifications/inbox.jsonl")
+        // Preparing a legacy card may call her part. Do that before the
+        // publication lock; the locked read below still owns the saved scope.
+        if let row = try await LiveNotificationInbox.live(dataRoot: dataRoot).rows().first(where: {
+            $0.objectValue?["id"] == .string(diskHygieneCardId)
+        }), row.objectValue?["cleanup_plans"] == nil {
+            guard await fileDiskHygieneNotice(dataRoot: dataRoot, report: DataRootDiskHygiene.scan(dataRoot: dataRoot)) else {
+                throw NSError(domain: "NativeAgentDisk", code: 500, userInfo: [NSLocalizedDescriptionKey:
+                    "Disk finding could not be refreshed; nothing was moved."])
+            }
+            throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
+                "Disk finding refreshed. Review its current cleanup plan before running Clean Up."])
+        }
         return try await SwiftNativePersistenceCore().withFileLock(inboxPath) {
-            let lines = try InboxRewriteGuard.readLines(inboxPath)
-            guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath),
-                  let row = lines.compactMap(\.row).first(where: {
+            let lines = try LiveNotificationInbox.readLines(inboxPath)
+            guard let row = lines.compactMap(\.row).first(where: {
                       guard case .object(let object) = $0 else { return false }
                       return object["id"] == .string(diskHygieneCardId)
                   }), case .object(let object) = row else {
                 throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
                     "No saved cleanup plan. Refresh the disk finding before cleaning up."])
             }
-            // A pre-plan card authorized residue only. Publish the new scope for review, never expand that old click.
+            // A concurrent legacy replacement still authorizes no fresh scope.
             guard let plans = object["cleanup_plans"] else {
-                guard await fileDiskHygieneNotice(dataRoot: dataRoot, report: DataRootDiskHygiene.scan(dataRoot: dataRoot)) else {
-                    throw NSError(domain: "NativeAgentDisk", code: 500, userInfo: [NSLocalizedDescriptionKey:
-                        "Disk finding could not be refreshed; nothing was moved."])
-                }
                 throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
-                    "Disk finding refreshed. Review its current cleanup plan before running Clean Up."])
+                    "No saved cleanup plan. Refresh the disk finding before cleaning up."])
             }
             let card = (object, try JSONDecoder().decode([DiskStorageOwner.Plan].self, from: plans.serializedData(pretty: false)))
             let owners = diskStorageOwners(dataRoot: dataRoot)
@@ -603,11 +631,7 @@ public struct MaintenanceBackgroundWork: Sendable {
         let persistence = SwiftNativePersistenceCore()
         do {
             let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-                let lines = try InboxRewriteGuard.readLines(inboxPath)
-                guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
-                    InboxRewriteGuard.refuse("DiskHygieneLoop", path: inboxPath)
-                    throw NSError(domain: "NativeAgentDisk", code: 422, userInfo: [NSLocalizedDescriptionKey: "Inbox rewrite was refused; existing bytes were kept."])
-                }
+                let lines = try LiveNotificationInbox.readLines(inboxPath)
                 var mutated: [Data] = []
                 mutated.reserveCapacity(lines.count + 1)
                 var found = false
@@ -654,7 +678,7 @@ public struct MaintenanceBackgroundWork: Sendable {
                     found = true
                 }
                 if !found { mutated.append(Data(try card.serialize(pretty: false).utf8)) }
-                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
+                try LiveNotificationInbox.write(mutated, to: inboxPath)
                 return !found || notify
             }
             return inserted
@@ -703,8 +727,6 @@ private struct TurnTraceRetentionRunner: LoopRunner {
                 now: now
             )
             let backupReport = await ChatCompactionBackupRetention.enforce(dataRoot: dataRoot)
-            let legacyContextReport = try await SwiftNativeContextClient(dataRoot: dataRoot)
-                .pruneLegacyReceipts(at: now)
             // 2026-09-01 (User): this pass no longer writes
             // `data/logs/maintenance_sweep.jsonl`. It had accumulated 2,921 rows
             // / 613 KB with no production reader — only an eval instrument and
@@ -730,29 +752,23 @@ private struct TurnTraceRetentionRunner: LoopRunner {
             if backupReport.failures > 0 {
                 return .failed(error: "compaction-backup sweep had \(backupReport.failures) failed session(s)")
             }
-            if legacyContextReport.unavailable || legacyContextReport.failedRemovals > 0 {
-                return .failed(error: "legacy-context sweep unavailable=\(legacyContextReport.unavailable) failures=\(legacyContextReport.failedRemovals)")
-            }
             let bounded = lockReport.deferred > 0
                 ? "; \(lockReport.deferred) orphan lock(s) deferred"
                 : ""
             let backupBounded = backupReport.truncated
                 ? "; compaction-backup scan bounded at \(backupReport.sessionsScanned) sessions"
                 : ""
-            let legacyContext = legacyContextReport.removed > 0
-                ? "; removed \(legacyContextReport.removed) legacy context receipt(s)"
-                : ""
             // A sweep that removed nothing and deferred nothing did no work.
             // Reporting it `.completed` every hour kept the dormancy clock
             // fresh regardless of whether retention was actually running.
             let swept = traceReport.removedDays
-                + lockReport.reaped + backupReport.removed + legacyContextReport.removed
+                + lockReport.reaped + backupReport.removed
             guard swept > 0 else {
                 return .skipped(reason: "nothing past any retention cutoff\(bounded)")
             }
             return .completed(
                 result: "maintenance retention removed \(swept) artifact(s)"
-                    + "\(bounded)\(backupBounded)\(legacyContext)")
+                    + "\(bounded)\(backupBounded)")
         } catch {
             nativeLog("turn_trace_retention: sweep failed: %@", String(describing: error))
             return .failed(error: String(describing: error))
@@ -760,19 +776,74 @@ private struct TurnTraceRetentionRunner: LoopRunner {
     }
 }
 
-/// Versioned off-disk backup (`port.createOffDiskBackup`). The newest
-/// `auto-*` folder in iCloud Drive is the clock: a backup runs when it is a day
-/// old, or when a persona doc or the personality profile changed after it — at most once per
-/// five-minute wake, so a burst of identity writes lands as one version. With
+private let backupCadenceRepairStep = "Repair or restore the backup-cadence part."
+
+/// Versioned off-disk backup (`port.createOffDiskBackup`). Her backup-cadence
+/// part selects the deadline and trigger from native backup freshness and
+/// identity-file modification observations; the shipped seed keeps daily and
+/// identity-change timing. Metadata reads, root protection and copying stay here.
+/// Identity-file invalidations coalesce before the canonical reread; the daily
+/// interval remains the missed-event/unavailable-volume backstop. With
 /// iCloud Drive off the tick is an `unavailable:` skip (a WARN row in Doctor);
-/// any other failure is `.failed` and an NSLog line.
-private struct OffDiskBackupRunner: LoopRunner {
+/// cancellation is not a backup defect; other failures are `.failed` and logged.
+private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
     let port: any MaintenanceBackgroundWorkPort
     let interval: TimeInterval
     let dataRoot: URL
 
     var loopId: String { "offdisk_backup" }
     var tickTimeoutOverride: TimeInterval? { 15 * 60 }
+
+    func physiologyEvents() -> AsyncStream<Void> {
+        guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL else {
+            return EventDeadlinePhysiology.storeAndFileEvents(paths: [])
+        }
+        let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
+        let identityFiles = ((try? FileManager.default.contentsOfDirectory(
+            at: personaRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? [])
+            .filter { !$0.lastPathComponent.hasSuffix(".lock") }
+        return EventDeadlinePhysiology.storeAndFileEvents(
+            paths: [personaRoot, dataRoot.appendingPathComponent("memory/profile.json")] + identityFiles,
+            loopId: loopId
+        )
+    }
+
+    func nextMeaningfulDeadline(after now: Date) async -> Date? {
+        guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL else { return nil }
+        let parent = port.offDiskBackupParent()
+        let port = port
+        do {
+            let newest = try await VolumeIO.run { try port.offDiskAutomaticBackups(in: parent).first?.date }
+            return try await port.backupDeadline(dataRoot: dataRoot, input: .object([
+                "kind": .string("deadline"), "now": .double(now.timeIntervalSince1970),
+                "newest": newest.map { .double($0.timeIntervalSince1970) } ?? .null, "interval": .double(interval)
+            ])).map { Date(timeIntervalSince1970: $0) }
+        } catch where Task.isCancelled || error is CancellationError {
+            return nil
+        } catch let error as PartCallError {
+            await recordDeadlineFailure(cadenceFailure(error, operation: "deadline"))
+            return nil
+        } catch {
+            nativeLog("offdisk_backup: deadline unavailable: %@", error.localizedDescription)
+            await recordDeadlineFailure(.failed(error: "off-disk backup failed: \(error.localizedDescription)"))
+            return nil
+        }
+    }
+
+    /// A deadline read runs outside the tick. Nil alone would erase its failure;
+    /// use the same scheduler receipt and Doctor health path as a failed tick.
+    private func recordDeadlineFailure(_ outcome: LoopTickOutcome) async {
+        await settle {
+            await BackgroundLoops.BackgroundLoopsManager.shared.recordOutOfBandOutcome(loopId: loopId, outcome: outcome)
+        }
+    }
+
+    private func cadenceFailure(_ error: any Error, operation: String) -> LoopTickOutcome {
+        let cause = "off-disk backup failed: backup-cadence part failed (\(operation)). "
+            + backupCadenceRepairStep + " Error: \(error.localizedDescription)"
+        nativeLog("offdisk_backup: %@", cause)
+        return .failed(error: cause)
+    }
 
     func tickOutcome() async -> LoopTickOutcome {
         // Only the live root goes to iCloud; an alternate (test) root must never
@@ -788,21 +859,27 @@ private struct OffDiskBackupRunner: LoopRunner {
                 guard FileManager.default.fileExists(atPath: parent.deletingLastPathComponent().path) else { return (false, nil) }
                 return (true, try port.offDiskAutomaticBackups(in: parent).first?.date)
             }
+            guard !Task.isCancelled else { return .skipped(reason: "canceled") }
             guard drive.available else {
                 return .skipped(reason: port.unavailableSkipPrefix + "iCloud Drive is off — no off-disk backup")
             }
             let now = Date()
             let newest = drive.newest
-            let trigger: String
-            // Below the daily check interval, so a once-a-day tick never skips a day.
-            if let newest, now.timeIntervalSince(newest) < 20 * 60 * 60 {
-                guard let changed = try identityChangedAt(), changed > newest else {
-                    return .skipped(reason: "newest off-disk backup is current")
-                }
-                trigger = "identity change"
-            } else {
-                trigger = "daily"
+            let identity: JSONValue
+            do {
+                identity = .object(["status": .string("available"),
+                    "changedAt": try identityChangedAt().map { .double($0.timeIntervalSince1970) } ?? .null])
+            } catch {
+                identity = .object(["status": .string("unavailable"), "error": .string(error.localizedDescription)])
             }
+            let selected = try await port.backupTrigger(dataRoot: dataRoot, input: .object([
+                "kind": .string("trigger"), "now": .double(now.timeIntervalSince1970),
+                "newest": newest.map { .double($0.timeIntervalSince1970) } ?? .null, "identity": identity
+            ]))
+            if selected == .current {
+                return .skipped(reason: "newest off-disk backup is current")
+            }
+            let trigger = selected.rawValue
             let folder = try await port.createOffDiskBackup(
                 reason: "automatic off-disk backup (\(trigger))",
                 dataRoot: dataRoot,
@@ -811,6 +888,10 @@ private struct OffDiskBackupRunner: LoopRunner {
             )
             nativeLog("offdisk_backup: wrote %@ (%@)", folder.path, trigger)
             return .completed(result: "off-disk backup \(folder.lastPathComponent) (\(trigger))")
+        } catch where Task.isCancelled || error is CancellationError {
+            return .skipped(reason: "canceled")
+        } catch let error as PartCallError {
+            return cadenceFailure(error, operation: "trigger")
         } catch {
             nativeLog("offdisk_backup: FAILED — Agent has no fresh off-disk copy: %@", String(describing: error))
             return .failed(error: "off-disk backup failed: \(error.localizedDescription)")
@@ -847,7 +928,7 @@ private struct OffDiskBackupRunner: LoopRunner {
 ///
 /// Replaces the dead "sweep" janitor. Once per ~7 days (and only when the
 /// `enableAutonomy` switch is on), it ingests a week of REAL usage — chat
-/// transcripts, error logs, Doctor health, skill registry — asks the app's
+/// transcripts, live error logs and Doctor health — asks the app's
 /// OWN configured LLM (the same `LLMClient` every other loop uses, routed by
 /// the `self_improvement` surface picker) what is failing / degrading /
 /// underused, and turns the answer into one-tap-approvable proposals plus a
@@ -901,10 +982,10 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     /// MEASURE leg (north-star, 2026-06-15): a compact week-over-week
     /// execution-outcome summary so the self-improvement brain reasons over REAL
     /// job OUTCOMES (completion rate / steps / wall-time trend), not only
-    /// chat/error/doctor proxies. The owning factory wires it to
-    /// `SwiftNativeWorkshopRunner.weeklyOutcomeStats()`. Default "" → the signal
-    /// is omitted (pre-MEASURE behavior, honest for installs with no executions).
-    private let workshopOutcomes: @Sendable () async -> String
+    /// chat/error/doctor proxies. EngineLaunch binds the weekly-outcomes part
+    /// through the originating maintenance door. Empty history omits the signal;
+    /// unavailable sources or a failed part fail the pass rather than erase it.
+    private let workshopOutcomes: @Sendable () async throws -> String
     /// What the pass learns from (2026-10-10), given the cards its previous
     /// digest recorded: misses by lesson, what became of those cards, and the
     /// standing corrections ready to graduate. Injected like
@@ -923,7 +1004,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         isEnabled: @escaping @Sendable () async -> Bool,
         stageProposal: @escaping @Sendable (SelfImprovementProposal) async throws -> String,
         fileCodeFinding: (@Sendable (SelfImprovementProposal) async throws -> Void)? = nil,
-        workshopOutcomes: @escaping @Sendable () async -> String = { "" },
+        workshopOutcomes: @escaping @Sendable () async throws -> String,
         learning: @escaping @Sendable (_ previousCards: [String]?) async -> SelfImprovementLearning = { _ in SelfImprovementLearning() },
         stageStandingLessons: @escaping @Sendable ([String: String]) async throws -> [String] = { _ in [] }
     ) {
@@ -1031,9 +1112,9 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             try Task.checkCancellation()
             var signals = try gatherSignals(now: now)
             // MEASURE leg: fold in the real Workshop execution-outcome trend (async — reads
-            // mission.json off disk). Empty when there's no history, so the
+            // execution.json off disk). Empty when there's no history, so the
             // prompt is unchanged on a fresh install.
-            let outcomes = await workshopOutcomes()
+            let outcomes = try await workshopOutcomes()
             try Task.checkCancellation()
             if !outcomes.isEmpty { signals += "\n\n" + outcomes }
             let learned = await learning(previousPassCards())
@@ -1212,13 +1293,6 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             sections.append("## Doctor health (latest)\n\(text.prefix(1500))")
         }
 
-        // 4. Skills — which exist; an empty registry is itself a signal.
-        let skillsPath = dataRoot.appendingPathComponent("skills", isDirectory: true)
-            .appendingPathComponent("registry.json")
-        if let text = try? String(contentsOf: skillsPath, encoding: .utf8) {
-            sections.append("## Skill registry\n\(text.prefix(1200))")
-        }
-
         return sections.joined(separator: "\n\n")
     }
 
@@ -1383,12 +1457,10 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     // MARK: - LLM prompt
 
     static let systemPrompt = """
-    You are the self-improvement analyst for NativeAgent, a native Mac + iOS AI \
-    assistant app. You are given a week of the app's REAL usage data. Find \
+    Review your past week of NativeAgent usage as yourself. Find \
     concrete, evidence-backed improvements — what is failing, degrading, \
     underused, or noisy. Do NOT invent problems; every finding must cite \
-    specific evidence from the data. Prefer a few high-value findings over a \
-    long list.
+    specific evidence from the data.
 
     Classify each finding as "runtime" or "code".
 
@@ -1404,12 +1476,12 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     A "code" finding needs a source change (or is a good idea with no applicable \
     op above). These are report-only — a shipped app cannot recompile itself.
 
-    Under "Standing lessons" you may be given corrections she is reminded of in \
-    nearly every conversation. For each one you can state as a rule, write it \
-    for her GROWTH.md in the first person, \(REMProposalStore.growthPassageBoundSentence), \
-    and return it in "standing" with its memory_id. Never invent ids.
+    "Standing lessons" contains recurring corrections. For each you can state \
+    as a rule, propose a GROWTH.md passage in your own first person, \
+    \(REMProposalStore.growthPassageBoundSentence). Return it in "standing" with \
+    its memory_id for approval. Never invent ids.
 
-    "Misses by lesson" counts the corrections she was given this week, last \
+    "Misses by lesson" counts the corrections you were given this week, last \
     week's in brackets: a lesson that keeps coming back is a finding. "The last \
     pass" shows what became of the previous proposals: build on what was \
     approved, and do not propose again what was denied.
@@ -1985,7 +2057,7 @@ public enum DataRootDiskHygiene {
     }
 }
 
-/// Once-per-day disk-hygiene watchdog. Walks `dataRoot`, and when a single file
+/// Once-per-day disk accounting. Walks `dataRoot`, and when a single file
 /// is oversized or the whole tree is over budget, files ONE notification-inbox
 /// card listing the offenders. NEVER deletes anything.
 ///
@@ -1993,7 +2065,9 @@ public enum DataRootDiskHygiene {
 /// `notifications/inbox.jsonl` upsert path HeartbeatLoop uses. The daily
 /// reservation runs through the shared `reserveOncePerPeriod` primitive so a
 /// BGTask wake and the in-app scheduler cannot double-run it the same day.
-public struct DataRootDiskHygieneCheck: LoopRunner {
+/// Startup reconciles immediately; the persisted day books the next local
+/// midnight. Only an unreserved day retains the hourly failure retry.
+public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
     public let loopId: String = "data_root_disk_hygiene"
     public let interval: TimeInterval
     public var tickTimeoutOverride: TimeInterval? { 120 }
@@ -2036,11 +2110,34 @@ public struct DataRootDiskHygieneCheck: LoopRunner {
         NativeTimestampFormat.calendarDay(date)
     }
 
-    public func tickOutcome() async -> LoopTickOutcome {
-        let now = clock()
-        let marker = dataRoot
+    private var marker: URL {
+        dataRoot
             .appendingPathComponent("logs", isDirectory: true)
             .appendingPathComponent("disk_hygiene_last_run")
+    }
+
+    public func physiologyEvents() -> AsyncStream<Void> {
+        // Do not watch the reservation itself: a failed notice restores it,
+        // and that self-write must not become an immediate retry loop.
+        EventDeadlinePhysiology.storeAndFileEvents(
+            paths: [],
+            notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange],
+            loopId: loopId
+        )
+    }
+
+    public func nextMeaningfulDeadline(after now: Date) async -> Date? {
+        guard (try? String(contentsOf: marker, encoding: .utf8)) == Self.dayKey(now) else {
+            // Preserve the existing hourly retry while today's scan/notice
+            // remains unreserved, without waking hourly after it succeeds.
+            return now.addingTimeInterval(60 * 60)
+        }
+        let calendar = Calendar.current
+        return calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now))
+    }
+
+    public func tickOutcome() async -> LoopTickOutcome {
+        let now = clock()
         do {
             try FileManager.default.createDirectory(
                 at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -2166,13 +2263,13 @@ public extension MaintenanceBackgroundWork {
     static func restartLoop(
         id: String,
         manager: BackgroundLoops.BackgroundLoopsManager,
-        replacementLoop: @Sendable (String) -> LoopRegistration?
+        replacementLoop: @escaping @Sendable (String) -> LoopRegistration?
     ) async -> LoopRestartOutcome {
         let registered = await manager.registered().contains(id)
         guard hotReloadableLoopIDs.contains(id) else {
             return registered ? .requiresRelaunch(loopId: id) : .unknown(loopId: id)
         }
-        await manager.restartLoop(id: id, newLoop: replacementLoop(id))
+        await manager.restartLoop(id: id) { replacementLoop(id) }
         return await manager.registered().contains(id)
             ? .restarted(loopId: id)
             : .unknown(loopId: id)
@@ -2212,11 +2309,12 @@ public extension MaintenanceBackgroundWork {
         error.lowercased().contains("telegram") && error.contains("notConfigured")
     }
 
-    /// The setting that fixes a loop's failure, and whether it is a sign-in or
-    /// a permission; nil when no setting does. The failure card and Doctor's
+    /// The recovery step for a loop's failure, and whether it is a sign-in or
+    /// a permission; nil when no specific step is known. The failure card and Doctor's
     /// loop row both read it, so they never disagree.
     static func loopSettingFix(loopId: String, error: String) -> (step: String, ask: DoctorAskKind?)? {
         let e = error.lowercased()
+        if loopId == "offdisk_backup", e.contains("backup-cadence part failed (") { return (backupCadenceRepairStep, nil) }
         if loopId == "offdisk_backup", e.contains("icloud drive") { return (DoctorLoopHealth.iCloudDriveStep, .permission) }
         if loopId == "telegram_poll", isTelegramTokenRejected(error) || e.contains("unauthoriz") || e.contains("token") {
             return ("Telegram → Bot token → Bot token, then Save.", .signIn)
@@ -2307,28 +2405,5 @@ extension WeeklySelfImprovementLoop {
         } catch {
             return (outcome, error.localizedDescription)
         }
-    }
-
-    public static func latestDigest(dataRoot: URL) async -> (text: String, date: String)? {
-        let dir = dataRoot
-            .appendingPathComponent("self_improvement", isDirectory: true)
-            .appendingPathComponent("digests", isDirectory: true)
-        return await Task.detached(priority: .utility) { () -> (text: String, date: String)? in
-            let fm = FileManager.default
-            guard let files = try? fm.contentsOfDirectory(
-                    at: dir, includingPropertiesForKeys: [.contentModificationDateKey])
-            else { return nil }
-            let dated = files
-                .filter { $0.pathExtension == "md" }
-                .map { url -> (url: URL, modified: Date) in
-                    let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
-                        .contentModificationDate ?? .distantPast
-                    return (url, modified)
-                }
-            guard let latest = dated.max(by: { $0.modified < $1.modified })?.url,
-                  let text = try? String(contentsOf: latest, encoding: .utf8)
-            else { return nil }
-            return (text, latest.deletingPathExtension().lastPathComponent)
-        }.value
     }
 }

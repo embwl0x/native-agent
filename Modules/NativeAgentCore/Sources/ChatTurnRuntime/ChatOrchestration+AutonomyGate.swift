@@ -5,6 +5,8 @@ import TrustCenter
 import ApprovalInbox
 import MacControl
 
+// Blueprint: | `ChatOrchestration+AutonomyGate.swift` | `AutonomyGate`: TrustCenter autonomy resolution and approval filing before concrete tool dispatch |
+
 // MARK: - Autonomy auto-gating for tool dispatch
 //
 // AutonomyGate sits between SwiftNativeTurnEngine's tool dispatch path and

@@ -1,5 +1,6 @@
 import Foundation
 import ChatTurnContracts
+// Blueprint: | `MacChatRetrySnapshot.swift` | `MacChatRetrySnapshot` struct; `capture`, `stillMatchesLocal` |
 
 /// Read-only evidence from the app's rendered/canonical transcript projection.
 /// The bubble and its metadata remain app-owned; retry validation lives here.

@@ -75,7 +75,7 @@ APNS success, a sync receipt, or a subscription's name.
 - `Modules/NativeAgentCore/Sources/DeviceSync/SwiftNativeAPNS.swift` — credentials,
   token targeting, APNS sends and receipts.
 - `Modules/NativeAgentCore/Sources/DeviceSync/MacSyncMobileNotificationRelay.swift`
-  — direct/bridge routing.
+  — canonical APNs registration/delivery-state mutations and direct/bridge routing.
 - `Modules/NativeAgentShared/Sources/NativeAgentShared/CloudKitDeviceTransport.swift`
   — subscription registration and repair.
 - `iOS/NativeAgentMobile/Sources/MobilePushNotifications.swift` — token sync,

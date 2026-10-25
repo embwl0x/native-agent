@@ -6,8 +6,6 @@ import Transcripts
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
-import MCPDispatcher
-import KnowledgeGraph
 import PersonaEngine
 import ProviderRouting
 import TrustCenter
@@ -16,6 +14,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
+// Blueprint: | `SwiftToolDispatcher+ChatHistoryTools.swift` | `SwiftToolDispatcher`: `impl_search_chat_history`, `impl_read_chat_message` |
 
 
 private struct ChatHistorySessionMetadata: Sendable {
@@ -751,7 +750,7 @@ extension SwiftToolDispatcher {
     /// Search relevance still uses the original content. Recorded provenance
     /// is display-only, shared with ordinary history and compaction, and never
     /// grants a bridge request or an interrupted answer additional authority.
-    private static func chatHistoryDisplayEvidence(
+    package static func chatHistoryDisplayEvidence(
         _ content: String, role: String, row: [String: JSONValue]
     ) -> String {
         let metadata: [String: JSONValue]?
@@ -763,47 +762,20 @@ extension SwiftToolDispatcher {
         return ChatTranscriptEvidenceRendering.displayContent(
             content,
             originLabel: role == "user"
-                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(metadata?["origin"]) : nil,
+                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(row, role: role) : nil,
             incompleteReplyLabel: role == "assistant"
                 ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: row, metadata: metadata) : nil
         )
     }
 
-    /// Resolve peer identity from persisted app provenance, as full reads do.
-    /// A persisted history row names its sender by display name; the contact that
-    /// name uniquely locates carries the attested id trust is keyed by. The name
-    /// itself never carries a grant, so a label no contact owns stays untrusted.
-    static func attestedHistoryPeer(_ label: String, dataRoot: URL) -> String {
-        PeerTrust.principal(label, dataRoot: dataRoot)
-    }
-
-    /// A history row's principals as its own stamp says (`ContactThread.stamp`),
-    /// speaker first: a bridge turn's door (another agent when it attests no
-    /// one) and every peer that steered the row; a tool receipt's labelled
-    /// sources. Kept with the row as one newline-separated value.
+    /// Receipt sources retain their own evidence; speech uses the shared row stamp.
     package static func persistedHistoryPeer(role: String, row: [String: JSONValue]) -> String? {
-        let principals = persistedHistoryPrincipals(role: role, row: row)
-        return principals.isEmpty ? nil : principals.joined(separator: "\n")
-    }
-
-    private static func persistedHistoryPrincipals(role: String, row: [String: JSONValue]) -> [String] {
-        let metadata = persistedHistoryMetadata(row: row)
-        // Who spoke. The steering a row's turn recorded is provenance to show,
-        // never a speaker: her own words and her tools' receipts do not carry
-        // last turn's steer into this one (User 10-20).
-        let stamp = ContactThread.stamp(id: HumanConversationReader.string(row["id"]) ?? "", metadata: metadata)
-        let spoke: [String]
-        switch role.lowercased() {
-        case "tool": spoke = toolReceiptSources(row: row, metadata: metadata)
-        case "user":
-            let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
-            let origin = HumanConversationReader.object(metadata["origin"])
-            let surface = HumanConversationReader.string(origin["surface"]) ?? envelope?.surface ?? ""
-            let bridged = surface.hasSuffix("-bridge") || PeerTurnEffectPolicy.isPeerBridge(surface: surface)
-            spoke = bridged ? [stamp.source ?? "another agent"] : []
-        default: spoke = []
-        }
-        return Array(NSOrderedSet(array: spoke)) as? [String] ?? []
+        let principals = role.lowercased() == "tool"
+            ? toolReceiptSources(row: row, metadata: persistedHistoryMetadata(row: row))
+            : ContactThread.Line(row, role: role.lowercased()).speakers
+        var seen: Set<String> = []
+        let unique = principals.filter { seen.insert($0).inserted }
+        return unique.isEmpty ? nil : unique.joined(separator: "\n")
     }
 
     /// The sources a tool receipt's own result labels, or its routed contact.
@@ -839,13 +811,11 @@ extension SwiftToolDispatcher {
         return []
     }
 
-    /// A history row's evidence fields: its principals, speaker first. The
-    /// result is read once, at the turn's one consumption boundary for tool
-    /// results (`PeerDataTaintDispatcher`), each principal under its own grant.
+    /// A history row's evidence fields, retaining the speakers' attribution.
     package static func historyEvidence(_ peer: String?, words: String, dataRoot: URL) -> [String: JSONValue] {
         let principals = (peer ?? "").split(separator: "\n").map(String.init)
         guard let speaker = principals.first else { return [:] }
-        let attested = principals.map { attestedHistoryPeer($0, dataRoot: dataRoot) }
+        let attested = principals.map { PeerTrust.principal($0, dataRoot: dataRoot) }
         var fields: [String: JSONValue] = ["agent": .string(speaker),
             "untrusted_remote_data": .bool(!attested.allSatisfy(PeerDataTaint.ownerTrusts) && !words.isEmpty)]
         if attested[0] != speaker { fields["agent_id"] = .string(attested[0]) }
@@ -884,14 +854,12 @@ extension SwiftToolDispatcher {
     package static func consumePersistedHistoryEvidence(_ value: JSONValue) {
         switch value {
         case .object(let fields):
-            // A peer's words read now steer; a memory's provenance in the receipt does not.
+            // Reopening retained evidence marks its speaker, never its recorded steering.
             if case .string(let peer)? = fields["agent"],
                fields["untrusted_remote_data"] == .bool(true) || fields["steered_by"] != nil {
                 let line = HumanConversationReader.string(fields["preview"] ?? fields["excerpt"] ?? fields["text"]) ?? ""
-                let steering: [String] = if case .array(let values)? = fields["steered_by"] {
-                    values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
-                } else { [] }
-                ContactThread.consume(mine: false, source: peer, steeredBy: steering, text: line) { PeerDataTaint.markConsumed(peer: $0, line: $1) }
+                ContactThread.consume(.init(text: line, stamp: .init(source: peer, steeredBy: [], contact: true)),
+                    mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) })
             }
             for child in fields.values { consumePersistedHistoryEvidence(child) }
         case .array(let values):
@@ -1204,13 +1172,10 @@ extension SwiftToolDispatcher {
         ]
         if found.message.role.lowercased() == "user",
            case .object(let row)? = found.message.extras,
-           case .object(let metadata)? = row["metadata"] {
-            if let origin = metadata["origin"] {
-                response["origin"] = origin
-                if let label = ChatTranscriptEvidenceRendering.recordedOriginLabel(origin) {
-                    response["authorship"] = .string(label)
-                }
-            }
+           let label = ChatTranscriptEvidenceRendering.recordedOriginLabel(row, role: "user"),
+           case .object(let metadata)? = row["metadata"], let origin = metadata["origin"] {
+            response["origin"] = origin
+            response["authorship"] = .string(label)
         }
         if case .object(let row)? = found.message.extras {
             response.merge(Self.historyEvidence(Self.persistedHistoryPeer(role: found.message.role, row: row),

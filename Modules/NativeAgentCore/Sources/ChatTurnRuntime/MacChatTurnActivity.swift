@@ -5,6 +5,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ToolRegistry
+// Blueprint: | `MacChatTurnActivity.swift` | `MacChatTurnActivity` struct |
 
 /// Exact routing identity for live Mac turn activity. The session id selects
 /// the AppModel slot; the turn id prevents late events from a prior stream

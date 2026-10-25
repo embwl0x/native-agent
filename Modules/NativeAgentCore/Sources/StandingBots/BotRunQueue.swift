@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+// Blueprint: | `BotRunQueue.swift` | `BotRunQueue` struct; `enqueue`, `presence` |
 
 public struct BotRunReceipt: Sendable, Equatable {
     public let runID: UUID
@@ -27,6 +28,15 @@ public struct BotEventProvenance: Codable, Equatable, Sendable {
         self.source = source
         self.verifiedChatID = verifiedChatID
         self.verifiedUserID = verifiedUserID
+    }
+
+    /// A request a GitHub event queued (before 10-21) reads as one whose sender was not recorded.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let source = try c.decodeIfPresent(String.self, forKey: .source)
+        self.source = try source == "github" ? nil : c.decodeIfPresent(BotEventSource.self, forKey: .source)
+        verifiedChatID = try c.decodeIfPresent(String.self, forKey: .verifiedChatID)
+        verifiedUserID = try c.decodeIfPresent(String.self, forKey: .verifiedUserID)
     }
 }
 
@@ -103,11 +113,10 @@ public struct BotRunQueue: Sendable {
         var waiting: [String: [UUID: [UUID: CheckedContinuation<Bool, Never>]]] = [:]
     }
 
-    /// The bots whose runs are on this task's stack. A bot reached from inside
-    /// its own run — `bot_ask(self)`, or a cycle A -> B -> A — would park on a
-    /// claim that only its own caller can release, and no deadline could free
-    /// it because the wait was not cancellable. Such a claim is refused instead
-    /// of parked.
+    /// The bots whose runs are on this task's stack. Self-calls are refused
+    /// before admission; a nested call finding its target busy cannot wait.
+    /// This also prevents independently admitted runs from waiting on each
+    /// other when neither target appears in its caller's ancestry.
     @TaskLocal public static var ancestry: Set<UUID> = []
     @TaskLocal public static var eventProvenance: BotEventProvenance?
     @TaskLocal public static var eventContext: String?
@@ -270,6 +279,9 @@ public struct BotRunQueue: Sendable {
             try Task.checkCancellation()
             do { return try claim(bot: id, requestID: requestID, manual: manual) }
             catch BotRunAdmissionError.alreadyRunning {
+                guard Self.ancestry.isEmpty else {
+                    throw StandingBotsError.invalidValue("This helper is already running. A running helper cannot wait for another active helper; continue without waiting.")
+                }
                 // Register under the same lock as finish; no missed wakeup and
                 // no polling timer. External processes still fail closed at flock.
                 let waiterID = UUID()

@@ -2,6 +2,7 @@ import Foundation
 import ChatTurnContracts
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `WorkshopSessionEffects.swift` | `WorkshopSessionEffects` protocol; `makeToolDispatcher`, `productionTurnExecutor` |
 
 /// Concrete dispatcher and resident chat factories supplied by the app host.
 /// The session calls these only after its durable reservation claim is checked.

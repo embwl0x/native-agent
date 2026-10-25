@@ -1,11 +1,13 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnContracts
+import ChatToolRuntime
 import DoctorChecks
 import NativeAgentCore
 import PersistenceCore
 import Privacy
 import ProviderRouting
 import ToolRegistry
+// Blueprint: | `AppToolExecutor+Health.swift` | `AppToolExecutor`: `doctorStatus`, `boundedDoctorDetail`, `doctorStatusEnvelope` |
 
 /// Live health observations supplied by the host; envelope policy belongs to Core.
 public protocol AppToolDoctorReport {
@@ -162,13 +164,22 @@ extension AppToolExecutor {
         // (prompt_prefix_health) and the local bridges a bridge turn arrives
         // through (live.bridges). Every other row is real but serves something
         // else (a connector, a loop, a backup), so it shows in `status` and in
-        // its row, never as a broken path. A provider warning while the active
-        // provider is ready names another account, not this path.
+        // its row, never as a broken path. Credential eligibility alone cannot
+        // prove a provider warning concerns another account or a working model.
         let pathIDs: Set<String> = ["live.providers", "live.memory", "prompt_prefix_health", "live.bridges"]
-        let activeProviderIsReady = activeProvider?.eligible == true
         let pathChecks = report.checks.filter { check in
-            pathIDs.contains(check.checkID)
-                && !(check.checkID == "live.providers" && check.status.lowercased() == "warn" && activeProviderIsReady)
+            guard pathIDs.contains(check.checkID) else { return false }
+            // Only the credential-owner reading names exactly which accounts
+            // its warning concerns; active-model and probe warnings lack this
+            // evidence and must stay on the path even with eligible credentials.
+            if check.checkID == "live.providers", check.status.lowercased() == "warn",
+               activeProvider?.eligible == true, let activeProviderID,
+               let source = check.source, source.hasPrefix("Providers accounts: ") {
+                let accounts = source.dropFirst("Providers accounts: ".count)
+                    .components(separatedBy: ", ").filter { !$0.isEmpty }
+                if !accounts.isEmpty, !accounts.contains(activeProviderID) { return false }
+            }
+            return true
         }
         var envelope: [String: JSONValue] = [
             "status": .string(report.status),

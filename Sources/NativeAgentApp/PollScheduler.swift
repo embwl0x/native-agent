@@ -1,7 +1,9 @@
 import NativeAgentCore
 import SwiftUI
 import AppKit
-import ChatOrchestration
+import ChatTurnRuntime
+
+// Blueprint: | `PollScheduler.swift` | `PollScheduler`: focus/stream-aware scheduling only for heterogeneous visible samples lacking a complete push owner |
 
 /// Central scheduler for the few visible reads that genuinely sample live
 /// heterogeneous state and do not have one complete push owner (currently the

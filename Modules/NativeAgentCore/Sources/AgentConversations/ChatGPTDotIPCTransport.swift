@@ -1,6 +1,7 @@
 import Foundation
 import os
 import PersistenceCore
+// Blueprint: | `ChatGPTDotIPCTransport.swift` | `ChatGPTDotIPCTransport` enum; `listen`, `reconnect`, `stop`, `readiness`; retained socket observation and helper pipes close on the delegation runner's shutdown; generation guards reject old callbacks, accepted room deliveries retain their handles until exit |
 
 public enum ChatGPTDotIPCTransport {
     public typealias Conversation = @Sendable (URL, AgentPeerContact, [JSONValue], String?, [String: JSONValue]?) async throws -> JSONValue
@@ -65,7 +66,11 @@ public enum ChatGPTDotIPCTransport {
     private struct Listener {
         var dataRoot: URL?
         var events: FileChangeEvents?
+        var observation: Task<Void, Never>?
+        var deliveries: [UUID: Task<Void, Never>] = [:]
+        var generation = UUID()
         var process: Process?
+        var output: FileHandle?
         /// The helper's stdin, held open: closing it (or this app ending) ends the helper.
         var lifeline: Pipe?
         var socket: UInt64?
@@ -79,34 +84,58 @@ public enum ChatGPTDotIPCTransport {
 
     /// Once, for the app's data root: follow Dot from now on.
     public static func listen(dataRoot: URL) {
-        guard listener.withLock({ state -> Bool in
-            guard state.dataRoot == nil else { return false }
+        listener.withLock { state in
+            guard state.dataRoot == nil, !Task.isCancelled else { return }
             state.dataRoot = dataRoot
-            return true
-        }) else { return }
-        let events = FileChangeEvents(paths: [socket], emitInitial: true)
-        listener.withLock { $0.events = events }
-        Task.detached { for await _ in events.stream { reconnect() } }
+            let events = FileChangeEvents(paths: [socket], emitInitial: true)
+            let generation = state.generation
+            state.events = events
+            state.observation = Task.detached {
+                defer {
+                    events.cancel()
+                    listener.withLock {
+                        if $0.generation == generation { $0.observation = nil; $0.events = nil }
+                    }
+                }
+                for await _ in events.stream {
+                    guard !Task.isCancelled else { return }
+                    reconnect(generation: generation)
+                }
+            }
+        }
+    }
+
+    /// Stop passive ingress at once. Messages already accepted finish under
+    /// their retained delivery tasks; their actual exits release those handles.
+    public static func stop() {
+        let retired = listener.withLock { state in
+            state.generation = UUID()
+            let retired = (state.events, state.observation, state.process, state.lifeline, state.output)
+            state.dataRoot = nil
+            state.state = unavailable("Dot messaging has not been checked yet.", status: "not_checked")
+            state.events = nil; state.observation = nil
+            state.process = nil; state.lifeline = nil; state.output = nil
+            return retired
+        }
+        retired.0?.cancel(); retired.1?.cancel()
+        retired.4?.readabilityHandler = nil
+        try? retired.3?.fileHandleForWriting.close()
+        if retired.2?.isRunning == true { retired.2?.terminate() }
+        NotificationCenter.default.post(name: didChange, object: nil)
     }
 
     /// Starts the listener unless one runs. Without a Dot contact there is nothing to follow.
-    public static func reconnect() { reconnect(restarted: false) }
+    public static func reconnect() { reconnect(generation: listener.withLock { $0.generation }) }
 
-    private static func reconnect(restarted: Bool) {
-        guard let root = listener.withLock({ $0.lifeline == nil ? $0.dataRoot : nil }),
+    private static func reconnect(restarted: Bool = false, generation: UUID) {
+        guard let root = listener.withLock({ $0.generation == generation && $0.lifeline == nil ? $0.dataRoot : nil }),
               (try? AgentPeerStore(dataRoot: root).list().contains(where: owns)) == true else { return }
         let environment = AgentBridgeRuntime.processEnvironment()
         guard let helper = AgentBridgeRuntime.helperURL(named: "chatgpt_dot_ipc.js", dataRoot: root),
               let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
-            return settle(unavailable("Dot messaging helper or Node.js is unavailable."))
+            return settle(unavailable("Dot messaging helper or Node.js is unavailable."), generation: generation)
         }
         let process = Process(), lifeline = Pipe(), output = Pipe()
-        guard listener.withLock({ state -> Bool in
-            guard state.lifeline == nil else { return false }
-            (state.process, state.lifeline, state.socket) = (process, lifeline, socketInode())
-            (state.restarted, state.lines) = (restarted, 0)
-            return true
-        }) else { return }
         process.executableURL = node
         process.arguments = [helper.path, "listen"]
         process.currentDirectoryURL = root
@@ -127,25 +156,33 @@ public enum ChatGPTDotIPCTransport {
                 return lines
             }
             listener.withLock { if $0.lifeline === lifeline { $0.lines += lines.count } }
-            lines.forEach { receive($0, root: root) }
+            lines.forEach { receive($0, root: root, generation: generation) }
             if chunk.isEmpty {
                 handle.readabilityHandler = nil
-                ended(lifeline)
+                ended(lifeline, generation: generation)
             }
         }
-        do { try process.run() } catch {
+        do { try listener.withLock { state in
+            guard state.generation == generation, state.dataRoot == root, state.lifeline == nil else { return }
+            (state.process, state.lifeline, state.socket) = (process, lifeline, socketInode())
+            (state.restarted, state.lines) = (restarted, 0)
+            state.output = output.fileHandleForReading
+            try process.run()
+        } } catch {
             output.fileHandleForReading.readabilityHandler = nil
-            listener.withLock { $0.process = nil; $0.lifeline = nil }
-            settle(unavailable("Dot messaging helper or Node.js is unavailable."))
+            listener.withLock {
+                if $0.lifeline === lifeline { $0.process = nil; $0.lifeline = nil; $0.output = nil }
+            }
+            settle(unavailable("Dot messaging helper or Node.js is unavailable."), generation: generation)
         }
     }
 
-    private static func receive(_ line: Data, root: URL) {
+    private static func receive(_ line: Data, root: URL, generation: UUID) {
         guard case .object(var fields)? = try? JSONDecoder().decode(JSONValue.self, from: line) else { return }
         let room = fields.removeValue(forKey: "messages")
-        settle(.object(fields))
+        settle(.object(fields), generation: generation)
         guard case .array(let messages)? = room else { return }
-        Task {
+        deliver(generation: generation) {
             guard let peer = try? AgentPeerStore(dataRoot: root).list().first(where: owns) else { return }
             do {
                 _ = try await conversation(root, peer, messages, nil)
@@ -161,19 +198,19 @@ public enum ChatGPTDotIPCTransport {
     /// stopped unexpectedly. While ChatGPT runs the next starts now, unless
     /// this one was already that restart and died at once (its last line was
     /// its only one): then its reason stands until ChatGPT's socket changes.
-    private static func ended(_ lifeline: Pipe) {
+    private static func ended(_ lifeline: Pipe, generation: UUID) {
         guard let (state, started, quick) = listener.withLock({ value -> (JSONValue, UInt64?, Bool)? in
-            guard value.lifeline === lifeline else { return nil }
-            (value.process, value.lifeline) = (nil, nil)
+            guard value.generation == generation, value.lifeline === lifeline else { return nil }
+            (value.process, value.lifeline, value.output) = (nil, nil, nil)
             return (value.state, value.socket, value.restarted && value.lines <= 1)
         }) else { return }
         guard case .object(let fields) = state else { return }
         if fields["status"] != .string("unavailable") {
-            settle(unavailable("Dot's listener stopped unexpectedly."))
+            settle(unavailable("Dot's listener stopped unexpectedly."), generation: generation)
         }
         guard let now = socketInode() else { return }
-        if now != started { reconnect() }
-        else if !quick, fields["reason"] != .string("app_not_running") { reconnect(restarted: true) }
+        if now != started { reconnect(generation: generation) }
+        else if !quick, fields["reason"] != .string("app_not_running") { reconnect(restarted: true, generation: generation) }
     }
 
     private static func socketInode() -> UInt64? {
@@ -182,9 +219,9 @@ public enum ChatGPTDotIPCTransport {
     }
 
     /// A new state is news at once: the contact rows and her contact health follow it.
-    private static func settle(_ state: JSONValue) {
+    private static func settle(_ state: JSONValue, generation: UUID) {
         guard let root = listener.withLock({ value -> URL?? in
-            guard value.state != state else { return nil }
+            guard value.generation == generation, value.dataRoot != nil, value.state != state else { return nil }
             value.state = state
             return .some(value.dataRoot)
         }) else { return }
@@ -196,11 +233,23 @@ public enum ChatGPTDotIPCTransport {
                 AgentPeerStore(dataRoot: root).clearUnavailable(peerID: peer.id, since: .distantPast)
             }
         }
-        Task.detached(priority: .utility) {
+        deliver(generation: generation) {
             await AgentContactHealth.shared.refresh(dataRoot: root)
             // Room messages a failed ingestion kept are tried again.
+            guard listener.withLock({ $0.generation == generation && $0.dataRoot != nil }) else { return }
             guard let peer = try? AgentPeerStore(dataRoot: root).list().first(where: owns) else { return }
             _ = try? await conversation(root, peer, [], nil)
+        }
+    }
+
+    private static func deliver(generation: UUID, work: @escaping @Sendable () async -> Void) {
+        listener.withLock { state in
+            guard state.generation == generation, state.dataRoot != nil else { return }
+            let id = UUID()
+            state.deliveries[id] = Task {
+                defer { listener.withLock { $0.deliveries[id] = nil } }
+                await work()
+            }
         }
     }
 }

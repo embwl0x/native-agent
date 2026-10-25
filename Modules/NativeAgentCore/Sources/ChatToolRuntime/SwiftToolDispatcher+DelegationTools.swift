@@ -3,6 +3,7 @@ import NativeAgentCore
 import Foundation
 import PersistenceCore
 import SwarmRuns
+// Blueprint: | `SwiftToolDispatcher+DelegationTools.swift` | `SwiftToolDispatcher`: `impl_delegation_status`, `delegationStatusLimit`, `delegationStatusOffset` |
 
 // MARK: - delegation_status (W2, upgrade campaign 2026-08 Track A)
 //

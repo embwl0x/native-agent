@@ -56,10 +56,10 @@
 import Foundation
 import GRDB
 import ApprovalInbox
-import KnowledgeGraph
 import NativeAgentCore
 import OSLog
 import PersistenceCore
+// Blueprint: | `MemoryV2+ConsolidationGate.swift` | `MemoryConsolidationGate`; gateLockTarget/withGateLock; reconciliation repairs known terminal receipts and respects the approval owner's terminal execution outcome before any candidate application |
 
 private struct MemoryProjectionReconciliationSummary: Sendable {
     let userMDPath: String
@@ -89,6 +89,8 @@ private struct MemoryProjectionReconciliationSummary: Sendable {
 
 // MARK: - Gate
 
+/// Candidate DBs, manifests and receipts are included in local backup/export
+/// and PrivacyMap's memory scope, never phone sync. Lock sidecars are omitted.
 public enum MemoryConsolidationGate {
 
     public static let approvalAction = "memory.consolidation.swap"
@@ -128,7 +130,9 @@ public enum MemoryConsolidationGate {
 
     /// Full pipeline: reconcile prior approvals → snapshot → candidate →
     /// destructive run on candidate → diff → probe gate → stage card.
-    /// NEVER mutates the live store. The whole pipeline holds the gate
+    /// Reconciliation may apply prior approved swaps; new work runs on a
+    /// candidate only. The caller also backfills live tombstone vectors first.
+    /// The whole pipeline holds the gate
     /// flock: pending-scan + approval-create are one critical section, so
     /// two concurrent calls cannot both stage (review finding 4).
     public static func run(
@@ -376,7 +380,7 @@ public enum MemoryConsolidationGate {
                 // left hygiene_last_run.json at `staged`. Re-drive the
                 // canonical health projection on every reconciliation so that
                 // crash-window and upgrade recovery converge too.
-                reconcileAppliedMaintenanceTruth(
+                MemoryConsolidationHygiene.reconcileAppliedMaintenanceTruth(
                     dataRoot: dataRoot,
                     runId: runId,
                     status: receipt.status,
@@ -399,6 +403,7 @@ public enum MemoryConsolidationGate {
                 cleanupCandidate(dataRoot: dataRoot, runId: runId)
                 continue
             }
+            if record.executedAction != nil { continue }
             let candidateExists = FileManager.default.fileExists(
                 atPath: candidateDBPath(dataRoot: dataRoot, runId: runId).path)
             switch (record.status, record.decision) {
@@ -631,16 +636,11 @@ public enum MemoryConsolidationGate {
             // SwapStaleError if a write slipped in after the check above.
             let backupPath = try backupLiveStore(liveStorage: liveStorage, dataRoot: dataRoot)
             do {
-                let boundEvictions = try transactionalTableSwap(
+                _ = try transactionalTableSwap(
                     liveStorage: liveStorage, candidatePath: candidatePath,
                     expectedLiveFingerprint: manifest.liveFingerprint,
                     appliedRunId: runId)
                 swapCommitted = true
-                await MemoryStorage.recordBoundEvictions(
-                    boundEvictions,
-                    memoryPath: livePath,
-                    reason: "approved_consolidation_swap"
-                )
             } catch is SwapStaleError {
                 return await refuseStale(dataRoot: dataRoot, runId: runId, approvalId: verified.id)
             }
@@ -721,16 +721,21 @@ public enum MemoryConsolidationGate {
             userMD = generator.userMDPath(persona: MemoryV2Defaults.personaID)
         }
 
-        let memories = try await storage.listMemories(persona: nil, status: nil, limit: nil)
-        let spotlightRecords = memories.filter {
-            $0.status == "active"
-                && MemoryLifecycle.isRecallEligible($0.lifecycle)
+        // The snapshot belongs inside the same lane as every incremental
+        // projection, so a completed deletion cannot precede a stale rebuild.
+        let spotlightTask = await storage.enqueueSpotlightProjection {
+            let memories = try await storage.listMemories(persona: nil, status: "active", limit: nil)
+            let records = memories.filter {
+                !MemoryStorage.metadataFlag($0.metadata, MemoryStorage.pendingAdmissionKey)
+            }
+            let spotlight = SwiftNativeMemoryIndexer(client: environment.spotlightClient)
+            try await spotlight.removeAll()
+            try await spotlight.indexBatch(records.map {
+                (id: $0.id, text: $0.content, kind: $0.status)
+            })
+            return records.count
         }
-        let spotlight = SwiftNativeMemoryIndexer(client: environment.spotlightClient)
-        try await spotlight.removeAll()
-        try await spotlight.indexBatch(spotlightRecords.map {
-            (id: $0.id, text: $0.content, kind: $0.status)
-        })
+        let spotlightCount = try await spotlightTask.value
 
         let graph = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: livePath)
         // Settings ▸ "Knowledge graph": approving a consolidation is not
@@ -752,7 +757,7 @@ public enum MemoryConsolidationGate {
         ))
         return MemoryProjectionReconciliationSummary(
             userMDPath: userMD.path,
-            spotlightRecords: spotlightRecords.count,
+            spotlightRecords: spotlightCount,
             knowledgeGraph: graphReport,
             invalidationPublished: true
         )

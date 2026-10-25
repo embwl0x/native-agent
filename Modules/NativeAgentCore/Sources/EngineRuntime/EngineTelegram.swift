@@ -5,6 +5,8 @@ import ProviderRouting
 import BackgroundLoops
 import TelegramBot
 import AppToolRuntime
+import NativeAgentCore
+// Blueprint: | `EngineTelegram.swift` | Telegram facade and tool status envelope; `TelegramFacade` class; `configuration`, `loadStatus`, `load`; status uses TelegramPollLoop's checked state read, reporting unavailable state in lastError; `refresh` alone publishes status through `LatestRead`, including diagnostic-clear readback; credential badges read TelegramPresentationSnapshot.tokenConfigured directly |
 
 /// Mounted Telegram management state. The core owns configuration and transport
 /// status; the facade adds bounded diagnostic feeds and the app's routing pick.
@@ -13,6 +15,12 @@ import AppToolRuntime
 public final class TelegramFacade {
     public nonisolated let dataRoot: URL
     public var status: TelegramPresentationSnapshot?
+    @ObservationIgnored private let statusRead = LatestRead()
+
+    @discardableResult
+    public func refresh(manager: BackgroundLoopsManager = .shared, credentialUnavailable: Bool = false) async throws -> TelegramPresentationSnapshot {
+        try await statusRead.read({ try await load(manager: manager, credentialUnavailable: credentialUnavailable) }, publish: { status = $0 })
+    }
 
     public nonisolated init(dataRoot: URL) { self.dataRoot = dataRoot }
 
@@ -65,8 +73,6 @@ public final class TelegramFacade {
             telegramBrain = try? await SwiftNativeProviderRouting(dataRoot: dataRoot)
                 .computeModelPreferences()["telegram"]
         }
-        let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
-        let stateURL = telegramDir.appendingPathComponent("state.json")
         var lastSeenUpdateId: Int?
         var lastSeenAt: String?
         var lastReplyAt: String?
@@ -74,26 +80,27 @@ public final class TelegramFacade {
         var pollBackoffFailures: Int?
         var lastPollAt: String?
         var lastDiagnosticsClearedAt: String?
-        if let data = try? Data(contentsOf: stateURL),
-           let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        do {
+            let raw = try await TelegramPollLoop.readState(dataRoot: dataRoot)
+            let strings = JSONValue.object(raw).stringFields
+            func integer(_ value: JSONValue?) -> Int? {
+                switch value {
+                case .int(let i)?: return Int(exactly: i)
+                case .double(let d)?: return Int(exactly: d.rounded(.towardZero))
+                case .bool(let b)?: return b ? 1 : 0
+                default: return nil
+                }
+            }
             // Current key first, legacy key second; an unrepresentable double
             // is treated as absent so the legacy key still gets its turn.
-            lastSeenUpdateId = [raw["lastSeenUpdateId"], raw["lastUpdateId"]].lazy.compactMap { value -> Int? in
-                if let i = value as? Int { return i }
-                if let d = value as? Double { return Int(exactly: d.rounded(.towardZero)) }
-                return nil
-            }.first
-            lastSeenAt = raw["lastSeenAt"] as? String
-            lastReplyAt = raw["lastReplyAt"] as? String
-            lastError = raw["lastError"] as? String
-            if let i = raw["pollBackoffFailures"] as? Int {
-                pollBackoffFailures = i
-            } else if let d = raw["pollBackoffFailures"] as? Double {
-                pollBackoffFailures = Int(exactly: d.rounded(.towardZero))
-            }
-            lastPollAt = raw["lastPollAt"] as? String
-            lastDiagnosticsClearedAt = raw["lastDiagnosticsClearedAt"] as? String
-        }
+            lastSeenUpdateId = integer(raw["lastSeenUpdateId"]) ?? integer(raw["lastUpdateId"])
+            lastSeenAt = strings["lastSeenAt"]
+            lastReplyAt = strings["lastReplyAt"]
+            lastError = strings["lastError"]
+            pollBackoffFailures = integer(raw["pollBackoffFailures"])
+            lastPollAt = strings["lastPollAt"]
+            lastDiagnosticsClearedAt = strings["lastDiagnosticsClearedAt"]
+        } catch { lastError = error.localizedDescription }
         if let loop = await manager.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop,
            let polledAt = await loop.lastSuccessfulPollAt {
             lastPollAt = ISO8601DateFormatter().string(from: polledAt)

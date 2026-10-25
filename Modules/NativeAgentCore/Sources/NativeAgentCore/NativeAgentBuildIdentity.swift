@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `NativeAgentBuildIdentity.swift` | process-cached current identity, injectable `from`, `writeLaunchStamp` |
 
 /// Exact identity of the bytes currently running inside the app bundle.
 ///

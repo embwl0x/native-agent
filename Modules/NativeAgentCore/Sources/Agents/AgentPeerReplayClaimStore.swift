@@ -1,50 +1,31 @@
 import Foundation
 import CryptoKit
+import NativeAgentCore
 import PersistenceCore
 import Darwin
 
-/// AT-MOST-ONCE FOR INBOUND PEER MESSAGES.
-///
-/// The MCP wire says its `request_id` is "correlation, not replay protection",
-/// and the A2A wire validates a `messageId` and then throws it away for a fresh
-/// UUID — so the same signed-looking peer message, re-sent, used to append a
-/// second turn and run it again. That is replay, and on a lane that can start
-/// work it matters more than the duplicate row.
-///
-/// So the identity the protocol already carries is CLAIMED durably, before the
-/// transcript append, together with a digest of the bytes:
-///
-///   * a fresh `(principal, protocol, id)` claims and runs;
-///   * the same triple with the same bytes returns the ORIGINAL receipt and
-///     appends nothing;
-///   * the same triple with different bytes is rejected — an id is being
-///     reused, and guessing which body the caller meant is not available.
-///
-/// One small atomic file per claim under `<dataRoot>/agents/peer-claims`,
-/// written through the canonical sidecar lock, the same shape
-/// `CodexCompletionLifecycle` uses for delivery claims.
+// Blueprint: | `AgentPeerReplayClaimStore.swift` | `AgentPeerReplayClaimStore`: principal/protocol/message digest claims and retained receipts; conflicting bytes refuse and prior-life unfinished claims do not resume |
+
+/// At-most-once inbound messages: claim `(principal, protocol, id)` and its
+/// digest before transcript admission. Identical bytes return their retained
+/// receipt; different bytes conflict. Receipt-less claims resume only in their life.
 public struct AgentPeerReplayClaimStore: Sendable {
     public enum Outcome: Sendable, Equatable {
         /// This message is new; the caller owns it and must record a receipt.
         case claimed
-        /// An identical message was already handled; answer with the original
-        /// receipt, carried as its serialized JSON (Sendable across the claim
-        /// boundary, where the bridge's own receipts are `[String: Any]`).
+        /// The original serialized receipt; no new turn.
         case replay(String)
         /// The id was already used for DIFFERENT bytes.
         case conflict
         /// An identical message is still in flight (no receipt recorded yet).
         case inFlight
+        case stopped
     }
 
     static let maximumClaimAgeSeconds: TimeInterval = 7 * 24 * 3600
-    /// The cap on LIVE claims — records still carrying a receipt, or still in
-    /// flight. Expired tombstones are not counted against it.
+    /// Live claims exclude expired tombstones.
     static let maximumClaims = 4096
-    /// The bound on retained tombstones. Each is a key and a digest and nothing
-    /// else, so this is a "something is very wrong" ceiling, not a working
-    /// limit: it is never reached by real peer traffic, and it refuses
-    /// admission rather than deleting replay protection.
+    /// Capacity refuses new admission; it never evicts replay protection.
     static let maximumTombstones = 1_000_000
 
     let directory: URL
@@ -57,8 +38,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
         SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// The claim key. The protocol's own id is namespaced by the AUTHENTICATED
-    /// principal so one peer cannot burn or probe another's ids.
+    /// An authenticated principal cannot consume another peer's ids.
     public static func key(principal: String, protocolName: String, messageID: String) -> String {
         "\(principal)\u{1F}\(protocolName)\u{1F}\(messageID)"
     }
@@ -74,37 +54,35 @@ public struct AgentPeerReplayClaimStore: Sendable {
         return try withStoreLock {
             if let existing = try read(url) {
                 guard existing.digest == digest else { return .conflict }
-                guard let receipt = existing.receipt else { return .inFlight }
+                guard let receipt = existing.receipt else {
+                    return try DataRootLife.isCurrent(existing.lifeID, in: directory.deletingLastPathComponent().deletingLastPathComponent()) ? .inFlight : .stopped
+                }
                 return .replay(receipt)
             }
             try makeRoomForClaim()
-            try write(Record(key: key, digest: digest, receipt: nil, at: Date()), to: url)
+            try write(Record(lifeID: try DataRootLife.current(in: directory.deletingLastPathComponent().deletingLastPathComponent()),
+                             key: key, digest: digest, receipt: nil, at: Date()), to: url)
             return .claimed
         }
     }
 
-    /// Record the receipt this claim answered with, so an identical replay can
-    /// be answered from it. Best effort: a failure here loses idempotency for
-    /// that one id, never correctness of the turn that already ran.
+    /// A failed receipt write leaves the claim closed to another execution.
     public func recordReceipt(key: String, digest: String, receipt: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return }
         let url = fileURL(for: key)
         try? withStoreLock {
             guard let existing = try read(url), existing.digest == digest else { return }
-            try write(Record(key: key, digest: digest, receipt: json, at: existing.at), to: url)
+            try write(Record(lifeID: existing.lifeID, key: key, digest: digest, receipt: json, at: existing.at), to: url)
         }
     }
 
-    /// Release a claim whose turn never started (a validation failure after the
-    /// claim), so an honest retry is not permanently answered with `inFlight`.
+    /// Only validation before a turn starts may release its current-life claim.
     public func release(key: String) {
         let url = fileURL(for: key)
         try? withStoreLock {
-            // A receipt-less record is either a claim still in flight or an
-            // expired TOMBSTONE. Only the first may be released; deleting a
-            // tombstone would hand the id back to a replay.
             if let existing = try read(url), existing.receipt == nil,
+               try DataRootLife.isCurrent(existing.lifeID, in: directory.deletingLastPathComponent().deletingLastPathComponent()),
                Date().timeIntervalSince(existing.at) < Self.maximumClaimAgeSeconds {
                 try? FileManager.default.removeItem(at: url)
             }
@@ -114,6 +92,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
     // MARK: - Storage
 
     private struct Record: Codable {
+        let lifeID: String?
         let key: String
         let digest: String
         let receipt: String?
@@ -127,14 +106,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
         )
     }
 
-    /// ONE lock for the whole claim directory.
-    ///
-    /// Per-claim sidecar locks left `pruneIfNeeded` — which runs inside one
-    /// claim's lock but deletes OTHER claims' files — excluding nobody: it
-    /// could unlink a claim another caller had just written and was about to
-    /// run. The critical sections are a small read plus a rename, so one
-    /// directory lock costs nothing and makes claim, receipt, release and
-    /// prune mutually exclusive.
+    /// Claim, receipt, release and pruning share the directory lock.
     private func withStoreLock<T>(_ body: () throws -> T) throws -> T {
         try CredentialFileLock.withLock(directory.appendingPathComponent("claims"), body)
     }
@@ -160,17 +132,10 @@ public struct AgentPeerReplayClaimStore: Sendable {
         }
         let record = try JSONDecoder().decode(Record.self, from: data)
         guard fileURL(for: record.key) == url else { throw POSIXError(.EIO) }
-        // AN EXPIRED CLAIM BECOMES A TOMBSTONE, NOT A DELETION. Deleting it made
-        // the id fresh again, so a captured signed peer message re-sent after
-        // the retention window ran a second time — the replay this store
-        // exists to stop, merely delayed a week. The key and the digest are
-        // what refuse the replay, so they are kept; only the RECEIPT is
-        // dropped, which is the part that costs space and the part nobody can
-        // still be waiting on. A replay of the same bytes now answers
-        // `inFlight` rather than re-running the turn.
+        // Expire only receipt bytes. The identity/digest tombstone still refuses replay.
         guard Date().timeIntervalSince(record.at) < Self.maximumClaimAgeSeconds else {
             guard record.receipt != nil else { return record }
-            let tombstone = Record(key: record.key, digest: record.digest, receipt: nil, at: record.at)
+            let tombstone = Record(lifeID: record.lifeID, key: record.key, digest: record.digest, receipt: nil, at: record.at)
             try? write(tombstone, to: url)
             return tombstone
         }
@@ -184,12 +149,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
         let temporary = url.deletingLastPathComponent()
             .appendingPathComponent(".\(UUID().uuidString).tmp")
         try data.write(to: temporary, options: .atomic)
-        // rename(2), not `replaceItemAt`: a FIRST claim's destination does not
-        // exist yet, and `replaceItemAt` documents its original as
-        // expected-to-exist — it failed, the failure was discarded, the temp
-        // was deleted, and the claim file was never created. Every "claimed"
-        // request could then run again, which is the replay this store exists
-        // to stop. `rename` creates-or-replaces, atomically, in both cases.
+        // rename atomically creates the first claim or replaces an existing one.
         let renamed = url.withUnsafeFileSystemRepresentation { destination -> Int32 in
             guard let destination else { return -1 }
             return temporary.withUnsafeFileSystemRepresentation { source -> Int32 in
@@ -207,23 +167,13 @@ public struct AgentPeerReplayClaimStore: Sendable {
         }
     }
 
-    /// Capacity cannot evict live replay protection. Expire old records, then
-    /// refuse new admission if the retained window is full.
     private func makeRoomForClaim() throws {
         let names = try FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: [.contentModificationDateKey]
         )
-        // Claim records ONLY. The directory also holds the `claims.lock`
-        // sidecar and, briefly, a `.<uuid>.tmp`; counting those inflated the
-        // total, and deleting one would take out a live lock or a writer's
-        // half-written record.
+        // Count records, never the live lock or a writer's temporary file.
         let claims = names.filter { Self.isClaimRecordName($0.lastPathComponent) }
         guard claims.count >= Self.maximumClaims else { return }
-        // A TOMBSTONE IS NEVER EVICTED. Evicting one hands its id back to a
-        // replay, which is the whole thing this store exists to stop — so the
-        // cap is enforced over LIVE claims only and tombstones are simply not
-        // counted against it. A store full of live claims still refuses
-        // admission rather than forgetting a decision.
         var live = 0
         var tombstones = 0
         for url in claims {
@@ -236,11 +186,6 @@ public struct AgentPeerReplayClaimStore: Sendable {
             }
         }
         guard live < Self.maximumClaims else { throw POSIXError(.ENOSPC) }
-        // Tombstones are a key and a digest — about 200 bytes each — so the
-        // bound exists only so the directory cannot grow without limit. At
-        // `maximumTombstones` (1,000,000, which is ~200 MB and far above any
-        // real peer traffic) admission is REFUSED rather than a tombstone
-        // forgotten; reaching it means something is wrong upstream.
         guard tombstones < Self.maximumTombstones else { throw POSIXError(.ENOSPC) }
     }
 

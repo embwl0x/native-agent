@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `ContinuityField.swift` | `ContinuityField`: bounded canonical node/association field, event deduplication, activation/decay and emotional-tag blending |
+
 struct ContinuityField: Sendable {
     private var nodesByKey: [String: CognitiveNode] = [:]
     private var decayAnchorsByKey: [String: Date] = [:]

@@ -5,6 +5,7 @@
 // Structs with divergent shapes (MissionRecord dual-casing, EvalRun,
 // SchedulerJob, ChatMessageRecord) remain in their respective targets.
 import Foundation
+// Blueprint: | `SharedModels.swift` | `ChatSession.displayTitle` is engine-resolved presentation; canonical index decoding initializes it from `title` when absent; `ChatSessionNavigation` carries ordered rows with actual pin/anchor flags and the shared `ConversationAnchorPin`; one `pinned_chat_sessions.json` object replaces separate platform merges and `chat_anchor.json` |
 
 // MARK: - Core shared structs
 
@@ -84,6 +85,9 @@ public struct MultimodalAttachment: Identifiable, Codable, Hashable, Sendable {
 public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var title: String
+    /// Resolved by TranscriptsFacade before a session is presented or synced.
+    /// Canonical index rows omit this presentation field and decode with `title`.
+    public var displayTitle: String
     public var source: String?
     public var sourceKey: String?
     public var createdAt: String
@@ -110,6 +114,9 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     /// whether an EMPTY one is newer than what it already shows. Never derived
     /// from the clock; `nil` on rows written before this existed.
     public var transcriptGeneration: Int? = nil
+    /// Engine classification for conversation lists; the phone never infers
+    /// bridge provenance from titles or reclassifies stored session sources.
+    public var isWorkingConversation: Bool? = nil
 
     public init(
         id: String, title: String, source: String? = nil, sourceKey: String? = nil,
@@ -122,6 +129,7 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     ) {
         self.id = id
         self.title = title
+        self.displayTitle = title
         self.source = source
         self.sourceKey = sourceKey
         self.createdAt = createdAt
@@ -139,6 +147,31 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
         self.modelId = modelId
         self.transcriptGeneration = transcriptGeneration
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        displayTitle = try c.decodeIfPresent(String.self, forKey: .displayTitle) ?? title
+        source = try c.decodeIfPresent(String.self, forKey: .source)
+        sourceKey = try c.decodeIfPresent(String.self, forKey: .sourceKey)
+        createdAt = try c.decode(String.self, forKey: .createdAt)
+        updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
+        archived = try c.decodeIfPresent(Bool.self, forKey: .archived)
+        messageCount = try c.decodeIfPresent(Int.self, forKey: .messageCount)
+        firstMessageAt = try c.decodeIfPresent(String.self, forKey: .firstMessageAt)
+        lastMessageAt = try c.decodeIfPresent(String.self, forKey: .lastMessageAt)
+        lastMessagePreview = try c.decodeIfPresent(String.self, forKey: .lastMessagePreview)
+        summary = try c.decodeIfPresent(String.self, forKey: .summary)
+        parentSessionId = try c.decodeIfPresent(String.self, forKey: .parentSessionId)
+        rootSessionId = try c.decodeIfPresent(String.self, forKey: .rootSessionId)
+        forkedAtMessageId = try c.decodeIfPresent(String.self, forKey: .forkedAtMessageId)
+        projectSpaceId = try c.decodeIfPresent(String.self, forKey: .projectSpaceId)
+        worktreePath = try c.decodeIfPresent(String.self, forKey: .worktreePath)
+        providerId = try c.decodeIfPresent(String.self, forKey: .providerId)
+        modelId = try c.decodeIfPresent(String.self, forKey: .modelId)
+        transcriptGeneration = try c.decodeIfPresent(Int.self, forKey: .transcriptGeneration)
+    }
 }
 
 public extension ChatSession {
@@ -146,21 +179,32 @@ public extension ChatSession {
     /// persistence both key off this exact string — keep them on one
     /// constant so they can't drift.
     static let placeholderTitle = "New Chat"
+}
 
-    /// Title for display surfaces. The persistence layer only auto-titles a
-    /// session from the first USER message, so agent-initiated sessions the
-    /// user never typed into stay "New Chat" forever — a sidebar full of
-    /// identical rows. Fall back to a compact cut of the last message
-    /// preview so lists stay distinguishable. Display-only; renames and
-    /// persistence keep using `title`.
-    var displayTitle: String {
-        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty, trimmed != Self.placeholderTitle { return trimmed }
-        let preview = (lastMessagePreview ?? "")
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !preview.isEmpty else { return trimmed.isEmpty ? Self.placeholderTitle : trimmed }
-        return String(preview.prefix(48))
+public struct ConversationAnchorPin: Sendable, Equatable, Codable {
+    public let sessionId: String
+    public let source: String
+    public let updatedAt: String
+    public init(sessionId: String, source: String, updatedAt: String) {
+        self.sessionId = sessionId; self.source = source; self.updatedAt = updatedAt
+    }
+    public var cleanSessionId: String? { sessionId.isEmpty ? nil : sessionId }
+}
+
+public struct ChatSessionNavigation: Codable, Sendable, Equatable {
+    public struct Row: Codable, Sendable, Equatable {
+        public let session: ChatSession
+        public let isPinned: Bool
+        public let isAnchor: Bool
+        public init(session: ChatSession, isPinned: Bool, isAnchor: Bool) {
+            self.session = session; self.isPinned = isPinned; self.isAnchor = isAnchor
+        }
+    }
+    public let rows: [Row]
+    public let pinnedSessionIDs: [String]
+    public let anchor: ConversationAnchorPin?
+    public init(rows: [Row], pinnedSessionIDs: [String], anchor: ConversationAnchorPin?) {
+        self.rows = rows; self.pinnedSessionIDs = pinnedSessionIDs; self.anchor = anchor
     }
 }
 
@@ -341,6 +385,9 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
     /// approval belong to the conversation in front of me?" without opening a
     /// second approval store of its own.
     public var chatOriginSessionId: String?
+    /// The Mac turn projection's selected approval, linked to its exact turn.
+    /// Nil when the Mac cannot establish that provenance.
+    public var chatOriginTurnId: String? = nil
     /// User, 2026-09-06: when a still-pending request was last ASKED FOR. A
     /// repeated identical request reuses its row rather than piling up
     /// duplicates, so a surface that fences on `createdAt` alone would hide a

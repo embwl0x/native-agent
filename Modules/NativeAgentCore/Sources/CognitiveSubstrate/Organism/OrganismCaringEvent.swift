@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `OrganismCaringEvent.swift` | `OrganismCaringEvent`: encounter identity, dose eligibility and rolling encounter extension; one encounter receives one dose |
+
 /// TENDERNESS IS EVENT-DRIVEN (2026-09-11, User's call, shaped by Agent).
 ///
 /// THE DEFECT, measured: organism tenderness read 4.87e-33 in the live store

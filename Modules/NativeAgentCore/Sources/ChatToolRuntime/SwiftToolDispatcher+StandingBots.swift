@@ -6,12 +6,14 @@ import PersistenceCore
 import ProviderRouting
 import StandingBots
 import ToolRegistry
+import TurnTrace
+// Blueprint: | `SwiftToolDispatcher+StandingBots.swift` | `SwiftToolDispatcher`: `standingBotApprovalReason`, `standingBotsArgumentRefusal`, `impl_standingBots` |
 
 extension SwiftToolDispatcher {
     func standingBotApprovalReason(tool: String, input: [String: JSONValue]) -> String? {
         guard tool == "bot_delete" else { return nil }
         let definitions = BotDefinitionStore(dataRoot: dataRoot)
-        guard let id = try? botReference(input, definitions: definitions),
+        guard let id = try? botReference(input, definitions: definitions, reportShim: false),
               let bot = try? definitions.get(id) else { return "Delete this bot? Its saved notes stay." }
         return "Delete the bot \(bot.name)? Its saved notes stay."
     }
@@ -37,8 +39,8 @@ extension SwiftToolDispatcher {
         let args = input.filter { !["__session_id", "session_id"].contains($0.key) }
         do {
             let candidate = tool == "bot_create"
-                ? try await botCreateCandidate(args)
-                : try await botUpdateCandidate(args, definitions: definitions)
+                ? try await botCreateCandidate(args, reportShim: false)
+                : try await botUpdateCandidate(args, definitions: definitions, reportShim: false)
             // The cadence floor and the rest of the persisted-shape rules, from
             // the store itself rather than a second copy of them here.
             do {
@@ -63,16 +65,17 @@ extension SwiftToolDispatcher {
 
     /// The bot bot_create would write. Shared by dispatch and the pre-approval
     /// check; it touches no file.
-    private func botCreateCandidate(_ args: [String: JSONValue]) async throws -> BotDefinition {
-        let args = args.filter { $0.value != .null && (["output_format", "schedule", "timezone"].contains($0.key) || $0.value != .string("")) }
-        try botKeys(args, allowed: ["name", "brief", "cadence", "schedule", "timezone", "details", "provider", "model", "model_pinned", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format", "paused", "event_trigger", "notify_condition"])
+    private func botCreateCandidate(_ args: [String: JSONValue], reportShim: Bool = true) async throws -> BotDefinition {
+        let args = args.filter { $0.value != .null && (["output_format", "schedule"].contains($0.key) || $0.value != .string("")) }
+        try botKeys(args, allowed: ["name", "personality", "brief", "cadence", "schedule", "details", "provider", "model", "model_pinned", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format", "paused", "event_trigger", "notify_condition"])
         _ = try botDetails(args)
         var bot = BotDefinition(name: try botString(args["name"], field: "name"),
                                 brief: try botString(args["brief"], field: "brief"),
-                                cadence: try botRequestedCadence(args) ?? .manual,
+                                cadence: try botRequestedCadence(args, reportShim: reportShim) ?? .manual,
                                 budget: try args["budget"].map(botBudget)
                                     ?? BotBudget(tokens: BotRunLimits.maximumTokens, seconds: BotRunLimits.maximumSeconds),
                                 outputFormat: try args["output_format"].map { try botDecode(String.self, $0, field: "output_format") })
+        bot.personality = try args["personality"].map { try botString($0, field: "personality") }
         bot.provider = try args["provider"].map { try botString($0, field: "provider") }
         bot.model = try args["model"].map { try botString($0, field: "model") }
         bot.reasoningEffort = try args["reasoning_effort"].map { try botString($0, field: "reasoning_effort") }
@@ -95,20 +98,21 @@ extension SwiftToolDispatcher {
 
     /// The bot bot_update would write, read from the store and edited in
     /// memory. Shared by dispatch and the pre-approval check; it writes nothing.
-    private func botUpdateCandidate(_ args: [String: JSONValue], definitions: BotDefinitionStore) async throws -> BotDefinition {
+    private func botUpdateCandidate(_ args: [String: JSONValue], definitions: BotDefinitionStore, reportShim: Bool = true) async throws -> BotDefinition {
         try botKeys(args, allowed: Set(botReferenceKeys + ["fields", "details"]))
         _ = try botDetails(args)
         let fields = try botObject(args["fields"], field: "fields")
-        try botKeys(fields, allowed: ["name", "brief", "cadence", "schedule", "timezone", "provider", "model", "model_pinned", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format", "event_trigger", "notify_condition"], path: "$.fields")
-        let edits = fields.filter { $0.value != .null && (["output_format", "schedule", "timezone", "notify_condition"].contains($0.key) || $0.value != .string("")) }
+        try botKeys(fields, allowed: ["name", "personality", "brief", "cadence", "schedule", "provider", "model", "model_pinned", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format", "event_trigger", "notify_condition"], path: "$.fields")
+        let edits = fields.filter { $0.value != .null && (["output_format", "schedule", "notify_condition"].contains($0.key) || $0.value != .string("")) }
         guard !edits.isEmpty else { throw botArgumentError("fields must contain at least one setting", field: "fields", accepted: "An object containing at least one setting to change.") }
-        var bot = try definitions.get(botReference(args, definitions: definitions))
+        var bot = try definitions.get(botReference(args, definitions: definitions, reportShim: reportShim))
         do {
             if let value = edits["name"] { bot.name = try botString(value, field: "name") }
             if let value = edits["brief"] { bot.brief = try botString(value, field: "brief") }
+            if let value = edits["personality"] { bot.personality = try botString(value, field: "personality") }
             // One "When" choice, as in the Bots editor: a schedule replaces an
             // event trigger, and an event trigger replaces the schedule.
-            let timing = try botRequestedCadence(edits)
+            let timing = try botRequestedCadence(edits, reportShim: reportShim)
             if let timing { bot.cadence = timing; bot.eventTrigger = nil }
             if let value = edits["event_trigger"] {
                 guard timing == nil || timing == .manual else { throw botTriggerTimingError }
@@ -211,11 +215,6 @@ extension SwiftToolDispatcher {
             let args = input.filter { !["__session_id", "session_id"].contains($0.key) }
             switch tool {
             case "bot_ask":
-                // "message", "text" and "prompt" are what a message is called everywhere else.
-                var args = args
-                if args["question"] == nil, let key = ["message", "text", "prompt"].first(where: { args[$0] != nil }) {
-                    args["question"] = args.removeValue(forKey: key)
-                }
                 try botKeys(args, allowed: Set(botReferenceKeys + ["question"]))
                 let question = try botString(args["question"], field: "question")
                 let botID: UUID
@@ -252,6 +251,7 @@ extension SwiftToolDispatcher {
                 switch status {
                 case .completed: wire = "completed"
                 case .failed: wire = "failed"
+                case .stopped: wire = "stopped"
                 case .interrupted: wire = "interrupted"
                 case .waitingForApproval: wire = "waiting_approval"
                 case .waitingOnPerson: wire = "waiting_on_you"
@@ -527,7 +527,7 @@ private func botObject(_ value: JSONValue?, field: String) throws -> [String: JS
 private func botDecode<T: Decodable>(_ type: T.Type, _ value: JSONValue?, field: String) throws -> T {
     var shape = type == Bool.self ? "A boolean." : type == Int.self ? "An integer." : type == String.self ? "A string."
         : type == BotBudget.self ? "An object with tokens: positive integer and seconds: positive finite number."
-        : type == BotCadence.self ? "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string, timeZone?: string}. Omitted timeZone follows this Mac wherever it is; name one only to pin the time to a place."
+        : type == BotCadence.self ? "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string}. Times are on this Mac's local clock and follow it when it changes zone."
         : "An object matching " + field + "."
     guard let value else { throw botArgumentError("missing " + field, field: field, accepted: shape) }
     do { return try JSONDecoder().decode(type, from: value.serializedData(pretty: false)) }
@@ -544,7 +544,6 @@ private func botDecode<T: Decodable>(_ type: T.Type, _ value: JSONValue?, field:
         case "budget.seconds": shape = "A positive finite number."
         case "cadence.interval.seconds": shape = "A finite number of seconds meeting the bot cadence minimum."
         case "cadence.cron.expression": shape = "A cron expression string."
-        case "cadence.cron.timeZone": shape = "An IANA timezone string."
         default: break
         }
         throw botArgumentError("invalid \(path); expected: \(shape)", field: path, accepted: shape)
@@ -569,23 +568,24 @@ private func botID(_ value: JSONValue?) throws -> UUID {
 /// refusal below names them plus the shelf.
 private let botReferenceKeys = ["id", "bot_id", "bot", "name"]
 
-/// The bot-naming keys actually PROVIDED. An empty or all-whitespace alias is
-/// absent, not a choice: a model that means one spelling routinely emits the
-/// other three as `""`, and counting those as provided refused the call with
-/// "name the bot once" until it gave up retrying.
+/// The bot-naming keys actually provided. Strict-provider nulls are absent.
 private func botSuppliedReferences(_ args: [String: JSONValue]) -> [(key: String, value: JSONValue)] {
     botReferenceKeys.compactMap { key -> (key: String, value: JSONValue)? in
         guard let value = args[key], value != .null else { return nil }
-        if case .string(let text) = value,
-           text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return nil }
         return (key: key, value: value)
     }
 }
 
 /// The bot named by `id` / `bot_id` / `bot` / `name`: a UUID, or a bot name
-/// matched case-insensitively — exactly, else by unique prefix.
-func botReference(_ args: [String: JSONValue], definitions: BotDefinitionStore) throws -> UUID {
+/// matched case-insensitively and exactly.
+func botReference(_ args: [String: JSONValue], definitions: BotDefinitionStore, reportShim: Bool = true) throws -> UUID {
     let supplied = botSuppliedReferences(args)
+    var corrected = botReferenceKeys.filter { args[$0] != nil }.count != supplied.count
+    defer {
+        if reportShim, corrected {
+            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T19"), "site": .string("SwiftToolDispatcher+StandingBots.swift:botReference")]))
+        }
+    }
     let shelf = (try? definitions.list()) ?? []
     func refuse(_ lead: String) -> StandingBotsError {
         let listed = shelf.isEmpty
@@ -597,25 +597,24 @@ func botReference(_ args: [String: JSONValue], definitions: BotDefinitionStore) 
     }
     guard let first = supplied.first else { throw refuse("No bot named.") }
     if supplied.count > 1 {
-        let ids = try supplied.map { try botReference([$0.key: $0.value], definitions: definitions) }
+        let ids = try supplied.map { try botReference([$0.key: $0.value], definitions: definitions, reportShim: false) }
         guard Set(ids).count == 1 else {
             throw refuse("Conflicting bot fields: " + supplied.map(\.key).joined(separator: ", ") + ". Pass id alone, for example id: \"\(ids[0])\".")
         }
+        corrected = true
         return ids[0]
     }
     let text = try botString(first.value, field: first.key).trimmingCharacters(in: .whitespacesAndNewlines)
-    // A blank reference names NOTHING. Left to the prefix match below it would
-    // match every bot, so a single-bot shelf would resolve `bot_delete(name: " ")`
-    // to that bot and delete it.
+    // A blank reference names nothing; reject it before lookup.
     guard !text.isEmpty else { throw refuse("\(first.key) is blank.") }
-    if let id = UUID(uuidString: text) { return id }
+    if let id = UUID(uuidString: text) {
+        corrected = corrected || first.key != "id"
+        return id
+    }
     let folded = text.lowercased()
     let exact = shelf.filter { $0.name.lowercased() == folded }
-    if exact.count == 1 { return exact[0].id }
+    if exact.count == 1 { corrected = true; return exact[0].id }
     if exact.count > 1 { throw refuse("More than one bot is called \"\(text)\"; use its ID.") }
-    let prefixed = shelf.filter { $0.name.lowercased().hasPrefix(folded) }
-    if prefixed.count == 1 { return prefixed[0].id }
-    if prefixed.count > 1 { throw refuse("\"\(text)\" matches more than one bot.") }
     throw refuse("No bot matches \"\(text)\".")
 }
 
@@ -631,30 +630,33 @@ private func botEventTrigger(_ value: JSONValue?) throws -> BotEventTrigger {
     try botKeys(object, allowed: ["source", "filter", "keyword"], path: "$.event_trigger")
     let raw = try botString(object["source"], field: "event_trigger.source")
     guard let source = BotEventSource(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
-        throw botArgumentError("event_trigger.source must be github or slack", field: "event_trigger.source", accepted: "github or slack.")
+        throw botArgumentError("event_trigger.source must be slack", field: "event_trigger.source", accepted: "slack.")
     }
     let filter = try botString(object["filter"], field: "event_trigger.filter").trimmingCharacters(in: .whitespacesAndNewlines)
     // Slack delivers a channel ID, never a name, so a name would never match.
-    if source == .slack, !BotEventTrigger.isChannelID(filter) {
+    if !BotEventTrigger.isChannelID(filter) {
         throw botArgumentError("A Slack trigger needs the channel ID, such as C0123ABCD, not its name. In Slack, open the channel, choose View channel details, and copy the ID at the bottom.", field: "event_trigger.filter", accepted: "A Slack channel ID such as C0123ABCD.")
     }
     let keyword = try object["keyword"].map { try botDecode(String.self, $0, field: "event_trigger.keyword") }
-    return BotEventTrigger(source: source, filter: source == .slack ? filter.uppercased() : filter, keyword: keyword)
+    return BotEventTrigger(source: source, filter: filter.uppercased(), keyword: keyword)
 }
 
 private var botTriggerTimingError: ToolFailureError { botArgumentError(
     "An event-woken helper keeps no schedule: the event is what runs it. Drop schedule and cadence, or use schedule manual.",
     field: "event_trigger", accepted: "event_trigger with no schedule, or with schedule manual.") }
 
-private func botCadence(_ value: JSONValue?) throws -> BotCadence {
+private func botCadence(_ value: JSONValue?, reportShim: Bool = true) throws -> BotCadence {
     // The null siblings are not branches. `{"interval":{…},"manual":null,
     // "cron":null}` is one cadence, and refusing it as "exactly one of…" sent
     // the model round the retry loop with nothing to change. Dropped before
     // the count AND before the decode: the synthesized enum decoder wants a
     // single key too.
-    let shape = "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string, timeZone?: string}. Omitted timeZone follows this Mac wherever it is; name one only to pin the time to a place."
+    let shape = "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string}. Times are on this Mac's local clock and follow it when it changes zone."
     guard case .object(let raw) = value else { throw botArgumentError("cadence must be an object", field: "cadence", accepted: shape) }
     let object = raw.filter { $0.value != .null }
+    if reportShim, object.count != raw.count {
+        TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T21"), "site": .string("SwiftToolDispatcher+StandingBots.swift:botCadence")]))
+    }
     guard object.count == 1 else { throw botArgumentError("cadence requires exactly one of manual, interval or cron", field: "cadence", accepted: shape) }
     try botKeys(object, allowed: ["manual", "interval", "cron"], path: "$.cadence")
     if let manual = object["manual"] {
@@ -664,32 +666,25 @@ private func botCadence(_ value: JSONValue?) throws -> BotCadence {
     } else if let interval = object["interval"] {
         try botKeys(botObject(interval, field: "cadence.interval"), allowed: ["seconds"], path: "$.cadence.interval")
     } else {
-        try botKeys(botObject(object["cron"], field: "cadence.cron"), allowed: ["expression", "timeZone"], path: "$.cadence.cron")
+        try botKeys(botObject(object["cron"], field: "cadence.cron"), allowed: ["expression"], path: "$.cadence.cron")
     }
-    let cadence = try botDecode(BotCadence.self, .object(object), field: "cadence")
-    guard case .cron(let expression, let zone) = cadence else { return cadence }
-    return .cron(expression: expression, timeZone: BotCadence.setZone(zone))
+    return try botDecode(BotCadence.self, .object(object), field: "cadence")
 }
 
 /// Both pre-approval and persistence call this adapter; cadence validity and
 /// the operator's minimum interval still belong to BotDefinitionStore.
-private func botRequestedCadence(_ args: [String: JSONValue]) throws -> BotCadence? {
+private func botRequestedCadence(_ args: [String: JSONValue], reportShim: Bool = true) throws -> BotCadence? {
     let args = args.filter { $0.value != .null }
     guard args["schedule"] != nil else {
-        guard args["timezone"] == nil else {
-            throw botArgumentError("timezone requires a daily or weekdays schedule; legacy cron uses its own timeZone", field: "timezone", accepted: "Supply timezone only with a daily, weekday or weekly schedule; cron uses cadence.cron.timeZone.")
-        }
-        return try args["cadence"].map(botCadence)
+        return try args["cadence"].map { try botCadence($0, reportShim: reportShim) }
     }
     guard args["cadence"] == nil else {
         throw botArgumentError("Use schedule or cadence, not both", field: "schedule", accepted: "Supply schedule or cadence, not both.")
     }
     do {
-        return try StandingBotSchedule.parse(
-            botString(args["schedule"], field: "schedule"),
-            timezone: args["timezone"].map { try botString($0, field: "timezone") })
+        return try StandingBotSchedule.parse(botString(args["schedule"], field: "schedule"))
     } catch StandingBotsError.invalidValue(let message) {
-        throw ToolFailureError(message, argumentPath: "$", accepted: "schedule: manual; every N minutes or hours; daily at HH:mm; weekdays at HH:mm; weekly on DAY at HH:mm. Clock: 00:00-23:59. Optional timezone: an IANA name for daily, weekday or weekly timing.", effects: .none)
+        throw ToolFailureError(message, argumentPath: "$", accepted: "schedule: manual; every N minutes or hours; daily at HH:mm; weekdays at HH:mm; weekly on DAY at HH:mm. Clock: 00:00-23:59 on this Mac's local clock.", effects: .none)
     }
 }
 
@@ -707,27 +702,19 @@ private func botJSON<T: Encodable>(_ value: T) throws -> JSONValue {
 private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, operation: String? = nil, currentModel: String? = nil) throws -> JSONValue {
     guard case .object(var fields) = try botJSON(bot) else { throw StandingBotsError.invalidValue("bot") }
     if !details {
-        let visible: Set<String> = ["id", "name", "brief", "provider", "model", "modelPinned", "reasoningEffort", "fast",
-                                   "cadence", "paused", "budget", "outputFormat", "eventTrigger", "notificationCondition"]
+        let visible: Set<String> = ["id", "name", "personality", "brief", "provider", "model", "modelPinned", "reasoningEffort", "fast",
+                                   "cadence", "paused", "offReason", "budget", "outputFormat", "eventTrigger", "notificationCondition"]
         fields = fields.filter { visible.contains($0.key) }
     }
     fields["status"] = .string("ok")
     fields["model_selection"] = .string(bot.modelSelection(currentModel: currentModel))
     fields["session_id"] = .string(bot.sessionID)
-    fields["daily_token_ceiling"] = .int(Int64(bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens))
+    fields["daily_token_ceiling"] = bot.dailyTokenCeiling.map { .int(Int64($0)) } ?? .string("none")
     fields["schedule"] = .string(StandingBotSchedule.describe(bot.cadence))
     fields["output_format"] = .string(bot.outputFormat ?? "")
-    if case .cron(_, let zone) = bot.cadence {
+    if case .cron = bot.cadence {
         fields["mac_timezone"] = .string(TimeZone.current.identifier)
-        if let zone {
-            fields["timezone"] = .string(zone)
-            if zone != TimeZone.current.identifier {
-                fields["timezone_warning"] = .string("Schedule time zone \(zone) differs from this Mac's current zone \(TimeZone.current.identifier). Saved timing was not changed.")
-            }
-        } else {
-            fields["timezone"] = .null
-            fields["timezone_detail"] = .string("Follows the Mac: \(TimeZone.current.identifier).")
-        }
+        fields["timezone_detail"] = .string("Follows the Mac: \(TimeZone.current.identifier).")
     }
     fields["scheduler_status"] = .string(bot.paused ? "paused" : bot.eventTrigger != nil ? "on_event" : bot.cadence == .manual ? "manual" : "scheduled")
     let reference = JSONValue.string(bot.name)

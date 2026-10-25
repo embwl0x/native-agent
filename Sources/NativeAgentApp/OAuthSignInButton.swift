@@ -1,4 +1,6 @@
 import ProviderRouting
+
+// Blueprint: | `OAuthSignInButton.swift` | `OAuthSignInButton` and presenter: in-process sign-in/sign-out, CLI session consent and current credential-state presentation |
 // Swift-native cutover (2026-06-02): OAuth flow is driven entirely in-process by
 // `NativeOAuthFlow` — provider-native OAuth for Anthropic/Grok via the
 // registered `nativeagent://oauth/...` callback, and (since 2026-07-05) the
@@ -22,11 +24,18 @@ struct OAuthSignInButton: View {
     // S.5: access AppModel so we can propagate revoke state to provider list
     @Environment(AppModel.self) private var appModel
 
-    @State private var status: OAuthSignInPresentation.State = .idle
+    private var authStatus: NativeOAuthFlow.SignInStatus? {
+        appModel.engine.providers.settings?.oauthStatuses[provider.id]
+    }
+    private var status: OAuthSignInPresentation.State {
+        flowTask != nil ? .running : (authStatus?.isSignedIn == true ? .complete : .idle)
+    }
     @State private var lastError: String? = nil
-    @State private var authStatusText: String? = nil
+    private var authStatusText: String? { authStatus?.detail }
     @State private var flowTask: Task<Void, Never>? = nil
-    @State private var cliSessionOffer: NativeOAuthFlow.CodexCLISessionOffer? = nil
+    private var cliSessionOffer: NativeOAuthFlow.CodexCLISessionOffer? {
+        provider.id == "openai_oauth_direct" ? appModel.engine.providers.settings?.codexCLISessionOffer : nil
+    }
     @State private var showingCLIConsentRepairConfirmation = false
     @State private var cliConsentRepairMessage: String? = nil
 
@@ -79,7 +88,7 @@ struct OAuthSignInButton: View {
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
             }
-            if let err = lastError {
+            if let err = lastError ?? authStatus?.error {
                 Label(err, systemImage: "exclamationmark.triangle.fill")
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.trouble)
@@ -107,8 +116,7 @@ struct OAuthSignInButton: View {
                                     NativeOAuthFlow.recordCodexCLISessionDecision(
                                         allow: false, source: "providers_offer",
                                         dataRoot: oauthDataRoot)
-                                    cliSessionOffer = NativeOAuthFlow.codexCLISessionOffer(
-                                        dataRoot: oauthDataRoot)
+                                    Task { await refreshStatus() }
                                 }
                                 .buttonStyle(.plain)
                                 .controlSize(.small)
@@ -177,22 +185,14 @@ struct OAuthSignInButton: View {
         // Keep the task owned until cancellation has torn down the old flow.
         defer { flowTask = nil }
         // ChatGPT uses the direct in-process browser OAuth, like Anthropic/Grok.
-        status = .running
         lastError = nil
-        authStatusText = nil
         print("[oauth-signin] starting native flow for \(provider.id)")
 
         let result = await appModel.engine.providers.connectOAuthProvider(
             platform: NativeOAuthPlatform.self, providerID: provider.id,
             present: { result in
                 NSApp.activate(ignoringOtherApps: true)
-                if result.ok {
-                    status = .complete
-                    authStatusText = NativeOAuthFlow.signInStatusDetail(
-                        providerId: provider.id, dataRoot: oauthDataRoot
-                    ) ?? "Signed in"
-                } else {
-                    status = .idle
+                if !result.ok {
                     lastError = result.error ?? "OAuth failed (no details)"
                 }
             },
@@ -200,10 +200,7 @@ struct OAuthSignInButton: View {
             failure: { error, action in appModel.setFailureStatus(error, action: action) },
             clearOverride: { try await appModel.clearSurfaceOverride(surface: $0) }
         )
-        guard let result else {
-            status = .idle
-            return
-        }
+        guard let result else { return }
         if result.ok { onSuccess?() }
     }
 
@@ -217,27 +214,18 @@ struct OAuthSignInButton: View {
         if !cleared {
             lastError = "Sign-out did not finish — a credential file could not be removed. Check permissions on the data folder and try again."
         } else if provider.id == "openai_oauth_direct",
-           NativeOAuthFlow.isSignedIn(providerId: provider.id, dataRoot: oauthDataRoot) {
+           authStatus?.isSignedIn == true {
             lastError = "Shared Codex auth is still signed in. Sign out from Codex to remove it."
         }
         // S.5: propagate revoke to the provider list so ProviderSettingsView
         // and the chat brain bar reflect the new auth state immediately.
-        await appModel.loadProvidersForChat()
+        if cleared { onSuccess?() }
     }
 
     @MainActor
     private func refreshStatus() async {
-        guard flowTask == nil else { return }
-        let projection = NativeOAuthFlow.signInStatus(
-            providerID: provider.id,
-            dataRoot: oauthDataRoot
-        )
-        status = projection.isSignedIn ? .complete : .idle
-        authStatusText = projection.detail
-        lastError = projection.error
-        cliSessionOffer = provider.id == "openai_oauth_direct"
-            ? NativeOAuthFlow.codexCLISessionOffer(dataRoot: oauthDataRoot)
-            : nil
+        lastError = nil
+        await appModel.loadProvidersForChat()
     }
 
     /// User accepted the "use your existing Codex CLI sign-in" offer: record
@@ -264,7 +252,7 @@ struct OAuthSignInButton: View {
                 dataRoot: oauthDataRoot)
             cliConsentRepairMessage = "Unreadable consent was backed up as \(backup.lastPathComponent). Choose Use it or Ignore again."
             lastError = nil
-            cliSessionOffer = NativeOAuthFlow.codexCLISessionOffer(dataRoot: oauthDataRoot)
+            await refreshStatus()
         } catch {
             lastError = UserFacingError.message(error, action: "repair the consent file")
         }

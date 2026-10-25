@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
 
+// Blueprint: | `CausalTransitionEvidence.swift` | `CausalTransitionEvidence`: immutable pre-transition assignment and evidence-class values; observational metadata grants no authority |
+
 /// Immutable assignment captured before an observed transition begins.
 ///
 /// This is evidence metadata, not authority. Production observational rows

@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `TurnDeadline.swift` | `TurnDeadline` class; shared active-work deadline pauses while awaiting a person |
 
 public final class TurnDeadline: @unchecked Sendable {
     @TaskLocal private static var current: [TurnDeadline] = []
@@ -61,6 +62,8 @@ public final class TurnDeadline: @unchecked Sendable {
     /// the moment the ceiling passes: a task group would still wait for a
     /// stuck operation to observe its cancellation before the scope closes.
     /// The loser is cancelled and its late result is discarded.
+    /// This bounds the response, not execution. Callers must keep exclusion
+    /// and resources inside `work` until its actual exit, even after timeout.
     public static func withDeadline<T: Sendable>(
         seconds: TimeInterval,
         _ work: @escaping @Sendable () async throws -> T

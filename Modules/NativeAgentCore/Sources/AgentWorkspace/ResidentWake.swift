@@ -3,6 +3,7 @@ import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ResidentWake.swift` | `ResidentWake`; arrival queue/claims stamp their beginning DataRootLife; pending work from another life (no stamp is the first life) reads stopped/restored and cannot wake, hand back or accept; retained original arrival content/evidence remains visible |
 
 /// Her one way to be woken between turns (Wave 2 #9, Agent 10-02). Something
 /// resolves (a reply lands with no turn of hers carrying it, a wake to another
@@ -14,7 +15,7 @@ import PersistenceCore
 ///   later rides the next one or a live turn;
 /// - at most three wakes per thread until it rests an hour, so she and an
 ///   agent cannot keep waking each other.
-/// Every wake waits for free time and the end of quiet hours.
+/// Wakes wait for free time; AttentionRouter holds delivery to the person during quiet hours.
 /// No timer of its own: the delegation event runner reads `nextDeadline` and
 /// watches this ledger. Callers name a reason and the items; `reason` heads
 /// the wake ("what resolved").
@@ -30,6 +31,8 @@ package final class ResidentWake: @unchecked Sendable {
     package struct Item: Codable, Sendable, Equatable {
         /// One arrival, once: an id kept today is not a second arrival.
         package var id: String
+        package var lifeID: String?
+        package var state: String?
         package var line: String
         package var recoveredFrom: String?
         package var recovery: AgentLocalHealth?
@@ -60,8 +63,9 @@ package final class ResidentWake: @unchecked Sendable {
         package var isReach: Bool { id.hasPrefix("reach:") }
 
         package var renderedLine: String {
-            guard let recoveredFrom, let recovery else { return line }
-            return line + ": " + recoveredFrom.replacingOccurrences(of: "_", with: " ")
+            let status = state == "stopped" ? "stopped (restored): " : ""
+            guard let recoveredFrom, let recovery else { return status + line }
+            return status + line + ": " + recoveredFrom.replacingOccurrences(of: "_", with: " ")
                 + " cleared at " + ISO8601DateFormatter().string(from: recovery.checkedAt) + "; " + recovery.detail
         }
 
@@ -79,6 +83,7 @@ package final class ResidentWake: @unchecked Sendable {
 
     struct Hop: Codable, Equatable { var count: Int; var at: Date }
     struct Ledger: Codable, Equatable {
+        var lifeID: String?
         var pending: [Item] = []
         /// Woken or taken, retained until the owning work clears them: dedupe and home.
         var recent: [Item] = []
@@ -95,9 +100,10 @@ package final class ResidentWake: @unchecked Sendable {
     static func read(_ root: URL) -> Ledger? {
         do {
             let ledger = try checkedRead(root)
-            for item in ledger.recent {
-                if item.acceptedAt == nil { owe(root, item: item) }
-                else { settle(root, item: item) }
+            // An older build's acceptance debt settles here too, should the
+            // process have ended between accepting and settling it.
+            for item in ledger.recent where item.acceptedAt != nil {
+                RepairOwed.settle(root, operation: "home.accept:" + item.id, evidence: .init(source: "agents/resident-wake.json", id: item.id))
             }
             return ledger
         }
@@ -105,12 +111,25 @@ package final class ResidentWake: @unchecked Sendable {
     }
 
     static func checkedRead(_ root: URL) throws -> Ledger {
+        var ledger: Ledger
         do {
-            return try JSONDecoder().decode(Ledger.self, from: Data(contentsOf: url(root)))
+            ledger = try JSONDecoder().decode(Ledger.self, from: Data(contentsOf: url(root)))
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return Ledger() }
+        let life = try DataRootLife.current(in: root)
+        for index in ledger.pending.indices where DataRootLife.life(of: ledger.pending[index].lifeID) != life {
+            ledger.pending[index].state = "stopped"
+            ledger.pending[index].reason = DataRootLife.stoppedReason
+        }
+        for index in ledger.recent.indices where ledger.recent[index].acceptedAt == nil && DataRootLife.life(of: ledger.recent[index].lifeID) != life {
+            ledger.recent[index].state = "stopped"
+            ledger.recent[index].reason = DataRootLife.stoppedReason
+        }
+        if DataRootLife.life(of: ledger.lifeID) != life { ledger.notBefore = nil; ledger.waitingForTurn = nil; ledger.lifeID = life }
+        return ledger
     }
 
-    private func update<T>(_ root: URL, _ edit: (inout Ledger) -> T) -> T? { kept(root, edit)?.result }
+    /// The edit's result once it is kept; nil when the ledger did not read or did not save.
+    private func update<T>(_ root: URL, _ edit: (inout Ledger) -> T) -> T? { kept(root, edit).flatMap { $0.saved ? $0.result : nil } }
 
     /// `saved` is false when the changed ledger could not be written.
     func kept<T>(_ root: URL, _ edit: (inout Ledger) -> T) -> (result: T, saved: Bool)? {
@@ -136,11 +155,15 @@ package final class ResidentWake: @unchecked Sendable {
     /// they could not be kept.
     @discardableResult
     package func request(dataRoot: URL, reason: String, items: [Item]) -> Bool {
-        kept(dataRoot) { ledger in
+        let life: String
+        do { life = try DataRootLife.current(in: dataRoot) }
+        catch { Self.storageFailure(dataRoot, error); return false }
+        return kept(dataRoot) { ledger in
             var known = Set((ledger.pending + ledger.recent).map(\.id))
             for var item in items where known.insert(item.id).inserted {
                 if ledger.pending.contains(where: { $0.key == item.key && $0.filedAt == item.filedAt && $0.routeWait != nil }) { continue }
                 item.reason = reason
+                item.lifeID = life
                 if let key = item.key {
                     ledger.pending.removeAll { $0.key == key }
                     if key.hasPrefix("carry.") { ledger.recent.removeAll { $0.key == key && $0.acceptedAt != nil } }
@@ -169,7 +192,7 @@ package final class ResidentWake: @unchecked Sendable {
     /// it said is no longer true, so its home line goes and a recurrence is a
     /// new arrival.
     package func clear(dataRoot: URL, key: String) {
-        // Its owner cleared it: any acceptance still owed for those arrivals settles.
+        // Its owner cleared it: a debt an older build filed for accepting those arrivals settles.
         guard let cleared = kept(dataRoot, { ledger -> [String] in
             let ids = (ledger.pending + ledger.recent).filter { $0.key == key }.map(\.id)
             ledger.pending.removeAll { $0.key == key }
@@ -183,7 +206,7 @@ package final class ResidentWake: @unchecked Sendable {
 
     private static func due(_ ledger: Ledger) -> Date? {
         guard ledger.waitingForTurn != true,
-              let first = ledger.pending.filter({ $0.routeWait == nil }).map({ $0.at.addingTimeInterval(max(window, $0.hold)) }).min() else { return nil }
+              let first = ledger.pending.filter({ $0.state != "stopped" && $0.routeWait == nil }).map({ $0.at.addingTimeInterval(max(window, $0.hold)) }).min() else { return nil }
         return max(first, ledger.lastWake?.addingTimeInterval(spacing) ?? .distantPast)
     }
 
@@ -208,7 +231,7 @@ package final class ResidentWake: @unchecked Sendable {
     }
 
     private static func readyItems(_ ledger: Ledger, now: Date) -> [Item] {
-        var ready = ledger.pending.filter { $0.routeWait == nil && now.timeIntervalSince($0.at) >= $0.hold }
+        var ready = ledger.pending.filter { $0.state != "stopped" && $0.routeWait == nil && now.timeIntervalSince($0.at) >= $0.hold }
         // A reach's reply is the message itself, so it wakes alone.
         if ready.contains(where: { !$0.isReach }) { ready.removeAll(where: \.isReach) }
         return ready
@@ -231,14 +254,19 @@ package final class ResidentWake: @unchecked Sendable {
             ledger.pending.removeAll { item in ready.contains { $0.id == item.id } }
             ledger.recent += ready
             var wake: [Item] = []
+            // One wake is one hop for each thread it carries, however many of its arrivals.
+            var admitted: [String: Bool] = [:]
             for item in ready {
                 if let thread = item.thread {
-                    var hop = ledger.hops[thread] ?? Hop(count: 0, at: now)
-                    if now.timeIntervalSince(hop.at) > Self.rest { hop.count = 0 }
+                    if admitted[thread] == nil {
+                        var hop = ledger.hops[thread] ?? Hop(count: 0, at: now)
+                        if now.timeIntervalSince(hop.at) > Self.rest { hop.count = 0 }
+                        let open = hop.count < Self.maxHops
+                        admitted[thread] = open
+                        if open { hop.count += 1; hop.at = now; ledger.hops[thread] = hop }
+                    }
                     // Past the cap it stays an arrival on home and wakes nothing.
-                    guard hop.count < Self.maxHops else { continue }
-                    hop.count += 1; hop.at = now
-                    ledger.hops[thread] = hop
+                    guard admitted[thread] == true else { continue }
                 }
                 wake.append(item)
             }
@@ -248,7 +276,6 @@ package final class ResidentWake: @unchecked Sendable {
             return (Self.text(wake, live: false), wake)
         }
         guard let claim, claim.saved else { return nil }
-        _ = Self.read(dataRoot)
         return claim.result
     }
 
@@ -296,7 +323,7 @@ package final class ResidentWake: @unchecked Sendable {
     package func take(dataRoot: URL, now: Date = Date()) -> (text: String, items: [Item])? {
         let taken = kept(dataRoot) { ledger -> (text: String, items: [Item])? in
             let ready = ledger.pending.filter {
-                now.timeIntervalSince($0.at) >= $0.hold && $0.agent == nil && !$0.isReach
+                $0.state != "stopped" && now.timeIntervalSince($0.at) >= $0.hold && $0.agent == nil && !$0.isReach
                     && $0.key?.hasPrefix("carry.") != true
             }
             guard !ready.isEmpty else { return nil }
@@ -304,26 +331,20 @@ package final class ResidentWake: @unchecked Sendable {
             ledger.recent += ready
             return (Self.text(ready, live: true), ready)
         }
-        guard let taken, taken.saved, let result = taken.result else { return nil }
-        for item in result.items { Self.owe(dataRoot, item: item) }
-        return result
+        guard let taken, taken.saved else { return nil }
+        return taken.result
     }
 
     private static func storageFailure(_ root: URL, _ error: Error) {
         RepairOwed.owe(root, id: UUID().uuidString, kind: .run, operation: "home.arrivals",
             owner: url(root).path,
             words: "Arrivals are unavailable: \(error.localizedDescription). Existing bytes were preserved. "
-                + "Call next_call for a bounded repair of this file, then accept the kept arrivals.",
-            nextCall: ToolFailureError.fileRepairCall(url(root), dataRoot: root, shape:
+                + "Ask the person to repair this file, then accept the kept arrivals.",
+            tap: ToolFailureError.fileRepairInstruction(url(root),
+                shape:
                 "Preserve every pending and recent record, optional field and hop. "
                 + "The JSON object requires pending and recent arrays and a hops object; each item requires id, line, reason, home, hold and at "
                 + "(seconds since 2001-01-01). Do not replay arrivals."))
-    }
-
-    private static func owe(_ root: URL, item: Item) {
-        RepairOwed.owe(root, id: "arrival-repair:" + item.id, kind: .run, operation: "home.accept:" + item.id,
-            owner: "agents/resident-wake.json#" + item.id, words: "This arrival is kept until you accept it.",
-            nextCall: ToolFailureError.call("app", ["action": .string("home.accept"), "args": .object(["id": .string(item.id)])]))
     }
 
     @discardableResult package func accept(dataRoot: URL, items: [Item]) -> Bool {
@@ -332,40 +353,36 @@ package final class ResidentWake: @unchecked Sendable {
                 ledger.recent[index].acceptedAt = Date()
             }
         })?.saved == true else { return false }
+        // A pending acceptance is not a fault: nothing owes repair for it now.
+        // A debt filed for it by an older build settles here, once.
         for item in items {
-            Self.settle(dataRoot, item: item)
+            RepairOwed.settle(dataRoot, operation: "home.accept:" + item.id, evidence: .init(source: "agents/resident-wake.json", id: item.id))
         }
         return true
     }
 
-    private static func settle(_ root: URL, item: Item) {
-        ExperienceStore.record(root, "arrival-repair:" + item.id) { store in
-            try await RepairOwed.settle(store, operation: "home.accept:" + item.id,
-                evidence: .init(source: "agents/resident-wake.json", id: item.id))
-        }
-    }
-
     package func accept(dataRoot: URL, id: String?) throws -> String {
         let ledger = try Self.checkedRead(dataRoot)
-        let items = ledger.recent.filter { $0.acceptedAt == nil && (id == nil || $0.id == id) }
+        let items = ledger.recent.filter { $0.state != "stopped" && $0.acceptedAt == nil && (id == nil || $0.id == id) }
         guard accept(dataRoot: dataRoot, items: items) else {
             throw PersistenceCoreError.ioFailure("Arrival acceptance could not be saved.")
         }
         RepairOwed.settle(dataRoot, operation: "home.arrivals", evidence: .init(source: "agents/resident-wake.json", id: "accepted"))
         for item in items {
             if let peer = item.agent {
-                ContactThread.consume(mine: false, source: peer, steeredBy: [], text: item.line) { peer, _ in
-                    AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
-                }
+                ContactThread.consume(.init(text: item.line, stamp: .init(source: peer, steeredBy: [], contact: true)),
+                    mark: { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) })
             }
         }
         return items.isEmpty ? "No claimed arrivals await acceptance." : Self.text(items, live: true)
     }
 
-    /// Home's own lines: arrivals, pending or not, that no other line names.
-    package static func homeItems(_ root: URL) -> [Item] {
-        guard let ledger = read(root) else { return [] }
-        return (ledger.pending + ledger.recent).filter { $0.home || $0.acceptedAt == nil }
+    /// Home's own lines: arrivals, pending or not, that no other line names;
+    /// and how many she was shown and has not accepted (MY QUEUE, not a repair).
+    static func homeItems(_ root: URL) -> (items: [Item], toAccept: Int) {
+        guard let ledger = read(root) else { return ([], 0) }
+        return ((ledger.pending + ledger.recent).filter { $0.home || $0.acceptedAt == nil },
+                ledger.recent.filter { $0.state != "stopped" && $0.acceptedAt == nil }.count)
     }
 
     package static func text(_ items: [Item], live: Bool) -> String {

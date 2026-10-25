@@ -2,8 +2,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import MacControl
-import MacAssistantStatus
+import MacIntegration
 import AttentionRouting
+// Blueprint: | `ConnectorActionPlatform.swift` | `ConnectorActionPlatform` protocol; `attentionRouter`, `macAction` |
 
 public enum ConnectorPlatformAction: Sendable {
     case calendarListUpcoming, remindersListDueToday, mailListRecent, messagesRecentThreads

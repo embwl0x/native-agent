@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import TrustPersistence
+// Blueprint: | `AppToolExecutor+UpkeepTarget.swift` | backup restore target validation |
 
 public struct QuietBackupRestoreFailure: Error {
     public let detail: String

@@ -4,6 +4,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+Affect.swift` | `CognitiveSubstrate`: `canonicalAffectProjection`, `decayAffectInMemory`, `applyAffectFromEvent` |
 
 extension CognitiveSubstrate {
     /// One fixed-time affect projection for sibling organs. Warmth and pressure

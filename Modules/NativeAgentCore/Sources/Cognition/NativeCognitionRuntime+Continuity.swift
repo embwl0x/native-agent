@@ -1,17 +1,20 @@
 // NativeCognitionRuntime+Continuity.swift
 // Phase 5 B (2026-10-03) — the local reads behind the two continuity cues.
-// Every read here is on-device and fail-open: a missing or unreadable source
-// contributes nothing, never a provider call, never a memory write.
+// On-device cue reads distinguish absent sources from unreadable evidence;
+// neither invokes a provider or writes a memory.
 
 import AgentConversations
 import ChatTurnRuntime
 import CognitiveSubstrate
 import Desk
+import DreamREMCycle
 import Foundation
 import os
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
+
+// Blueprint: | `NativeCognitionRuntime+Continuity.swift` | `NativeCognitionRuntime` continuity reads: dream residue, local gap cues and builder activity; absent and unreadable sources remain distinct |
 
 extension NativeCognitionRuntime {
     // MARK: - B1 dream residue
@@ -47,7 +50,8 @@ extension NativeCognitionRuntime {
     /// spent (`excluding`), returns before any embedding; the embedder is used
     /// only when it is already warm, never loaded during turn preparation; and
     /// the message vector is kept for a recompile of the same turn. A missing
-    /// or other-space cache asks its builder; this turn carries no residue.
+    /// or different-width cache asks its builder; this turn carries no residue.
+    /// The cache has no epoch: equal-width space changes are not detected.
     nonisolated static func dreamThemes(
         message: String,
         excluding: Set<String>,
@@ -82,12 +86,12 @@ extension NativeCognitionRuntime {
         }
         return CognitiveCueRead(file.phrases
             .filter { !excluding.contains($0.id) }
-            .map { CognitiveDreamTheme(id: $0.id, text: $0.text, score: Double(cosine($0.vector, query))) }
+            .map { CognitiveDreamTheme(id: $0.id, text: $0.text, score: VectorMath.cosine($0.vector, query)) }
             .filter { $0.score >= dreamThemeScoreFloor }
             .sorted { $0.score > $1.score })
     }
 
-    /// One message vector, kept: the same turn recompiled asks again.
+    /// One message vector keyed only by text; it carries no embedding epoch.
     private static let lastMessageVector = OSAllocatedUnfairLock<(String, [Float])?>(initialState: nil)
     private static let lastDreamTheme = OSAllocatedUnfairLock<(
         url: URL, stamp: SnapshotTailOpLog.FileStamp, file: DreamThemeFile
@@ -116,13 +120,13 @@ extension NativeCognitionRuntime {
     nonisolated static func livingDiary(dataRoot: URL, now: Date) throws -> LivingDiary? {
         let dir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
         guard FileManager.default.fileExists(atPath: dir.path) else { return nil }
-        guard let newest = try FileManager.default.contentsOfDirectory(atPath: dir.path)
-            .filter({ $0.range(of: #"^\d{4}-\d{2}-\d{2}\.md$"#, options: .regularExpression) != nil }).max()
+        guard let newest = try FileBackedDreamDiary(dataRoot: dataRoot)
+            .discover(in: .active, matching: .nightly).max(by: { $0.name < $1.name })
         else { return nil }
-        let url = dir.appendingPathComponent(newest)
+        let url = newest.url
         guard let written = try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date,
               now.timeIntervalSince(written) < dreamThemeLife else { return nil }
-        return LivingDiary(url: url, name: String(newest.dropLast(3)), written: written)
+        return LivingDiary(url: url, name: newest.stem, written: written)
     }
 
     /// The cached themes, when they were extracted from exactly this diary;
@@ -179,7 +183,7 @@ extension NativeCognitionRuntime {
         // embedder picks, the diary supplies every word.
         let center = vectors[candidates.count]
         let kept = candidates.indices
-            .sorted { cosine(vectors[$0], center) > cosine(vectors[$1], center) }
+            .sorted { VectorMath.cosine(vectors[$0], center) > VectorMath.cosine(vectors[$1], center) }
             .prefix(dreamThemeMaxPhrases)
             .sorted()
         let file = DreamThemeFile(
@@ -420,10 +424,4 @@ extension NativeCognitionRuntime {
         return (cut.lastIndex(of: " ").map { String(cut[..<$0]) } ?? String(cut)) + "…"
     }
 
-    nonisolated static func cosine(_ a: [Float], _ b: [Float]) -> Float {
-        guard a.count == b.count, !a.isEmpty else { return 0 }
-        var dot: Float = 0, na: Float = 0, nb: Float = 0
-        for i in a.indices { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
-        return na > 0 && nb > 0 ? dot / (na.squareRoot() * nb.squareRoot()) : 0
-    }
 }

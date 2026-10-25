@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `BrowserCaptureCache.swift` | `BrowserCaptureCache`: serialized bounded storage and grouped eviction of disposable perception artifacts; expired captures require new observation |
+
 /// Disposable observations only. Downloads, authored documents, profile state,
 /// and generated images never enter this owner. Old receipt paths may expire;
 /// callers must capture again rather than treating a missing file as evidence.

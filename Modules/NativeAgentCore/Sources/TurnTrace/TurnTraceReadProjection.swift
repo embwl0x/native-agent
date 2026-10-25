@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `TurnTraceReadProjection.swift` | `TurnTraceRow`, `TurnTraceGrouping`, `TurnTraceReplayReader`, `TurnInspectorGrouping`; PersistenceCore framing and TurnTraceEvent decoding shared by replay, recent, Doctor, recovery and guarded append reads; reports read coverage before window/kind policies; decoded terminal matching is independent of strict recovery coverage validation |
 
 /// Stable chronological evidence and metrics shared by the Inspector and phone summaries.
 public struct TurnTraceGroup: Identifiable, Sendable {
@@ -98,48 +99,52 @@ public struct TurnTraceReplayReader {
     public static func fileURL(for date: Date, root: URL) -> URL {
         TurnTracePersistLane.fileURL(for: date, root: root)
     }
+    public typealias ReadResult = (events: [TurnTraceEvent], report: JSONLReadReport)
 
-    /// Decode every well-formed JSONL row in `url` into events. Returns an empty
-    /// array if the file is absent (no turns recorded that day) — not an error.
-    /// Bad rows are counted in `skipped` for diagnostics.
-    public static func read(_ url: URL) -> (events: [TurnTraceEvent], skipped: Int) {
+    /// Missing files are empty; read failures throw and damaged framing stays in the report.
+    public static func read(_ url: URL) async throws -> ReadResult {
         let key = url.resolvingSymlinksInPath().path
         let before = TurnTraceReplayCache.fileStamp(url)
-        if let cached = replayCache.lookup(key: key, stamp: before) {
-            return cached
-        }
-        guard let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else {
-            return ([], 0)
-        }
-        let result = parse(text)
-        if let before,
-           before.byteCount <= TurnTraceReplayCache.maximumCacheableBytes,
+        if let cached = replayCache.lookup(key: key, stamp: before) { return cached }
+        let result: ReadResult = before == .absent ? ([], .clean) : try parse(Data(contentsOf: url))
+        if let before, before.byteCount <= TurnTraceReplayCache.maximumCacheableBytes,
            before == TurnTraceReplayCache.fileStamp(url) {
             replayCache.store(key: key, stamp: before, result: result)
         }
         return result
     }
 
-    /// Decode persisted rows while retaining the malformed-row count.
-    static func parse(_ text: String) -> (events: [TurnTraceEvent], skipped: Int) {
-        var events: [TurnTraceEvent] = []
-        var skipped = 0
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty else { continue }
-            let physicalByteCount = line.utf8.count + 1
-            guard let value = try? JSONValue.parse(Data(line.utf8)),
-                  let event = TurnTraceEvent(
-                    persistedJSONRow: value,
-                    physicalByteCount: physicalByteCount
-                  ) else {
-                skipped += 1
-                continue
-            }
-            events.append(event)
+    static func parse(_ data: Data) -> ReadResult {
+        let read = SwiftNativePersistenceCore.decodeJSONL(data) {
+            TurnTraceEvent(persistedJSONRow: $0, physicalByteCount: $1)
         }
-        return (events, skipped)
+        return (read.rows, read.report)
+    }
+
+    /// Positive terminal evidence among decoded rows. Recovery callers must
+    /// separately validate coverage before concluding a damaged feed is settled.
+    static func containsTerminal(forTurn turnId: String, in events: [TurnTraceEvent], status: String? = nil) -> Bool {
+        events.contains { event in
+            guard event.turnId == turnId, TurnTraceEvent.isTerminalKind(event.kind) else { return false }
+            guard let status else { return true }
+            guard case .object(let payload) = event.payload else { return false }
+            return payload["status"] == .string(status)
+        }
+    }
+
+    static func decode(_ rows: [JSONValue], report: JSONLReadReport) -> ReadResult {
+        let events = rows.compactMap(TurnTraceEvent.init(jsonRow:))
+        var report = report
+        report.malformedLineCount += rows.count - events.count
+        return (events, report)
+    }
+
+    static func tail(_ url: URL, limit: Int, maxBytes: Int) async throws
+        -> (events: [TurnTraceEvent], report: JSONLReadReport, bytesRead: Int, truncated: Bool) {
+        let read = try await SwiftNativePersistenceCore().tailJSONLReadReceipt(url, limit: limit, maxBytes: maxBytes)
+        let result = decode(read.rows, report: JSONLReadReport(
+            malformedLineCount: read.malformedJSONRowCount, physicalLineCount: read.physicalRowsScanned))
+        return (result.events, result.report, read.bytesRead, read.truncatedToByteWindow)
     }
 }
 
@@ -150,7 +155,7 @@ public struct TurnTraceReplayReader {
 /// 2 MiB are deliberately not retained to bound decoded-event memory when the
 /// user browses an unusually large historical day.
 final class TurnTraceReplayCache: @unchecked Sendable {
-    typealias Result = (events: [TurnTraceEvent], skipped: Int)
+    typealias Result = TurnTraceReplayReader.ReadResult
 
     enum FileStamp: Equatable {
         case absent
@@ -222,96 +227,19 @@ public struct TurnTraceRow: Sendable {
 }
 
 extension TurnTraceReplayReader {
-    /// Retains the Doctor window reader's selective malformed-row accounting.
+    /// Validate the retained physical window before applying the Doctor's kind/time policy.
     public static func scan(
         _ path: URL, budget: Int, floor: Date, kinds: Set<String>, handle: (TurnTraceRow) -> Void
-    ) -> (truncated: Bool, malformedLines: Int, matchedRows: Int)? {
-        guard let (text, truncated) = tail(path, budget: budget) else { return nil }
-        var malformedLines = 0
+    ) async -> (truncated: Bool, malformedLines: Int, matchedRows: Int)? {
+        guard let read = try? await tail(path, limit: Int.max, maxBytes: budget) else { return nil }
         var matchedRows = 0
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard kinds.contains(where: { line.contains($0) }) else { continue }
-            // The substring hit above is only a CANDIDATE: a valid
-            // context.ready or provider.requestStarted row can mention a
-            // requested kind inside its payload. Parse first, and decide
-            // "malformed" only on a line that genuinely failed to parse as
-            // a trace row. A row that parsed fine and simply carries a
-            // different top-level kind is someone else's row, not a defect.
-            guard let data = String(line).data(using: .utf8),
-                  let value = try? JSONValue.parse(data),
-                  case .object(let row) = value
-            else {
-                malformedLines += 1
-                continue
-            }
-            guard case .string(let kind)? = row["kind"] else {
-                // A trace row with no top-level kind really is malformed.
-                malformedLines += 1
-                continue
-            }
-            // Not ours. Silence, not a corruption warning.
-            guard kinds.contains(kind) else { continue }
-            guard case .string(let ts)? = row["ts"],
-                  let stamp = TurnTraceEvent.parseISO8601(ts)
-            else {
-                // One of ours, but undatable — that is a real defect.
-                malformedLines += 1
-                continue
-            }
-            guard stamp >= floor else { continue }
-            var payload: [String: JSONValue] = [:]
-            if case .object(let object)? = row["payload"] { payload = object }
-            let turnId: String = {
-                if case .string(let value)? = row["turnId"] { return value }
-                return ""
-            }()
+        for event in read.events where kinds.contains(event.kind) && event.ts >= floor {
             matchedRows += 1
-            handle(
-                TurnTraceRow(
-                    kind: kind,
-                    ts: stamp,
-                    turnId: turnId,
-                    sessionId: stringValue(row["sessionId"]),
-                    surface: stringValue(row["surface"]),
-                    payload: payload
-                )
-            )
+            let payload: [String: JSONValue] = if case .object(let fields) = event.payload { fields } else { [:] }
+            handle(TurnTraceRow(kind: event.kind, ts: event.ts, turnId: event.turnId,
+                sessionId: event.sessionId, surface: event.surface, payload: payload))
         }
-        return (truncated, malformedLines, matchedRows)
-    }
-
-    /// Read at most `budget` bytes from the END of `path`. Returns nil only
-    /// when the file exists but cannot be read or decoded — the caller turns
-    /// that into a FAIL. The bool says whether the head was cut.
-    private static func tail(_ path: URL, budget: Int) -> (String, Bool)? {
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return nil }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd() else { return nil }
-        let base = size > UInt64(budget) ? size - UInt64(budget) : 0
-        let truncated = base > 0
-        // A byte-offset tail can land mid-UTF8. Nudge the start forward a few
-        // bytes rather than calling a perfectly readable day unreadable. A
-        // WHOLE-file read that will not decode really is unreadable, so the
-        // nudge only applies to a tailed read.
-        for nudge in 0...(truncated ? 4 : 0) {
-            let start = base + UInt64(nudge)
-            guard start <= size,
-                  (try? handle.seek(toOffset: start)) != nil,
-                  let data = try? handle.readToEnd(),
-                  var text = String(data: data, encoding: .utf8)
-            else { continue }
-            if truncated, let newline = text.firstIndex(of: "\n") {
-                // Drop the partial first line the byte cut produced.
-                text = String(text[text.index(after: newline)...])
-            }
-            return (text, truncated)
-        }
-        return nil
-    }
-
-    static func stringValue(_ value: JSONValue?) -> String? {
-        if case .string(let string)? = value, !string.isEmpty { return string }
-        return nil
+        return (read.truncated, read.report.malformedLineCount, matchedRows)
     }
 }
 
@@ -418,7 +346,11 @@ public enum TurnInspectorGrouping {
     /// Events with turnId "unknown" are still grouped (under that id) so a
     /// direct-engine-caller turn is visible rather than silently dropped.
     public static func group(_ events: [TurnTraceEvent]) -> [InspectorTurnCard] {
-        TurnTraceGrouping.group(events).map { group in
+        cards(TurnTraceGrouping.group(events))
+    }
+
+    public static func cards(_ groups: [TurnTraceGroup]) -> [InspectorTurnCard] {
+        groups.map { group in
             InspectorTurnCard(
                 id: group.id, surface: group.surface, sessionId: group.sessionId,
                 rows: group.events.enumerated().map { offset, event in
@@ -429,23 +361,6 @@ public enum TurnInspectorGrouping {
                 llmTokens: group.llmTokens, ttftMs: group.ttftMs
             )
         }
-    }
-
-    public static func updating(
-        _ events: [TurnTraceEvent],
-        previous: [String: [TurnTraceEvent]],
-        cards: [InspectorTurnCard]
-    ) -> (events: [String: [TurnTraceEvent]], cards: [InspectorTurnCard]) {
-        let grouped = Dictionary(grouping: events, by: \.turnId)
-        let retained = Dictionary(uniqueKeysWithValues: cards.map { ($0.id, $0) })
-        let updated = grouped.flatMap { id, events -> [InspectorTurnCard] in
-            guard !Task.isCancelled else { return [] }
-            if previous[id] == events, let card = retained[id] { return [card] }
-            return group(events)
-        }.sorted {
-            $0.startedAt == $1.startedAt ? $0.id > $1.id : $0.startedAt > $1.startedAt
-        }
-        return (grouped, updated)
     }
 
     // MARK: Row construction (per-kind shaping)

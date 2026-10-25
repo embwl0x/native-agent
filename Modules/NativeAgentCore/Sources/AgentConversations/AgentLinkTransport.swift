@@ -1,5 +1,6 @@
 @_exported import AgentLinkTransport
 import Foundation
+// Blueprint: | `AgentLinkTransport.swift` | Re-exports `AgentLinkTransport` |
 
 extension AgentPeerHTTP {
     public static func send(_ request: AgentA2AWire.Request, bearerToken: String? = nil,

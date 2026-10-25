@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `StudioCanon.swift` | Append-only membership, evidence-bound proposal references and unchanged native identity/fingerprints (fixed 90-day silence ledger units); editable `Resources/abilities/studio-canon.js` owns proposal selection/reasons and the next silence deadline; native counts/entry ids cannot be supplied by the part, native capacity and agent-only decision/append authority remain |
 
 // MARK: - The museum's canon — desk 903 phase 4
 //
@@ -12,10 +13,10 @@ import PersistenceCore
 //
 // ── WHAT THIS FILE IS, AND IS NOT ────────────────────────────────────────────
 // It is the LAW and the LEDGER, and nothing else:
-//   • `StudioCanonLaw` — pure. Evidence in, PROPOSALS out. It has no clock of
-//     its own, no store, no approval inbox, and no way to write anything. That
-//     is what makes "no auto-canonization" structural rather than promised: the
-//     only thing this code can produce is a request for her decision.
+//   • `StudioCanonLaw` exports neutral facts to studio-canon.js and binds its
+//     proposal references back to native evidence. Identity and membership
+//     stay here; selection, reasons and the next silence deadline are hers.
+//     Neither the part nor this adapter can append a canon decision.
 //   • `canon.jsonl` — append-only promote/demote rows, each naming the evidence
 //     entry ids that argued for it and WHO decided. A demotion does not erase a
 //     promotion; both rows stay, so the canon's own history reads as the record
@@ -28,7 +29,7 @@ import PersistenceCore
 //
 // ── WHY RECURRENCE, AND WHY A PULL ───────────────────────────────────────────
 // Two independent doors, either of which is enough:
-//   1. RECURRENCE — `recurrenceThreshold` distinct later entries linking back to
+//   1. RECURRENCE — the seed's threshold of distinct later entries linking back to
 //      the work with `deepens` or `echoes`. Not `revises` and not
 //      `contradicts`: those are her arguing with an earlier judgment, and an
 //      argument is not evidence that a work has become load-bearing.
@@ -40,7 +41,7 @@ import PersistenceCore
 // ── AND WHY SILENCE DEMOTES ──────────────────────────────────────────────────
 // A canon that only ever grows is a favourites list with extra steps. If
 // nothing has been written about a canon work and nothing has pulled it for
-// `silenceWindow`, that is a PROPOSAL to demote — never a demotion. She may
+// the seed's silence window, that is a PROPOSAL to demote — never a demotion. She may
 // look at it and say it still holds.
 
 // MARK: - Vocabulary
@@ -250,6 +251,7 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
     public var recallHits: Int
     public var lastActivityAt: String
     public var elapsedSilenceWindows: Int
+    public var reasonLine: String
 
     public init(
         action: StudioCanonAction,
@@ -260,6 +262,7 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
         recurrenceCount: Int,
         recallHits: Int,
         lastActivityAt: String,
+        reasonLine: String,
         elapsedSilenceWindows: Int = 0
     ) {
         self.action = action
@@ -271,6 +274,7 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
         self.recallHits = recallHits
         self.lastActivityAt = lastActivityAt
         self.elapsedSilenceWindows = elapsedSilenceWindows
+        self.reasonLine = reasonLine
     }
 
     /// The LANE key: this work, this direction. At most one card may be OPEN on
@@ -303,37 +307,15 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
         return parts.joined(separator: "\u{1f}")
     }
 
-    /// The card's reason line — states the evidence and stops. No adjective
-    /// about the work, no suggested answer.
-    public var reasonLine: String {
-        switch evidenceKind {
-        case .recurrence:
-            return "\(recurrenceCount) later entries deepen or echo this work. "
-                + "That is recurrence, not a rating — you kept coming back to it."
-        case .pulledInProduction:
-            return "This work's pointer was pulled \(recallHits) time(s) in live judgments. "
-                + "It is being used, not just filed."
-        case .silence:
-            return "Nothing has been written about this work and nothing has pulled it "
-                + "since \(lastActivityAt.isEmpty ? "it entered the canon" : lastActivityAt). "
-                + "Demote it, or say it still holds and it stays."
-        }
-    }
 }
 
 // MARK: - The law
 
 public enum StudioCanonLaw {
-    /// N later entries that deepen/echo a work. Her brief says "N later
-    /// entries"; three is the smallest number that is a pattern rather than a
-    /// pair, and the plan names it.
-    public static let recurrenceThreshold = 3
-    /// One real production pull is enough. The whole point of phase 5 was that
-    /// a pointer nobody calls has failed; a pointer that IS called has proved
-    /// something about the work it points at.
-    public static let recallThreshold = 1
-    /// 90 days of nothing — no new entry, no recall.
-    public static let silenceWindow: TimeInterval = 90 * 24 * 60 * 60
+    /// Existing silence fingerprints count these fixed ledger windows. The
+    /// editable proposal/deadline policy lives in studio-canon.js; changing it
+    /// cannot reinterpret the identity of an argument already decided.
+    public static let silenceIdentityWindow: TimeInterval = 90 * 24 * 60 * 60
     /// Bound on one pass. Canon-tending is deliberate and low-frequency; an
     /// inbox of twenty cards is homework, which the design forbids.
     public static let maximumProposalsPerPass = 3
@@ -374,74 +356,71 @@ public enum StudioCanonLaw {
         return result
     }
 
-    /// THE ONLY THING THIS FILE PRODUCES. Evidence in, proposals out — never a
-    /// row, never a write, never a canonization.
-    ///
-    /// `now` is passed in rather than read: the law has no clock, so a test and
-    /// production run the same code.
-    public static func proposals(
+    /// Export neutral facts, then bind the part's references back to those
+    /// facts. The part supplies no counts, entry ids, membership or identity.
+    public static func project(
         evidence: [StudioCanonWorkEvidence],
         membership: [String: StudioCanonMember],
         now: Date,
-        parseISO: (String) -> Date? = { StudioClock.parseISO($0) }
-    ) -> [StudioCanonProposalDraft] {
-        var drafts: [StudioCanonProposalDraft] = []
-
-        // Promotions: only for works that are NOT already in the canon.
-        for work in evidence.sorted(by: { $0.workKey < $1.workKey }) {
-            guard membership[work.workKey] == nil else { continue }
-            let recurrence = uniqued(work.recurrenceEntryIDs)
-            if recurrence.count >= recurrenceThreshold {
-                drafts.append(StudioCanonProposalDraft(
-                    action: .promote,
-                    workTitle: work.title,
-                    workCreator: work.creator,
-                    evidenceKind: .recurrence,
-                    evidenceEntryIDs: recurrence,
-                    recurrenceCount: recurrence.count,
-                    recallHits: work.recallHits,
-                    lastActivityAt: work.lastActivityAt
-                ))
-            } else if work.recallHits >= recallThreshold {
-                drafts.append(StudioCanonProposalDraft(
-                    action: .promote,
-                    workTitle: work.title,
-                    workCreator: work.creator,
-                    evidenceKind: .pulledInProduction,
-                    evidenceEntryIDs: recurrence,
-                    recurrenceCount: recurrence.count,
-                    recallHits: work.recallHits,
-                    lastActivityAt: work.lastActivityAt
-                ))
+        deadlineDate: @Sendable (String) -> Date? = { NativeTimestampFormat.parseISO8601FractionalFirst($0) },
+        decide: @Sendable (JSONValue) async throws -> JSONValue
+    ) async throws -> (drafts: [StudioCanonProposalDraft], nextAt: Date?) {
+        let works = Dictionary(evidence.map { ($0.workKey, $0) }, uniquingKeysWith: { first, _ in first })
+        let activity = Dictionary(evidence.map { ($0.workKey, $0.lastActivityAt) }, uniquingKeysWith: { max($0, $1) })
+        func stamp(_ key: String, _ member: StudioCanonMember) -> String { max(works[key]?.lastActivityAt ?? "", member.since) }
+        func seconds(_ stamp: String) -> JSONValue { NativeTimestampFormat.parseISO8601FractionalFirst(stamp).map { .double($0.timeIntervalSince1970) } ?? .null }
+        func deadlineSeconds(_ stamp: String) -> JSONValue { deadlineDate(stamp).map { .double($0.timeIntervalSince1970) } ?? .null }
+        let workFacts: [JSONValue] = evidence.sorted { $0.workKey < $1.workKey }.map { work in
+            .object(["key": .string(work.workKey), "title": .string(work.title),
+                "creator": work.creator.map(JSONValue.string) ?? .null,
+                "recurrence_entry_ids": .array(uniqued(work.recurrenceEntryIDs).map(JSONValue.string)),
+                "recurrence_count": .int(Int64(uniqued(work.recurrenceEntryIDs).count)),
+                "recall_hits": .int(Int64(work.recallHits)), "last_activity_at": .string(work.lastActivityAt)])
+        }
+        let memberFacts: [JSONValue] = membership.keys.sorted().compactMap { key in
+            membership[key].map { member in
+                .object(["key": .string(key), "title": .string(member.workTitle),
+                    "creator": member.workCreator.map(JSONValue.string) ?? .null,
+                    "evidence_entry_ids": .array(member.evidenceEntryIDs.map(JSONValue.string)),
+                    "last_signal": .string(stamp(key, member)), "last_signal_seconds": seconds(stamp(key, member)),
+                    "deadline_signal_seconds": deadlineSeconds(max(activity[key] ?? "", member.since))])
             }
         }
-
-        // Demotions: canon that has gone silent for the whole window.
-        let evidenceByKey = Dictionary(
-            evidence.map { ($0.workKey, $0) }, uniquingKeysWith: { first, _ in first }
-        )
-        for key in membership.keys.sorted() {
-            guard let member = membership[key] else { continue }
-            // The latest signal of life: activity if there is any, otherwise the
-            // day it entered the canon. A work promoted yesterday is never
-            // silent, whatever the evidence table does or does not hold.
-            let lastActivity = evidenceByKey[key]?.lastActivityAt ?? ""
-            let stamp = [lastActivity, member.since].filter { !$0.isEmpty }.max() ?? ""
-            guard let last = parseISO(stamp) else { continue }
-            guard now.timeIntervalSince(last) >= silenceWindow else { continue }
-            drafts.append(StudioCanonProposalDraft(
-                action: .demote,
-                workTitle: member.workTitle,
-                workCreator: member.workCreator,
-                evidenceKind: .silence,
-                evidenceEntryIDs: member.evidenceEntryIDs,
-                recurrenceCount: evidenceByKey[key]?.recurrenceEntryIDs.count ?? 0,
-                recallHits: evidenceByKey[key]?.recallHits ?? 0,
-                lastActivityAt: stamp,
-                elapsedSilenceWindows: Int(now.timeIntervalSince(last) / silenceWindow)
-            ))
+        let facts = JSONValue.object(["now": .double(now.timeIntervalSince1970),
+            "evidence": .array(workFacts), "members": .array(memberFacts)])
+        struct Choice: Decodable { let key: String; let action: String; let evidenceKind: String; let reasonLine: String }
+        struct Selection: Decodable { let proposals: [Choice]; let nextAt: Double? }
+        let selection = try JSONDecoder().decode(Selection.self, from: try await decide(facts).serializedData(pretty: false))
+        var seen = Set<String>()
+        let drafts = try selection.proposals.map { choice -> StudioCanonProposalDraft in
+            guard seen.insert(choice.action + "|" + choice.key).inserted,
+                  !choice.reasonLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw PersistenceCoreError.ioFailure("Canon returned a duplicate proposal or an empty reason.")
+            }
+            if choice.action == "promote", let work = works[choice.key], membership[choice.key] == nil,
+               let kind = StudioCanonEvidenceKind(rawValue: choice.evidenceKind), kind != .silence {
+                let ids = uniqued(work.recurrenceEntryIDs)
+                guard kind == .recurrence ? !ids.isEmpty : work.recallHits > 0 else {
+                    throw PersistenceCoreError.ioFailure("Canon proposed recurrence or a production pull without a native witness.")
+                }
+                return StudioCanonProposalDraft(action: .promote, workTitle: work.title, workCreator: work.creator,
+                    evidenceKind: kind, evidenceEntryIDs: ids, recurrenceCount: ids.count, recallHits: work.recallHits,
+                    lastActivityAt: work.lastActivityAt, reasonLine: choice.reasonLine)
+            }
+            if choice.action == "demote", choice.evidenceKind == "silence", let member = membership[choice.key],
+               let last = NativeTimestampFormat.parseISO8601FractionalFirst(stamp(choice.key, member)) {
+                return StudioCanonProposalDraft(action: .demote, workTitle: member.workTitle, workCreator: member.workCreator,
+                    evidenceKind: .silence, evidenceEntryIDs: member.evidenceEntryIDs,
+                    recurrenceCount: works[choice.key]?.recurrenceEntryIDs.count ?? 0, recallHits: works[choice.key]?.recallHits ?? 0,
+                    lastActivityAt: stamp(choice.key, member), reasonLine: choice.reasonLine,
+                    elapsedSilenceWindows: Int(max(0, now.timeIntervalSince(last)) / silenceIdentityWindow))
+            }
+            throw PersistenceCoreError.ioFailure("Canon selected a proposal without matching native evidence or membership.")
         }
-        return drafts
+        if let next = selection.nextAt, !next.isFinite || next <= now.timeIntervalSince1970 {
+            throw PersistenceCoreError.ioFailure("Canon's next deadline must be a finite future instant.")
+        }
+        return (drafts, selection.nextAt.map(Date.init(timeIntervalSince1970:)))
     }
 
     private static func uniqued(_ values: [String]) -> [String] {
@@ -611,7 +590,7 @@ public extension SwiftNativeStudioStore {
         maximumTrackedWorks: Int = 256
     ) async {
         guard !titles.isEmpty else { return }
-        let stamp = StudioClock.nowISO(now)
+        let stamp = NativeTimestampFormat.sixDigitUTCOffset(now)
         try? FileManager.default.createDirectory(
             at: canonDirectory, withIntermediateDirectories: true
         )

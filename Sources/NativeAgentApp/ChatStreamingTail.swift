@@ -1,5 +1,7 @@
 import SwiftUI
 
+// Blueprint: | `ChatStreamingTail.swift` | `StreamingTailBubble` and observer: row-local live text updates without republishing the whole transcript |
+
 /// The live content of ONE streaming transcript row.
 ///
 /// User, 2026-09-14 ("snappy is a requirement"): a streamed chunk used to

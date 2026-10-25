@@ -136,6 +136,24 @@ Live slots are scoped to the sense and source file. Supervision restarts a
 failed helper from its notebook without a retry timer; a repeated failure cause
 marks that version unavailable with a reason and news. Missing, non-executable
 or launch-blocked helpers are unavailable immediately. Repair and switch on to retry.
+Source subscriptions retain only their newest material and signal the existing
+part-wake owner. `EnginePartWake` admits the unattended interpretation under
+Autonomy, serially with that part's other wakes; capture and transport stay with
+the source. While Autonomy is off, the wake waits on the existing trust-policy
+change path with its source slot and helper generation intact, including senses
+without a wake header. On resume it interprets the newest retained material;
+a retired helper generation cannot interpret a later edge.
+The registry assigns each selected lifetime an in-memory identity under its
+publication lock. Disable, replacement and unavailable reporting retire only
+that selection's live helpers, passive on-call helpers and pending admissions;
+accepted human on-call work settles with its caller. Part wakes carry the
+unattended observation context, while the person's view events explicitly carry
+human origin; on-call admission retains that distinction through settlement.
+Returning to an earlier version or a bundled default creates a new lifetime.
+Late retirement and failure reporting from the old lifetime cannot stop or mark
+the new one unavailable. The registry returns whether it accepted an availability
+report for the selected lifetime; a rejected report posts no availability news,
+while the accepted human request still receives its own failure result.
 Registry read failures preserve the saved bytes and report the repair; they never mean no sense.
 
 Helper → app (API messages have `id` and `callID`; progress has only `id`):
@@ -181,15 +199,15 @@ Helper → app (API messages have `id` and `callID`; progress has only `id`):
   `timeout`. A failed context is never reused.
 
 Launch contract: P2 uses `/usr/bin/sandbox-exec -p <profile> <helper>` and
-`SenseSandboxProfile.build(reach:helperURL:scratch:dataRoot:personaRoot:language:)`.
+`SenseSandboxProfile.build(reach:helperURL:scratch:dataRoot:personaRoot:)`.
 Scratch must be a new owned 0700 directory outside data/persona roots. Deny by
 default; declared extra paths are read-only, the entire app data/persona roots
 and credential stores are always denied. Host reach resolves to exact IPs
 before spawn, with no wildcard grant; shared-IP hosting is the granularity
 Seatbelt can enforce. JS exposes no direct OS/network API. Extra reads still
 go through source.read and the app must enforce reach there. All source material
-delivery must retain the same private-store exclusions; supplied bytes never
-bypass them. Network resolution
+delivery shares the private-root policy, explicitly permitting workspace files
+even inside the data root; the helper itself has no such exception. Network resolution
 failure is `bad_reach`, never a broad network fallback. JSC has a watchdog per
 entry (SPI unavailable = `unsupported`); P2 owns outer accepted-progress stall
 detection and memory caps, for authored JavaScript execution. App-served plug reply

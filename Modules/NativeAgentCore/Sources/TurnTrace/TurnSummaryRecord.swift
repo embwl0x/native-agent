@@ -1,11 +1,11 @@
 import Foundation
-import PersistenceCore
+// Blueprint: | `TurnSummaryRecord.swift` | `TurnSummaryRecord`, `TurnSummaryFile`, `TurnSummaryComputer`, `TurnSummarySource` |
 
 // MARK: - Turn Inspector W4 — per-turn SUMMARY records for the iCloud snapshot lane
 //
 // The iOS read-only inspector does NOT receive the full per-event stream (size
-// budget — turn_traces files run to 20k rows/day). Instead the Mac sync engine
-// computes a compact summary PER TURN off the persisted day file and writes a
+// budget — turn_traces files run to 20k rows/day). The engine's Inspector
+// projection supplies a compact summary PER TURN, and Mac sync writes a
 // single bounded `turn_summaries.json` into the iCloud snapshot dir. iOS decodes
 // it with its own lenient struct (it cannot import this target) and renders a
 // flat list of turn cards.
@@ -15,9 +15,9 @@ import PersistenceCore
 // content. Events are already redacted at emission (W1/W2); this lane goes
 // further and emits counts/metrics exclusively.
 //
-// The mapping reuses the EXISTING `TurnTraceGrouping.group(_:)` so grouping /
-// ordering / token+ttft summarization logic is not duplicated. This file only
-// projects each `TurnTraceGroup` down to the summary shape + computes the
+// The mapping reads the engine's already grouped `InspectorTurnCard`s, so
+// grouping / ordering / token+ttft summarization is not repeated. It only
+// projects each card down to the summary shape + computes the
 // cheap per-kind breakdown, then applies the size budget.
 
 // MARK: - TurnSummaryRecord
@@ -62,9 +62,8 @@ public struct TurnSummaryFile: Codable, Sendable, Equatable {
 
 // MARK: - TurnSummaryComputer (pure projection + size budget)
 
-/// Pure transform: a flat `[TurnTraceEvent]` list (today's persisted day file,
-/// optionally yesterday's appended) → a bounded `TurnSummaryFile`. No IO, no
-/// actor — testable from an explicit event array.
+/// Pure transform: the engine's grouped Inspector cards → a bounded
+/// content-free `TurnSummaryFile`. No independent IO or grouping.
 public enum TurnSummaryComputer {
 
     /// Hard cap on the number of turns carried in the snapshot. Newest-first;
@@ -98,15 +97,11 @@ public enum TurnSummaryComputer {
     /// injectable for deterministic truncation tests; production callers use the
     /// defaults.
     public static func compute(
-        from events: [TurnTraceEvent],
+        from cards: [InspectorTurnCard],
         encoder: JSONEncoder = TurnSummaryComputer.makeEncoder(),
         maxTurns: Int = TurnSummaryComputer.maxTurns,
         maxBytes: Int = TurnSummaryComputer.maxBytes
     ) -> TurnSummaryFile {
-        // Reuse the existing grouping — newest-started turn first, rows sorted
-        // chronologically within each turn. We only read summary-level fields +
-        // each row's kind, allow-list filtered below — never content.
-        let cards = TurnTraceGrouping.group(events)
         let totalTurnsSeen = cards.count
 
         func capped(_ s: String?) -> String? {
@@ -116,7 +111,7 @@ public enum TurnSummaryComputer {
 
         var all: [TurnSummaryRecord] = cards.prefix(maxTurns).map { card in
             var kinds: [String: Int] = [:]
-            for row in card.events {
+            for row in card.rows {
                 let key = allowedKinds.contains(row.kind) ? row.kind : otherKindBucket
                 kinds[key, default: 0] += 1
             }
@@ -173,34 +168,28 @@ public enum TurnSummaryComputer {
     }
 }
 
-// MARK: - TurnSummarySource (reads the persisted day file via the live root)
+// MARK: - TurnSummarySource (the engine projection's persisted reader)
 
 /// Reads today's (and optionally yesterday's) persisted turn-trace day files
 /// from the SAME root the live persist lane writes to — env override
 /// (`NATIVE_AGENT_TURN_TRACE_ROOT`) → process static → `defaultDataRoot()` — and
-/// decodes the rows with the parse-resilient `TurnTraceReplayReader` (malformed
-/// rows skipped, never crashes). Pure-ish: a directory parameter makes it
-/// testable without touching the live feed.
+/// decodes through `TurnTraceReplayReader`. Read failures or incomplete framing
+/// throw so the snapshot publisher cannot label a partial read as a complete day.
 public enum TurnSummarySource {
-
-    /// The trace root the live lane resolves to. Mirrors
-    /// `TurnTracePersistLane.resolvedDataRoot()` so summaries read exactly where
-    /// W1/W2 wrote, honoring the test override seam.
-    public static func liveRoot() -> URL {
-        TurnTracePersistLane().resolvedDataRoot()
-    }
 
     /// Load + decode today's (and optionally yesterday's) day files under `root`,
     /// returning the concatenated events. Yesterday is appended SECOND so today's
     /// events keep their natural arrival index for stable tie-breaking inside the
     /// grouping (the grouping sorts by ts anyway; index only breaks exact ties).
-    public static func loadEvents(root: URL, now: Date = Date(), includeYesterday: Bool = true) -> [TurnTraceEvent] {
+    public static func loadEvents(root: URL, now: Date = Date(), includeYesterday: Bool = true) async throws -> [TurnTraceEvent] {
         var out: [TurnTraceEvent] = []
-        let today = TurnTraceReplayReader.read(TurnTraceReplayReader.fileURL(for: now, root: root))
+        let today = try await TurnTraceReplayReader.read(TurnTraceReplayReader.fileURL(for: now, root: root))
+        guard today.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
         out.append(contentsOf: today.events)
         if includeYesterday {
             let yDate = Calendar.current.date(byAdding: .day, value: -1, to: now) ?? now
-            let yesterday = TurnTraceReplayReader.read(TurnTraceReplayReader.fileURL(for: yDate, root: root))
+            let yesterday = try await TurnTraceReplayReader.read(TurnTraceReplayReader.fileURL(for: yDate, root: root))
+            guard yesterday.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
             out.append(contentsOf: yesterday.events)
         }
         return out

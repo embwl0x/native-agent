@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MacFourVerbsContracts.swift` | `MacFourVerbsSupplementalTarget`, `MacFourVerbsSupplement`, `MacFourVerbsSupplementalPerceptionSource`; four verbs dispatch through `MacControlClient` |
 
 /// A target discovered by the fused screenshot/vision lane. The addressing
 /// tokens remain on this side of the four-verb wall: the model sees the label
@@ -214,6 +215,11 @@ public struct MacFourVerbsReply: Sendable, Equatable {
         self.ok = ok
         self.text = text
         var detail = detail
+        for key in ["error", "reason", "failure_code"] {
+            if detail[key] == .string("ax_untrusted") || detail[key] == .string("accessibility_untrusted") {
+                detail[key] = .string("accessibility_not_trusted")
+            }
+        }
         if !ok, detail["remedy"] == nil, case .string(let code)? = detail["error"] {
             detail["remedy"] = Self.privacyRemedy(code)
         }

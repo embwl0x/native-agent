@@ -1,8 +1,8 @@
 import Foundation
 import BackgroundLoops
 import DoctorChecks
-import PersistenceCore
 import Privacy
+// Blueprint: | `DoctorLoopHealth.swift` | `DoctorLoopHealth`, `LoopHealthVerdict`; health, dormancy and schedule interpretation of supplied manager observations, plus bounded failure-receipt parsing |
 
 // Live scheduler state and bounded durable receipts distinguish persistent
 // failures from transient failures without changing scheduling or due clocks.
@@ -98,26 +98,16 @@ public enum DoctorLoopHealth {
     /// floor holds up to 6 ticks, so 3 = half the window solidly failing.
     public static let persistentFailureThreshold = 3
 
-    /// The scheduler sets nextTickAt = lastTickAt + interval on every recorded
-    /// tick, so the spread is a faithful interval estimate; loops that have not
-    /// ticked yet fall back to the 5-minute manager default.
-    public static func estimatedInterval(for observation: LoopStatus) -> TimeInterval {
-        if let last = observation.lastRun, let next = observation.nextRun, next > last {
-            return next.timeIntervalSince(last)
-        }
-        return 300
-    }
-
-    /// Grace window = max(3 × estimated interval, 30 min).
+    /// Grace window = max(3 × registered interval, 30 min).
     public static func graceWindow(for observation: LoopStatus) -> TimeInterval {
-        max(3 * estimatedInterval(for: observation), 30 * 60)
+        max(3 * observation.interval, 30 * 60)
     }
 
     /// How far past `nextRun` a loop may drift before Doctor calls it overdue.
-    /// Half an estimated interval, floored at 60s, so ordinary tick jitter and
+    /// Half the registered interval, floored at 60s, so ordinary tick jitter and
     /// a tick body that legitimately runs long never flap the verdict.
     public static func overdueTolerance(for observation: LoopStatus) -> TimeInterval {
-        max(estimatedInterval(for: observation) / 2, 60)
+        max(observation.interval / 2, 60)
     }
 
     /// Pure health rule. Incidents stay compact; only occurrences confirmed
@@ -159,8 +149,8 @@ public enum DoctorLoopHealth {
             ?? "never started"
         let restarts = listener.restartCount == 1 ? "1 restart" : "\(listener.restartCount) restarts"
         let detail = "Event listener \(listener.active ? "restarted but not yet delivering" : "is down")"
-            + " (\(listener.consecutiveEnds) consecutive stream end(s), \(restarts), \(endedPhrase))."
-            + (listener.lastError.map { " \($0)" } ?? "")
+            + " (\(listener.consecutiveEnds) consecutive stream end(s), \(restarts), \(endedPhrase))"
+            + (listener.lastError.map { "; last listener error: \($0.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))" } ?? "") + "."
         let level: LoopHealthLevel = listener.consecutiveEnds >= eventListenerFailureThreshold
             ? .fail
             : .warn
@@ -174,7 +164,7 @@ public enum DoctorLoopHealth {
     public static let dormancyFloor: TimeInterval = 7 * 24 * 60 * 60
 
     public static func dormancyThreshold(for observation: LoopStatus) -> TimeInterval {
-        max(dormancyFloor, 3 * estimatedInterval(for: observation))
+        max(dormancyFloor, 3 * observation.interval)
     }
 
     /// True when the loop's last tick was a skip that IS evidence of health:
@@ -234,10 +224,10 @@ public enum DoctorLoopHealth {
         let lead = observation.lastSuccessfulWorkAt == nil
             ? "Registered and ticking, but it has NEVER completed any work"
             : "Registered and ticking, but no work completed in \(describeAge(idle))"
-        let reason = observation.lastResult.map { " Last outcome: \($0)." } ?? ""
+        let reason = observation.lastResult.map { "; last outcome: \($0.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))" } ?? ""
         return (
             .warn,
-            "\(lead) (dormancy bound \(describeAge(threshold))).\(reason)"
+            "\(lead) (dormancy bound \(describeAge(threshold)))\(reason)."
         )
     }
 
@@ -250,7 +240,7 @@ public enum DoctorLoopHealth {
         return LoopHealthVerdict(
             loopId: base.loopId,
             level: level,
-            detail: "\(base.detail) \(listener.detail)"
+            detail: base.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; " + listener.detail
         )
     }
 
@@ -280,7 +270,7 @@ public enum DoctorLoopHealth {
             return LoopHealthVerdict(
                 loopId: observation.name,
                 level: .fail,
-                detail: "Failing persistently (at least \(recentFailures) failures in \(describeAge(window))): \(lastError). Last tick \(age) ago."
+                detail: "Failing persistently (at least \(recentFailures) failures in \(describeAge(window))); last tick \(age) ago; last failure: \(lastError.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))."
             )
         }
         return LoopHealthVerdict(
@@ -289,7 +279,7 @@ public enum DoctorLoopHealth {
             // Never ticked: the lane could not be built (its configuration
             // could not be read), so the error is why it cannot run.
             detail: observation.lastRun == nil ? "Cannot run: \(lastError)."
-                : "Last tick failed: \(lastError). Last tick \(age) ago."
+                : "Last tick failed \(age) ago: \(lastError.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))."
         )
     }
 
@@ -313,14 +303,14 @@ public enum DoctorLoopHealth {
             LoopHealthVerdict(loopId: observation.name, level: level, detail: detail)
         }
         let lastTickPhrase = observation.lastRun
-            .map { "Last tick \(describeAge(now.timeIntervalSince($0))) ago." }
-            ?? "It has never ticked."
+            .map { "last tick \(describeAge(now.timeIntervalSince($0))) ago." }
+            ?? "it has never ticked."
 
         if let reason = observation.disabledReason {
             return verdict(.off, "Off: \(reason).")
         }
         guard observation.running else {
-            return verdict(.fail, "Not running: registered, but no scheduler task is active. \(lastTickPhrase)")
+            return verdict(.fail, "Not running: registered, but no scheduler task is active; \(lastTickPhrase)")
         }
         if observation.executing {
             let age = observation.executionStartedAt
@@ -328,14 +318,14 @@ public enum DoctorLoopHealth {
             if let age, age > observation.executionTimeout + overdueTolerance(for: observation) {
                 return verdict(
                     .fail,
-                    "Active tick exceeded its \(describeAge(observation.executionTimeout)) watchdog. \(lastTickPhrase)"
+                    "Active tick exceeded its \(describeAge(observation.executionTimeout)) watchdog; \(lastTickPhrase)"
                 )
             }
             let agePhrase = age.map { " for \(describeAge($0))" } ?? ""
             return verdict(.ok, "Active tick in progress\(agePhrase).")
         }
         guard let nextRun = observation.nextRun else {
-            return verdict(.fail, "Not scheduled: running, but no next tick is planned. \(lastTickPhrase)")
+            return verdict(.fail, "Not scheduled: running, but no next tick is planned; \(lastTickPhrase)")
         }
 
         let overdueBy = now.timeIntervalSince(nextRun)
@@ -363,9 +353,9 @@ public enum DoctorLoopHealth {
         }
         let grace = graceWindow(for: observation)
         if overdueBy > grace {
-            return verdict(.fail, "Overdue by \(describeAge(overdueBy)) (beyond \(describeAge(grace)) grace). \(lastTickPhrase)")
+            return verdict(.fail, "Overdue by \(describeAge(overdueBy)) (beyond \(describeAge(grace)) grace); \(lastTickPhrase)")
         }
-        return verdict(.warn, "Overdue by \(describeAge(overdueBy)). \(lastTickPhrase)")
+        return verdict(.warn, "Overdue by \(describeAge(overdueBy)); \(lastTickPhrase)")
     }
 
     private static func rank(_ level: LoopHealthLevel) -> Int {
@@ -457,8 +447,7 @@ public enum DoctorLoopHealth {
                 id: doctorCheckID,
                 title: "Background Loops",
                 status: "unmeasured",
-                detail: "No background loops are registered, so there is nothing to report on. "
-                    + "That is a missing signal, not a clean bill of health.",
+                detail: "No background loops are registered, so their health has not been measured.",
                 human_action: "Quit and reopen NativeAgent to start background scheduling, then run Doctor again."
             )
         }
@@ -495,50 +484,19 @@ public enum DoctorLoopHealth {
         if off > 0 { counts.append("\(off) off") }
         if notNeeded > 0 { counts.append("\(notNeeded) not needed") }
         counts.append("\(healthy) healthy")
-        var detail = "\(verdicts.count) background loop(s): \(counts.joined(separator: ", "))."
+        var detail = "\(verdicts.count) background loop(s): \(counts.joined(separator: ", "))"
         // `evaluate` sorts worst-first, so the head of the list IS the worst
         // offender; naming it means the pill's tooltip points somewhere.
         if let worst = verdicts.first, worst.level.isFault {
-            detail += " Worst: \(worst.loopId) — \(worst.detail)"
+            detail += "; worst: \(worst.loopId) — \(worst.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))"
         }
         // Individual loop rows own repairs; this count creates no second debt.
         return CheckResult(source: "Background loop registrations",
             id: doctorCheckID,
             title: "Background Loops",
-            status: failing.isEmpty && dormantVerdicts.isEmpty && degraded.isEmpty ? "ok" : "unmeasured",
-            detail: detail
+            status: !failing.isEmpty ? "fail" : !dormantVerdicts.isEmpty || !degraded.isEmpty ? "warn" : healthy > 0 ? "ok" : off > 0 ? "off" : "not needed",
+            detail: detail + "."
         )
     }
 
-    /// Live variant of `doctorCheck`, sharing `current`'s inputs.
-    public static func doctorCheck(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        now: Date = Date()
-    ) async -> CheckResult {
-        let statuses = await BackgroundLoops.BackgroundLoopsManager.shared.status()
-        let receipts = recentFailureDates(
-            receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl")
-        )
-        return doctorCheck(
-            observations: statuses,
-            recentFailureDates: receipts,
-            now: now
-        )
-    }
-
-    /// Live snapshot for DoctorView: core manager states + receipts tail.
-    public static func current(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        now: Date = Date()
-    ) async -> [LoopHealthVerdict] {
-        let statuses = await BackgroundLoops.BackgroundLoopsManager.shared.status()
-        let receipts = recentFailureDates(
-            receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl")
-        )
-        return evaluate(
-            observations: statuses,
-            recentFailureDates: receipts,
-            now: now
-        )
-    }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import TrustCenter
+// Blueprint: | `MacSyncRemoteMacControl.swift` | `MacSyncRemoteMacControl` struct; `dispatch` |
 
 @MainActor
 public struct MacSyncRemoteMacControl {

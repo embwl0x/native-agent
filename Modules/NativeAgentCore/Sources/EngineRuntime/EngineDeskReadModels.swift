@@ -1,13 +1,13 @@
 import Foundation
+import Cognition
 import OSLog
-import ChatOrchestration
 import PersistenceCore
 import StandingBots
 import NativeAgentShared
 import Desk
-import GitHubConnector
 import TriggerScheduler
 import WorkshopExecution
+// Blueprint: | `EngineDeskReadModels.swift` | Desk movement, live activity, program-family eligibility and execution slices; `DeskPageSnapshot`, `DeskPageContent`, `DeskAttentionStrip` and `DeskPageWords`; Desk movement/activity projections and WorkStatusPublication; each AppModel retains its own publication/coalescing lifetime and supplies only WidgetKit reload; Shared DeskPageContent facts, project/deadline projection and execution verification values |
 public enum DeskLaneState<Row: Sendable>: Sendable {
     case unavailable(String)
     case rows([Row])
@@ -47,46 +47,6 @@ extension DeskLaneState where Row == WorkshopExecutionRecord {
             return .unavailable(boundedReason("Couldn't read the execution record(s) store — \(reason)"))
         }
         return .rows(rows)
-    }
-}
-
-public enum DeskGitHubWaitingRollup {
-    public static let toggleKey = "gh:waiting-upstream"
-    private static let palettePrefix = "ghwait:"
-
-    public static func paletteRows(in items: [GitHubCommandItem]) -> [DeskPaletteRow] {
-        items.compactMap { item in
-            guard case .waitingUpstream = item.state else { return nil }
-            return DeskPaletteRow(
-                handle: paletteHandle(for: item),
-                alias: "GH",
-                title: item.title.isEmpty ? "\(item.repository) #\(item.number)" : item.title,
-                project: item.repository,
-                status: "waiting upstream",
-                isActionable: false
-            )
-        }
-    }
-
-    public static func paletteHandle(for item: GitHubCommandItem) -> String {
-        palettePrefix + item.itemId
-    }
-
-    public static func isPaletteHandle(_ handle: String) -> Bool {
-        handle.hasPrefix(palettePrefix)
-    }
-
-    /// Produces the sole expansion key for a currently persisted waiting row.
-    /// A stale palette result, an arbitrary string, or a row whose watcher
-    /// state advanced since the palette opened must not expand anything.
-    public static func revealKeys(
-        forPaletteHandle handle: String,
-        in items: [GitHubCommandItem]
-    ) -> [String] {
-        guard let item = items.first(where: { paletteHandle(for: $0) == handle }),
-              case .waitingUpstream = item.state
-        else { return [] }
-        return [toggleKey]
     }
 }
 
@@ -140,7 +100,7 @@ public enum DeskLiveActivityPresentation {
         public let isStale: Bool
         public var asOfText: String { "as of \(DeskRelativeTimePresentation.text(for: generatedAt, now: now))" }
         /// The next semantic boundary only: snapshot becomes stale or one
-        /// active row ages out. DeskLiveReloader sleeps to this exact instant;
+        /// active row ages out. DeskFacade sleeps to this exact instant;
         /// there is no periodic freshness timer.
         public let nextRefreshAt: Date?
 
@@ -310,48 +270,76 @@ public enum DeskExecutionPresentation {
 }
 
 public struct DeskPageSnapshot: Sendable {
-    public var loaded = false
-    public var items: [DeskItem] = []
-    public var deskUnavailable: String?
-    public var generatedTs: String?
-    public var executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord> = .rows([])
-    public var github: DeskLaneState<GitHubCommandItem> = .rows([])
-    /// The same derived sequencing the projection renders (blockers, held
-    /// rows, subtree rollups). Computed ONCE per read, off the main actor,
-    /// because the projects lane asks it a question per row and `body` runs
-    /// far more often than the board changes.
+    public let id = UUID()
+    public var board: DeskBoardRead?
+    public var loaded: Bool { board != nil }
+    public var items: [DeskItem] { board?.items ?? [] }
+    /// Her MY QUEUE resolves by ID but is not a row on his board.
+    public var boardItems: [DeskItem] { items.filter { $0.project != MyQueue.project } }
+    public var deskUnavailable: String? { board?.deskError }
+    public var generatedTs: String? { board?.deskState?.generatedTs }
+    public var executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord> { board?.executions ?? .rows([]) }
+    public var overview: WorkOverview? { board?.overview }
+    /// Sequencing and every prepared row are derived once, off the main actor,
+    /// from this read's board, clock, bot rows, reminders and schedule.
     public var plan = DeskSequencing.Plan()
-    public var overview: WorkOverview?
+    public var now = Date.distantPast
+    public var jobs: [ScheduledJob] = []
+    public var nagConfig = DeskNagConfig()
+    public var herHour: DeskHerHourPresentation.State = .absent
+    public var missedBots: [DeskMissedBot] = []
+    public var timedBots: [DeskTimedBot] = []
+    public var rows: DeskPageContent.Projection = ([], [], [], [], [], [], [], [], nil)
 
     public static let empty = DeskPageSnapshot()
+    public init() {}
 
-    /// One canonical board read, with sequencing derived from those same items.
-    public static func load(desk: DeskFacade) async -> DeskPageSnapshot {
-        let read = await desk.loadBoard(includeOverview: true)
-        var snapshot = DeskPageSnapshot()
-        snapshot.loaded = true
-        // Her MY QUEUE is hers, not a row on his board.
-        snapshot.items = read.items.filter { $0.project != MyQueue.project }
-        snapshot.deskUnavailable = read.deskError
-        snapshot.generatedTs = read.deskState?.generatedTs
-        snapshot.executions = read.executions
-        snapshot.overview = read.overview
-        snapshot.github = read.github
-        snapshot.plan = DeskSequencing.compute(
-            DeskState(items: snapshot.items, generatedTs: ""))
-        return snapshot
+    public init(read: DeskBoardRead) {
+        board = read
+        plan = DeskSequencing.compute(DeskState(items: boardItems, generatedTs: ""))
+    }
+}
+
+/// One line from the engine's newest Her Hour trace, never another Desk task.
+/// An uninstalled lane is absent from the page.
+public enum DeskHerHourPresentation {
+    public enum State: Sendable, Equatable {
+        case absent
+        /// Her own closing line, plus how long ago. Nothing else: no verdict,
+        /// no outcome adjective we chose, no progress.
+        case line(text: String, symbol: String)
+    }
+
+    static func state(
+        installed: Bool,
+        entry: StudioWanderLane.TraceEntry?,
+        now: Date
+    ) -> State {
+        guard installed, let entry else { return .absent }
+        let words = entry.line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !words.isEmpty else { return .absent }
+        let when = DeskRelativeTimePresentation.text(forISO: entry.at, now: now)
+        return .line(text: "\(bounded(words)) · \(when)", symbol: symbol(entry.outcome))
+    }
+
+    /// Icons, not labels. The three endings are equal in standing — a decline is
+    /// not a lesser outcome — so none of them gets a word here that ranks it.
+    static func symbol(_ outcome: StudioWanderLane.Outcome) -> String {
+        switch outcome {
+        case .chose: return "eye"
+        case .declined: return "moon.zzz"
+        case .noArtifact: return "eye.slash"
+        }
+    }
+
+    static let maximumCharacters = 160
+
+    private static func bounded(_ value: String) -> String {
+        value.truncated(to: maximumCharacters, keeping: maximumCharacters - 1)
     }
 }
 
 public enum DeskAttentionStrip {
-    public static func sortedGitHubItems(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
-        items.sorted { l, r in
-            if l.updatedAt != r.updatedAt { return l.updatedAt > r.updatedAt }
-            if l.createdAt != r.createdAt { return l.createdAt > r.createdAt }
-            return l.itemId < r.itemId
-        }
-    }
-
     public static func sortedDeskItems(_ items: [DeskItem]) -> [DeskItem] {
         items.sorted { l, r in
             if l.updatedAt != r.updatedAt { return l.updatedAt > r.updatedAt }
@@ -362,28 +350,11 @@ public enum DeskAttentionStrip {
 
 }
 
-public enum DeskGitHubBucket: String, CaseIterable, Sendable {
-    case actionNeeded = "Action needed"
-    case legacyWork = "Finishing prior work"
-    case needsOwner = "Needs you"
-    case waiting = "Waiting upstream"
-    case attention = "Attention"
-    case resolved = "Recently resolved"
-
-    public static func bucket(for state: GitHubCommandItemState) -> Self {
-        switch state {
-        case .detected, .needsCodex: return .actionNeeded
-        case .codexWorking, .verifying: return .legacyWork
-        case .needsOwner: return .needsOwner
-        case .waitingUpstream: return .waiting
-        case .attention: return .attention
-        case .resolved: return .resolved
-        }
-    }
-
-}
-
 public enum DeskPageContent {
+    public typealias Projection = (projects: [ProjectRow], owner: [DeskItem], blocked: [DeskItem],
+        watches: [DeskItem], stale: [DeskItem], other: [DeskItem], history: [DeskItem],
+        executions: [WorkshopExecutionRecord], deadline: Date?)
+
     public static func active(_ items: [DeskItem]) -> [DeskItem] {
         DeskBoardLayout.activeItems(items)
     }
@@ -439,27 +410,6 @@ public enum DeskPageContent {
             return Int(now.timeIntervalSince(at) / 86_400) >= DeskProjection.staleThresholdDays
         }
     }
-
-    public static func githubNeedingAHand(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
-        DeskAttentionStrip.sortedGitHubItems(
-            items.filter { DeskGitHubBucket.bucket(for: $0.state) == .actionNeeded })
-    }
-
-    public static func githubNeedsOwner(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
-        DeskAttentionStrip.sortedGitHubItems(
-            items.filter { DeskGitHubBucket.bucket(for: $0.state) == .needsOwner })
-    }
-
-    public static func githubAttention(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
-        DeskAttentionStrip.sortedGitHubItems(
-            items.filter { DeskGitHubBucket.bucket(for: $0.state) == .attention })
-    }
-
-    public static func githubRest(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
-        let claimed = Set(
-            (githubNeedingAHand(items) + githubNeedsOwner(items) + githubAttention(items)).map(\.itemId))
-        return DeskAttentionStrip.sortedGitHubItems(items.filter { !claimed.contains($0.itemId) })
-    }
 }
 
 extension DeskPageContent {
@@ -467,11 +417,11 @@ extension DeskPageContent {
         item: DeskItem, execution: WorkshopExecutionRecord?, activity: DeskActivityState, parked: Bool
     )] {
         guard snapshot.deskUnavailable == nil else { return [] }
-        let state = DeskState(items: snapshot.items, generatedTs: "")
+        let state = DeskState(items: snapshot.boardItems, generatedTs: "")
         let evidence = DeskMovementPresentation.evidence(snapshot.executions.items)
         let familyParents = Set(DeskProgramFamilyPresentation.families(
-            from: DeskLaneState.rows(snapshot.items), executions: snapshot.executions, now: now).map(\.id))
-        return projects(snapshot.items, excluding: familyParents).map { item in
+            from: DeskLaneState.rows(snapshot.boardItems), executions: snapshot.executions, now: now).map(\.id))
+        return projects(snapshot.boardItems, excluding: familyParents).map { item in
             let handles = DeskParking.subtreeHandles(item.handle, in: state)
             let live = snapshot.executions.items
                 .filter { $0.deskHandle.map(handles.contains) ?? false }
@@ -525,12 +475,6 @@ public enum DeskPageWords {
 
     public static func plural(_ count: Int, _ singular: String, _ plural: String) -> String {
         count == 1 ? singular : plural
-    }
-
-    /// "a hundred and five" is right after "I'm watching" and wrong after "the
-    /// other". The article goes when a determiner already leads the phrase.
-    public static func withoutArticle(_ words: String) -> String {
-        words.hasPrefix("a ") ? String(words.dropFirst(2)) : words
     }
 }
 
@@ -603,50 +547,6 @@ public extension DeskPageContent {
         return named.isEmpty ? item.handle : named
     }
 
-    // MARK: GitHub
-
-    /// The remainder fold holds everything the three attention groups did not
-    /// claim: work in progress, work waiting upstream, and work already closed.
-    /// Closed work is finished, not moving, and waiting is not movement either,
-    /// so the title counts what the fold actually holds.
-    static func githubRestTitle(_ rest: [GitHubCommandItem]) -> String {
-        let closed = rest.filter { DeskGitHubBucket.bucket(for: $0.state) == .resolved }.count
-        let open = rest.count - closed
-        let others = rest.count == 1
-            ? "The other one"
-            : "The other \(DeskPageWords.withoutArticle(DeskPageWords.spelledLower(rest.count)))"
-        let verb = rest.count == 1 ? "is" : "are"
-        if open == 0 { return "\(others) \(verb) closed" }
-        if closed == 0 { return "\(others) \(verb) open, none needing a hand" }
-        return "\(others): \(DeskPageWords.spelledLower(open)) still open, "
-            + "\(DeskPageWords.spelledLower(closed)) closed"
-    }
-
-    /// "a hundred and twenty-one pull requests, sixteen need a hand". The noun
-    /// tells the truth about the mix: the watcher tracks issues too.
-    static func githubHeadline(_ items: [GitHubCommandItem]) -> String {
-        let total = items.count
-        let hands = githubNeedingAHand(items).count + githubNeedsOwner(items).count
-            + githubAttention(items).count
-        let allPRs = items.allSatisfy { $0.kind == .pullRequest }
-        let noun: String
-        if allPRs {
-            noun = DeskPageWords.plural(total, "pull request", "pull requests")
-        } else {
-            noun = "pull requests and issues"
-        }
-        let head = "I'm watching \(DeskPageWords.spelledLower(total)) \(noun)"
-        guard hands > 0 else { return head + ", none of them need a hand" }
-        return "\(head), \(DeskPageWords.spelledLower(hands)) need\(hands == 1 ? "s" : "") a hand"
-    }
-
-    static func githubTitle(_ item: GitHubCommandItem) -> String {
-        let named = TodayWords.line(item.title, limit: 110)
-        return named.isEmpty ? "\(item.repository) #\(item.number)" : named
-    }
-
-    /// repo · number · state-as-a-word · when. No pill, no colour.
-
     // MARK: Schedule
 
     /// Only enabled jobs run. The rows beneath this headline already say
@@ -705,7 +605,7 @@ public final class WorkStatusPublication {
         defer { workStatusInFlight = false }
         repeat {
             workStatusDirty = false
-            let board = await engine.desk.loadBoard(includeOverview: true)
+            let board = await engine.desk.refreshPage().board!
             let overview = board.overview!
             let waiting = overview.unavailable.isEmpty ? overview.needsYouCount : nil
             publishAttention(waiting, overview.unavailable.isEmpty ? overview.needsYouCounts : nil)
@@ -921,69 +821,6 @@ public enum DeskItemPresentation {
 
 }
 
-public enum DeskGitHubStatePillPresentation {
-    public struct Pill: Equatable {
-        public let label: String
-        public let tone: DeskPresentationTone
-    }
-
-    public static let stalledCallbackStatus = "stalled"
-
-    public static func pill(for item: GitHubCommandItem) -> Pill {
-        switch item.state {
-        case .detected, .needsCodex:
-            return Pill(label: "Action needed", tone: .warning)
-        case .codexWorking:
-            return Pill(label: "Codex working", tone: .info)
-        case .verifying:
-            return Pill(label: "Verifying", tone: .info)
-        case .needsOwner:
-            return Pill(label: "Needs you", tone: .warning)
-        case let .waitingUpstream(kind):
-            return Pill(label: waitingLabel(for: kind), tone: .neutral)
-        case let .attention(reason):
-            return attentionPill(reason: reason, callbackStatus: item.lastCallbackStatus)
-        case .resolved:
-            return Pill(label: "Resolved", tone: .success)
-        }
-    }
-
-    public static func waitingLabel(for kind: GitHubCommandWaitingKind) -> String {
-        switch kind {
-        case .review: return "Waiting for review"
-        case .ci: return "Waiting for checks"
-        case .maintainer: return "Waiting for maintainer"
-        case .readyToMerge: return "Ready to merge"
-        }
-    }
-
-    private static func attentionPill(
-        reason: GitHubCommandAttentionReason,
-        callbackStatus: String?
-    ) -> Pill {
-        let label: String
-        switch reason {
-        case .dispatchFailed: label = "Dispatch failed"
-        case .codexFailed:
-            label = normalizedCallbackStatus(callbackStatus) == stalledCallbackStatus
-                ? "Codex stalled"
-                : "Codex no result"
-        case .verificationFailed: label = "GitHub still actionable"
-        case .verificationReadFailed: label = "GitHub verification unreadable"
-        case .callbackOverdue: label = "Codex stalled"
-        case .codexBusy: label = "Legacy Codex retry"
-        case .stale: label = "Stale observation"
-        case .contradictoryState: label = "State needs review"
-        }
-        return Pill(label: label, tone: .danger)
-    }
-
-    private static func normalizedCallbackStatus(_ status: String?) -> String {
-        status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-    }
-}
-
-
 public extension DeskPageContent {
     struct ProjectRow: Identifiable, Sendable {
         public let id: String
@@ -1011,7 +848,7 @@ public extension DeskPageContent {
 
     private static func computeProjectRows(snapshot: DeskPageSnapshot, now: Date) -> [ProjectRow] {
         guard snapshot.deskUnavailable == nil else { return [] }
-        let state = DeskState(items: snapshot.items, generatedTs: "")
+        let state = DeskState(items: snapshot.boardItems, generatedTs: "")
         let plan = snapshot.plan
         return DeskPageContent.projectRows(snapshot, now: now).map { facts in
             let item = facts.item
@@ -1058,11 +895,9 @@ public extension DeskPageContent {
         snapshot loaded: DeskPageSnapshot, now presentationNow: Date,
         nags loadedNags: DeskNagConfig, timedBots timedSnapshot: [DeskTimedBot],
         jobStamps: [String], hourExpiry: Date?
-    ) -> (projects: [ProjectRow], owner: [DeskItem], blocked: [DeskItem], watches: [DeskItem],
-          stale: [DeskItem], other: [DeskItem], history: [DeskItem],
-          executions: [WorkshopExecutionRecord], deadline: Date?) {
+    ) -> Projection {
         let projects = computeProjectRows(snapshot: loaded, now: presentationNow)
-        let items = loaded.items
+        let items = loaded.boardItems
         let owner = DeskPageContent.waitingOnOwner(items)
         let blocked = DeskPageContent.blocked(items)
         let watches = DeskPageContent.freshWatches(items, now: presentationNow)
@@ -1106,7 +941,6 @@ public extension DeskPageContent {
             + items.compactMap { $0.pursuit?.lastWorkedAt }
             + loaded.executions.items.map(\.updatedAt)
             + loaded.executions.items.compactMap(\.lastMovementAt)
-            + loaded.github.items.map { $0.motorUpdatedAt ?? $0.updatedAt }
             + jobStamps
             + [loaded.generatedTs].compactMap { $0 }
         let relativeDates = relativeStamps.compactMap(UserDisplayFormatters.parseISOTimestamp)

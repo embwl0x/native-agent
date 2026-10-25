@@ -142,10 +142,7 @@ daily recovery registrations implemented by `Cognition/CognitiveBackgroundLoops.
 A reflection sweep requests spontaneous admission, so a quiet state need not
 spend a call.
 
-`backgroundCognitionGate` checks Low Power Mode, thermal pressure and
-organism loop posture. Conserve throttles expensive lanes with a 45-minute
-floor stored in process memory; sleep refuses. These mechanisms alone do not
-prove whole-app resource use over elapsed time.
+They are always on while the Mac is on (User 10-24): their model calls run at the provider, so no power, heat or tiredness gate defers or throttles any background lane.
 
 ## 6. Replay and reflection
 

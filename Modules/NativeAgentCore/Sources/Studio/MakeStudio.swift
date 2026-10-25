@@ -1,7 +1,10 @@
 import Foundation
+import AppKit
 import Observation
+import AuthoredCapabilities
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MakeStudio.swift` | Root-scoped artifact metadata, native decoding, durable version allocation and previews; generated-image registration is editable `Resources/abilities/make-generated.js`, composing native raw generation results with `make.add` (prompt/model metadata retained); native generation receipt paths are scoped to that call, and the registration primitive admits those verified app outputs while arbitrary files retain the workspace fence; `MakeStudio.Shelf` owns watcher/coalescing lifetime and publishes its read results through `LatestRead`; each preview file/revision owns L0 `PartFaces` for editable `Resources/abilities/make-title.js` (HTML title → prompt → filename); native unavailable/failed status accompanies the face, views only read their preview's snapshots; shutdown drains projections and cancellation never rearms a retired shelf |
 
 /// What she makes for User: mockups, screens, icons, artwork. Each piece is a
 /// ref with numbered versions, so an earlier one stays one click back and a
@@ -11,6 +14,10 @@ import PersistenceCore
 /// apart from studio/ (her taste journal), so a ref folder never reads as one
 /// of the journal's. A version is a copy: what User commented on stays as it was.
 public struct MakeStudio: Sendable {
+    /// Native generation receipt paths, scoped to its registration call. A
+    /// part cannot add provenance by naming a file or a directory in its input.
+    @TaskLocal public static var generatedImagePaths: Set<String> = []
+
     public struct Version: Codable, Sendable, Equatable {
         public let n: Int
         public let file: String
@@ -82,7 +89,7 @@ public struct MakeStudio: Sendable {
             let n = (meta.versions.last?.n ?? 0) + 1
             let ext = file.pathExtension.lowercased()
             let version = Version(n: n, file: ext.isEmpty ? "v\(n)" : "v\(n).\(ext)", prompt: prompt, model: model,
-                                  created: StudioClock.nowISO())
+                                  created: NativeTimestampFormat.sixDigitUTCOffset(Date()))
             let dir = folder(meta.ref)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try FileManager.default.copyItem(at: file, to: dir.appendingPathComponent(version.file))
@@ -94,43 +101,15 @@ public struct MakeStudio: Sendable {
         }
     }
 
-    /// image.generate's images, as versions of `ref` (a new ref when nil).
-    /// The envelope gains `make_ref` for what landed and `make_failed` for each
-    /// image that did not, with why; a requested ref is never swapped for a new one.
-    public static func registerGenerated(_ result: JSONValue, prompt: String, ref: String?, dataRoot: URL) -> JSONValue {
-        guard case .object(var response) = result, response["status"] == .string("ok"),
-              case .array(let images)? = response["images"] else { return result }
-        let studio = MakeStudio(dataRoot: dataRoot)
-        var ref = ref, landed = false, failed: [JSONValue] = []
-        let model: String? = if case .string(let name)? = response["model"] { name } else { nil }
-        for image in images {
-            guard case .object(let row) = image, case .string(let path)? = row["path"] else { continue }
-            do {
-                ref = try studio.add(URL(fileURLWithPath: path), ref: ref, prompt: prompt, model: model).ref
-                landed = true
-            } catch {
-                failed.append(.object(["path": .string(path), "error": .string(error.localizedDescription)]))
-            }
-        }
-        if landed, let ref { response["make_ref"] = .string(ref) }
-        if !failed.isEmpty { response["make_failed"] = .array(failed) }
-        return .object(response)
-    }
 }
 
 extension MakeStudio {
-    /// What User reads in the header: a mockup's own <title>, else an image's
-    /// prompt, else the file's name. The ref stays in the tooltip.
-    public static func title(_ version: MakeStudio.Version, file: URL) -> String {
-        if webTypes.contains(file.pathExtension.lowercased()),
-           let html = try? String(contentsOf: file, encoding: .utf8),
-           let open = html.range(of: "<title>", options: .caseInsensitive),
-           let close = html.range(of: "</title>", options: .caseInsensitive, range: open.upperBound..<html.endIndex) {
-            let text = html[open.upperBound..<close.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { return text }
-        }
-        if let prompt = version.prompt?.trimmingCharacters(in: .whitespacesAndNewlines), !prompt.isEmpty { return prompt }
-        return file.lastPathComponent
+    /// Prepared off-main, then handed to the renderer without mutating its image.
+    public struct Preview: Sendable {
+        public let file: URL
+        public let revision: Int
+        public let titleFaces: PartFaces?
+        public let image: NSImage?
     }
 
     public static let webTypes: Set = ["html", "htm", "xhtml", "svg"]
@@ -170,7 +149,6 @@ extension MakeStudio {
     @MainActor
     @Observable
     public final class Shelf {
-        public static let shared = Shelf()
         private var metadata: [String: MakeStudio.Meta] = [:]
         private var refs: [String] = []
         public private(set) var newest: MakeStudio.Meta?
@@ -178,66 +156,154 @@ extension MakeStudio {
         /// Why the shelf shows less than the disk holds; the last good
         /// membership and metadata stand meanwhile, never an empty shelf.
         public private(set) var fault: String?
-        private var studio: MakeStudio?
+        private nonisolated let studio: MakeStudio
         private var watcher: FileChangeWatcher?
         private var armed: [URL] = []
         private var pending: Set<URL> = []
-        private var loading = false
+        private var refresh: Task<Void, Never>?
+        private var lifecycle = UUID()
+        private var stopped = false
+        @ObservationIgnored private lazy var latest = LatestRead()
+        @ObservationIgnored private nonisolated let project: PartFaces.Call
+        @ObservationIgnored private var titleProjections: [String: (faces: PartFaces, task: Task<Void, Never>)] = [:]
+        @ObservationIgnored private var titleOrder: [String] = []
+        @ObservationIgnored private var previewReads: [UUID: Task<Preview, Never>] = [:]
+
+        public nonisolated init(dataRoot: URL, project: @escaping PartFaces.Call) {
+            studio = MakeStudio(dataRoot: dataRoot)
+            self.project = project
+        }
+
+        public nonisolated func file(_ ref: String, _ version: Version) -> URL { studio.url(ref, version) }
+        public nonisolated func folder(_ ref: String) -> URL { studio.folder(ref) }
+
+        public func preview(_ ref: String, _ version: Version, revision: Int) async -> Preview {
+            if stopped || Task.isCancelled { return Preview(file: file(ref, version), revision: revision, titleFaces: nil, image: nil) }
+            let id = UUID()
+            let read = Task { await preparePreview(ref, version, revision: revision) }
+            previewReads[id] = read
+            defer { previewReads.removeValue(forKey: id) }
+            return await withTaskCancellationHandler { await read.value } onCancel: { read.cancel() }
+        }
+
+        private func preparePreview(_ ref: String, _ version: Version, revision: Int) async -> Preview {
+            let file = file(ref, version)
+            let read = Task.detached(priority: .userInitiated) { () -> (JSONValue, String?, NSImage?) in
+                var html: JSONValue = .object(["state": .string("not_applicable")])
+                var unavailable: String?
+                if MakeStudio.webTypes.contains(file.pathExtension.lowercased()) {
+                    do { html = .object(["state": .string("available"), "text": .string(try String(contentsOf: file, encoding: .utf8))]) }
+                    catch { unavailable = "\(file.lastPathComponent) could not be decoded: \(error.localizedDescription)" }
+                }
+                return (.object(["file": .string(file.path), "revision": .int(Int64(revision)),
+                    "filename": .string(file.lastPathComponent), "html": html,
+                    "prompt": version.prompt.map(JSONValue.string) ?? .null]), unavailable,
+                    MakeStudio.imageTypes.contains(file.pathExtension.lowercased()) ? NSImage(contentsOf: file) : nil)
+            }
+            let (input, unavailable, image) = await withTaskCancellationHandler { await read.value } onCancel: { read.cancel() }
+            // Each file/revision has its own source, including concurrent page renders.
+            let key = "\(file.path) \(revision)"
+            let faces = titleProjections[key]?.faces ?? PartFaces(dataRoot: studio.dataRoot, call: project)
+            if !stopped, !Task.isCancelled {
+                let previous = titleProjections[key]?.task
+                previous?.cancel()
+                titleProjections[key] = (faces, Task {
+                    if let previous { await settle { await previous.value } }
+                    guard !stopped, !Task.isCancelled else { return }
+                    await faces.sourceChanged(id: "make-title", epoch: 0, input: input, unavailable: unavailable)
+                })
+                // Only recent previews keep live titles; each retired one stops its part watcher.
+                titleOrder.removeAll { $0 == key }
+                titleOrder.append(key)
+                while titleOrder.count > 4 {
+                    if let gone = titleProjections.removeValue(forKey: titleOrder.removeFirst()) { gone.task.cancel(); _ = gone.faces.stop() }
+                }
+            }
+            return Preview(file: file, revision: revision, titleFaces: faces, image: image)
+        }
 
         public func meta(_ ref: String?) -> MakeStudio.Meta? {
             ref.map { metadata[$0] } ?? newest
         }
 
-        public func open(dataRoot: URL) {
-            guard studio?.dataRoot != dataRoot else { return }
-            let studio = MakeStudio(dataRoot: dataRoot)
-            self.studio = studio
-            metadata = [:]
-            refs = []
-            newest = nil
-            loaded = false
+        public func start() {
+            guard !stopped, !loaded else { return }
             changed(studio.root)
         }
 
+        /// Terminal engine shutdown retires this root's shelf and its reads.
+        public func shutdown() -> Task<Void, Never> {
+            stopped = true
+            lifecycle = UUID()
+            watcher?.cancel()
+            watcher = nil
+            armed = []
+            pending.removeAll()
+            let refreshDrain = refresh
+            refreshDrain?.cancel()
+            refresh = nil
+            let reads = Array(previewReads.values)
+            for read in reads { read.cancel() }
+            let projections = Array(titleProjections.values)
+            for projection in projections { projection.task.cancel() }
+            titleProjections.removeAll()
+            titleOrder.removeAll()
+            let faceDrains = projections.map { $0.faces.stop() }
+            return Task.detached {
+                await settle {
+                    for read in reads { _ = await read.value }
+                    for projection in projections { await projection.task.value }
+                    for drain in faceDrains { await drain.value }
+                    if let refreshDrain { await refreshDrain.value }
+                }
+            }
+        }
+
         private func changed(_ path: URL) {
+            guard !stopped else { return }
             pending.insert(path)
-            guard !loading else { return }
-            loading = true
-            Task {
-                defer { loading = false }
-                while !pending.isEmpty {
-                    guard let studio = self.studio else { return }
+            guard refresh == nil else { return }
+            let lifecycle = self.lifecycle
+            refresh = Task {
+                defer { if self.lifecycle == lifecycle { refresh = nil } }
+                while !Task.isCancelled, self.lifecycle == lifecycle, !pending.isEmpty {
+                    let studio = self.studio
                     let changes = pending
                     pending.removeAll()
                     let previous = metadata
                     let previousRefs = refs
-                    let fresh = await Task.detached(priority: .utility) {
-                        var refs = previousRefs, faults: [String] = []
-                        if changes.contains(studio.root) {
-                            do {
-                                try FileManager.default.createDirectory(at: studio.root, withIntermediateDirectories: true)
-                                refs = try FileManager.default.contentsOfDirectory(atPath: studio.root.path).filter(MakeStudio.isRef)
-                            } catch {
-                                faults.append("\(studio.root.path) could not be read: \(error.localizedDescription)")
+                    await latest.read({
+                        let read = Task.detached(priority: .utility) {
+                            var refs = previousRefs, faults: [String] = []
+                            if changes.contains(studio.root) {
+                                do {
+                                    try FileManager.default.createDirectory(at: studio.root, withIntermediateDirectories: true)
+                                    refs = try FileManager.default.contentsOfDirectory(atPath: studio.root.path).filter(MakeStudio.isRef)
+                                } catch {
+                                    faults.append("\(studio.root.path) could not be read: \(error.localizedDescription)")
+                                }
                             }
-                        }
-                        let membership = Set(refs)
-                        var result = previous.filter { membership.contains($0.key) }
-                        for ref in refs where result[ref] == nil || changes.contains(studio.folder(ref).appendingPathComponent("meta.json")) {
-                            do { result[ref] = try studio.readMeta(ref) } catch {
-                                faults.append("\(ref)/meta.json could not be read: \(error.localizedDescription)")
+                            let membership = Set(refs)
+                            var result = previous.filter { membership.contains($0.key) }
+                            for ref in refs where result[ref] == nil || changes.contains(studio.folder(ref).appendingPathComponent("meta.json")) {
+                                if Task.isCancelled { break }
+                                do { result[ref] = try studio.readMeta(ref) } catch {
+                                    faults.append("\(ref)/meta.json could not be read: \(error.localizedDescription)")
+                                }
                             }
+                            return (result, refs, refs.compactMap { result[$0] }.max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") },
+                                    faults.isEmpty ? nil : faults.joined(separator: "; "))
                         }
-                        return (result, refs, refs.compactMap { result[$0] }.max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") },
-                                faults.isEmpty ? nil : faults.joined(separator: "; "))
-                    }.value
-                    guard self.studio?.dataRoot == studio.dataRoot else { continue }
-                    if fresh.0 != metadata { metadata = fresh.0 }
-                    refs = fresh.1
-                    if newest != fresh.2 { newest = fresh.2 }
-                    fault = fresh.3
-                    loaded = true
-                    rearm(studio)
+                        return await withTaskCancellationHandler { await read.value } onCancel: { read.cancel() }
+                    }, publish: { fresh in
+                        guard !Task.isCancelled, self.lifecycle == lifecycle else { return }
+                        if fresh.0 != metadata { metadata = fresh.0 }
+                        refs = fresh.1
+                        if newest != fresh.2 { newest = fresh.2 }
+                        fault = fresh.3
+                        loaded = true
+                        rearm(studio)
+                    })
                 }
             }
         }
@@ -249,8 +315,12 @@ extension MakeStudio {
             guard paths != armed else { return }
             armed = paths
             watcher?.cancel()
+            let lifecycle = self.lifecycle
             watcher = FileChangeWatcher(paths: paths) { [weak self] path in
-                Task { @MainActor in self?.changed(path.standardizedFileURL) }
+                Task { @MainActor in
+                    guard let self, self.lifecycle == lifecycle else { return }
+                    self.changed(path.standardizedFileURL)
+                }
             }
             // Close the registration race once, using the now-armed source.
             pending.formUnion(paths)

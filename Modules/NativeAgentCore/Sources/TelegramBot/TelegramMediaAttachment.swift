@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentShared
 
+// Blueprint: | `TelegramMediaAttachment.swift` | `TelegramMediaDownloader`: two-stage file metadata/download admission with declared-size and actual-byte bounds |
+
 // MARK: - TelegramMediaAttachment
 
 /// A Telegram media attachment (photo, voice, video, document, …).

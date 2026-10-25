@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `DeskObservation.swift` | `DeskObservationEvaluator`: pure externally observed drift, auto-resolution and verdict fingerprints for tracked references |
+
 // MARK: - Desk Wave 5 — the desk learns from OBSERVED REALITY
 //
 // Waves 1–4 made the desk a real project board: sequencing edges, one-call
@@ -57,7 +59,7 @@ public struct DeskObservedRef: Sendable, Equatable {
     public var source: String
     /// ISO stamp of the observation itself (not of the remote event).
     public var observedAt: String
-    /// Opaque change token for cadence learning: differing fingerprint between
+    /// Opaque change token for observation identity: differing fingerprint between
     /// passes == the thing changed. Not interpreted here.
     public var fingerprint: String
     /// When the source confirmed a transition from closed to open.
@@ -99,8 +101,7 @@ public struct DeskObservedRef: Sendable, Equatable {
 }
 
 /// What the desk got wrong, in reality's opinion. Each case is a CONTRADICTION,
-/// not a staleness complaint — a merely out-of-date cached field is the cadence
-/// lane's problem, not drift.
+/// not a staleness complaint — a merely out-of-date cached field is not drift.
 public enum DeskDriftKind: String, Sendable, CaseIterable, Equatable {
     /// Desk says blocked / waiting; every external thing it points at is done.
     case blockedButShipped = "blocked_but_shipped"

@@ -1,8 +1,9 @@
 import ApprovalTransactions
-import ChatOrchestration
+import ChatTurnContracts
 import Foundation
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `ToolInteractionResolving+Transactions.swift` | interaction lookup and transaction resolution |
 
 extension ToolInteractionResolving {
     public func interaction(id: String, sessionID: String, dataRoot: URL) async -> InlineInteraction? {

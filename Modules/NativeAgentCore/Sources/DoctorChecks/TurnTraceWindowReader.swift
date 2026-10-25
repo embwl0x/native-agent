@@ -2,11 +2,12 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+// Blueprint: | `TurnTraceWindowReader.swift` | Measurement-window policy and coverage through canonical TurnTrace framing |
 
 // MARK: - Bounded reader for the per-day turn-trace feed
 //
-// Shared by `PromptPrefixHealthCheck` and `SubconsciousVitalsCheck`. It exists
-// so both rows obey the same three rules, written once:
+// Shared by prefix health, subconscious vitals and model compensations. It
+// keeps their three measurement rules in one place:
 //
 //   1. BOUNDED. The feed is 20k rows/day and grows without a ceiling. A health
 //      row may not turn into an unbounded read, so each day file is TAILED to
@@ -149,7 +150,7 @@ enum TurnTraceWindowReader {
         kinds: Set<String>,
         budgetPerDay: Int = defaultBudgetPerDay,
         handle: (TurnTraceRow) -> Void
-    ) -> TurnTraceScanSummary {
+    ) async -> TurnTraceScanSummary {
         var summary = TurnTraceScanSummary()
         let dir = root.appendingPathComponent("turn_traces", isDirectory: true)
         let formatter = DateFormatter()
@@ -168,7 +169,7 @@ enum TurnTraceWindowReader {
             let path = dir.appendingPathComponent("\(name).jsonl")
             guard FileManager.default.fileExists(atPath: path.path) else { continue }
 
-            guard let result = TurnTraceReplayReader.scan(
+            guard let result = await TurnTraceReplayReader.scan(
                 path, budget: budgetPerDay, floor: cutoff, kinds: kinds, handle: handle
             ) else {
                 summary.unreadableDays.append(name)

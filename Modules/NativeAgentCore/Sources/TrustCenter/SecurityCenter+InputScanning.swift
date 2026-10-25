@@ -1,15 +1,16 @@
 import Foundation
 import PersistenceCore
+import Privacy
+// Blueprint: | `SecurityCenter+InputScanning.swift` | `SwiftNativeSecurityCenter`: audit `redactValue`, using Privacy's canonical detection predicates |
 
 extension SwiftNativeSecurityCenter {
     static func redactValue(_ value: JSONValue, keyPath: String = "") -> JSONValue {
-        let key = keyPath.lowercased()
-        if isSecretKey(key) {
+        if NativeAgentSecretRedactor.isSecretName(keyPath, use: .audit) {
             return .string("[REDACTED]")
         }
         switch value {
         case .string(let s):
-            if looksLikeSecret(s) {
+            if NativeAgentSecretRedactor.containsAuditSecret(s) {
                 return .string("[REDACTED]")
             }
             if s.count > 500 {
@@ -31,68 +32,4 @@ extension SwiftNativeSecurityCenter {
         }
     }
 
-    static func isSecretKey(_ key: String) -> Bool {
-        let needles = [
-            "password", "passphrase", "api_key", "apikey", "secret", "token",
-            "credential", "authorization", "auth", "cookie", "jwt", "bearer",
-            "private_key", "access_token", "refresh_token", "client_secret",
-        ]
-        return needles.contains(where: { key.contains($0) })
-    }
-
-    static func looksLikeSecret(_ value: String) -> Bool {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.contains("-----BEGIN") && trimmed.contains("PRIVATE KEY") { return true }
-        let lower = trimmed.lowercased()
-        if lower.hasPrefix("bearer ") && trimmed.count > 24 { return true }
-        if trimmed.hasPrefix("sk-") && trimmed.count > 20 { return true }
-        if trimmed.hasPrefix("ghp_") && trimmed.count > 20 { return true }
-        if trimmed.hasPrefix("xoxb-") && trimmed.count > 20 { return true }
-        if trimmed.range(of: #"sk-[A-Za-z0-9_\-]{10,}"#, options: .regularExpression) != nil { return true }
-        if trimmed.range(of: #"ghp_[A-Za-z0-9_]{10,}"#, options: .regularExpression) != nil { return true }
-        if trimmed.range(of: #"xoxb-[A-Za-z0-9_\-]{10,}"#, options: .regularExpression) != nil { return true }
-        if containsValidJWT(in: trimmed) { return true }
-        return false
-    }
-
-    /// Detect a real JWT token inside arbitrary text. The former implementation
-    /// split the *entire input string* on "." and treated three long chunks as
-    /// a JWT. A shell command that mentioned `Package.swift` twice therefore
-    /// became three chunks and was blocked as secret egress. Candidate tokens
-    /// must now be bounded base64url triplets whose header and payload decode
-    /// as JSON objects; ordinary dotted paths and filenames cannot qualify.
-    private static func containsValidJWT(in value: String) -> Bool {
-        let pattern = #"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
-        let fullRange = NSRange(value.startIndex..<value.endIndex, in: value)
-        for match in regex.matches(in: value, range: fullRange) {
-            guard let range = Range(match.range, in: value) else { continue }
-            let parts = value[range].split(separator: ".", omittingEmptySubsequences: false)
-            guard parts.count == 3,
-                  let header = decodeBase64URLJSON(parts[0]),
-                  decodeBase64URLJSON(parts[1]) != nil else {
-                continue
-            }
-            if header["alg"] != nil || header["typ"] != nil {
-                return true
-            }
-        }
-        return false
-    }
-
-    private static func decodeBase64URLJSON(_ segment: Substring) -> [String: Any]? {
-        var encoded = String(segment)
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        let remainder = encoded.count % 4
-        if remainder != 0 {
-            encoded += String(repeating: "=", count: 4 - remainder)
-        }
-        guard let data = Data(base64Encoded: encoded),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              let dictionary = object as? [String: Any] else {
-            return nil
-        }
-        return dictionary
-    }
 }

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryRecallScoring.swift` | `MemoryRecallScoring`: timestamp delegation, decay, literal kind extraction and record correction classification; mutation exceptions require explicit correction kind |
 
 // MARK: - Wave-1 semantics tunables (Agent's canon, 2026-06-09)
 
@@ -39,11 +40,8 @@ public let memorySupersessionCosineFloor: Double = 0.55
 public let memoryDecayHalfLifeDays: [String: Double] = [
     "volatile": 60, "project": 60, "operational": 60,
     "decision": 180, "note": 180, "incident": 180,
-    // The moments lane (2026-09-02). A moment she keeps reaching for stays —
-    // `updatedAt` moves on recall — and one she never returns to fades out of
-    // ranking without ever being deleted. Same 60-day shape as the volatile
-    // lane, which is the honest half-life for something that was true of one
-    // afternoon.
+    // Moment age decay reads updatedAt; recall changes only use_count and
+    // last_used_at, so access does not refresh this clock.
     "moment": 60,
 ]
 
@@ -55,26 +53,9 @@ public let memoryBM25LexicalBoost: Double = 0.25
 
 /// Pure decay math, separated for testability.
 public enum MemoryRecallScoring {
-    // Cached formatters — this runs per-candidate inside the recall hot loop;
-    // allocating ISO8601DateFormatter per call is the only real cost there
-    // (gpt-5.5 wave1 finding 5). Configured once, never mutated, and only
-    // used under `formatterLock`: recall runs from several tasks at once.
-    private static let formatterLock = NSLock()
-    nonisolated(unsafe) private static let fractionalFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-    nonisolated(unsafe) private static let plainFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
-
     /// Parse either ISO8601 variant the codebase writes (fractional + plain).
     public static func parseTimestamp(_ s: String) -> Date? {
-        formatterLock.lock(); defer { formatterLock.unlock() }
-        return fractionalFormatter.date(from: s) ?? plainFormatter.date(from: s)
+        NativeTimestampFormat.parseISO8601FractionalFirst(s)
     }
 
     /// Multiplier in (0, 1]: pow(0.5, age/halfLife) for kinds with a configured
@@ -94,10 +75,33 @@ public enum MemoryRecallScoring {
         0.9 + 0.1 * decayFactor(kind: kind, updatedAt: updatedAt, now: now)
     }
 
-    /// Extract the kind stamped by the #1 signal-carry (metadata.kind).
+    /// Kind values are literal: only a missing/non-string or empty value is absent.
     public static func kind(of metadata: JSONValue?) -> String? {
         guard case .object(let obj)? = metadata, case .string(let k)? = obj["kind"] else { return nil }
         return k.isEmpty ? nil : k
+    }
+
+    /// Mutation exceptions require the explicit kind, not projection-only tags
+    /// or historical correction metadata shapes.
+    static func isExplicitCorrection(_ metadata: JSONValue?) -> Bool {
+        kind(of: metadata) == "correction"
+    }
+
+    public static func isCorrection(_ record: MemoryRecord, tags: [String]) -> Bool {
+        if record.memoryKind?.lowercased() == "correction" || tags.contains("correction") { return true }
+        let metadata: [String: JSONValue]
+        if case .object(let object)? = record.extras { metadata = object } else { metadata = [:] }
+        guard let correction = record.correction ?? metadata["correction"] else { return false }
+        switch correction {
+        case .null, .bool(false): return false
+        case .object(let object):
+            if case .bool(let current)? = object["current"] { return current }
+            if case .bool(let active)? = object["active"] { return active }
+            return !object.isEmpty
+        case .array(let values): return !values.isEmpty
+        case .string(let value): return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .bool(true), .int, .double: return true
+        }
     }
 
     public static func lexicalTokens(_ text: String) -> [String] {

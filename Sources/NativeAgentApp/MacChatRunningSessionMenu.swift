@@ -2,6 +2,8 @@ import EngineRuntime
 import SwiftUI
 import NativeAgentShared
 
+// Blueprint: | `MacChatRunningSessionMenu.swift` | `MacChatRunningSessionMenu`: shared go-to menu for sessions with background turns |
+
 /// 658.14 — "Go to…" for the sessions running a turn in the background.
 ///
 /// Lives in its own file rather than inline in ChatView for a mechanical

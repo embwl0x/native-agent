@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ChatUpdateNote.swift` | Version note selection and launch transaction with supplied bundle resource/version inputs |
 
 /// U1 (User, 2026-09-10): after the app updates, the agent had no way to know
 /// what changed — someone asked theirs and it could not find out.

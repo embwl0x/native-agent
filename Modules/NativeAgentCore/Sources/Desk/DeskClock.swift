@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `DeskClock.swift` | `DeskClock` enum; `nowISO`, `commitStamp` |
 
 // Shared formatting for Desk and TaskLedger: instants are UTC stamps, calendar
 // days are the Mac's current zone (law 7); monotonic issuance belongs to Desk.

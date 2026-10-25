@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `NextGenStatusModels.swift` | `NextGenSummary`, `NextGenReceipt` structs |
 
 public struct NextGenSummary: Sendable, Hashable {
     public var status: String?
@@ -68,11 +69,6 @@ public struct NextGenPhaseRange: Sendable, Hashable {
     public init(start: Int, end: Int) {
         self.start = start
         self.end = end
-    }
-
-    public var displayValue: String? {
-        guard let start, let end else { return nil }
-        return start == end ? "\(start)" : "\(start)-\(end)"
     }
 }
 
@@ -204,10 +200,6 @@ public struct NextGenAction: Identifiable, Sendable, Decodable, Hashable {
         name ?? title ?? id
     }
 
-    public var displayStatus: String {
-        status ?? risk ?? "ready"
-    }
-
     public var displayDetail: String {
         if let description, !description.isEmpty {
             return description
@@ -303,10 +295,6 @@ public struct NextGenReceipt: Identifiable, Sendable, Decodable, Hashable {
 
     public var displayStatus: String {
         status ?? "recorded"
-    }
-
-    public var displayDetail: String {
-        detail ?? output ?? createdAt ?? actionId ?? "Next-gen receipt"
     }
 
     public init(

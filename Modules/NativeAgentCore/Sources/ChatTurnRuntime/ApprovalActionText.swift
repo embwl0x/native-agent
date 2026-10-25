@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `ApprovalActionText.swift` | `ApprovalActionText`: approval action/reason presentation; original arguments remain execution authority |
+
 /// Presentation only; the original arguments remain authoritative for execution.
 public enum ApprovalActionText {
     public static func actionName(_ tool: String) -> String {

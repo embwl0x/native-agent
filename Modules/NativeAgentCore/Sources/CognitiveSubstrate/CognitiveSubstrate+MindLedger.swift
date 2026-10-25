@@ -16,6 +16,8 @@ import NativeAgentCore
 import PersistenceCore
 import Studio
 
+// Blueprint: | `CognitiveSubstrate+MindLedger.swift` | `CognitiveSubstrate` mind ledger: bounded association suppressions and undo entries, persistence and restoration |
+
 public struct CognitiveAssociationSuppression: Sendable, Equatable {
     /// `memory:<record id>`, `view:<uuid>`, `seed:<uuid>` or `dream:<date>#<n>`;
     /// an outreach subject may also be `desk:<handle>` or `ship:<builder>[:<id>]`.

@@ -6,6 +6,7 @@ import Experiences
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
+// Blueprint: | `HerQueue.swift` | `MyQueueTurnProjectionProviding` protocol over cognition's Desk-revision-checked candidates and explicit refresh-pending-after-write state; `MyQueueReady` reads named experience conditions by primary key for unattended and recorded-session eligibility; `HerScreen`: `queueContext`, async `queueRows` shows those obligations, `resume` |
 
 private let queueDoors: [String: Set<String>] = ["mac": ["app", "chat", "mac"], "phone": ["ios", "iphone", "mobile", "icloud"],
                                                "ios": ["ios", "iphone", "mobile", "icloud"]]
@@ -219,7 +220,7 @@ extension HerScreen {
 
     /// Wave 2 #8: what an approval's follow-up hears about the steps queued
     /// for after its card, each read fresh now. A declined or canceled card
-    /// drops them, and she hears that. An approved card whose call completed
+    /// drops only unchanged steps; a newer revision is kept and named. An approved card whose call completed
     /// hands her each step as she queued it, to run now; a failed call or a
     /// step changed since is brought to her, not run. Their peers join the
     /// card's steer.
@@ -237,6 +238,8 @@ extension HerScreen {
                 do {
                     try await MyQueue.finish(entry, dropped: true, why: why, store: store)
                     lines.append("The step you queued for after this card was \(why): \(queued).")
+                } catch is MyQueue.Superseded {
+                    lines.append("The step you queued for after this card, \(queued), changed or closed before the card settled. The newer state was kept.")
                 } catch {
                     lines.append("The step you queued for after this card, \(queued), could not be dropped: "
                         + error.localizedDescription + ". It is still in MY QUEUE.")

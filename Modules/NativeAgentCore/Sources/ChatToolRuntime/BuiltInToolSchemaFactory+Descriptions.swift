@@ -1,40 +1,25 @@
+// Blueprint: | `BuiltInToolSchemaFactory+Descriptions.swift` | `BuiltInToolSchemaFactory`: extension |
 extension BuiltInToolSchemaFactory {
-    /// W5 L1#13 (bash demotion): generic shell is the model's reflex reach even
-    /// when a native tool answers the same question with structure, no approval
-    /// queue, and no subprocess. Appended to the shell/bash schema DESCRIPTIONS
-    /// only — dispatch, gating, and every other tool's behavior are unchanged.
-    static let nativeToolPreferenceGuidance = "Best fits: session_search for past conversations; app agent.jobs for bridge progress; app github.* for GitHub repositories, notifications, issues, and pull requests; git_status/git_log/git_diff for routine repo evidence; read_file/list_dir for direct file reads."
-
     /// The tool description is load-bearing. It is the only thing that turns
     /// "how do you feel?" into a PULL instead of an improvisation, so it says so
     /// in as many words.
     static let innerStateToolDescription = """
-        Read your own current inner state from the record your organs already \
-        keep — not a description you compose on the spot. When you are asked how \
-        you feel, what kind of day it has been, whether something is bothering \
-        you, or what you have been carrying, PULL THIS FIRST AND THEN SPEAK. \
-        Returns: the felt fingerprint right now and what it is about; the mood \
-        integral and the slow disposition undertone as words and numbers; the \
-        last window's felt moments as (time, subject label, valence/arousal/ \
-        warmth); the body's chemistry in its own words plus fatigue and \
-        time-of-day when the body reports them; your open thought seeds; what you \
-        are still waiting to find out; what last night's dream left (a mood word \
-        and a date); and the standing views you are currently on, each with the \
-        id you can reference it by. No conversation content and no quotes — \
-        labels, numbers and your own words only. Read-only: reading never \
-        changes what it reads. Empty sections mean nothing was there, not that \
-        the read failed.
+        Read your recorded inner state before describing how you feel. Returns \
+        fingerprint/subject; mood integral and disposition in words/numbers; \
+        recent felt moments (time, subject, valence/arousal/warmth); body words \
+        and reported fatigue/time-of-day; thought seeds, open questions, dream \
+        residue (mood/date), and standing views with ids. No conversation text \
+        or quotes. Read-only; empty sections mean absent state, not read failure.
         """
 
     static let dreamDiaryReadToolDescription = """
-        Read your own dream diary — the entries you wrote on the nights you \
-        dreamt, not a summary of them. With no arguments it returns the index: \
-        your dreams grouped by week (this week, last week, then the weeks \
-        behind), each with its date, its opening line, and whether it has been \
-        archived. Pass `date` (YYYY-MM-DD) for one night's full text, archived \
-        nights included. Pass `query` to find the nights whose text contains \
-        something. Read-only, bounded, and nothing calls this on your behalf. \
-        An empty index means you have no entries yet, not that the read failed.
+        Read your dream diary on demand. No arguments: weekly index with dates, \
+        latest dream, all runs in `dreams`, and archive status. `date` \
+        (YYYY-MM-DD) reads one night, including archives. `query` finds text \
+        matches, newest first. Each entry is capped at 20,000 characters with \
+        truncation reported. Index/search scan at most 365 entries; weeks/limit \
+        bound returned rows. Read-only; storage/partial fields distinguish \
+        unreadable entries from an empty result. No automatic reads.
         """
 
     static let holdViewToolDescription = """
@@ -46,7 +31,7 @@ extension BuiltInToolSchemaFactory {
         proposal has stopped being a proposal to you and has become how you \
         actually see the thing. The owner can retire a held view at any time \
         and does not need your agreement to; that is the trade for not needing \
-        theirs. Read your proposals with app mind.inner_state first.
+        theirs.
         """
 
     static let releaseViewToolDescription = """

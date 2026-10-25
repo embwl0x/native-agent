@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `MacScreenRender.swift` | `MacScreenText` and `MacScreenRender`: shared semantic/pixel screen formatting that preserves compiler redaction verdicts |
+
 // Shared screen evidence and pixel formatting for MacScreenPageCompiler.
 // Text carries the compiler's redaction verdict through both presentations.
 
@@ -609,8 +611,8 @@ public enum MacScreenRender {
     // A `MacLookPercept` — whatever produced it — becomes a `Screen`. This is a
     // TRANSLATION, not a second renderer: it fills the same neutral model the
     // vision lane fills, and the output goes through the one `render` above.
-    // The vision lane's own adapter lives in VisionPerception (which depends on
-    // MacControl, not the reverse) and fills this same model.
+    // The vision lane's adapter, VisionFourVerbAdapter, shares this MacControl
+    // owner and fills this same model.
 
     /// Roles whose affordances are CONTENT rows rather than controls: the rows
     /// of a list, the cells of a table, the rename-in-place text field every

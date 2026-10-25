@@ -8,6 +8,7 @@ import PersonaEngine
 import PersistenceCore
 import TurnTrace
 import WorkshopExecution
+// Blueprint: | `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime` actor; joined, ordered start/stop/reload transitions reserve ownership before suspension; stop retains and drains picker/observation work, whose follow-ups check their lifecycle; retired embedding tickets fail immediately, and predictions retain their bounded slots until actual exit; persona registrations and mirrors share a compiler batch |
 
 private struct NativeContextEmbeddingProvider: ContextMarkdownEmbeddingProvider {
     let memory: SwiftNativeMemoryV2
@@ -331,16 +332,25 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// every edge makes the existing ContextFlow coordinator reread the stores.
     private var residentWorkObservationTask: Task<Void, Never>?
     private var terminalResidentWorkRecordPaths: Set<String> = []
-    /// The startup in flight. Waiters await this task, so a turn or a quit
-    /// lends its priority to the launch's utility-priority startup instead of
-    /// parking behind it on a busy Mac (a continuation lends nothing).
-    private var startup: Task<Void, Never>?
-    private var personaPickerReconcile: Task<Void, Never>?
+    private enum LifecycleOperation { case start, stop, reload }
+    /// Reserve before suspension: requests for the same operation/configuration
+    /// join, other transitions follow the prior task. Reload owns teardown and
+    /// replacement together.
+    /// Awaiting the task also lends the caller's priority to startup.
+    private var lifecycle: (
+        id: UUID, operation: LifecycleOperation,
+        configuration: NativeContextFlowConfiguration?, task: Task<Void, Never>
+    )?
+    private var personaPickerReconcile: (id: UUID, task: Task<Void, Never>)?
+    private var personaPickerRequestRevision: UInt64 = 0
     private var semanticQueryCache: [String: ContextQueryEmbeddingValue] = [:]
     private var semanticQueryCacheOrder: [String] = []
     static let maximumConcurrentSemanticQueries = 8
+    private static let retiredSemanticQueryCause = "memory search stopped before the query embedded"
     private var semanticQueryTickets: [String: ContextQueryEmbeddingTicket] = [:]
-    private var semanticQueryTasks: [String: Task<Void, Never>] = [:]
+    /// Retired predictions still own a slot until their actual exit. A stop
+    /// settles tickets immediately without admitting overlapping replacements.
+    private var semanticQueryTasks: [UUID: Task<Void, Never>] = [:]
     private var semanticQueryEpoch: UInt64 = 0
     private var startupFailedClosed = false
     /// Why the configured runtime has no coordinator. The next turn retries
@@ -365,22 +375,33 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     public func start() async {
-        if let startup { return await startup.value }
-        guard coordinator == nil else { return }
-        // Cleared by the task itself, so a stop-then-start after it finishes
-        // never mistakes the finished one for a startup in flight.
-        let startup = Task {
-            await performStartup()
-            self.startup = nil
-        }
-        self.startup = startup
-        await startup.value
+        await transition(.start)
     }
 
-    private func performStartup() async {
+    private func transition(_ operation: LifecycleOperation) async {
+        let configuration = operation == .reload ? resolvedConfiguration() : nil
+        if let lifecycle, lifecycle.operation == operation, lifecycle.configuration == configuration {
+            return await lifecycle.task.value
+        }
+        if lifecycle == nil, operation == .start, coordinator != nil { return }
+        let predecessor = lifecycle?.task
+        let id = UUID()
+        let task = Task {
+            await predecessor?.value
+            if operation != .start { await performStop() }
+            if operation != .stop, coordinator == nil {
+                await performStartup(configuration: configuration ?? resolvedConfiguration())
+            }
+            // A queued successor owns the slot as soon as it is reserved.
+            if lifecycle?.id == id { lifecycle = nil }
+        }
+        lifecycle = (id, operation, configuration, task)
+        await task.value
+    }
+
+    private func performStartup(configuration: NativeContextFlowConfiguration) async {
         startupFailedClosed = false
         startupFailure = nil
-        let configuration = resolvedConfiguration()
         guard configuration.mode != .off else {
             nativeLog("[context-flow] disabled until onboarding or explicit enablement")
             return
@@ -444,33 +465,45 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             startupFailure = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             await memoryPressureObserver?.stop()
             residentWorkObservationTask?.cancel()
+            await residentWorkObservationTask?.value
             residentWorkObservationTask = nil
             nativeLog("[context-flow] start failed closed: %@", String(describing: error))
         }
     }
 
     public func stop() async {
-        await startup?.value
+        await transition(.stop)
+    }
+
+    private func performStop() async {
         semanticQueryEpoch &+= 1
+        let picker = personaPickerReconcile?.task
+        picker?.cancel()
+        let observation = residentWorkObservationTask
+        observation?.cancel()
         semanticQueryTasks.values.forEach { $0.cancel() }
-        semanticQueryTasks.removeAll()
+        semanticQueryTickets.values.forEach { $0.fail(Self.retiredSemanticQueryCause) }
         semanticQueryTickets.removeAll()
         semanticQueryCache.removeAll()
         semanticQueryCacheOrder.removeAll()
-        await memoryPressureObserver?.stop()
-        residentWorkObservationTask?.cancel()
-        residentWorkObservationTask = nil
+        // A pressure handler can itself be parked behind compilation. Close
+        // coordinator admission while the pressure source drains, not after it.
+        async let pressureStop: Void? = memoryPressureObserver?.stop()
         if usesLiveAppBody {
             await ContextFlowInvalidationRelay.shared.set(nil)
         }
         await coordinator?.stop()
+        _ = await pressureStop
+        await picker?.value
+        await observation?.value
+        personaPickerReconcile = nil
+        residentWorkObservationTask = nil
         coordinator = nil
         memoryRuntime = nil
     }
 
     public func reloadConfiguration() async {
-        await stop()
-        await start()
+        await transition(.reload)
     }
 
     /// Persist and hot-apply the single production Context Flow mode. Public
@@ -506,15 +539,29 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// requests it, without waiting: a turn whose kernel predates the selection
     /// gets the persona receipt, never the prior persona.
     public func personaPickerDidChange() async {
-        await reconcilePersonaPickerIfNeeded()
+        await requestPersonaPickerReconcile()?.value
     }
 
-    private func requestPersonaPickerReconcile() {
-        guard personaPickerReconcile == nil else { return }
-        personaPickerReconcile = Task {
-            await reconcilePersonaPickerIfNeeded()
-            personaPickerReconcile = nil
+    @discardableResult
+    private func requestPersonaPickerReconcile() -> Task<Void, Never>? {
+        guard lifecycle == nil, coordinator != nil else { return nil }
+        personaPickerRequestRevision &+= 1
+        if let personaPickerReconcile { return personaPickerReconcile.task }
+        let id = UUID()
+        let epoch = semanticQueryEpoch
+        let task = Task {
+            var revision: UInt64
+            repeat {
+                revision = personaPickerRequestRevision
+                await reconcilePersonaPickerIfNeeded(epoch: epoch)
+                // Only a newly accepted picker/turn request asks for another
+                // pass; a failed build alone never retries itself.
+            } while epoch == semanticQueryEpoch && !Task.isCancelled
+                && revision != personaPickerRequestRevision
+            if personaPickerReconcile?.id == id { personaPickerReconcile = nil }
         }
+        personaPickerReconcile = (id, task)
+        return task
     }
 
     private func normalizedPersonaOverride() -> String? {
@@ -522,8 +569,8 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         return value.isEmpty ? nil : value
     }
 
-    private func reconcilePersonaPickerIfNeeded() async {
-        guard let coordinator else { return }
+    private func reconcilePersonaPickerIfNeeded(epoch: UInt64) async {
+        guard epoch == semanticQueryEpoch, !Task.isCancelled, let coordinator else { return }
         // Only the immutable published kernel can acknowledge a selection.
         // Sampling preferences before/after an awaited build loses changes
         // (including ABA); a cached provider build may not have published yet.
@@ -534,6 +581,8 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         let selectionPublished = chatKernels.count == 1
             && chatKernels[0].requestedPersonaOverride == normalizedPersonaOverride()
         lease?.release()
+        guard epoch == semanticQueryEpoch, self.coordinator === coordinator,
+              !Task.isCancelled else { return }
         // Missing publication is not an acknowledged default/nil selection.
         guard !selectionPublished else { return }
         _ = await coordinator.reconcileSourceChanges([DerivedSourceChange(
@@ -550,7 +599,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// coordinator to report, so it answers not-started (the bridge's state
     /// read waited here ~95 s after a launch on a loaded Mac).
     public func health() async -> ContextFlowCoordinatorHealth? {
-        guard startup == nil else { return nil }
+        guard lifecycle == nil else { return nil }
         return await coordinator?.health()
     }
 
@@ -558,7 +607,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// from one whose health cannot be obtained. Both have no coordinator, but
     /// only the former is a healthy configuration state.
     public func observatoryHealthState() async -> ContextFlowObservatoryHealthState {
-        await startup?.value
+        await lifecycle?.task.value
         if let coordinator {
             return .health(await coordinator.health())
         }
@@ -566,9 +615,9 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         return resolvedConfiguration().mode == .off ? .off : .unavailable
     }
 
-    /// During startup, the configured mode it is bringing up; never a wait.
+    /// During a lifecycle transition, report the configured mode without waiting.
     public func contextFlowMode() async -> ContextFlowMode {
-        if startup == nil, let coordinator { return await coordinator.mode }
+        if lifecycle == nil, let coordinator { return await coordinator.mode }
         return resolvedConfiguration().mode
     }
 
@@ -578,10 +627,27 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
 
     public func beginQueryEmbedding(_ text: String) async -> ContextQueryEmbeddingTicket? {
         let epoch = semanticQueryEpoch
-        guard let coordinator, await coordinator.mode == .active,
-              let memory = memoryRuntime else { return nil }
         let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty, query.utf8.count <= 8 * 1_024 else { return nil }
+        guard !query.isEmpty else { return nil }
+        guard lifecycle == nil else {
+            return resolvedConfiguration().mode == .active
+                ? ContextQueryEmbeddingTicket(unavailable: "memory search is still starting")
+                : nil
+        }
+        guard let coordinator else {
+            return resolvedConfiguration().mode == .active
+                ? ContextQueryEmbeddingTicket(unavailable: "memory search is still starting")
+                : nil
+        }
+        guard await coordinator.mode == .active,
+              let memory = memoryRuntime else { return nil }
+        guard epoch == semanticQueryEpoch, lifecycle == nil, self.coordinator === coordinator,
+              !Task.isCancelled else {
+            return ContextQueryEmbeddingTicket(unavailable: Self.retiredSemanticQueryCause)
+        }
+        guard query.utf8.count <= 8 * 1_024 else {
+            return ContextQueryEmbeddingTicket(unavailable: "the message is over 8 KB, too long to embed")
+        }
         guard let runtime = await memory.embeddingRuntimeSnapshot(),
               runtime.effectiveBackend != ManagedEmbeddingProvider.failClosedBackend,
               runtime.coreMLLoaded
@@ -590,8 +656,10 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         }
         // Backend inspection suspends. A stop/reload during that await must
         // not admit a task against the retired runtime after its drain.
-        guard epoch == semanticQueryEpoch, self.coordinator != nil,
-              !Task.isCancelled else { return nil }
+        guard epoch == semanticQueryEpoch, lifecycle == nil, self.coordinator === coordinator,
+              !Task.isCancelled else {
+            return ContextQueryEmbeddingTicket(unavailable: Self.retiredSemanticQueryCause)
+        }
         let normalized = query.split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
             .lowercased()
@@ -637,17 +705,18 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         // Semantic query vectors are optional. Keep a wedged provider or burst
         // of turns from building an unbounded task/ticket backlog; overflow
         // follows the existing lexical-only path without delaying the turn.
-        guard semanticQueryTickets.count < Self.maximumConcurrentSemanticQueries else {
+        guard semanticQueryTasks.count < Self.maximumConcurrentSemanticQueries else {
             return ContextQueryEmbeddingTicket(unavailable: "\(Self.maximumConcurrentSemanticQueries) query embeddings are already in flight")
         }
         let ticket = ContextQueryEmbeddingTicket()
         semanticQueryTickets[key] = ticket
         let modelID = runtime.modelId
-        semanticQueryTasks[key] = Task(priority: .utility) { [weak self, memory] in
+        let taskID = UUID()
+        semanticQueryTasks[taskID] = Task(priority: .userInitiated) { [weak self, memory] in
             let value: Result<ContextQueryEmbeddingValue, Error>
             do {
                 let texts = alternateQuery.map { [query, $0] } ?? [query]
-                let batch = try await memory.embedForDerivedContextWithEpoch(texts)
+                let batch = try await memory.embedQueriesWithEpoch(texts)
                 guard let first = batch.vectors.first else { throw MemoryV2Error.underlying("embedder returned no vectors") }
                 value = .success(ContextQueryEmbeddingValue(
                     values: first,
@@ -659,7 +728,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                 value = .failure(error)
             }
             await self?.completeSemanticQuery(
-                key: key, epoch: epoch, expectedEmbeddingEpoch: embeddingEpoch, value: value
+                key: key, taskID: taskID, epoch: epoch, expectedEmbeddingEpoch: embeddingEpoch, value: value
             )
         }
         return ticket
@@ -667,12 +736,13 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
 
     private func completeSemanticQuery(
         key: String,
+        taskID: UUID,
         epoch: UInt64,
         expectedEmbeddingEpoch: String,
         value result: Result<ContextQueryEmbeddingValue, Error>
     ) {
+        semanticQueryTasks[taskID] = nil
         guard epoch == semanticQueryEpoch else { return }
-        semanticQueryTasks[key] = nil
         let ticket = semanticQueryTickets.removeValue(forKey: key)
         let value: ContextQueryEmbeddingValue
         switch result {
@@ -786,7 +856,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     private func applyObservedMemoryPressure(_ pressure: ContextArenaPressure) async {
-        guard let coordinator else { return }
+        guard lifecycle == nil, let coordinator else { return }
         _ = try? await coordinator.applyMemoryPressure(pressure)
     }
 
@@ -808,28 +878,30 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// terminal write is therefore buffered instead of being lost.
     private func startResidentWorkObservationIfNeeded() async {
         guard residentWorkObservationTask == nil else { return }
+        let epoch = semanticQueryEpoch
         let observation = makeResidentWorkObservation()
         await observation.waitUntilArmed()
-        guard coordinator != nil, !Task.isCancelled else { observation.cancel(); return }
+        guard epoch == semanticQueryEpoch, coordinator != nil,
+              !Task.isCancelled else { observation.cancel(); return }
         residentWorkObservationTask = Task { [weak self] in
             guard let self else { observation.cancel(); return }
-            await self.observeResidentWorkChanges(observation)
+            await self.observeResidentWorkChanges(observation, epoch: epoch)
         }
     }
 
-    private func observeResidentWorkChanges(_ initial: FileChangeEvents) async {
+    private func observeResidentWorkChanges(_ initial: FileChangeEvents, epoch: UInt64) async {
         var observation = initial
         defer { observation.cancel() }
         while !Task.isCancelled {
             let changed = await waitForResidentWorkChange(observation)
             observation.cancel()
-            guard changed, !Task.isCancelled else { return }
+            guard changed, epoch == semanticQueryEpoch, !Task.isCancelled else { return }
 
             // Re-arm first. The projection read below can suspend on Desk or
             // Workshop I/O while the canonical owner commits a related edge.
             observation = makeResidentWorkObservation()
             await observation.waitUntilArmed()
-            guard !Task.isCancelled, let coordinator else { return }
+            guard epoch == semanticQueryEpoch, !Task.isCancelled, let coordinator else { return }
             await coordinator.sourceDidChange(DerivedSourceChange(
                 namespace: "resident-work",
                 stableID: "canonical",
@@ -875,18 +947,9 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                     forKeys: [.isDirectoryKey]
                 ).isDirectory) ?? false
                 if isDirectory {
-                    // RESOLVED AT ARM TIME (P2-1): watch the record name this
-                    // directory actually has right now — `execution.json`, or a
-                    // legacy `mission.json` the rename pass hasn't reached.
-                    // Watching both names would double the kqueue fd count
-                    // across EVERY execution directory to cover a rename that
-                    // cannot happen while this runtime is armed: the migrator
-                    // renames only in applicationDidFinishLaunching, before
-                    // this runtime starts. For a directory with neither file,
-                    // resolve() yields the canonical name and
-                    // FileChangeWatcher falls back to the directory itself, so
-                    // first creation still wakes us.
-                    let record = ExecutionRecordFile.resolve(in: directory)
+                    // Watch only the canonical record. For an absent file,
+                    // FileChangeWatcher watches its directory so first creation wakes us.
+                    let record = ExecutionRecordFile.canonicalPath(in: directory)
                     discoveredRecordPaths.insert(record.path)
                     if terminalResidentWorkRecordPaths.contains(record.path) {
                         continue

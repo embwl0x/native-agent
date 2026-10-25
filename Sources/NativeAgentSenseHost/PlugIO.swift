@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import Senses
+// Blueprint: | `Sources/NativeAgentSenseHost/PlugIO.swift` | Bounded JSON-line transport and active-reply stall window |
 
 /// Bounded JSON lines. App-served reply waits are not sense execution stalls.
 /// Buffered input is also forwarded to Swift children through this owner.

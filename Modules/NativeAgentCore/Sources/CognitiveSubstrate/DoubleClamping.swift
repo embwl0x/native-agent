@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `DoubleClamping.swift` | `Double.clamped01` and `clampedSigned`: shared unit/signed clamps for substrate and organism magnitudes |
+
 /// The one place the `[0, 1]` and `[-1, 1]` clamps live for this module.
 ///
 /// Before this, the same `min(1, max(0, x))` was hand-inlined dozens of times

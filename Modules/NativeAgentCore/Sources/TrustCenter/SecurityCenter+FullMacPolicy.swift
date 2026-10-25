@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SecurityCenter+FullMacPolicy.swift` | `SwiftNativeSecurityCenter`: `fullMacActive`, `fullMacYoloAuthority`, checked local `localFullMacYoloAdmitted`, `drivenAgentLaunchPermission` |
 
 extension SwiftNativeSecurityCenter {
     /// Full Mac is on when the saved policy is Full Mac. No timer
@@ -10,6 +11,15 @@ extension SwiftNativeSecurityCenter {
             return false
         }
         return MacControlGate.fullMacActive(trust)
+    }
+
+    /// The local operator has one admission for every native action. Read
+    /// checked saved authority at presentation time; never retain a grant.
+    public nonisolated static func localFullMacYoloAdmitted(dataRoot: URL) -> Bool {
+        switch SavedTrustPolicyAuthority.read(dataRoot: dataRoot) {
+        case .present(let policy): fullMacActive(policy: policy)
+        case .absent, .damaged: false
+        }
     }
 
     /// The public checked authority door for non-chat/raw consumers. A damaged

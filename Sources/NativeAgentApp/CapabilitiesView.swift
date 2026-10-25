@@ -1,5 +1,5 @@
 import EngineRuntime
-import SelfImprovement
+import MemoryV2
 import Foundation
 import SystemOps
 import ToolRegistry
@@ -8,6 +8,7 @@ import SwiftUI
 import TrustCenter
 import ApprovalInbox
 import WorkflowOrchestration
+// Blueprint: | `CapabilitiesView.swift` | `CapabilitiesView` struct; shared engine NextGen snapshot and eligible actions; `AppModel.routeIntent`; `NextGenReceipt.humanized` |
 
 
 enum CapabilitiesDisclosurePreference {
@@ -22,80 +23,48 @@ enum CapabilitiesDisclosurePreference {
     }
 }
 
-/// The overview tiles are evidence from a scoped Capabilities refresh, not
-/// launch defaults. A dash is intentional: it says the source was not loaded
-/// (or failed) instead of silently reporting zero capabilities.
+/// Counts and availability come from the same engine owners on every route.
 enum CapabilitiesRefreshPresentation {
     struct SummaryTiles: Equatable {
-        let capabilities: String
-        let workflows: String
-        let mcp: String
         let nextGen: String
         let approvals: String
         let notice: String?
     }
 
-    static func summary(
-        capabilityCount: Int?,
-        workflowCount: Int,
-        mcpCount: Int,
-        nextGenReadyCount: Int,
-        nextGenTotalCount: Int,
-        approvalCount: Int,
-        refresh: AppModel.PanelRefreshStatus?
-    ) -> SummaryTiles {
-        let failures = Set(refresh?.failedEndpoints.map {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        } ?? [])
-        func value(_ value: String, endpoint: String) -> String {
-            guard refresh != nil, !failures.contains(endpoint) else { return "—" }
-            return value
-        }
-        let unavailable = refresh == nil
+    @MainActor
+    static func summary(trust: TrustFacade, approvals: ApprovalsFacade, nextGen: NextGenStatusProjection) -> SummaryTiles {
+        let unavailable = trust.catalogRefresh == nil
             ? "Capability summary is loading."
-            : failures.isEmpty ? nil
+            : trust.catalogRefresh?.isStale != true && nextGen.readError == nil && approvals.refreshErrorText == nil ? nil
             : "Some of this could not be loaded; anything marked — is missing, not zero."
         return SummaryTiles(
-            capabilities: value(capabilityCount.map { String($0) } ?? "—", endpoint: "capability summary"),
-            workflows: value(String(workflowCount), endpoint: "workflows"),
-            mcp: value(String(mcpCount), endpoint: "mcp servers"),
-            nextGen: value("\(nextGenReadyCount)/\(nextGenTotalCount)", endpoint: "nextgen summary"),
-            approvals: value(String(approvalCount), endpoint: "approvals"),
+            nextGen: nextGen.readError == nil ? nextGen.current.map { "\($0.summary.readyPhaseCount ?? 0)/\($0.summary.totalPhaseCount ?? 0)" } ?? "—" : "—",
+            approvals: approvals.hasLoadedSnapshot && approvals.refreshErrorText == nil
+                ? String(WorkOverviewRead.waitingApprovals(approvals.records).count) : "—",
             notice: unavailable
         )
     }
 }
 
-/// The footer is scoped to Capabilities. `AppModel.statusText` is intentionally
-/// global and can be replaced by a chat, approval, or background operation
-/// before this view redraws; rendering it here made unrelated work look like a
-/// Capabilities result.
+/// The footer reports this page's refresh receipt, rather than unrelated
+/// operation feedback in AppModel.statusText. Domain values remain engine-owned.
 enum CapabilitiesStatusLinePresentation {
     struct State: Equatable {
         let text: String
         let status: String
     }
 
-    static func resolve(refresh: AppModel.PanelRefreshStatus?) -> State {
+    static func resolve(refresh: PanelRefreshStatus?) -> State {
         guard let refresh else {
-            return State(
-                text: "Capabilities data has not loaded yet.",
-                status: "info"
-            )
+            return State(text: "Capabilities data has not loaded yet.", status: "info")
         }
         guard !refresh.isStale else {
             let count = refresh.failedEndpoints.count
             let source = count == 1 ? "source" : "sources"
             guard refresh.lastSuccessAt != nil else {
-                return State(
-                    text: "Capabilities data is unavailable: \(count) \(source) did not load.",
-                    status: "failed"
-                )
+                return State(text: "Capabilities data is unavailable: \(count) \(source) did not load.", status: "failed")
             }
-            return State(
-                text: "Capabilities refresh is incomplete: \(count) \(source) did not load. Showing last known data where available.",
-                status: "warn"
-            )
+            return State(text: "Capabilities refresh is incomplete: \(count) \(source) did not load. Showing last known data where available.", status: "warn")
         }
         return State(text: "Capabilities data is current.", status: "ok")
     }
@@ -250,21 +219,15 @@ struct CapabilitiesView: View {
     private let mode: CapabilityWorkspaceMode
     private var routeText: String { appModel.editDraft("capability-route/new", seed: "Research a topic, save it as a reusable tool if it comes up again, and ask me before anything risky.") }
     private var researchObjective: String { appModel.editDraft("capability-research/new", seed: "Find current best practices for lightweight autonomous agent capability systems.") }
-    @State private var researchLabRunsState: CapabilitiesResearchLabPresentation.RunList = .loading
     @State private var researchLabMessage: CapabilitiesResearchLabPresentation.Message?
     @State private var isRunningResearchLab = false
     private var catalogSourceName: String { appModel.editDraft("capability-catalog/new/name", seed: "Local NativeAgent Catalog") }
     private var catalogSourceURL: String { appModel.editDraft("capability-catalog/new/url", seed: "") }
     @State private var catalogSourceOutcome: AppModel.CapabilityCatalogSourceSaveOutcome?
-    /// Per-action result from the checked SecurityCenter authority owner.
-    /// Missing stays conservative: the Run button remains disabled until a
-    /// current policy/origin read proves admitted Full Mac YOLO.
-    @State private var nativeActionYoloAdmission: [String: Bool] = [:]
     @State private var showAllNativeActions = false
     @State private var capabilitySearch = ""
     // 2026-07-22 page-tighten: the two heaviest always-expanded blocks
-    // (Next-Gen Runtime migration cockpit in Overview, MCP Builder in Build —
-    // whose canonical home is the dedicated MCP tab) collapse by default;
+    // (Next-Gen Runtime migration cockpit in Overview) collapse by default;
     // open-state persists across visits like the Trust Advanced group.
     @AppStorage(CapabilitiesDisclosurePreference.nextGenKey) private var showNextGen = false
     // Everything a stranger has no business reading — hardening, the research
@@ -293,11 +256,8 @@ struct CapabilitiesView: View {
 
                 developerTools
 
-                CapabilitiesStatusTextLine(
-                    state: CapabilitiesStatusLinePresentation.resolve(
-                        refresh: appModel.panelRefreshStatus[.capabilities]
-                    )
-                )
+                CapabilitiesStatusTextLine(state: CapabilitiesStatusLinePresentation.resolve(
+                    refresh: appModel.panelRefreshStatus[.capabilities]))
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.bottom, 32)
@@ -307,8 +267,7 @@ struct CapabilitiesView: View {
             Button("Refresh", systemImage: "arrow.clockwise") {
                 Task {
                     await appModel.refreshForSidebarItem(.capabilities)
-                    await refreshNativeActionYoloAdmission()
-                    await refreshResearchLabRuns()
+                    await appModel.engine.desk.refreshResearchRuns()
                 }
             }
         }
@@ -316,8 +275,7 @@ struct CapabilitiesView: View {
         .navigationTitle("Capabilities")
         .quietReadTask {
             await appModel.refreshForSidebarItem(.capabilities)
-            await refreshNativeActionYoloAdmission()
-            await refreshResearchLabRuns()
+            await appModel.engine.desk.refreshResearchRuns()
         }
     }
 
@@ -325,17 +283,17 @@ struct CapabilitiesView: View {
     /// Nil until the scoped refresh has run; a failed count says so rather
     /// than claim zero.
     private var headerLine: String? {
-        guard let refresh = appModel.panelRefreshStatus[.capabilities] else { return nil }
-        let failed = refresh.failedEndpoints.contains {
+        guard appModel.engine.trust.catalogRefresh != nil else { return nil }
+        let failed = appModel.engine.trust.catalogRefresh?.failedEndpoints.contains {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "capability summary"
-        }
+        } ?? false
         guard !failed, let counts = appModel.engine.trust.capabilitySummary?.summary else {
             return "I couldn't read all my capabilities just now."
         }
         // Total and ready come from the same summary the list's count reads,
         // so the two never disagree.
         let total = counts.total
-        let workflows = appModel.workflows.count
+        let workflows = appModel.engine.desk.workflows.count
         let ready = counts.active == total ? "all ready to use" : "\(counts.active) ready to use"
         let have = "I have \(total) \(total == 1 ? "capability" : "capabilities")"
             + (total > 0 ? ", \(ready)" : "")
@@ -344,22 +302,13 @@ struct CapabilitiesView: View {
     }
 
     private var summaryGrid: some View {
-        let tiles = CapabilitiesRefreshPresentation.summary(
-            capabilityCount: appModel.engine.trust.capabilitySummary?.summary.total,
-            workflowCount: appModel.workflows.count,
-            mcpCount: appModel.mcpServers.count,
-            nextGenReadyCount: nextGenReadyCount,
-            nextGenTotalCount: nextGenTotalCount,
-            approvalCount: WorkOverviewRead.waitingApprovals(appModel.engine.approvals.records).count,
-            refresh: appModel.panelRefreshStatus[.capabilities]
-        )
+        let tiles = CapabilitiesRefreshPresentation.summary(trust: appModel.engine.trust, approvals: appModel.engine.approvals, nextGen: appModel.engine.nextGen)
         // Alive glass (2026-09-23): the five tiles fold into one quiet line of
         // counts; a dash still means "not read", never zero.
         return VStack(alignment: .leading, spacing: 8) {
             AliveFlow(spacing: 18, lineSpacing: 6) {
                 // Capabilities and workflows are in the header line already.
                 ForEach([
-                    (tiles.mcp, "tool server", "tool servers"),
                     (tiles.nextGen, "self-checks ready", "self-checks ready"),
                     (tiles.approvals, "approval", "approvals"),
                 ].filter { $0.0 != "0/0" }, id: \.2) { value, one, many in
@@ -382,7 +331,7 @@ struct CapabilitiesView: View {
 
     // 2026-07-22 page-tighten: the two heaviest blocks fold away by default.
     // 2026-07-23 audit F5-L1: a fold hides its inner attention state (e.g. an
-    // MCP session's lastError). When the underlying state carries an attention
+    // phase not yet ready). When the underlying state carries an attention
     // signal, the fold row says so, so the signal survives the collapse. Nil =
     // nothing to say (identical to before).
     // 2026-09-03 kit pass: the plate and the tinted badge are gone. A fold is a
@@ -412,8 +361,7 @@ struct CapabilitiesView: View {
             // L3#7 (2026-08-11): the "Capability Foundry" panel is deleted.
             // E-1 already stripped its fake counters; what was left was a
             // status badge and 2-3 lane tiles over a subsystem that was never
-            // ported (no auto-implementation ledger, no review pipeline). The
-            // Core CapabilityFoundry stays behind its MCP metadata consumer;
+            // ported (no auto-implementation ledger, no review pipeline):
             // the panel claimed a workshop that does not exist.
 
             AdvancedSection(title: "Capabilities I can use") {
@@ -489,11 +437,9 @@ struct CapabilitiesView: View {
             }
 
             AdvancedSection(title: "Your spaces") {
-                if let personalOS = appModel.personalOS {
+                if let profile = appModel.engine.persona.profile {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 16)], spacing: 16) {
-                        ForEach(personalOS.spaces) { space in
-                            AdvancedStat(title: space.name, value: "\(space.count)", detail: space.kind ?? "space")
-                        }
+                        AdvancedStat(title: profile.name, value: "1", detail: "persona")
                     }
                 } else {
                     Text("Your spaces have not loaded yet.")
@@ -504,75 +450,26 @@ struct CapabilitiesView: View {
         }
     }
 
-    private var nextGenLoadedPhases: [NextGenPhase] {
-        var seen = Set<String>()
-        return appModel.nextGenPhases
-            .filter { seen.insert($0.id).inserted }
-            .sorted { lhs, rhs in
-                switch (lhs.phaseNumber, rhs.phaseNumber) {
-                case let (left?, right?):
-                    return left < right
-                case (_?, nil):
-                    return true
-                case (nil, _?):
-                    return false
-                case (nil, nil):
-                    return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
-                }
-            }
-    }
-
-    private var nextGenReadyCount: Int {
-        if let count = appModel.nextGenSummary?.readyPhaseCount {
-            return count
-        }
-        return nextGenLoadedPhases.filter { $0.ready == true || $0.displayStatus == "ready" }.count
-    }
-
-    private var nextGenTotalCount: Int {
-        appModel.nextGenSummary?.totalPhaseCount ?? nextGenLoadedPhases.count
-    }
-
-    // F5-L1 attention signals surfaced on the collapsed card headers.
-    // Next-Gen: phases not yet ready are the review-needed count. MCP: sessions
-    // reporting a non-empty lastError (the detail otherwise hidden at :532).
-    private var nextGenReviewCount: Int {
-        max(0, nextGenTotalCount - nextGenReadyCount)
-    }
-
-    private var nextGenReceipts: [NextGenReceipt] {
-        var seen = Set<String>()
-        let combined =
-            (appModel.latestNextGenReceipt.map { [$0] } ?? []) +
-            appModel.nextGenReceipts +
-            (appModel.nextGenSummary?.latestReceipts ?? []) +
-            nextGenLoadedPhases.compactMap(\.latestReceipt)
-        return combined.filter { seen.insert($0.id).inserted }
-    }
-
-    /// L3#6 (2026-08-11): the catalog (`nextgen_phases.json`) is a data file and
-    /// can list any action id; the read-only executor is a fixed switch. Only
-    /// ids that switch actually has a case for get a button — everything else
-    /// resolves to `default:` → 410 "not backed by a Swift read-only executor
-    /// yet", which is a button that cannot do its job. One set intersection.
-    private var nextGenActions: [NextGenAction] {
-        var seen = Set<String>()
-        let combined = (appModel.nextGenSummary?.actions ?? []) + nextGenLoadedPhases.flatMap { $0.actions ?? [] }
-        return combined
-            .filter { NativeAgentEngine.isNextGenActionBacked($0.id) }
-            .filter { seen.insert($0.id).inserted }
-    }
+    private var nextGenLoadedPhases: [NextGenPhase] { appModel.engine.nextGen.current?.phases ?? [] }
+    private var nextGenReadyCount: Int { appModel.engine.nextGen.current?.summary.readyPhaseCount ?? 0 }
+    private var nextGenTotalCount: Int { appModel.engine.nextGen.current?.summary.totalPhaseCount ?? 0 }
+    private var nextGenReviewCount: Int { max(0, nextGenTotalCount - nextGenReadyCount) }
+    private var nextGenReceipts: [NextGenReceipt] { appModel.engine.nextGen.current?.receipts ?? [] }
+    private var nextGenActions: [NextGenAction] { appModel.engine.nextGen.current?.eligibleActions ?? [] }
 
     private var nextGenRuntime: some View {
         AliveGroupCard {
-            if appModel.nextGenSummary == nil && nextGenLoadedPhases.isEmpty && appModel.latestNextGenReceipt == nil {
+            if let error = appModel.engine.nextGen.readError {
+                Text(error).font(ShellType.label).foregroundStyle(NativeAgentShell.trouble)
+            }
+            if appModel.engine.nextGen.current == nil {
                 Text("These checks have not loaded yet.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             } else {
                 HStack(spacing: 12) {
-                    AdvancedStatusWord(status: appModel.nextGenSummary?.readinessStatus ?? "ready")
-                    if let current = appModel.nextGenSummary?.currentPhaseName ?? appModel.nextGenSummary?.currentPhaseId {
+                    AdvancedStatusWord(status: appModel.engine.nextGen.current?.summary.readinessStatus ?? "ready")
+                    if let current = appModel.engine.nextGen.current?.summary.currentPhaseName ?? appModel.engine.nextGen.current?.summary.currentPhaseId {
                         AdvancedMeta(current.withoutStaleNextGenPhaseCopy)
                     }
                     AdvancedMeta("\(nextGenLoadedPhases.count) checks")
@@ -583,25 +480,25 @@ struct CapabilitiesView: View {
                     AdvancedStat(
                         title: "Checks ready",
                         value: "\(nextGenReadyCount)/\(nextGenTotalCount)",
-                        detail: appModel.nextGenSummary?.readiness ?? "ready checks",
-                        status: appModel.nextGenSummary?.readinessStatus ?? "ready"
+                        detail: appModel.engine.nextGen.current?.summary.readiness ?? "ready checks",
+                        status: appModel.engine.nextGen.current?.summary.readinessStatus ?? "ready"
                     )
                     AdvancedStat(
                         title: "Receipts",
-                        value: "\(appModel.nextGenSummary?.receiptCount ?? nextGenReceipts.count)",
+                        value: "\(appModel.engine.nextGen.current?.summary.receiptCount ?? nextGenReceipts.count)",
                         detail: nextGenReceipts.first?.displayStatus ?? "none yet",
                         status: nextGenReceipts.first?.displayStatus
                     )
                     AdvancedStat(
                         title: "Action previews",
-                        value: "\(appModel.nextGenSummary?.actionCount ?? nextGenActions.count)",
+                        value: "\(appModel.engine.nextGen.current?.summary.actionCount ?? nextGenActions.count)",
                         detail: appModel.isRunningNextGenAction ? "running" : "available",
                         status: appModel.isRunningNextGenAction ? "running" : "ready"
                     )
                 }
 
                 ForEach(nextGenLoadedPhases) { phase in
-                    NextGenPhaseRow(phase: phase, isRunning: appModel.isRunningNextGenAction) { actionId in
+                    NextGenPhaseRow(phase: phase, eligibleActions: nextGenActions, isRunning: appModel.isRunningNextGenAction) { actionId in
                         Task { await appModel.runNextGenAction(id: actionId, dryRun: true) }
                     }
                 }
@@ -639,8 +536,8 @@ struct CapabilitiesView: View {
     private var build: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
             // W3 (eval5): surface the "feature disabled / not implemented"
-            // envelope for Build-tab actions (capability pack install,
-            // MCP warm/refresh) so users see why nothing happened
+            // envelope for Build-tab actions (capability pack install)
+            // so users see why nothing happened
             // instead of a fake success toast.
             if let disabled = appModel.disabledFeature, !disabled.isEmpty {
                 Text(disabled)
@@ -666,7 +563,7 @@ struct CapabilitiesView: View {
                         .controlSize(.small)
                     }
                     Spacer()
-                    AdvancedMeta("\(appModel.capabilityPackInstalls.count) installed")
+                    AdvancedMeta("\(appModel.engine.trust.capabilityPackInstalls.count) installed")
                 }
 
                 if let outcome = appModel.capabilityCatalogInstallOutcome {
@@ -698,9 +595,9 @@ struct CapabilitiesView: View {
                         .accessibilityIdentifier("capabilities.catalogSource.outcome")
                 }
 
-                if !appModel.capabilityCatalogSources.isEmpty || appModel.engine.trust.capabilityNetwork != nil || appModel.latestCapabilityUpdateCheck != nil {
+                if !appModel.engine.trust.capabilityCatalogSources.isEmpty || appModel.engine.trust.capabilityNetwork != nil || appModel.latestCapabilityUpdateCheck != nil {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 16) {
-                        AdvancedStat(title: "Sources", value: "\(appModel.capabilityCatalogSources.count)", detail: appModel.capabilityCatalogSources.first?.status ?? "not checked")
+                        AdvancedStat(title: "Sources", value: "\(appModel.engine.trust.capabilityCatalogSources.count)", detail: appModel.engine.trust.capabilityCatalogSources.first?.status ?? "not checked")
                         AdvancedStat(title: "Trusted", value: "\(appModel.engine.trust.capabilityNetwork?.summary?.trusted ?? 0)", detail: "\(appModel.engine.trust.capabilityNetwork?.summary?.review ?? 0) to review")
                         AdvancedStat(title: "Updates", value: "\(appModel.latestCapabilityUpdateCheck?.updates.count ?? 0)", detail: appModel.latestCapabilityUpdateCheck?.status ?? "not checked")
                     }
@@ -710,19 +607,19 @@ struct CapabilitiesView: View {
                     CapabilityDetailRow(title: trust.name ?? trust.id, detail: trust.reasons.prefix(2).joined(separator: " "), status: trust.trustTier)
                 }
 
-                if appModel.capabilityCatalog.isEmpty {
+                if appModel.engine.trust.capabilityCatalog.isEmpty {
                     AdvancedEmptyState(
                         title: "No items yet",
                         detail: "Adding a source, or installing a signed pack, fills this list."
                     )
                 } else {
-                    ForEach(appModel.capabilityCatalog) { item in
+                    ForEach(appModel.engine.trust.capabilityCatalog) { item in
                         CatalogRow(item: item)
                     }
                 }
 
-                if !appModel.capabilityPackInstalls.isEmpty {
-                    ForEach(appModel.capabilityPackInstalls.prefix(4)) { install in
+                if !appModel.engine.trust.capabilityPackInstalls.isEmpty {
+                    ForEach(appModel.engine.trust.capabilityPackInstalls.prefix(4)) { install in
                             HStack(alignment: .top, spacing: 8) {
                                 CapabilityDetailRow(
                                     title: install.name ?? install.packId,
@@ -840,7 +737,7 @@ struct CapabilitiesView: View {
                 }
 
                 AdvancedSection(title: "Recent activity") {
-                    let traceState = appModel.capabilityTraceTimeline
+                    let traceState = appModel.engine.turns.capabilityTraceTimeline
                     if case .sourceAbsent = traceState {
                         AdvancedEmptyState(
                             title: "No activity yet",
@@ -917,26 +814,25 @@ struct CapabilitiesView: View {
                 researchLabMessageRow(researchLabMessage)
             }
 
-            switch researchLabRunsState {
-            case .loading:
+            if !appModel.engine.desk.researchRunsLoaded {
                 AdvancedWaitingLine("Reading the research lab's receipts…")
-            case .empty:
-                AdvancedEmptyState(
-                    title: "No research runs",
-                    detail: "A run started here leaves its receipt in this list."
-                )
-            case .loaded(let runs):
-                researchLabRunRows(runs)
-            case .unavailable(let detail, let retained):
+            } else if let detail = appModel.engine.desk.researchRunsError {
                 Text("Research lab receipts are unavailable: \(detail)")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.trouble)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
-                if !retained.isEmpty {
+                if !appModel.engine.desk.researchRuns.isEmpty {
                     AdvancedEyebrow(text: "Last known receipts")
-                    researchLabRunRows(retained)
+                    researchLabRunRows(appModel.engine.desk.researchRuns)
                 }
+            } else if appModel.engine.desk.researchRuns.isEmpty {
+                AdvancedEmptyState(
+                    title: "No research runs",
+                    detail: "A run started here leaves its receipt in this list."
+                )
+            } else {
+                researchLabRunRows(appModel.engine.desk.researchRuns)
             }
         }
     }
@@ -947,18 +843,10 @@ struct CapabilitiesView: View {
         defer { isRunningResearchLab = false }
         let outcome = await appModel.runResearchLab(objective: objective)
         researchLabMessage = CapabilitiesResearchLabPresentation.message(for: outcome)
-        if case .recorded(let run) = outcome {
+        if case .recorded = outcome {
             if researchObjective == objective { appModel.clearEditDraft("capability-research/new") }
-            researchLabRunsState = CapabilitiesResearchLabPresentation.list(
-                rows: [run] + appModel.engine.desk.researchRuns.filter { $0.id != run.id }
-            )
-            await refreshResearchLabRuns()
+            await appModel.engine.desk.refreshResearchRuns()
         }
-    }
-
-    @MainActor
-    private func refreshResearchLabRuns() async {
-        researchLabRunsState = await appModel.refreshResearchLabRunsForCapabilities()
     }
 
     private func researchLabMessageRow(_ message: CapabilitiesResearchLabPresentation.Message) -> some View {
@@ -1002,7 +890,7 @@ struct CapabilitiesView: View {
     private var hardening: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
             AdvancedSection(title: "Autonomy guardrails") {
-                if let kernel = appModel.autonomyKernel {
+                if let kernel = appModel.engine.trust.autonomyKernel {
                     HStack(spacing: 12) {
                         AdvancedStatusWord(status: kernel.status)
                         if let mode = kernel.mode {
@@ -1035,35 +923,28 @@ struct CapabilitiesView: View {
                 // chain was fully deleted 2026-08-14), so both rendered permanent
                 // empty/"Loading" furniture. The remaining tiles and action
                 // rows below are fed by live readers.
-                let refresh = appModel.panelRefreshStatus[.capabilities]
-                let failedEndpoints = Set((refresh?.failedEndpoints ?? []).map {
+                let failedEndpoints = Set(((appModel.engine.tools.nativePowerRefresh?.failedEndpoints ?? [])
+                    + (appModel.engine.memory.statusRefresh?.failedEndpoints ?? [])).map {
                     $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 })
                 let notificationTile = NativeMacPowerPanelPresentation.tile(
-                    value: appModel.notificationStatus?.pendingApprovals.map(String.init),
+                    value: appModel.engine.tools.notificationStatus?.pendingApprovals.map(String.init),
                     detail: "pending approvals",
-                    runtimeStatus: appModel.notificationStatus?.status,
-                    hasRefreshAttempt: refresh != nil,
+                    runtimeStatus: appModel.engine.tools.notificationStatus?.status,
+                    hasRefreshAttempt: appModel.engine.tools.nativePowerRefresh != nil,
                     readFailed: failedEndpoints.contains("notification status")
                 )
                 let browserTile = NativeMacPowerPanelPresentation.tile(
-                    value: appModel.browserRuntimeStatus?.receiptCount.map(String.init),
-                    detail: appModel.browserRuntimeStatus?.domainPolicy,
-                    runtimeStatus: appModel.browserRuntimeStatus?.status,
-                    hasRefreshAttempt: refresh != nil,
+                    value: appModel.engine.tools.browserStatus?.receiptCount.map(String.init),
+                    detail: appModel.engine.tools.browserStatus?.domainPolicy,
+                    runtimeStatus: appModel.engine.tools.browserStatus?.status,
+                    hasRefreshAttempt: appModel.engine.tools.nativePowerRefresh != nil,
                     readFailed: failedEndpoints.contains("browser status")
                 )
-                let vectorTile = NativeMacPowerPanelPresentation.tile(
-                    value: appModel.memoryVectorStatus?.nodeCount.map(String.init),
-                    detail: appModel.memoryVectorStatus?.providerModel,
-                    runtimeStatus: appModel.memoryVectorStatus?.status,
-                    hasRefreshAttempt: refresh != nil,
-                    readFailed: failedEndpoints.contains("memory vector status")
-                )
                 let nativeActionsState = NativeMacPowerPanelPresentation.readState(
-                    itemCount: appModel.nativeActions.count,
-                    hasRefreshAttempt: refresh != nil,
-                    readFailed: failedEndpoints.contains("native actions")
+                    itemCount: appModel.engine.tools.nativeActions.count,
+                    hasRefreshAttempt: true,
+                    readFailed: false
                 )
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 16)], spacing: 16) {
                     AdvancedStat(
@@ -1078,12 +959,6 @@ struct CapabilitiesView: View {
                         detail: browserTile.detail,
                         status: browserTile.status
                     )
-                    AdvancedStat(
-                        title: "Vector memory",
-                        value: vectorTile.value,
-                        detail: vectorTile.detail,
-                        status: vectorTile.status
-                    )
                 }
 
                 if nativeActionsState == .unavailable {
@@ -1095,7 +970,7 @@ struct CapabilitiesView: View {
                     Text("Mac actions have not loaded yet.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
-                } else if appModel.nativeActions.isEmpty {
+                } else if appModel.engine.tools.nativeActions.isEmpty {
                     Text("No Mac actions are available.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
@@ -1106,11 +981,12 @@ struct CapabilitiesView: View {
                             .foregroundStyle(NativeAgentShell.trouble)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    ForEach(appModel.nativeActions.prefix(showAllNativeActions ? appModel.nativeActions.count : 6)) { action in
+                    let fullMacYoloAdmitted = appModel.engine.trust.nativeActionYoloAdmitted
+                    ForEach(appModel.engine.tools.nativeActions.prefix(showAllNativeActions ? appModel.engine.tools.nativeActions.count : 6)) { action in
                             let actionPresentation = NativeMacPowerPanelPresentation.action(
                                 requiresApproval: action.requiresApproval,
                                 dryRunAvailable: action.dryRunAvailable,
-                                fullMacYoloAdmitted: nativeActionYoloAdmission[action.id] == true
+                                fullMacYoloAdmitted: fullMacYoloAdmitted
                             )
                             VStack(alignment: .leading, spacing: 4) {
                             HStack(alignment: .top, spacing: 8) {
@@ -1141,13 +1017,13 @@ struct CapabilitiesView: View {
                     }
                 }
 
-                if appModel.nativeActions.count > 6 && nativeActionsState != .unavailable {
+                if appModel.engine.tools.nativeActions.count > 6 && nativeActionsState != .unavailable {
                     HStack {
                         Button(showAllNativeActions ? "Show fewer actions" : "Show all actions") {
                             showAllNativeActions.toggle()
                         }
                         .accessibilityIdentifier("capabilities.show-all-native-actions")
-                        Text("Showing \(showAllNativeActions ? appModel.nativeActions.count : 6) of \(appModel.nativeActions.count) loaded actions")
+                        Text("Showing \(showAllNativeActions ? appModel.engine.tools.nativeActions.count : 6) of \(appModel.engine.tools.nativeActions.count) loaded actions")
                             .font(ShellType.caption)
                             .foregroundStyle(NativeAgentShell.secondary)
                     }
@@ -1158,7 +1034,7 @@ struct CapabilitiesView: View {
                 // last FOUR native-action receipts; this row showed only the
                 // latest, which silently narrowed visibility when the roll-up
                 // died. Canonical home is here, next to the actions themselves.
-                ForEach(appModel.nativeActionReceipts.prefix(4)) { receipt in
+                ForEach(appModel.engine.tools.nativeActionReceipts.prefix(4)) { receipt in
                     CapabilityDetailRow(
                         title: AdvancedStatusWords.label(receipt.name ?? receipt.actionId),
                         detail: receipt.createdAt ?? AdvancedStatusWords.label(receipt.actionId),
@@ -1166,12 +1042,12 @@ struct CapabilitiesView: View {
                     )
                 }
 
-                if let connectorRegistry = appModel.connectorActionRegistry {
+                if let connectorRegistry = appModel.engine.connectors.actions {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             AdvancedEyebrow(text: "\(connectorRegistry.actions.count) connector actions")
                             Spacer()
-                            if let latest = appModel.latestConnectorActionReceipt ?? connectorRegistry.latestReceipt {
+                            if let latest = connectorRegistry.latestReceipt {
                                 AdvancedStatusWord(status: latest.status)
                             }
                         }
@@ -1197,20 +1073,7 @@ struct CapabilitiesView: View {
 
     }
 
-    @MainActor
-    private func refreshNativeActionYoloAdmission() async {
-        let actionIDs = appModel.nativeActions
-            .filter { $0.requiresApproval != false }
-            .map(\.id)
-        var checked: [String: Bool] = [:]
-        for actionID in actionIDs {
-            checked[actionID] = await appModel.fullMacYoloAuthorityAdmitted(
-                tool: actionID,
-                surface: "native_actions"
-            )
-        }
-        nativeActionYoloAdmission = checked
-    }
+
 }
 
 struct CapabilitiesRunGauntletAndBrowserActions: View {
@@ -1220,8 +1083,7 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
 
     private var latestGauntlet: Result<ImprovementGauntletRun?, Error> {
         Result {
-            let storedRun = try appModel.improvementGauntletStatus?.latestDisplayRun
-            return appModel.latestGauntletRun ?? storedRun
+            try appModel.engine.doctor.improvementGauntletStatus?.latestDisplayRun
         }
     }
 
@@ -1263,7 +1125,7 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                 }
             }
 
-            if let run = appModel.latestBrowserRun {
+            if let run = appModel.engine.tools.browserStatus?.latestReceipt {
                 let presentation = CapabilitiesRunActionPresentation.browserOutcome(for: run)
                 CapabilityDetailRow(
                     title: presentation.title,
@@ -1396,6 +1258,7 @@ struct CapabilityRow: View {
 
 struct NextGenPhaseRow: View {
     var phase: NextGenPhase
+    var eligibleActions: [NextGenAction]
     var isRunning: Bool
     var runProbe: (String) -> Void
 
@@ -1410,7 +1273,7 @@ struct NextGenPhaseRow: View {
             // L3#6: a phase's primaryDryRunActionId comes from the catalog data
             // file and may name an id the read-only executor has no case for.
             // Render the probe only when an executor backs it.
-            if let actionId = phase.primaryDryRunActionId, NativeAgentEngine.isNextGenActionBacked(actionId) {
+            if let actionId = phase.primaryDryRunActionId, eligibleActions.contains(where: { $0.id == actionId }) {
                 Button("Preview") {
                     runProbe(actionId)
                 }
@@ -1427,17 +1290,19 @@ struct NextGenPhaseRow: View {
 struct SkillMemoryGraphPanel: View {
     @Environment(AppModel.self) private var appModel
     @State private var graphQuery = "memory workflow capability"
+    private var memory: MemoryFacade { appModel.engine.memory }
 
     var body: some View {
         AdvancedSection(title: "Skill memory graph") {
-            if let graph = appModel.agentGraph {
+            if let snapshot = memory.graphSnapshot {
+                let graph = KnowledgeGraphReadProjection.agentGraph(from: snapshot, executionCount: nil)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 16) {
                     AdvancedStat(title: "Items", value: "\(graph.summary.nodes)", detail: "memories, runs, Desk tasks, capabilities")
                     AdvancedStat(title: "Links", value: "\(graph.summary.edges)", detail: "what produced and used what")
                     AdvancedStat(title: "Capabilities", value: "\(graph.summary.capabilities ?? 0)", detail: "listed in the graph")
                 }
 
-                if let error = appModel.graphLoadError {
+                if let error = memory.graphLoadError {
                     Text("\(error) What is shown may be out of date.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.trouble)
@@ -1445,10 +1310,8 @@ struct SkillMemoryGraphPanel: View {
                 }
 
                 HStack(spacing: 8) {
-                    if let status = appModel.graphStatus {
-                        AdvancedStatusWord(status: status.status)
-                        AdvancedMeta("\(status.entityCount ?? appModel.graphEntities.count) entities")
-                    }
+                    AdvancedStatusWord(status: KnowledgeGraphReadProjection.graphIndexStatus(from: snapshot).status)
+                    AdvancedMeta("\(snapshot.entities.count) entities")
                     TextField("Search the graph", text: $graphQuery)
                         .textFieldStyle(.roundedBorder)
                         .font(ShellType.label)
@@ -1479,8 +1342,8 @@ struct SkillMemoryGraphPanel: View {
                         }
                 }
 
-                if !appModel.graphEntities.isEmpty {
-                        ForEach(appModel.graphEntities.prefix(5)) { entity in
+                if !snapshot.entities.isEmpty {
+                        ForEach(snapshot.entities.prefix(5)) { entity in
                             CapabilityDetailRow(
                                 title: entity.name,
                                 detail: "\(entity.mentions ?? 0) mentions · confidence \(String(format: "%.2f", entity.confidence ?? 0))",
@@ -1488,7 +1351,7 @@ struct SkillMemoryGraphPanel: View {
                             )
                         }
                 }
-            } else if let error = appModel.graphLoadError {
+            } else if let error = memory.graphLoadError {
                 AdvancedEmptyState(
                     title: "Skill memory graph unavailable",
                     detail: error,
@@ -1515,13 +1378,13 @@ struct WorkflowBuilderPanel: View {
 
     var body: some View {
         AdvancedSection(title: "Saved workflows") {
-            if appModel.workflows.isEmpty {
+            if appModel.engine.desk.workflows.isEmpty {
                 AdvancedEmptyState(
                     title: "No workflows",
                     detail: "A workflow saved here shows up in this list. Refresh Capabilities to see the current set."
                 )
             } else {
-                ForEach(appModel.workflows) { workflow in
+                ForEach(appModel.engine.desk.workflows) { workflow in
                     WorkflowRow(workflow: workflow)
                 }
             }
@@ -1778,13 +1641,6 @@ enum CapabilitiesResearchLabPresentation {
         let systemImage: String
     }
 
-    enum RunList: Equatable {
-        case loading
-        case empty
-        case loaded([ResearchLabRun])
-        case unavailable(detail: String, retained: [ResearchLabRun])
-    }
-
     static func message(for outcome: ResearchLabActionOutcome) -> Message {
         switch outcome {
         case .rejected(let detail):
@@ -1835,14 +1691,6 @@ enum CapabilitiesResearchLabPresentation {
                 systemImage: "questionmark.diamond"
             )
         }
-    }
-
-    static func list(rows: [ResearchLabRun]) -> RunList {
-        rows.isEmpty ? .empty : .loaded(rows)
-    }
-
-    static func unavailableList(detail: String, retained: [ResearchLabRun]) -> RunList {
-        .unavailable(detail: bounded(detail), retained: retained)
     }
 
     private static func meaningfulDetail(for run: ResearchLabRun) -> String? {
@@ -1900,9 +1748,7 @@ extension AppModel {
             try IntentRoutePlan(await SwiftNativeRouterPlanClient().planRoute(message: message))
         })
         guard didRoute else { return }
-        let traceTimeline = await EngineRuntime.CapabilityTraceFeed.read(dataRoot: engine.dataRoot)
-        capabilityTraceTimeline = traceTimeline
-        traces = traceTimeline.traces
+        await engine.turns.refreshCapabilityTraces()
     }
 
     /// The UI owns visible route state while the injected planner remains the

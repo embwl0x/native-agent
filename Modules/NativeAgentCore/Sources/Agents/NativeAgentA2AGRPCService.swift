@@ -1,10 +1,11 @@
 import Foundation
 import AgentLinkTransport
-import ChatOrchestration
+import AgentConversations
 import GRPCCore
 import GRPCProtobuf
 import SwiftProtobuf
 import NativeAgentCore
+// Blueprint: | `NativeAgentA2AGRPCService.swift` | gRPC authentication, protocol/error projection and acknowledged stream delivery |
 
 /// Protobuf is a wire projection of the same canonical endpoint used by JSON-RPC and HTTP+JSON.
 struct NativeAgentA2AGRPCService: Lf_A2a_V1_A2AService.ServiceProtocol {

@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `DefaultReasoningEffortOptions.swift` | `defaultReasoningEffortOptions` |
 public var defaultReasoningEffortOptions: [ReasoningEffortOption] {
     [
         ReasoningEffortOption(id: "none", label: "None", description: nil),

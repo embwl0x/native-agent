@@ -1,6 +1,8 @@
 import AgentWorkspace
 import Foundation
+import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `AgentConversationExchange.swift` | `AgentConversationExchange`: `started`, `absorb`, `validate`; partial text is retained separately from a finished reply; each exchange retains its receipt's shelf result UUID across subsequent sends |
 
 extension AgentConversationExchange {
     package static let textLimit = 8 * 1024
@@ -17,11 +19,12 @@ extension AgentConversationExchange {
     mutating func absorb(_ row: AgentConversationRecord) {
         guard row.phase != "sending", row.operationID == id else { return }
         let hadReply = reply != nil
+        let observing = if case .object(let fields)? = row.receipt { fields["reply_observation"] == .string("running") } else { false }
         defer {
             // Stamped when it settles, and again if a reply lands after that.
             // A route that watched the answer finish says when (`replied_at`, the
             // last change it saw), not when it noticed it had stopped changing.
-            if row.phase != "waiting", settledAt == nil || (!hadReply && reply != nil) {
+            if !observing, row.phase != "waiting", settledAt == nil || (!hadReply && reply != nil) {
                 settledAt = Self.repliedAt(row.receipt, after: sentAt, key: reply == nil ? "ended_at" : "replied_at") ?? Date()
             }
         }
@@ -30,6 +33,7 @@ extension AgentConversationExchange {
         if case .object(let fields)? = row.receipt { root = fields } else { root = [:] }
         var value = root
         if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { value = job }
+        resultID = Self.string(value["entry_id"]).flatMap(UUID.init(uuidString:))
         status = Self.state(Self.string(value["run_status"]) ?? Self.string(value["status"])
             ?? Self.string(value["state"]) ?? "unknown")
         if let card = Self.string(root["approvalId"]) { approvalId = card }
@@ -50,6 +54,7 @@ extension AgentConversationExchange {
         // Replace, never carry an older answer through a failed/unknown read.
         let text = answer.map { Self.clipped($0, limit: Self.textLimit) }
         reply = text?.text
+        partialReply = Self.string(value["partial_reply"]).map { Self.clipped($0, limit: Self.textLimit).text }
         replyTruncated = text.map { ownerTruncated || $0.truncated } ?? false
     }
 
@@ -67,21 +72,21 @@ extension AgentConversationExchange {
         return fields
     }
 
-    static func validate(_ history: [Self]?) throws {
+    static func validate(_ history: [Self]?, file: URL) throws {
         guard let history else { return }
         guard history.count <= countLimit, Set(history.map(\.id)).count == history.count,
               history.allSatisfy({ entry in
                   UUID(uuidString: entry.id) != nil && entry.sentAt.timeIntervalSince1970.isFinite
                     && [entry.phase, entry.status].allSatisfy { !$0.isEmpty && $0.utf8.count <= 256 && !$0.contains("\0") }
-                    && [entry.prompt, entry.reply].compactMap { $0 }.allSatisfy { $0.utf8.count <= textLimit }
+                    && [entry.prompt, entry.reply, entry.partialReply].compactMap { $0 }.allSatisfy { $0.utf8.count <= textLimit }
                     && (entry.prompt != nil || !entry.promptTruncated)
                     && (entry.reply != nil || !entry.replyTruncated)
               }), try JSONEncoder().encode(history).count <= byteLimit else {
-            throw AgentConversationStore.Failure(message: "Saved conversation history is unavailable; existing records were preserved.")
+            throw historyFailure("Saved conversation history is invalid; existing records were preserved.", code: "agent_conversation_history_invalid", file: file)
         }
     }
 
-    static func bounded(_ history: [Self]) throws -> [Self] {
+    static func bounded(_ history: [Self], file: URL) throws -> [Self] {
         var result = history
         let encoder = JSONEncoder()
         var sizes = try result.map { try encoder.encode($0).count }
@@ -90,7 +95,9 @@ extension AgentConversationExchange {
         // the only copy of what her contact has not yet taken (`takeHeld`).
         while result.count > 1, result.count > countLimit || size > byteLimit {
             guard let oldest = result.indices.dropLast().first(where: { !["held", "delivering"].contains(result[$0].status) }) else {
-                throw AgentConversationStore.Failure(message: "This conversation already keeps as many messages as it can hold for its contact's next check-in; nothing more was added. They go out when it next calls.")
+                throw ToolFailureError("Conversation capacity is held by queued messages awaiting the contact's check-in.", effects: .unknown,
+                    nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]),
+                    code: "agent_conversation_capacity", instruction: "Wait for the contact's check-in; read contacts for delivery state. Preserve queued messages.", recovery: .inspect)
             }
             size -= sizes.remove(at: oldest) + 1
             result.remove(at: oldest)
@@ -105,11 +112,17 @@ extension AgentConversationExchange {
             } else if let prompt = result[last].prompt, prompt.utf8.count > 0 {
                 result[last].prompt = clipped(prompt, limit: prompt.utf8.count / 2).text
                 result[last].promptTruncated = true
-            } else { throw AgentConversationStore.Failure(message: "This conversation history exceeds its storage limit.") }
+            } else { throw historyFailure("Conversation history exceeds its 65536-byte storage limit.", code: "agent_conversation_history_limit", file: file) }
             size = try encoder.encode(result).count
         }
-        try validate(result)
+        try validate(result, file: file)
         return result
+    }
+
+    private static func historyFailure(_ message: String, code: String, file: URL) -> ToolFailureError {
+        ToolFailureError(message, effects: .unknown, owner: file.path,
+            code: code, instruction: ToolFailureError.fileRepairInstruction(file,
+                shape: "Preserve conversation records and queued messages. Each exchange history has at most 32 unique UUID entries and 65536 encoded bytes; prompt, reply and partialReply are at most 8192 UTF-8 bytes each.") + " Repair the saved history from retained evidence without discarding queued messages.")
     }
 
     static func clipped(_ text: String, limit: Int) -> (text: String, truncated: Bool) {

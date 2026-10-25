@@ -18,10 +18,10 @@
 import Foundation
 import Senses
 import GRDB
-import KnowledgeGraph
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
+// Blueprint: | `MemoryV2+SharedInstance.swift` | Concrete `MemoryStorageBridge` translates canonical records; attachment readiness, engine-closed projection hooks and unavailable-storage admission; late canonical attachment never reopens stopped projections |
 
 // MARK: - MemoryStorageBridge
 
@@ -214,13 +214,6 @@ public actor MemoryStorageBridge {
         try await storage.isTombstoned(content: content)
     }
 
-    public func recordTombstone(content: String, reason: String?) async throws {
-        try await storage.addTombstone(content: content, reason: reason)
-    }
-    public func removeTombstone(content: String) async throws {
-        try await storage.removeTombstone(content: content)
-    }
-
     public func recordRecallHits(ids: [String]) async throws {
         try await storage.recordRecallHits(ids: ids)
     }
@@ -393,23 +386,6 @@ extension SwiftNativeMemoryV2 {
         return try MemoryStorage(dataRoot: dataRoot.standardizedFileURL)
     }
 
-    /// memory.sqlite's owner for the Knowledge Graph
-    /// (`KnowledgeGraphPoolCache.installOwner`): the kg_* tables live in this
-    /// store, so the graph reads and writes them through the owning storage's
-    /// pool, never a connection of its own.
-    public static func knowledgeGraphPool(at sqlitePath: URL) async throws -> DatabasePool {
-        let file = sqlitePath.standardizedFileURL
-        let memoryDir = file.deletingLastPathComponent()
-        guard file.lastPathComponent == "memory.sqlite",
-              memoryDir.lastPathComponent == "memory" else {
-            throw MemoryStorageError.databaseUnavailable(
-                "not a MemoryStorage database: \(file.path)"
-            )
-        }
-        let storage = try await resolvedStorage(dataRoot: memoryDir.deletingLastPathComponent())
-        return storage.dbPool
-    }
-
     /// Build and attach the USER.md projection hook to this actor's exact
     /// underlying storage. The caller gets the generator only after the hook is
     /// installed, so launch cannot regenerate through one SQLite owner and then
@@ -419,6 +395,7 @@ extension SwiftNativeMemoryV2 {
         personaRoot: URL? = nil,
         debounceInterval: TimeInterval = 30
     ) async -> UserMDGenerator? {
+        guard !memoryProjectionsStopped else { return nil }
         if let canonicalDataRoot,
            Self.canonicalRootIdentity(canonicalDataRoot) != Self.canonicalRootIdentity(dataRoot) { return nil }
         userProjectionBinding = (dataRoot, personaRoot, debounceInterval)
@@ -426,6 +403,7 @@ extension SwiftNativeMemoryV2 {
         catch { emitDiagnostic("[MemoryV2] USER projection attachment failed: \(error)"); return nil }
         guard let bridge = storage else { return nil }
         let underlying = await bridge.underlyingStorage()
+        guard !memoryProjectionsStopped else { return nil }
         let storagePath = underlying.path
         let storageDataRoot = storagePath
             .deletingLastPathComponent()
@@ -441,7 +419,18 @@ extension SwiftNativeMemoryV2 {
             debounceInterval: debounceInterval
         )
         await underlying.attachUserMDGenerator(generator)
+        guard !memoryProjectionsStopped else { return nil }
         return generator
+    }
+
+    /// Retire projection resources without closing the canonical write store.
+    public func shutdownProjections() async {
+        memoryProjectionsStopped = true
+        if let storage {
+            let underlying = await storage.underlyingStorage()
+            await underlying.shutdownProjections()
+        }
+        await canonicalAttachmentReady?.value
     }
 
     /// Reconcile the rebuildable Knowledge Graph projection from the exact
@@ -512,7 +501,8 @@ extension SwiftNativeMemoryV2 {
         }
         guard storage == nil, let dataRoot = canonicalDataRoot else { return }
         do {
-            let (bridge, ready) = try Self.sharedBackingStore(dataRoot: dataRoot, userProjectionBinding: userProjectionBinding)
+            let (bridge, ready) = try Self.sharedBackingStore(dataRoot: dataRoot, userProjectionBinding: userProjectionBinding,
+                                                            projectionsEnabled: !memoryProjectionsStopped)
             storage = bridge
             canonicalAttachmentReady = ready
             Self.sharedOpenFailureSlot.withLock { $0 = nil }
@@ -539,10 +529,12 @@ extension SwiftNativeMemoryV2 {
 
     private static func sharedBackingStore(
         dataRoot: URL,
-        userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?
+        userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?,
+        projectionsEnabled: Bool
     ) throws -> (MemoryStorageBridge, Task<Void, Never>) {
         let storage = try MemoryStorage(dataRoot: dataRoot)
         let bridge = MemoryStorageBridge(storage: storage)
+        guard projectionsEnabled else { return (bridge, Task {}) }
         // Spotlight indexing hook: every memory mutation (insert/update/
         // delete/acceptProposal) reflects into the Spotlight index so the
         // system surfaces them. Built lazily to avoid retaining the indexer

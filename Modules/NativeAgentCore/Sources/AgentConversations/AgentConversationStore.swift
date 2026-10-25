@@ -8,6 +8,7 @@ import ApprovalInbox
 import ChatTurnContracts
 import Experiences
 import TurnTrace
+// Blueprint: | `AgentConversationStore.swift` | `records` reconciles/saves denied approvals and publishes experience/live projections; `outcome_unknown` attention receipts use the session's `unsettledAttention` owner: unresolved sends stay waiting with the answer owed, terminal unknowns fail without claiming non-delivery; `records` and `recordsUnlocked` project stored reply deadlines through `AgentConversationView`; reporting expiry releases the conversation without settling its retained desktop observer, which writes its one terminal receipt, partial text and local release together at settlement; other reply expiry is terminal with no reply, while transport still accepts late answers; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
 
 
 
@@ -35,7 +36,7 @@ extension AgentConversationRecord {
 /// Where a contact's current send stands, from evidence the lanes already
 /// keep: sending → delivered → read → answered, or failed. `waiting` is a
 /// send the lane is still carrying, or one handed over whose asked-for
-/// answer is still owed, until its recorded reply deadline.
+/// answer is still owed, until its recorded reply deadline. `outcome_unknown` follows the session's hold; terminal unknowns fail without claiming non-delivery.
 public enum AgentConversationDelivery: String, Sendable {
     case sending, waiting, delivered, read, answered, failed, notDelivered
 
@@ -53,10 +54,9 @@ public enum AgentConversationDelivery: String, Sendable {
         if case .object(let receipt)? = row.receipt, receipt["sent"] == .bool(false) { return .notDelivered }
         if row.phase == "ready", row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return .answered }
         switch row.phase {
-        case "sending": return .sending
         case "attention":
-            if case .object(let receipt)? = row.receipt, receipt["sent"] == .bool(false) || receipt["error"] != nil
-                || receipt["status"] == .string("outcome_unknown") { return .notDelivered }
+            if case .object(let receipt)? = row.receipt, receipt["status"] == .string("outcome_unknown") { return AgentConversationSession.unsettledAttention(row) ? .waiting : .failed }
+            if case .object(let receipt)? = row.receipt, receipt["error"] != nil { return .notDelivered }
             return row.awaitsReply ? .failed : (accepted(row, read: read) ? .delivered : .waiting)
         case "waiting":
             // Still with the lane (queued, running, a peer's task at work): the
@@ -154,6 +154,7 @@ public struct AgentConversationStore: Sendable {
         public var errorDescription: String? { message }
     }
 
+    /// Reconciles/saves denied approvals and publishes experience and live-display projections while reading.
     public func records() throws -> [AgentConversationRecord] {
         try locked {
             var rows = try load()
@@ -249,14 +250,16 @@ public struct AgentConversationStore: Sendable {
                     label: label ?? (fresh ? "Conversation " + String(id.prefix(8)) : "Main"),
                     phase: "ready", operationID: id, updatedAt: Date(), sourceSurface: sourceSurface)
             }
-            try Self.absorbExchange(into: &row)
+            try Self.absorbExchange(into: &row, file: fileURL)
             row.operationID = UUID().uuidString.lowercased()
+            row.lifeID = try DataRootLife.current(in: fileURL.deletingLastPathComponent().deletingLastPathComponent())
             row.phase = "sending"
             row.updatedAt = Date()
             row.operationStartedAt = row.updatedAt
             row.exchanges = try AgentConversationExchange.bounded((row.exchanges ?? []) + [
                 .started(operationID: row.operationID, at: row.updatedAt, message: message, byPerson: personInitiated)
-            ])
+            ], file: fileURL)
+            if let latest = row.exchanges?.indices.last { row.exchanges?[latest].lifeID = row.lifeID }
             row.personInitiated = personInitiated ? true : nil
             row.expectsReply = expectsReply
             row.sourceSurface = sourceSurface
@@ -283,7 +286,7 @@ public struct AgentConversationStore: Sendable {
 
     /// Queue a follow-up on a thread whose reply is still in flight. Nil when
     /// the reply settled meanwhile (the caller sends it normally instead).
-    public func enqueue(id: String, text: String, byPerson: Bool,
+    public func enqueue(id: String, text: String, byPerson: Bool, arguments: [String: JSONValue]? = nil,
                         stillInFlight: (AgentConversationRecord) -> Bool) throws -> (AgentConversationRecord, AgentConversationQueued)? {
         try locked {
             var rows = try load()
@@ -291,8 +294,9 @@ public struct AgentConversationStore: Sendable {
             guard (rows[i].queued ?? []).count < 20 else {
                 throw Failure(message: "Twenty messages are already queued on this conversation; nothing more was added.")
             }
-            let item = AgentConversationQueued(id: UUID().uuidString.lowercased(), text: text, queuedAt: Date(),
-                                               byPerson: byPerson ? true : nil)
+            var item = AgentConversationQueued(id: UUID().uuidString.lowercased(), text: text, queuedAt: Date(),
+                                               byPerson: byPerson ? true : nil, arguments: arguments)
+            item.lifeID = try DataRootLife.current(in: fileURL.deletingLastPathComponent().deletingLastPathComponent())
             rows[i].queued = (rows[i].queued ?? []) + [item]
             rows[i].updatedAt = Date()
             try save(rows)
@@ -344,7 +348,7 @@ public struct AgentConversationStore: Sendable {
     /// The current exchange settles with its receipt; a late answer lands
     /// on its earlier exchange, never on the current one.
     public func settleExchange(id: String, exchange: String, reply: String?, receipt: JSONValue? = nil,
-                               firstActivity: Date? = nil) throws {
+                               firstActivity: Date? = nil, stopDetail: String? = nil) throws {
         try locked {
             var rows = try load()
             guard let i = rows.firstIndex(where: { $0.id == id }), var history = rows[i].exchanges,
@@ -356,18 +360,30 @@ public struct AgentConversationStore: Sendable {
             if rows[i].operationID == exchange, let receipt {
                 rows[i].receipt = Self.cacheReceipt(receipt)
                 rows[i].phase = reply == nil ? "attention" : "ready"
+                if let stopDetail {
+                    rows[i].stop = AgentConversationStop(state: "released", operationID: exchange, at: Date(), detail: stopDetail)
+                    rows[i].phase = "ready"
+                }
+                rows[i].automaticRead = false; rows[i].nextReadAt = nil
                 rows[i].exchanges = history
-                try Self.absorbExchange(into: &rows[i])
+                try Self.absorbExchange(into: &rows[i], file: fileURL)
                 rows[i].updatedAt = Date()
             } else {
-                guard let reply else {
-                    throw Failure(message: "This conversation has moved on; the older result was not applied.")
-                }
                 if history[j].reply != nil { return }
-                let text = AgentConversationExchange.clipped(reply, limit: AgentConversationExchange.textLimit)
-                history[j].reply = text.text; history[j].replyTruncated = text.truncated
-                history[j].status = "answered"; history[j].phase = "ready"; history[j].settledAt = Date()
-                rows[i].exchanges = try AgentConversationExchange.bounded(history)
+                if let reply {
+                    let text = AgentConversationExchange.clipped(reply, limit: AgentConversationExchange.textLimit)
+                    history[j].reply = text.text; history[j].replyTruncated = text.truncated
+                }
+                if case .object(let fields)? = receipt {
+                    if case .string(let entryID)? = fields["entry_id"] { history[j].resultID = UUID(uuidString: entryID) }
+                    if case .string(let partial)? = fields["partial_reply"] {
+                        history[j].partialReply = AgentConversationExchange.clipped(partial, limit: AgentConversationExchange.textLimit).text
+                    }
+                    if case .string(let status)? = fields["status"] { history[j].status = status }
+                } else { history[j].status = "answered" }
+                history[j].phase = stopDetail != nil || reply != nil ? "ready" : "attention"
+                history[j].settledAt = Date()
+                rows[i].exchanges = try AgentConversationExchange.bounded(history, file: fileURL)
             }
             try save(rows)
             // Read from this record's own route: the route the transport read attests it.
@@ -437,7 +453,7 @@ public struct AgentConversationStore: Sendable {
             guard rows[i].id == identity.id, rows[i].agent == identity.agent,
                   rows[i].scopeSessionID == identity.scopeSessionID,
                   rows[i].operationID == operationID else { throw Failure(message: "Conversation identity cannot change.") }
-            try Self.absorbExchange(into: &rows[i])
+            try Self.absorbExchange(into: &rows[i], file: fileURL)
             if touch || rows[i].phase != identity.phase || rows[i].exchanges?.last?.reply != identity.exchanges?.last?.reply {
                 rows[i].updatedAt = Date()
             }
@@ -621,7 +637,7 @@ public struct AgentConversationStore: Sendable {
             rows[index].automaticRead = false
             rows[index].nextReadAt = nil
             rows[index].updatedAt = Date()
-            try Self.absorbExchange(into: &rows[index])
+            try Self.absorbExchange(into: &rows[index], file: fileURL)
             try save(rows)
             // Where the thread reader already reads it (any session of the
             // record's identity), the original attested row is the reply: no copy.
@@ -666,7 +682,7 @@ public struct AgentConversationStore: Sendable {
                 guard (next.phase != "waiting" && next.phase != row.phase)
                         || (AgentConversationSession.liveHandOff(next) && !AgentConversationSession.liveHandOff(row)) else { continue }
                 next.updatedAt = Date()
-                try Self.absorbExchange(into: &next)
+                try Self.absorbExchange(into: &next, file: fileURL)
                 before.append((index, row))
                 rows[index] = next
                 changed += 1
@@ -738,11 +754,11 @@ public struct AgentConversationStore: Sendable {
         return value
     }
 
-    private static func absorbExchange(into row: inout AgentConversationRecord) throws {
+    private static func absorbExchange(into row: inout AgentConversationRecord, file: URL) throws {
         guard row.phase != "sending", var history = row.exchanges,
               let index = history.firstIndex(where: { $0.id == row.operationID }) else { return }
         history[index].absorb(row)
-        row.exchanges = try AgentConversationExchange.bounded(history)
+        row.exchanges = try AgentConversationExchange.bounded(history, file: file)
     }
 
     /// Heal decisions already saved before this process saw them, including
@@ -778,7 +794,7 @@ public struct AgentConversationStore: Sendable {
                 if history[index].settledAt == nil { history[index].settledAt = Date() }
                 changed = true
             }
-            rows[i].exchanges = try AgentConversationExchange.bounded(history)
+            rows[i].exchanges = try AgentConversationExchange.bounded(history, file: fileURL)
         }
         for i in held {
             guard case .object(let receipt)? = rows[i].receipt,
@@ -791,7 +807,7 @@ public struct AgentConversationStore: Sendable {
             rows[i].phase = "ready"; rows[i].automaticRead = false; rows[i].nextReadAt = nil; rows[i].deliveryState = nil
             // Keep its own time: settling an old denial must not make it the
             // contact's newest send (it hid newer replies behind "denied").
-            try Self.absorbExchange(into: &rows[i])
+            try Self.absorbExchange(into: &rows[i], file: fileURL)
             changed = true
         }
         return changed
@@ -826,8 +842,33 @@ public struct AgentConversationStore: Sendable {
               rows.allSatisfy({ UUID(uuidString: $0.id) != nil && UUID(uuidString: $0.operationID) != nil && !$0.scopeSessionID.isEmpty }) else {
             throw Failure(message: "Saved conversations are unavailable; existing records were preserved.")
         }
-        for row in rows { try AgentConversationExchange.validate(row.exchanges) }
+        for row in rows { try AgentConversationExchange.validate(row.exchanges, file: fileURL) }
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        for i in rows.indices {
+            for j in rows[i].queued?.indices ?? 0..<0 where try !DataRootLife.isCurrent(rows[i].queued?[j].lifeID, in: root) {
+                rows[i].queued?[j].held = DataRootLife.stoppedReason
+                if rows[i].queueReservation == rows[i].queued?[j].id { rows[i].queueReservation = nil }
+            }
+            for j in rows[i].exchanges?.indices ?? 0..<0 {
+                guard ["held", "delivering"].contains(rows[i].exchanges?[j].status ?? ""),
+                      try !DataRootLife.isCurrent(rows[i].exchanges?[j].lifeID, in: root) else { continue }
+                rows[i].exchanges?[j].phase = "stopped"
+                rows[i].exchanges?[j].status = DataRootLife.stoppedReason
+            }
+            guard try !DataRootLife.isCurrent(rows[i].lifeID, in: root),
+                  ["sending", "waiting"].contains(rows[i].phase) || rows[i].automaticRead || rows[i].deliveryState == "delivering" else { continue }
+            rows[i].phase = "stopped"
+            rows[i].stop = .init(state: "stopped", operationID: rows[i].operationID,
+                                 at: rows[i].updatedAt, detail: DataRootLife.stoppedReason)
+            rows[i].automaticRead = false
+            rows[i].notice = nil
+            rows[i].nextReadAt = nil
+            rows[i].deliveryState = "stopped"
+            var receipt: [String: JSONValue] = rows[i].receipt.flatMap { if case .object(let fields) = $0 { fields } else { nil } } ?? [:]
+            receipt["status"] = .string("stopped")
+            receipt["reason"] = .string(DataRootLife.stoppedReason)
+            rows[i].receipt = .object(receipt)
+        }
         guard let peers = try? AgentPeerStore(dataRoot: root).list() else { return rows }
         for index in rows.indices where AgentConversationDelivery.inbox(agent: rows[index].agent,
             bridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root)) != nil {
@@ -852,7 +893,7 @@ public struct AgentConversationStore: Sendable {
             receipt["remedy"] = door.remedy()
             if DelegationStatusProjector.requestTexts(inbox: door.inbox, ids: [message], field: "read")[message] == "true" { receipt["read"] = .bool(true) }
             AgentConversationSession.absorb(.object(receipt), into: &rows[index])
-            try Self.absorbExchange(into: &rows[index])
+            try Self.absorbExchange(into: &rows[index], file: fileURL)
         }
         return try reconcilingExpiredReplies(rows)
     }
@@ -872,7 +913,7 @@ public struct AgentConversationStore: Sendable {
             receipt = AgentConversationView.expiringReply(receipt)
             if case .object(let fields) = receipt, fields["reply_state"] == .string("no_reply_expired") {
                 AgentConversationSession.absorb(receipt, into: &rows[i])
-                try Self.absorbExchange(into: &rows[i])
+                try Self.absorbExchange(into: &rows[i], file: fileURL)
             }
         }
         return rows
@@ -902,7 +943,7 @@ public struct AgentConversationStore: Sendable {
                 }
             }
         }
-        for row in rows { try AgentConversationExchange.validate(row.exchanges) }
+        for row in rows { try AgentConversationExchange.validate(row.exchanges, file: fileURL) }
         // A send the bounded ledger lets go keeps its evidence on the record, in
         // this same write, until its last state is on its own transcript row.
         var released = false
@@ -1010,7 +1051,7 @@ public struct AgentConversationStore: Sendable {
         ExperienceStore.record(root, "agent-conversations") { store in
             for row in rows {
                 var settled = row.settledObligations ?? [:]
-                if dropped {
+                if dropped || row.stop?.detail == DataRootLife.stoppedReason {
                     for (id, key) in [(row.operationID, "answer"), (row.operationID, "accept")] + (row.queued ?? []).flatMap({ item in ["deliver", "accept", "answer"].map { (item.id, $0) } }) {
                         var obligation = Experience.Obligation(to: "conversation:" + row.id)
                         obligation.phase = .letGo

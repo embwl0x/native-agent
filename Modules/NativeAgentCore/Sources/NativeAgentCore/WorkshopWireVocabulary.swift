@@ -1,6 +1,8 @@
 import Foundation
 import os
 
+// Blueprint: | `WorkshopWireVocabulary.swift` | Workshop wire vocabularies: canonical surface/event/approval/inbox/environment spelling and centralized legacy translation |
+
 // The de-mission wire bridges (Phase 2, items P2-3/P2-4/P2-5).
 //
 // Phase 1 removed every human-facing use of the word "mission". What is left
@@ -239,21 +241,6 @@ public enum InboxActionExecutionIdVocabulary {
             if let value = payload[key], !value.isEmpty { return value }
         }
         return nil
-    }
-}
-
-/// P2-6 residue: the notification action identifier for "open the execution".
-/// Wave 5 flips the EMITTER to the canonical spelling; readers accept both
-/// because a 0.3.x payload (or a notification already queued in Notification
-/// Center) still carries the legacy id.
-public enum WorkshopOpenNotificationAction {
-    public static let canonical = "open_execution"
-    public static let legacy = "open_mission"
-    public static let bothSpellings: [String] = [canonical, legacy]
-
-    /// True when `value` is the open-execution action in EITHER spelling.
-    public static func matches(_ value: String) -> Bool {
-        bothSpellings.contains(value.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }
 

@@ -4,6 +4,8 @@ import UniformTypeIdentifiers
 import ActivityWatch
 import TrustCenter
 
+// Blueprint: | `ActivityCapturePermissionsView.swift` | `ActivityCapturePermissionsView`: Trust Center consent/title/exclusion controls and honest capture privacy/issue presentation |
+
 /// W8 — the Trust Center surface for the ambient activity watcher.
 ///
 /// The copy here is the feature's actual privacy contract, so it is written to
@@ -30,13 +32,9 @@ import TrustCenter
 /// says whether recording is on; no pill repeats it.
 struct ActivityCapturePermissionsView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var controller: ActivityWatchController
+    private var controller: ActivityWatchController { appModel.engine.activityWatch }
     @State private var pendingExclusion: String?
     @State private var showWipeConfirm = false
-
-    init(controller: ActivityWatchController = .shared) {
-        _controller = State(initialValue: controller)
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {

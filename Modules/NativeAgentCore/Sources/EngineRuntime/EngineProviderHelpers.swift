@@ -1,11 +1,12 @@
 import Privacy
-import ChatOrchestration
+import ChatToolRuntime
 import AppToolRuntime
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Foundation
 import ProviderRouting
+// Blueprint: | `EngineProviderHelpers.swift` | ProvidersFacade checked settings refresh, credential/OAuth verdicts, model grouping, eligibility, snapshot-owned model/account inheritance, auth normalization and quiet provider policy; routing-derived selections share SettingsSnapshot. LatestRead orders settings and failures; committed routing publishes through write and retires prior session reads before checked session refresh. |
 extension ProvidersFacade {
     public nonisolated static func readModelRoutingConfig(dataRoot: URL) async throws -> ModelRoutingConfig {
         let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedRoutingSnapshot()
@@ -44,27 +45,39 @@ extension ProvidersFacade {
 
 @MainActor
 extension ProvidersFacade {
-    public struct SettingsSnapshot {
+    public struct SettingsSnapshot: Sendable {
         public let routing: ProviderRoutingSnapshot
         public let providers: [ProviderInfo]
         public let catalog: ModelCatalogResponse?
         public let catalogError: String?
         public let rowSet: ProviderSurfaceRowSet
-        public let activeProviders: [String: String]
-        public let preferences: [String: SurfacePreference]
+        public var activeProviders: [String: String] { routing.activeProviders }
+        public var preferences: [String: SurfacePreference] { routing.preferences }
+        public let unavailableModels: [String: Bool]
+        public let oauthStatuses: [String: NativeOAuthFlow.SignInStatus]
+        public let codexCLISessionOffer: NativeOAuthFlow.CodexCLISessionOffer?
     }
 
-    public enum SettingsRefreshOutcome {
+    public enum SettingsRefreshOutcome: Sendable {
         case loaded(SettingsSnapshot)
         case failed(String)
     }
 
     public func refreshSettings(refreshCatalog: Bool, cause: (Error, String) -> String) async -> SettingsRefreshOutcome {
+        defer { if !refreshCatalog { refreshAccountModelsInBackground() } }
+        return await settingsReads.read {
+            await readSettings(refreshCatalog: refreshCatalog, cause: cause)
+        } publish: { outcome in
+            switch outcome {
+            case .loaded(let settings): publishSettings(settings)
+            case .failed(let detail): publishSettingsFailure(detail)
+            }
+        }
+    }
+
+    private func readSettings(refreshCatalog: Bool, cause: (Error, String) -> String) async -> SettingsRefreshOutcome {
         do {
             let facade = self
-            defer {
-                if !refreshCatalog { facade.refreshAccountModelsInBackground() }
-            }
             var catalog: ModelCatalogResponse?
             var catalogError: String?
             if refreshCatalog {
@@ -80,26 +93,64 @@ extension ProvidersFacade {
                     catalog = try await facade.modelCatalog(refresh: false, routingSnapshot: snapshot.routing)
                 } catch { catalogError = cause(error, "load the model list") }
             }
-            let config = try ProvidersFacade.modelRoutingConfig(from: snapshot.routing)
-            catalog?.current = config.current
-            catalog?.defaultModel = config.current.chat.model
-            return .loaded(SettingsSnapshot(
+            return .loaded(try settingsSnapshot(
                 routing: snapshot.routing,
                 providers: providers,
                 catalog: catalog,
                 catalogError: catalogError,
-                rowSet: snapshot.rowSet,
-                activeProviders: snapshot.routing.activeProviders,
-                preferences: snapshot.routing.preferences
+                rowSet: snapshot.rowSet
             ))
         } catch {
-            return .failed(cause(error, "read the accounts"))
+            return SettingsRefreshOutcome.failed(cause(error, "read the accounts"))
         }
+    }
+
+    private func settingsSnapshot(
+        routing: ProviderRoutingSnapshot, providers: [ProviderInfo], catalog: ModelCatalogResponse?,
+        catalogError: String?, rowSet: ProviderSurfaceRowSet
+    ) throws -> SettingsSnapshot {
+        var catalog = catalog
+        let config = try Self.modelRoutingConfig(from: routing)
+        catalog?.current = config.current
+        catalog?.defaultModel = config.current.chat.model
+        return SettingsSnapshot(
+            routing: routing, providers: providers, catalog: catalog, catalogError: catalogError,
+            rowSet: rowSet,
+            unavailableModels: Dictionary(uniqueKeysWithValues: routing.preferences.map { surface, preference in
+                (surface, Self.savedModelIsKnownAbsent(
+                    providerId: routing.activeProviders[surface] ?? "", model: preference.model,
+                    providers: providers, dataRoot: dataRoot
+                ))
+            }),
+            oauthStatuses: Dictionary(uniqueKeysWithValues: ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct"].map {
+                ($0, NativeOAuthFlow.signInStatus(providerID: $0, dataRoot: dataRoot))
+            }),
+            codexCLISessionOffer: NativeOAuthFlow.codexCLISessionOffer(dataRoot: dataRoot)
+        )
+    }
+
+    /// The transaction's own routing is published before any suspended older read can return.
+    func publishCommittedRouting(_ routing: ProviderRoutingSnapshot) throws {
+        let committed = try settings.map {
+            try settingsSnapshot(routing: routing, providers: $0.providers, catalog: $0.catalog,
+                                 catalogError: $0.catalogError, rowSet: $0.rowSet)
+        }
+        settingsReads.write {
+            if let committed { publishSettings(committed) }
+        }
+        retireSessionReads()
     }
 }
 
 extension ProvidersFacade {
     public var hasReadyConnection: Bool { connections.contains { $0.auth_status.eligible } }
+
+    public func selection(for surface: String) -> SurfaceSelection {
+        let preference = settings?.preferences[surface]
+        return SurfaceSelection(provider: settings?.activeProviders[surface] ?? "",
+            model: preference?.model ?? "", reasoningEffort: preference?.reasoningEffort ?? "",
+            fastMode: preference?.serviceTier == "priority")
+    }
 
     public nonisolated static func chatModelIsReady(providers: [ProviderInfo], providerID: String, model: String) -> Bool {
         providers.contains { $0.provider_id == providerID && $0.auth_status.eligible
@@ -221,7 +272,7 @@ extension ProvidersFacade {
     /// or a static provider's compiled-in list, which is the whole truth about
     /// that provider. Moonshot has no live/fallback discriminator, so it never
     /// convicts. Anything unproven shows the saved model plainly.
-    public nonisolated static func savedModelIsKnownAbsent(providerId: String, model: String, providers: [ProviderInfo], dataRoot: URL) -> Bool {
+    private nonisolated static func savedModelIsKnownAbsent(providerId: String, model: String, providers: [ProviderInfo], dataRoot: URL) -> Bool {
         if providerId == "openrouter" {
             // User, 2026-09-06: this read the DEFAULT data root while the rest
             // of the screen works off the model's scoped one, so under an
@@ -262,18 +313,7 @@ extension ProvidersFacade {
 
 
     public nonisolated static func explicitSurfaces(in routing: ProviderRoutingSnapshot) -> Set<String> {
-        let chatPreference = routing.preferences["chat"]
-        let chatProvider = routing.activeProviders["chat"]
-        func resolvedDiffersFromChat(_ surface: String) -> Bool {
-            let mine = routing.preferences[surface]
-            let myProvider = routing.activeProviders[surface] ?? chatProvider
-            return mine?.model != chatPreference?.model
-                || mine?.reasoningEffort != chatPreference?.reasoningEffort
-                || mine?.serviceTier != chatPreference?.serviceTier
-                || myProvider != chatProvider
-        }
-        return Set(routing.pinnedModels.keys)
-            .union(MODEL_SURFACES.filter { $0 != "chat" && resolvedDiffersFromChat($0) })
+        routing.modelOverrideSurfaces
     }
 
     public nonisolated static func pickerProviders(_ providers: [ProviderInfo], activeProviders: [String: String]) -> [ProviderInfo] {
@@ -317,9 +357,8 @@ extension ProvidersFacade {
         return lead
     }
 
-    /// A group whose surfaces are all inheriting is not mixed even when their
-    /// unpinned seeds differ (dream and REM seed cheaper than chat by design).
-    /// Mixed means somebody's saved choice put the group's surfaces at odds.
+    /// Independent effort does not make an inheriting group mixed. Only a
+    /// model/account override makes its members' saved choices relevant here.
     public nonisolated static func groupIsMixed(_ group: ProviderSurfaceGroup, selections: [String: SurfaceSelection], explicitSurfaces: Set<String>) -> Bool {
         guard groupHasOverride(group, explicitSurfaces: explicitSurfaces), let first = group.surfaces.first.map({ selections[$0] ?? .empty }) else {
             return false
@@ -327,7 +366,7 @@ extension ProvidersFacade {
         return group.surfaces.dropFirst().contains { (selections[$0] ?? .empty) != first }
     }
 
-    /// Whether the group holds a saved choice that "Use Chat's choice" would clear.
+    /// Whether the group holds its own model/account choice.
     /// `chat` is the root everything else inherits from and never clears.
     public nonisolated static func groupHasOverride(_ group: ProviderSurfaceGroup, explicitSurfaces: Set<String>) -> Bool {
         group.surfaces.contains { $0 != "chat" && explicitSurfaces.contains($0) }

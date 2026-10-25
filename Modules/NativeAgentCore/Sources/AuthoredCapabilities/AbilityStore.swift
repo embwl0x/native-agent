@@ -5,10 +5,16 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
+// Blueprint: | `AbilityStore.swift` | The bundled seed catalog owns shipped-id and native- reservations for new parts in Parts.save and for installation; all-kind registry rows carry kind and version, including recordless turns, and senses expose record-owned version/reach/mode without ability wake/residency; one throwing partHeader normalizer/catalog for tools, skills, senses and reserved turns: reach/wake/face/resident/learned/choices, the `signalled` notification sources post and each part's `wakes`, legacy permissions projection and one 512 KB source limit; invocation-scoped file reach binds declared read/write approval to the part's own data root; current/prev/next lifecycle, shared ID normalization and all-slot name/identity occupancy for create-only saves and pack preflight, permitting same-install same-id replacements, atomic current-only seed installation under the store lock with any existing id/slot skipped, notebook schema and read/write/delete under the same lock (16 KiB/value, 64 KiB/notebook), independent versioned outcomes/read counts in state.json with exact-file read recovery and the captured restore digest retained in the remedy instruction, including native/bundled reads without executable files, without source rewrites, bounded recent exact-input/reached-call outcomes with redacted input previews and version run totals projected as learned.use from ordinary gated execution (no rehearsal/preview/replay competence credit), scoped rehearsal evidence distinguished from bundled admission and projected separately for current and proposed versions, operation-scoped repair owed through Experiences with source-filled native authoring calls for them abilities/senses, source reads and a person-directed defect for reserved turns, and no automatic swap-back; damaged-source recovery preserves fileRepairInstruction; unique ids, owner-off/peer-authoring guards, change invalidation and read/files/states perform verified on-disk migration of the three old stores into one retained .old-layout archive; `restoredLegacyCarry` prepares older-backup parts plus readable current uncarried kinds/accounting before installation, returning omissions for the sealed restore receipt; `installRestoredLegacy` installs that selection, or the backup alone when carry is lost, and archives the legacy sources without rereading current accounting |
 
-/// The files are the catalog. Accounting is the only separate document.
+/// Files are the catalog; accounting and notebooks are separate. Abilities,
+/// including retained archives, are backed up/exported with credential exclusions
+/// off disk; phone sync is eligible metadata only. PrivacyMap lists abilities.
 public struct AbilityStore: Sendable {
     @TaskLocal public static var fileReach: (root: URL, write: Bool)?
+    /// Her private moment after a turn's reply: a part it writes is stamped
+    /// `keptAfter` {turn, at} in its record, so her next turn hears of it.
+    @TaskLocal public static var keeping: (turn: String, at: Date)?
 
     public static func fileReachAllows(_ path: URL, write: Bool = false) -> Bool {
         guard let reach = fileReach, !write || reach.write else { return false }
@@ -17,7 +23,12 @@ public struct AbilityStore: Sendable {
         return target == root || target.hasPrefix(root + "/")
     }
 
-    public enum Kind: String, CaseIterable, Sendable { case tool, skill, sense, turn }
+    public enum Kind: String, CaseIterable, Sendable {
+        /// One she grows is an ability (User 10-21); written `ability` in its header.
+        case part = "ability", sense, turn
+        /// A header's kind; `tool`, `skill` and `part` are an ability's older spellings.
+        public init?(stored: String) { self.init(rawValue: ["tool", "skill", "part"].contains(stored) ? "ability" : stored) }
+    }
     public static let sourceLimit = 512 * 1024
     public static let didChange = Notification.Name("NativeAgent.abilityDidChange")
     /// A wake source fired. The stem delivers it to each part whose `wake`
@@ -26,65 +37,129 @@ public struct AbilityStore: Sendable {
     public static let signalled = Notification.Name("NativeAgent.partSignalled")
     public static let partKeys: Set<String> = ["reach", "wake", "face", "resident", "learned", "choices"]
 
+    /// Shared below Parts and pack installation, which cannot import Parts.
+    public static func normalizedID(_ given: String) -> String {
+        given.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9_-]+"#, with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    }
+    public static func isAbilityID(_ id: String) -> Bool { id.range(of: #"^[a-z][a-z0-9_-]{1,63}$"#, options: .regularExpression) != nil }
+
     public static func knownReach(_ name: String) -> Bool {
         if ["app_data_read", "app_data_write", "network_localhost", "network_public", "network", "shell", "computer_files", "arbitrary_file_write", "model", "calendar", "reminders", "contacts", "screen.watch", "hands"].contains(name) { return true }
         let pieces = name.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        if pieces.count == 2, pieces[0] == "secret" { return Keyring.validName(String(pieces[1])) }
+        // `connector:<id>` still reads, so an older ability loads; it grants nothing since 10-21.
         return pieces.count == 2 && ["app_read", "app_write", "connector"].contains(pieces[0])
             && !pieces[1].isEmpty && pieces[1].allSatisfy { $0.isLetter || $0.isNumber || "._-".contains($0) }
     }
 
-    /// The same header for every part. Legacy authority is projected, never rewritten on read.
-    public static func partHeader(_ fields: [String: JSONValue]) throws -> [String: JSONValue] {
+    /// The same header for every part. Abilities consume reach.capabilities;
+    /// readPaths/hosts/apps serve senses. Legacy authority is projected.
+    /// `saving` holds a new version to the wakes that are posted; a kept file
+    /// reads as it was accepted, so one stale wake never stops the catalog.
+    public static func partHeader(_ fields: [String: JSONValue], saving: Bool = false) throws -> [String: JSONValue] {
         var header = fields.filter { partKeys.contains($0.key) }
         var reach = header["reach"] ?? .object([:])
-        guard case .object(var scope) = reach else { throw failure("reach is {capabilities, readPaths, hosts, apps}.") }
+        guard case .object(var scope) = reach else { throw headerFailure("reach", accepted: "{capabilities?: [string], readPaths?: [string], hosts?: [string], apps?: [string]}") }
         if scope["capabilities"] == nil { scope["capabilities"] = fields["permissions"] ?? .array([]) }
         for key in ["capabilities", "readPaths", "hosts", "apps"] {
             if scope[key] == nil { scope[key] = .array([]) }
             guard case .array(let values)? = scope[key], values.allSatisfy({ if case .string(let text) = $0 { return !text.isEmpty }; return false }) else {
-                throw failure("reach.\(key) must be an array of nonempty strings.")
+                throw headerFailure("reach.\(key)", accepted: "an array of nonempty strings")
             }
             if key == "capabilities", let invalid = values.compactMap(\.stringValue).first(where: { !knownReach($0) }) {
-                throw failure("Unknown reach name: \(invalid).")
+                throw headerFailure("reach.capabilities", accepted: "known reach names; use app {find:\"ability.save\"} for declarations", detail: "Unknown reach name: \(invalid).")
             }
         }
-        if let key = scope.keys.sorted().first(where: { !["capabilities", "readPaths", "hosts", "apps"].contains($0) }) { throw failure("Unknown reach key: \(key).") }
+        if let key = scope.keys.sorted().first(where: { !["capabilities", "readPaths", "hosts", "apps"].contains($0) }) { throw headerFailure("reach.\(key)", accepted: "capabilities, readPaths, hosts or apps", detail: "Unknown reach key: \(key). Remove it or use an accepted key.", code: "unknown_header_reach_key") }
         header["reach"] = .object(scope)
         let wake = header["wake"] ?? .array([])
-        guard case .array(let signals) = wake else { throw failure("wake must be an array of signal names.") }
+        guard case .array(let signals) = wake else { throw headerFailure("wake", accepted: "an array of signal-name strings") }
         for signal in signals {
-            guard case .string(let name) = signal else { throw failure("wake must contain strings.") }
-            let valid = ["app.installed", "turn.ended"].contains(name)
-                || ["schedule:", "file.changed:", "message.arrived:"].contains { prefix in
+            guard case .string(let name) = signal else { throw headerFailure("wake", accepted: "an array of signal-name strings") }
+            let valid = ["app.installed", "turn.ended", "held", "resumed", "person.away", "person.here"].contains(name)
+                || ["message.arrived:slack", "message.arrived:telegram"].contains(name)
+                || (saving ? ["schedule:", "file.changed:"] : ["schedule:", "file.changed:", "message.arrived:"]).contains { prefix in
                     name.hasPrefix(prefix) && !name.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
-            guard valid else { throw failure("Unknown wake name: \(name). Use schedule:<cron>, app.installed, file.changed:<path>, turn.ended or message.arrived:<transport>.") }
+            guard valid else { throw headerFailure("wake", accepted: "schedule:<cron>, app.installed, file.changed:<path>, turn.ended, message.arrived:slack, message.arrived:telegram, held, resumed, person.away or person.here", detail: "Unknown wake name: \(name). Replace it with an accepted signal.") }
         }
         header["wake"] = wake
-        guard case .object(let face) = header["face"] ?? .object([:]) else { throw failure("face is {page?: string, action?: string}.") }
-        if let key = face.keys.sorted().first(where: { !["page", "action"].contains($0) }) { throw failure("Unknown face key: \(key).") }
+        guard case .object(let face) = header["face"] ?? .object([:]) else { throw headerFailure("face", accepted: "{page?: string, action?: string, projection?: bool}") }
+        if let key = face.keys.sorted().first(where: { !["page", "action", "projection"].contains($0) }) { throw headerFailure("face.\(key)", accepted: "page, action or projection", detail: "Unknown face key: \(key). Remove it or use an accepted key.", code: "unknown_header_face_key") }
+        if let projection = face["projection"], projection != .bool(true), projection != .bool(false) {
+            throw headerFailure("face.projection", accepted: "a Boolean; true declares function face(input)")
+        }
         if let action = face["action"], action.stringValue?.range(of: "^[a-z][a-z0-9_]*[.][a-z][a-z0-9_.]*$", options: .regularExpression) == nil {
-            throw failure("face.action must be a lowercase door action id, such as weather.forecast.")
+            throw headerFailure("face.action", accepted: "a lowercase app action id, such as weather.forecast")
         }
         if let page = face["page"] {
             guard case .string(let name) = page, AppDoorNames.partPages.contains(name) else {
-                throw failure("Unknown face.page \(page). Pages: \(AppDoorNames.partPages.sorted().joined(separator: ", ")).")
+                throw headerFailure("face.page", accepted: AppDoorNames.partPages.sorted().joined(separator: ", "), detail: "Unknown face.page \(page). Select an accepted page.")
             }
         }
         header["face"] = .object(face)
-        guard case .bool = header["resident"] ?? .bool(false) else { throw failure("resident must be a Boolean.") }
+        // Abilities use resident; sense helper retention uses SenseRecord.mode.
+        guard case .bool = header["resident"] ?? .bool(false) else { throw headerFailure("resident", accepted: "a Boolean") }
         header["resident"] = header["resident"] ?? .bool(false)
         return header
+    }
+
+    private static func headerFailure(_ field: String, accepted: String, detail: String? = nil, code: String? = nil) -> ToolFailureError {
+        ToolFailureError(detail ?? "\(field) must be \(accepted).", argumentPath: field, accepted: accepted, effects: .none,
+            code: code ?? "invalid_header_" + field.replacingOccurrences(of: ".", with: "_"), status: .refused,
+            instruction: "Correct \(field) in this call or retained header to match accepted.", recovery: .correctArguments)
+    }
+    /// A part's code as she reads it: whole when it fits one read, else in
+    /// pages that say where they are and how to go on, never a silent cut.
+    /// A page is sized so a read carrying two (a skill's selected and waiting
+    /// versions) stays inside one tool result, which is never re-cut.
+    public static let sourcePageCharacters = 18_000
+    public static func sourcePage(_ code: String, version: String, offset: Int, next: (Int) -> JSONValue) -> JSONValue {
+        let from = min(max(0, offset), code.count)
+        let start = code.index(code.startIndex, offsetBy: from)
+        let end = code.index(start, offsetBy: sourcePageCharacters, limitedBy: code.endIndex) ?? code.endIndex
+        var page: [String: JSONValue] = ["version": .string(version), "code": .string(String(code[start..<end]))]
+        guard from > 0 || end < code.endIndex else { return .object(page) }
+        let reached = from + code.distance(from: start, to: end)
+        page["offset"] = .int(Int64(from)); page["total_chars"] = .int(Int64(code.count))
+        if end < code.endIndex {
+            page["next_call"] = next(reached)
+            page["note"] = .string("Characters \(from) to \(reached) of \(code.count); the code continues. next_call reads on from \(reached).")
+        } else {
+            page["note"] = .string("Characters \(from) to \(reached) of \(code.count): the end of the code.")
+        }
+        return .object(page)
+    }
+
+    /// A revised body: each {old, new} in turn replaces the one place its old occurs.
+    public static func edited(_ body: String, _ edits: JSONValue) throws -> String {
+        guard case .array(let list) = edits, !list.isEmpty else { throw failure("edits is a nonempty list of {old, new}.") }
+        var text = body
+        for (i, edit) in list.enumerated() {
+            guard case .object(let pair) = edit, case .string(let old)? = pair["old"], !old.isEmpty,
+                  case .string(let new)? = pair["new"] else { throw failure("edits[\(i)] is {old, new}: old the exact text to replace, new its replacement.") }
+            let found = text.ranges(of: old)
+            guard found.count == 1 else {
+                throw failure(found.isEmpty ? "edits[\(i)].old is not in the code (after the edits before it); copy it exactly from the latest source."
+                    : "edits[\(i)].old occurs \(found.count) times; include more of its surrounding lines so it occurs once.")
+            }
+            text.replaceSubrange(found[0], with: new)
+        }
+        return text
     }
     public enum Slot: String, CaseIterable, Sendable { case current, previous, next }
     public struct File: Sendable, Equatable {
         public var id: String
         public var kind: Kind
         public var metadata: [String: JSONValue]
-        public var body: String
+        public var body: String { didSet { bodyDigest = Self.digest(body) } }
+        public private(set) var bodyDigest: String
         public var pathExtension: String
-        public init(id: String, kind: Kind, metadata: [String: JSONValue], body: String, pathExtension: String) {
+        public init(id: String, kind: Kind, metadata: [String: JSONValue], body: String, pathExtension: String) throws {
             self.id = id; self.kind = kind; self.metadata = metadata; self.body = body; self.pathExtension = pathExtension
+            self.bodyDigest = Self.digest(body)
             if self.metadata["version"] == nil { self.metadata["version"] = .int(1) }
             let candidate = metadata["candidate"]?.objectValue ?? [:]
             let manifest = candidate["manifest"]?.objectValue ?? [:]
@@ -94,45 +169,56 @@ public struct AbilityStore: Sendable {
             let program = candidate["program"]?.objectValue ?? [:]
             if properties["reach"] == nil { properties["reach"] = program["reach"] }
             if properties["permissions"] == nil { properties["permissions"] = program["permissions"] }
-            var reach = properties["reach"] ?? .object([:])
-            if case .object(var scope) = reach {
-                scope["capabilities"] = scope["capabilities"] ?? properties["permissions"] ?? .array([])
-                for key in ["readPaths", "hosts", "apps"] { scope[key] = scope[key] ?? .array([]) }
-                reach = .object(scope)
-            }
-            properties["reach"] = reach
-            properties["wake"] = properties["wake"] ?? .array([])
-            properties["face"] = properties["face"] ?? .object([:])
-            properties["resident"] = properties["resident"] ?? .bool(false)
-            self.metadata.merge(properties.filter { AbilityStore.partKeys.contains($0.key) }) { _, value in value }
+            self.metadata.merge(try AbilityStore.partHeader(properties)) { _, value in value }
             self.metadata.removeValue(forKey: "permissions")
             if var row = self.metadata["record"]?.objectValue {
                 row.removeValue(forKey: "permissions")
-                for key in AbilityStore.partKeys { row.removeValue(forKey: key) }
+                for key in AbilityStore.partKeys.union(kind == .sense ? ["kind"] : ["kind", "version"]) { row.removeValue(forKey: key) }
                 self.metadata["record"] = .object(row)
             }
         }
         public var part: [String: JSONValue] { metadata.filter { AbilityStore.partKeys.contains($0.key) } }
         public var record: [String: JSONValue]? {
-            guard var row = metadata["record"]?.objectValue else { return nil }
+            let manifest = metadata["candidate"]?.objectValue?["manifest"]?.objectValue ?? [:]
+            var row = metadata["record"]?.objectValue ?? manifest["record"]?.objectValue ?? manifest
+            row["id"] = .string(id); row["kind"] = .string(kind.rawValue)
+            // A sense keeps its SenseRecord version; other parts use the header's.
+            if kind != .sense { row["version"] = metadata["version"] }
+            if kind == .turn { row["status"] = .string("installed") }
+            else if metadata["record"]?.objectValue == nil { row["status"] = .string("draft") }
             row.merge(part) { _, value in value }
-            if kind == .tool { row["permissions"] = part["reach"]?.objectValue?["capabilities"] }
-            if kind == .sense, let reach = part["reach"]?.objectValue { row["reach"] = .object(reach.filter { $0.key != "capabilities" }) }
+            if kind == .part { row["permissions"] = part["reach"]?.objectValue?["capabilities"] }
+            if kind == .sense, let reach = part["reach"]?.objectValue {
+                row["reach"] = .object(reach.filter { $0.key != "capabilities" })
+                row.removeValue(forKey: "wake"); row.removeValue(forKey: "resident")
+            }
             return row
         }
         public var partLine: String {
-            id + " · " + ["reach", "wake", "face", "resident"].map {
+            if kind == .sense {
+                return id + " · " + ["reach", "mode"].map {
+                    $0 + ":" + ((try? (record?[$0] ?? .null).serialize(pretty: false)) ?? "null")
+                }.joined(separator: " ")
+            }
+            return id + " · " + ["reach", "wake", "face", "resident"].map {
                 $0 + ":" + ((try? (metadata[$0] ?? .null).serialize(pretty: false)) ?? "null")
             }.joined(separator: " ")
         }
         /// What wakes it while it is on.
         public var wakes: [String] {
             let status = record?["status"]?.stringValue
-            guard kind == .tool && status == "active" || kind == .skill && ["active", "installed"].contains(status)
-                || kind == .sense && status == "on" else { return [] }
+            guard kind == .part && status == "active" || kind == .sense && status == "on" else { return [] }
             return (metadata["wake"]?.arrayValue ?? []).compactMap(\.stringValue)
         }
-        public var bodyDigest: String { SHA256.hash(data: Data(body.utf8)).map { String(format: "%02x", $0) }.joined() }
+        /// The checked decoded file carries its digest; changing its body
+        /// refreshes it. Derived data does not change source-field equality.
+        private static func digest(_ body: String) -> String {
+            SHA256.hash(data: Data(body.utf8)).map { String(format: "%02x", $0) }.joined()
+        }
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.id == rhs.id && lhs.kind == rhs.kind && lhs.metadata == rhs.metadata
+                && lhs.body == rhs.body && lhs.pathExtension == rhs.pathExtension
+        }
     }
 
     public let dataRoot: URL
@@ -143,10 +229,10 @@ public struct AbilityStore: Sendable {
     nonisolated(unsafe) private static var walked: Set<String> = []
     nonisolated(unsafe) private static var depth = 0
     private static let statistics: Set<String> = ["uses", "useCount", "lastUsedAt", "lastRunVersion", "lastRun",
-        "lastCleanCode", "lastCleanVersion", "runs", "corrections", "unavailableReason"]
+        "lastCleanCode", "lastCleanVersion", "runs", "corrections", "unavailableReason", "keptAfter"]
     private static let obsolete: Set<String> = ["versionOwners", "bodyPath", "activePath", "proposalPath", "quarantinePath",
         "rollbackCounterparts", "versionValidation", "builtIn", "registryPath", "sourceRoot", "versions", "previousVersion",
-        "failuresInARow", "lastCleanDigest", "seeded", "validation_evidence", "candidate_validation_evidence"]
+        "failuresInARow", "lastCleanDigest", "seeded", "validation_evidence", "candidate_validation_evidence", "candidateReview", "keepReview"]
     private static let pending: Set<String> = ["candidateDigest", "candidatePrior", "candidateSelection", "candidateValidation", "candidateOrigin", "validationErrors"]
 
     public init(dataRoot: URL) { self.dataRoot = dataRoot.standardizedFileURL }
@@ -201,6 +287,7 @@ public struct AbilityStore: Sendable {
         return url
     }
 
+    /// Migrates legacy storage on disk before reading; unsuitable for a filesystem-read-only audit.
     public func read(id: String, slot: Slot = .current) throws -> File? {
         try Self.withLock {
             try migrate()
@@ -208,6 +295,7 @@ public struct AbilityStore: Sendable {
         }
     }
 
+    /// Migrates legacy storage on disk before listing; unsuitable for a filesystem-read-only audit.
     public func files(kind: Kind? = nil, includeProposals: Bool = true) throws -> [File] {
         try Self.withLock {
             try migrate()
@@ -224,18 +312,30 @@ public struct AbilityStore: Sendable {
             try migrate()
             try CapabilityLifecycle.requireWrite()
             let siblings = try allFiles().filter { $0.file.id.lowercased() == file.id.lowercased() }
-            guard siblings.allSatisfy({ $0.file.id == file.id && $0.file.kind == file.kind }) else {
-                throw Self.failure("Ability id collision: \(file.id). Choose a unique id across tools, skills and senses.")
+            // A taken id names the part of hers that has it, and how to change that part instead.
+            if let owner = siblings.map(\.file).first(where: { $0.id != file.id || $0.kind != file.kind }) {
+                let record = owner.record ?? [:]
+                let name = record["name"]?.stringValue ?? owner.id
+                let when = ["promotedAt", "updatedAt", "createdAt"].lazy.compactMap { record[$0]?.stringValue }.first
+                let state = (record["status"]?.stringValue).map { " (" + $0 + (when.map { " since " + $0 } ?? "") + ")" } ?? ""
+                let revise = switch owner.kind {
+                case .part: "revise it with ability.save {id:\"\(owner.id)\", edits}"
+                case .sense: "revise it with sense.make"
+                case .turn: "it is your turn part"
+                }
+                throw Self.failure("\(file.id) is your \(owner.kind.rawValue) \(name)\(state); \(revise), or choose another id. Nothing was written.")
             }
             try writeFile(file, slot: slot, writing: writing)
         }
     }
 
-    package func contains(id: String, name: String? = nil) throws -> Bool {
+    package func contains(id: String, name: String? = nil, replacingInstallID: String? = nil) throws -> Bool {
         try Self.withLock {
             try migrate()
             return try allFiles().contains { entry in
                 let file = entry.file
+                if let replacingInstallID, file.id == id, file.kind == .part,
+                   file.record?["capabilityPackInstallId"] == .string(replacingInstallID) { return false }
                 let manifest = file.metadata["candidate"]?.objectValue?["manifest"]?.objectValue
                 return file.id.caseInsensitiveCompare(id) == .orderedSame || name.map { name in
                     [file.id, file.record?["name"]?.stringValue, manifest?["name"]?.stringValue,
@@ -246,10 +346,21 @@ public struct AbilityStore: Sendable {
         }
     }
 
+    /// The shipped catalog owns reserved names; future seeds use native-.
+    public static func seedCatalog(resources: URL = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")) throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(at: resources.appendingPathComponent("abilities"),
+            includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).filter { $0.pathExtension == "js" }
+    }
+
+    public static func reservedPart(_ id: String) throws -> String? {
+        if id.hasPrefix("native-") { return id }
+        for url in try seedCatalog() where try decode(url).id == id { return id }
+        return nil
+    }
+
     /// A bundled seed lands once; after that it follows the bundle only while
     /// it is still the seed (her edit, a version of her own, is hers to keep).
-    /// A newer seed takes the current slot with the old one as previous, so the
-    /// judge can swap back exactly as for any version of her own.
+    /// A newer seed retains the old one as previous for explicit rollback.
     package func installSeed(_ file: File) throws {
         try Self.withLock {
             guard let current = try readFile(id: file.id, slot: .current) else {
@@ -259,6 +370,13 @@ public struct AbilityStore: Sendable {
             }
             guard Self.isSeed(current), current.body != file.body else { return }
             try migrate(); try CapabilityLifecycle.requireWrite()
+            // Off is the ability's, not the bundle version's: it stays off, by whoever switched it.
+            var file = file
+            if var record = file.metadata["record"]?.objectValue, let before = current.metadata["record"]?.objectValue,
+               before["status"] == .string("disabled") {
+                for key in ["status", "disabledBy", "disabledReason"] { record[key] = before[key] }
+                file.metadata["record"] = .object(record)
+            }
             try writeFile(current, slot: .previous)
             try write(file)
         }
@@ -290,9 +408,14 @@ public struct AbilityStore: Sendable {
             }
             if preview { return }
             try CapabilityLifecycle.requireWrite()
+            // Its notebook (host.state) goes with it: a new ability under this id starts blank.
+            // Never through a link, checked before anything is removed.
+            let notebook = Self.notebookPath(dataRoot: dataRoot, id: id)
+            try Self.checkPath(notebook)
             for slot in Slot.allCases { try remove(id: id, slot: slot) }
             var stats = try readState(); stats.removeValue(forKey: id)
             try writeState(stats)
+            if FileManager.default.fileExists(atPath: notebook.path) { try FileManager.default.removeItem(at: notebook) }
         }
     }
 
@@ -308,7 +431,7 @@ public struct AbilityStore: Sendable {
                 restored = try CapabilityLifecycle.preservingOwnerOff(fields, before: before)
             }
             if let restored {
-                previous.metadata["record"] = .object(Self.storedRecord(restored).filter { !Self.pending.contains($0.key) })
+                previous.metadata["record"] = .object(Self.storedRecord(restored, kind: previous.kind).filter { !Self.pending.contains($0.key) })
                 try writeFile(previous, slot: .previous)
             }
             let selected = try path(id: id, pathExtension: current.pathExtension)
@@ -324,10 +447,30 @@ public struct AbilityStore: Sendable {
         }
     }
 
+    /// Terminal accounting survives caller cancellation with its causal act.
+    /// A run owns this once; projections do not manufacture run evidence.
+    public func settleRun(id: String, version: String, receipt: JSONValue, input: JSONValue?) async -> JSONValue {
+        let cause = Experience.currentAct
+        return await settle {
+            Experience.$currentAct.withValue(cause) {
+                var fields = receipt.objectValue ?? [:]
+                do {
+                    if let upgrade = try recordRun(id: id, version: version, receipt: receipt, input: input) {
+                        fields["upgrade"] = .string(upgrade)
+                    }
+                } catch { fields["accounting_error"] = .string(error.localizedDescription) }
+                return .object(fields)
+            }
+        }
+    }
+
     /// Terminal evidence belongs to the stem, including on a peer-steered run.
-    public func recordRun(id: String, version: String, receipt: JSONValue, input: JSONValue? = nil) throws {
-        let recorded: Bool
-        do { recorded = try recordRunEvidence(id: id, version: version, receipt: receipt, input: input) }
+    /// Returns the upgrade signal this run raised: `reason@step` when the same
+    /// world stop at the same place ended 2 of the part's last 3 runs, said once.
+    @discardableResult
+    public func recordRun(id: String, version: String, receipt: JSONValue, input: JSONValue? = nil, nativeSense: JSONValue? = nil) throws -> String? {
+        let recorded: (written: Bool, upgrade: String?)
+        do { recorded = try recordRunEvidence(id: id, version: version, receipt: receipt, input: input, nativeSense: nativeSense) }
         catch {
             // The ledger's write is apart from what the run did: its failure owes
             // repair to the file that refused it, never to the act, whose own
@@ -341,26 +484,36 @@ public struct AbilityStore: Sendable {
             throw failure
         }
         // Only a ledger write that happened proves the ledger works again.
-        if recorded { RepairOwed.settle(dataRoot, operation: "abilities.accounting", evidence: .init(source: "abilities/state.json", id: id)) }
+        if recorded.written { RepairOwed.settle(dataRoot, operation: "abilities.accounting", evidence: .init(source: "abilities/state.json", id: id)) }
+        return recorded.upgrade
     }
 
-    /// False when the run's part or version is gone, so nothing was written.
-    private func recordRunEvidence(id: String, version: String, receipt: JSONValue, input: JSONValue?) throws -> Bool {
+    /// Not written when the run's part or version is gone.
+    private func recordRunEvidence(id: String, version: String, receipt: JSONValue, input: JSONValue?, nativeSense: JSONValue?) throws -> (written: Bool, upgrade: String?) {
         try Self.withLock {
             try migrate()
-            guard let current = try readFile(id: id, slot: .current) else { return false }
+            // Native/bundled reads have a registry record but no executable file.
+            guard let current = try readFile(id: id, slot: .current) ?? nativeSense.map({
+                try File(id: id, kind: .sense, metadata: ["record": $0, "version": $0.objectValue?["version"] ?? .int(1)], body: "", pathExtension: "js")
+            }) else { return (false, nil) }
             let previous = try readFile(id: id, slot: .previous)
-            guard let file = [current, previous].compactMap({ $0 }).first(where: { identity($0) == version }) else { return false }
+            let currentIdentity = identity(current), previousIdentity = previous.flatMap(identity)
+            let file: File
+            if currentIdentity == version { file = current }
+            else if previousIdentity == version, let previous { file = previous }
+            else { return (false, nil) }
             var state = try readState(), row = state[id]?.objectValue ?? [:]
             var runs = row["runs"]?.objectValue ?? [:], versions = runs["versions"]?.objectValue ?? [:]
-            func key(_ file: File) -> String { (identity(file) ?? file.bodyDigest) + "@" + String(file.metadata["version"]?.integer ?? 1) }
-            if let previous, versions[key(previous)] == nil,
-               row["lastCleanVersion"] == identity(previous).map(JSONValue.string),
+            let currentKey = (currentIdentity ?? current.bodyDigest) + "@" + String(current.metadata["version"]?.integer ?? 1)
+            let previousKey = previous.map { (previousIdentity ?? $0.bodyDigest) + "@" + String($0.metadata["version"]?.integer ?? 1) }
+            if let previousKey, versions[previousKey] == nil,
+               row["lastCleanVersion"] == previousIdentity.map(JSONValue.string),
                row["lastRunVersion"] == row["lastCleanVersion"], row["lastRun"]?.objectValue?["status"] == .string("ok"),
                let at = row["lastUsedAt"] {
-                versions[key(previous)] = .object(["last": .object(["outcome": .string("ok"), "at": at]), "ok": .int(1)])
+                versions[previousKey] = .object(["last": .object(["outcome": .string("ok"), "at": at]), "ok": .int(1)])
             }
-            let selected = key(file), at = ISO8601DateFormatter().string(from: Date())
+            let selected = version + "@" + String(file.metadata["version"]?.integer ?? 1), now = Date()
+            let at = ISO8601DateFormatter().string(from: now)
             var evidence = versions[selected]?.objectValue ?? [:]
             let outcome = Self.runOutcome(receipt)
             let count = (evidence["count"]?.integer ?? 0) + 1
@@ -368,6 +521,9 @@ public struct AbilityStore: Sendable {
             evidence["last"] = .object(["outcome": .string(outcome), "at": .string(at)])
             evidence[outcome] = .int((evidence[outcome]?.integer ?? 0) + 1)
             let fields = receipt.objectValue ?? [:]
+            if file.kind == .sense, outcome == "ok", fields["read"] == .bool(true) {
+                evidence["reads"] = .int((evidence["reads"]?.integer ?? 0) + 1)
+            }
             // Only the runner supplies input: fixtures, previews and admission refusals earn no competence.
             if let input {
                 let calls = (fields["calls"]?.arrayValue ?? []).map {
@@ -376,31 +532,48 @@ public struct AbilityStore: Sendable {
                 let scope: JSONValue = .object([
                     "input_digest": .string(SHA256.hash(data: try input.serializedData(pretty: false)).map { String(format: "%02x", $0) }.joined()),
                     "calls": .array(calls),
-                    "returned": fields["returned"] == .bool(false) ? .bool(false) : .object((fields["returned"]?.objectValue ?? [:]).filter { ["ok", "status"].contains($0.key) }),
                 ])
                 let digest = SHA256.hash(data: try scope.serializedData(pretty: false)).map { String(format: "%02x", $0) }.joined()
                 var operations = evidence["operations"]?.objectValue ?? [:], operation = operations[digest]?.objectValue ?? [:]
                 operation["scope"] = scope
                 operation["input_preview"] = .string(String(try Self.inputDescription(input).serialize(pretty: false).prefix(1024)))
-                let result = fields["returned"] == .bool(false) || fields["returned"]?.objectValue?["ok"] == .bool(false) ? "returned_false" : outcome == "ok" ? "completed" : outcome
+                let result = outcome == "ok" ? "completed" : outcome
                 operation[result] = .int((operation[result]?.integer ?? 0) + 1)
                 operation["at"] = .string(at); operation["last_run"] = .int(count)
                 operations[digest] = .object(operation)
                 // Retain recent scopes, not every distinct input. Version totals above never expire.
-                evidence["operations"] = .object(Dictionary(uniqueKeysWithValues: operations.sorted {
-                    let lhs = $0.value.objectValue?["last_run"]?.integer ?? 0, rhs = $1.value.objectValue?["last_run"]?.integer ?? 0
-                    let leftAt = $0.value.objectValue?["at"]?.stringValue ?? "", rightAt = $1.value.objectValue?["at"]?.stringValue ?? ""
-                    return (lhs, leftAt, $0.key) < (rhs, rightAt, $1.key)
-                }.suffix(CapabilityLifecycle.inputLimit)))
+                if operations.count > CapabilityLifecycle.inputLimit {
+                    operations = Dictionary(uniqueKeysWithValues: operations.sorted {
+                        let lhs = $0.value.objectValue?["last_run"]?.integer ?? 0, rhs = $1.value.objectValue?["last_run"]?.integer ?? 0
+                        let leftAt = $0.value.objectValue?["at"]?.stringValue ?? "", rightAt = $1.value.objectValue?["at"]?.stringValue ?? ""
+                        return (lhs, leftAt, $0.key) < (rhs, rightAt, $1.key)
+                    }.suffix(CapabilityLifecycle.inputLimit))
+                }
+                evidence["operations"] = .object(operations)
             }
             versions[selected] = .object(evidence)
-            versions = versions.filter { [key(current), previous.map(key)].compactMap({ $0 }).contains($0.key) }
-            runs["versions"] = .object(versions); row["runs"] = .object(runs)
+            versions = versions.filter { $0.key == currentKey || $0.key == previousKey }
+            runs["versions"] = .object(versions)
+            // Where each of its last three runs ended; a world stop that keeps
+            // ending it at one place is an upgrade it owes, said once.
+            var upgrade: String?
+            if input != nil {
+                let back = fields["hand_back"]?.objectValue ?? [:]
+                let place = back["step"]?.stringValue ?? (fields["stopped"]?.objectValue?["line"]?.integer).map { "line \($0)" } ?? ""
+                let stops = Array(((runs["stops"]?.arrayValue ?? []) + [.string((fields["reason"]?.stringValue ?? outcome) + "@" + place)]).suffix(3))
+                runs["stops"] = .array(stops)
+                if let repeated = CapabilityLifecycle.repeatedStop(stops.compactMap(\.stringValue)), runs["noted"] != .string(repeated) {
+                    runs["noted"] = .string(repeated); upgrade = repeated
+                }
+            }
+            row["runs"] = .object(runs)
             row["useCount"] = .int((row["useCount"]?.integer ?? 0) + 1)
             if file == current, file.kind == .sense, outcome == "ok", fields["read"] == .bool(true) {
+                guard (row["uses"]?.integer ?? 0) < Int64.max else { throw Self.failure("Sense use counter overflow.") }
                 row["uses"] = .int((row["uses"]?.integer ?? 0) + 1)
             }
-            row["lastUsedAt"] = .string(at); row["lastRunVersion"] = .string(version)
+            row["lastUsedAt"] = file.kind == .sense ? .double(now.timeIntervalSinceReferenceDate) : .string(at)
+            row["lastRunVersion"] = .string(version)
             row["lastRun"] = .object(fields.filter { ["status", "effects", "version", "calls", "error", "stopped"].contains($0.key) }
                 .merging(evidence["last"]?.objectValue ?? [:]) { _, new in new })
             if outcome == "ok" { row["lastCleanVersion"] = .string(version) }
@@ -414,31 +587,27 @@ public struct AbilityStore: Sendable {
                 if outcome == "error", !["repair", "person_decides", "correct_arguments", "inspect"].contains(remedy?.objectValue?["kind"]?.stringValue ?? "") {
                     let source = try path(id: id, slot: file == current ? .current : .previous, pathExtension: file.pathExtension).path
                     let fault = fields["error"]?.objectValue ?? fields["stopped"]?.objectValue ?? fields
-                    let detail = fault["message"]?.stringValue ?? fault["detail"]?.stringValue ?? fault["reason"]?.stringValue ?? "Part execution failed."
+                    let detail = fault["message"]?.stringValue ?? fault["detail"]?.stringValue ?? fault["reason"]?.stringValue ?? "Ability execution failed."
                     RepairOwed.owe(dataRoot, id: run, kind: .run,
                         cause: Experience.currentAct.map { [$0] } ?? [], operation: operation,
                         owner: source + " > " + version,
-                        words: TurnSecretRedactor.redactText(detail) + " Revise code/source in next_call through "
-                            + (file.kind == .skill ? "skill.save" : file.kind == .sense ? "sense.make" : file.kind == .turn ? "codex.invoke" : "tool.propose")
-                            + ", validate and keep that version, reconcile any prior effects, then perform the failed operation again.",
-                        lever: file.kind == .skill ? "skill.enable" : file.kind == .sense ? "sense.make" : file.kind == .tool ? "tool.approve" : nil,
-                        nextCall: try repairCall(file, input: input))
+                        words: TurnSecretRedactor.redactText(detail) + (file.kind == .turn
+                            ? " Tell the person: NativeAgent's turn part failed; preserve its versions and reconcile prior effects."
+                            : " Revise code/source in next_call through " + (file.kind == .sense ? "sense.make" : "ability.save")
+                                + ", keep that version, reconcile any prior effects, then perform the failed operation again."),
+                        lever: file.kind == .sense ? "sense.make" : file.kind == .part ? "ability.enable" : nil,
+                        nextCall: try repairCall(file), tap: file.kind == .turn ? "Report NativeAgent's turn-part execution defect at \(source), version \(version), to the person; preserve every retained version and prior effect." : nil)
                 } else if outcome == "ok" {
                     RepairOwed.settle(dataRoot, operation: operation, evidence: .init(source: "abilities/state.json", id: id + ":" + selected + ":" + String(count)))
                 }
             }
-            return true
+            return (true, upgrade)
         }
     }
 
     public static func runOutcome(_ receipt: JSONValue) -> String {
         let fields = receipt.objectValue ?? [:]
-        if fields["status"] == .string("ok") {
-            if fields["returned"] == .bool(false) || fields["returned"]?.objectValue?["ok"] == .bool(false) { return "error" }
-            if let returned = fields["returned"], let status = returned.objectValue?["status"]?.stringValue,
-               ["failed", "refused", "cancelled", "timed_out"].contains(status) { return runOutcome(returned) }
-            return "ok"
-        }
+        if fields["status"] == .string("ok") { return "ok" }
         if fields["status"] == .string("timed_out") { return "cut" }
         let fault = fields["error"]?.objectValue ?? fields["stopped"]?.objectValue ?? fields
         let reason = fault["reason"]?.stringValue ?? fields["reason"]?.stringValue ?? ""
@@ -459,29 +628,39 @@ public struct AbilityStore: Sendable {
         return "refused"
     }
 
+    /// Migrates legacy storage on disk before reading accounting; unsuitable for a filesystem-read-only audit.
     public func states() throws -> [String: JSONValue] {
         try Self.withLock { try migrate(); return try readState() }
     }
 
     public func saveState(id: String, fields: [String: JSONValue]) throws {
+        try updateState(id: id) { $0 = fields }
+    }
+
+    /// One part's accounting, changed under the store's lock.
+    public func updateState(id: String, _ change: (inout [String: JSONValue]) -> Void) throws {
         try Self.withLock {
             try migrate()
-            var stats = try readState(); stats[id] = .object(fields)
-            try writeState(stats)
+            var stats = try readState(), fields = stats[id]?.objectValue ?? [:]
+            let before = stats[id]
+            change(&fields); stats[id] = .object(fields)
+            if stats[id] != before { try writeState(stats) }
         }
     }
 
     /// Domain records are projections of these files, never another persisted catalog.
-    public func registry(kind: Kind) throws -> JSONValue {
+    public func registry(kind: Kind? = nil) throws -> JSONValue {
         try Self.withLock {
             try migrate()
             let stats = try readState()
-            let selected = try files(kind: kind)
+            // Typed registries retain their published-record selection; the
+            // all-kind read also exposes unkept files, never as active records.
+            let selected = try files(kind: kind).filter { kind == nil || $0.kind == .turn || $0.metadata["record"]?.objectValue != nil }
             if kind == .sense {
                 return .object(["format": .int(1), "senses": .array(try selected.compactMap { file in
-                    guard let row = record(file, statistics: stats[file.id]) else { return nil }
+                    guard let row = try record(file, statistics: stats[file.id]) else { return nil }
                     var versions: [JSONValue] = []
-                    if let previous = try readFile(id: file.id, slot: .previous), let old = record(previous, statistics: nil) {
+                    if let previous = try readFile(id: file.id, slot: .previous), let old = try record(previous, statistics: nil) {
                         versions.append(senseVersion(previous, record: old))
                     }
                     versions.append(senseVersion(file, record: row))
@@ -489,14 +668,19 @@ public struct AbilityStore: Sendable {
                 })])
             }
             return .array(try selected.compactMap { file in
-                guard var row = record(file, statistics: stats[file.id]) else { return nil }
+                guard var row = try record(file, statistics: stats[file.id]) else { return nil }
                 var versions: [JSONValue] = []
                 if let previous = try readFile(id: file.id, slot: .previous), let digest = identity(previous) {
                     row["previousVersion"] = .string(digest); versions.append(.string(digest))
                 }
                 if let digest = identity(file) { versions.append(.string(digest)) }
                 row["versions"] = .array(versions)
+                if file.kind != .part { return .object(row) }
+                row.removeValue(forKey: "candidateReview")
+                row.removeValue(forKey: "keepReview")
+                var reviewFile = file
                 if let next = try readFile(id: file.id, slot: .next), let digest = identity(next) {
+                    reviewFile = next
                     row.merge((next.metadata["record"]?.objectValue ?? [:]).filter { Self.pending.contains($0.key) || $0.key == "updatedAt" }) { _, new in new }
                     row["candidateDigest"] = .string(digest)
                     row["candidate_validation_evidence"] = Self.validationEvidence(next.metadata["proof"], fixtures: next.metadata["candidate"]?.objectValue?["fixtures"])
@@ -505,7 +689,20 @@ public struct AbilityStore: Sendable {
                     for key in Self.pending { row.removeValue(forKey: key) }
                     if let status = Self.validationStatus(file.metadata["proof"]) { row["candidateValidation"] = .string(status) }
                 }
-                if kind == .tool {
+                if kind == .part {
+                    // Capture the code and its digest in this locked catalog read,
+                    // for both a waiting candidate and a selected version turned off.
+                    if reviewFile.pathExtension == "js", let digest = identity(reviewFile),
+                       let candidate = reviewFile.metadata["candidate"]?.objectValue,
+                       let manifest = candidate["manifest"]?.objectValue {
+                        row["keepReview"] = .object(["version": .string(digest),
+                            "description": manifest["description"] ?? .null,
+                            "reach": reviewFile.part["reach"] ?? .null, "code": .string(reviewFile.body),
+                            "manifest": .object(manifest), "program": candidate["program"] ?? .null,
+                            "fixtures": candidate["fixtures"] ?? .array([]),
+                            "dependencyShapes": candidate["dependencyShapes"] ?? .null,
+                            "prior": candidate["prior"] ?? .null])
+                    }
                     if try readFile(id: file.id, slot: .current) != nil {
                         row["activePath"] = .string(try path(id: file.id, pathExtension: file.pathExtension).path)
                     }
@@ -557,6 +754,8 @@ public struct AbilityStore: Sendable {
                 } : [:]
                 stats[id] = .object(accounting.merging(input.filter { Self.statistics.contains($0.key) }) { _, new in new })
                 if input["bundledDefault"] == .bool(true) { continue }
+                let slots: [Slot] = Self.keeping == nil ? [] : [.current, .previous, .next]
+                let written = try slots.map { try readFile(id: id, slot: $0) }
                 var slot: Slot = .current
                 var file: File
                 if promote {
@@ -566,10 +765,10 @@ public struct AbilityStore: Sendable {
                 else if let next { file = next; slot = .next }
                 else {
                     let script = input["script"]?.objectValue
-                    file = File(id: id, kind: kind, metadata: ["record": .object(input)], body: script?["source"]?.stringValue ?? input["body"]?.stringValue ?? "",
-                                pathExtension: script == nil && kind == .skill ? "md" : "js")
+                    file = try File(id: id, kind: kind, metadata: ["record": .object(input)], body: script?["source"]?.stringValue ?? input["body"]?.stringValue ?? "",
+                                pathExtension: "js")
                 }
-                var row = Self.storedRecord(input)
+                var row = Self.storedRecord(input, kind: kind)
                 if kind == .sense, row["status"] == .string("unavailable"),
                    let saved = current?.metadata["record"]?.objectValue, saved["status"] == .string("on") {
                     row["status"] = .string("on"); row["disabledBy"] = saved["disabledBy"]
@@ -587,19 +786,34 @@ public struct AbilityStore: Sendable {
                 file.metadata["record"] = .object(row)
                 if try readFile(id: id, slot: slot) != file { try write(file, slot: slot) }
                 if promote { try remove(id: id, slot: .next) }
+                if let keeping = Self.keeping, try slots.map({ try readFile(id: id, slot: $0) }) != written {
+                    var fields = stats[id]?.objectValue ?? [:]
+                    fields["keptAfter"] = .object(["turn": .string(keeping.turn), "at": .string(ISO8601DateFormatter().string(from: keeping.at))])
+                    stats[id] = .object(fields)
+                }
             }
             try writeState(stats)
         }
     }
 
-    private static func storedRecord(_ input: [String: JSONValue]) -> [String: JSONValue] {
+    private static func storedRecord(_ input: [String: JSONValue], kind: Kind) -> [String: JSONValue] {
         var row = input.filter { !statistics.contains($0.key) && !obsolete.contains($0.key)
-            && !partKeys.contains($0.key) && !["permissions", "bundledDefault", "body"].contains($0.key) }
+            && !partKeys.contains($0.key) && !["kind", "permissions", "bundledDefault", "body"].contains($0.key)
+            && (kind == .sense || $0.key != "version") }
         if var script = row["script"]?.objectValue { script.removeValue(forKey: "source"); row["script"] = .object(script) }
         return row
     }
 
-    private func record(_ file: File, statistics: JSONValue?) -> [String: JSONValue]? {
+    /// Retained and bundled senses share the record's numeric Codable date projection.
+    public static func senseRecord(_ input: [String: JSONValue]) throws -> [String: JSONValue] {
+        var row = input
+        if case .string(let at)? = row["lastUsedAt"] {
+            row["lastUsedAt"] = .double(try Date(at, strategy: .iso8601).timeIntervalSinceReferenceDate)
+        }
+        return row
+    }
+
+    private func record(_ file: File, statistics: JSONValue?) throws -> [String: JSONValue]? {
         guard var row = file.record else { return nil }
         row.merge(statistics?.objectValue ?? [:]) { _, new in new }
         row["validation_evidence"] = Self.validationEvidence(file.metadata["proof"], fixtures: file.metadata["candidate"]?.objectValue?["fixtures"])
@@ -614,6 +828,7 @@ public struct AbilityStore: Sendable {
         if file.kind == .sense {
             row["uses"] = row["uses"] ?? .int(0); row["corrections"] = row["corrections"] ?? .int(0)
             if row["status"] == .string("on"), row["unavailableReason"] != nil { row["status"] = .string("unavailable") }
+            row = try Self.senseRecord(row)
         }
         if var script = row["script"]?.objectValue { script["source"] = .string(file.body); row["script"] = .object(script) }
         return row
@@ -633,6 +848,7 @@ public struct AbilityStore: Sendable {
     private static func validationStatus(_ value: JSONValue?) -> String? {
         guard let proof = value?.objectValue else { return nil }
         if proof["domain"] == .string("owned-program-seed") { return "bundled" }
+        if proof["domain"] == .string("owned-program-kept") { return "kept" }
         if proof["domain"] == .string("owned-program-validation"), proof["receipts"]?.arrayValue?.isEmpty == false { return "rehearsed" }
         return "unvalidated"
     }
@@ -669,10 +885,14 @@ public struct AbilityStore: Sendable {
 
     private func readFile(id: String, slot: Slot) throws -> File? {
         let paths = try ["js", "md"].map { try path(id: id, slot: slot, pathExtension: $0) }.filter { FileManager.default.fileExists(atPath: $0.path) }
-        guard paths.count <= 1 else { throw Self.failure("Ability id collision: \(id) has both JavaScript and Markdown files.") }
+        guard paths.count <= 1 else {
+            throw ToolFailureError("Ability \(id) has both JavaScript and Markdown files in slot \(slot.rawValue).", effects: .none,
+                owner: root.path, nextCall: ToolFailureError.call("app", ["action": .string("files.list"), "args": .object(["path": .string(root.path)])]),
+                code: "ability_id_collision", instruction: "Inspect both files; resolve their identity collision while preserving both bodies and retained versions.", recovery: .inspect)
+        }
         guard let source = paths.first else { return nil }
         do { return try Self.decode(source) }
-        catch { throw repairFailure(source: source, detail: error.localizedDescription) }
+        catch { throw sourceFailure(source, error) }
     }
     private static func checkPath(_ url: URL) throws {
         var parent = url
@@ -687,7 +907,7 @@ public struct AbilityStore: Sendable {
             guard attributes[.type] as? FileAttributeType != .typeSymbolicLink else { throw failure("Ability storage cannot follow symbolic links: \(url.path).") }
         } catch let error as NSError where error.domain == NSCocoaErrorDomain && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code) { }
     }
-    private func allFiles() throws -> [(file: File, slot: Slot)] {
+    private func allFiles(omittingUnreadable: ((URL, Error) -> Void)? = nil) throws -> [(file: File, slot: Slot)] {
         guard FileManager.default.fileExists(atPath: root.path) else { return [] }
         var result: [(file: File, slot: Slot)] = []
         for url in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).sorted(by: { $0.path < $1.path }) {
@@ -698,9 +918,15 @@ public struct AbilityStore: Sendable {
                 let slot: Slot = stem.hasSuffix(".prev") ? .previous : stem.hasSuffix(".next") ? .next : .current
                 let file = try Self.decode(url)
                 guard try path(id: file.id, slot: slot, pathExtension: file.pathExtension) == url else { throw Self.failure("Ability header id differs from its file: \(url.lastPathComponent).") }
-                guard !result.contains(where: { $0.slot == slot && $0.file.id.lowercased() == file.id.lowercased() }) else { throw Self.failure("Ability id collision: \(file.id).") }
+                guard !result.contains(where: { $0.slot == slot && $0.file.id.lowercased() == file.id.lowercased() }) else {
+                    throw ToolFailureError("Ability id collision: \(file.id) in slot \(slot.rawValue), including \(url.lastPathComponent).", effects: .none,
+                        code: "ability_id_collision", instruction: "Inspect both retained sources and restore their correct ids without discarding either body.", recovery: .inspect)
+                }
                 result.append((file, slot))
-            } catch { throw repairFailure(source: url, detail: error.localizedDescription) }
+            } catch {
+                if let omittingUnreadable { omittingUnreadable(url, error) }
+                else { throw sourceFailure(url, error) }
+            }
         }
         return result
     }
@@ -720,7 +946,7 @@ public struct AbilityStore: Sendable {
         header.removeValue(forKey: "permissions")
         if var row = header["record"]?.objectValue {
             row.removeValue(forKey: "permissions")
-            for key in partKeys { row.removeValue(forKey: key) }
+            for key in partKeys.union(file.kind == .sense ? ["kind"] : ["kind", "version"]) { row.removeValue(forKey: key) }
             header["record"] = .object(row)
         }
         try validate(file, header: header)
@@ -740,33 +966,40 @@ public struct AbilityStore: Sendable {
               let text = String(data: try Data(contentsOf: url), encoding: .utf8) else { throw failure("Unreadable ability file: \(url.lastPathComponent).") }
         let start = url.pathExtension == "md" ? "<!-- NativeAgent ability\n" : "/* NativeAgent ability\n"
         let end = url.pathExtension == "md" ? "\n-->\n" : "\n*/\n"
-        guard text.hasPrefix(start), let boundary = text.range(of: end, range: text.index(text.startIndex, offsetBy: start.count)..<text.endIndex),
-              case .object(var header) = try JSONValue.parse(Data(text[text.index(text.startIndex, offsetBy: start.count)..<boundary.lowerBound].utf8)),
-              let id = header.removeValue(forKey: "id")?.stringValue, let name = header.removeValue(forKey: "kind")?.stringValue,
-              let kind = Kind(rawValue: name) else { throw failure("Invalid ability header: \(url.lastPathComponent).") }
-        let file = File(id: id, kind: kind, metadata: header, body: String(text[boundary.upperBound...]), pathExtension: url.pathExtension)
+        guard text.hasPrefix(start), let boundary = text.range(of: end, range: text.index(text.startIndex, offsetBy: start.count)..<text.endIndex) else {
+            throw headerFailure("envelope", accepted: "a NativeAgent ability comment before the body", detail: "Invalid ability header comment: \(url.lastPathComponent). Restore its delimiters from retained evidence.")
+        }
+        let value: JSONValue
+        do { value = try JSONValue.parse(Data(text[text.index(text.startIndex, offsetBy: start.count)..<boundary.lowerBound].utf8)) }
+        catch { throw headerFailure("json", accepted: "a JSON object inside the header comment", detail: "Invalid ability header JSON in \(url.lastPathComponent): \(error.localizedDescription)") }
+        guard case .object(var header) = value else { throw headerFailure("json", accepted: "a JSON object inside the header comment") }
+        guard let id = header.removeValue(forKey: "id")?.stringValue else { throw headerFailure("id", accepted: "the retained ability's string id") }
+        guard let name = header.removeValue(forKey: "kind")?.stringValue, let kind = Kind(stored: name) else {
+            throw headerFailure("kind", accepted: "ability, sense or turn; legacy tool, skill and part remain readable")
+        }
+        let file = try File(id: id, kind: kind, metadata: header, body: String(text[boundary.upperBound...]), pathExtension: url.pathExtension)
         try validate(file, header: file.metadata)
         withLock { decoded[url.path] = (revision, file) }
         return file
     }
     private static func validate(_ file: File, header: [String: JSONValue]) throws {
         if let key = header.keys.sorted().first(where: { !partKeys.union(["id", "kind", "version", "record", "candidate", "proof", "sourceFiles", "permissions"]).contains($0) }) {
-            throw failure("Unknown part header key: \(key).")
+            throw headerFailure(key, accepted: partKeys.union(["id", "kind", "version", "record", "candidate", "proof", "sourceFiles", "permissions"]).sorted().joined(separator: ", "), detail: "Unknown ability header key: \(key). Remove it or use an accepted key.", code: "unknown_ability_header_key")
         }
         _ = try partHeader(header)
         guard file.body.utf8.count <= sourceLimit else { throw failure("Part source exceeds \(sourceLimit) bytes.") }
     }
     private func readState() throws -> [String: JSONValue] {
         let url = root.appendingPathComponent("state.json")
-        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        guard try Self.fileRevision(url) != "missing" else { return [:] }
         let bytes: Data
         do { try VerifiedPath.confirmNoSymlink(url); bytes = try Data(contentsOf: url) }
         catch { throw repairFailure(source: url, detail: error.localizedDescription) }
         do { return try Self.decodeState(bytes) }
         catch {
             throw ToolFailureError("Ability run state is unreadable. Read abilities/state.json with files.read, recover its state object without inventing run evidence, then pass state to abilities.restore_state. Saved bytes were preserved.", effects: .none,
-                owner: "abilities/state.json", nextCall: ToolFailureError.call("app", ["action": .string("abilities.restore_state"),
-                    "args": .object(["expected_digest": .string(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())])]))
+                owner: "abilities/state.json", nextCall: ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(url.path)])]),
+                instruction: "After reconstructing state, call abilities.restore_state with state and expected_digest: \(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()).")
         }
     }
     private static func decodeState(_ bytes: Data) throws -> [String: JSONValue] {
@@ -823,32 +1056,35 @@ public struct AbilityStore: Sendable {
         NSError(domain: "AbilityStore", code: 1, userInfo: [NSLocalizedDescriptionKey: detail])
     }
 
+    private func sourceFailure(_ source: URL, _ error: Error) -> ToolFailureError {
+        let repair = repairFailure(source: source, detail: error.localizedDescription)
+        let header = error as? ToolFailureError
+        return ToolFailureError(repair.message, argumentPath: header?.argumentPath, accepted: header?.accepted, effects: .none,
+            owner: repair.owner, nextCall: repair.nextCall, code: header?.code ?? "ability_source_unreadable",
+            instruction: repair.instruction, recovery: .repair)
+    }
+
     public func repairFailure(source: URL, detail: String) -> ToolFailureError {
         ToolFailureError("\(source.path): \(detail) Saved bytes remain authoritative and were preserved.", effects: .none,
-            owner: source.path, nextCall: ToolFailureError.fileRepairCall(source, dataRoot: dataRoot, shape:
+            owner: source.path, instruction: ToolFailureError.fileRepairInstruction(source,
+                shape:
                 "It is an AbilityStore source that failed with: \(detail) Repair it with its directly referenced retained sources. "
                 + "Preserve all current, previous and candidate versions, bodies, identities, digests and authority fields. "
                 + "Do not invent disabledBy, change an owner off-switch, grant peer authority, enable a part, select another version "
                 + "or delete retained material; if missing content or authority cannot be established, preserve it and name the missing evidence."))
     }
 
-    /// The existing authoring door, filled from the retained part for revision.
-    public func repairCall(_ file: File, input: JSONValue? = nil) throws -> String {
+    /// Her authoring door, filled from the retained part; reserved turns only read their source.
+    public func repairCall(_ file: File) throws -> String {
         let record = file.record ?? [:]
         var args = file.part
         let action: String
         switch file.kind {
-        case .tool:
-            action = "tool.propose"
-            args.merge(["tool_id": .string(file.id), "description": record["description"] ?? .string(file.id),
-                "code": .string(file.body), "input_schema": record["inputSchema"] ?? .object(["type": .string("object")]),
-                "actions": record["actions"] ?? .array([])]) { _, new in new }
-            if case .object? = input { args["input"] = input }
-        case .skill:
-            action = "skill.save"
-            var script = record["script"]?.objectValue ?? [:]
-            script["source"] = .string(file.body)
-            args.merge(["name": .string(file.id), "description": record["description"] ?? .string(file.id), "script": .object(script)]) { _, new in new }
+        case .part:
+            action = "ability.save"
+            // A revision restates only what changes: its code; the rest carries over.
+            args.merge(["id": .string(file.id), "description": record["description"] ?? .string(file.id),
+                "code": .string(file.body)]) { _, new in new }
         case .sense:
             let corner = record["corner"]?.objectValue ?? [:]
             let place = [("app", "bundleID", "app"), ("fileKind", "_0", "file"), ("site", "host", "site"), ("stream", "id", "stream"), ("need", "id", "need")].compactMap { kind, field, prefix in
@@ -859,9 +1095,8 @@ public struct AbilityStore: Sendable {
             args["code"] = .string(file.body); args["place"] = .string(place)
         case .turn:
             let slot: Slot = try readFile(id: file.id, slot: .current) == file ? .current : .previous
-            return ToolFailureError.call("app", ["action": .string("codex.invoke"), "args": .object([
-                "cwd": .string(dataRoot.path), "context": .string("Turn part \(file.id), version \(file.bodyDigest), source \(try path(id: file.id, slot: slot, pathExtension: file.pathExtension).path)."),
-                "text": .string("Repair the named turn part's JavaScript body for its recorded execution failure. Preserve original bytes in a new hidden sibling backup first. Preserve the header, authority and all retained versions. Do not change persona, memories, credentials, Trust or other installations. Do not build, test, install or restart. Report the source change and remaining failure; the failed operation must work again before repair is settled.")])])
+            return ToolFailureError.call("app", ["action": .string("files.read"), "args": .object([
+                "path": .string(try path(id: file.id, slot: slot, pathExtension: file.pathExtension).path)])])
         }
         return ToolFailureError.call("app", ["action": .string(action), "args": .object(args)])
     }
@@ -871,7 +1106,7 @@ public struct AbilityStore: Sendable {
     /// resume on the next load if the process stopped during that final phase.
     public func migrate() throws {
         let fm = FileManager.default
-        let legacy = [Kind.tool, .skill, .sense].map { ($0, dataRoot.appendingPathComponent($0.rawValue + "s")) }
+        let legacy = [Legacy.tool, .skill, .sense].map { ($0, dataRoot.appendingPathComponent($0.rawValue + "s")) }
         if fm.fileExists(atPath: root.appendingPathComponent(".old-layout").path) {
             try Self.checkPath(root.appendingPathComponent(".old-layout"))
             guard fm.fileExists(atPath: root.appendingPathComponent("state.json").path) else {
@@ -885,6 +1120,29 @@ public struct AbilityStore: Sendable {
             try archiveLegacy(legacy)
             return
         }
+        let (prepared, stats, _) = try prepareLegacy(legacy)
+        try CapabilityLifecycle.requireWrite()
+        if fm.fileExists(atPath: root.path), try !fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).isEmpty {
+            throw Self.failure("Ability migration found an incomplete abilities folder without state.json. Preserve it and repair the interrupted migration before retrying.")
+        }
+        let staging = dataRoot.appendingPathComponent(".abilities-incoming-\(UUID().uuidString)")
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: staging) }
+        for (file, slot) in prepared {
+            let destination = staging.appendingPathComponent(try path(id: file.id, slot: slot, pathExtension: file.pathExtension).lastPathComponent)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(Self.encode(file), to: destination)
+            guard try Self.decode(destination) == file else { throw Self.failure("Ability migration readback failed for \(file.kind.rawValue) \(file.id). Old layout was preserved.") }
+        }
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONValue.object(stats).serializedData(pretty: true), to: staging.appendingPathComponent("state.json"))
+        if fm.fileExists(atPath: root.path) { try fm.removeItem(at: root) }
+        try fm.moveItem(at: staging, to: root)
+        try archiveLegacy(legacy)
+    }
+
+    /// Every live row of the old layout's registries, read and prepared as
+    /// ability files; nothing is written. Its ids are lowercased.
+    private func prepareLegacy(_ legacy: [(Legacy, URL)]) throws -> (prepared: [(File, Slot)], stats: [String: JSONValue], ids: Set<String>) {
+        let fm = FileManager.default
         var prepared: [(File, Slot)] = []
         var stats: [String: JSONValue] = [:]
         var ids: Set<String> = []
@@ -953,25 +1211,93 @@ public struct AbilityStore: Sendable {
                 }
             }
         }
-        try CapabilityLifecycle.requireWrite()
-        if fm.fileExists(atPath: root.path), try !fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).isEmpty {
-            throw Self.failure("Ability migration found an incomplete abilities folder without state.json. Preserve it and repair the interrupted migration before retrying.")
-        }
-        let staging = dataRoot.appendingPathComponent(".abilities-incoming-\(UUID().uuidString)")
-        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: staging) }
-        for (file, slot) in prepared {
-            let destination = staging.appendingPathComponent(try path(id: file.id, slot: slot, pathExtension: file.pathExtension).lastPathComponent)
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(Self.encode(file), to: destination)
-            guard try Self.decode(destination) == file else { throw Self.failure("Ability migration readback failed for \(file.kind.rawValue) \(file.id). Old layout was preserved.") }
-        }
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONValue.object(stats).serializedData(pretty: true), to: staging.appendingPathComponent("state.json"))
-        if fm.fileExists(atPath: root.path) { try fm.removeItem(at: root) }
-        try fm.moveItem(at: staging, to: root)
-        try archiveLegacy(legacy)
+        return (prepared, stats, ids)
     }
 
-    private func legacyFile(kind: Kind, id: String, row input: [String: JSONValue], directory: URL, digest requested: String? = nil, slot: Slot = .current) throws -> File {
+    /// Prepare an older backup's abilities and readable uncarried kinds before
+    /// restore changes anything. The restore seals these bytes and omissions.
+    public func restoredLegacyCarry(backupRoot: URL) throws -> (files: [String: Data], notes: [String]) {
+        try Self.withLock {
+            let fm = FileManager.default
+            let backup = AbilityStore(dataRoot: backupRoot)
+            let returned = [Legacy.tool, .skill, .sense].map { ($0, backupRoot.appendingPathComponent($0.rawValue + "s")) }
+                .filter { fm.fileExists(atPath: $0.1.appendingPathComponent("registry.json").path) }
+            guard !returned.isEmpty else { return ([:], []) }
+            let (prepared, stats, ids) = try backup.prepareLegacy(returned)
+            let kinds = Set(returned.map { $0.0 == .sense ? Kind.sense : Kind.part })
+            var notes: [String] = []
+            let archive = root.appendingPathComponent(".old-layout")
+            if let values = try? archive.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+               values.isDirectory != true || values.isSymbolicLink == true {
+                notes.append("abilities/.old-layout: not a regular migration archive; current archive was not kept.")
+            }
+            var present: [(file: File, slot: Slot)] = []
+            do {
+                try VerifiedPath.confirmNoSymlink(root)
+                present = try allFiles { url, error in
+                    notes.append("abilities/\(url.lastPathComponent): \(error.localizedDescription); current ability was not kept.")
+                }
+            } catch {
+                notes.append("abilities: \(error.localizedDescription); current abilities could not be enumerated and were not kept.")
+            }
+            var state: [String: JSONValue] = [:]
+            do { state = try readState() }
+            catch { notes.append("abilities/state.json: current run accounting could not be read or decoded; it was not kept.") }
+            let replaced = present.filter { kinds.contains($0.file.kind) || ids.contains($0.file.id.lowercased()) }
+            for entry in replaced where !kinds.contains(entry.file.kind) {
+                notes.append("abilities/\(entry.file.id): its identity conflicts with the backup; current \(entry.file.kind.rawValue) was not kept.")
+            }
+            var files: [String: Data] = [:]
+            for entry in present where !kinds.contains(entry.file.kind) && !ids.contains(entry.file.id.lowercased()) {
+                do {
+                    let source = try path(id: entry.file.id, slot: entry.slot, pathExtension: entry.file.pathExtension)
+                    files["abilities/" + source.lastPathComponent] = try Data(contentsOf: source)
+                } catch { notes.append("abilities/\(entry.file.id): \(error.localizedDescription); current ability was not kept.") }
+            }
+            for (file, slot) in prepared {
+                let name = try backup.path(id: file.id, slot: slot, pathExtension: file.pathExtension).lastPathComponent
+                files["abilities/" + name] = try Self.encode(file)
+            }
+            for entry in replaced { state.removeValue(forKey: entry.file.id) }
+            state.merge(stats) { _, restored in restored }
+            files["abilities/state.json"] = try JSONValue.object(state).serializedData(pretty: true)
+            return (files, notes)
+        }
+    }
+
+    /// Install only the sealed selection; current accounting is never reread.
+    public func installRestoredLegacy(_ files: [String: Data], backupRoot: URL) throws {
+        try Self.withLock {
+            var selected = files.filter { $0.key.hasPrefix("abilities/") }
+            if selected.isEmpty {
+                selected = try AbilityStore(dataRoot: backupRoot).restoredLegacyCarry(backupRoot: backupRoot).files
+            }
+            guard !selected.isEmpty else { return }
+            try CapabilityLifecycle.requireWrite()
+            let fm = FileManager.default
+            try VerifiedPath.confirmNoSymlink(root.deletingLastPathComponent())
+            let values = try? root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            if values?.isDirectory == true, values?.isSymbolicLink != true {
+                for child in try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
+                    let kept = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                    if child.lastPathComponent == ".old-layout", kept?.isDirectory == true, kept?.isSymbolicLink != true { continue }
+                    try fm.removeItem(at: child)
+                }
+            } else if try Self.fileRevision(root) != "missing" { try fm.removeItem(at: root) }
+            for (path, bytes) in selected {
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: dataRoot.appendingPathComponent(path))
+            }
+            let legacy = [Legacy.tool, .skill, .sense].filter {
+                fm.fileExists(atPath: backupRoot.appendingPathComponent($0.rawValue + "s/registry.json").path)
+            }.map { ($0, dataRoot.appendingPathComponent($0.rawValue + "s")) }
+            try archiveLegacy(legacy)
+        }
+    }
+
+    /// The three stores of the layout before abilities/.
+    private enum Legacy: String { case tool, skill, sense }
+
+    private func legacyFile(kind: Legacy, id: String, row input: [String: JSONValue], directory: URL, digest requested: String? = nil, slot: Slot = .current) throws -> File {
         var row = input
         var metadata: [String: JSONValue] = [:]
         let digest = requested ?? (kind == .sense ? row["candidateDigest"]?.stringValue : row["codeFingerprint"]?.stringValue)
@@ -1056,7 +1382,7 @@ public struct AbilityStore: Sendable {
         if var script = row["script"]?.objectValue { script.removeValue(forKey: "source"); row["script"] = .object(script) }
         metadata["record"] = .object(row)
         metadata["version"] = input["version"] ?? .int(Int64(max(1, input["versions"]?.arrayValue?.count ?? 1)))
-        return File(id: id, kind: kind, metadata: metadata, body: body, pathExtension: ext)
+        return try File(id: id, kind: kind == .sense ? .sense : .part, metadata: metadata, body: body, pathExtension: ext)
     }
 
     private func legacyJSON(_ url: URL) throws -> JSONValue {
@@ -1069,7 +1395,7 @@ public struct AbilityStore: Sendable {
         try Self.checkPath(path)
         return path
     }
-    private func archiveLegacy(_ legacy: [(Kind, URL)]) throws {
+    private func archiveLegacy(_ legacy: [(Legacy, URL)]) throws {
         let fm = FileManager.default
         let incoming = root.appendingPathComponent(".old-layout.incoming")
         for (kind, directory) in legacy {
@@ -1107,7 +1433,55 @@ public struct AbilityStore: Sendable {
                 try fm.moveItem(at: source, to: destination)
             }
         }
-        if fm.fileExists(atPath: incoming.path) { try fm.moveItem(at: incoming, to: root.appendingPathComponent(".old-layout")) }
+        // A restored older layout is archived beside the first migration's.
+        let archive = root.appendingPathComponent(".old-layout")
+        if fm.fileExists(atPath: incoming.path) {
+            try fm.moveItem(at: incoming, to: fm.fileExists(atPath: archive.path)
+                ? archive.appendingPathComponent("restored-" + UUID().uuidString.lowercased()) : archive)
+        }
+    }
+    /// Notebook schema and mutations share the ability deletion lock. Local and
+    /// off-disk backup include notebooks except news/ledger; export/sharing/sync
+    /// exclude them. PrivacyMap lists senses; lifecycle accounting stays separate.
+    package static let notebookValueBytes = 16_384
+    package static func notebookPath(dataRoot: URL, id: String) -> URL {
+        dataRoot.appendingPathComponent("senses/\(id)/state.json")
+    }
+
+    package static func notebook(dataRoot: URL, id: String, setting: Bool, value: JSONValue,
+                               failure: (String, String) -> any Error) throws -> JSONValue {
+        guard !id.isEmpty, id != ".", id != "..", !id.contains("/"), !id.contains("\\") else {
+            throw failure("bad_state", "Part notebook id is invalid.")
+        }
+        return try notebook(notebookPath(dataRoot: dataRoot, id: id), key: "part", setting: setting, value: value, failure: failure)
+    }
+
+    package static func notebook(_ notebook: URL, key: String, setting: Bool, value: JSONValue,
+                               failure: (String, String) -> any Error) throws -> JSONValue {
+        try withLock {
+            guard notebook.resolvingSymlinksInPath().path == notebook.standardizedFileURL.path else {
+                throw failure("bad_state", "Sense notebook cannot be a symbolic link.")
+            }
+            var state: [String: JSONValue] = [:]
+            do {
+                let attrs = try FileManager.default.attributesOfItem(atPath: notebook.path)
+                guard attrs[.type] as? FileAttributeType == .typeRegular,
+                      ((attrs[.size] as? NSNumber)?.intValue ?? Int.max) <= 65_536,
+                      let saved = try? JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: notebook)) else {
+                    throw failure("bad_state", "Sense notebook is malformed or too large.")
+                }
+                state = saved
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {}
+            guard setting else { return state[key] ?? .null }
+            guard try JSONEncoder().encode(value).count <= notebookValueBytes else {
+                throw failure("state_limit", "Sense notebook values must be at most 16 KiB.")
+            }
+            state[key] = value
+            let data = try JSONEncoder().encode(state)
+            guard data.count <= 65_536 else { throw failure("state_limit", "Sense notebook exceeds 64 KiB.") }
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: notebook)
+            return .null
+        }
     }
 }
 

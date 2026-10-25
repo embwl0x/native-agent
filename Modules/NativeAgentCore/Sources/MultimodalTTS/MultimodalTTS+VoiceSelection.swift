@@ -5,6 +5,7 @@ import TrustCenter
 import AVFoundation
 import Observation
 import os
+// Blueprint: | `MultimodalTTS+VoiceSelection.swift` | voice authority/routing, native/cloud playback, generations/cancellation; `VoicePreference`: `quiet`, `name`; auto-read decision |
 
 public enum VoiceOutputMode: String, CaseIterable, Identifiable {
     case local = "local"
@@ -206,6 +207,8 @@ public final class VoiceOutputController: NSObject {
         loadPolicy: @MainActor () async throws -> TrustPolicy,
         ownerID: String? = nil
     ) async {
+        // Admission order, not policy-read completion order, owns playback.
+        speechGeneration &+= 1
         let generation = speechGeneration
         let resolution = await VoiceOutputModeSelection.resolve(policy: policy, loadPolicy: loadPolicy, failureCause: failureCause)
         guard generation == speechGeneration else { return }

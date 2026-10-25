@@ -1,5 +1,5 @@
 import MultimodalTTS
-import ChatOrchestration
+import ChatSessionWork
 import Cognition
 import Context
 import Foundation
@@ -12,6 +12,7 @@ import ProviderRouting
 import DeviceSync
 import StandingBots
 import TrustCenter
+// Blueprint: | `QuietSelfAdminSettings.swift` | `QuietSettingsHostProvider` typealias; static-first settings lookup and read-scoped bot projections, with fresh mutation readers; thinking writes only effort, preserving model/account inheritance |
 
 public typealias QuietSettingsHostProvider = @MainActor @Sendable () -> (any QuietSettingsHost)?
 
@@ -631,22 +632,11 @@ public enum QuietSettings {
 
     /// The row's "Use Chat's choice" (`ProviderSettingsView.clearGroupOverride`):
     /// every member but Chat itself drops its own pick and follows Chat again,
-    /// all of them or none. Reads true when no member has a choice of its own,
-    /// by the page's own test: a saved pin, or an answer that differs from Chat's.
+    /// all of them or none. Model/account inheritance is owned by the routing snapshot.
     private static func providerGroupUseChat(_ group: ProviderSurfaceGroup) -> QuietSetting {
         let label = "\(group.title): use Chat's choice"
         @Sendable func hasOwnChoice(_ snapshot: ProviderRoutingSnapshot) -> Bool {
-            let chat = snapshot.preferences["chat"]
-            let chatProvider = snapshot.activeProviders["chat"]
-            return group.surfaces.contains { surface in
-                guard surface != "chat" else { return false }
-                let mine = snapshot.preferences[surface]
-                return snapshot.pinnedModels[surface] != nil
-                    || mine?.model != chat?.model
-                    || mine?.reasoningEffort != chat?.reasoningEffort
-                    || mine?.serviceTier != chat?.serviceTier
-                    || (snapshot.activeProviders[surface] ?? chatProvider) != chatProvider
-            }
+            group.surfaces.contains { $0 != "chat" && snapshot.modelOverrideSurfaces.contains($0) }
         }
         return QuietSetting(
             id: "providers.\(group.id)_use_chat",
@@ -767,11 +757,11 @@ public enum QuietSettings {
                 let effort = try effortValue(
                     value, "\(group.title) thinking", await groupEfforts(group, appModel),
                     model: preference.model, modelSetting: "providers.\(group.id)_model")
-                let providerID = await leadProvider(group)
-                try await writeGroupSelection(
-                    appModel, group: group, providerID: providerID, model: preference.model,
-                    reasoningEffort: effort, serviceTier: preference.serviceTier
+                let result = try await writeProviderGroup(
+                    appModel, group: group, providerID: nil, model: nil,
+                    reasoningEffort: effort, serviceTier: nil, clearOverride: false
                 )
+                QuietWriteDetail.record("surfaces_changed", .array(result.surfacesChanged.map { .string($0) }))
             }
         )
     }
@@ -811,9 +801,7 @@ public enum QuietSettings {
                         "\(preference.model) does not offer a fast tier on \(providerID), so "
                         + "\(group.title) cannot be set fast. Choose a model that does.")
                 }
-                // Through the same helper as model and thinking: a loop of its
-                // own bypassed the rollback, so a failure on the third surface
-                // left the first two fast with a receipt that said nothing.
+                // Model, Fast and thinking share the one group transaction.
                 try await writeGroupSelection(
                     appModel, group: group, providerID: providerID, model: preference.model,
                     reasoningEffort: preference.reasoningEffort,
@@ -997,16 +985,14 @@ public enum QuietSettings {
     // MARK: - Bots
 
     /// A bot's cadence, in one line the model can both read and write:
-    /// `manual`, `interval:900`, or `cron:<zone>:<expression>`. Zones carry no
-    /// colon and the expression is last, so the three-way split is unambiguous.
-    /// An empty zone (`cron::0 8 * * *`) follows the Mac wherever it is.
+    /// `manual`, `interval:900`, or `cron:<expression>`, on the Mac's local clock.
     public static func cadenceText(_ cadence: BotCadence) -> String {
         switch cadence {
         case .manual: return "manual"
         case .interval(let seconds):
             if let rounded = Int(exactly: seconds.rounded()) { return "interval:\(rounded)" }
             return "interval:\(seconds)"
-        case .cron(let expression, let timeZone): return "cron:\(timeZone ?? ""):\(expression)"
+        case .cron(let expression): return "cron:\(expression)"
         }
     }
 
@@ -1022,21 +1008,15 @@ public enum QuietSettings {
             return .interval(seconds: seconds)
         }
         if text.lowercased().hasPrefix("cron:") {
-            let tail = String(text.dropFirst("cron:".count))
-            let parts = tail.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
-            guard parts.count == 2 else {
+            let expression = text.dropFirst("cron:".count).trimmingCharacters(in: .whitespaces)
+            guard !expression.contains(":") else {
                 throw QuietSettingError.badValue(
-                    "\(label): cron takes cron:<zone>:<expression>, as cron:Europe/London:0 7 * * *, or cron::0 7 * * * to follow this Mac.")
+                    "\(label): cron takes cron:<expression>, as cron:0 7 * * *; it runs on this Mac's local clock, so there is no zone.")
             }
-            let zone = BotCadence.setZone(String(parts[0]))
-            let expression = parts[1].trimmingCharacters(in: .whitespaces)
-            if let zone, TimeZone(identifier: zone) == nil {
-                throw QuietSettingError.badValue("\(label): \(zone) is not a time zone.")
-            }
-            return .cron(expression: expression, timeZone: zone)
+            return .cron(expression: expression)
         }
         throw QuietSettingError.badValue(
-            "\(label) takes manual, interval:<seconds>, or cron:<zone>:<expression> (an empty zone follows this Mac).")
+            "\(label) takes manual, interval:<seconds>, or cron:<expression> (on this Mac's local clock).")
     }
 
     @MainActor
@@ -1065,7 +1045,7 @@ public enum QuietSettings {
                     page: "bots",
                     label: "\(name) schedule",
                     kind: .text,
-                    note: "manual, interval:<seconds>, or cron:<zone>:<expression> (an empty zone, cron::0 8 * * *, follows this Mac wherever it is). Scheduled runs "
+                    note: "manual, interval:<seconds>, or cron:<expression> (cron:0 8 * * *), on this Mac's local clock wherever it is. Scheduled runs "
                         + "may be no closer together than the bot floor "
                         + "(bots.minimum_interval_minutes), which the store enforces.",
                     read: { appModel in
@@ -1640,12 +1620,12 @@ public enum QuietSettings {
             }
         ))
         rows.append(QuietSetting(
-            id: "memories.recur_to_facts", page: "settings", label: "Memories that recur become facts",
+            id: "memories.recur_to_facts", page: "settings", label: "Recurring memories are proposed as facts",
             kind: .boolean,
             note: "What keeps coming back is proposed as a durable fact to accept.",
             read: { appModel in .bool((appModel.trustPolicy?.memoryPolicy ?? TrustMemoryPolicy()).adaptive_promotion) },
             write: { appModel, value in
-                let enabled = try boolValue(value, "Memories that recur become facts")
+                let enabled = try boolValue(value, "Recurring memories are proposed as facts")
                 guard await appModel.patchMemoryPolicy(
                     knowledgeGraphEnabled: nil, adaptivePromotion: enabled, hygieneEnabled: nil) else {
                     throw QuietSettingError.unavailable(
@@ -1796,30 +1776,6 @@ public enum QuietSettings {
 
         // ── Desk ────────────────────────────────────────────────────────────
         rows.append(QuietSetting(
-            id: "desk.timeline", page: "trust", label: "Show the Desk timeline",
-            kind: .boolean,
-            read: { appModel in .bool(appModel.trustPolicy?.workshopPolicy?.showTimeline ?? true) },
-            write: { appModel, value in
-                let enabled = try boolValue(value, "Show the Desk timeline")
-                // The page's save (`saveWorkshopPolicyToggle`) re-sends the
-                // cached posture beside this field. The one-field patch lands
-                // in the same policy through the same writer, and cannot carry
-                // a stale posture back with it.
-                let saved: TrustPolicy
-                do {
-                    saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
-                        body: [WorkshopPolicyBlockVocabulary.wireKey: ["showTimeline": enabled]],
-                        dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-                    )
-                } catch {
-                    throw QuietSettingError.unavailable(
-                        "Show the Desk timeline was not saved: \(error.localizedDescription). "
-                        + "Check \(AppToolExecutor.doorDoctor), then try again.")
-                }
-                appModel.applySavedTrustPolicy(saved, status: "Desk execution policy saved")
-            }
-        ).onTab("features"))
-        rows.append(QuietSetting(
             id: "research.search_url", page: "desk", label: "Search service",
             kind: .text,
             note: "The SearXNG address research searches through, as http://host:port. auto looks for "
@@ -1961,34 +1917,15 @@ public enum QuietSettings {
         return rows
     }()
 
-    @MainActor
-    private static var fixedRows: [QuietSetting] {
-        staticRows + [QuietSetting(
-            id: "settings.display_timezone", page: "settings",
-            label: "The clock the app speaks in", kind: .text,
-            note: "An IANA zone (Europe/London); empty = the Mac's zone. Current zone: \(DisplayTimeZone.current.identifier). "
-                + "This changes what is displayed. Wall-clock schedules follow the Mac's own zone; explicitly zoned schedules keep their zone.",
-            read: { _ in .string(DisplayTimeZone.identifier()) },
-            write: { _, value in
-                let raw = try stringValue(value, "The clock the app speaks in").trimmingCharacters(in: .whitespaces)
-                guard raw.isEmpty || TimeZone(identifier: raw) != nil else {
-                    throw QuietSettingError.badValue("\(raw) is not an IANA time zone. Empty follows this Mac.")
-                }
-                UserDefaults.standard.set(raw, forKey: DisplayTimeZone.key)
-                NotificationCenter.default.post(name: .NSSystemTimeZoneDidChange, object: nil)
-            }
-        )]
-    }
-
     /// Snapshot bot values only for a read; mutations keep fresh store readers.
     @MainActor
     public static func all(host: (any QuietSettingsHost)?, snapshotBots: Bool = false) -> [QuietSetting] {
-        fixedRows + botRows(host, snapshot: snapshotBots) + (host?.lowerOnlyRows ?? [])
+        staticRows + botRows(host, snapshot: snapshotBots) + (host?.lowerOnlyRows ?? [])
     }
 
     @MainActor
     public static func settings(forPage page: String, host: (any QuietSettingsHost)?) -> [QuietSetting] {
-        fixedRows.filter { $0.page == page }
+        staticRows.filter { $0.page == page }
             + (page == "bots" ? botRows(host, snapshot: true) : [])
             + (host?.lowerOnlyRows ?? []).filter { $0.page == page }
     }
@@ -1996,7 +1933,7 @@ public enum QuietSettings {
     @MainActor
     public static func setting(id: String, host: (any QuietSettingsHost)?) -> QuietSetting? {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let fixed = fixedRows
+        let fixed = staticRows
         if let setting = fixed.first(where: { $0.id.lowercased() == key }) { return setting }
         let lower = host?.lowerOnlyRows ?? []
         if !key.hasPrefix("bots.") {

@@ -1,9 +1,11 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatSessionWork
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import ProviderRouting
+// Blueprint: | `ContextReceiptProjection.swift` | `ComposerContextReceiptRow`, `ComposerContextReceipt`, `ComposerContextReceiptState`, `ContextReceiptProjection`; shared context trace/receipt facts and checked Composer receipt reader using the caller engine's root for trace and provider/window reads |
 
 /// The composer's context receipt: what the last turn of THIS conversation
 /// actually put on the wire, component by component.
@@ -88,17 +90,16 @@ public enum ContextReceiptProjection {
     /// window on the SELECTED model — the one the ring also reads — with the
     /// model's own window named beside it. No pick of its own means the turn
     /// ran on the resolved model; that one is used.
-    public static func load(sessionId: String, selectedModel: String) async throws -> ComposerContextReceiptState {
-        let loaded = try await load(sessionId: sessionId)
+    public static func load(sessionId: String, selectedModel: String, dataRoot: URL) async throws -> ComposerContextReceiptState {
+        let loaded = try await load(sessionId: sessionId, reader: TurnTraceRecentReader(dataRootOverride: dataRoot, rowLimit: rowLimit))
         guard case .receipt(var receipt) = loaded else { return loaded }
         let selected = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let windowModel = selected.isEmpty ? (receipt.model ?? "") : selected
         // The selected model on the Chat route, as the ring reads it; a window
         // no catalog row states stays nil, and the card says so.
-        let root = PersistenceCore.defaultDataRoot()
-        let route = await SwiftNativeProviderRouting(dataRoot: root).chatRouteProvider()
-        receipt.windowTokens = ContextBudgetPolicy.windowTokens(forModel: windowModel, providerID: route, dataRoot: root)
-        receipt.nativeWindowTokens = ProviderRouting.verifiedContextLength(forModel: windowModel, providerID: route, dataRoot: root)
+        let route = await SwiftNativeProviderRouting(dataRoot: dataRoot).chatRouteProvider()
+        receipt.windowTokens = ContextBudgetPolicy.windowTokens(forModel: windowModel, providerID: route, dataRoot: dataRoot)
+        receipt.nativeWindowTokens = ProviderRouting.verifiedContextLength(forModel: windowModel, providerID: route, dataRoot: dataRoot)
         receipt.windowModelName = windowModel.isEmpty
             ? nil
             : FirstPartyModelCatalog.descriptor(for: windowModel)?.name ?? windowModel
@@ -318,7 +319,7 @@ public enum ContextReceiptProjection {
     }
 
     /// The count is everything advertised this turn: the always-on core, the
-    /// session's loaded set (capped at 40) and pinned MCP tools.
+    /// session's loaded set (capped at 40).
     private static func toolDetail(
         _ payload: [String: JSONValue],
         asText: Bool,
@@ -424,9 +425,9 @@ public enum ContextReceiptProjection {
 }
 
 extension ContextReceiptProjection {
-    public static func read(sessionId: String, selectedModel: String) async -> ComposerContextReceiptState {
+    public static func read(sessionId: String, selectedModel: String, dataRoot: URL) async -> ComposerContextReceiptState {
         do {
-            return try await ContextReceiptProjection.load(sessionId: sessionId, selectedModel: selectedModel)
+            return try await ContextReceiptProjection.load(sessionId: sessionId, selectedModel: selectedModel, dataRoot: dataRoot)
         } catch {
             return .unavailable(UserFacingError.cause(error, action: "read the turn trace"))
         }

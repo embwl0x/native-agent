@@ -2,6 +2,8 @@ import NativeAgentCore
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `Browser+MotorReadModel.swift` | `SwiftNativeBrowserClient.motorActionReadModel`: payload-free projection from canonical runs only; Browser retains outcome and effect authority |
+
 /// Fail-loud errors for the Browser shared-motor projection. The projection
 /// reads only the canonical `runs.json`; derived receipts are deliberately not
 /// a recovery source because an older receipt must never manufacture a terminal

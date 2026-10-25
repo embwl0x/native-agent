@@ -6,10 +6,11 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
-import MemoryV2
 import ApprovalInbox
 import TrustCenter
 import TelegramBot
+import AuthoredCapabilities
+// Blueprint: | `TrustBackupPersistence.swift` | `TrustBackupPersistence`; before replacement the normal writer keeps a cataloged backup, reason before restore of the target name; backup failure replaces nothing. The retained backup supplies domain-owned readable continuity facts; the intent UUID becomes the new DataRootLife. Interrupted installation moves forward; backups/restore-receipt.json retains omissions. Temporary carry snapshot writer and per-kind checkpoint settlement are deleted. Snapshot integrity, lock-sidecar exclusion, JSONL writer locks, legacy ability preparation, transcript stamping and retention remain with their owners |
 
 private actor NativeBackupRestoreCoordinator {
     private var activeDataRoots: Set<String> = []
@@ -42,15 +43,13 @@ private struct NativeBackupRestoreIntent: Codable {
     enum State: String, Codable {
         case staged
         case applying
-        case rollingBack
-        case completed
     }
 
-    let transactionID: String
+    let transactionID: UUID
     let targetID: String
     let targetManifestSHA256: String
-    var safetyBackupID: String
-    var safetyManifestSHA256: String
+    var safetyBackupID: String?
+    var safetyManifestSHA256: String?
     let stagedAt: String
     var state: State
 }
@@ -150,7 +149,8 @@ public enum TrustBackupPersistence {
         let intentPath = backupRestoreIntentPath(dataRoot: root)
         if pathEntryExists(intentPath) {
             let intent = try readRestoreIntent(at: intentPath)
-            pinned.formUnion([intent.targetID, intent.safetyBackupID])
+            pinned.insert(intent.targetID)
+            if let id = intent.safetyBackupID { pinned.insert(id) }
         }
         let ordered = records.values.sorted {
             $0.date == $1.date ? $0.record.id < $1.record.id : $0.date > $1.date
@@ -265,9 +265,7 @@ public enum TrustBackupPersistence {
                 .sorted { $0.lastPathComponent < $1.lastPathComponent }
             // `<dataRoot>/persona` never shadows the live persona root copied above.
             for child in children where child.lastPathComponent != "persona" {
-                if try await Self.copyOffDiskItem(child, relative: child.lastPathComponent, into: dataDir, dataRoot: root) {
-                    copied.append(child.lastPathComponent)
-                }
+                copied += try await Self.copyOffDiskEntry(child, relative: child.lastPathComponent, into: dataDir, dataRoot: root)
             }
         } else {
             let ordinaryPaths = Self.backupRelativePaths.filter {
@@ -287,20 +285,10 @@ public enum TrustBackupPersistence {
             if Self.pathEntryExists(memorySource) {
                 // A linked Memory root would aim the SQLite backup below through it.
                 try Self.requireRegularDirectory(memorySource)
-                let memoryDestination = dataDir.appendingNativeRelativePath("memory")
                 try await Self.copyLockedSnapshotItem(
                     from: memorySource,
-                    to: memoryDestination,
-                    excludingSQLiteArtifacts: true
+                    to: dataDir.appendingNativeRelativePath("memory")
                 )
-                let liveDatabase = memorySource.appendingPathComponent("memory.sqlite")
-                if Self.pathEntryExists(liveDatabase) {
-                    try await MemoryStorage.createConsistentBackup(
-                        dataRoot: root,
-                        destinationDatabaseURL: memoryDestination
-                            .appendingPathComponent("memory.sqlite")
-                    )
-                }
                 copied.append("memory")
             }
             // Retention publishes archive bytes and locators under the session index lock.
@@ -311,8 +299,7 @@ public enum TrustBackupPersistence {
                     guard Self.pathEntryExists(source) else { continue }
                     try await Self.copyLockedSnapshotItem(
                         from: source,
-                        to: dataDir.appendingNativeRelativePath(relative),
-                        excludingSQLiteArtifacts: false
+                        to: dataDir.appendingNativeRelativePath(relative)
                     )
                     paths.append(relative)
                 }
@@ -333,6 +320,7 @@ public enum TrustBackupPersistence {
             "id": .string(id),
             "integrityVersion": .int(2),
             "scopeVersion": .int(2),
+            "lifeID": .string(try DataRootLife.current(in: root)),
             // An off-disk copy is never a restore target: its `data/persona` is
             // the live persona root, which a restore would write to
             // `<dataRoot>/persona` and so move Agent's persona root.
@@ -510,14 +498,15 @@ public enum TrustBackupPersistence {
     }
 
     /// Off-disk leaves these data-root-relative paths behind: the model that
-    /// ships in the DMG, local backups, the rebuildable history index, regenerable diagnostics, old
-    /// pre-consolidation memory copies, and credential stores. Credential files
-    /// anywhere else are `isCredentialFile`.
+    /// ships in the DMG, local backups, past export and support bundles (copies
+    /// of what the backup carries), the rebuildable history index, regenerable diagnostics, old
+    /// pre-consolidation memory copies, and what PrivacyMap
+    /// promises never leaves the Mac (usage history, sense ledger and news).
+    /// Credential files anywhere else are `isCredentialFile`.
     private static let offDiskExcludedPaths: Set<String> = [
-        "extras", "backups", "chat/index",
+        "extras", "backups", "production", "chat/index", "activity_watch",
         "logs", "diagnostics", "crash_reports", "ui-frames", "mobile_snapshot_cache",
         "evals", "traces", "turn_traces", "harness", "builder_audit", "memory/backups",
-        "security", "secrets", "oauth_tokens", "oauth_apps", "claude-bridge", "nextgen/remote",
         "senses/ledger",
         "senses/news",
     ]
@@ -525,18 +514,59 @@ public enum TrustBackupPersistence {
     /// `providers/` holds API keys and OAuth tokens; only its model routing goes.
     private static let offDiskProviderFiles: Set<String> = ["providers/active.json", "providers/surfaces.json"]
 
+    private static let outgoingCredentialStores: Set<String> = [
+        "security", "secrets", "oauth_tokens", "oauth_apps", "claude-bridge", "nextgen/remote",
+    ]
+
+    private static func isOutgoingCredential(_ relative: String, _ url: URL) -> Bool {
+        isCredentialFile(url)
+            || outgoingCredentialStores.contains { relative == $0 || relative.hasPrefix($0 + "/") }
+            || (relative.hasPrefix("providers/") && !offDiskProviderFiles.contains(relative))
+    }
+
     /// True for a data-root-relative path an off-disk backup leaves behind.
     private static func isOffDiskExcluded(_ relative: String, _ url: URL) -> Bool {
         relative.hasSuffix(".lock")
-            || Self.isCredentialFile(url)
+            || Self.isOutgoingCredential(relative, url)
             || Self.offDiskExcludedPaths.contains { relative == $0 || relative.hasPrefix($0 + "/") }
-            || (relative.hasPrefix("providers/") && !Self.offDiskProviderFiles.contains(relative))
+    }
+
+    /// A feed and its optional compaction base are one copy, at any depth
+    /// (REM's pair lives directly in the data root). Only the feed copies its
+    /// base, so traversal cannot later replace half with a newer epoch.
+    private static func copyOffDiskEntry(
+        _ source: URL, relative: String, into dataDir: URL, dataRoot root: URL
+    ) async throws -> [String] {
+        guard !Self.isOffDiskExcluded(relative, source) else { return [] }
+        let name = source.lastPathComponent
+        if name.hasSuffix("_base.json"), Self.pathEntryExists(source.deletingLastPathComponent()
+            .appendingPathComponent(String(name.dropLast("_base.json".count)) + ".jsonl")) { return [] }
+        guard source.pathExtension == "jsonl" else {
+            return try await Self.copyOffDiskItem(source, relative: relative, into: dataDir, dataRoot: root) ? [relative] : []
+        }
+        // Lock even before the first base exists: compaction may create it
+        // while a backup is reading the original feed.
+        return try await SwiftNativePersistenceCore().withFileLock(source) {
+            var copied: [String] = []
+            if try await Self.copyOffDiskItem(source, relative: relative, into: dataDir, dataRoot: root) {
+                copied.append(relative)
+            }
+            let baseName = source.deletingPathExtension().lastPathComponent + "_base.json"
+            let base = source.deletingLastPathComponent().appendingPathComponent(baseName)
+            let baseRelative = String(relative.dropLast(name.count)) + baseName
+            if Self.pathEntryExists(base),
+               try await Self.copyOffDiskItem(base, relative: baseRelative, into: dataDir, dataRoot: root) {
+                copied.append(baseRelative)
+            }
+            return copied
+        }
     }
 
     /// Copy one data-root item into an off-disk snapshot, returning false when
     /// it is left behind. Every SQLite database is copied as a coherent image
     /// without the backup ever opening live data for write; its
-    /// `-wal`/`-shm`/`-journal` never travel raw.
+    /// `-wal`/`-shm`/`-journal` never travel raw. Snapshot/tail feeds copy their
+    /// optional base and tail together under the feed writer's lock.
     private static func copyOffDiskItem(
         _ source: URL,
         relative: String,
@@ -571,14 +601,14 @@ public enum TrustBackupPersistence {
                 }) { continue }
                 // An atomic writer's in-flight temp file (`.<name>.<pid>...tmp`).
                 if name.hasPrefix("."), name.hasSuffix(".tmp") { continue }
-                _ = try await Self.copyOffDiskItem(child, relative: relative + "/" + name, into: dataDir, dataRoot: root)
+                _ = try await Self.copyOffDiskEntry(child, relative: relative + "/" + name, into: dataDir, dataRoot: root)
             }
             return true
         } else if values.isRegularFile != true {
             throw Self.backupError(code: 422, "Backup source contains a non-regular item: \(relative)")
         }
         if relative == "memory/memory.sqlite" {
-            try await MemoryStorage.createConsistentBackup(dataRoot: root, destinationDatabaseURL: destination)
+            try Self.copyLiveSQLite(from: source, to: destination)
             return true
         }
         // A database that may be live goes through a read-only online backup.
@@ -665,40 +695,16 @@ public enum TrustBackupPersistence {
         let intentPath = Self.backupRestoreIntentPath(dataRoot: root)
         guard !Self.pathEntryExists(intentPath) else {
             throw NSError(domain: "NativeAgentBackup", code: 409, userInfo: [
-                NSLocalizedDescriptionKey: "A staged backup restore already exists. Restart NativeAgent to finish or roll it back before staging another restore."
-            ])
-        }
-
-        let safetyReason = "pre-restore safety backup before restoring \"\(snapshot.reason)\" from \(snapshot.createdAt) [\(snapshot.id)]"
-        let safetyBackup: BackupRecord
-        do {
-            safetyBackup = try await createBackup(reason: safetyReason, dataRoot: root, host: host)
-        } catch {
-            throw NSError(domain: "NativeAgentBackup", code: 412, userInfo: [
-                NSLocalizedDescriptionKey: "Safety backup failed; restore was cancelled before current data changed: \(error.localizedDescription)",
-                NSUnderlyingErrorKey: error,
-            ])
-        }
-        let safetySnapshot: NativeValidatedBackupSnapshot
-        do {
-            safetySnapshot = try Self.validateBackupSnapshot(
-                id: safetyBackup.id,
-                dataRoot: root,
-                requireRestorableAuthority: false
-            )
-        } catch {
-            throw NSError(domain: "NativeAgentBackup", code: 412, userInfo: [
-                NSLocalizedDescriptionKey: "Safety backup validation failed; restore was cancelled before current data changed: \(error.localizedDescription)",
-                NSUnderlyingErrorKey: error,
+                NSLocalizedDescriptionKey: "A staged backup restore already exists. Restart NativeAgent to finish it before staging another restore."
             ])
         }
 
         let intent = NativeBackupRestoreIntent(
-            transactionID: UUID().uuidString.lowercased(),
+            transactionID: UUID(),
             targetID: snapshot.id,
             targetManifestSHA256: snapshot.manifestSHA256,
-            safetyBackupID: safetySnapshot.id,
-            safetyManifestSHA256: safetySnapshot.manifestSHA256,
+            safetyBackupID: nil,
+            safetyManifestSHA256: nil,
             stagedAt: Self.nativeArtifactTimestamp(),
             state: .staged
         )
@@ -706,7 +712,7 @@ public enum TrustBackupPersistence {
             try Self.writeRestoreIntent(intent, to: intentPath)
         } catch {
             throw NSError(domain: "NativeAgentBackup", code: 500, userInfo: [
-                NSLocalizedDescriptionKey: "Restore intent could not be made durable. Current data was not changed; safety backup \(safetyBackup.id) remains available: \(error.localizedDescription)",
+                NSLocalizedDescriptionKey: "Restore intent could not be made durable. Current data was not changed: \(error.localizedDescription)",
                 NSUnderlyingErrorKey: error,
             ])
         }
@@ -714,51 +720,23 @@ public enum TrustBackupPersistence {
             id: id,
             restored: snapshot.copied,
             restoredAt: intent.stagedAt,
-            requiresRestart: true,
-            safetyBackupId: safetyBackup.id
+            requiresRestart: true
         )
     }
 
     /// Runs before NativeAgentApp/AppModel construction, while no SQLite,
     /// TrustCenter, chat, cognition, or background-loop owner has opened the
-    /// data root. A previous crash during target application never resumes the
-    /// target over mixed bytes: it first restores the exact safety snapshot.
+    /// data root. Preserve the life being left through the normal backup writer
+    /// before replacing any scope, then install the approved backup forward.
     public static func resumeStagedBackupRestoreAtLaunch(
         dataRoot root: URL,
         host: TrustBackupHost
-    ) throws -> BackupRestoreResult? {
+    ) async throws -> BackupRestoreResult? {
         let intentPath = Self.backupRestoreIntentPath(dataRoot: root)
+        _ = try DataRootLife.current(in: root)
         guard Self.pathEntryExists(intentPath) else { return nil }
 
         var intent = try Self.readRestoreIntent(at: intentPath)
-        var safety = try Self.validateBackupSnapshot(
-            id: intent.safetyBackupID,
-            dataRoot: root,
-            requireRestorableAuthority: false
-        )
-        guard safety.manifestSHA256 == intent.safetyManifestSHA256 else {
-            throw Self.backupError(
-                code: 422,
-                "A staged restore backup changed after approval. NativeAgent preserved the intent and refused to start."
-            )
-        }
-
-        if intent.state == .applying || intent.state == .rollingBack {
-            if intent.state == .applying {
-                intent.state = .rollingBack
-                try Self.writeRestoreIntent(intent, to: intentPath)
-            }
-            return try Self.rollbackInterruptedRestore(
-                safety: safety,
-                intentPath: intentPath,
-                dataRoot: root,
-                originalError: Self.backupError(
-                    code: 500,
-                    "NativeAgent detected an interrupted restore and restored the pre-restore safety snapshot."
-                )
-            )
-        }
-
         let target = try Self.validateBackupSnapshot(id: intent.targetID, dataRoot: root)
         guard target.manifestSHA256 == intent.targetManifestSHA256 else {
             throw Self.backupError(
@@ -768,175 +746,37 @@ public enum TrustBackupPersistence {
         }
 
         if intent.state == .staged {
-            // Staging leaves runtime owners live until exit. Capture their final
-            // writes now, before any owner opens, and bind this exact rollback
-            // and effect-fence source before the first destructive copy.
-            safety = try Self.createLaunchRestoreSafetySnapshot(dataRoot: root, host: host)
-            intent.safetyBackupID = safety.id
-            intent.safetyManifestSHA256 = safety.manifestSHA256
-            intent.state = .applying
-            try Self.writeRestoreIntent(intent, to: intentPath)
             do {
-                try Self.applyBackupSnapshotPreservingEffectFences(
-                    target: target,
-                    safety: safety,
-                    destinationRoot: root
-                )
+                let backup = try await Self.createBackup(reason: "before restore of \(target.id)", dataRoot: root, host: host)
+                let kept = try Self.validateBackupSnapshot(id: backup.id, dataRoot: root, requireRestorableAuthority: false)
+                intent.safetyBackupID = kept.id
+                intent.safetyManifestSHA256 = kept.manifestSHA256
             } catch {
-                intent.state = .rollingBack
-                try Self.writeRestoreIntent(intent, to: intentPath)
-                return try Self.rollbackInterruptedRestore(
-                    safety: safety,
-                    intentPath: intentPath,
-                    dataRoot: root,
-                    originalError: error
-                )
+                throw Self.backupError(code: 500,
+                    "NativeAgent could not keep the life before restore of \(target.id). No current data was replaced. Tell the person: the backup could not be written: \(error.localizedDescription)")
             }
-
-        } else {
-            // A crash after the completed marker but before intent removal is
-            // still pre-owner. Reapplying the verified target plus the same
-            // monotonic safety overlay is deterministic and idempotent.
-            try Self.applyBackupSnapshotPreservingEffectFences(
-                target: target,
-                safety: safety,
-                destinationRoot: root
-            )
         }
-
-        intent.state = .completed
+        intent.state = .applying
         try Self.writeRestoreIntent(intent, to: intentPath)
+        var notes: [String] = []
+        try await Self.applyBackupSnapshotPreservingEffectFences(
+            target: target, intent: intent, destinationRoot: root, notes: &notes)
+
         let result = BackupRestoreResult(
             id: target.id,
             restored: target.copied,
             restoredAt: Self.nativeArtifactTimestamp(),
             requiresRestart: false,
-            safetyBackupId: safety.id
+            notCarried: notes
         )
+        // Launch has no Backup UI owner yet. Keep the completed receipt on disk
+        // before removing the intent, so omissions remain inspectable afterward.
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(
+            JSONEncoder().encode(result), to: root.appendingPathComponent("backups/restore-receipt.json"))
         try FileManager.default.removeItem(at: intentPath)
         return result
     }
 
-    private static func rollbackInterruptedRestore(
-        safety: NativeValidatedBackupSnapshot,
-        intentPath: URL,
-        dataRoot root: URL,
-        originalError: Error
-    ) throws -> BackupRestoreResult? {
-        do {
-            let priorGenerations = Self.transcriptGenerations(in: root)
-            try Self.applyBackupSnapshot(
-                safety,
-                destinationRoot: root,
-                requireRestorableAuthority: false
-            )
-            try Self.verifyAppliedSnapshot(safety, destinationRoot: root)
-            try Self.rollTranscriptGenerationsForward(
-                in: root,
-                priorGenerations: priorGenerations
-            )
-            try FileManager.default.removeItem(at: intentPath)
-        } catch {
-            // Keep the rollingBack intent byte-for-byte available. The next
-            // launch resumes this exact rollback before any state owner opens.
-            throw Self.backupError(
-                code: 503,
-                "Backup restore and its safety rollback could not finish. NativeAgent preserved the rollback intent and refused to start: \(error.localizedDescription)"
-            )
-        }
-        throw Self.backupError(
-            code: 500,
-            "Backup restore did not complete. The pre-restore safety snapshot was restored before NativeAgent started: \(originalError.localizedDescription)"
-        )
-    }
-
-    /// Only called at pre-owner launch. SQLite and its WAL are quiescent here;
-    /// copying both retains committed frames without opening a runtime store.
-    private static func createLaunchRestoreSafetySnapshot(
-        dataRoot root: URL,
-        host: TrustBackupHost
-    ) throws -> NativeValidatedBackupSnapshot {
-        let id = UUID().uuidString.lowercased()
-        let backupDir = root.appendingPathComponent("backups/\(id)", isDirectory: true)
-        let dataDir = backupDir.appendingPathComponent("data", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
-            var copied: [String] = []
-            for relative in Self.backupRelativePaths {
-                let source = root.appendingNativeRelativePath(relative)
-                guard Self.pathEntryExists(source) else { continue }
-                try Self.copyQuiescentRestoreSafetyItem(
-                    from: source,
-                    to: dataDir.appendingNativeRelativePath(relative)
-                )
-                copied.append(relative)
-            }
-            let links = try Self.takeBackupLinks(in: dataDir)
-            let files = try Self.backupIntegrityFiles(in: dataDir)
-            let manifest: JSONValue = .object([
-                "app": .string("NativeAgent"),
-                "createdAt": .string(Self.nativeArtifactTimestamp()),
-                "id": .string(id),
-                "integrityVersion": .int(2),
-                "scopeVersion": .int(2),
-                "kind": .string("backup"),
-                "reason": .string("final pre-owner restore safety snapshot"),
-                "scope": .array(Self.scopeNames(for: copied).map { .string($0) }),
-                "copied": .array(copied.map { .string($0) }),
-                "files": .array(files.map(Self.backupIntegrityFileJSON)),
-                "links": .array(links.map(Self.backupLinkJSON)),
-                "version": .string(host.applicationVersion()),
-            ])
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(
-                manifest.serializedData(pretty: true),
-                to: backupDir.appendingPathComponent("manifest.json")
-            )
-            let snapshot = try Self.validateBackupSnapshot(id: id, dataRoot: root, requireRestorableAuthority: false)
-            // Keep the final rollback point selectable in the same Backup UI
-            // as the provisional staging backup. No registry writer is live.
-            let record = BackupRecord(
-                id: id, reason: snapshot.reason, scope: Self.scopeNames(for: copied),
-                path: backupDir.path, createdAt: snapshot.createdAt
-            )
-            let records = [record] + (try Self.readBackupRecords(root: root))
-            let catalog = try JSONValue.array(records.map(Self.backupRecordJSON))
-                .serializedData(pretty: true)
-            for name in ["index.json", "registry.json"] {
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(
-                    catalog, to: root.appendingPathComponent("backups/\(name)")
-                )
-            }
-            return snapshot
-        } catch {
-            try? FileManager.default.removeItem(at: backupDir)
-            throw error
-        }
-    }
-
-    private static func copyQuiescentRestoreSafetyItem(from source: URL, to destination: URL) throws {
-        let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
-        if values.isSymbolicLink == true {
-            try Self.copyBackupLink(from: source, to: destination)
-            return
-        }
-        if values.isRegularFile == true {
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(
-                Data(contentsOf: source, options: [.mappedIfSafe]), to: destination
-            )
-            return
-        }
-        guard values.isDirectory == true else {
-            throw Self.backupError(code: 422, "Restore safety source contains a non-regular item.")
-        }
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        for child in try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
-            guard !child.lastPathComponent.hasSuffix(".lock"),
-                  !(source.lastPathComponent == "senses" && ["ledger", "news"].contains(child.lastPathComponent)) else { continue }
-            try Self.copyQuiescentRestoreSafetyItem(
-                from: child, to: destination.appendingPathComponent(child.lastPathComponent)
-            )
-        }
-    }
 
     private static func backupRestoreIntentPath(dataRoot root: URL) -> URL {
         root.appendingPathComponent("backups", isDirectory: true)
@@ -944,7 +784,7 @@ public enum TrustBackupPersistence {
     }
 
     private static func readRestoreIntent(at path: URL) throws -> NativeBackupRestoreIntent {
-        try Self.requireRegularFile(path, maximumBytes: 64 * 1024)
+        try Self.requireRegularFile(path, maximumBytes: 16 * 1024 * 1024)
         do {
             return try JSONDecoder.nativeAgent.decode(
                 NativeBackupRestoreIntent.self,
@@ -1130,7 +970,10 @@ public enum TrustBackupPersistence {
         return NativeValidatedBackupSnapshot(
             id: id,
             dataDirectory: dataDir,
-            restorePaths: restorePaths.filter { scopeVersion == .int(2) || $0 != "chat/archive" || copiedSet.contains($0) },
+            restorePaths: restorePaths.filter {
+                if ["chat/attachments", "chat/mac_turn_lifecycle.json"].contains($0) { return copiedSet.contains($0) }
+                return scopeVersion == .int(2) || $0 != "chat/archive" || copiedSet.contains($0)
+            },
             copied: copied,
             files: actualFiles,
             links: links,
@@ -1232,32 +1075,41 @@ public enum TrustBackupPersistence {
 
     private static func applyBackupSnapshot(
         _ snapshot: NativeValidatedBackupSnapshot,
-        destinationRoot: URL,
-        requireRestorableAuthority: Bool
+        destinationRoot: URL
     ) throws {
         _ = try Self.validateBackupSnapshot(
             id: snapshot.id,
-            dataRoot: destinationRoot,
-            requireRestorableAuthority: requireRestorableAuthority
+            dataRoot: destinationRoot
         )
         let fm = FileManager.default
         for rel in snapshot.restorePaths {
             let source = snapshot.dataDirectory.appendingNativeRelativePath(rel)
             let destination = destinationRoot.appendingNativeRelativePath(rel)
-            if Self.pathEntryExists(destination) {
-                try fm.removeItem(at: destination)
+            let kept = Self.unbackedChildren(of: rel, at: destination)
+            if kept.isEmpty {
+                if Self.pathEntryExists(destination) { try fm.removeItem(at: destination) }
+            } else {
+                for child in try fm.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil)
+                    where !kept.contains(child.lastPathComponent) {
+                    try fm.removeItem(at: child)
+                }
             }
             if Self.pathEntryExists(source) {
                 try fm.createDirectory(
                     at: destination.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
-                try fm.copyItem(at: source, to: destination)
-                // Sidecars are not snapshot data; live writers create their own.
-                if let copies = fm.enumerator(at: destination, includingPropertiesForKeys: nil) {
-                    for case let copied as URL in copies where copied.lastPathComponent.hasSuffix(".lock")
-                        && (try? copied.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
-                        try fm.removeItem(at: copied)
+                // Into a kept scope directory child by child, never over what it keeps.
+                let copies = kept.isEmpty ? [source] : try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil)
+                for from in copies where kept.isEmpty || !from.lastPathComponent.hasSuffix(".lock") {
+                    let to = kept.isEmpty ? destination : destination.appendingPathComponent(from.lastPathComponent)
+                    try fm.copyItem(at: from, to: to)
+                    // Sidecars are not snapshot data; live writers create their own.
+                    if let copied = fm.enumerator(at: to, includingPropertiesForKeys: nil) {
+                        for case let item as URL in copied where item.lastPathComponent.hasSuffix(".lock")
+                            && (try? item.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                            try fm.removeItem(at: item)
+                        }
                     }
                 }
             }
@@ -1273,209 +1125,98 @@ public enum TrustBackupPersistence {
 
     private static func applyBackupSnapshotPreservingEffectFences(
         target: NativeValidatedBackupSnapshot,
-        safety: NativeValidatedBackupSnapshot,
-        destinationRoot: URL
-    ) throws {
-        // 2026-09-06: read BEFORE the copy overwrites the live index — see
-        // `rollTranscriptGenerationsForward`.
-        let priorGenerations = Self.transcriptGenerations(in: destinationRoot)
+        intent: NativeBackupRestoreIntent,
+        destinationRoot: URL,
+        notes: inout [String]
+    ) async throws {
+        guard let id = intent.safetyBackupID else {
+            throw Self.backupError(code: 422, "The pre-restore backup is missing. Tell the person: NativeAgent cannot replace current data until its backup is kept.")
+        }
+        let kept = try Self.validateBackupSnapshot(id: id, dataRoot: destinationRoot, requireRestorableAuthority: false)
+        guard kept.manifestSHA256 == intent.safetyManifestSHA256,
+              kept.reason == "before restore of \(target.id)" else {
+            throw Self.backupError(code: 422, "The pre-restore backup changed. Tell the person: NativeAgent kept the restore intent and refused to replace current data.")
+        }
+        var generationFloor: Int64 = 0
+        do {
+            generationFloor = try ChatSessionIndexFile.loadObjectRowsForMutation(at: Self.chatSessionIndexPath(in: kept.dataDirectory))
+                .compactMap { ChatSessionIndexFile.transcriptGeneration(in: $0) }.max() ?? 0
+        } catch {
+            notes.append("chat/sessions.json: \(error.localizedDescription); current transcript-version counters were not kept.")
+        }
+        do {
+            let epochPath = Self.transcriptRestoreEpochPath(in: destinationRoot)
+            if Self.pathEntryExists(epochPath) {
+                try Self.requireRegularFile(epochPath, maximumBytes: 1024)
+                guard case .object(let object) = try JSONValue.parse(Data(contentsOf: epochPath)),
+                      case .int(let value)? = object["epoch"], value >= 0 else {
+                    throw Self.backupError(code: 422, "The transcript restore epoch is malformed.")
+                }
+                generationFloor = max(generationFloor, value)
+            }
+        } catch {
+            notes.append("chat/transcript_restore_epoch.json: \(error.localizedDescription); current transcript version floor was not kept; readable carried/restored counters set the new floor.")
+        }
+        var carriedAbilities: [String: Data] = [:]
+        if !target.restorePaths.contains("abilities") {
+            let legacy = try AbilityStore(dataRoot: kept.dataDirectory).restoredLegacyCarry(backupRoot: target.dataDirectory)
+            carriedAbilities = legacy.files
+            notes += legacy.notes
+        }
         try Self.applyBackupSnapshot(
             target,
-            destinationRoot: destinationRoot,
-            requireRestorableAuthority: true
+            destinationRoot: destinationRoot
         )
         // Prove the selected backup exactly before overlaying facts that are
         // intentionally newer than it.
         try Self.verifyAppliedSnapshot(target, destinationRoot: destinationRoot)
-        // Older local backups did not cover archives; retain their safety copy.
-        if !target.copied.contains("chat/archive"), safety.copied.contains("chat/archive") {
-            try Self.copyQuiescentRestoreSafetyItem(
-                from: safety.dataDirectory.appendingNativeRelativePath("chat/archive"),
-                to: destinationRoot.appendingNativeRelativePath("chat/archive")
-            )
+        // A backup older than abilities/ restored the tools and skills they
+        // became; what it never carried (senses, her turn) stays.
+        if !target.restorePaths.contains("abilities") {
+            try AbilityStore(dataRoot: destinationRoot).installRestoredLegacy(carriedAbilities, backupRoot: target.dataDirectory)
         }
-        try TelegramConfig.preserveCredential(safetyRoot: safety.dataDirectory, destinationRoot: destinationRoot)
-        try ConnectorCredentialFile.preserveCredentials(safetyRoot: safety.dataDirectory, destinationRoot: destinationRoot)
+        if let cause = try TelegramConfig.preserveCredential(safetyRoot: kept.dataDirectory, destinationRoot: destinationRoot) {
+            notes.append("telegram/config.json: \(cause); current credential grant was not kept.")
+        }
+        notes += try SwiftNativeApprovalInbox.mergeRestoreFences(
+            safetyRoot: kept.dataDirectory, destinationRoot: destinationRoot)
+        let schedulerPath = kept.dataDirectory.appendingNativeRelativePath("scheduler/jobs.json")
+        if Self.pathEntryExists(schedulerPath) {
+            let scheduler = try Data(contentsOf: schedulerPath)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(scheduler, to: destinationRoot.appendingNativeRelativePath("scheduler/jobs.json"))
+        }
+        try DataRootLife.begin(in: destinationRoot, id: intent.transactionID)
+        // Raise the selected backup above the prior phone version floor.
         try Self.rollTranscriptGenerationsForward(
             in: destinationRoot,
-            priorGenerations: priorGenerations
-        )
-        try SwiftNativeApprovalInbox.mergeRestoreFences(
-            safetyRoot: safety.dataDirectory,
-            destinationRoot: destinationRoot
-        )
-        try Self.preserveSchedulerOccurrenceState(
-            safetyRoot: safety.dataDirectory,
-            destinationRoot: destinationRoot
-        )
-        try Self.preserveExternalSendReceipts(
-            safetyRoot: safety.dataDirectory,
-            destinationRoot: destinationRoot
-        )
-        // The merge changes only authority outcomes/fences; validate selected
-        // restorable authority again after those monotonic overlays land.
-        try Self.validateBackupChatSessionIndex(dataDir: destinationRoot)
-        try Self.validateBackupTrustPolicy(dataDir: destinationRoot)
-        try Self.validateBackupCapabilityAuthority(dataDir: destinationRoot)
-    }
-
-    /// Scheduler currently keeps configuration and occurrence claims in one
-    /// checked file. Until that owner splits them, preserving the entire newer
-    /// safety generation is the only restore that cannot resurrect an already
-    /// claimed occurrence. This intentionally favors no duplicate effects over
-    /// restoring older schedule configuration.
-    private static func preserveSchedulerOccurrenceState(
-        safetyRoot: URL,
-        destinationRoot: URL
-    ) throws {
-        let source = safetyRoot.appendingNativeRelativePath("scheduler/jobs.json")
-        guard Self.pathEntryExists(source) else { return }
-        try Self.requireRegularFile(source, maximumBytes: 64 * 1024 * 1024)
-        let raw = try JSONValue.parse(Data(contentsOf: source))
-        guard case .array(let rows) = raw,
-              rows.allSatisfy({ if case .object = $0 { return true }; return false }) else {
-            throw Self.backupError(
-                code: 422,
-                "The pre-restore scheduler generation is malformed; current bytes were preserved and restore was rolled back."
-            )
-        }
-        try Self.writeJSONValue(
-            raw,
-            to: destinationRoot.appendingNativeRelativePath("scheduler/jobs.json")
+            priorGenerationFloor: generationFloor
         )
     }
 
-    private static func preserveExternalSendReceipts(
-        safetyRoot: URL,
-        destinationRoot: URL
-    ) throws {
-        let sourceDirectory = safetyRoot.appendingNativeRelativePath(
-            "connectors/actions/external_send_receipts"
-        )
-        guard Self.pathEntryExists(sourceDirectory) else { return }
-        try Self.requireRegularDirectory(sourceDirectory)
-        let destinationDirectory = destinationRoot.appendingNativeRelativePath(
-            "connectors/actions/external_send_receipts"
-        )
-        try FileManager.default.createDirectory(
-            at: destinationDirectory, withIntermediateDirectories: true
-        )
-        guard let members = try? FileManager.default.contentsOfDirectory(
-            at: sourceDirectory,
-            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            throw Self.backupError(code: 422, "External-send receipt fences could not be enumerated.")
-        }
-        for source in members {
-            if source.lastPathComponent.hasSuffix(".lock") { continue }
-            let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-            guard values.isRegularFile == true,
-                  values.isSymbolicLink != true,
-                  source.pathExtension == "json",
-                  let approvalID = UUID(uuidString: source.deletingPathExtension().lastPathComponent)?
-                    .uuidString.lowercased(),
-                  approvalID == source.deletingPathExtension().lastPathComponent.lowercased() else {
-                throw Self.backupError(code: 422, "External-send receipt fence has an invalid member.")
-            }
-            let bytes = try Data(contentsOf: source)
-            let value = try JSONValue.parse(bytes)
-            guard case .object(let object) = value,
-                  object["kind"] == .string("external_send_execution"),
-                  object["approvalId"] == .string(approvalID),
-                  case .string(let idempotency)? = object["idempotencyKey"], !idempotency.isEmpty,
-                  case .string(let connector)? = object["connectorId"], !connector.isEmpty,
-                  case .string(let action)? = object["actionId"], !action.isEmpty,
-                  case .string(let status)? = object["status"], !status.isEmpty,
-                  case .bool(_)? = object["didDispatch"] else {
-                throw Self.backupError(
-                    code: 422,
-                    "A current external-send receipt is malformed; its bytes were preserved and restore was rolled back."
-                )
-            }
-            try bytes.write(
-                to: destinationDirectory.appendingPathComponent("\(approvalID).json"),
-                options: .atomic
-            )
-        }
-    }
-
-    /// The transcript version each session's index row carries right now.
-    private static func transcriptGenerations(in root: URL) -> [String: Int64] {
-        let path = Self.chatSessionIndexPath(in: root)
-        guard let rows = try? ChatSessionIndexFile.loadObjectRowsForMutation(at: path) else {
-            return [:]
-        }
-        var out: [String: Int64] = [:]
-        for row in rows {
-            guard case .string(let id)? = row["id"],
-                  let generation = ChatSessionIndexFile.transcriptGeneration(in: row) else { continue }
-            out[id] = generation
-        }
-        return out
-    }
-
-    /// 2026-09-06: a restore copies `chat/sessions.json` back wholesale, which
-    /// rolls every session's transcript version BACKWARD to whatever it was
-    /// when the backup was taken. The phone keeps its own watermark across the
-    /// restore, so every restored transcript then looked older than the copy it
-    /// already held and was refused — the two surfaces disagreed about the
-    /// conversation permanently.
-    ///
-    /// Each restored row's version is therefore raised to
-    /// `max(restored, previous + 1)`: strictly newer than anything this Mac
-    /// published before the restore, and never lowered. Runs AFTER
-    /// `verifyAppliedSnapshot` — the snapshot is proven byte-exact first, and
-    /// this is one of the facts deliberately overlaid on top of it.
-    ///
-    /// 2026-09-06: NOT best effort. A restore whose index could not be
-    /// re-stamped leaves the phone refusing every restored transcript as older
-    /// than the copy it holds, and reporting that restore as a success hides
-    /// exactly that. A failed raise now fails the restore step (and the
-    /// rollback path), which preserves the intent for the next launch.
-    ///
-    /// 2026-09-06: the floor is the restore EPOCH, not the per-session prior
-    /// alone. A session absent from the pre-restore index — one the backup has
-    /// and this Mac had already deleted, or one published from another surface
-    /// — had no prior, was skipped outright, and came back carrying the
-    /// backup's old counter. The epoch is a monotonic counter persisted OUTSIDE
-    /// the index (a restore overwrites the index wholesale), raised past every
-    /// generation the pre-restore index carried and bumped once per restore, so
-    /// every restored row lands strictly above anything this Mac published
-    /// before the restore.
+    /// Stamp the installed index above retained/readable version counters.
     private static func rollTranscriptGenerationsForward(
         in root: URL,
-        priorGenerations: [String: Int64]
+        priorGenerationFloor: Int64
     ) throws {
         let path = Self.chatSessionIndexPath(in: root)
-        let epoch = try Self.bumpTranscriptRestoreEpoch(
-            in: root,
-            atLeast: priorGenerations.values.max() ?? 0
-        )
-        var rows: [[String: JSONValue]]
-        do {
-            rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
-        } catch {
-            throw Self.backupError(
-                code: 500,
-                "The restored session index could not be read to raise its transcript versions: \(error.localizedDescription)"
-            )
-        }
+        var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
+        guard !rows.isEmpty else { return }
+        let epoch = try Self.bumpTranscriptRestoreEpoch(in: root, atLeast: max(
+            priorGenerationFloor,
+            rows.compactMap { ChatSessionIndexFile.transcriptGeneration(in: $0) }.max() ?? 0))
+        guard epoch < Int64.max else { return }
         var changed = false
         for index in rows.indices {
-            guard case .string(let id)? = rows[index]["id"] else { continue }
-            let floor = max(priorGenerations[id] ?? 0, epoch)
-            guard floor < Int64.max else { continue }
+            guard case .string(_)? = rows[index]["id"] else { continue }
             let restored = ChatSessionIndexFile.transcriptGeneration(in: rows[index]) ?? 0
-            let forward = max(restored, floor + 1)
+            let forward = max(restored, epoch + 1)
             guard forward != restored else { continue }
             rows[index][ChatSessionIndexFile.transcriptGenerationKey] = .int(forward)
             changed = true
         }
         guard changed else { return }
         do {
-            let data = try ChatSessionIndexFile.serializedData(for: rows)
-            try data.write(to: path, options: [.atomic])
+            try ChatSessionIndexFile.write(rows, to: path)
         } catch {
             throw Self.backupError(
                 code: 500,
@@ -1484,41 +1225,29 @@ public enum TrustBackupPersistence {
         }
     }
 
-    /// `<root>/chat/transcript_restore_epoch.json` — deliberately NOT one of
-    /// `backupRelativePaths`, so a restore cannot roll it backward with the
-    /// rest of `chat/`. Holds one integer: a floor every restored transcript
-    /// version must clear.
+    /// The transcript version floor stays outside backupRelativePaths so a
+    /// restore cannot lower it along with chat history.
     private static func transcriptRestoreEpochPath(in root: URL) -> URL {
         root
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("transcript_restore_epoch.json")
     }
 
-    /// Raise the epoch past `floor` and past its own last value, persist it,
-    /// and return it. Throws if it cannot be persisted — an epoch that is not
-    /// on disk would be handed out twice.
+    /// Persist a new epoch above the readable floor before publishing it.
     private static func bumpTranscriptRestoreEpoch(
         in root: URL,
         atLeast floor: Int64
     ) throws -> Int64 {
         let path = Self.transcriptRestoreEpochPath(in: root)
-        var stored: Int64 = 0
-        if let data = try? Data(contentsOf: path),
-           let parsed = try? JSONValue.parse(data),
-           case .object(let object) = parsed,
-           case .int(let value)? = object["epoch"] {
-            stored = value
-        }
-        let raised = max(stored, floor)
-        guard raised < Int64.max else { return raised }
-        let next = raised + 1
+        guard floor < Int64.max else { return floor }
+        let next = floor + 1
         do {
-            try FileManager.default.createDirectory(
-                at: path.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let data = try JSONValue.object(["epoch": .int(next)]).serialize(pretty: false)
-            try Data(data.utf8).write(to: path, options: [.atomic])
+            var info = stat()
+            if lstat(path.path, &info) == 0, (info.st_mode & S_IFMT) != S_IFREG {
+                try FileManager.default.removeItem(at: path)
+            }
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                JSONValue.object(["epoch": .int(next)]).serializedData(pretty: false), to: path)
         } catch {
             throw Self.backupError(
                 code: 500,
@@ -1540,7 +1269,10 @@ public enum TrustBackupPersistence {
     ) throws {
         for rel in snapshot.restorePaths where !snapshot.copied.contains(rel) {
             let destination = destinationRoot.appendingNativeRelativePath(rel)
-            guard !Self.pathEntryExists(destination) else {
+            guard Self.pathEntryExists(destination) else { continue }
+            // Only what no backup carries may remain.
+            let kept = Self.unbackedChildren(of: rel, at: destination)
+            guard !kept.isEmpty, try Set(FileManager.default.contentsOfDirectory(atPath: destination.path)) == kept else {
                 throw Self.backupError(code: 500, "Restored scope contains an item absent from the selected snapshot: \(rel)")
             }
         }
@@ -1736,7 +1468,24 @@ public enum TrustBackupPersistence {
         ])
     }
 
-    private static let backupRelativePaths = legacyBackupRelativePaths + ["abilities", "senses", "make"]
+    // Newly covered chat paths are restored only when carried by the snapshot;
+    // their absence in an older backup must not erase live attachment or queue state.
+    // Capture queue references before the attachment tree: the queue owner
+    // durably writes each attachment before publishing its lifecycle reference.
+    private static let backupRelativePaths = legacyBackupRelativePaths + [
+        "abilities", "senses", "make", "chat/mac_turn_lifecycle.json", "chat/attachments",
+    ]
+
+    /// No backup carries the live sense ledger or unread news.
+    private static let unbackedSenseNames: Set<String> = ["ledger", "news"]
+
+    /// The live children of a restore scope that no backup carries, kept in place.
+    private static func unbackedChildren(of rel: String, at destination: URL) -> Set<String> {
+        guard rel == "senses",
+              let values = try? destination.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              values.isDirectory == true, values.isSymbolicLink != true else { return [] }
+        return Self.unbackedSenseNames.filter { Self.pathEntryExists(destination.appendingPathComponent($0)) }
+    }
 
     private static let legacyBackupRelativePaths: [String] = [
         "trust",
@@ -1755,7 +1504,6 @@ public enum TrustBackupPersistence {
         "workflows",
         "catalog/registry.json",
         "catalog/installs.json",
-        "catalog/packs",
         "catalog/sources/sources.json",
         "catalog/trust/roots.json",
         "capabilities",
@@ -1775,27 +1523,49 @@ public enum TrustBackupPersistence {
     public static func copySelectedDataPaths(
         root: URL,
         destinationRoot: URL,
-        relativePaths: [String]
+        relativePaths: [String],
+        excluded: inout [String]
     ) throws -> [String] {
         var copied: [String] = []
         for rel in relativePaths {
             let source = root.appendingNativeRelativePath(rel)
             let destination = destinationRoot.appendingNativeRelativePath(rel)
-            if try copyExistingItem(from: source, to: destination) {
+            if try copyExistingItem(from: source, to: destination, relative: rel, excluded: &excluded) {
                 copied.append(rel)
             }
         }
         return copied
     }
 
-    public static func copyExistingItem(from source: URL, to destination: URL) throws -> Bool {
+    public static func copyExistingItem(
+        from source: URL, to destination: URL, relative: String, excluded: inout [String]
+    ) throws -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: source.path) else { return false }
+        if isOutgoingCredential(relative, source)
+            || (relative.hasPrefix("memory/") && [".lock", ".sqlite-wal", ".sqlite-shm", ".sqlite-journal"]
+                .contains(where: { source.lastPathComponent.hasSuffix($0) })) {
+            excluded.append(relative)
+            return false
+        }
         try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         if fm.fileExists(atPath: destination.path) {
             try fm.removeItem(at: destination)
         }
-        try fm.copyItem(at: source, to: destination)
+        let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        if values.isDirectory == true, values.isSymbolicLink != true {
+            try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+            for child in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil).sorted(by: { $0.path < $1.path }) {
+                _ = try copyExistingItem(from: child, to: destination.appendingPathComponent(child.lastPathComponent),
+                    relative: relative + "/" + child.lastPathComponent, excluded: &excluded)
+            }
+        } else {
+            if relative.hasPrefix("memory/"), source.pathExtension == "sqlite", values.isSymbolicLink != true {
+                try Self.copyLiveSQLite(from: source, to: destination)
+            } else {
+                try fm.copyItem(at: source, to: destination)
+            }
+        }
         return true
     }
 
@@ -1807,7 +1577,7 @@ public enum TrustBackupPersistence {
         let fm = FileManager.default
         let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard values.isDirectory == true, values.isSymbolicLink != true,
-              ["workshop", "workshop/github_command", "senses", "make"].contains(relative) else {
+              ["workshop", "senses", "make"].contains(relative) else {
             try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fm.copyItem(at: source, to: destination)
             return
@@ -1835,7 +1605,7 @@ public enum TrustBackupPersistence {
         try fm.createDirectory(at: destination, withIntermediateDirectories: true)
         for child in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
             let name = child.lastPathComponent
-            if name.hasSuffix(".lock") || (relative == "senses" && ["ledger", "news"].contains(name)) { continue }
+            if name.hasSuffix(".lock") || (relative == "senses" && Self.unbackedSenseNames.contains(name)) { continue }
             try await Self.copyLocalSnapshotItem(
                 from: child,
                 to: destination.appendingPathComponent(name),
@@ -1847,13 +1617,12 @@ public enum TrustBackupPersistence {
 
     /// Copy one mutable file tree while holding the same per-file lock its
     /// writers use. Lock sidecars are synchronization machinery, not state, and
-    /// are never restored. Memory's canonical SQLite database is created by its
-    /// online-backup owner instead of copying a live DB/WAL tuple. A link is
+    /// are never restored. Every SQLite database uses the read-only backup owner;
+    /// no live storage owner is opened. A link is
     /// kept as a link for the manifest (`takeBackupLinks`).
     private static func copyLockedSnapshotItem(
         from source: URL,
-        to destination: URL,
-        excludingSQLiteArtifacts: Bool
+        to destination: URL
     ) async throws {
         let values = try source.resourceValues(forKeys: [
             .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
@@ -1863,7 +1632,11 @@ public enum TrustBackupPersistence {
             return
         }
         if values.isRegularFile == true {
-            try await Self.copyLockedSnapshotFile(from: source, to: destination)
+            if source.pathExtension == "sqlite" {
+                try Self.copyLiveSQLite(from: source, to: destination)
+            } else {
+                try await Self.copyLockedSnapshotFile(from: source, to: destination)
+            }
             return
         }
         guard values.isDirectory == true else {
@@ -1882,14 +1655,13 @@ public enum TrustBackupPersistence {
         for child in children {
             let name = child.lastPathComponent
             if name.hasSuffix(".lock") { continue }
-            if excludingSQLiteArtifacts,
-               name.hasSuffix(".sqlite") || name.hasSuffix(".sqlite-wal") || name.hasSuffix(".sqlite-shm") {
+            if name.hasSuffix(".sqlite-wal")
+                || name.hasSuffix(".sqlite-shm") || name.hasSuffix(".sqlite-journal") {
                 continue
             }
             try await Self.copyLockedSnapshotItem(
                 from: child,
-                to: destination.appendingPathComponent(name),
-                excludingSQLiteArtifacts: excludingSQLiteArtifacts
+                to: destination.appendingPathComponent(name)
             )
         }
     }
@@ -1901,7 +1673,7 @@ public enum TrustBackupPersistence {
     /// and the config files that embed a token or key — app config (Telegram
     /// token, X app secrets), Telegram config, MCP server commands, and the
     /// Mac-control / browser IPC bridge files. Whole credential stores are in
-    /// `offDiskExcludedPaths`.
+    /// `outgoingCredentialStores`.
     private static func isCredentialFile(_ url: URL) -> Bool {
         let name = url.lastPathComponent.lowercased()
         return ["auth.json", "oauth_app.json", "macctl_bridge.json", "browser_ipc.json"].contains(name)
@@ -1984,8 +1756,12 @@ public enum TrustBackupPersistence {
             // 2026-09-06: only absence bootstraps a registry. Preserve unreadable
             // or malformed existing bytes instead of replacing discovery.
             let existing: [JSONValue]
+            // A backup catalog may wrap its rows ({backups, ...}): only its rows change.
+            var wrapper: [String: JSONValue]?
             if isBackupCatalog {
-                existing = try Self.readBackupCatalogChecked(path).rows
+                let catalog = try Self.readBackupCatalogChecked(path)
+                existing = catalog.rows
+                if case .object(let object) = catalog.raw { wrapper = object }
             } else {
                 do {
                     let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
@@ -2011,7 +1787,12 @@ public enum TrustBackupPersistence {
             if let maxRows, rows.count > maxRows {
                 rows = Array(rows.suffix(maxRows))
             }
-            try await persistence.writeJSON(.array(rows), to: path)
+            if var wrapper {
+                wrapper["backups"] = .array(rows)
+                try await persistence.writeJSON(.object(wrapper), to: path)
+            } else {
+                try await persistence.writeJSON(.array(rows), to: path)
+            }
         }
     }
 
@@ -2048,7 +1829,7 @@ public enum TrustBackupPersistence {
     }
 
     private static func readBackupCatalogChecked(_ path: URL) throws
-        -> (rows: [JSONValue], records: [BackupRecord])
+        -> (rows: [JSONValue], records: [BackupRecord], raw: JSONValue)
     {
         do {
             let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
@@ -2057,7 +1838,7 @@ public enum TrustBackupPersistence {
             }
         } catch let error as NSError where error.domain == NSCocoaErrorDomain
             && error.code == NSFileReadNoSuchFileError {
-            return ([], [])
+            return ([], [], .array([]))
         }
         let raw = try JSONValue.parse(Data(contentsOf: path))
         let rows: [JSONValue]
@@ -2075,7 +1856,7 @@ public enum TrustBackupPersistence {
             [BackupRecord].self,
             from: JSONValue.array(rows).serializedData(pretty: false)
         )
-        return (rows, records)
+        return (rows, records, raw)
     }
 
     private static func validateBackupChatSessionIndex(dataDir: URL) throws {

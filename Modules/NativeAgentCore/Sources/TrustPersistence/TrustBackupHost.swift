@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `TrustBackupHost.swift` | `TrustBackupHost`; running-bundle version factory |
 
 /// Platform metadata read at the point a backup manifest is written.
 /// Launch coordination and restore choices remain with the calling app.

@@ -1,5 +1,6 @@
 import BackgroundWork
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatToolRuntime
 import AppToolRuntime
 import NativeAgentCore
 import SwiftUI
@@ -10,10 +11,12 @@ import PersistenceCore
 import Transcripts
 import NativeAgentShared
 import AppKit
+// Blueprint: | `BotsShelfView.swift` | shared helper status and transcript messages/streaming tail; no private transcript rows or JSONL observation |
 
 struct BotsShelfView: View {
     @Environment(AppModel.self) private var appModel
     @State var records: [BotsShelfRecord] = []
+    @State private var shelfRead = LatestRead()
     @State var selectedID: UUID?
     var onContinue: (NativeAgentNavigationDestination) -> Void = { _ in }
     var isVisible = true
@@ -21,17 +24,13 @@ struct BotsShelfView: View {
         let visible: Bool
         let records: [UUID]
     }
-    private struct TranscriptWatchIdentity: Equatable {
-        let visible: Bool
-        let sessionID: String
-    }
-    @State var activeIDs: Set<UUID> = []
-    @State var queuedIDs: Set<UUID> = []
-    @State private var editing = false
-    @State private var editedBot: BotDefinition?
+    /// The sheet opens WITH the bot it edits, one value: a separate "editing"
+    /// flag opened before the chosen bot reached it, so Edit showed "New bot"
+    /// and Save updated a helper that did not exist (User, 10-24).
+    private struct EditTarget: Identifiable { let id = UUID(); let definition: BotDefinition? }
+    @State private var editTarget: EditTarget?
     @State private var notice: String?
     @State private var sessionOpen = false
-    @State private var messages: [ChatMessage] = []
     @State private var messagesLoading = true
     @State private var messagesError: String?
     @State private var shelfLoaded = false
@@ -55,7 +54,7 @@ struct BotsShelfView: View {
                 HStack(alignment: .top) {
                     AlivePageHeader(title: "Helpers", line: headerLine)
                     Spacer()
-                    Button("New helper", systemImage: "plus") { editedBot = nil; editing = true }
+                    Button("New helper", systemImage: "plus") { editTarget = EditTarget(definition: nil) }
                         .buttonStyle(.borderedProminent)
                         .hazeTinted(.button)
                         .padding(.top, 14)
@@ -69,7 +68,6 @@ struct BotsShelfView: View {
                     Button {
                         selectedID = nil
                         sessionOpen = false
-                        messages = []
                         messagesLoading = true
                         messagesError = nil
                     } label: {
@@ -79,17 +77,15 @@ struct BotsShelfView: View {
                 } else {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Helpers").font(ShellType.display)
-                        if let subtitle = SidebarItem.bots.shellPageSubtitle {
-                            Text(subtitle)
+                            ShellRailSubtitle(page: .bots)
                                 .font(ShellType.labelMedium)
                                 .foregroundStyle(NativeAgentShell.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
-                        }
                     }
                 }
                 Spacer()
                 if selected == nil {
-                    Button("New helper", systemImage: "plus") { editedBot = nil; editing = true }
+                    Button("New helper", systemImage: "plus") { editTarget = EditTarget(definition: nil) }
                 }
             }
             }
@@ -104,10 +100,10 @@ struct BotsShelfView: View {
         .frame(maxWidth: aliveList ? TodayMetrics.contentWidth : .infinity, alignment: .leading)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: aliveList ? .top : .topLeading)
         .background { ShellRoomBackdrop() }
-        .sheet(isPresented: $editing) {
-            BotsEditorSheet(definition: editedBot) { bot in
+        .sheet(item: $editTarget) { target in
+            BotsEditorSheet(definition: target.definition, nextRun: records.first { $0.id == target.definition?.id }?.nextRun) { bot in
                 let store = BotDefinitionStore(dataRoot: root)
-                let creating = editedBot == nil
+                let creating = target.definition == nil
                 _ = try await Task.detached(priority: .utility) {
                     try (creating ? store.create(bot) : store.update(bot))
                 }.value
@@ -139,7 +135,7 @@ struct BotsShelfView: View {
             if isVisible { reload() }
         }
         .onChange(of: isVisible) { _, visible in
-            if !visible { editing = false }
+            if !visible { editTarget = nil }
         }
         .transformPreference(MoodTintProseRectKey.self) { rect in
             if !isVisible { rect = nil }
@@ -150,17 +146,13 @@ struct BotsShelfView: View {
     /// sends it; the agent asks for the rest.
     static let makeABotDraft = "Help me keep up with something regularly."
 
-    private func state(_ record: BotsShelfRecord) -> BotState {
-        BotState(record: record, running: activeIDs.contains(record.id), queued: queuedIDs.contains(record.id))
-    }
-
     /// One glass card per bot: the mark, the name, the brief, one caption.
     private var list: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(records) { record in
                     Button { selectedID = record.id; notice = nil } label: {
-                        BotCard(record: record, state: state(record), allowsMotion: isVisible)
+                        BotCard(record: record, state: record, allowsMotion: isVisible)
                     }.buttonStyle(.plain)
                 }
                 listFooter
@@ -177,7 +169,7 @@ struct BotsShelfView: View {
                     AliveGroupCard {
                         ForEach(records) { record in
                             Button { selectedID = record.id; notice = nil } label: {
-                                BotRow(record: record, state: state(record))
+                                BotRow(record: record, state: record)
                                     .contentShape(Rectangle())
                             }.buttonStyle(.plain)
                         }
@@ -238,12 +230,13 @@ struct BotsShelfView: View {
     }
 
     private func detail(_ record: BotsShelfRecord) -> some View {
-        ScrollView {
+        let messages = appModel.engine.transcripts.messages(for: record.definition.sessionID)
+        return ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 10) {
-                        BotMark(state: state(record), allowsMotion: isVisible)
-                        Text(state(record).word).font(ShellType.labelMedium).foregroundStyle(NativeAgentShell.text)
+                        BotMark(state: record, allowsMotion: isVisible)
+                        Text(record.word).font(ShellType.labelMedium).foregroundStyle(NativeAgentShell.text)
                         Text("·").foregroundStyle(NativeAgentShell.tertiary)
                         Text(record.choiceLine).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).lineLimit(1)
                         Spacer()
@@ -275,7 +268,7 @@ struct BotsShelfView: View {
                                 Task { await perform { _ = try store.pause(record.id, paused: !record.definition.paused) } }
                             }.help("Pause scheduled turns. Run once remains available.")
                         }
-                        Button("Edit") { editedBot = record.definition; editing = true }
+                        Button("Edit") { editTarget = EditTarget(definition: record.definition) }
                         Button("Continue in Chat", systemImage: "arrow.up.right") { Task { await continueInChat(record) } }.disabled(busy)
                     }.buttonStyle(.bordered).controlSize(.small)
                 }
@@ -300,7 +293,10 @@ struct BotsShelfView: View {
                 }
                 DisclosureGroup("Session · messages and tool activity", isExpanded: $sessionOpen) {
                     VStack(alignment: .leading, spacing: 4) {
-                        ForEach(messages) { message in MessageBubble(message: message) }
+                        ForEach(messages) { message in
+                            StreamingTailBubble(message: message, isLastAssistant: false,
+                                isLive: appModel.engine.turns.streamingSessions.contains(record.definition.sessionID) && message.id == messages.last?.id)
+                        }
                         if messagesLoading {
                             ProgressView("Loading messages…")
                         } else if let messagesError {
@@ -318,27 +314,13 @@ struct BotsShelfView: View {
                 // is the one thing the tint never does. Publish the block as
                 // the punched-out band, exactly as the chat transcript does.
                 .moodTintProseGuard()
-                .task(id: TranscriptWatchIdentity(visible: isVisible && sessionOpen, sessionID: record.definition.sessionID)) {
+                .task(id: "\(isVisible && sessionOpen):\(record.definition.sessionID)") {
                     guard isVisible && sessionOpen else { return }
                     let sessionID = record.definition.sessionID
-                    let path = root.appendingPathComponent("chat/messages/\(sessionID).jsonl")
-                    let events = FileChangeEvents(paths: [path], emitInitial: true)
-                    await withTaskCancellationHandler {
-                        for await _ in events.stream {
-                            guard !Task.isCancelled else { break }
-                            messagesLoading = true
-                            messagesError = nil
-                            do {
-                                let loaded = try await appModel.engine.transcripts.loadMessages(sessionId: sessionID, cached: true)
-                                guard !Task.isCancelled else { break }
-                                messages = loaded
-                            } catch {
-                                guard !Task.isCancelled else { break }
-                                messagesError = UserFacingError.message(error, action: "load these messages")
-                            }
-                            messagesLoading = false
-                        }
-                    } onCancel: { events.cancel() }
+                    await appModel.engine.observeSessionMessages(sessionID) { error in
+                        messagesError = error.map { UserFacingError.message($0, action: "load these messages") }
+                        messagesLoading = false
+                    }
                 }
             }
             .frame(maxWidth: 760, alignment: .leading).padding(.bottom, 20)
@@ -346,7 +328,7 @@ struct BotsShelfView: View {
     }
 
     static func limits(_ bot: BotDefinition) -> String {
-        "Limits: \(bot.budget.tokens.formatted()) output tokens and \(Int(bot.budget.seconds)) seconds per run · \((bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens).formatted()) reserved output tokens daily"
+        "Limits: \(bot.budget.tokens.formatted()) output tokens and \(Int(bot.budget.seconds)) seconds per run · \(bot.dailyTokenCeiling.map { $0.formatted() + " reserved output tokens daily" } ?? "no daily ceiling")"
     }
     private func perform(_ action: @escaping @Sendable () throws -> Void) async {
         do {
@@ -380,20 +362,27 @@ struct BotsShelfView: View {
     private func readShelfOnce() async {
         // Definitions, the shelf and the scheduler's jobs are all read under the
         // cross-process store lock. That never belongs on the main actor.
+        _ = await shelfRead.read({ () async -> Result<([BotsShelfRecord], Bool?), Error> in
         do {
+            var unattended: Bool?
             let loaded = try await appModel.engine.botsShelfRead { allowed in
-                if unattended != allowed { unattended = allowed }
+                unattended = allowed
             }
+            return .success((loaded, unattended))
+        } catch { return .failure(error) }
+        }, publish: { result in
+        do {
+            let (loaded, allowed) = try result.get()
+            if let allowed, unattended != allowed { unattended = allowed }
             // Most reloads in a burst find the same shelf. Publishing only what
             // actually changed keeps SwiftUI from re-laying out every card —
             // and keeps the file watcher above (keyed on the record ids) from
             // restarting for nothing.
-            if records != loaded.records { records = loaded.records }
-            if activeIDs != loaded.runs.active { activeIDs = loaded.runs.active }
-            if queuedIDs != loaded.runs.queued { queuedIDs = loaded.runs.queued }
+            if records != loaded { records = loaded }
             shelfLoaded = true
             shelfError = nil
         } catch { shelfError = UserFacingError.message(error, action: "load helpers") }
+        })
     }
 
     private func continueInChat(_ record: BotsShelfRecord) async {
@@ -413,8 +402,7 @@ struct BotsShelfView: View {
         if let contract = await BotChatContract.checked(record.definition.sessionID, dataRoot: root),
            let problem = contract.modelChoiceProblem {
             notice = "\(record.definition.name) can't run yet. \(problem) Its unfinished work is kept - choose here and it picks up from there."
-            editedBot = record.definition
-            editing = true
+            editTarget = EditTarget(definition: record.definition)
             return
         }
         do {
@@ -481,7 +469,7 @@ struct BotRunCard: View {
                 return "Waiting for approval — no reply yet"
             case .waitingOnPerson:
                 return "Waiting on you — no reply yet"
-            case .failed, .interrupted:
+            case .failed, .stopped, .interrupted:
                 // The recorded cause, said once, with the absence stated.
                 return (causeStem.isEmpty ? outcome : causeStem) + " — no reply"
             }
@@ -502,7 +490,8 @@ struct BotRunCard: View {
         switch entry.runtimeStatus {
         case .completed: return "Completed"
         case .failed: return "Failed"
-        case .interrupted: return "Stopped"
+        case .stopped: return "Stopped"
+        case .interrupted: return "Interrupted"
         case .waitingForApproval: return "Blocked"
         case .waitingOnPerson: return "Waiting"
         }
@@ -634,33 +623,23 @@ struct BotQuietRunsRow: View {
     }
 }
 
-/// What a bot is doing right now, said in one word and one colour.
-struct BotState {
-    let word: String
-    let color: Color
-    let running: Bool
-    let queued: Bool
-
-    init(record: BotsShelfRecord, running: Bool, queued: Bool) {
-        self.running = running
-        self.queued = queued
-        if running { word = "Running"; color = NativeAgentShell.calm; return }
-        if queued { word = "Queued"; color = NativeAgentShell.secondary; return }
-        if record.definition.paused { word = "Paused"; color = NativeAgentShell.tertiary; return }
-        guard let latest = record.sortedEntries.first else { word = "New"; color = NativeAgentShell.secondary; return }
-        switch latest.runtimeStatus {
-        case .waitingForApproval: word = "Waiting for approval"
-        case .waitingOnPerson: word = "Waiting on you"
-        case .failed: word = "Failed"
-        case .interrupted: word = "Interrupted"
-        default: word = "Ready"
+/// The Mac draws the shared helper status in the shell's colors.
+extension BotsShelfRecord {
+    var word: String { statusWord }
+    var color: Color {
+        switch status {
+        case .running, .ready: NativeAgentShell.calm
+        case .queued, .new, .stopped: NativeAgentShell.secondary
+        case .paused: NativeAgentShell.tertiary
+        case .waitingForApproval, .waitingOnPerson: NativeAgentShell.needsYou
+        case .failed, .interrupted, .needsModelChoice: NativeAgentShell.trouble
         }
-        color = Self.color(forStatus: latest.runtimeStatus)
     }
 
     static func color(forStatus status: BotRunStatus) -> Color {
         switch status {
         case .waitingForApproval, .waitingOnPerson: NativeAgentShell.needsYou
+        case .stopped: NativeAgentShell.secondary
         case .failed, .interrupted: NativeAgentShell.trouble
         default: NativeAgentShell.calm
         }
@@ -669,7 +648,7 @@ struct BotState {
 
 /// The little bot itself: a rounded tile with one light that breathes while it works.
 struct BotMark: View {
-    let state: BotState
+    let state: BotsShelfRecord
     var allowsMotion = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
@@ -680,7 +659,7 @@ struct BotMark: View {
 /// The same mounted content, with the system motion preference passed in so
 /// lifecycle checks need not change the owner's global accessibility setting.
 struct BotMarkContent: View {
-    let state: BotState
+    let state: BotsShelfRecord
     let reduceMotion: Bool
     var allowsMotion = true
     var body: some View {
@@ -711,7 +690,7 @@ struct BotMarkContent: View {
 
 struct BotCard: View {
     let record: BotsShelfRecord
-    let state: BotState
+    let state: BotsShelfRecord
     var allowsMotion = true
     /// The card is one thing to a reader: this bot. SwiftUI publishes nothing
     /// for a stack of styled Texts asked offscreen, so the words are stated
@@ -724,7 +703,7 @@ struct BotCard: View {
             : "\(record.definition.name). \(record.definition.brief)"
     }
     /// State word, what it last said, when it runs next, and a run it missed.
-    static func spokenState(_ record: BotsShelfRecord, state: BotState) -> String {
+    static func spokenState(_ record: BotsShelfRecord, state: BotsShelfRecord) -> String {
         [state.word, record.lastOutcomeLine, record.scheduleLine, record.missedLine]
             .compactMap { $0 }
             .filter { !$0.isEmpty }
@@ -763,7 +742,7 @@ struct BotCard: View {
 /// animates; a helper waiting on him wears the waiting dot, the one teal.
 struct BotRow: View {
     let record: BotsShelfRecord
-    let state: BotState
+    let state: BotsShelfRecord
 
     private var isManual: Bool {
         if case .manual = record.definition.cadence, record.definition.eventTrigger == nil { return true }
@@ -811,7 +790,8 @@ struct BotRow: View {
             case .waitingForApproval: parts.append("waiting for approval")
             case .waitingOnPerson: parts.append("waiting on you")
             case .failed: parts.append("last run failed \(when)")
-            case .interrupted: parts.append("last run stopped \(when)")
+            case .stopped: parts.append("last run stopped \(when)")
+            case .interrupted: parts.append("last run interrupted \(when)")
             }
         } else {
             parts.append("no runs yet")
@@ -828,10 +808,10 @@ struct BotRow: View {
     /// "at 8:30 AM" today, "tomorrow at 8:30 AM", else "on Sep 25 at 8:30 AM".
     static func when(_ date: Date, now: Date = Date()) -> String {
         var calendar = Calendar.current
-        calendar.timeZone = DisplayTimeZone.current
+        calendar.timeZone = TimeZone.autoupdatingCurrent
         let time = DateFormatter()
         time.setLocalizedDateFormatFromTemplate("jm")
-        time.timeZone = DisplayTimeZone.current
+        time.timeZone = TimeZone.autoupdatingCurrent
         if calendar.isDate(date, inSameDayAs: now) { return "at \(time.string(from: date))" }
         if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
            calendar.isDate(date, inSameDayAs: tomorrow) {

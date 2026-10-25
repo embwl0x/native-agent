@@ -8,12 +8,9 @@ import PersistenceCore
 import TurnTrace
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import ToolRegistry
 import TrustCenter
-import KnowledgeGraph
-import XConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
@@ -23,6 +20,7 @@ import StandingBots
 import ChatTurnContracts
 import ChatSessionWork
 import AgentConversations
+// Blueprint: | `CanonicalToolNameDispatcher.swift` | `CanonicalToolNameDispatcher` class; `canonical`, `dispatch` |
 
 /// The `app` door's way back in: the canonical dispatcher binds it around an
 /// `app` call, and each call of a script re-enters the whole chain through it
@@ -33,10 +31,6 @@ public enum AppDoorReentry {
     public typealias Validate = @Sendable (String, [String: JSONValue]) async -> JSONValue?
     @TaskLocal public static var validate: Validate?
     @TaskLocal public static var waitForInteraction: (@Sendable (InlineInteraction, String, [String: JSONValue]) async -> JSONValue)?
-    /// What a send listed in an `app {actions}` call returns instead of
-    /// running when the step also called something else: the step's held
-    /// receipt (`heldOutboundResult`), nil when the step holds no send.
-    @TaskLocal public static var heldSend: JSONValue?
 }
 
 // MARK: - Dotted-alias canonicalization (outermost)
@@ -56,14 +50,12 @@ public enum AppDoorReentry {
 public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked Sendable {
     private let inner: any ToolDispatchClient
     private let peerDataRoot: URL?
-    private let builtInLanes: (any BuiltInAgentLaneProviding)?
     private let conversationScope: String?
 
     public init(inner: any ToolDispatchClient, peerDataRoot: URL? = nil,
                 builtInLanes: (any BuiltInAgentLaneProviding)? = nil, conversationScope: String? = nil) {
         self.inner = inner
         self.peerDataRoot = peerDataRoot
-        self.builtInLanes = builtInLanes ?? (inner as? any BuiltInAgentLaneProviding)
         self.conversationScope = conversationScope
     }
 
@@ -112,6 +104,9 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
     }
 
     private func dispatchWithWorkspacePorts(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        if Self.canonical(tool) != tool {
+            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T04"), "site": .string("CanonicalToolNameDispatcher.swift:dispatch")]))
+        }
         let result = try await inner.withToolArguments(tool: Self.canonical(tool), input: input) { input in
             let result = try await AgentRecipeStore.$dryRun.withValue(Self.canonical(tool) == "agent_message" && input["dry_run"] == .bool(true)) {
                 try await dispatchNormalized(tool: tool, input: input, surface: surface)
@@ -148,11 +143,9 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
     }
 
     private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        // The app door: `app` is admitted first under its
-        // own profile, classified by action, and an action runs in process, so
-        // this was its one pass. Each call of a script re-enters the SAME
-        // complete chain as its own `app` call; a script cannot confer its
-        // authority. The name it reaches is active for that call only.
+        // Admit `app` by its action profile, then re-enter the complete chain
+        // for each folded tool or script call. The reached name is active
+        // for that call only; the app door confers no authority on it.
         if Self.canonical(tool) == "app" {
             return try await AppDoorReentry.$validate.withValue({ name, arguments in
                 if let validating = self.inner as? any PreApprovalToolValidating {
@@ -209,7 +202,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         // Agent 09-24: "agent_message connects if needed and hands back the
         // thread, so it's one call." A known agent that is not a contact yet
         // is connected first, through agent_connect's own gates and card.
-        if tool == "agent_message", PersonInitiatedSend.current == nil, !AgentRecipeStore.dryRun,
+        if tool == "agent_message", !HelperContact.matches(input), PersonInitiatedSend.current == nil, !AgentRecipeStore.dryRun,
            case .string(let name)? = input["agent"], !name.contains(":"),
            let row = AgentHostDirectory.row(named: name), let root = peerDataRoot,
            AgentConversationDelivery.door(for: name, dataRoot: root) == nil,

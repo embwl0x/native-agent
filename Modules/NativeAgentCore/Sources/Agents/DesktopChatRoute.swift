@@ -1,9 +1,10 @@
 import AppKit
 import ApplicationServices
-import ChatOrchestration
+import AgentConversations
 import MacControl
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `DesktopChatRoute.swift` | Recipe-bound conversation selection, send confirmation and learned reads; MacControl owns bounded window/subtree reads, attributes, activation, AX mutations and input construction/emission; control searches exclude the message log, and incomplete reads remain read failures through waits and delivery receipts; shared desktop observation preserves reply quiet, title and setup deadlines, including a final condition read; answered receipts name the read method and wake; uncertain delivery without automatic resend; sends and late readers preserve produced text and release their resources through `settle` |
 
 /// A chat app driven through its own window, by the labels its recipe names
 /// (agents/recipes/<host>.json, `desktopChat`). The agent gets a side chat of
@@ -51,13 +52,27 @@ import PersistenceCore
     var appName: String { recipe.host.displayName }
     var untitled: String { ui.newChat }
     private static var busy = false {
-        didSet { if !busy { let waiting = idleWaiters; idleWaiters = []; waiting.forEach { $0.resume() } } }
+        didSet { if !busy { let waiting = idleWaiters.values; idleWaiters = [:]; waiting.forEach { $0.resume() } } }
     }
-    private static var idleWaiters: [CheckedContinuation<Void, Never>] = []
+    private static var idleWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    private static func waitForIdle() async throws {
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if !busy || Task.isCancelled { continuation.resume() }
+                else { idleWaiters[id] = continuation }
+            }
+        } onCancel: {
+            Task { @MainActor in idleWaiters.removeValue(forKey: id)?.resume() }
+        }
+        try Task.checkCancellation()
+    }
     /// The chat her message went into, for an uncertain result to carry.
     private static var lastChat: String?
     /// Which of the chat's same-text messages of hers this send was (0 = first).
     private static var lastOccurrence: Int?
+    private static var lastReply = ""
     /// Return was pressed for this send: from here an error leaves its outcome unknown.
     private static var pressedReturn = false
     private typealias AX = GrokRoutineAccessibility
@@ -73,8 +88,15 @@ import PersistenceCore
                             "detail": .string("No recipe says how to drive this app's chat window (route desktop-chat with desktopChat labels). Read it with agent.recipe and fix it with agent.recipe_write. Nothing was sent.")])
         }
         let route = Self(recipe: recipe, bundleID: bundle, ui: ui)
-        if plan["dry_run"] == .bool(true) { return await route.dryRun(peerID: peerID, dataRoot: dataRoot) }
-        return await route.perform(text, peerID: peerID, plan: plan, dataRoot: dataRoot)
+        func execute() async -> JSONValue {
+            if plan["dry_run"] == .bool(true) { return await route.dryRun(peerID: peerID, dataRoot: dataRoot) }
+            return await route.perform(text, peerID: peerID, plan: plan, dataRoot: dataRoot)
+        }
+        if MacDriverContext.binding != nil { return await execute() }
+        let binding = await MacAttentionSessionStore.shared.bindDriver()
+        return await withTaskCancellationHandler {
+            await MacDriverContext.$binding.withValue(binding) { await execute() }
+        } onCancel: { binding.cancel() }
     }
 
     /// A repair's dry run (`AgentContactHealth.repair`): the controls a send
@@ -89,7 +111,7 @@ import PersistenceCore
         }
         guard !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty else { return failed(Blocker.offline.detail(name, app: appName)) }
         guard !Self.busy else { return failed("\(appName) is still answering the previous message. Nothing was checked.") }
-        guard AXIsProcessTrusted() else { return failed(Blocker.permission.detail(name, app: appName)) }
+        guard SystemMacAXElementSource().isTrusted() else { return failed(Blocker.permission.detail(name, app: appName)) }
         Self.busy = true
         defer { Self.busy = false }
         var ui = self.ui, tried: Set<String> = []
@@ -141,7 +163,7 @@ import PersistenceCore
         try await showWindow()
         try await showSideChats()
         _ = try composer()
-        guard try !buttons({ AX.string($0, kAXTitleAttribute) == ui.newChat }).isEmpty else { throw Mismatch(key: "newChat", wanted: ui.newChat) }
+        guard try !buttons({ MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.newChat }).isEmpty else { throw Mismatch(key: "newChat", wanted: ui.newChat) }
     }
 
     /// Up to five labels sharing the most words with `wanted`: the window's
@@ -149,8 +171,8 @@ import PersistenceCore
     func nearest(_ wanted: String, among: [String]? = nil) -> [String] {
         func words(_ text: String) -> Set<Substring> { Set(text.lowercased().split { !$0.isLetter && !$0.isNumber }) }
         let goal = words(wanted)
-        let seen = Set((among ?? ((try? windows()) ?? []).flatMap { walk($0) }.flatMap { node in
-            [kAXTitleAttribute, kAXDescriptionAttribute].map { AX.string(node, $0) } })
+        let seen = Set((among ?? ((try? windows()) ?? []).flatMap { (try? walk($0)) ?? [] }.flatMap { node in
+            [kAXTitleAttribute, kAXDescriptionAttribute].map { MacAXAttributeRead.text(node, $0) } })
             .map { String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80)) }.filter { !$0.isEmpty })
         func shared(_ label: String) -> Int { goal.intersection(words(label)).count }
         return Array(seen.sorted { (shared($0), $1) > (shared($1), $0) }.prefix(5))
@@ -173,7 +195,9 @@ import PersistenceCore
     /// what the log holds.
     func unconfirmed(_ before: Int?, name: String) -> (detail: String, fields: [String: JSONValue]) {
         let unsure = "The message may have gone out; check \(name)'s chat in \(appName) and don't resend it."
-        guard let rows = try? logRows() else { return said(Mismatch(key: "log", wanted: ui.log), then: unsure) }
+        let rows: [AXUIElement]
+        do { rows = try logRows() }
+        catch { return (error.localizedDescription + " " + unsure, ["reason": .string("accessibility_read_incomplete")]) }
         guard let before, rows.count > before else {
             // Nothing came: today's words, and the window's labels for the fix.
             var fields = said(Mismatch(key: "userPrefix", wanted: ui.userPrefix)).fields
@@ -182,11 +206,14 @@ import PersistenceCore
         }
         let added = Array(rows[before...])
         let row = added.first.map { node in
-            let own = AX.string(node, kAXTitleAttribute) + AX.string(node, kAXDescriptionAttribute)
-            return String((own.isEmpty ? texts(node).prefix(2).joined(separator: " ") : own).prefix(80))
+            let own = MacAXAttributeRead.text(node, kAXTitleAttribute) + MacAXAttributeRead.text(node, kAXDescriptionAttribute)
+            return String((own.isEmpty ? ((try? texts(node)) ?? []).prefix(2).joined(separator: " ") : own).prefix(80))
         } ?? ""
-        let labels = nearest(ui.userPrefix, among: added.flatMap { AX.nodes($0) }.flatMap { node in
-            [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].map { AX.string(node, $0) } })
+        let addedTree: [AXUIElement]
+        do { addedTree = try added.flatMap { try MacAccessibilityReader.elements(in: $0, searching: "the outgoing desktop message") } }
+        catch { return (error.localizedDescription + " " + unsure, ["reason": .string("accessibility_read_incomplete")]) }
+        let labels = nearest(ui.userPrefix, among: addedTree.flatMap { node in
+            [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].map { MacAXAttributeRead.text(node, $0) } })
         return ("\(appName)'s chat gained \(added.count) row\(added.count == 1 ? "" : "s") after the message that \(added.count == 1 ? "doesn't" : "don't") read as hers "
                     + "(its recipe's userPrefix \u{201C}\(ui.userPrefix)\u{201D}): \u{201C}\(row)\u{201D}"
                     + (labels.isEmpty ? "" : "; nearest: " + Self.quoted(labels)) + ". " + unsure,
@@ -200,11 +227,10 @@ import PersistenceCore
                             "detail": .string("\(appName) is still answering the previous message. Nothing was sent.")])
         }
         Self.busy = true
-        defer { Self.busy = false }
         var thread: String?
         if case .string(let saved)? = plan["conversation_id"] { thread = saved }
         let store = AgentPeerStore(dataRoot: dataRoot)
-        Self.lastChat = nil; Self.lastOccurrence = nil; Self.pressedReturn = false
+        Self.lastChat = nil; Self.lastOccurrence = nil; Self.lastReply = ""; Self.pressedReturn = false
         // Her first message names her, so the chat is recognisably hers in the app.
         let message = thread == nil && !text.hasPrefix(name) ? name + " here — " + text : text
         // The exact first message of each of her chats, by title: a renamed chat
@@ -217,6 +243,7 @@ import PersistenceCore
         // An uncertain send keeps its chat, so the thread resumes instead of being orphaned.
         func uncertain(_ detail: String, _ fields: [String: JSONValue] = [:]) async -> JSONValue {
             var result = fields.merging(["status": .string("outcome_unknown"), "completed": .bool(false), "detail": .string(detail)]) { $1 }
+            if !Self.lastReply.isEmpty { result["partial_reply"] = .string(Self.lastReply); result["untrusted_remote_data"] = .bool(true) }
             if submissionConfirmed { result["sent"] = .bool(true) }
             let snapshot = try? await passiveRead()
             let matchingNewChat = thread == nil && snapshot.map({ opensWith($0.turns, first) }) == true ? snapshot?.title : nil
@@ -224,67 +251,91 @@ import PersistenceCore
             if let chat, chat != untitled { result["conversation_id"] = .string(chat); remember(chat) }
             return .object(result)
         }
-        do {
-            let (reply, title) = try await send(message, thread: thread, first: first) { submissionConfirmed = true }
-            remember(title)
-            store.recordProof(peerID: peerID, inbound: true, outbound: true)
-            store.recordRoundTrip(peerID: peerID, workspace: title, recipe: recipe)
-            var answered: [String: JSONValue] = ["status": .string("answered"), "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
-                            "sent": .bool(true), "completed": .bool(true), "reply": .string(reply),
-                            "conversation_id": .string(title), "continued": .bool(thread != nil), "untrusted_remote_data": .bool(true)]
-            if thread == nil { answered["detail"] = .string("Opened a new side chat in \(appName) for this conversation.") }
-            return .object(answered)
-        } catch {
-            if submissionConfirmed {
-                if let blocker = error as? Blocker, [.moved, .timeout].contains(blocker) {
-                    // User 10-07: an answer is delivered whenever it comes.
-                    if let live = AgentConversationLiveContext.target, let row = live.recordID, let operation = live.operationID,
-                       let occurrence = Self.lastOccurrence, let events = try? MacAppSourceEvents(bundleID: bundleID) {
-                        Task { await lateAnswer(message, occurrence: occurrence, first: first, peerID: peerID,
-                                                row: row, operation: operation, events: events, dataRoot: dataRoot) }
-                        return await uncertain(Blocker.named(Blocker.late, name, app: appName))
+        let result: Result<(String, String, JSONValue), Error>
+        do { result = .success(try await send(message, thread: thread, first: first) { submissionConfirmed = true }) }
+        catch { result = .failure(error) }
+        let stopped = Task.isCancelled
+        let live = AgentConversationLiveContext.target
+        return await settle { @MainActor in
+            defer { Self.busy = false }
+            do {
+                let (reply, title, observation) = try result.get()
+                remember(title)
+                store.recordProof(peerID: peerID, inbound: true, outbound: true)
+                store.recordRoundTrip(peerID: peerID, workspace: title, recipe: recipe)
+                var answered: [String: JSONValue] = ["status": .string("answered"), "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
+                                "sent": .bool(true), "completed": .bool(true), "reply": .string(reply),
+                                "conversation_id": .string(title), "continued": .bool(thread != nil), "untrusted_remote_data": .bool(true)]
+                answered["reply_observation_receipt"] = observation
+                if thread == nil { answered["detail"] = .string("Opened a new side chat in \(appName) for this conversation.") }
+                return .object(answered)
+            } catch {
+                if let failure = error as? MacAccessibilityReader.NativeReadFailure {
+                    if Self.pressedReturn || submissionConfirmed {
+                        return await uncertain(failure.detail + " " + (submissionConfirmed
+                            ? "The message was sent; its answer remains unconfirmed. Nothing was resent."
+                            : "Return was posted; message submission is unconfirmed. Nothing was resent."))
                     }
-                    return await uncertain(blocker.detail(name, app: appName))
+                    return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                        "detail": .string(failure.detail + " Nothing was sent.")])
                 }
-                return await uncertain("\(appName)'s answer couldn't be read. The message was sent; check \(name)'s chat in \(appName). It won't be resent automatically.")
+                if submissionConfirmed {
+                    if !stopped, let blocker = error as? Blocker, [.moved, .timeout].contains(blocker) {
+                        // User 10-07: an answer is delivered whenever it comes.
+                        if let live, let row = live.recordID, let operation = live.operationID,
+                           let occurrence = Self.lastOccurrence, let events = try? MacAppSourceEvents(bundleID: bundleID) {
+                            let receipt = await uncertain(Blocker.named(Blocker.late, name, app: appName), ["reply_observation": .string("running")])
+                            let id = UUID()
+                            let task = Task {
+                                await lateAnswer(message, occurrence: occurrence, first: first, peerID: peerID,
+                                                 row: row, operation: operation, events: events, receipt: receipt, dataRoot: dataRoot)
+                                await settle { AgentConversationWatches.finish(id) }
+                            }
+                            AgentConversationWatches.retain(id, row: row, operation: operation, task: task)
+                            return receipt
+                        }
+                        return await uncertain(blocker.detail(name, app: appName))
+                    }
+                    return await uncertain("\(appName)'s answer couldn't be read. The message was sent; check \(name)'s chat in \(appName). It won't be resent automatically.")
+                }
+                if let covered = error as? MacScreenLock.Covered {
+                    return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(covered.detail + " Nothing was sent.")])
+                }
+                // Its recipe and its window disagree: a repair acts on it (`AgentContactHealth.heal`).
+                if let miss = error as? Mismatch {
+                    let report = said(miss)
+                    return .object(report.fields.merging(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                        "agent": .string("peer:" + peerID), "transport": .string("desktopChat"), "detail": .string(report.detail)]) { $1 })
+                }
+                if let unconfirmed = error as? Unconfirmed {
+                    let report = self.unconfirmed(unconfirmed.rows, name: name)
+                    return await uncertain(report.detail, report.fields)
+                }
+                if let blocker = error as? Blocker {
+                    if [.moved, .timeout, .submission].contains(blocker) || Self.pressedReturn { return await uncertain(blocker.detail(name, app: appName)) }
+                    // Say what the app shows instead of its chat (09-25: a forced-update alert over its login window).
+                    let shown = blocker == .window ? try? await MacAccessibilityReader.read { showing() } : nil
+                    let detail = shown.map { "\(appName) isn't showing its chat; it shows \($0). Nothing was sent." }
+                    var result: [String: JSONValue] = ["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail ?? blocker.detail(name, app: appName))]
+                    // Her saved chat is gone: the conversation drops it, so the next send opens a new one.
+                    if blocker == .missing { result["conversation_id"] = .null }
+                    return .object(result)
+                }
+                // Before Return nothing reached it: not sent, in the error's own words.
+                guard Self.pressedReturn else {
+                    return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                                    "detail": .string("\(appName) couldn't be driven: \(error.localizedDescription). Nothing was sent.")])
+                }
+                return await uncertain(Blocker.submission.detail(name, app: appName))
             }
-            if let covered = error as? MacScreenLock.Covered {
-                return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(covered.detail + " Nothing was sent.")])
-            }
-            // Its recipe and its window disagree: a repair acts on it (`AgentContactHealth.heal`).
-            if let miss = error as? Mismatch {
-                let report = said(miss)
-                return .object(report.fields.merging(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
-                    "agent": .string("peer:" + peerID), "transport": .string("desktopChat"), "detail": .string(report.detail)]) { $1 })
-            }
-            if let unconfirmed = error as? Unconfirmed {
-                let report = self.unconfirmed(unconfirmed.rows, name: name)
-                return await uncertain(report.detail, report.fields)
-            }
-            if let blocker = error as? Blocker {
-                if [.moved, .timeout, .submission].contains(blocker) || Self.pressedReturn { return await uncertain(blocker.detail(name, app: appName)) }
-                // Say what the app shows instead of its chat (09-25: a forced-update alert over its login window).
-                let shown = blocker == .window ? try? await DesktopPeerReadLane.read { showing() } : nil
-                let detail = shown.map { "\(appName) isn't showing its chat; it shows \($0). Nothing was sent." }
-                var result: [String: JSONValue] = ["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail ?? blocker.detail(name, app: appName))]
-                // Her saved chat is gone: the conversation drops it, so the next send opens a new one.
-                if blocker == .missing { result["conversation_id"] = .null }
-                return .object(result)
-            }
-            // Before Return nothing reached it: not sent, in the error's own words.
-            guard Self.pressedReturn else {
-                return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
-                                "detail": .string("\(appName) couldn't be driven: \(error.localizedDescription). Nothing was sent.")])
-            }
-            return await uncertain(Blocker.submission.detail(name, app: appName))
         }
     }
 
     // MARK: - One exchange
 
-    func send(_ message: String, thread: String?, first: String?, didSubmit: () -> Void) async throws -> (String, String) {
+    func send(_ message: String, thread: String?, first: String?, didSubmit: () -> Void) async throws -> (String, String, JSONValue) {
         try await unlocked()
-        guard AXIsProcessTrusted() else { throw Blocker.permission }
+        guard SystemMacAXElementSource().isTrusted() else { throw Blocker.permission }
         try await showWindow()
         var (reopen, chat) = try await openThread(thread, first: first)
         Self.lastChat = chat
@@ -300,13 +351,16 @@ import PersistenceCore
                                              count: { rows = try? logRows().count; return try sent() })
         do {
             try await until(seconds: 15) { try sent() > before }
-        } catch { throw Unconfirmed(rows: rows) }
+        } catch let failure as MacAccessibilityReader.NativeReadFailure { throw failure }
+        catch { throw Unconfirmed(rows: rows) }
         Self.lastOccurrence = before
         didSubmit()
+        let events = try DesktopRouteObservation(bundleID: bundleID)
+        defer { events.stop() }
         var last = "", stableSince = Date()
         let deadline = Date().addingTimeInterval(120)
-        while Date() < deadline {
-            try await Task.sleep(for: .milliseconds(500))
+        repeat {
+            try Task.checkCancellation()
             let snapshot = try await passiveRead()
             let all = snapshot.turns
             let title = snapshot.title
@@ -315,14 +369,21 @@ import PersistenceCore
                 guard let title, opensWith(all, first) else { throw Blocker.moved }
                 chat = title
             }
-            guard let index = mine(all) else { continue }
-            Self.lastChat = title ?? Self.lastChat
-            let reply = all[(index + 1)...].filter { !$0.user }.map(\.text).joined(separator: "\n\n")
-            if reply != last { last = reply; stableSince = Date(); continue }
-            if !reply.isEmpty, Date().timeIntervalSince(stableSince) >= 3, !snapshot.generating {
-                return (reply, try await settledTitle(chat, first: first))
+            var wake = deadline
+            if let index = mine(all) {
+                Self.lastChat = title ?? Self.lastChat
+                let reply = all[(index + 1)...].filter { !$0.user }.map(\.text).joined(separator: "\n\n")
+                Self.lastReply = reply
+                if reply != last { last = reply; stableSince = Date() }
+                if !reply.isEmpty, !snapshot.generating {
+                    let quiet = stableSince.addingTimeInterval(3)
+                    if Date() >= quiet { return (reply, try await settledTitle(chat, first: first), events.receipt(readBy: "accessibility")) }
+                    wake = min(deadline, quiet)
+                }
             }
-        }
+            if Date() >= deadline { break }
+            try await events.next(until: wake)
+        } while true
         throw Blocker.timeout
     }
 
@@ -330,41 +391,64 @@ import PersistenceCore
     /// (values and children changing in its window) each trigger one read of
     /// her chat, never a clock. When the answer after her message is there and
     /// the app has stopped generating, it lands on its exchange. It ends when
-    /// the app quits, or when a later message of hers follows unanswered.
+    /// the app quits, the exchange is explicitly retired, NativeAgent shuts
+    /// down, or a later message of hers follows unanswered.
     /// `occurrence`: which of her same-text messages in that chat this send was.
     func lateAnswer(_ message: String, occurrence: Int, first: String?, peerID: String, row: String, operation: String,
-                    events: MacAppSourceEvents, dataRoot: URL) async {
-        defer { events.cancel() }
+                    events: MacAppSourceEvents, receipt: JSONValue, dataRoot: URL) async {
         let key = String(flat(message).prefix(40))
+        var fields: [String: JSONValue] = if case .object(let fields) = receipt { fields } else { [:] }
+        var answer: String?
         do {
             for try await _ in events.stream {
                 // Another send drives the app now: read once it is done, not never.
-                while Self.busy { await withCheckedContinuation { Self.idleWaiters.append($0) } }
+                while Self.busy { try await Self.waitForIdle() }
+                try Task.checkCancellation()
                 // Hold the same admission as sends across the worker suspension.
                 Self.busy = true
-                let snapshot = try? await passiveRead()
+                let snapshot: Read
+                do { snapshot = try await passiveRead() }
+                catch { Self.busy = false; throw error }
                 Self.busy = false
-                guard let snapshot, opensWith(snapshot.turns, first) else { continue }
+                guard opensWith(snapshot.turns, first) else { continue }
                 let all = snapshot.turns
                 let mine = all.indices.filter { all[$0].user && flat(all[$0].text).hasPrefix(key) }
                 guard mine.count > occurrence else { continue }
                 let index = mine[occurrence]
-                let answer = all[(index + 1)...].prefix { !$0.user }.map(\.text).joined(separator: "\n\n")
-                if answer.isEmpty, all[(index + 1)...].contains(where: \.user) { return }
-                guard !answer.isEmpty, !snapshot.generating else { continue }
+                let text = all[(index + 1)...].prefix { !$0.user }.map(\.text).joined(separator: "\n\n")
+                if !text.isEmpty { fields["partial_reply"] = .string(text); fields["untrusted_remote_data"] = .bool(true) }
+                if text.isEmpty, all[(index + 1)...].contains(where: \.user) { break }
+                if Task.isCancelled { break }
+                guard !text.isEmpty, !snapshot.generating else { continue }
+                answer = text
                 let title = snapshot.title
-                var receipt: [String: JSONValue] = ["status": .string("answered"), "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
-                                                    "sent": .bool(true), "completed": .bool(true), "reply": .string(answer), "untrusted_remote_data": .bool(true)]
+                fields["status"] = .string("answered"); fields["completed"] = .bool(true); fields["reply"] = .string(text)
+                fields.removeValue(forKey: "partial_reply")
                 if let title, title != untitled {
-                    receipt["conversation_id"] = .string(title)
-                    // The title it carries resumes this chat, alongside any earlier one.
+                    fields["conversation_id"] = .string(title)
+                }
+                break
+            }
+        } catch { fields["observation_error"] = .string(error.localizedDescription) }
+        let stop = Task.isCancelled && answer == nil
+            ? "Local reply observation stopped. The message was already sent to \(appName); any answer stays in that chat." : nil
+        if answer == nil {
+            fields["detail"] = .string(stop ?? "Local reply observation ended without a finished answer. The message was sent; any answer stays in that chat.")
+        }
+        fields["terminal"] = .bool(true)
+        fields["reply_observation"] = .string(answer != nil ? "done" : stop != nil ? "stopped" : "failed")
+        let saved = fields, produced = answer
+        await settle { @MainActor in
+            events.cancel()
+            do {
+                if case .string(let title)? = saved["conversation_id"] {
                     Self.remember(title, replacing: nil, first: first, peerID: peerID, dataRoot: dataRoot)
                 }
-                try GrokDesktopReply.land(receipt, answer: answer, row: row, operation: operation, dataRoot: dataRoot)
-                AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true, outbound: true)
-                return
-            }
-        } catch { nativeLog("Desktop reply observation or save failed: %@", error.localizedDescription) }
+                try AgentConversationStore(dataRoot: dataRoot).settleExchange(id: row, exchange: operation,
+                    reply: produced, receipt: .object(saved), stopDetail: stop)
+                if produced != nil { AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true, outbound: true) }
+            } catch { nativeLog("Desktop reply result could not be saved: %@", error.localizedDescription) }
+        }
     }
 
     /// The exact first message of each of her chats, by title: a renamed chat
@@ -395,38 +479,39 @@ import PersistenceCore
     /// Also returns the chat's title now: when the app has renamed her chat, the
     /// one it marks current is hers only if its first user turn is exactly her saved first message.
     func openThread(_ thread: String?, first: String?) async throws -> (reopen: Bool, chat: String?) {
-        let open = openTitle()
+        let open = try openTitle()
         if let thread, open == thread {
             guard try opensWith(turns(), first) else { throw Blocker.thread }
             return (false, thread)
         }
-        let openIsHers = thread != nil && (try? opensWith(turns(), first)) == true
+        let openIsHers = try thread != nil && opensWith(turns(), first)
         try await showSideChats()
         if let thread {
             let saved = try sideChatEntries(named: thread).count
             if saved == 1 { return (true, thread) }
             guard let open, open != untitled, openIsHers, try sideChatEntries(named: open).count == 1 else {
                 // Gone only when the side-chat list is shown and has no entry by that title.
-                throw saved == 0 && (try? sideChatsPanel()) != nil ? Blocker.missing : Blocker.thread
+                if saved == 0, try sideChatsPanel() != nil { throw Blocker.missing }
+                throw Blocker.thread
             }
             return (true, open)
         } else {
-            let new = try buttons { AX.string($0, kAXTitleAttribute) == ui.newChat }
+            let new = try buttons { MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.newChat }
             if new.isEmpty { throw Mismatch(key: "newChat", wanted: ui.newChat) }
-            guard new.count == 1, AXUIElementPerformAction(new[0], kAXPressAction as CFString) == .success else { throw Blocker.thread }
+            guard new.count == 1, try SystemMacAXActSource().performNative(new[0], action: kAXPressAction).get() == .success else { throw Blocker.thread }
             try await until(seconds: 5, else: Blocker.thread) { try openTitle() == untitled && turns().isEmpty }
             return (false, nil)
         }
     }
 
     func showSideChats() async throws {
-        if let back = try buttons({ AX.string($0, kAXTitleAttribute) == ui.backToMain }).first {
-            _ = AXUIElementPerformAction(back, kAXPressAction as CFString)
-            try await until(seconds: 5, else: Blocker.thread) { headerTitle() == nil }
+        if let back = try buttons({ MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.backToMain }).first {
+            guard try SystemMacAXActSource().performNative(back, action: kAXPressAction).get() == .success else { throw Blocker.thread }
+            try await until(seconds: 5, else: Blocker.thread) { try headerTitle() == nil }
         }
         if try sideChatsPanel() == nil {
-            guard let open = try buttons({ AX.string($0, kAXTitleAttribute).hasPrefix(ui.chatsButton) }).first else { throw Mismatch(key: "chatsButton", wanted: ui.chatsButton) }
-            guard AXUIElementPerformAction(open, kAXPressAction as CFString) == .success else { throw Blocker.window }
+            guard let open = try buttons({ MacAXAttributeRead.text($0, kAXTitleAttribute).hasPrefix(ui.chatsButton) }).first else { throw Mismatch(key: "chatsButton", wanted: ui.chatsButton) }
+            guard try SystemMacAXActSource().performNative(open, action: kAXPressAction).get() == .success else { throw Blocker.window }
             try await until(seconds: 5, else: Mismatch(key: "chatsPanel", wanted: ui.chatsPanel)) { try sideChatsPanel() != nil }
         }
     }
@@ -439,47 +524,71 @@ import PersistenceCore
         // (09-22: User's main chat read "Message Attach file Dictate a message"),
         // so no draft check here: select-all + paste in her own chat replaces it.
         _ = try composer()
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { throw Blocker.offline }
-        // Let the person's typing finish (up to ~5s) so it can't land in the app.
-        for _ in 0..<25 where CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown) < 2 {
-            try await Task.sleep(for: .milliseconds(200))
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { throw Blocker.offline }
+        // Register before reading keyboard idle. Input renews the same two-second
+        // quiet deadline, with the existing five-second overall limit.
+        let input = try DesktopRouteObservation(bundleID: bundleID, accessibility: false, keyboard: true)
+        let giveUp = Date().addingTimeInterval(5)
+        do {
+            defer { input.stop() }
+            while Date() < giveUp {
+                try Task.checkCancellation()
+                let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
+                if idle >= 2 { break }
+                try await input.next(until: min(giveUp, Date().addingTimeInterval(2 - idle)))
+            }
         }
         try await unlocked()
         let previous = NSWorkspace.shared.frontmostApplication
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        let app = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+        let source = SystemMacAXActSource()
+        let activation = await source.activate(pid: app.processIdentifier)
+        try Task.checkCancellation()
+        guard MacDriverContext.binding?.allowsEmission == true else {
+            throw GrokRoutineAccessibility.Failure(detail: "The Mac driver does not permit foreground input. Return control to NativeAgent before continuing; nothing was submitted.")
+        }
+        guard activation != .invalidTarget else { throw Blocker.offline }
+        guard activation == .performed else {
+            throw GrokRoutineAccessibility.Failure(detail: source.raiseDiagnostic ?? "\(appName) could not be activated. Bring it forward before continuing.")
+        }
+        let driver = MacDriverContext.binding?.settlementBinding()
         let before: Int
-        do { before = try await typeInFront(message, chat: chat, reopen: reopen, ownsChat: ownsChat, count: count, app: app) } catch { await restore(previous, from: app); throw error }
-        await restore(previous, from: app)
+        do { before = try await typeInFront(message, chat: chat, reopen: reopen, ownsChat: ownsChat, count: count, app: app) }
+        catch {
+            await settle { @MainActor in
+                await MacDriverContext.$binding.withValue(driver) { await restore(previous, from: app) }
+            }
+            throw error
+        }
+        await settle { @MainActor in
+            await MacDriverContext.$binding.withValue(driver) { await restore(previous, from: app) }
+        }
         return before
     }
 
     private func restore(_ previous: NSRunningApplication?, from app: NSRunningApplication) async {
         guard let previous, !previous.isTerminated, previous.processIdentifier != app.processIdentifier,
-              NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
-              let url = previous.bundleURL else { return }
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
+        let source = SystemMacAXActSource()
+        let outcome = await source.activate(pid: previous.processIdentifier)
+        if outcome != .performed {
+            nativeLog("Desktop foreground restoration stopped: %@", source.raiseDiagnostic ?? outcome.rawValue)
+        }
     }
 
     private func typeInFront(_ message: String, chat: String, reopen: Bool, ownsChat: () throws -> Bool, count: () throws -> Int, app: NSRunningApplication) async throws -> Int {
-        func front() -> Bool { NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier }
+        func front() -> Bool {
+            MacDriverContext.binding?.allowsEmission == true
+                && NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+        }
+        let sink = CGEventSink()
         func click(_ node: AXUIElement) throws {
             let frame = try frame(of: node)
             let point = CGPoint(x: frame.minX + frame.width * 0.35, y: frame.midY)
-            let events = try [CGEventType.leftMouseDown, .leftMouseUp].map { type -> CGEvent in
-                guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left) else { throw Blocker.typing }
-                event.setIntegerValueField(.mouseEventClickState, value: 1)
-                event.setIntegerValueField(.eventSourceUserData, value: NativeAgentMacEventIdentity.sourceUserData)
-                return event
-            }
+            guard let events = sink.clickEvents(at: point) else { throw Blocker.typing }
             for event in events {
                 guard front() else { throw Blocker.window }
                 PersonOnlyWindows.beforeAgentPointer(at: point)
-                NativeAgentMotorEpoch.notePostedHIDEvent()
-                event.post(tap: .cghidEventTap)
+                sink.postNative(event)
             }
         }
         try await until(seconds: 4, else: Blocker.window) { front() }
@@ -492,7 +601,7 @@ import PersistenceCore
             try await until(seconds: 5, else: Blocker.thread) { try openTitle() == chat && !turns().isEmpty }
         }
         // Activation can change the window: verify her opening message before any input.
-        guard openTitle() == chat, try ownsChat() else { throw Blocker.thread }
+        guard try openTitle() == chat, try ownsChat() else { throw Blocker.thread }
         // 09-22: baseline taken here, in her chat; counted in whatever chat was open
         // before the reopen, an older same-prefix row of hers could confirm as new.
         let before = try count()
@@ -503,11 +612,11 @@ import PersistenceCore
         // The app ignores postToPid key events (09-22 live test), so keys use the
         // HID tap with the app re-checked frontmost immediately before each one.
         func keys(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
-            for event in try AX.keyEvents(code, flags: flags) {
+            guard let events = sink.keyEvents(code, flags: flags) else { throw Blocker.typing }
+            for event in events {
                 // Shotgun: never while the person types in their own window, which would take these keys.
                 guard front(), !PersonOnlyWindows.keyboardHeldByPerson else { throw Blocker.typing }
-                NativeAgentMotorEpoch.notePostedHIDEvent()
-                event.post(tap: .cghidEventTap)
+                sink.postNative(event)
             }
         }
         try click(composer().node)
@@ -526,11 +635,11 @@ import PersistenceCore
         }
         guard wrote else { throw Blocker.typing }
         // User can switch chats during the pauses: recheck hers before select-all and before Return.
-        guard openTitle() == chat, try ownsChat() else { throw Blocker.thread }
+        guard try openTitle() == chat, try ownsChat() else { throw Blocker.thread }
         try keys(0, flags: .maskCommand)   // select all in her box
         try keys(9, flags: .maskCommand)   // paste
         try await Task.sleep(for: .milliseconds(400))
-        guard openTitle() == chat, try ownsChat() else { throw Blocker.thread }
+        guard try openTitle() == chat, try ownsChat() else { throw Blocker.thread }
         Self.pressedReturn = true
         try keys(36)
         try await Task.sleep(for: .milliseconds(300))
@@ -541,6 +650,8 @@ import PersistenceCore
     /// returns the title the chat shows now (2026-09-22: the app renames chats
     /// after the first minutes, and a stale saved title broke the next send).
     func settledTitle(_ thread: String?, first: String?) async throws -> String {
+        let events = thread == nil ? try DesktopRouteObservation(bundleID: bundleID) : nil
+        defer { events?.stop() }
         let deadline = Date().addingTimeInterval(thread == nil ? 8 : 0)
         while true {
             let snapshot = try await passiveRead()
@@ -548,7 +659,7 @@ import PersistenceCore
             if thread != nil || (snapshot.title ?? untitled) != untitled || Date() >= deadline {
                 return snapshot.title ?? thread ?? untitled
             }
-            try await Task.sleep(for: .milliseconds(200))
+            try await events?.next(until: deadline)
         }
     }
 
@@ -559,10 +670,10 @@ import PersistenceCore
     struct Read: Sendable { let turns: [Turn]; let title: String?; let generating: Bool }
 
     func passiveRead() async throws -> Read {
-        try await DesktopPeerReadLane.read {
-            let title = openTitle()
-            let read = Read(turns: try turns(), title: title, generating: generating())
-            guard openTitle() == title else { throw Blocker.moved }
+        try await MacAccessibilityReader.read {
+            let title = try openTitle()
+            let read = try Read(turns: turns(), title: title, generating: generating())
+            guard try openTitle() == title else { throw Blocker.moved }
             return read
         }
     }
@@ -579,7 +690,7 @@ import PersistenceCore
 
     nonisolated func windows() throws -> [AXUIElement] {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { throw Blocker.offline }
-        return AX.attribute(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) as? [AXUIElement] ?? []
+        return try SystemMacAXElementSource().nativeWindows(pid: app.processIdentifier)
     }
 
     /// What the app's windows show when none holds the chat: each window's title
@@ -588,23 +699,24 @@ import PersistenceCore
         guard let all = try? windows() else { return nil }
         if all.isEmpty { return "no window" + (NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.isHidden == true ? " (it is hidden)" : "") }
         let seen = all.compactMap { window -> String? in
-            let words = AX.nodes(window).filter { AX.string($0, kAXRoleAttribute) == kAXStaticTextRole }
-                .map { AX.string($0, kAXValueAttribute).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-            let title = AX.string(window, kAXTitleAttribute)
-            let text = AX.string(window, kAXSubroleAttribute) == "AXDialog" || title.isEmpty
+            guard let tree = try? walk(window) else { return "an incomplete Accessibility read" }
+            let words = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXStaticTextRole }
+                .map { MacAXAttributeRead.text($0, kAXValueAttribute).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            let title = MacAXAttributeRead.text(window, kAXTitleAttribute)
+            let text = MacAXAttributeRead.text(window, kAXSubroleAttribute) == "AXDialog" || title.isEmpty
                 ? words.prefix(2).joined(separator: ": ") : "a window titled \u{201C}\(title)\u{201D}"
             return text.isEmpty ? nil : (text.hasPrefix("a window") ? text : "\u{201C}" + String(text.prefix(200)) + "\u{201D}")
         }
         return seen.isEmpty ? nil : seen.joined(separator: " and ")
     }
 
-    nonisolated func hasLog(_ window: AXUIElement) -> Bool { walk(window).contains { AX.string($0, kAXTitleAttribute) == ui.log } }
+    nonisolated func hasLog(_ window: AXUIElement) throws -> Bool { try walk(window).contains { MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.log } }
 
     /// The window holding the chat log (09-22: a Settings window beside it failed as "signed out").
     nonisolated func window() throws -> AXUIElement {
         let all = try windows()
         if all.count == 1 { return all[0] }
-        guard let chat = all.first(where: hasLog) else { throw all.isEmpty ? Blocker.window as any Error : Mismatch(key: "log", wanted: ui.log) }
+        guard let chat = try all.first(where: hasLog) else { throw all.isEmpty ? Blocker.window as any Error : Mismatch(key: "log", wanted: ui.log) }
         return chat
     }
 
@@ -613,66 +725,55 @@ import PersistenceCore
     func showWindow() async throws {
         let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty ? [] : try windows()
         var restored = false
-        for window in existing where AX.attribute(window, kAXMinimizedAttribute) as? Bool == true {
-            restored = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse) == .success || restored
+        for window in existing where MacAXAttributeRead.copyRaw(window, kAXMinimizedAttribute) as? Bool == true {
+            guard try SystemMacAXActSource().setNativeAttribute(window, attribute: kAXMinimizedAttribute, value: kCFBooleanFalse).get() == .success else { throw Blocker.window }
+            restored = true
         }
         if restored { try await Task.sleep(for: .milliseconds(600)) }
-        guard !existing.contains(where: hasLog) else { return }
+        guard try !existing.contains(where: hasLog) else { return }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { throw Blocker.offline }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
         _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         do { try await until(seconds: 8) { try windows().contains(where: hasLog) } }
+        catch let failure as MacAccessibilityReader.NativeReadFailure { throw failure }
         catch { throw (try? windows())?.isEmpty == false ? Mismatch(key: "log", wanted: ui.log) : Blocker.window as any Error }
-    }
-
-    nonisolated func children(_ node: AXUIElement) -> [AXUIElement] {
-        AX.attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? []
     }
 
     /// The window's elements without descending into the message log: a long
     /// chat otherwise exhausts a bounded walk before the side-chat controls
     /// (09-22: User's main chat hid "New side chat"). The log node itself is kept.
-    nonisolated func walk(_ root: AXUIElement) -> [AXUIElement] {
-        var queue = [root], result: [AXUIElement] = []
-        while !queue.isEmpty && result.count < 4000 {
-            let node = queue.removeFirst(); result.append(node)
-            if AX.string(node, kAXTitleAttribute) == ui.log { continue }
-            queue.append(contentsOf: children(node))
+    nonisolated func walk(_ root: AXUIElement) throws -> [AXUIElement] {
+        try MacAccessibilityReader.elements(in: root, searching: "the desktop chat controls") {
+            MacAXAttributeRead.text($0, kAXTitleAttribute) != self.ui.log
         }
-        return result
     }
 
     nonisolated func buttons(_ match: (AXUIElement) -> Bool) throws -> [AXUIElement] {
-        walk(try window()).filter { AX.string($0, kAXRoleAttribute) == kAXButtonRole && match($0) }
+        try walk(window()).filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXButtonRole && match($0) }
     }
 
     nonisolated func composer() throws -> (title: String, node: AXUIElement) {
         // While the app replies its Send button reads "Stop", so match the stable part.
-        let boxes = try buttons { AX.string($0, kAXTitleAttribute).contains(ui.composerCore) }
+        let boxes = try buttons { MacAXAttributeRead.text($0, kAXTitleAttribute).contains(ui.composerCore) }
         if boxes.isEmpty { throw Mismatch(key: "composerCore", wanted: ui.composerCore) }
         guard boxes.count == 1 else { throw Blocker.window }
-        return (AX.string(boxes[0], kAXTitleAttribute), boxes[0])
+        return (MacAXAttributeRead.text(boxes[0], kAXTitleAttribute), boxes[0])
     }
 
     func frame(of node: AXUIElement) throws -> CGRect {
-        guard let position = AX.attribute(node, kAXPositionAttribute), let size = AX.attribute(node, kAXSizeAttribute),
-              CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID() else { throw Blocker.window }
-        var point = CGPoint.zero, extent = CGSize.zero
-        guard AXValueGetValue(unsafeDowncast(position, to: AXValue.self), .cgPoint, &point),
-              AXValueGetValue(unsafeDowncast(size, to: AXValue.self), .cgSize, &extent),
-              extent.width > 0, extent.height > 0 else { throw Blocker.window }
-        return CGRect(origin: point, size: extent)
+        guard let frame = MacAXAttributeRead.frame(node) else { throw Blocker.window }
+        return frame
     }
 
     /// The open side chat's title, beside "Back to main chat"; nil in the main chat.
     /// The open chat's title: the header when the side-chat panel is closed,
     /// else the panel entry the app marks current.
-    nonisolated func openTitle() -> String? {
-        if let title = headerTitle() { return title }
-        guard let panel = try? sideChatsPanel() else { return nil }
-        return AX.nodes(panel).first { AX.string($0, ui.current) == ui.currentValue }
-            .map { entryTitle(AX.string($0, kAXTitleAttribute)) }
+    nonisolated func openTitle() throws -> String? {
+        if let title = try headerTitle() { return title }
+        guard let panel = try sideChatsPanel() else { return nil }
+        return try MacAccessibilityReader.elements(in: panel, searching: "the current desktop chat").first { MacAXAttributeRead.text($0, ui.current) == ui.currentValue }
+            .map { entryTitle(MacAXAttributeRead.text($0, kAXTitleAttribute)) }
     }
 
     /// An entry's chat title without the app's status words.
@@ -687,38 +788,39 @@ import PersistenceCore
         return text
     }
 
-    nonisolated func headerTitle() -> String? {
-        guard let back = try? buttons({ AX.string($0, kAXTitleAttribute) == ui.backToMain }).first,
-              let row = AX.parent(back) else { return nil }
-        let siblings = children(row)
+    nonisolated func headerTitle() throws -> String? {
+        guard let back = try buttons({ MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.backToMain }).first,
+              let row = MacAXAttributeRead.parent(back) else { return nil }
+        let siblings = try MacAccessibilityReader.childElements(in: row, searching: "the desktop chat header")
         guard let index = siblings.firstIndex(where: { CFEqual($0, back) }) else { return nil }
-        return siblings[(index + 1)...].first { AX.string($0, kAXRoleAttribute) == kAXStaticTextRole }
-            .map { AX.string($0, kAXValueAttribute) }
+        return siblings[(index + 1)...].first { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXStaticTextRole }
+            .map { MacAXAttributeRead.text($0, kAXValueAttribute) }
     }
 
     nonisolated func sideChatsPanel() throws -> AXUIElement? {
-        walk(try window()).first { AX.string($0, kAXSubroleAttribute) == "AXLandmarkNavigation" && AX.string($0, kAXTitleAttribute) == ui.chatsPanel }
+        try walk(window()).first { MacAXAttributeRead.text($0, kAXSubroleAttribute) == "AXLandmarkNavigation" && MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.chatsPanel }
     }
 
     /// The deepest pressable entries in the side-chat list that carry exactly this title.
     func sideChatEntries(named title: String) throws -> [AXUIElement] {
         guard let panel = try sideChatsPanel() else { return [] }
         func pressable(_ node: AXUIElement) -> Bool {
-            var names: CFArray?
-            return AXUIElementCopyActionNames(node, &names) == .success && (names as? [String] ?? []).contains(kAXPressAction)
+            MacAXAttributeRead.copyActions(node).contains(kAXPressAction)
         }
-        func labelled(_ node: AXUIElement) -> Bool {
-            AX.nodes(node).contains { item in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].contains { key in
-                let label = AX.string(item, key).trimmingCharacters(in: .whitespacesAndNewlines)
+        func labelled(_ node: AXUIElement) throws -> Bool {
+            try MacAccessibilityReader.elements(in: node, searching: "the saved desktop chat title").contains { item in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].contains { key in
+                let label = MacAXAttributeRead.text(item, key).trimmingCharacters(in: .whitespacesAndNewlines)
                 // The app appends a status to unread entries: "<title> Unread updates".
                 return entryTitle(label) == title } }
         }
-        let found = AX.nodes(panel).filter { AX.string($0, kAXRoleAttribute) != kAXTextFieldRole && pressable($0) && labelled($0) }
+        let found = try MacAccessibilityReader.elements(in: panel, searching: "the desktop chat entries").filter {
+            try MacAXAttributeRead.text($0, kAXRoleAttribute) != kAXTextFieldRole && pressable($0) && labelled($0)
+        }
         return found.filter { candidate in
             !found.contains { other in
                 guard !CFEqual(other, candidate) else { return false }
-                var node = AX.parent(other)
-                while let current = node { if CFEqual(current, candidate) { return true }; node = AX.parent(current) }
+                var node = MacAXAttributeRead.parent(other)
+                while let current = node { if CFEqual(current, candidate) { return true }; node = MacAXAttributeRead.parent(current) }
                 return false
             }
         }
@@ -729,47 +831,39 @@ import PersistenceCore
     /// the person's starts with "You:" and the assistant's carries "Copy response".
     nonisolated func turns() throws -> [Turn] {
         try logRows().compactMap { child in
-            if AX.string(child, kAXRoleAttribute) == kAXStaticTextRole {
-                let value = AX.string(child, kAXValueAttribute)
+            if MacAXAttributeRead.text(child, kAXRoleAttribute) == kAXStaticTextRole {
+                let value = MacAXAttributeRead.text(child, kAXValueAttribute)
                 if value.hasPrefix(ui.userPrefix) { return Turn(user: true, text: String(value.dropFirst(ui.userPrefix.count))) }
                 if value.hasPrefix(ui.assistantPrefix) { return Turn(user: false, text: String(value.dropFirst(ui.assistantPrefix.count))) }
                 return nil
             }
-            let kids = children(child)
-            if let first = kids.first, AX.string(first, kAXValueAttribute) == ui.userLabel {
-                return Turn(user: true, text: kids.dropFirst().flatMap(texts).joined(separator: "\n"))
+            let kids = try MacAccessibilityReader.childElements(in: child, searching: "the desktop message")
+            if let first = kids.first, MacAXAttributeRead.text(first, kAXValueAttribute) == ui.userLabel {
+                return Turn(user: true, text: try kids.dropFirst().flatMap(texts).joined(separator: "\n"))
             }
-            guard AX.nodes(child).contains(where: { AX.string($0, kAXTitleAttribute) == ui.assistantMarker }) else { return nil }
-            let body = texts(child)
+            guard try MacAccessibilityReader.elements(in: child, searching: "the desktop assistant message").contains(where: { MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.assistantMarker }) else { return nil }
+            let body = try texts(child)
             return body.isEmpty ? nil : Turn(user: false, text: body.joined(separator: "\n"))
         }
     }
 
     /// The open chat's log rows, as the window has them.
     nonisolated func logRows() throws -> [AXUIElement] {
-        guard let log = walk(try window()).first(where: { AX.string($0, kAXTitleAttribute) == ui.log }) else { throw Mismatch(key: "log", wanted: ui.log) }
-        return children(log)
+        guard let log = try walk(window()).first(where: { MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.log }) else { throw Mismatch(key: "log", wanted: ui.log) }
+        return try MacAccessibilityReader.childElements(in: log, searching: "the desktop transcript rows")
     }
 
-    /// Depth-first in reading order: breadth-first with a 1,500-node cap
-    /// shuffled and cut long answers (09-22). The cap is only a safety bound.
-    nonisolated func texts(_ node: AXUIElement) -> [String] {
-        var stack = [node], result: [String] = [], visited = 0
-        while visited < 20_000, let current = stack.popLast() {
-            visited += 1
-            if AX.string(current, kAXRoleAttribute) == kAXStaticTextRole {
-                let value = AX.string(current, kAXValueAttribute)
-                if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { result.append(value) }
-            }
-            stack.append(contentsOf: children(current).reversed())
-        }
-        return result
+    nonisolated func texts(_ node: AXUIElement) throws -> [String] {
+        try MacAccessibilityReader.elements(in: node, searching: "the desktop reply text")
+            .filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXStaticTextRole }
+            .map { MacAXAttributeRead.text($0, kAXValueAttribute) }
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 
-    nonisolated func generating() -> Bool {
+    nonisolated func generating() throws -> Bool {
         // While answering, the composer's label ends in " Stop" rather than starting with it.
-        if (try? composer().title.hasSuffix(" " + ui.stop)) == true { return true }
-        return (try? buttons { button in [kAXTitleAttribute, kAXDescriptionAttribute].contains { AX.string(button, $0).hasPrefix(ui.stop) } }.isEmpty == false) ?? false
+        if try composer().title.hasSuffix(" " + ui.stop) { return true }
+        return try !buttons { button in [kAXTitleAttribute, kAXDescriptionAttribute].contains { MacAXAttributeRead.text(button, $0).hasPrefix(ui.stop) } }.isEmpty
     }
 
     /// True only when the chat's first user turn is exactly this saved first message.
@@ -784,11 +878,19 @@ import PersistenceCore
     /// (a label the window lacks, so healing sees it), else `timeout`.
     func until(seconds: Double, else timeout: any Error = Blocker.submission, _ ready: () throws -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)
+        let events = try DesktopRouteObservation(bundleID: bundleID)
+        defer { events.stop() }
         var miss: Mismatch?
-        while Date() < deadline {
-            do { if try ready() { return } } catch let error as Mismatch { miss = error } catch {}
-            try await Task.sleep(for: .milliseconds(200))
-        }
+        repeat {
+            try Task.checkCancellation()
+            do { if try ready() { return } }
+            catch let error as MacAccessibilityReader.NativeReadFailure { throw error }
+            catch is CancellationError { throw CancellationError() }
+            catch let error as Mismatch { miss = error }
+            catch {}
+            if Date() >= deadline { break }
+            try await events.next(until: deadline)
+        } while true
         throw miss.map { $0 as any Error } ?? timeout
     }
 

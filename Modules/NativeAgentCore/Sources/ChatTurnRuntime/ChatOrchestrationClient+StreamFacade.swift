@@ -5,15 +5,13 @@ import PersistenceCore
 import TurnTrace
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
+// Blueprint: | `ChatOrchestrationClient+StreamFacade.swift` | `SwiftNativeChatOrchestrationClient`: `chatStream`, `chatStreamExecution` |
 
 /// Joinable ownership for one core streaming producer. Surface adapters that
 /// cancel a consumer must wait for this execution before treating the turn as
@@ -441,13 +439,14 @@ extension SwiftNativeChatOrchestrationClient {
                 },
                 noticeSink: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
             )
+            let turn = try execution.turn.get()
             // A card-lane sentence the model never wrote reaches the terminal
             // result only; a consumer that rebuilds the reply from deltas has
             // to see it as one.
             if let suffix = TurnSettle.takeStreamSuffix() {
                 continuation.yield(.delta(suffix))
             }
-            continuation.yield(.final(execution.turn))
+            continuation.yield(.final(turn))
         } catch let e as ChatOrchestrationError {
             switch e {
             case .emptyMessage:

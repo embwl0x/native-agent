@@ -9,6 +9,7 @@ import PersistenceCore
 // the remote/iOS sets. A second copy of them here would be a second answer to
 // "is this surface the person" — the thing that type exists to prevent.
 import TrustCenter
+// Blueprint: | `ApprovalInbox.swift` | `SwiftNativeApprovalInbox`; canonical checked authority storage and decision/grant facts; recordsUnlocked/list share the originating DataRootLife projection for execution and chat continuation. Old approved but unexecuted work reads stopped/restored without changing the grant or settled outcomes; resolution stamps new work; raw offline validation remains side effect free |
 
 // MARK: - Records
 
@@ -75,6 +76,11 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
            let result = ChatToolOutcome.ExactResultClass(rawValue: raw) { return result }
         guard let status = execution["status"] else { return .unknown }
         return ChatToolOutcome.exactResultClass(.object(["status": status]))
+    }
+
+    public var executionIsStopped: Bool {
+        guard case .object(let execution)? = executedAction else { return false }
+        return execution["status"] == .string("stopped")
     }
 
     /// The inbox owns the decision. Every reader gets this same expression,
@@ -457,12 +463,6 @@ public enum ApprovalInboxError: Error, Equatable {
     case notFound(String)
     /// Tried to resolve an approval that's already in a terminal state.
     case alreadyResolved(id: String, status: String)
-    /// Decision verb was outside {approved, denied, canceled}.
-    case invalidDecision(String)
-    /// Method is outside the Swift-native surface.
-    case unsupported(String)
-    /// Legacy transport error case retained for API compatibility.
-    case http(status: Int, body: String)
     /// JSON serialization or shape mismatch.
     case malformedResponse(String)
     /// Legacy transport-level failure case retained for API compatibility.
@@ -542,6 +542,10 @@ public extension ApprovalInboxProtocol {
 /// File-backed implementation. Reads/writes
 /// `<root>/workflows/approvals/requests.json` via PersistenceCore for
 /// atomic, 0600, sorted-keys, UTF-8 IO.
+/// Local backup and export include this checked array; phone sync projects
+/// approvals, and PrivacyMap lists Approvals. Legacy approvals/requests.json
+/// and its completed-import requests.json.migrated archive are excluded from
+/// backup/export/raw sync and listed under Legacy Approvals.
 ///
 /// Actor-isolated: serializes concurrent resolve/archive calls so two
 /// in-flight mutations against the same on-disk file can't clobber each
@@ -600,7 +604,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     }
 
     /// Canonical approval storage path.
-    public var approvalsPath: URL {
+    public nonisolated var approvalsPath: URL {
         root
             .appendingPathComponent("workflows", isDirectory: true)
             .appendingPathComponent("approvals", isDirectory: true)
@@ -610,14 +614,15 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// Pending requests, read-only and without the lock, for a glance that
     /// must not wait; a file caught mid-write fails its check and throws.
     public nonisolated func pendingUnlocked() throws -> [ApprovalRecord] {
-        let path = root.appendingPathComponent("workflows/approvals/requests.json")
-        return try Self.loadApprovalRowsChecked(at: path).compactMap(ApprovalRecord.init(json:)).filter { $0.status == "pending" }
+        try recordsUnlocked().filter { $0.status == "pending" }
     }
 
     public nonisolated func resolvedUnlocked() throws -> [ApprovalRecord] {
-        let path = root.appendingPathComponent("workflows/approvals/requests.json")
-        return try Self.loadApprovalRowsChecked(at: path).compactMap(ApprovalRecord.init(json:))
-            .filter { $0.status == "resolved" }
+        try recordsUnlocked().filter { $0.status == "resolved" }
+    }
+
+    public nonisolated func recordsUnlocked() throws -> [ApprovalRecord] {
+        try readContinuations(Self.loadApprovalRowsChecked(at: approvalsPath).compactMap(ApprovalRecord.init(json:)))
     }
 
     public func list(filter: ApprovalFilter) async throws -> [ApprovalRecord] {
@@ -626,7 +631,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
         // `loadApprovalRowsChecked` validates every row before returning, so
         // compactMap cannot hide a corrupt record as a shorter healthy queue.
-        let records = items.compactMap(ApprovalRecord.init(json:))
+        let records = try readContinuations(items.compactMap(ApprovalRecord.init(json:)))
         let sorted = records.sorted { lhs, rhs in
             // Match Python's: sorted(..., key=lambda x: str(x.createdAt or ""), reverse=True).
             lhs.createdAt > rhs.createdAt
@@ -844,10 +849,12 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         decision: ApprovalDecision,
         provenance: ApprovalResolutionProvenance
     ) async throws -> ApprovalRecord {
+        let lifeID = try DataRootLife.current(in: root)
         let record = try await runSerialized { [persistence, approvalsPath] in
             return try await Self._resolveImpl(
                 id: id, decision: decision,
                 provenance: provenance,
+                lifeID: lifeID,
                 persistence: persistence,
                 approvalsPath: approvalsPath,
                 now: Date()
@@ -896,9 +903,10 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             payload = .object(fields)
         }
         let action = codepointPrefix(pyStr(bodyObj["action"], fallback: "unknown"), 120)
-        // A script install card shows the whole script it admits, never part of it.
-        let previewLimit = action == Self.skillScriptInstallAction ? Self.skillScriptPreviewLimit : 4000
-        guard action != Self.skillScriptInstallAction || rawPayloadPreview.count <= previewLimit else {
+        // Every executable-code approval shows the whole staged review.
+        let executableReview = Self.requiresExecutableReview(action: action, payload: payload)
+        let previewLimit = executableReview ? Self.skillScriptPreviewLimit : 4000
+        guard !executableReview || rawPayloadPreview.count <= previewLimit else {
             throw ApprovalInboxError.malformedResponse("the script is too long to show whole on the card")
         }
         let payloadPreview = String(rawPayloadPreview.prefix(previewLimit))
@@ -984,6 +992,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         id: String,
         decision: ApprovalDecision,
         provenance: ApprovalResolutionProvenance,
+        lifeID: String,
         persistence: any PersistenceCoreProtocol,
         approvalsPath: URL,
         now: Date
@@ -1010,6 +1019,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             obj["resolvedAt"] = .string(Self.isoTimestamp(now))
             obj["decidedBy"] = .string(provenance.decidedBy)
             obj["resolutionProvenance"] = provenance.toJSON()
+            obj["chatContinuation"] = .object(["lifeID": .string(lifeID)])
             mutated[idx] = .object(obj)
             guard let rec = ApprovalRecord(json: .object(obj)) else {
                 throw ApprovalInboxError.malformedResponse("could not re-parse mutated record")
@@ -1062,10 +1072,11 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 return annotated
             }
         }
-        await ApprovalLifecycleBus.shared.publish(.init(phase: .executed, record: record,
+        let settled = try readContinuations([record])[0]
+        await ApprovalLifecycleBus.shared.publish(.init(phase: .executed, record: settled,
             result: result ?? executedAction))
-        recordProjection(record)
-        return record
+        recordProjection(settled)
+        return settled
     }
 
     /// Claim or complete the reporting turn independently of deletable chat history.
@@ -1097,16 +1108,13 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         } && (done || legacyStartedAt == nil)
     }
 
-    /// Telegram keeps its delivery payload here until the queued turn starts.
-    /// 2026-09-18: queueing never replaces a claim, even after a restart.
-    public func queueChatContinuation(_ id: String, delivery: JSONValue, alreadyStarted: Bool = false,
-                                      previouslyQueued: Bool = false) async throws -> Bool {
+    /// The current-life approval owns its queued delivery until the turn starts.
+    public func queueChatContinuation(_ id: String, delivery: JSONValue) async throws -> Bool {
         let now = Date()
         return try await updateChatContinuation(id) { record, state in
-            guard (previouslyQueued || Self.continuationIsPending(record, now: now)),
+            guard Self.continuationIsPending(record, now: now),
                   state["done"] == nil, state["started"] == nil else { return false }
             state["delivery"] = delivery
-            if alreadyStarted { state["started"] = .string(Self.isoTimestamp(now)) }
             return true
         }
     }
@@ -1161,8 +1169,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
     }
 
-    /// Merge `fields` into a pending approval's chat card (its Telegram DM
-    /// prompt), creating the card when there is none yet.
+    /// Merge delivery receipts even if the approval was resolved while its
+    /// Telegram send was in flight. A decision does not erase what was sent.
     public func markChatCard(_ id: String, _ fields: [String: JSONValue]) async throws {
         try await runSerialized { [persistence, approvalsPath] in
             try await persistence.withFileLock(approvalsPath) {
@@ -1170,8 +1178,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 guard let index = items.firstIndex(where: {
                     guard case .object(let object) = $0 else { return false }
                     return object["id"] == .string(id)
-                }), case .object(var object) = items[index],
-                    object["status"] == .string("pending") else { return }
+                }), case .object(var object) = items[index] else { return }
                 var card: [String: JSONValue] = [:]
                 if case .object(let saved)? = object["chatCard"] { card = saved }
                 object["chatCard"] = .object(card.merging(fields) { _, new in new })
@@ -1185,7 +1192,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         _ id: String,
         update: @escaping @Sendable (ApprovalRecord, inout [String: JSONValue]) -> Bool
     ) async throws -> Bool {
-        try await runSerialized { [persistence, approvalsPath] in
+        let lifeID = try DataRootLife.current(in: root)
+        return try await runSerialized { [persistence, approvalsPath] in
             try await persistence.withFileLock(approvalsPath) {
                 var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
                 guard let index = items.firstIndex(where: {
@@ -1201,6 +1209,13 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                     guard case .object(let value) = saved else { return false }
                     state = value
                 }
+                let read = Self.readContinuation(state, lifeID: lifeID)
+                if read != state {
+                    object["chatContinuation"] = .object(read)
+                    items[index] = .object(object)
+                    try await persistence.writeJSON(.array(items), to: approvalsPath)
+                    return false
+                }
                 guard update(record, &state) else { return false }
                 object["chatContinuation"] = .object(state)
                 items[index] = .object(object)
@@ -1208,6 +1223,30 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 return true
             }
         }
+    }
+
+    private nonisolated func readContinuations(_ records: [ApprovalRecord]) throws -> [ApprovalRecord] {
+        let lifeID = try DataRootLife.current(in: root)
+        return records.map { original in
+            var record = original
+            if record.status == "resolved" {
+                let state: [String: JSONValue] = if case .object(let saved)? = record.chatContinuation { saved } else { [:] }
+                record.chatContinuation = .object(Self.readContinuation(state, lifeID: lifeID))
+                if record.decision == "approved", record.executedAction == nil, DataRootLife.life(of: state["lifeID"]) != lifeID {
+                    record.executedAction = .object(["status": .string("stopped"), "reason": .string(DataRootLife.stoppedReason)])
+                }
+            }
+            return record
+        }
+    }
+
+    private nonisolated static func readContinuation(_ original: [String: JSONValue], lifeID: String) -> [String: JSONValue] {
+        guard original["done"] != .bool(true), DataRootLife.life(of: original["lifeID"]) != lifeID else { return original }
+        var state = original
+        state["done"] = .bool(true)
+        state["status"] = .string("stopped")
+        state["reason"] = .string(DataRootLife.stoppedReason)
+        return state
     }
 
     // MARK: - Helpers
@@ -1312,10 +1351,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// malformed row make the whole queue unavailable. In particular, mutation
     /// callers must never turn damaged state into `[]` and overwrite pending
     /// approvals with a newly created record.
-    /// 2026-09-06: `public` so the one app-side route that still merges rows
-    /// into this file (the legacy approvals migration in the Workshop step
-    /// route) reads it through the owner's own check instead of flattening a
-    /// damaged store to `[]` and overwriting it.
     public nonisolated static func loadApprovalRowsChecked(at path: URL) throws -> [JSONValue] {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: path.path) else { return [] }
@@ -1450,6 +1485,11 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 id: id, reason: "decision provenance has no actor"
             )
         }
+        if case .telegram = provenance, record.requiresExecutableReview {
+            throw ApprovalInboxError.resolutionNotAuthorized(
+                id: id, reason: "Review and approve the exact code on the Mac or paired phone; Telegram cannot show the whole review."
+            )
+        }
         if case .signedIOS(let clientID, _) = provenance {
             guard !clientID.isEmpty else {
                 throw ApprovalInboxError.resolutionNotAuthorized(
@@ -1461,7 +1501,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             // Agent alone decides her studio canon.
             guard !record.isAgentsOwnDecision else {
                 throw ApprovalInboxError.resolutionNotAuthorized(
-                    id: id, reason: "Agent decides her studio canon."
+                    id: id, reason: "The agent decides her own studio canon."
                 )
             }
             return
@@ -1474,7 +1514,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
            case .object(let card)? = row["chatCard"], card["telegramChatId"] == .string(chatID) {
             guard !record.isAgentsOwnDecision else {
                 throw ApprovalInboxError.resolutionNotAuthorized(
-                    id: id, reason: "Agent decides her studio canon."
+                    id: id, reason: "The agent decides her own studio canon."
                 )
             }
             return
@@ -1541,13 +1581,12 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// closed to local-only. Keep this list minimal and justified — adding an
     /// entry widens who can approve that action.
     ///
-    /// Workflow/MCP step gates live here because "the run is parked waiting on
-    /// you" is exactly the case a phone approval exists for, and both actions
-    /// were remotely resolvable before the fail-closed flip (behavior preserved
+    /// Workflow step gates live here because "the run is parked waiting on
+    /// you" is exactly the case a phone approval exists for, and the action
+    /// was remotely resolvable before the fail-closed flip (behavior preserved
     /// deliberately, not by accident).
     nonisolated static let remoteSafeActions: Set<String> = [
         "workflow_step",
-        "mcp_tool",
     ]
 
     /// Matches Python's `now_iso()` shape: an ISO-8601 string with
@@ -1556,17 +1595,10 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
 
-    /// One-time merge of any rows still at the pre-R5 `<root>/approvals/
-    /// requests.json` into the canonical `<root>/workflows/approvals/
-    /// requests.json`, then rename the legacy file so a later boot skips it.
-    /// Canonical wins on id-conflict.
-    ///
-    /// 2026-09-06: run BY THE OWNER. This merge used to read the canonical file
-    /// and write the merged array from `NativeClient`, outside both the actor's
-    /// mutation chain and the file lock every other writer takes — so a create
-    /// or resolve landing in the same moment was overwritten wholesale by the
-    /// migration's stale copy. It now runs on the same serialized, locked path
-    /// as `create`/`resolve`, so the read and the write see one state.
+    /// One-time legacy merge under the canonical owner's mutation lock.
+    /// Canonical wins on conflicts. Renaming the source completes the import;
+    /// its absence prevents retention-evicted rows from being re-imported.
+    /// The .migrated archive preserves the completed import's source bytes.
     public func mergeLegacyApprovalRows() async throws {
         let legacyPath = root
             .appendingPathComponent("approvals", isDirectory: true)
@@ -1594,8 +1626,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             return rows
         }()
         if !legacyRows.isEmpty {
-            // A throwing read IS the damaged-store signal: nothing below
-            // writes over a store this call could not read.
             var merged = try Self.loadApprovalRowsChecked(at: canonicalPath)
             func rowKey(_ value: JSONValue) -> String? {
                 guard case .object(let object) = value else { return nil }
@@ -1619,8 +1649,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 appended = true
             }
             if appended {
-                // Refuse the merge outright rather than write a store the
-                // canonical reader will reject.
                 try Self.validateApprovalRows(merged)
                 let data = try JSONValue.array(merged).serialize(pretty: false)
                 try Data(data.utf8).write(to: canonicalPath, options: [.atomic])

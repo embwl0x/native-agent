@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ICloudTextDeltaCoalescer.swift` | `ICloudTextDeltaCoalescer` struct; `push`, `flush` |
 
 struct ICloudTextDeltaFlush: Equatable, Sendable {
     enum Reason: String, Sendable {

@@ -1,6 +1,7 @@
 import Dispatcher
 import SwiftUI
 import ToolRegistry
+// Blueprint: | `ChatSlashCommandMenu.swift` | `SlashCommandMenu` struct |
 
 // PATCH-2026-05-08: wave2-chat-ux — slash command menu popover
 // PATCH-Phase6b: extraTools — dynamic tool entries appended after hardcoded ones.

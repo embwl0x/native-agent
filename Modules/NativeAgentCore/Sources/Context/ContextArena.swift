@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ContextArena.swift` | `ContextArena`: bounded resident generations, immutable snapshot leases, serialized publication and pressure trimming |
+
 public enum ContextArenaBudget: Int, CaseIterable, Sendable, Codable {
     case mib32 = 32
     case mib64 = 64

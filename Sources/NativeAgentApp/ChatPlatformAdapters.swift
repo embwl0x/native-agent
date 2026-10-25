@@ -19,6 +19,8 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+// Blueprint: | `ChatPlatformAdapters.swift` | Chat platform adapters: attachment drops, editor-scoped paste interception and scroll event bridges with mounted-page visibility |
+
 /// The whole room accepts attachments, including its scrollback and composer.
 /// A neutral, stationary outline is also quiet with Reduce Motion enabled.
 struct ChatAttachmentDropTarget: ViewModifier {

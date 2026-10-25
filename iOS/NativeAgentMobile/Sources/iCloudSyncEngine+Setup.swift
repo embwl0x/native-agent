@@ -6,7 +6,6 @@
 //          MacSyncEngine validates it, dispatches into the in-process Swift runtime,
 //          writes `responses/<msg_id>.json`, then pings `inbox_response_<msg_id>`.
 
-import CryptoKit
 import Foundation
 import SwiftUI
 import NativeAgentShared
@@ -254,7 +253,6 @@ extension iCloudSyncEngine {
         refreshQueued = false
         fullRefreshQueued = false
         transportDeliveryQueued = false
-        pendingPhoneSurfaceModels = [:]
         syncError = nil
     }
 
@@ -271,7 +269,6 @@ extension iCloudSyncEngine {
         refreshQueued = false
         fullRefreshQueued = false
         transportDeliveryQueued = false
-        pendingPhoneSurfaceModels = [:]
         prefersCloudKitSnapshotCache = true
         NotificationCenter.default.removeObserver(
             self,
@@ -317,7 +314,7 @@ extension iCloudSyncEngine {
         guard AgentNameCache.fingerprint(deliveryPairing) != nil else { return false }
         do {
             let directory = cloudKitSnapshotCacheDirectory(pairing: deliveryPairing)
-            let versions = try await Task.detached(priority: .utility) {
+            try await Task.detached(priority: .utility) {
                 let files = try NAMobileSnapshotStatusCodec.decode(
                     value,
                     expectedGroup: group
@@ -336,8 +333,6 @@ extension iCloudSyncEngine {
                         options: .atomic
                     )
                 }
-                return files.filter { $0.key == "knowledge_graph.json" || $0.key == "telegram.json" }
-                    .mapValues { Data(SHA256.hash(data: $0)) }
             }.value
             guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
             guard generation == lifecycleGeneration else { return true }
@@ -356,9 +351,6 @@ extension iCloudSyncEngine {
             guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
             guard generation == lifecycleGeneration else { return true }
             if refreshed {
-                for (filename, version) in versions where pageSnapshotVersions[filename] != version {
-                    pageSnapshotVersions[filename] = version
-                }
                 if let writtenAt {
                     iCloudBridge.shared.recordMacConfirmation(at: writtenAt)
                 }
@@ -463,6 +455,7 @@ extension iCloudSyncEngine {
             let summaries = await refreshTurnSummariesSnapshot()
             let runs = await refreshRunsSnapshot() == .refreshed
             await refreshHelpersSnapshot()
+            await refreshKnowledgeGraphSnapshot()
             return summaries && runs
         }
     }

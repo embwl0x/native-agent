@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 
+// Blueprint: | `ChatGPTAccountModelRefresh.swift` | `ChatGPTAccountModelRefresh`: account-scoped UI/sign-in model discovery and checked cache publication outside provider dispatch |
+
 /// Account discovery is UI/sign-in maintenance, never part of provider dispatch.
 public actor ChatGPTAccountModelRefresh {
     public static let shared = ChatGPTAccountModelRefresh()
@@ -25,7 +27,10 @@ public actor ChatGPTAccountModelRefresh {
     @discardableResult
     public func refresh(dataRoot: URL, force: Bool = false) async throws -> Bool {
         let root = dataRoot.standardizedFileURL
-        let authPath = NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: root)
+        let authPath = OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: root)
+        // This maintenance operation writes only the app-owned account cache;
+        // do not discover an inactive sign-in when runtime selected another one.
+        guard authPath.standardizedFileURL == NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: root).standardizedFileURL else { return false }
         guard let token = OpenAIOAuthDirectAdapter.storedAccessToken(at: authPath) else { return false }
         var key = CredentialKey(root: root, accessToken: token)
         if !force {

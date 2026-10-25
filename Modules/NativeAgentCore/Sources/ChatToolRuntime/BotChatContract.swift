@@ -2,6 +2,7 @@ import Foundation
 import PersistenceCore
 import ProviderRouting
 import StandingBots
+// Blueprint: | `BotChatContract.swift` | Helper identity, personality, job/output instructions and checked provider choice; helpers follow Chat unless explicitly pinned |
 
 /// Every door into a helper uses its current brief and the same checked choice.
 public struct BotChatContract: Sendable, Equatable {
@@ -15,7 +16,9 @@ public struct BotChatContract: Sendable, Equatable {
     public var modelChoiceProblem: String? = nil
 
     public static func instructions(for bot: BotDefinition) -> String {
-        "Current standing instructions for \(bot.name):\n\(bot.brief)"
+        "You are \(bot.name)."
+            + (bot.personality.map { "\n\n" + $0 } ?? "")
+            + "\n\nCurrent standing instructions for \(bot.name):\n\(bot.brief)"
             + (bot.outputFormat.map { "\nRequested output: " + $0 } ?? "")
     }
 

@@ -1,7 +1,9 @@
 import Foundation
 import AgentConversations
 import BackgroundLoops
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatToolRuntime
+import AgentWorkspace
 import Cognition
 import NativeAgentCore
 import NotificationInbox
@@ -10,6 +12,7 @@ import Desk
 import DeviceSync
 import TelegramBot
 import SlackBot
+// Blueprint: | `DelegationBackgroundWork.swift` | `DelegationBackgroundWork` struct; `makeDelegationOutcomeLoop`, `delegationJobSnapshot`; one owed-answer notice per peer, retires the duplicate Codex backlog card; one failed-before-answer finding per peer or human route, dated counts and bounded newest-first file refs; per-peer findings persist and refresh every covered delivery ID as a trace ref; closed peer findings settle only those IDs before reply reconciliation; Telegram's index and exact iOS events retain settlement ownership |
 
 // MARK: - DelegationOutcomeLoop registration (W2b, upgrade campaign 2026-08)
 //
@@ -95,28 +98,6 @@ public struct DelegationBackgroundWork: Sendable {
             summary: "\(records.count) replies \(destination) failed before an answer (\(DeskClock.dayStamp(ordered.last!.date)) – \(DeskClock.dayStamp(ordered.first!.date))) — inspect or let go",
             owner: .agent, refs: refs, source: .loop), dataRoot: dataRoot, refreshRefs: true)
         try await HarnessQueue.fold(keyPrefixes: legacyPrefixes, into: title, dataRoot: dataRoot)
-    }
-
-    func retitleSavedDecisions(dataRoot: URL) async throws {
-        let marker = dataRoot.appendingPathComponent("agents/decided-principals-migrated.json")
-        guard !FileManager.default.fileExists(atPath: marker.path) else { return }
-        let peers = try AgentPeerStore(dataRoot: dataRoot).list()
-        let path = LiveNotificationInbox.livePath(dataRoot: dataRoot)
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            let lines = try InboxRewriteGuard.readLines(path)
-            guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: path) else { throw CocoaError(.fileReadCorruptFile) }
-            let rewritten = try lines.map { line -> Data in
-                guard case .object(var fields)? = line.row, fields["source"] == .string("harness_decided"),
-                      case .string(let id)? = fields["id"], case .string(let title)? = fields["title"],
-                      let peer = peers.first(where: { id.hasPrefix("harness_decided.peer:" + $0.id + ".") }) else { return line.raw }
-                fields["title"] = .string(title.replacingOccurrences(of: "peer:" + peer.id, with: peer.name))
-                fields["principal"] = .object(["peerID": .string(peer.id), "displayName": .string(peer.name)])
-                return try JSONValue.object(fields).serializedData(pretty: false)
-            }
-            try InboxRewriteGuard.writeLines(rewritten, to: path)
-        }
-        try await persistence.writeJSON(.bool(true), to: marker)
     }
 
 
@@ -272,18 +253,20 @@ public struct DelegationBackgroundWork: Sendable {
                 }
                 return await recordBoundDelegationSettlement(dataRoot: dataRoot, job: job)
             },
-            reportDeferral: { deferred in await deferral.record(deferred) },
+            reportDeferral: { remaining in
+                guard remaining, !Task.isCancelled else { return }
+                NotificationCenter.default.post(name: DelegationOutcomeLoop.workRemaining, object: dataRoot)
+            },
             readHandledOutcomes: {
                 let inbox = LiveNotificationInbox.livePath(dataRoot: dataRoot)
                 var handled = Set<String>()
                 for path in [inbox, LiveNotificationInbox.archivePath(forInbox: inbox)] {
-                    let lines = try InboxRewriteGuard.readLines(path)
-                    guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: path),
-                          lines.allSatisfy({ line in
-                              if line.raw.isEmpty { return true }
-                              if case .object? = line.row { return true }
-                              return false
-                          }) else {
+                    let lines = try LiveNotificationInbox.readLines(path)
+                    guard lines.allSatisfy({ line in
+                        if line.raw.isEmpty { return true }
+                        if case .object? = line.row { return true }
+                        return false
+                    }) else {
                         throw CocoaError(.fileReadCorruptFile)
                     }
                     for line in lines {
@@ -467,12 +450,8 @@ public struct DelegationBackgroundWork: Sendable {
 
         let persistence = SwiftNativePersistenceCore()
         do {
-            let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool? in
-                let lines = try InboxRewriteGuard.readLines(inboxPath)
-                guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
-                    InboxRewriteGuard.refuse("DelegationOutcomeLoop", path: inboxPath)
-                    return nil
-                }
+            let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
+                let lines = try LiveNotificationInbox.readLines(inboxPath)
                 var mutated: [Data] = []
                 mutated.reserveCapacity(lines.count + 1)
                 var found = false
@@ -523,13 +502,10 @@ public struct DelegationBackgroundWork: Sendable {
                     found = true
                 }
                 if !found { mutated.append(Data(try row.serialize(pretty: false).utf8)) }
-                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
+                try LiveNotificationInbox.write(mutated, to: inboxPath)
                 return pushWorthy
             }
-            // A refused rewrite is NOT a delivered card: report false so the
-            // loop retries rather than marking the job handled.
-            guard let shouldPush = inserted else { return false }
-            if shouldPush {
+            if inserted {
                 await port.notifyIfAttentionWorthy(
                     dataRoot: dataRoot,
                     itemId: card.cardId,
@@ -563,14 +539,10 @@ public struct DelegationBackgroundWork: Sendable {
         let name = DelegationOutcomeCard.displayName(source: card.source, agent: card.agent)
         let persistence = SwiftNativePersistenceCore()
         do {
-            // nil = refused rewrite; .some(nil) = landed, no push.
+            // nil = invalid card; .some(nil) = landed, no push.
             let landed = try await persistence.withFileLock(inboxPath) {
                 () async throws -> (title: String, summary: String)?? in
-                let lines = try InboxRewriteGuard.readLines(inboxPath)
-                guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
-                    InboxRewriteGuard.refuse("DelegationOutcomeLoop", path: inboxPath)
-                    return nil
-                }
+                let lines = try LiveNotificationInbox.readLines(inboxPath)
                 func isActive(_ obj: [String: JSONValue]) -> Bool {
                     guard case .string(let status)? = obj["status"] else { return true }
                     return status != "archived" && status != "dismissed"
@@ -618,7 +590,7 @@ public struct DelegationBackgroundWork: Sendable {
                     mutated.append(line.raw)
                 }
                 mutated.append(Data(try row.serialize(pretty: false).utf8))
-                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
+                try LiveNotificationInbox.write(mutated, to: inboxPath)
                 return wasUnread ? .some(nil) : .some((title, summary))
             }
             guard let landed else { return false }
@@ -660,8 +632,7 @@ public struct DelegationBackgroundWork: Sendable {
         let path = LiveNotificationInbox.livePath(dataRoot: dataRoot)
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(path) {
-            let lines = try InboxRewriteGuard.readLines(path)
-            guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: path) else { throw CocoaError(.fileReadCorruptFile) }
+            let lines = try LiveNotificationInbox.readLines(path)
             var changed = false
             let rewritten = try lines.map { line -> Data in
                 guard case .object(var fields)? = line.row, case .string(let id)? = fields["id"],
@@ -682,7 +653,7 @@ public struct DelegationBackgroundWork: Sendable {
                 }
                 return try JSONValue.object(fields).serializedData(pretty: false)
             }
-            if changed { try InboxRewriteGuard.writeLines(rewritten, to: path) }
+            if changed { try LiveNotificationInbox.write(rewritten, to: path) }
         }
     }
 
@@ -747,10 +718,8 @@ public struct DelegationBackgroundWork: Sendable {
     }
 }
 
-/// Whether the last tick left outcomes unsettled. Written by the loop's
-/// deferral report, read by the runner's deadline projection.
+/// Event-fed reply reconciliation and the exact iOS failure projection.
 actor DelegationDeferralState {
-    private var deferred = false
     private var replyReconciliationPending = true
     private var iosFailures: [URL: String] = [:]
     private var iosFailuresLoaded = false
@@ -767,8 +736,6 @@ actor DelegationDeferralState {
         defer { replyReconciliationPending = false }
         return replyReconciliationPending
     }
-    func record(_ value: Bool) { deferred = value }
-    var hasDeferredWork: Bool { deferred }
 }
 
 private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
@@ -780,16 +747,13 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
     let deferral: DelegationDeferralState
     let watchedPaths: [URL]
 
-    /// How soon a tick that deferred outcomes comes back. Short enough that the
-    /// remainder of a burst lands while the user is still in the same sitting,
-    /// long enough that a permanently failing settlement cannot spin.
-    static let deferredRerunGap: TimeInterval = 60
-
     var loopId: String { underlying.loopId }
     var interval: TimeInterval { underlying.interval }
     // One delayed peer continuation may include a full resident chat turn.
     // The manager still owns single-flight execution and cancellation.
     var tickTimeoutOverride: TimeInterval? { 600 }
+
+    func shutdown() async { await port.stopAgentConversations() }
 
     func tickOutcome() async -> LoopTickOutcome {
         do { try await work.reconcileClosedReplyFindings(dataRoot: dataRoot, configRoot: configRoot) }
@@ -802,7 +766,6 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
             }
         }
         do {
-            try await work.retitleSavedDecisions(dataRoot: dataRoot)
             let archived = try await work
                 .reconcileLegacySuccessfulDelegationNotices(dataRoot: dataRoot)
                 + work.reconcileStaleAdverseDelegationNotices(dataRoot: dataRoot)
@@ -843,37 +806,65 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
             let journalChanges = StoreChangeBus.shared.changes()
             let routes = EventDeadlinePhysiology.storeAndFileEvents(
                 paths: [dataRoot.appendingPathComponent("chat/sessions.json"), dataRoot.appendingPathComponent("user_prefs.json")],
-                notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange])
+                notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange,
+                    DelegationOutcomeLoop.workRemaining])
+            let deliveryEvents = port.storeAndFileEvents(paths: deliveryPaths, loopId: nil)
+            let ordinaryEvents = port.storeAndFileEvents(paths: ordinaryPaths, loopId: nil)
             let task = Task {
-                await withTaskGroup(of: Void.self) { group in
+                await withTaskGroup(of: String.self) { group in
                     group.addTask {
+                        guard !Task.isCancelled else { return "reply-delivery journal" }
                         do { try await work.fileFailedIOSReplies(dataRoot: dataRoot, deferral: deferral) }
                         catch { nativeLog("Reply failure filing failed: %@", error.localizedDescription) }
                         for await change in journalChanges where change.store == .replyDelivery
                             && change.path.standardizedFileURL.path.hasPrefix(dataRoot.standardizedFileURL.path + "/") {
+                            guard !Task.isCancelled else { break }
                             do { try await work.fileFailedIOSReplies(dataRoot: dataRoot, deferral: deferral, changedPath: change.path) }
                             catch { nativeLog("Reply failure filing failed: %@", error.localizedDescription) }
+                            guard !Task.isCancelled else { break }
                             await deferral.requestReplyReconciliation()
+                            guard !Task.isCancelled else { break }
                             continuation.yield(())
                         }
+                        return "reply-delivery journal"
                     }
                     group.addTask {
-                        for await _ in port.storeAndFileEvents(paths: deliveryPaths, loopId: nil) {
+                        for await _ in deliveryEvents {
+                            guard !Task.isCancelled else { break }
                             await deferral.requestReplyReconciliation()
+                            guard !Task.isCancelled else { break }
                             continuation.yield(())
                         }
+                        return "delivery files"
                     }
                     group.addTask {
-                        for await _ in port.storeAndFileEvents(paths: ordinaryPaths, loopId: nil) { continuation.yield(()) }
+                        for await _ in ordinaryEvents {
+                            guard !Task.isCancelled else { break }
+                            continuation.yield(())
+                        }
+                        return "delegation files"
                     }
                     group.addTask {
+                        guard !Task.isCancelled else { return "reply routes" }
                         await ResidentWake.shared.routesChanged(dataRoot: dataRoot)
                         for await _ in routes {
+                            guard !Task.isCancelled else { break }
                             await ResidentWake.shared.routesChanged(dataRoot: dataRoot)
+                            guard !Task.isCancelled else { break }
                             await deferral.requestReplyReconciliation()
+                            guard !Task.isCancelled else { break }
                             continuation.yield(())
                         }
+                        return "reply routes"
                     }
+                    // A sibling's infinite stream must not hide a lost source.
+                    // Finish before draining so BackgroundLoops can report and
+                    // rebuild its listener through its existing restart owner.
+                    if let source = await group.next(), !Task.isCancelled {
+                        nativeLog("DelegationOutcomeLoop: %@ event source ended; rebuilding fan-in", source)
+                        continuation.finish()
+                    }
+                    group.cancelAll()
                 }
                 continuation.finish()
             }
@@ -884,10 +875,9 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
     func nextMeaningfulDeadline(after now: Date) async -> Date? {
         let stall = DelegationStatusProjector(configRoot: configRoot, dataRoot: dataRoot)
             .nextStallDeadline(after: now)
-        // 2026-09-06: the ten-card cap and contiguous settlement leave real
-        // work behind, and nothing in the store changes when they do — so the
-        // remainder used to wait for the next bridge write or the six-hour
-        // integrity sweep. A deferring tick books its own continuation.
+        // Capped healthy batches request their own coalesced event. Only real
+        // domain deadlines belong here; failures wait for repair/source events
+        // or the six-hour missed-event integrity sweep.
         let conversation = port.nextConversationDeadline(after: now)
         var quietEnd: Date?
         if let window = TurnQuietHoursWindow.read(dataRoot: dataRoot),
@@ -896,10 +886,6 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
             // The existing saved-delivery pass runs at this exact crossing.
             await deferral.requestReplyReconciliation()
         }
-        let deadline = [stall, conversation, quietEnd].compactMap { $0 }.min()
-        guard await deferral.hasDeferredWork else { return deadline }
-        let rerun = now.addingTimeInterval(Self.deferredRerunGap)
-        guard let deadline else { return rerun }
-        return min(deadline, rerun)
+        return [stall, conversation, quietEnd].compactMap { $0 }.min()
     }
 }

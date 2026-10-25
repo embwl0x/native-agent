@@ -4,6 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
+// Blueprint: | `SchedulerDueJobRunner+ProactiveScan.swift` | `SchedulerDueJobRunner`: `surfaceProactiveScan` |
 
 extension SchedulerDueJobRunner {
     struct ProactiveScanSurfaceResult: Sendable {

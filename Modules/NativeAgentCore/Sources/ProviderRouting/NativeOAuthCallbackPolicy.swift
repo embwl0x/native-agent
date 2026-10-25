@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `NativeOAuthCallbackPolicy.swift` | Shared callback validation with exactly one state and caller-specific messages; handleCallbackURL, validateCallback, parseCallback |
 
 extension NativeOAuthFlow {
     /// Fallback path: forwarded from the SwiftUI `onOpenURL` handler when the
@@ -19,15 +20,19 @@ extension NativeOAuthFlow {
         case failure(String)
     }
 
-    public static func validateCallback(_ url: URL, expectedState: String) -> CallbackValidation {
+    public static func validateCallback(
+        _ url: URL, expectedState: String,
+        providerErrorMessage: (String) -> String = { "Provider returned error: \($0)" },
+        missingCodeMessage: String = "Provider did not return an authorization code."
+    ) -> CallbackValidation {
         let (code, returnedState, providerError) = parseCallback(url)
         if let providerError = providerError {
-            return .failure("Provider returned error: \(providerError)")
+            return .failure(providerErrorMessage(providerError))
         }
         guard let code = code, !code.isEmpty else {
-            return .failure("Provider did not return an authorization code.")
+            return .failure(missingCodeMessage)
         }
-        guard returnedState == expectedState else {
+        guard !expectedState.isEmpty, returnedState == expectedState else {
             return .failure("OAuth state mismatch — possible CSRF; aborting.")
         }
         return .code(code)
@@ -40,13 +45,13 @@ extension NativeOAuthFlow {
             return (nil, nil, "Invalid callback URL")
         }
         var code: String?
-        var state: String?
+        let states = (comps.queryItems ?? []).filter { $0.name == "state" }
+        let state = states.count == 1 ? states[0].value : nil
         var providerErr: String?
         var providerErrDetail: String?
         for item in comps.queryItems ?? [] {
             switch item.name {
             case "code":              code = item.value
-            case "state":             state = item.value
             case "error":             providerErr = item.value
             case "error_description": providerErrDetail = item.value
             default: break

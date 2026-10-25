@@ -1,80 +1,13 @@
-// SwiftNative port of POST /v1/multimodal/tts (Subsystem #28 — wave 35 W18).
-//
-// HISTORY / WHY THIS UNBLOCKS WAVE-34:
-//   Wave 33 W16 and wave 34 W16 both classed this
-//   route KEPT_LIVE, BLOCKED on "the Swift secret-resolution layer" — at the
-//   time the OpenAI API key was only resolvable daemon-side (Runtime
-//   `_VisionClient._get_token`). That blocker is now LIFTED: the chat-path
-//   cutover landed `LLMCredentialResolver.resolveAPIKey(providerConfigFile:dataRoot:)`
-//   in the ProviderRouting module (LLMClient+Real.swift), which resolves the
-//   OpenAI platform key from the one place Settings saves it —
-//   data/providers/openai.json `api_key`. ProviderRouting is already a product
-//   dep of NativeAgentApp (Package.swift, wired for BackgroundLoops), so the
-//   module-graph blocker is also already closed.
-//
-// SCOPE (audit-first, method-level):
-//   POST /v1/multimodal/tts  (Runtime.multimodal_tts -> _VisionClient.tts)  -> PORTED
-//
-// The daemon handler:
-//   - runs `_multimodal_policy_check("tts_openai")` (trust-policy gate),
-//   - validates non-empty text,
-//   - calls `_VisionClient.tts(text, voice, fmt)`, a stdlib-urllib passthrough
-//     POSTing https://api.openai.com/v1/audio/speech with
-//       {model:"tts-1", input:text[:4096], voice, response_format:fmt}
-//       headers Authorization: Bearer <token>, Content-Type: application/json,
-//       User-Agent: NativeAgent/0.2.0
-//     and returns the raw audio bytes (or an "[tts_*]" error string),
-//   - base64-encodes the bytes into the {ok, audio_base64, format,
-//     duration_ms_estimate, latency_ms} JSON envelope.
-//
-// WHAT THIS PORT REPRODUCES (verified against the retired daemon primary source,
-// NOT assumed):
-//   • URL https://api.openai.com/v1/audio/speech
-//   • body {model:"tts-1", input:text[:4096], voice, response_format:fmt}
-// — note input is truncated to 4096 chars;
-//     the same cap applies here and the unread remainder is reported.
-//   • headers Authorization/Content-Type/User-Agent.
-//   • 60s timeout.
-//   • token from <dataRoot>/providers/openai.json `api_key` only (no env var,
-//     no codex auth.json — 2026-09-26), via LLMCredentialResolver, resolved
-//     against the SAME data root the daemon's _VisionClient was constructed
-//     with (provider_config_dir=self.root/"providers"), NOT the process CWD. This is the
-//     REPO_PATH-parity fix (wave 36 W08 / §6.138): the wave-35 port used the
-//     CWD-relative overload, which silently returns notConfigured in an installed
-//     .app bundle (CWD `/`) even when the key is present in the stamped data root.
-//     (The daemon's third source reads
-//     a codex `access_token`/`token` JWT; in the user's OAuth-only production env that
-//     JWT is a ChatGPT-backend token, NOT a platform key, and the daemon's own
-//     comment at the retired daemon documents that it 401s against the
-//     platform `/v1/audio/speech` endpoint. So NOT consulting that JWT here is
-//     correct parity, not a regression — we never point a ChatGPT OAuth token at
-//     the wrong endpoint.)
-//
-// TRUST GATE — REPRODUCED NATIVELY (NOT a daemon-only concern):
-//   • The `_multimodal_policy_check("tts_openai")` trust gate IS reproduced here
-//     by `SwiftOpenAITTSClient.ttsOpenAIAllowed()` (below), which reads
-//     `<dataRoot>/trust/policy.json` → `multimodalPolicy.tts_openai`
-//     (default-deny / fail-closed); `synthesize` throws `.trustDenied` BEFORE
-//     any key/network work when it returns false. This is the gpt-5.5 BLOCKER
-//     fix that landed WITH this port (wave-35 W18, §6.117) — it is NOT deferred.
-//     [wave 39 W20 §6.201: this header block previously read "the native client
-//     does NOT reproduce it … until a future wave ports the trust gate" — that
-//     was stale; it predated the same-wave BLOCKER fix and contradicted the
-//     `ttsOpenAIAllowed()`/`.trustDenied` code below. Corrected.]
-//
-// WHAT IS NOT IN SCOPE:
-//   • The base64 envelope shape was route-only: the native client returns raw
-//     `Data` directly (the consumer, VoiceOutputController, immediately feeds it
-//     to AVAudioPlayer(data:)), skipping the base64 round-trip the HTTP path
-//     needs only because JSON can't carry raw bytes.
-//
-// DEP-LIGHT MODULE (mirrors Browser / SwarmRuns / KnowledgeGraph): depends only
-// on ProviderRouting (for LLMCredentialResolver) + NativeAgentCore.
+// OpenAI speech uses the caller's model, a 4096-scalar input cap and a
+// 60-second timeout. The unread remainder is reported with the raw audio.
+// SavedTrustPolicyAuthority denies before credential/network work unless
+// multimodalPolicy.tts_openai is enabled. LLMCredentialResolver owns keys.
 
 import Foundation
 import ProviderRouting
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `MultimodalTTS.swift` | `MultimodalTTSError`, `SwiftOpenAITTSClient` |
 
 /// Typed failures retain diagnostic details while `LocalizedError` supplies
 /// plain messages for the read-aloud UI.
@@ -82,8 +15,7 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
     /// Trust Center denies `multimodalPolicy.tts_openai` (default OFF). Mirrors
     /// the daemon's `_multimodal_policy_check("tts_openai")` "[trust_denied]" path.
     case trustDenied
-    /// No OpenAI platform key saved in providers/openai.json. Mirrors the
-    /// daemon's "[tts_unavailable] No OpenAI API key found." path.
+    /// The configured OpenAI platform key could not be resolved.
     case notConfigured
     /// HTTP 401 — token rejected. Mirrors "[tts_auth_error] HTTP 401".
     case authRejected
@@ -121,9 +53,7 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
 }
 
 /// SwiftNative OpenAI TTS client. Calls https://api.openai.com/v1/audio/speech
-/// directly via URLSession, resolving the platform key with
-/// `LLMCredentialResolver`. Byte-for-byte request parity with the daemon's
-/// `_VisionClient.tts`.
+/// directly via URLSession, using the caller's model and the shared credential resolver.
 public final class SwiftOpenAITTSClient: Sendable {
     /// Matches the retired daemon `OPENAI_TTS_URL`.
     public static let ttsURL = URL(string: "https://api.openai.com/v1/audio/speech")!
@@ -163,17 +93,7 @@ public final class SwiftOpenAITTSClient: Sendable {
         // empty text BEFORE calling _vision_client.tts.
         if text.isEmpty { throw MultimodalTTSError.emptyText }
 
-        // The one key source: <dataRoot>/providers/openai.json `api_key`.
-        //
-        // REPO_PATH parity (wave 36 W08 / §6.138): resolve against the SAME
-        // `dataRoot` the trust gate above already uses
-        // (`PersistenceCore.defaultDataRoot()`), NOT the CWD-relative default
-        // overload. An installed `.app` bundle runs with CWD `/`, so the
-        // CWD-relative resolver would look in `/data/providers/openai.json`
-        // (nonexistent) and return notConfigured even though the key is sitting
-        // in the stamped/AppSupport data root. The daemon's `_VisionClient` is
-        // constructed with `provider_config_dir=self.root / "providers"`, so
-        // resolving against `dataRoot` is exact parity for installed builds.
+        // Resolve the platform key through the shared owner at this data root.
         guard let key = LLMCredentialResolver.resolveAPIKey(
                 providerConfigFile: "openai.json",
                 dataRoot: dataRoot),

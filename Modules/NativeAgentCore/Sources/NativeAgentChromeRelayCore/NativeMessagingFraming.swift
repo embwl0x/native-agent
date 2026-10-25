@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `NativeMessagingFraming.swift` | `NativeMessagingFramer`: bounded little-endian JSON framing shared by Chrome pipes and private relay socket, with exact fragmented reads |
+
 public enum NativeMessagingFramingError: Error, Equatable, LocalizedError, Sendable {
     case unexpectedEndOfFile
     case emptyMessage

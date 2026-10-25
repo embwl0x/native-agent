@@ -1,12 +1,14 @@
 import BackgroundLoops
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import CognitiveSubstrate
 import Foundation
-import KnowledgeGraph
+import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Studio
 import PersonaEngine
+// Blueprint: | `NativeCognitionRuntime+StudioWander.swift` | `NativeCognitionRuntime`: `considerStudioWander`, `studioWanderIsInstalled`, `studioWanderInstallationNow`; unanswered consult ordering and all encounter invitation wording call editable studio-intake through the originating door, with native source-failure reporting and encounter validation |
 
 // MARK: - HER HOUR, wired — personality-depth item 9
 //
@@ -186,12 +188,6 @@ extension NativeCognitionRuntime {
         // `conserve` budget defers it rather than letting it through. A deferral
         // does NOT consume her hour: the refractory advances only when the hour
         // actually happened.
-        switch await backgroundCognitionGate(reason: "studio_wander:reflection") {
-        case .skipped:
-            return
-        case .allowed:
-            break
-        }
 
         let (material, sourceFailures) = await composeStudioWanderMaterial()
         // 2026-09-06: a source that could not be READ used to look exactly like
@@ -237,8 +233,8 @@ extension NativeCognitionRuntime {
         // The narrowing is not decoration. `runEphemeralToolTurn` inherits the
         // WHOLE catalog, and `fileAccess: read_only` stops file writes and
         // shells but stops none of the things that reach the world: `act`/`go`
-        // move User's screen, `mail_send`/`messages_send`/`slack_post_message`/
-        // `agentmail_send` speak as him, `claude_message`/`codex_message`/
+        // move User's screen, `mail_send`/`messages_send`
+        // speak as him, `claude_message`/`codex_message`/
         // `invoke_codex` wake other agents, `commit_memory` rewrites what she
         // knows, the `desk_*` mutations edit his board, `workshop_submit` starts
         // work. An unattended hour of her own must be able to LOOK and to WRITE
@@ -255,7 +251,7 @@ extension NativeCognitionRuntime {
             ),
             shouldContinue: { [weak self] in await self?.studioWanderStillEligible() ?? false }
         )
-        let response: ChatOrchestration.ChatResponse
+        let response: ChatTurnRuntime.ChatResponse
         do {
             let client = engine.chatClient(tools: witness)
             response = try await LLMCallContext.$purpose.withValue("studio_wander") {
@@ -353,7 +349,7 @@ extension NativeCognitionRuntime {
         // reading a stale `.installed`.
         guard await Self.studioWanderIsInstalled(dataRoot: dataRoot) else { return }
         let entry = StudioWanderLane.TraceEntry(
-            at: StudioClock.nowISO(at),
+            at: NativeTimestampFormat.sixDigitUTCOffset(at),
             outcome: outcome,
             line: line,
             journalEntryID: journalEntryID
@@ -424,7 +420,11 @@ extension NativeCognitionRuntime {
 
         var invitations: [StudioEncounterCandidate]
         do {
-            invitations = try await store.namedEncounterIntake()
+            let host = self.host, root = dataRoot
+            invitations = try await store.namedEncounterIntake { input in
+                try await host.callReadPart(id: "studio-intake", input: input, actions: ["studio.intake.read"],
+                    dataRoot: root, origin: "studio_wander:intake")
+            }
         } catch {
             invitations = []
             sourceFailures.append("named encounter intake: \(error.localizedDescription)")
@@ -455,6 +455,20 @@ extension NativeCognitionRuntime {
             .reversed()
             .map(\.work.title)
 
+        var invitationLines: [String] = []
+        do {
+            let packet: [JSONValue] = invitations.map { candidate in
+                .object(["source": .string(candidate.source.rawValue), "id": .string(candidate.originID),
+                    "title": candidate.title.map(JSONValue.string) ?? .null,
+                    "creator": candidate.creator.map(JSONValue.string) ?? .null,
+                    "reference": candidate.reference.map(JSONValue.string) ?? .null])
+            }
+            let result = try await host.callReadPart(id: "studio-intake", input: .object([
+                "operation": .string("invitations"), "candidates": .array(packet),
+                "unavailable_sources": .array(sourceFailures.map(JSONValue.string))]),
+                actions: ["studio.intake.read"], dataRoot: dataRoot, origin: "studio_wander:invitations")
+            invitationLines = try JSONDecoder().decode([String].self, from: result.serializedData(pretty: false))
+        } catch { sourceFailures.append("studio invitations: \(error.localizedDescription)") }
         let material = StudioWanderLane.Material(
             curiosity: curiosity,
             // An invitation she cannot open is a tease. A consult User filed is
@@ -463,11 +477,7 @@ extension NativeCognitionRuntime {
             // prompt names the tool. Without this she was being shown one-line
             // summaries of works and asked to judge them, which is the
             // description-only encounter her own rule forbids.
-            invitations: invitations.map { candidate in
-                guard candidate.source == .named else { return candidate.invitationLine }
-                return "\(candidate.invitationLine) "
-                    + "[studio_consult_read consult_id: \(candidate.originID)]"
-            },
+            invitations: invitationLines,
             recentJournalTitles: Array(recentTitles),
             interests: await substrate.openInterests().prefix(2).map { interest in
                 interest.title == interest.body ? interest.body : "\(interest.title) — \(interest.body)"
@@ -707,9 +717,9 @@ extension NativeCognitionRuntime {
 /// `runEphemeralToolTurn` inherits the whole catalog, and `fileAccess:
 /// "read_only"` gates the FILESYSTEM, not the world: it blocks `write_file` and
 /// the shells and leaves `act`, `go`, `mail_send`, `messages_send`,
-/// `slack_post_message`, `agentmail_send`, `claude_message`, `codex_message`,
+/// `claude_message`, `codex_message`,
 /// `invoke_codex`, `agent_swarm`, `commit_memory`, `workshop_submit`, the
-/// `desk_*` mutations and every external MCP tool fully reachable. A deny list
+/// `desk_*` mutations fully reachable. A deny list
 /// over that surface fails OPEN the moment somebody adds a tool — which is the
 /// one direction an unattended, unwitnessed lane must never fail. So this is an
 /// allowlist: anything not named here is neither advertised nor dispatchable,
@@ -733,7 +743,7 @@ struct StudioWanderToolAllowlist: ToolDispatchClient {
         "mac.look", "mac.read", "files.read", "files.excerpt", "web.read",
         "browser.status", "browser.open", "browser.text", "browser.links", "browser.screenshot",
         "studio.journal", "studio.recall", "studio.consult_read",
-        "memory.recall", "graph.search", "context.expand", "skill.list", "skill.read",
+        "memory.recall", "graph.search", "context.expand", "ability.list", "ability.read",
         "time.now", "mind.inner_state", "result.page",
     ]
 

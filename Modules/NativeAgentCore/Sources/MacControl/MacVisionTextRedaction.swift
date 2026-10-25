@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `MacVisionTextRedaction.swift` | `VisionTextRedaction`, `VisionRedactionConfig`, `VisionRedactedText`; pixel-unit adapter to shared AX caption geometry; one positional caption/overlap redaction boundary for both OCR readers |
 
 // MARK: - Shared positional OCR redaction
 //
@@ -11,12 +12,8 @@ import PersistenceCore
 // drift, and the copy that drifts is the one nobody re-reviews (the reason
 // ActivityWatch depends on MacControl for exactly this, Package.swift).
 //
-// What this file DOES own is the GEOMETRY, because the pixel channel has no AX
-// tree: there are no enclosing groups and no control captions, only boxes. So
-// the beside/above caption test that `MacScreenViewTextRedaction.applied` runs
-// over AX frames is run here over OCR BOXES — the caption of a value is the
-// short text immediately left of it on the same line, or directly above it.
-// That is the design detail the v0 pipeline said it had to prove.
+// OCR boxes use the shared AX caption predicate in their own pixel units.
+// This file owns overlap between recognized fragments, not enclosing AX groups.
 
 public struct VisionRedactedText: Sendable, Equatable {
     /// The recognized string, kept in memory for geometry and matching. It is
@@ -66,29 +63,19 @@ public struct VisionRedactionConfig: Sendable, Equatable {
 }
 
 public enum VisionTextRedaction {
-    /// Is `caption` positioned as the LABEL of the value at `value`?
-    /// Mirrors the AX channel's geometry: immediately left on the same line,
-    /// or directly above with horizontal overlap.
+    /// Is `caption` immediately left of the value on the same line, or directly
+    /// above with horizontal overlap? Coordinates and proximity must share units.
     public static func isCaption(
         _ caption: VisionRect,
         forValueAt value: VisionRect,
         proximity: Double
     ) -> Bool {
-        guard caption.w > 0, caption.h > 0, value.w > 0, value.h > 0 else { return false }
         guard caption != value else { return false }
-        let sameRow = caption.y < value.maxY && caption.maxY > value.y
-        let toTheLeft = caption.maxX <= value.x + 1
-        if sameRow, toTheLeft {
-            let distance = value.x - caption.maxX
-            return distance >= 0 && distance <= proximity
-        }
-        let above = caption.maxY <= value.y + 1
-        let horizontallyOverlapping = caption.x < value.maxX && caption.maxX > value.x
-        if above, horizontallyOverlapping {
-            let distance = value.y - caption.maxY
-            return distance >= 0 && distance <= proximity
-        }
-        return false
+        return MacScreenViewTextRedaction.isLabel(
+            MacAXFrame(x: caption.x, y: caption.y, w: caption.w, h: caption.h),
+            forValueAt: MacAXFrame(x: value.x, y: value.y, w: value.w, h: value.h),
+            proximity: proximity
+        )
     }
 
     /// Every OCR string, redacted under the shared rules, BEFORE anything

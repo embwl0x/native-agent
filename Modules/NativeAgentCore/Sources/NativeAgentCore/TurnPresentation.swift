@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentShared
 
+// Blueprint: | `TurnPresentation.swift` | `TurnPresentationReducer`: sanitized bounded turn lifecycle/activity projection; no tool arguments, payloads or hidden reasoning |
+
 /// Surface-neutral lifecycle phases for presenting one accepted agent turn.
 /// Raw values remain stable for existing persisted presentation adapters.
 public enum TurnPresentationPhase: String, CaseIterable, Sendable, Codable, Equatable {
@@ -93,6 +95,7 @@ public struct TurnPresentationState: Sendable, Equatable {
     // enough to coalesce duplicate streaming snapshots while observing real
     // movement.
     public internal(set) var streamedTextLength: Int
+    public internal(set) var firstReplyAt: Date? = nil
 
     public var isTerminal: Bool { phase.isTerminal }
 
@@ -300,6 +303,7 @@ public enum TurnPresentationReducer {
         next.currentAction = safeAction
         next.delegateName = safeDelegate
         next.streamedTextLength = nextTextLength
+        if nextTextLength > 0, next.firstReplyAt == nil { next.firstReplyAt = movementAt }
         next.activities.append(TurnPresentationActivity(
             phase: phase,
             detail: safeAction,

@@ -2,6 +2,8 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `ContextFlowModels.swift` | ContextFlow value vocabulary: source/atom/relationship identity, authority, privacy, injection policy and immutable generation records |
+
 // MARK: - Stable identifiers
 
 public struct ContextSourceID: RawRepresentable, Codable, Hashable, Sendable, Comparable {

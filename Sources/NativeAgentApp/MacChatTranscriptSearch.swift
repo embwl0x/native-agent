@@ -2,6 +2,8 @@ import Foundation
 import Observation
 import SwiftUI
 import ChatSessionWork
+import NativeAgentCore
+// Blueprint: | `MacChatTranscriptSearch.swift` | `MacChatTranscriptSearch` alias to `ChatSessionWork.TranscriptSearch`; `MacChatTranscriptSearchCursor`, `MacChatTranscriptSearchController`, `MacChatTranscriptSearchBar`; source preparation and search results publish through `LatestRead`, with input revisions retained only for coalescing; `TranscriptSearch.scrollTargetID` |
 
 typealias MacChatTranscriptSearchDocument = TranscriptSearchDocument
 typealias MacChatTranscriptSearchResult = TranscriptSearchResult
@@ -63,10 +65,10 @@ final class MacChatTranscriptSearchController {
     @ObservationIgnored private var sourceMessages: [ChatMessage] = []
     @ObservationIgnored private var structureVersion: UInt64?
     @ObservationIgnored private var sourceTask: Task<Void, Never>?
-    @ObservationIgnored private var sourceGeneration: UInt64 = 0
+    @ObservationIgnored private let sourceRead = LatestRead()
     @ObservationIgnored private var sourceSessionID = ""
     @ObservationIgnored private var sourceRevision: UInt = 0
-    @ObservationIgnored private var searchGeneration: UInt = 0
+    @ObservationIgnored private let searchRead = LatestRead()
     @ObservationIgnored private var searchTask: Task<Void, Never>?
     typealias SearchOperation = @Sendable (String, [MacChatTranscriptSearchDocument]) async -> MacChatTranscriptSearchResponse?
     @ObservationIgnored private let search: SearchOperation
@@ -110,14 +112,12 @@ final class MacChatTranscriptSearchController {
         guard structureVersion != revision else { return }
         structureVersion = revision
         sourceMessages = messages
-        sourceGeneration &+= 1
-        let generation = sourceGeneration
         sourceTask?.cancel()
         sourceTask = Task {
+            _ = await sourceRead.read({
             var prepared = await Task.detached(priority: .userInitiated) {
                 MacChatTranscriptSearch.documents(from: messages)
             }.value
-            guard !Task.isCancelled, generation == sourceGeneration else { return }
             // A token can arrive while the structure is being prepared.
             let ordinal = sourceMessages.count - 1
             if prepared.last?.ordinal == ordinal { prepared.removeLast() }
@@ -125,10 +125,13 @@ final class MacChatTranscriptSearchController {
                let document = MacChatTranscriptSearch.document(from: tail, ordinal: ordinal) {
                 prepared.append(document)
             }
+            return prepared
+            }, publish: { prepared in
             documents = prepared
             sourceTask = nil
             sourceRevision &+= 1
             if !query.isEmpty || phase != .results { scheduleSearch() }
+            })
         }
     }
 
@@ -192,11 +195,11 @@ final class MacChatTranscriptSearchController {
         searchTask?.cancel()
         sourceTask?.cancel()
         sourceTask = nil
-        sourceGeneration &+= 1
+        sourceRead.write {}
         structureVersion = nil
         sourceMessages = []
         searchTask = nil
-        searchGeneration &+= 1
+        searchRead.write {}
         sourceRevision &+= 1
         sourceSessionID = sessionID
         documents = []
@@ -211,7 +214,7 @@ final class MacChatTranscriptSearchController {
         if restarting {
             searchTask?.cancel()
             searchTask = nil
-            searchGeneration &+= 1
+            searchRead.write {}
         }
         let bounded = MacChatTranscriptSearch.boundedQuery(query)
 
@@ -226,31 +229,30 @@ final class MacChatTranscriptSearchController {
         // Source updates coalesce into the active pass instead of restarting
         // its deadline on every token. Only a changed query restarts debounce.
         guard searchTask == nil else { return }
-        let generation = searchGeneration
         let rawQuery = query
         phase = .searching
         searchTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(120))
-                guard !Task.isCancelled, let self,
-                      generation == self.searchGeneration else { return }
+                guard !Task.isCancelled, let self else { return }
                 let revision = self.sourceRevision
-                let response = await self.search(rawQuery, self.documents)
-                guard !Task.isCancelled, generation == self.searchGeneration else { return }
-                guard let response else {
+                let response = await self.searchRead.read({ await self.search(rawQuery, self.documents) }, publish: { response in
+                    if let response { self.apply(response, preserving: self.selectedMessageID) }
+                })
+                guard !Task.isCancelled else { return }
+                guard response != nil else {
                     self.searchTask = nil
                     return
                 }
                 // The reader may have navigated during the scan. Anchor to
                 // that latest selection, not the one at refresh submission.
-                self.apply(response, preserving: self.selectedMessageID)
                 guard revision != self.sourceRevision else {
                     self.searchTask = nil
                     return
                 }
                 // A mutation during this scan queues one more sequential pass.
                 // Mutations during that pass can queue another; no finite tail
-                // is lost and scans never overlap within a query generation.
+                // is lost and scans never overlap within a query.
             }
         }
     }

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplayChecked`; schema status and dated REM resolutions share the inbox's decision snapshot by proposal identity; adoption requires its application claim; unmatched retained history stays explicitly unavailable, without persisting another status or resolution |
 
 extension CognitiveSubstrate {
     /// Scheduled replay's checked boundary. All replay artifacts, lineage, and
@@ -194,6 +195,33 @@ extension CognitiveSubstrate {
             proposal.decision = decisions[String(proposal.lineageId.dropFirst(4))]
             return proposal
         }
+    }
+
+    // Canonical timeline source titles also feed developmental recall. Keep
+    // those bytes native; growth-week.js owns only the readout projection.
+    static func growthRowTitle(for event: CognitiveDevelopmentalTimelineEvent) -> String {
+        let title = event.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = title.lowercased()
+        let namesTheActNotTheThing =
+            lower.hasPrefix("schema proposal")
+            || lower.hasPrefix("identity proposal")
+            || lower.hasSuffix("rem proposal")
+        guard namesTheActNotTheThing else { return title }
+        // THE FIRST SENTENCE, not the whole lesson. A title is a name; a
+        // paragraph in the name slot pushes the verdict and the reason off the
+        // end of the line, which is the same failure by another route.
+        let lesson = {
+            let flat = event.summary.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            return flat.count > 160 ? String(flat.prefix(159)) + "…" : flat
+        }()
+        guard !lesson.isEmpty else { return title }
+        guard let stop = lesson.firstIndex(where: { $0 == "." || $0 == "?" || $0 == "!" }) else {
+            return lesson
+        }
+        let sentence = String(lesson[lesson.startIndex...stop])
+        // A "sentence" of three words is an abbreviation the scanner tripped
+        // on, not a name; keep the whole lesson rather than a stub.
+        return sentence.count >= 16 ? sentence : lesson
     }
 
     public func developmentalTimelineSnapshot(limit: Int = 40) async -> [CognitiveDevelopmentalTimelineEvent] {

@@ -1,6 +1,7 @@
 import NativeAgentCore
 import PersistenceCore
 import Foundation
+// Blueprint: | `ChatToolBridges.swift` | `PureToolArgumentValidating` protocol; `argumentRefusal`; MacIntegrationToolBridge requires the requesting data root for due-reminders |
 
 /// Optional argument validation owned by the executor. Implementations must use
 /// their execution parser, perform no I/O or permission requests, and return the
@@ -16,7 +17,7 @@ public protocol PureToolArgumentValidating: Sendable {
 // from Settings → Mac Integration). The actual EventKit / notification /
 // Spotlight backends live in the NativeAgentApp target (MacPIMConnectorActions,
 // NativeClient.runMacNotify/.runMobileNotify/.runMacSpotlightSearch) and
-// ChatOrchestration can't import them — Foundation/EventKit headers would pull
+// ChatTurnContracts can't import them — Foundation/EventKit headers would pull
 // the whole app surface into a leaf module.
 //
 // The app injects a conforming bridge during ChatOrchestrationClient init.
@@ -31,9 +32,9 @@ public protocol MacIntegrationToolBridge: Sendable {
     func remindersQuery(input: [String: JSONValue]) async throws -> JSONValue
     func remindersRead(input: [String: JSONValue]) async throws -> JSONValue
     func remindersUpdate(input: [String: JSONValue]) async throws -> JSONValue
-    func remindersListDueToday(input: [String: JSONValue]) async throws -> JSONValue
+    func remindersListDueToday(input: [String: JSONValue], dataRoot: URL) async throws -> JSONValue
     func macNotify(input: [String: JSONValue]) async throws -> JSONValue
-    func mobileNotify(input: [String: JSONValue]) async throws -> JSONValue
+    func mobileNotify(input: [String: JSONValue], surface: String) async throws -> JSONValue
     func phoneRequest(input: [String: JSONValue]) async throws -> JSONValue
     func spotlightSearch(input: [String: JSONValue]) async throws -> JSONValue
 

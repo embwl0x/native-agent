@@ -2,6 +2,7 @@ import NativeAgentCore
 import Foundation
 import GRDB
 import PersistenceCore
+// Blueprint: | `CognitiveSQLiteStore.swift` | `CognitiveSQLiteStore` actor; `backupForDoctor`, `saveNodes` |
 
 struct CognitiveSQLitePruneResult: Sendable, Equatable {
     var deletedNodes: Int

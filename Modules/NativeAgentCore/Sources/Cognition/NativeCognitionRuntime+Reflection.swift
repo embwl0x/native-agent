@@ -2,7 +2,6 @@
 
 import Foundation
 import BackgroundLoops
-import ChatOrchestration
 import CognitiveSubstrate
 import Context
 import DreamREMCycle
@@ -12,6 +11,8 @@ import MemoryV2
 import PersistenceCore
 import Desk
 import ProviderRouting
+
+// Blueprint: | `NativeCognitionRuntime+Reflection.swift` | `NativeCognitionRuntime` reflection: dream/REM-triggered single-flight reflection, budget admission, result settlement and pursuit proposals |
 
 private enum CognitiveReflectionPersonaError: Error, Sendable, CustomStringConvertible {
     case compileFailed(String)
@@ -74,10 +75,6 @@ extension NativeCognitionRuntime {
         await bootstrap()
         if let bootstrapFailure { return .failed(bootstrapFailure) }
         if let providerRoutingFailure { return .failed(providerRoutingFailure) }
-        switch await backgroundCognitionGate(reason: reason) {
-        case .skipped(let reason): return .skipped(reason)
-        case .allowed: break
-        }
         let request: CognitiveReflectionRequest
         // Take the lease BEFORE planning: planning sets the in-flight
         // reservation, and a lease refusal after it would strand that
@@ -164,7 +161,6 @@ extension NativeCognitionRuntime {
             candidates: candidates,
             openAgentPursuitCount: openPursuits.count,
             standingViewIdsWithOpenPursuit: citedViewIds,
-            openPursuitTitles: allAgentPursuits.map(\.title),
             resolveStatus: { statusById[$0] }
         ) else { return }
 
@@ -218,21 +214,6 @@ extension NativeCognitionRuntime {
         let configuration = await substrate.configurationSnapshot()
         guard configuration.enabled && configuration.reflectiveCallsEnabled else {
             let gateReason = "reflection is disabled"
-            await substrate.recordReceipt(
-                kind: "reflection.skipped",
-                payload: .object([
-                    "reason": .string(reason),
-                    "status": .string("gate_denied"),
-                    "error": .string(gateReason),
-                ])
-            )
-            publishRuntimeChange(reason: "reflection:gate_denied")
-            return .skipped(gateReason)
-        }
-        switch await backgroundCognitionGate(reason: reason) {
-        case .allowed:
-            break
-        case .skipped(let gateReason):
             await substrate.recordReceipt(
                 kind: "reflection.skipped",
                 payload: .object([
@@ -321,12 +302,14 @@ extension NativeCognitionRuntime {
         }
         do {
             let system = try await cognitiveReflectionSystemPrompt(surface: request.surface)
-            let raw = try await llm.complete(
-                prompt: request.prompt,
-                system: system,
-                model: routedModel,
-                surface: request.surface, purpose: "reflection"
-            )
+            let raw = try await PrivateWorkContextAssembly.$current.withValue(.suppliedPersona) {
+                try await llm.complete(
+                    prompt: request.prompt,
+                    system: system,
+                    model: routedModel,
+                    surface: request.surface, purpose: "reflection"
+                )
+            }
             try Task.checkCancellation()
             result = try JSONDecoder().decode(CognitiveReflectionJudgment.self, from: Data(raw.utf8))
             try result.validate(material: request.material)
@@ -431,8 +414,8 @@ extension NativeCognitionRuntime {
             ])
         )
         let boundary = """
-        # Background Cognition Boundary
-        You are in a private NativeAgent background reflection pass. Produce a concise reflection grounded only in the provided runtime state. Do not claim hidden state, mutate identity, dispatch actions, or treat inferred/dreamed content as observed. Any identity, memory, or schema change must remain a proposal for review.
+        # Private reflection
+        Reflect as yourself on the supplied runtime evidence. Be concise. Do not claim hidden state, dispatch actions, change identity, memory or schemas, or treat inferred or dreamed content as observed. Use only the standing-view path stated in the task.
         """
         return [compiled, boundary].joined(separator: "\n\n")
     }

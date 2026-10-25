@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `StandingBotSchedule.swift` | `StandingBotSchedule` enum; `parse`, `words` |
 
 /// A deliberately small input language; the existing cadence owner validates
 /// and schedules its output. Unsupported prose never becomes a guessed cron.
@@ -6,13 +7,10 @@ public enum StandingBotSchedule {
     /// Cron day-of-week order: 0 is Sunday.
     public static let weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
 
-    public static func parse(_ input: String, timezone: String? = nil) throws -> BotCadence {
+    public static func parse(_ input: String) throws -> BotCadence {
         let words = input.trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
-        if words == ["manual"] {
-            guard timezone == nil else { throw invalid("Manual timing does not use a timezone") }
-            return .manual
-        }
+        if words == ["manual"] { return .manual }
         if words.count == 3, words[0] == "every", words[1].utf8.allSatisfy({ (48...57).contains($0) }),
            let count = Int(words[1]), count > 0 {
             let multiplier: Int
@@ -21,7 +19,6 @@ public enum StandingBotSchedule {
             case "hour", "hours": multiplier = 3600
             default: throw unsupported
             }
-            guard timezone == nil else { throw invalid("Interval timing does not use a timezone") }
             let (seconds, overflow) = count.multipliedReportingOverflow(by: multiplier)
             guard !overflow else { throw invalid("Schedule interval is too large") }
             return .interval(seconds: TimeInterval(seconds))
@@ -41,15 +38,8 @@ public enum StandingBotSchedule {
         let hour = Int(clock[0] - 48) * 10 + Int(clock[1] - 48)
         let minute = Int(clock[3] - 48) * 10 + Int(clock[4] - 48)
         guard hour < 24, minute < 60 else { throw invalid("Schedule time must be between 00:00 and 23:59") }
-        // No zone given: the time follows the Mac wherever it is.
-        let zone = BotCadence.setZone(timezone)
-        if let zone {
-            guard TimeZone.knownTimeZoneIdentifiers.contains(zone) || ["UTC", "GMT"].contains(zone),
-                  TimeZone(identifier: zone) != nil else {
-                throw invalid("Unknown timezone; use an IANA name such as America/Denver, or none to follow this Mac")
-            }
-        }
-        return .cron(expression: "\(minute) \(hour) * * \(days)", timeZone: zone)
+        // The time follows the Mac wherever it is.
+        return .cron(expression: "\(minute) \(hour) * * \(days)")
     }
 
     /// The words the Bots page shows ("Weekly", "Manual only"); the agent's
@@ -62,10 +52,10 @@ public enum StandingBotSchedule {
                 : seconds < 3600 ? "Every \(Int(seconds / 60)) minutes"
                 : seconds.truncatingRemainder(dividingBy: 86400) == 0 ? "Every \(Int(seconds / 86400)) days"
                 : "Every \((seconds / 3600).formatted()) hours"
-        case .cron(_, let timeZone):
-            // "Daily at 23:57", not the raw cron; a zone only when one is pinned.
+        case .cron:
+            // "Daily at 23:57", not the raw cron.
             let said = describe(cadence)
-            return said.prefix(1).uppercased() + said.dropFirst() + (timeZone.map { " · " + $0 } ?? "")
+            return said.prefix(1).uppercased() + said.dropFirst()
         }
     }
 
@@ -80,7 +70,7 @@ public enum StandingBotSchedule {
                 return "every " + String(format: "%.0f", seconds / 60) + (seconds == 60 ? " minute" : " minutes")
             }
             return "every \(seconds) seconds"
-        case .cron(let expression, _):
+        case .cron(let expression):
             let parts = expression.split(separator: " ").map(String.init)
             if parts.count == 5, let minute = Int(parts[0]), let hour = Int(parts[1]),
                (0...59).contains(minute), (0...23).contains(hour),

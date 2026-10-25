@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `TrustBackupFoundation.swift` | `JSONDecoder`: extension |
 
 extension JSONDecoder {
     public static var nativeAgent: JSONDecoder {

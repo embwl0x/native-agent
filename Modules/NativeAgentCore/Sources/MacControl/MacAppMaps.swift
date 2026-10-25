@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `MacAppMaps.swift` | `MacAppMapStore` owns per-app control maps and learned choices; malformed maps remain in place without overwrite; no quarantine/reset copy |
 
 // Her-screen Phase 5 — MUSCLE MEMORY: per-app maps.
 //
@@ -117,9 +118,7 @@ public actor MacAppMapStore {
         MacAppMaps.fileName(bundle).map { directory.appendingPathComponent($0) }
     }
 
-    /// nil = the file exists but could not be read (I/O): nothing may be
-    /// written over it this time. A malformed file is moved aside to
-    /// `.corrupt` and the map starts fresh.
+    /// Malformed maps remain in place and are not overwritten.
     private func load(_ bundle: String) -> MacAppMap? {
         guard let url = url(bundle) else { return nil }
         // Unflushed changes are newer than the file.
@@ -135,11 +134,7 @@ public actor MacAppMapStore {
             cache[bundle] = (mtime, map)
             return map
         }
-        let aside = url.appendingPathExtension("corrupt")
-        try? FileManager.default.removeItem(at: aside)
-        guard (try? FileManager.default.moveItem(at: url, to: aside)) != nil else { return nil }
-        cache[bundle] = (nil, MacAppMap())
-        return MacAppMap()
+        return nil
     }
 
     private func store(_ bundle: String, _ map: MacAppMap) {

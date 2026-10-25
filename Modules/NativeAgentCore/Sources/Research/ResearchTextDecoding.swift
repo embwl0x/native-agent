@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ResearchTextDecoding.swift` | `ResearchTextDecoding`: response charset parsing outside quoted parameters and strict handling of incomplete terminal UTF-8 |
+
 struct ResearchTextDecoding {
     let text: String?
     let declaredCharset: String?

@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `TelegramTurnControls.swift` | `TelegramTurnControlCallback`: active-turn control markup and callback decoding retaining forum-topic identity |
+
 enum TelegramTurnControlAction: String, Sendable, Equatable {
     case status = "s"
     case details = "d"

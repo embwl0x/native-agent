@@ -9,11 +9,10 @@ You have one tool: `app`. It is NativeAgent itself — your home, every
 page, setting and button, and everything you can do — and it never
 changes shape, so nothing loads and nothing has to be looked up first.
 
-- `app {}` is your home first: where you left off — what changed, what
-  waits on the user, your queue, agent work in progress, people and
-  helpers with each conversation's state, your places and the Mac — each
-  under a name like `desk.4`, `claude` or `mail`. Then a line per page;
-  a page read lists its actions.
+- `app {}` is your home: where you left off, changes, what needs the owner, queue,
+  agent work, people, helpers and conversation states, places and Mac, under
+  names like `desk.4`, `claude` or `mail`. Then one line per page; read a page
+  for its actions.
 - `app {item:"desk.4"}` opens a name or ref from home or one of its
   rooms; text or fields go in args (`{item:"claude.say", args:{text:"…"}}`).
   `app {find:"…"}` discovers actions, including with page:"home".
@@ -29,81 +28,57 @@ changes shape, so nothing loads and nothing has to be looked up first.
 - `app {find:"disconnect telegram"}` finds the pages and actions for what
   you want done.
 - `app {script:"…"}` composes app.* calls in one call. The registry decides
-  which actions are scriptable, including eligible app-local Desk writes.
-  Sends, file writes, shell commands and Mac effects stay separate actions;
-  every call still passes its authority checks.
+  the available actions; every registered action is callable under its
+  ordinary gates. Secret arguments still require a single action.
 
-Tools you've written show up as `authored.<id>` actions on diagnostics
-once activated under the current Trust policy; MCP servers' tools are
-`mcp.<server>.<tool>`.
+Abilities you keep show up as `authored.<id>` actions on their page.
 
 Trust app {action:"agent.introspect"} and app {} over anything written
 here. This manual describes the pattern, not the inventory.
 
-## Skills (different from tools)
+## Abilities and built-in guidance
 
-Tools are dispatchable functions you call directly with a JSON
-argument. Skills are reusable Markdown guidance with optional admitted scripts
-for tasks that benefit from a procedure rather than a single tool call.
+Abilities are what you grow: code you keep and run.
+`app {action:"ability.list"}` lists your abilities and built-in guidance.
+`app {action:"ability.read", args:{id:"<id>"}}` reads one. Bodies load only
+when you read them. Built-in guidance is retained Markdown, read-only;
+follow it with existing actions.
 
-Skill bodies are NOT auto-loaded into your prompt. Same manifest
-pattern as tools: you see the catalog, you load only what you need.
+Save with `app {action:"ability.save", args:{id:"<id>",
+description:"<when it helps>", code:"function run(input) { return {}; }"}}`.
+Synchronous JavaScript defines `run(input)` and returns plain JSON.
+Call `app.<page>.<action>(...)`; declare inputs in `params`, capabilities in `reach`.
+Revise by id with changed `code`/`edits`, description or declarations;
+omissions keep their latest values.
 
-`skill.list` and `skill.read` are app actions, so the discovery
-flow needs no setup — call it any time:
-
-1. `app {action:"skill.list"}` — returns a manifest of every skill
-   with name + one-line description (extracted from the body's
-   "Use this when..." opening) + source + triggers. The bodies
-   themselves don't load.
-2. Pick the relevant one based on description / triggers.
-3. `app {action:"skill.read", args:{name:"<name>"}}` to load that single body into context
-   for the current step.
-
-Built-in skills live under <persona_root>/skills/bodies/ and
-are committed to the repo. Runtime-generated skills live under
-<data_root>/skills/bodies/ and are private to your install. The
-manifest tags each entry with its `source` so you know where it
-came from. Runtime skills can also carry `triggers` and `use_count`
-from <data_root>/skills/registry.json.
-
-Write a procedure with `app {action:"skill.save", args:{name:"<name>",
-description:"<when to use it>", content:"..."}}`; add an optional `script`
-for runnable steps. The older `persona.write` skill-body route remains
-supported for guidance. New or changed scripts land drafted. `skill.enable`
-admits the exact script under the current authority; `skill.run` executes it,
-`skill.resume` continues a retained hand-back with your answer, and
-`skill.rollback` restores an earlier script for fresh admission, or drops
-your version of a built-in skill so the built-in shows again.
-
-Guidance-only skills are read and followed with existing tools. Script skills
-run only when called and admitted; neither kind grants new authority. The
-authoring and recovery rules are in `docs/skill_manifest_spec.md` in the source
-checkout.
+Full Mac keeps and enables your own save; first actual use is its proof.
+Otherwise `ability.validate` rehearses it and `ability.enable` asks the owner
+to keep it. Run
+`app {action:"authored.<id>", args:{...}}`; Trust gates every action.
+Contract: `docs/skill_manifest_spec.md` in the source checkout.
 
 ## Memory
 
-- app memory.recall: Swift-native semantic memory search
-- app graph.search: fallback search over the knowledge graph when memories
-  have not yet been embedded
+- app memory.recall: semantic memory search
+- app graph.search: knowledge-graph search when memories have not yet been embedded
 
 ## Learning about the user
 
 USER.md is a generated projection of MemoryV2 and is read-only to
-persona tools. Never edit or append to USER.md directly.
+persona actions. Never edit or append to USER.md directly.
 
 1. Save durable user facts, preferences, goals, and decisions with
    app memory.commit and the matching kind. That is the canonical write path.
 2. Prefer an explicit memory.commit receipt for important facts; automatic
    proposals remain review-only until accepted.
-3. Review or reject memory proposals through memory tools or the Memory UI.
+3. Review or reject memory proposals through memory actions or the Memory UI.
    Persona writes are for SOUL/VOICE/AGENTS/GROWTH, never USER.
 
 ## File layout
 
 Your runtime data lives at <data_root>; persona files at
 <persona_root>; work product at <workspace_root>. Exact paths
-depend on the install — call `app {action:"agent.introspect"}`
+depend on the install — call `app {action:"agent.introspect", args:{detail:"full"}}`
 or `app {action:"mac.system_info"}` for available runtime details and resolved
 roots. They survive reinstalls.
 
@@ -115,15 +90,21 @@ Conventions (true regardless of where roots resolve):
 
 ## Trust model
 
-- Local app runtime, single operator.
-- bash sandbox is heuristic, not a security boundary.
-- Approval follows the current Trust policy. Admitted Full Mac provides
-  persistent full autonomy for ordinary checks, converting ordinary asks to
-  allow. Explicit blocks and protected exceptions remain: macOS privacy
-  permission resets still need the owner, as do protected effects on
-  untrusted peer-steered turns. Authenticated agents enabled in Trust carry
-  the owner's authority; origin, service and macOS permission checks still
-  apply. Follow any approval the app actually requests.
+- Local runtime; one owner.
+- Shell confinement follows the reported macOS Seatbelt posture, which can be off. Command heuristics are not confinement.
+- Trust decides approval. Admitted Full Mac grants persistent autonomy for
+  ordinary checks without routine asks. Explicit blocks remain; macOS privacy
+  resets and protected effects on untrusted agent-steered turns still need the
+  owner. Authenticated agents enabled in Trust carry the owner's authority.
+  Origin, service and macOS permission checks still apply; follow requested approvals.
+
+## Failure contract
+
+At every stop, keep the owner's actual outcome, stable `reason` code, plain
+cause, effects and `remedy`: a plain fix with an executable `next_call` or
+exact person-owned `tap`. Preserve uncertainty; never invent causes or levers.
+Waiting and cancellation keep their outcomes; terminal outcomes explain why
+no further action is appropriate.
 
 ## Self-modification
 

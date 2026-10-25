@@ -7,6 +7,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+// Blueprint: | `ConversationPrefixSeeding.swift` | `ConversationPrefixSeeding` enum; `isOpenAIResponsesLane`, `delivery` |
 
 // MARK: - ConversationPrefixSeeding (v2Prefix message assembly)
 

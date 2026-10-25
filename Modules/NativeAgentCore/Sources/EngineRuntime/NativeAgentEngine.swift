@@ -1,11 +1,16 @@
 import BackgroundWork
+import AgentWorkspace
+import Studio
 import ApprovalTransactions
 import AppToolRuntime
 import Foundation
 import NotificationInbox
 import AttentionRouting
 import Agents
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatToolRuntime
+import AgentConversations
 import ChromeControl
 import Cognition
 import MacControl
@@ -15,10 +20,14 @@ import ContextFlow
 import DeviceSync
 import NativeAgentCore
 import PersistenceCore
+import PersonaEngine
 import Desk
 import StandingBots
+import ToolExecution
+import TurnTrace
 import TrustCenter
 import WorkshopExecution
+// Blueprint: | `NativeAgentEngine.swift` | Core live/isolated root selection, chat/tool and manifest composition; resident service facades, shared persona/configuration/runs projections and `ConnectorStatusProjection`; Desk receives the engine's inbox, approvals and bots; owns root-scoped contact/crew and layout observation plus Activity invalidations and the bot scheduler shared by deadlines and read projections |
 
 // MARK: - Engine root
 
@@ -32,6 +41,7 @@ import WorkshopExecution
 /// TrustCenter, and the per-turn gated dispatcher.
 public final class NativeAgentEngine: Sendable {
     public let dataRoot: URL
+    public let layout: SurfaceLayoutLive
     public let ports: NativeAgentEnginePorts
     public let hasBody: Bool
     /// The resident mind: cognitive events and capsule, provider lifecycle,
@@ -43,6 +53,8 @@ public final class NativeAgentEngine: Sendable {
     /// Doctor, this runtime's health and the loop watchdog, in core types;
     /// Diagnostics, Status and the health pill observe it.
     public let doctor: DoctorFacade
+    /// Persisted turn evidence shared by Mac Inspector and phone summaries.
+    public let trace: TurnInspectorFeed
     /// Device sync: the phone's bridge, snapshots, signed inbox, pairing and
     /// APNs. Only a root with a body has one.
     public let deviceSync: DeviceSync?
@@ -51,6 +63,8 @@ public final class NativeAgentEngine: Sendable {
     /// MemoryV2 and the Knowledge Graph for this root, in core types; the
     /// Memories and Knowledge Graph pages observe it.
     public let memory: MemoryFacade
+    /// One saved persona presentation for the Mac and phone.
+    public let persona: PersonaFacade
     /// The ApprovalInbox and the live notification inbox for this root, in
     /// core types; every approval and inbox surface observes them.
     public let approvals: ApprovalsFacade
@@ -63,13 +77,26 @@ public final class NativeAgentEngine: Sendable {
     /// in core types; the Trust Center, Providers and picker surfaces observe
     /// them.
     public let trust: TrustFacade
+    public let macIntegration: MacIntegrationFacade
     public let providers: ProvidersFacade
+    public let configuration = RuntimeReadProjection.Configuration()
+    public let runs = RuntimeReadProjection.Runs()
+    public let connectors: ConnectorStatusProjection
+    public func setSurfaceExpanded(_ open: Bool, surface: String, block: String) async {
+        await layout.setExpanded(open, surface: surface, block: block)
+    }
     /// The tool catalog (load state and trust per tool) and the authored-tool
     /// registry; the Desk board, the schedule and research lab runs. In core
     /// types; the Tools, Desk, Schedule and Capabilities pages observe them.
     public let telegram: TelegramFacade
     public let tools: ToolsFacade
+    public let contacts: ContactListFacade
+    public let senses: SensesFacade
+    public let make: MakeStudio.Shelf
+    public let today: TodayProjection
     public let desk: DeskFacade
+    public let nextGen: NextGenStatusProjection
+    public let bots: BotRunnerScheduler
     /// The chat session index and transcripts, and the running turns, for
     /// this root, in core types; every chat surface observes them.
     public let transcripts: TranscriptsFacade
@@ -77,6 +104,7 @@ public final class NativeAgentEngine: Sendable {
     /// Agent contacts: A2A tasks, the desktop route, human replies, Grok's
     /// inbound answers and the reply/notice continuation, on this root's clients.
     public let agents: AgentContacts
+    public let contactThreads: ContactThreadsProjection
     /// ContextFlow: turn preparation and memory-record → atom-id translation.
     /// Chat clients reach it only on a root with a body.
     public let contextFlow: NativeContextFlowRuntime
@@ -87,15 +115,27 @@ public final class NativeAgentEngine: Sendable {
         hasBody: Bool = true
     ) {
         self.dataRoot = dataRoot
+        self.layout = SurfaceLayoutLive(dataRoot: dataRoot)
         self.ports = ports
         self.hasBody = hasBody
+        let clients = EngineAgentContactClients()
+        self.bots = BotRunnerScheduler(dataRoot: dataRoot,
+            session: { bot, message in try await clients.engine.standingBotSession()(bot, message) },
+            isAutonomyEnabled: { await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot) })
         PeerTrust.install(dataRoot: dataRoot)
+        // Keeping is hers under Full Mac; a trusted agent's turn is hers too,
+        // never the owner's (his acts come through his own surfaces).
         CapabilityLifecycle.keepAuthority = { root in
             if case .present(let policy) = SavedTrustPolicyAuthority.read(dataRoot: root),
                AppToolExecutor.lockedPolicyIsFullMac(policy) { return true }
-            return PeerDataTaint.ownerAuthorized
+            return false
+        }
+        // A capability pack's part lands as a draft, its origin the pack's.
+        CapabilityPackParts.save = { item, root, pack in
+            _ = try await Parts(root: root).save(Parts.saveArguments(item), steer: [], fullMac: false, origin: Parts.origin(pack: pack))
         }
         self.memory = MemoryFacade(dataRoot: dataRoot)
+        self.persona = PersonaFacade(dataRoot: dataRoot, isolated: !hasBody)
         self.approvals = ApprovalsFacade(dataRoot: dataRoot)
         self.inbox = InboxFacade(dataRoot: dataRoot)
         let chromeInbox = self.inbox.store
@@ -113,12 +153,31 @@ public final class NativeAgentEngine: Sendable {
         })
         self.trust = TrustFacade(dataRoot: dataRoot, connectorActionStatuses: ports.connectorActionStatuses)
         self.providers = ProvidersFacade(dataRoot: dataRoot)
+        self.connectors = ConnectorStatusProjection(root: dataRoot, platform: ports.connectorStatus)
         self.telegram = TelegramFacade(dataRoot: dataRoot)
-        self.tools = ToolsFacade(dataRoot: dataRoot, ports: ports)
-        self.desk = DeskFacade(dataRoot: dataRoot)
+        self.tools = ToolsFacade(dataRoot: dataRoot) { detail in
+            try await clients.engine.toolDispatchClient().toolManifest(detail: detail)
+        }
+        self.desk = DeskFacade(dataRoot: dataRoot, inbox: self.inbox, approvals: self.approvals, bots: self.bots)
+        self.contacts = ContactListFacade(dataRoot: dataRoot)
+        self.contactThreads = ContactThreadsProjection(dataRoot: dataRoot, contacts: self.contacts)
+        self.senses = SensesFacade()
+        let makeTools = self.tools
+        self.make = MakeStudio.Shelf(dataRoot: dataRoot) { id, input, version in
+            do {
+                return try await makeTools.withPartDoor(envelope: .native("mac_ui:make.preview")) {
+                    await Parts(root: dataRoot).face(id: id, input: input, version: version)
+                }
+            } catch { return .failure(.init(code: "door_unavailable", message: error.localizedDescription)) }
+        }
+        self.today = TodayProjection()
+        self.nextGen = NextGenStatusProjection(dataRoot: dataRoot)
         self.transcripts = TranscriptsFacade(dataRoot: dataRoot)
         self.turns = TurnsFacade(dataRoot: dataRoot)
         self.doctor = DoctorFacade(dataRoot: dataRoot)
+        let trace = TurnInspectorFeed(dataRootOverride: dataRoot)
+        self.trace = trace
+        if hasBody { Task { @MainActor in trace.start() } }
         let contextFlow = NativeContextFlowRuntime(dataRoot: dataRoot)
         self.contextFlow = contextFlow
         let cognition = (hasBody ? ports : nil).map {
@@ -131,18 +190,19 @@ public final class NativeAgentEngine: Sendable {
         }
         self.deviceSync = deviceSync
         self.sync = SyncFacade(owner: deviceSync)
-        let clients = EngineAgentContactClients()
+        self.macIntegration = MacIntegrationFacade(dataRoot: dataRoot, deviceSync: deviceSync, platform: ports.connectorStatus)
         AgentHostLaunches.install { AgentRecipeStore.launch($0) }
         self.agents = AgentContacts(dataRoot: dataRoot, clients: clients,
                                     completionSender: ports.completionSender(dataRoot))
         clients.attach(self)
+        Task { @MainActor [layout] in layout.start() }
     }
 
     /// The app's tool chain.
     public func toolDispatchClient(
         enforceAppAutonomy: Bool = true,
         swarmApprovalFiler: (any ApprovalFiler)? = nil
-    ) -> any ToolDispatchClient {
+    ) -> AppChatToolDispatcher {
         let dataRoot = self.dataRoot
         // The app's own tools reach Core's one catalog through this port; a
         // root with no body has none of them.
@@ -188,10 +248,6 @@ public final class NativeAgentEngine: Sendable {
                     case .macControl:
                         model = try? await MacControlOperationStore(dataRoot: dataRoot)
                             .motorActionReadModel(actionId: reference.ownerActionID)
-                    case .externalSend:
-                        model = try? await ExternalSendMotorActionReadModelProvider(
-                            dataRoot: dataRoot
-                        ).motorActionReadModel(actionId: reference.ownerActionID)
                     case .agentBridge:
                         let row = DelegationStatusProjector(
                             configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
@@ -261,14 +317,18 @@ public final class NativeAgentEngine: Sendable {
         )
     }
 
-    /// Both scheduled turns and bot_ask construct the same ordinary app chat client.
-    public func standingBotSession() -> BotRunnerSession {
+    /// Scheduled turns and bot_ask use the helper runner with the app's tool gates.
+    public func standingBotSession(admitted: Bool = false, attachments: [MultimodalAttachment] = [],
+                                   fileAccess: String = "auto", progress: ChatOrchestrationProgressHandler? = nil) -> BotRunnerSession {
         { [self] bot, message in
-            let client = chatClient(
-                tools: toolDispatchClient(),
-                approvalFiler: NativeAgentChatApprovalFiler(dataRoot: dataRoot),
-                continuationCapabilityProfile: .mac)
-            return try await StandingBotContinuity.session(client: client, dataRoot: dataRoot)(bot, message)
+            let client = makeChatOrchestrationClient(
+                tools: toolDispatchClient(), dataRoot: dataRoot,
+                continuationCapabilityProfile: NativeAgentAppChatSurfaceProfile.mac.rawValue,
+                approvalFiler: NativeAgentChatApprovalFiler(dataRoot: dataRoot))
+            return try await HelperContact.$door.withValue(agents.helperDoor(for: bot)) {
+                try await StandingBotContinuity.session(client: client, dataRoot: dataRoot, admitted: admitted,
+                    attachments: attachments, fileAccess: fileAccess, progress: progress)(bot, message)
+            }
         }
     }
 
@@ -315,7 +375,7 @@ public final class NativeAgentEngine: Sendable {
                 ? NativeAgentChatApprovalFiler(dataRoot: dataRoot)
                 : nil)
         let tools = toolDispatchClient(
-            // The shared ChatOrchestration membrane resolves autonomy once, after
+            // The shared ChatTurnRuntime membrane resolves autonomy once, after
             // SecurityCenter authenticates the exact origin, and owns approval
             // filing/replay. Keep the inner app dispatcher on hard SecurityCenter
             // checks without re-running the autonomy decision from a reconstructed
@@ -331,13 +391,13 @@ public final class NativeAgentEngine: Sendable {
     }
 }
 
-/// This root's chat and tool clients, handed to the agent contacts it owns.
+/// This root's chat and tool clients, shared by its contacts and scheduled bots.
 /// Attached once the root is built; held weakly, since the root owns them.
 private final class EngineAgentContactClients: AgentContactClients, @unchecked Sendable {
     private let lock = NSLock()
     private weak var attached: NativeAgentEngine?
     func attach(_ engine: NativeAgentEngine) { lock.withLock { attached = engine } }
-    private var engine: NativeAgentEngine { lock.withLock { attached! } }
+    var engine: NativeAgentEngine { lock.withLock { attached! } }
 
     func bridgeChatClient() -> SwiftNativeChatOrchestrationClient { engine.chatClient(profile: .bridge) }
     func backgroundChatClient() -> SwiftNativeChatOrchestrationClient { engine.chatClient(profile: .background) }
@@ -359,6 +419,22 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
 }
 
 extension NativeAgentEngine {
+    /// The Activity badge follows this engine's authority sources while mounted.
+    @MainActor
+    public func watchActivityChanges(refresh: @escaping @MainActor @Sendable () async -> Void) async {
+        let database = dataRoot.appendingPathComponent("memory/memory.sqlite")
+        var paths = [
+            dataRoot.appendingPathComponent("workflows/approvals/requests.json"),
+            dataRoot.appendingPathComponent("notifications/inbox.jsonl"),
+            database, URL(fileURLWithPath: database.path + "-wal"),
+        ]
+        if #available(macOS 27, *) {
+            paths += [dataRoot.appendingPathComponent("desk/desk_ops.jsonl"),
+                      dataRoot.appendingPathComponent("desk/desk_ops_base.json")]
+        }
+        await EventDeadlinePhysiology.refreshOnChanges(paths: paths, refresh: refresh)
+    }
+
     public static let live: NativeAgentEngine = {
         let dataRoot = PersistenceCore.defaultDataRoot()
         return NativeAgentEngine(dataRoot: dataRoot, ports: .app(dataRoot: dataRoot))

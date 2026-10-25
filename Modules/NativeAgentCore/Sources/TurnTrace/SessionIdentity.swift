@@ -3,6 +3,8 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 
+// Blueprint: | `SessionIdentity.swift` | `ChatThreadKind` and session identity ledger: creation-time conversation kind, mint-site traces and source-flapping diagnostics |
+
 // MARK: - ChatThreadKind
 
 /// What KIND of conversation a chat session row is — recorded on the session
@@ -169,13 +171,16 @@ public enum SessionIdentityLedger {
         public let totalRows: Int
         /// Days of the per-day trace feed actually present on disk.
         public let daysRead: Int
+        /// Existing day files whose contents could not be read.
+        public let unreadablePaths: [String]
 
         public var totalMinted: Int { mintedByMintSite.values.reduce(0, +) }
 
-        public init(mintedByMintSite: [String: Int], totalRows: Int, daysRead: Int) {
+        public init(mintedByMintSite: [String: Int], totalRows: Int, daysRead: Int, unreadablePaths: [String] = []) {
             self.mintedByMintSite = mintedByMintSite
             self.totalRows = totalRows
             self.daysRead = daysRead
+            self.unreadablePaths = unreadablePaths
         }
     }
 
@@ -195,6 +200,7 @@ public enum SessionIdentityLedger {
         var minted: [String: Int] = [:]
         var total = 0
         var daysRead = 0
+        var unreadablePaths: [String] = []
 
         var day = calendar.startOfDay(for: cutoff)
         let lastDay = calendar.startOfDay(for: now)
@@ -202,7 +208,15 @@ public enum SessionIdentityLedger {
             let path = TurnTracePersistLane.fileURL(for: day, root: dataRoot)
             guard let nextDay = calendar.date(byAdding: .day, value: 1, to: day) else { break }
             day = nextDay
-            guard let raw = try? String(contentsOf: path, encoding: .utf8) else { continue }
+            let raw: String
+            do {
+                raw = try String(contentsOf: path, encoding: .utf8)
+            } catch CocoaError.fileReadNoSuchFile {
+                continue
+            } catch {
+                unreadablePaths.append(path.path)
+                continue
+            }
             daysRead += 1
             for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
                 // Cheap prefilter: the kind appears verbatim in the row, and
@@ -228,7 +242,7 @@ public enum SessionIdentityLedger {
                 minted[site, default: 0] += 1
             }
         }
-        return MintTally(mintedByMintSite: minted, totalRows: total, daysRead: daysRead)
+        return MintTally(mintedByMintSite: minted, totalRows: total, daysRead: daysRead, unreadablePaths: unreadablePaths)
     }
 
     public struct FlappingReport: Sendable, Equatable {

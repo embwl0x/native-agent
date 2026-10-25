@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import AgentConversations
+// Blueprint: | `MacSyncEngine+Helpers.swift` | `MacSyncEngine`: `startHelpersSnapshotObservation`, `helpersSnapshotData` |
 
 extension MacSyncEngine {
     func startHelpersSnapshotObservation() async {

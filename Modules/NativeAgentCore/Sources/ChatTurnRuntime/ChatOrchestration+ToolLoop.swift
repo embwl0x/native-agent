@@ -14,6 +14,8 @@ import AgentWorkspace
 import ToolRegistry
 import Desk
 import TrustCenter
+import TurnTrace
+// Blueprint: | `ChatOrchestration+ToolLoop.swift` | `TurnContext`: `withToolSchemas`; `finishReplyTurn` settles reply.end, including incomplete work; ContextFlow's `.completed` records this loop exit; tool rounds distinguish Stop, control return and failed observation; failed handback waits end the turn without resuming, and the return nudge requires current driver permission |
 
 // MARK: - Tool-dispatch loops
 
@@ -72,13 +74,10 @@ extension SwiftNativeTurnEngine {
         ) ?? rawCtx
     }
 
-    /// Shared terminal for a loop iteration that produced a final reply (no
-    /// executable tool calls): record the completed outcome, run the after-turn
-    /// work when her turn part asked for it (`after`: promises,
-    /// the memory-promotion side channel — without it AdaptiveMemoryPromoter
-    /// never sees the user/assistant pair), and build the TurnEngineResult.
-    /// `rawLLMResponse` is the turn's accumulated raw output.
-    func finishCompletedTurn(
+    /// Settles reply.end, including incomplete/waiting work. ContextFlow records
+    /// `.completed` for this loop exit; the result's completionState describes work.
+    /// Runs after-turn work only when the part requested it.
+    func finishReplyTurn(
         reply: String,
         ctx: TurnContext,
         dispatches: [TurnEngineResult.ToolDispatchRecord],
@@ -145,20 +144,23 @@ extension SwiftNativeTurnEngine {
         let origin = ChatPersistenceContext.originPrincipal
         let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                           peerID: ChatToolSessionContext.envelope?.verifiedUserId)
-        // A skill run still stopped as the turn ends waits for her own turn,
+        // A part's run still stopped as the turn ends waits for her own turn,
         // the turn's steer with it: its last word this turn is the one that counts.
         var stopped: [String: String] = [:]
-        for dispatch in dispatches where dispatch.name == "app"
-            && [.string("skill.run"), .string("skill.resume")].contains(dispatch.input["action"]) {
-            guard case .object(let receipt) = dispatch.result else { continue }
+        for dispatch in dispatches where dispatch.name == "app" {
+            guard case .string(let action)? = dispatch.input["action"],
+                  action.hasPrefix("authored.") || ["ability.resume", "skill.run", "skill.resume"].contains(action),
+                  case .object(let outer) = dispatch.result else { continue }
+            // A part's own action answers inside the door's receipt; a resume answers as itself.
+            let receipt: [String: JSONValue] = if case .object(let inner)? = outer["result"], outer["resume"] == nil { inner } else { outer }
             if case .object(let resume)? = receipt["resume"], case .string(let run)? = resume["run_id"],
-               case .string(let skill)? = receipt["skill"] {
+               case .string(let skill)? = receipt["name"] {
                 let held = if case .array(let items)? = resume["held"] {
                     items.compactMap { if case .string(let id) = $0 { id } else { nil } }
                 } else { [String]() }
                 let question = if case .string(let text)? = resume["question"] { text } else { "" }
                 stopped[run] = MyQueue.skillRunWords(skill: skill, run: run, question: question, held: held)
-            } else if case .object(let args)? = dispatch.input["args"], case .string(let run)? = args["run_id"] {
+            } else if dispatch.input["preview"] != .bool(true), case .object(let args)? = dispatch.input["args"], case .string(let run)? = args["run_id"] {
                 stopped.removeValue(forKey: run)
             }
         }
@@ -185,10 +187,13 @@ extension SwiftNativeTurnEngine {
             let after = promise.when == "after_card" ? card : nil
             let when = promise.when == "after_card" && after == nil ? "next_turn" : promise.when
             do {
-                _ = try await MyQueue.add(DeskStep(words: promise.sentence, when: when, card: after, source: promise.sentence,
+                let queued = try await MyQueue.add(DeskStep(words: promise.sentence, when: when, card: after, source: promise.sentence,
                                                    peers: steer.sources, elevated: steer.elevated,
                                                    session: ChatToolSessionContext.verifiedSessionId, origin: origin,
                                                    replyRoute: TurnEnvelope.current(surface: surface).persistedMetadata()), store: store)
+                if queued.change == .added {
+                    TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L24"), "site": .string("ChatOrchestration+ToolLoop.swift:queuePromises")]))
+                }
             } catch {
                 nativeLog("[my-queue] a promise was not queued: \(error)")
             }
@@ -221,13 +226,12 @@ extension SwiftNativeTurnEngine {
         conversation: inout [LLMMessage],
         dispatches: inout [TurnEngineResult.ToolDispatchRecord],
         providerTools: ProviderToolNameMap,
-        noProgressGuard: inout ToolLoopNoProgressGuard,
         cancelFlagPath: URL? = nil,
         /// Set on the marker protocol: the round replays as the model's own
         /// text and its results come back as one text message (8b carrier).
         markerCodec: TextMarkerCodec? = nil,
         toolBoundaryReason: LLMToolBoundaryReason? = nil
-    ) async {
+    ) async throws {
         // Append the assistant turn that contained the tool calls. Strip any
         // <tool_use> markers from the surfaced text so the assistant text block
         // carries only the model's prose (the structured toolUse blocks below
@@ -249,17 +253,12 @@ extension SwiftNativeTurnEngine {
         let roundBase = dispatches.count
         var pairedIds: [String] = []
         for (idx, call) in providerCalls.enumerated() {
-            let argsJSON: Data = {
-                if let v = try? JSONValue.object(call.input).serializedData(pretty: false) {
-                    return v
-                }
-                return Data("{}".utf8)
-            }()
             let id = call.id.isEmpty
                 ? "toolu_synth_\(roundBase + idx)_\(call.name)"
                 : call.id
             pairedIds.append(id)
             if markerCodec == nil {
+                let argsJSON = (try? JSONValue.object(call.input).serializedData(pretty: false)) ?? Data("{}".utf8)
                 assistantBlocks.append(.toolUse(id: id, name: call.name, inputJSON: argsJSON))
             }
         }
@@ -313,6 +312,7 @@ extension SwiftNativeTurnEngine {
             TurnObservation.apply(.boundary(toolBoundaryReason), to: &conversation, surface: surface)
         }
         LocalToolImage.boundConversation(&conversation)
+        ChatTurnExecution.current?.keepPixels(LocalToolImage.imageNames(conversation))
         // An app chrome.* call is the Chrome tool it ran, with its args as input.
         if iterationRecords.contains(where: {
             let ran = $0.ranCall.tool
@@ -325,27 +325,41 @@ extension SwiftNativeTurnEngine {
                 "You took control of the Mac; waiting for you to return control."))
             // Keep the conversation and its delivery route alive while the
             // existing handback event or this run's Stop releases the wait.
+            // Observation failure ends the turn; it cannot stand in for either.
             let changes = await MacAttentionSessionStore.shared.driverChanges(waitingForReturn: true)
-            await withTaskGroup(of: Void.self) { group in
+            let outcome = await withTaskGroup(of: MacControlWaitOutcome.self) { group in
                 group.addTask {
                     for await _ in changes {
-                        if Self.dispatchCancelSignalled(cancelFlagPath)
-                            || MacAttentionSessionStore.shared.currentDriverAllowed { return }
+                        if Self.dispatchCancelSignalled(cancelFlagPath) { return .stopped }
+                        if MacAttentionSessionStore.shared.currentDriverAllowed { return .returned }
                     }
+                    return Self.dispatchCancelSignalled(cancelFlagPath)
+                        ? .stopped : .unavailable("The control-return observation ended.")
                 }
                 if let flag = cancelFlagPath {
                     group.addTask {
                         let stop = FileChangeEvents(paths: [URL(fileURLWithPath: flag.path)])
                         defer { stop.cancel() }
                         for await _ in stop.stream {
-                            if Self.dispatchCancelSignalled(flag) { return }
+                            if Self.dispatchCancelSignalled(flag) { return .stopped }
                         }
+                        return Self.dispatchCancelSignalled(flag)
+                            ? .stopped : .unavailable("The Stop-file observation failed.")
                     }
                 }
-                _ = await group.next()
+                let result = await group.next() ?? .unavailable("The control-return wait ended without an outcome.")
                 group.cancelAll()
+                return result
             }
             if Self.dispatchCancelSignalled(cancelFlagPath) { return }
+            switch outcome {
+            case .stopped: throw CancellationError()
+            case .unavailable(let why): throw TurnEngineError.macControlWaitUnavailable(why)
+            case .returned: break
+            }
+            if !MacAttentionSessionStore.shared.currentDriverAllowed {
+                throw TurnEngineError.macControlWaitUnavailable("Mac control is still with you.")
+            }
             Self.appendStructuredUserNudge("Mac control has returned; continue from the recorded results.", to: &conversation)
         }
         if StandingBotContinuity.isHelperTurn, iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
@@ -358,15 +372,12 @@ extension SwiftNativeTurnEngine {
             .first(where: InlineInteractionNeed.blocksTurn) {
             ChatTurnExecution.current?.waitForInteraction(waiting)
         }
-        switch noProgressGuard.observe(iterationRecords) {
-        case .none:
-            break
-        case .warn(let feedback, let visible):
-            if let visible {
-                await progress?(.notice(kind: "tool_loop_recovery", text: visible))
-            }
-            Self.appendStructuredUserNudge(feedback, to: &conversation)
-        }
+    }
+
+    private enum MacControlWaitOutcome: Sendable {
+        case returned
+        case stopped
+        case unavailable(String)
     }
 
     private static func driverTakeoverReceipt(_ value: JSONValue, depth: Int = 0) -> [String: JSONValue]? {

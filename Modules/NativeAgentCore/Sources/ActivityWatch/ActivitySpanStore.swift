@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+// Blueprint: | `ActivitySpanStore.swift` | `ActivitySpanStore`; asynchronous per-root store acquisition shared by capture, retention and queries |
 
 /// Single-writer SQLite store for activity spans.
 ///

@@ -1,4 +1,3 @@
-import FeedPolicy
 // Canonical memories, proposals, and rejection tombstones in
 // <dataRoot>/memory/memory.sqlite, owned by the MemoryStorage actor.
 
@@ -6,9 +5,13 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryV2+Storage.swift` | `MemoryStorage` actor; ordered USER.md, Spotlight and graph tails retained through actual exit; close/drain projections without cancelling canonical writes, retire replaced USER.md generators; scalar `statusCounts`, checked `curationPage` |
 
 // MARK: - MemoryStorage actor
 
+/// Owns memory.sqlite's schema (including kg_*). Local backup and export take
+/// SQLite snapshots, never journal sidecars; PrivacyMap: memory. The phone
+/// receives active-memory, proposal and graph projections, never these files.
 public actor MemoryStorage {
     // Same-module storage extensions share this pool rather than reopening
     // the database.
@@ -22,11 +25,15 @@ public actor MemoryStorage {
     private var userMDGenerator: UserMDGenerator?
     private var spotlightHook: (@Sendable (StoredMemory, Bool) async -> Void)?
     private var knowledgeGraphHook: (@Sendable (StoredMemory, Bool) async -> Void)?
-    /// Ordered, bounded projection lanes. Canonical SQLite mutations enter this
-    /// actor in order; each lane preserves that order across asynchronous index
-    /// I/O so a late update cannot land after a newer delete and resurrect it.
+    /// Ordered projection lanes resolve canonical eligibility when they run.
+    /// A hook queued after suspension carries identity, never stale intent.
     private var spotlightProjectionTail: Task<Void, Never>?
     private var knowledgeGraphProjectionTail: Task<Void, Never>?
+    private var userMDProjectionTail: Task<Void, Never>?
+    private var spotlightProjectionID: UUID?
+    private var knowledgeGraphProjectionID: UUID?
+    private var userMDProjectionID: UUID?
+    private var projectionsClosed = false
 
     // MARK: - Recall candidate cache
     // Canonical recall_generation excludes usage and graph-only writes.
@@ -34,8 +41,17 @@ public actor MemoryStorage {
     var recallGeneration: Int = 0
 
     /// Attach a USER.md generator so mutations debounce-regenerate the file.
-    public func attachUserMDGenerator(_ generator: UserMDGenerator) {
+    public func attachUserMDGenerator(_ generator: UserMDGenerator) async {
+        guard !projectionsClosed else { await generator.shutdown(); return }
+        guard userMDGenerator !== generator else { return }
+        let previous = self.userMDGenerator
         self.userMDGenerator = generator
+        // Replacement retires the old generator's deadline and accepted work.
+        if let previous {
+            let retirement = enqueueUserMDProjection { await previous.shutdown() }
+            await retirement?.value
+        }
+        guard !projectionsClosed, self.userMDGenerator === generator else { return }
         if !replayedStartupUserProjection {
             replayedStartupUserProjection = true
             for persona in Set(startupBoundEvictions.map(\.personaId)) {
@@ -50,6 +66,7 @@ public actor MemoryStorage {
     public func attachSpotlightHook(
         _ hook: @escaping @Sendable (StoredMemory, Bool) async -> Void
     ) {
+        guard !projectionsClosed else { return }
         self.spotlightHook = hook
         if !replayedStartupSpotlightProjection {
             replayedStartupSpotlightProjection = true
@@ -63,6 +80,7 @@ public actor MemoryStorage {
     public func attachKnowledgeGraphHook(
         _ hook: @escaping @Sendable (StoredMemory, Bool) async -> Void
     ) {
+        guard !projectionsClosed else { return }
         self.knowledgeGraphHook = hook
         if !replayedStartupKnowledgeGraphProjection {
             replayedStartupKnowledgeGraphProjection = true
@@ -71,30 +89,101 @@ public actor MemoryStorage {
     }
 
     func pokeUserMDRegen(persona: String) {
-        guard let gen = userMDGenerator else { return }
-        Task { try? await gen.requestRegeneration(persona: persona) }
+        guard !projectionsClosed, let gen = userMDGenerator else { return }
+        _ = enqueueUserMDProjection { _ = try? await gen.requestRegeneration(persona: persona) }
+    }
+
+    private func enqueueUserMDProjection(_ operation: @escaping @Sendable () async -> Void) -> Task<Void, Never>? {
+        guard !projectionsClosed else { return nil }
+        let prior = userMDProjectionTail
+        let id = UUID()
+        userMDProjectionID = id
+        let task = Task {
+            defer {
+                if userMDProjectionID == id { userMDProjectionTail = nil; userMDProjectionID = nil }
+            }
+            await prior?.value
+            await operation()
+        }
+        userMDProjectionTail = task
+        return task
     }
 
     private func pokeSpotlight(_ stored: StoredMemory, deleted: Bool) {
         guard let hook = spotlightHook else { return }
-        let prior = spotlightProjectionTail
-        spotlightProjectionTail = Task {
-            await prior?.value
-            await hook(stored, deleted)
+        _ = enqueueSpotlightProjection {
+            guard let (current, removed) = await self.currentProjection(stored) else { return }
+            await hook(current, removed)
         }
+    }
+
+    func enqueueSpotlightProjection<Result: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> Result
+    ) -> Task<Result, Error> {
+        guard !projectionsClosed else { return Task { throw CancellationError() } }
+        let prior = spotlightProjectionTail
+        let id = UUID()
+        spotlightProjectionID = id
+        let task = Task {
+            await prior?.value
+            return try await operation()
+        }
+        spotlightProjectionTail = Task {
+            defer {
+                if spotlightProjectionID == id { spotlightProjectionTail = nil; spotlightProjectionID = nil }
+            }
+            _ = try? await task.value
+        }
+        return task
     }
 
     private func pokeKnowledgeGraph(_ stored: StoredMemory, deleted: Bool) {
         guard let hook = knowledgeGraphHook else { return }
-        enqueueKnowledgeGraphProjection { await hook(stored, deleted) }
+        enqueueKnowledgeGraphProjection {
+            guard let (current, removed) = await self.currentProjection(stored) else { return }
+            await hook(current, removed)
+        }
+    }
+
+    private func currentProjection(_ hint: StoredMemory) -> (StoredMemory, Bool)? {
+        do {
+            let current = try dbPool.read { db in
+                try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [hint.id])
+                    .map(Self.decodeMemory)
+            }
+            return current.map { ($0, !Self.projectionEligible($0)) } ?? (hint, true)
+        } catch {
+            nativeLog("[memory] projection read failed for \(hint.id): \(error)")
+            return nil
+        }
     }
 
     func enqueueKnowledgeGraphProjection(_ operation: @escaping @Sendable () async -> Void) {
+        guard !projectionsClosed else { return }
         let prior = knowledgeGraphProjectionTail
+        let id = UUID()
+        knowledgeGraphProjectionID = id
         knowledgeGraphProjectionTail = Task {
+            defer {
+                if knowledgeGraphProjectionID == id { knowledgeGraphProjectionTail = nil; knowledgeGraphProjectionID = nil }
+            }
             await prior?.value
             await operation()
         }
+    }
+
+    /// Close only derived-work admission. Canonical writes remain accepted;
+    /// already-enqueued projections drain in order without blanket cancellation.
+    /// Writes arriving after closure are reconciled from SQLite at next launch.
+    public func shutdownProjections() async {
+        projectionsClosed = true
+        spotlightHook = nil
+        knowledgeGraphHook = nil
+        await userMDProjectionTail?.value
+        await userMDGenerator?.shutdown()
+        userMDGenerator = nil
+        await spotlightProjectionTail?.value
+        await knowledgeGraphProjectionTail?.value
     }
 
     private func pokeDerivedState(_ stored: StoredMemory, deleted: Bool) async {
@@ -108,8 +197,10 @@ public actor MemoryStorage {
         await DerivedStateInvalidationCenter.shared.publish(change)
     }
 
+    /// A cold write awaiting admission is not projected until its vector lands.
     private static func projectionEligible(_ stored: StoredMemory) -> Bool {
         stored.status == "active" && MemoryLifecycle.isRecallEligible(stored.lifecycle)
+            && !metadataFlag(stored.metadata, pendingAdmissionKey)
     }
 
     func pokeProjectionHooks(_ stored: StoredMemory) async {
@@ -195,11 +286,15 @@ public actor MemoryStorage {
         let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memories") ?? 0
         let overflow = count - boundedLimit
         guard overflow > 0 else { return [] }
-        // Supersession is history, never capacity eviction. Refuse admission
-        // when retaining that history leaves too few disposable rows.
+        // Supersession is history, never capacity eviction, and so is a memory
+        // a pending replacement will demote once admitted. Refuse admission
+        // when retaining them leaves too few disposable rows.
         let rows = try Row.fetchAll(db, sql: """
             SELECT * FROM memories
             WHERE json_extract(metadata_json, '$.superseded_by') IS NULL
+              AND id NOT IN (SELECT json_extract(owed.value, '$.id')
+                             FROM memories p, json_each(p.metadata_json, '$.\(pendingSupersedesKey)') owed
+                             WHERE json_extract(owed.value, '$.id') IS NOT NULL)
         """).map(Self.decodeMemory)
 
         let ordered = rows.sorted { lhs, rhs in
@@ -212,11 +307,9 @@ public actor MemoryStorage {
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
             return lhs.id < rhs.id
         }
-        var evicted = Array(ordered.filter { !preservingIDs.contains($0.id) }.prefix(overflow))
-        if evicted.count < overflow {
-            let already = Set(evicted.map(\.id))
-            evicted += ordered.filter { !already.contains($0.id) }.prefix(overflow - evicted.count)
-        }
+        // The row being admitted is never its own eviction: refuse instead,
+        // so the caller's transaction rolls back whole.
+        let evicted = Array(ordered.filter { !preservingIDs.contains($0.id) }.prefix(overflow))
         guard evicted.count == overflow else { throw MemoryStorageError.capacityExceeded }
         // Admission must not trade protected tissue for a lower-priority row.
         if evicted.contains(where: { retentionEvictionRank($0) == 4 }),
@@ -275,11 +368,10 @@ public actor MemoryStorage {
                     reason: "memory_capacity_evicted_on_open"
                 ))
             }
-            await recordBoundEvictions(evicted, memoryPath: memoryPath, reason: "store_open")
         }
     }
 
-    func handleBoundEvictions(_ evicted: [StoredMemory], reason: String) async {
+    func handleBoundEvictions(_ evicted: [StoredMemory]) async {
         guard !evicted.isEmpty else { return }
         invalidateRecallCache()
         for persona in Set(evicted.map(\.personaId)) { pokeUserMDRegen(persona: persona) }
@@ -287,36 +379,6 @@ public actor MemoryStorage {
             pokeSpotlight(memory, deleted: true)
             pokeKnowledgeGraph(memory, deleted: true)
             await pokeDerivedState(memory, deleted: true)
-        }
-        await Self.recordBoundEvictions(evicted, memoryPath: path, reason: reason)
-    }
-
-    static func recordBoundEvictions(
-        _ evicted: [StoredMemory],
-        memoryPath: URL,
-        reason: String
-    ) async {
-        guard !evicted.isEmpty else { return }
-        let receipt: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string("memory.capacity_eviction"),
-            "reason": .string(reason),
-            "count": .int(Int64(evicted.count)),
-            "memoryIds": .array(evicted.prefix(100).map { .string($0.id) }),
-            "createdAt": .string(nowISO8601()),
-        ])
-        let receiptPath = memoryPath.deletingLastPathComponent()
-            .appendingPathComponent("retention_receipts.jsonl")
-        do {
-            try await appendJSONLCapped(
-                receipt,
-                to: receiptPath,
-                using: SwiftNativePersistenceCore(),
-                maxLines: JSONLLineCaps.memoryRetentionReceipts,
-                logLabel: "MemoryV2.retention"
-            )
-        } catch {
-            nativeLog("MemoryV2 bound: retention receipt failed: %@", String(describing: error))
         }
     }
 
@@ -356,7 +418,7 @@ public actor MemoryStorage {
             pokeUserMDRegen(persona: row.personaId)
             await pokeProjectionHooks(row)
         }
-        await handleBoundEvictions(result.1, reason: "insert")
+        await handleBoundEvictions(result.1)
         return result.0
     }
 
@@ -367,23 +429,23 @@ public actor MemoryStorage {
                                    in db: Database) throws -> StoredMemory? {
         let incoming = MemoryRecord(stored: memory)
         let scope = MemoryRecordDisclosurePolicy.classify(incoming)
-        let key = MemoryConsolidator.normalizedContentKey(memory.content)
+        let scopeKey = Self.disclosureScopeKey(personaId: memory.personaId, metadata: memory.metadata)
+        let key = Self.comparisonKey(memory.content, mode: .canonical)
         var duplicate = rows.sorted { $0.createdAt > $1.createdAt }.first {
-            scope != nil && MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: $0)) == scope
-                && MemoryConsolidator.normalizedContentKey($0.content) == key
+            scope != nil && Self.disclosureScopeKey(personaId: $0.personaId, metadata: $0.metadata) == scopeKey
+                && Self.comparisonKey($0.content, mode: .canonical) == key
         }
-        if duplicate == nil, MemoryRecallScoring.kind(of: memory.metadata) != "correction",
+        if duplicate == nil, !MemoryRecallScoring.isExplicitCorrection(memory.metadata),
            let vector = memory.embedding, let epoch = memory.embeddingEpoch, !epoch.isEmpty {
             let activeEpoch = try Self.embeddingEpochState(in: db).activeEpoch
             if activeEpoch == nil || activeEpoch == epoch {
-                let nearest = rows.filter { $0.embeddingEpoch == epoch && $0.embedding != nil }
+                let nearest = rows.filter { Self.comparableEpochs($0.embeddingEpoch, epoch) && $0.embedding != nil }
                     .map { (row: $0, cosine: VectorMath.cosine(vector, $0.embedding)) }
                     .max { $0.cosine < $1.cosine }
-                if let nearest, nearest.cosine >= MemoryManagerLane.duplicateSimilarity,
-                   MemoryRecallScoring.kind(of: nearest.row.metadata) != "correction",
+                if let nearest, Self.semanticDuplicate(nearest.row.content, memory.content, similarity: nearest.cosine, mode: .admission),
+                   !MemoryRecallScoring.isExplicitCorrection(nearest.row.metadata),
                    scope != nil,
-                   MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: nearest.row)) == scope,
-                   MemorySemanticDuplicateGuard.sameQuantityAndNegation(nearest.row.content, memory.content),
+                   Self.disclosureScopeKey(personaId: nearest.row.personaId, metadata: nearest.row.metadata) == scopeKey,
                    let created = MemoryRecallScoring.parseTimestamp(nearest.row.createdAt),
                    Date().timeIntervalSince(created) < 24 * 3600 {
                     duplicate = nearest.row
@@ -398,16 +460,33 @@ public actor MemoryStorage {
     /// A cold write is saved but not admitted until its vector lands and
     /// passes the checks; a turn withholds it until then.
     public static let pendingAdmissionKey = "admission_pending"
+    /// What a cold replacement demotes once admitted; until then those stay as they are.
+    static let pendingSupersedesKey = "admission_supersedes"
 
-    static func owingAdmission(_ metadata: JSONValue?, preservingID: Bool) -> JSONValue {
+    static func owingAdmission(_ metadata: JSONValue?, preservingID: Bool,
+                               superseding: [SupersedingAcceptance] = []) -> JSONValue {
         var object: [String: JSONValue] = [:]
         if case .object(let current)? = metadata { object = current }
         object[pendingAdmissionKey] = .bool(true)
         if preservingID { object[preservesIDKey] = .bool(true) }
+        if !superseding.isEmpty {
+            object[pendingSupersedesKey] = .array(superseding.map {
+                .object(["id": .string($0.targetId), "hash": .string($0.expectedContentHash), "reason": .string($0.reason)])
+            })
+        }
         return .object(object)
     }
 
-    static func metadataFlag(_ metadata: JSONValue?, _ key: String) -> Bool {
+    static func owedSupersessions(_ metadata: JSONValue?) -> [SupersedingAcceptance] {
+        guard case .object(let object)? = metadata, case .array(let rows)? = object[pendingSupersedesKey] else { return [] }
+        return rows.compactMap { row in
+            guard case .object(let fields) = row, case .string(let id)? = fields["id"],
+                  case .string(let hash)? = fields["hash"], case .string(let reason)? = fields["reason"] else { return nil }
+            return SupersedingAcceptance(targetId: id, expectedContentHash: hash, reason: reason)
+        }
+    }
+
+    public static func metadataFlag(_ metadata: JSONValue?, _ key: String) -> Bool {
         if case .object(let object)? = metadata, object[key] == .bool(true) { return true }
         return false
     }
@@ -417,7 +496,7 @@ public actor MemoryStorage {
     static func foldDuplicate(_ memory: StoredMemory, into existing: StoredMemory, in db: Database,
                               carryingHistory: Bool = false) throws -> StoredMemory {
         var row = existing
-        let key = MemoryConsolidator.normalizedContentKey(memory.content)
+        let key = Self.comparisonKey(memory.content, mode: .canonical)
         if memory.embedding == nil {
             try Self.requireNotTombstoned(row, in: db)
         }
@@ -439,7 +518,7 @@ public actor MemoryStorage {
             existing: MemoryRecord(stored: row), newSource: memory.source, newMetadata: memory.metadata)
         // Explicit scope replaces scope only on the same text, never
         // on a merely similar record. Omission retains the old scope.
-        if MemoryConsolidator.normalizedContentKey(row.content) == key,
+        if Self.comparisonKey(row.content, mode: .canonical) == key,
            case .object(let incoming)? = memory.metadata,
            case .array(let topics)? = incoming["context_topics"], !topics.isEmpty {
             patch["context_topics"] = .array(topics)
@@ -497,9 +576,6 @@ public actor MemoryStorage {
                 limit: memoryLimit,
                 preservingIDs: [memory.id]
             )
-            if !superseding.isEmpty, evicted.contains(where: { $0.id == memory.id }) {
-                throw MemoryStorageError.capacityExceeded
-            }
             guard let saved = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [memory.id]).map(Self.decodeMemory) else {
                 throw MemoryStorageError.databaseUnavailable("committed memory is missing")
             }
@@ -512,7 +588,7 @@ public actor MemoryStorage {
             pokeUserMDRegen(persona: predecessor.personaId)
             await pokeProjectionHooks(predecessor)
         }
-        await handleBoundEvictions(evicted, reason: "insert")
+        await handleBoundEvictions(evicted)
         return saved
     }
 
@@ -567,13 +643,16 @@ public actor MemoryStorage {
             owed.embeddingEpoch = epoch.rawValue
             var reason: String?
             var folded: StoredMemory?
+            var demoted: [StoredMemory] = []
             // A caller-owned id (one lesson origin per proposal) is admitted
             // as itself, never folded into another row, as its warm write was.
             let preservesID = Self.metadataFlag(owed.metadata, Self.preservesIDKey)
-            if try Self.tombstoneMatch(db: db, query: vector, queryEpoch: epoch.rawValue,
-                                       threshold: memoryTombstoneMatchThreshold) {
-                reason = "a paraphrase of a rejected claim, found when its owed vector landed"
-            } else if !preservesID {
+            do {
+                try Self.requireNotTombstoned(owed, in: db)
+            } catch MemoryStorageError.tombstoned {
+                reason = "a rejected claim, found when its owed vector landed"
+            }
+            if reason == nil, !preservesID {
                 let others = try Row.fetchAll(db, sql: """
                     SELECT * FROM memories WHERE status = 'active' AND id <> ?
                         AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL) ORDER BY rowid
@@ -583,13 +662,31 @@ public actor MemoryStorage {
                     reason = "folded into \(duplicate.id), a duplicate found when its owed vector landed"
                 }
             }
+            // An admitted replacement demotes what it replaces now, all or none,
+            // as its warm write would have; one that changed or left meanwhile
+            // refuses it, as a warm write is refused.
+            let supersessions = Self.owedSupersessions(owed.metadata)
+            if reason == nil, !supersessions.isEmpty {
+                do {
+                    try db.inSavepoint {
+                        demoted = try supersessions.map { try Self.demoteSuperseded($0, by: owed, in: db) }
+                        return .commit
+                    }
+                } catch {
+                    reason = "a memory it was to replace changed or left before its owed vector landed: \(error)"
+                }
+            }
             guard let reason else {
                 try db.execute(sql: """
                     UPDATE memories SET embedding = ?, embedding_epoch = ?,
-                        metadata_json = json_remove(metadata_json, '$.\(Self.preservesIDKey)', '$.\(Self.pendingAdmissionKey)')
+                        metadata_json = json_remove(metadata_json, '$.\(Self.preservesIDKey)', '$.\(Self.pendingAdmissionKey)',
+                            '$.\(Self.pendingSupersedesKey)')
                     WHERE id = ?
                     """, arguments: [Self.encodeEmbedding(vector), epoch.rawValue, id])
-                return (.landed, [])
+                // Admitted now: the projections that withheld it publish it.
+                let landed = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id])
+                    .map(Self.decodeMemory)
+                return (.landed, [landed].compactMap { $0 } + demoted)
             }
             var metadata: [String: JSONValue] = [:]
             if case .object(let current)? = owed.metadata { metadata = current }
@@ -627,13 +724,19 @@ public actor MemoryStorage {
         }
     }
 
-    public func updateMemory(id: String, patch: MemoryPatch) async throws -> StoredMemory? {
+    /// A conditional edit skips a row whose approved original has changed.
+    public func updateMemory(
+        id: String, patch: MemoryPatch, expectedContent: String? = nil,
+        onlyIf: (@Sendable (StoredMemory) -> Bool)? = nil
+    ) async throws -> StoredMemory? {
         let turnProvenance = try MemorySenseProvenance.stamping(nil)
         let turnDataProvenance = MemoryDataProvenance.stamping(nil)
-        let updated = try await dbPool.write { db -> StoredMemory? in
+        let (updated, demoted) = try await dbPool.write { db -> (StoredMemory?, [StoredMemory]) in
             guard var existing = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory) else {
-                return nil
+                return (nil, [])
             }
+            if let expectedContent, existing.content != expectedContent { return (nil, []) }
+            if let onlyIf, !onlyIf(existing) { return (nil, []) }
             let priorMetadata = existing.metadata
             let owesVector = patch.content.map { $0 != existing.content } == true && patch.embedding == nil
             if let c = patch.content { existing.content = c }
@@ -653,14 +756,14 @@ public actor MemoryStorage {
                 if case .object(let current)? = existing.metadata { metadata = current }
                 if merge["pinned"] == .bool(true), metadata["pinned"] != .bool(true) {
                     let kind: String? = if case .string(let value)? = metadata["kind"] { value } else { nil }
-                    if let refusal = UserMDGenerator.pinRefusal(kind: kind) {
-                        throw MemoryV2Error.underlying(refusal)
+                    if let refusal = UserMDGenerator.pinFailure(kind: kind) {
+                        throw refusal
                     }
                     let last = try Int64.fetchOne(db, sql: """
                         SELECT MAX(CAST(json_extract(metadata_json, '$.pinned_order') AS INTEGER)) FROM memories
                     """) ?? 0
                     let (next, overflow) = last.addingReportingOverflow(1)
-                    guard !overflow else { throw MemoryStorageError.capacityExceeded }
+                    guard !overflow else { throw MemoryStorageError.pinOrderExhausted }
                     metadata["pinned_order"] = .int(next)
                 }
                 for (key, value) in merge { metadata[key] = value }
@@ -683,6 +786,21 @@ public actor MemoryStorage {
                 existing.embedding = nil
                 existing.embeddingEpoch = nil
                 existing.metadata = Self.owingAdmission(existing.metadata, preservingID: true)
+            }
+            var demoted: [StoredMemory] = []
+            if existing.status == "active", let vector = existing.embedding,
+               Self.metadataFlag(priorMetadata, Self.pendingAdmissionKey) {
+                // An active row awaiting admission that now has its vector is
+                // admitted here, with its landing's checks, so it never stays withheld.
+                if try Self.tombstoneMatch(db: db, query: vector, queryEpoch: existing.embeddingEpoch,
+                                           threshold: memoryTombstoneMatchThreshold) {
+                    throw MemoryV2Error.forgottenContent("Updated content paraphrases a forgotten or rejected memory.")
+                }
+                demoted = try Self.owedSupersessions(priorMetadata).map { try Self.demoteSuperseded($0, by: existing, in: db) }
+                if case .object(var metadata)? = existing.metadata {
+                    for key in [Self.pendingAdmissionKey, Self.preservesIDKey, Self.pendingSupersedesKey] { metadata[key] = nil }
+                    existing.metadata = .object(metadata)
+                }
             }
             existing.updatedAt = Self.nowISO8601()
             if patch.content != nil || patch.embedding != nil {
@@ -714,9 +832,10 @@ public actor MemoryStorage {
                 Self.encodeMetadata(existing.metadata),
                 existing.id
             ])
-            return try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [existing.id]).map(Self.decodeMemory)
+            return (try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [existing.id]).map(Self.decodeMemory),
+                    demoted)
         }
-        if let u = updated {
+        for u in [updated].compactMap({ $0 }) + demoted {
             invalidateRecallCache()
             pokeUserMDRegen(persona: u.personaId)
             await pokeProjectionHooks(u)
@@ -811,7 +930,8 @@ public actor MemoryStorage {
                     metadata: Self.decodeMetadata(row.decode(forColumn: "metadata_json"))
                 ))
                 guard archived ? Self.isRecoverable(record)
-                    : record.status == "active" && MemoryLifecycle.isRecallEligible(record.lifecycle),
+                    : record.status == "active" && MemoryLifecycle.isRecallEligible(record.lifecycle)
+                        && !Self.metadataFlag(record.extras, Self.pendingAdmissionKey),
                     kind == nil || record.memoryKind == kind,
                     MemoryRecordDisclosurePolicy.classify(
                         personaID: record.personaId, status: archived ? "active" : record.status,
@@ -879,6 +999,7 @@ public actor MemoryStorage {
                 SELECT * FROM memories WHERE status = 'active'
                     AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
                     AND json_extract(metadata_json, '$.pinned') = 1
+                    AND json_extract(metadata_json, '$.\(Self.pendingAdmissionKey)') IS NOT 1
                 ORDER BY COALESCE(json_extract(metadata_json, '$.pinned_order'), 0), created_at, id
             """).map(Self.decodeMemory).map(MemoryRecord.init(stored:)).filter {
                 $0.memoryKind.map(UserMDGenerator.userIdentityKinds.contains) == true

@@ -1,5 +1,6 @@
 import Foundation
 import Desk
+// Blueprint: | `WorkshopSessionContracts.swift` | `WorkshopSessionStatus` enum |
 
 public enum WorkshopSessionStatus: String, Sendable, Equatable {
     case completed   // ran and produced output

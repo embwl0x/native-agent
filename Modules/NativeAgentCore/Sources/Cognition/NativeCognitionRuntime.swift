@@ -1,7 +1,8 @@
 import Foundation
 import ApprovalInbox
 import BackgroundLoops
-import ChatOrchestration
+import ChatTurnRuntime
+import AgentConversations
 import CognitiveSubstrate
 import Context
 import ContextFlow
@@ -13,6 +14,9 @@ import Desk
 import Experiences
 import DreamREMCycle
 import ProviderRouting
+import AuthoredCapabilities
+import NativeAgentShared
+// Blueprint: | `NativeCognitionRuntime.swift` | `NativeCognitionRuntime` actor; `rememberNonLiveTurnKind`; Desk candidates/approval context publish together with the read's Desk revision, checked at turn and wake admission; generation orders refreshes; observes Experiences for carried wait settlement, caching only its last read to ignore unchanged replay events; settled live turns trigger one held-memory drain at idle; `GrowthWeekProjection` binds frozen growth facts to L0's version/source cache through the native host |
 
 public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProviding {
     public let dataRoot: URL
@@ -75,9 +79,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     var lastInjectedBodyLineAt: Date?  // internal for actor extensions (move-only Wave C)
     /// Event-coalesced owner for the fast dirty microcycle. A burst of sensory
     /// events becomes one settle pass; quiet time creates no wake at all.
-    private var microcycleGeneration: UInt64 = 0
-    private var pendingMicrocycleGeneration: UInt64?
-    private var pendingMicrocycleTask: Task<Void, Never>?
+    private var microcycleTimer = StoreReloadDebouncer.Timer()
     private var microcycleTelemetry: CognitiveMicrocycleTelemetry
     static let microcycleCoalescingDelay: TimeInterval = 0.25
     private var replayReconciliationPending = false
@@ -91,6 +93,9 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// Studio canon tending: single-flight, throttled. See
     /// NativeCognitionRuntime+StudioCanon.swift.
     var studioCanonTask: Task<Void, Never>?  // internal for actor extensions
+    var horizonRefreshTask: Task<Void, Never>?
+    var reachTask: Task<Void, Never>?
+    var sourceWakes = CognitiveSourceWakes()
     var lastStudioCanonTendingAt: Date?  // internal for actor extensions
     var lastStudioRelationAuditVerdict: String?  // internal for actor extensions
     public static let eventDrivenReplayDeadlineSeconds: TimeInterval = 10
@@ -120,19 +125,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// instead; the hour-scale retry above is for gate/error skips, not
     /// momentary commit contention.
     private static let cognitionMaintenanceContentionRetryDelay: TimeInterval = 30
-    /// Comb 3 lane 2 item 2: a `conserve` loop budget used to be an INDEFINITE
-    /// veto on reflection/replay/cue work. On the evening of 2026-09-11 that
-    /// produced 90 deferrals and zero reflections while resource pressure stayed
-    /// nominal — the body's fatigue alone closed the only processes that could
-    /// integrate the day. Conserve is now a THROTTLE: each lane still gets
-    /// deferred, but not starved past this interval. `sleep` is untouched and
-    /// still refuses outright, and the thermal and low-power checks below still
-    /// apply to the pass.
-    static let conserveExpensiveStarvationFloor: TimeInterval = 45 * 60
-    /// Last time each expensive lane was let through while conserving. Lives in
-    /// the process, not on disk: it bounds how often conserve is overridden, and
-    /// a fresh launch is allowed one pass per lane.
-    private var conserveExpensivePassAt: [String: Date] = [:]
     /// Owner-emitted invalidations for visible cognition projections. Views
     /// subscribe while mounted instead of rereading the whole mind every five
     /// seconds. Buffering-newest coalesces bursts; the runtime state remains
@@ -205,7 +197,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// Real chat-turn lifecycle latch (review 2026-09-01, HIGH).
     ///
     /// The coalesced microcycle generation is NOT a turn. `runScheduledMicrocycle`
-    /// clears `pendingMicrocycleGeneration` the moment the settlement it owns
+    /// consumes `microcycleTimer` the moment the settlement it owns
     /// starts, while the user's turn — provider stream, tool loop, reply
     /// persistence — keeps running for minutes afterwards. A residual deadline
     /// landing in that window read "no turn in flight" and could start a
@@ -301,6 +293,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 }
             )
         )
+        let growthProjection = GrowthWeekProjection(dataRoot: root, host: host)
         self.substrate = CognitiveSubstrate(
             configuration: store == nil
                 ? Self.configurationWithoutPersistence(configuration)
@@ -322,7 +315,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 // UNBIDDEN RECALL (2026-09-02). The substrate asks with the
                 // words of its own felt line and gets back felt MOMENTS. Local
                 // SQLite + the already-warm embedder — no provider call — and
-                // any failure returns [], which reads as "nothing came to her".
+                // unreadable sources carry explicit cue-read evidence.
                 // Rooted at THIS runtime's data root and filtered by the turn's
                 // own surface; both are correctness, not hygiene (see below).
                 recallMoments: { feltLine, k, surface in
@@ -350,6 +343,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                     await SwiftNativeMemoryV2.resolvedOwner(dataRoot: root).embedIfWarm(texts)
                 },
                 peerTrusted: { PeerTrust.ownerTrusts($0, dataRoot: root) },
+                surfaceIsPrivate: {
+                    MemoryRecordDisclosurePolicy.localPrivateSurfaces.contains(
+                        MemoryRecordDisclosurePolicy.canonicalSurface($0))
+                },
                 sinceGap: { from, to, surface in
                     await NativeCognitionRuntime.sinceGapItems(from: from, to: to, surface: surface, dataRoot: root)
                 },
@@ -364,7 +361,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                         nativeLog("[cognition] decision unavailable: \(error)")
                         return [:]
                     }
-                }
+                },
+                growthProjection: { await growthProjection.read($0) }
             ),
             store: store
         )
@@ -376,6 +374,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     }
 
     deinit {
+        sourceWakes.cancelObservations()
         approvalLifecycleObservationTask?.cancel()
         pursuitObservationTask?.cancel()
         carriedExperienceObservationTask?.cancel()
@@ -389,12 +388,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         let path = dataRoot
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("profile.json")
-        guard let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let name = obj["userName"] as? String else {
-            return ""
-        }
-        return name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return SwiftNativeKnowledgeGraphIndexer.profileNames(profileURL: path).user ?? ""
     }
 
     // MARK: - Unbidden recall (2026-09-02)
@@ -410,8 +404,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     ]
 
     /// One local recall, mapped into the substrate's vocabulary. Never throws:
-    /// a cold or unavailable store means she is reminded of nothing, which is
-    /// the correct degraded behavior for an enhancer line.
+    /// a cold store contributes no cue; unavailable reads carry unreadable
+    /// evidence into frozen capsule preparation.
     ///
     /// TWO THINGS HERE ARE LOAD-BEARING, and the first cut had neither:
     ///
@@ -537,10 +531,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
 
     private nonisolated static func isoDate(_ raw: String?) -> Date? {
         guard let raw, !raw.isEmpty else { return nil }
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFraction.date(from: raw) { return date }
-        return ISO8601DateFormatter().date(from: raw)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
     public func bootstrap() async {
@@ -652,6 +643,9 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     }
 
     public func refreshConfiguration() async {
+        sourceWakes.canonDirty = true
+        sourceWakes.horizonDirty = true
+        sourceWakes.reachDirty = true
         withdrawReachIfDisabled()
         if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot),
            preferenceDefaults.object(forKey: Self.enabledKey) == nil {
@@ -720,6 +714,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 }
                 let reaction = await substrate.finishAfterTurn(context, appraisal: interpretation?.affect,
                                                                caring: interpretation?.caring)
+                await self?.standingViewsSourceChanged()
                 // Phase 5 E3: a correction from the person she took in (kept as
                 // a standing correction) is her own outcome: a little more sure.
                 if let self, context.event.sourceClass != .imported,
@@ -760,6 +755,9 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             defaults: preferenceDefaults
         )
         await organismKernel.configure(organismConfiguration)
+        // Configuration replaces the pushed clock. Invalidate after that await
+        // so a concurrent body read cannot consume the invalidation too early.
+        sourceWakes.clockDirty = true
         await somaticSignalBus.configure(organismConfiguration)
     }
 
@@ -807,6 +805,11 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         // Exact replay is inert across both resident owners. It must not create
         // settlement work, persistence, invalidations, or telemetry.
         guard substrateAccepted || somaticAccepted else { return }
+        // The completion slot and live-turn timing are in-memory sources.
+        if inherited.event.kind == .userMessageReceived || inherited.event.kind == .assistantTurnCompleted || inherited.event.kind == .providerFailure {
+            sourceWakes.horizonDirty = true
+            sourceWakes.reachDirty = true
+        }
         if somaticAccepted {
             cachedBodyRead = nil
             // Round 3 Wave A2 (review 3360e532dd3b, High): the MAIN event
@@ -1030,10 +1033,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     public func runMicrocycle(reason: String) async -> CognitiveBackgroundRunOutcome {
         await bootstrap()
         if let bootstrapFailure { return .failed(bootstrapFailure) }
-        switch await backgroundCognitionGate(reason: reason) {
-        case .skipped(let reason): return .skipped(reason)
-        case .allowed: break
-        }
         do {
             let snapshot = try await substrate.runMicrocycleChecked(reason: reason)
             guard snapshot != nil else {
@@ -1055,33 +1054,22 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         // snapshot. Same latch the reschedule bodies honor.
         guard !isFlushedForTermination else { return }
         microcycleTelemetry.scheduledSignalCount &+= 1
-        if pendingMicrocycleGeneration != nil {
+        if microcycleTimer.isPending {
             microcycleTelemetry.coalescedReplacementCount &+= 1
         }
         microcycleTelemetry.lastScheduledAt = now()
         microcycleTelemetry.lastReason = String(reason.prefix(160))
-        microcycleGeneration &+= 1
-        let generation = microcycleGeneration
-        pendingMicrocycleGeneration = generation
-        pendingMicrocycleTask?.cancel()
-        pendingMicrocycleTask = nil
-        pendingMicrocycleTask = Task { [weak self] in
-            let nanos = UInt64(Self.microcycleCoalescingDelay * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: nanos)
-            guard !Task.isCancelled, let self else { return }
-            await self.runScheduledMicrocycle(generation: generation, reason: reason)
+        microcycleTimer.schedule(delay: .seconds(Self.microcycleCoalescingDelay)) { [weak self] generation in
+            await self?.runScheduledMicrocycle(generation: generation, reason: reason)
         }
     }
 
     private func runScheduledMicrocycle(generation: UInt64, reason: String) async {
         guard !isFlushedForTermination,
-              generation == microcycleGeneration,
-              pendingMicrocycleGeneration == generation else { return }
+              microcycleTimer.take(generation) else { return }
         // This generation is now in flight, not pending. A reentrant event
         // arriving while persistence awaits must start a distinct generation
         // instead of being merged into work already started by this cycle.
-        pendingMicrocycleGeneration = nil
-        pendingMicrocycleTask = nil
         let startedAt = now()
         let monotonicStartedAt = monotonicNowNanoseconds()
         microcycleTelemetry.executedCount &+= 1
@@ -1111,11 +1099,13 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         // A microcycle may create or resolve thought seeds and standing views.
         // Re-project the single maintenance deadline after that canonical
         // transition; ordinary reads and quiet elapsed time remain wake-free.
+        await standingViewsSourceChanged()
         await rescheduleCognitionMaintenanceDeadline()
         // `runMicrocycle` publishes after the substrate commit; scheduled
         // settlement publishes once more after its telemetry has reached the
         // same terminal state so Observatory readers cannot see stale counters.
         publishRuntimeChange(reason: "microcycle_settlement:finished")
+        await rescheduleResidualRepairDeadline()
     }
 
     public func microcycleTelemetrySnapshot() -> CognitiveMicrocycleTelemetry {
@@ -1126,14 +1116,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     public func runMaintenance(reason: String) async -> CognitiveBackgroundRunOutcome {
         await bootstrap()
         if let bootstrapFailure { return .failed(bootstrapFailure) }
-        switch await backgroundCognitionGate(reason: reason) {
-        case .skipped(let reason):
-            await rescheduleCognitionMaintenanceDeadline(
-                notBefore: now().addingTimeInterval(Self.cognitionMaintenanceRetryDelay)
-            )
-            return .skipped(reason)
-        case .allowed: break
-        }
         do {
             let configuration = await substrate.configurationSnapshot()
             let persistenceEnabled = configuration.persistenceEnabled
@@ -1172,10 +1154,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         let configuration = await substrate.configurationSnapshot()
         guard configuration.enabled else {
             return .skipped(LoopTickOutcome.offPrefix + "cognitive replay disabled")
-        }
-        switch await backgroundCognitionGate(reason: reason) {
-        case .skipped(let reason): return .skipped(reason)
-        case .allowed: break
         }
         do {
             let persistenceEnabled = configuration.persistenceEnabled
@@ -1220,14 +1198,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         // otherwise commit — and re-arm a deadline this flush just cancelled —
         // AFTER the terminal snapshot below. The reschedule bodies also honor
         // `isFlushedForTermination` so any survivor no-ops instead of re-arming.
-        pendingMicrocycleTask?.cancel()
-        pendingMicrocycleTask = nil
-        // gpt-5.5 fix round: cancel() alone leaves a hole — a task that passed
-        // its Task.isCancelled check before this line still enters
-        // runScheduledMicrocycle afterwards. Clearing the pending generation
-        // fails its generation guard, and the latch guards below close the
-        // schedule/retry entry points for anything that re-arrives later.
-        pendingMicrocycleGeneration = nil
+        microcycleTimer.cancel()
         replayRetryTask?.cancel()
         replayRetryTask = nil
         // A4.6: quiesce the event-driven reflection lane the same way — the
@@ -1245,6 +1216,13 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             summary: "NativeAgent app is terminating",
             importance: 0.35
         )
+        // Her saved mind is written only by a process that has read it
+        // (docs/STOP.md): join the launch restore already running; if it never
+        // ran or failed, nothing of hers is saved and the disk stays as it was.
+        // A quit seconds after launch used to save a fresh, unrestored
+        // substrate over her real one.
+        await bootstrapTask?.value
+        guard bootstrapTask != nil, bootstrapFailure == nil else { return }
         await substrate.observe(sleepEvent)
         await somaticSignalBus.observe(sleepEvent)
         await substrate.runMaintenance(reason: "app termination")
@@ -1421,6 +1399,9 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 await restoreOrganismContinuityIfAvailable()
                 await refreshOrganismBodySchema(reason: "subconscious enabled")
                 await persistOrganismContinuity(reason: "subconscious enabled")
+                // Desk changes while she was off did not reach her ruminations;
+                // waking reads the Desk once.
+                await startPursuitRefresh()
             } else {
                 await bootstrap()
             }
@@ -1752,99 +1733,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// Reasons are shaped `<lane>:<class>` ("transcript_aging:reflection",
     /// "studio_encounter:reflection"); the lane is what gets its own floor, so
     /// one busy lane cannot consume another's pass.
-    static func expensiveLaneKey(for reason: String) -> String {
-        let lane = reason.split(separator: ":", maxSplits: 1).first.map(String.init) ?? reason
-        return String(lane.prefix(64))
-    }
-
-    public func backgroundCognitionGate(reason: String) async -> CognitiveBackgroundGate {  // internal for actor extensions (move-only Wave C)
-        let process = ProcessInfo.processInfo
-        if process.isLowPowerModeEnabled {
-            await substrate.recordReceipt(
-                kind: "cognition.resource_skip",
-                payload: .object([
-                    "reason": .string(reason),
-                    "resource": .string("low_power_mode"),
-                ])
-            )
-            return .skipped("low power mode")
-        }
-        // Thermal is decided BEFORE the conserve lane bookkeeping below. A
-        // refusal that never runs the operation must not consume the lane's
-        // 45-minute starvation pass — otherwise a thermal spike that clears a
-        // second later still costs the evening another full floor.
-        switch process.thermalState {
-        case .serious, .critical:
-            await substrate.recordReceipt(
-                kind: "cognition.resource_skip",
-                payload: .object([
-                    "reason": .string(reason),
-                    "resource": .string("thermal_pressure"),
-                    "state": .string(String(describing: process.thermalState)),
-                ])
-            )
-            return .skipped("thermal pressure")
-        default:
-            break
-        }
-        if let posture = await organismKernel.behaviorPosture() {
-            switch posture.loopBudget {
-            case .sleep:
-                await substrate.recordReceipt(
-                    kind: "cognition.organism_loop_skip",
-                    payload: .object([
-                        "reason": .string(reason),
-                        "loopBudget": .string(posture.loopBudget.rawValue),
-                        "posture": .string(posture.posture),
-                    ])
-                )
-                return .skipped("organism loop budget is sleep")
-            case .conserve:
-                let expensive = reason.contains("reflection")
-                    || reason.contains("replay")
-                    || reason.contains("cue")
-                if expensive {
-                    // Throttle, not a veto. A lane that has not been let through
-                    // for the starvation floor gets one pass, so the evening can
-                    // integrate; everything inside the floor is still deferred.
-                    let lane = Self.expensiveLaneKey(for: reason)
-                    let last = conserveExpensivePassAt[lane]
-                    let waited = last.map { now().timeIntervalSince($0) }
-                    if let waited, waited < Self.conserveExpensiveStarvationFloor {
-                        await substrate.recordReceipt(
-                            kind: "cognition.organism_loop_deferred",
-                            payload: .object([
-                                "reason": .string(reason),
-                                "loopBudget": .string(posture.loopBudget.rawValue),
-                                "posture": .string(posture.posture),
-                                "lane": .string(lane),
-                                "secondsSinceLanePass": .int(Int64(waited)),
-                                "starvationFloorSeconds":
-                                    .int(Int64(Self.conserveExpensiveStarvationFloor)),
-                            ])
-                        )
-                        return .skipped("organism loop budget is conserve")
-                    }
-                    conserveExpensivePassAt[lane] = now()
-                    await substrate.recordReceipt(
-                        kind: "cognition.organism_loop_starvation_pass",
-                        payload: .object([
-                            "reason": .string(reason),
-                            "loopBudget": .string(posture.loopBudget.rawValue),
-                            "posture": .string(posture.posture),
-                            "lane": .string(lane),
-                            "secondsSinceLanePass": waited.map { .int(Int64($0)) } ?? .null,
-                            "starvationFloorSeconds":
-                                .int(Int64(Self.conserveExpensiveStarvationFloor)),
-                        ])
-                    )
-                }
-            case .normal:
-                break
-            }
-        }
-        return .allowed
-    }
 
 
     static func loadConfiguration(  // internal for actor extensions (move-only Wave C)
@@ -1967,4 +1855,28 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// knob: the ceiling is what User steers; this is the shape's tuning seam.
     private static let reflectionLoadThresholdKey = "cognitiveSubstrateReflectionLoadThreshold"
     static let organismKernelEnabledKey = "organismKernelEnabled"  // internal for actor extensions (move-only Wave C)
+}
+
+/// The source epoch belongs to this readout, publication ordering to L0's
+/// LatestRead. No projection helper is ever launched from a view render.
+private actor GrowthWeekProjection {
+    private let faces: Task<PartFaces, Never>
+    private var previous: JSONValue?
+    private var epoch: UInt64 = 0
+
+    init(dataRoot: URL, host: any CognitionHost) {
+        faces = Task { @MainActor in
+            PartFaces(dataRoot: dataRoot) { id, input, version in
+                await host.readoutFace(id: id, input: input, version: version, dataRoot: dataRoot)
+            }
+        }
+    }
+
+    func read(_ input: JSONValue) async -> PartFaceSnapshot {
+        // Native window membership is in the frozen packet. An unchanged
+        // read reuses the face; an edited part invalidates it through L0.
+        if input != previous { epoch += 1; previous = input }
+        let selectedEpoch = epoch
+        return await faces.value.sourceChanged(id: "growth-week", epoch: selectedEpoch, input: input)
+    }
 }

@@ -3,18 +3,16 @@ import os
 import ProviderRouting
 #if canImport(CloudKit)
 import CloudKit
+// Blueprint: | `EngineRouteError.swift` | Engine route failures and shared UserFacingError interpretation |
 #endif
 // Local errors for Swift-native app routes. Retired-route callers either use a
 // native implementation or throw an explicit notImplemented envelope.
 public enum DaemonError: Error, LocalizedError, Sendable {
     case notFound(String)
-    case swiftNativeNotImplemented(String)
 
     public var errorDescription: String? {
         switch self {
         case .notFound(let path): return "Not found: \(path)"
-        case .swiftNativeNotImplemented(let what):
-            return "Swift-native impl for \(what) is not built yet."
         }
     }
 }
@@ -71,7 +69,6 @@ public enum UserFacingError {
     }
     #endif
     public static let iCloudSignedIn = "Signed in to iCloud"
-    public static let iCloudNoAnswer = "iCloud didn't answer in time"
 
     /// A sentence the app wrote itself, shown as is: a Swift error type from
     /// our own modules that describes itself (LocalizedError), or an NSError

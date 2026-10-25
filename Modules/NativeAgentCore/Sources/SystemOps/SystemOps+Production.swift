@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 
+// Blueprint: | `SystemOps+Production.swift` | `SwiftNativeProductionExportsClient`: lossless production export registry reads and verification; no external status runtime |
+
 // MARK: - Production read routes
 //
 // Swift-owned reader for production export registry state.
@@ -148,14 +150,12 @@ public struct SwiftNativeProductionExportsClient: Sendable {
     }
 
     public func listExports() async throws -> [ProductionExportReceipt] {
-        // Python: read_json(path, []) — missing/garbage file yields the
-        // default []. PersistenceCore.readJSON returns the defaultValue on
-        // any read/parse failure, so `.array([])` is the byte-accurate
-        // mirror of `read_json(..., [])`.
+        // Only a missing registry means no exports; existing invalid storage fails.
         let value = try await persistence.readJSON(registryPath, ifMissing: .array([]))
         guard case .array(let rows) = value else {
-            // Python: `if not isinstance(exports, list): return []`
-            return []
+            throw NSError(domain: "NativeAgentBackup", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Export registry must contain an array."
+            ])
         }
         let receipts = rows.map { ProductionExportReceipt(raw: $0) }
         // Python: sorted(..., key=lambda i: str(i.get("createdAt") or ""), reverse=True).

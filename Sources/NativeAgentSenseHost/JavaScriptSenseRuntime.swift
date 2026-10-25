@@ -4,6 +4,7 @@ import JavaScriptCore
 import Senses
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift` | Persistent sense/resident-part contexts with fresh frozen input per call, synchronous run/face entries, fresh projection helpers, shared Swift fragment-redaction binding and SenseWire validation, JSC execution watchdog with ProgramProgressWindow arithmetic |
 
 /// One isolated context per helper/program. Resident parts retain their context;
 /// all kinds share the VM, exception latch, host exchange and JSC watchdog.
@@ -22,7 +23,7 @@ final class JavaScriptProgramRuntime {
         // Flush a trailing accepted advance even when JS has stopped calling
         // the bridge, so coalescing cannot shorten the runner's stall window.
         do { try progress.flush() } catch { progress.forwardFailure = error; return true }
-        if !progress.awaitingReply, ProcessInfo.processInfo.systemUptime >= progress.deadline { return true }
+        if !progress.awaitingReply, ContinuousClock.now >= progress.window.deadline { return true }
         setTimeLimit(group, 0.25, JavaScriptProgramRuntime.expired, cell)
         return false
     }
@@ -30,35 +31,32 @@ final class JavaScriptProgramRuntime {
     private final class ProgressWindow {
         let io: PlugIO
         var id = 0
-        var seconds = 30.0
+        var window = ProgramProgressWindow(seconds: 30)
         var kind = OwnedProgram.Kind.sense
-        var last = 0.0
         var forwarded = -Double.infinity
         var pendingMark: Double?
         var forwardFailure: Error?
-        private var replyStarted: Double?
+        private var replyStarted: ContinuousClock.Instant?
         var awaitingReply: Bool { replyStarted != nil }
-        var deadline: Double { last + seconds }
         init(io: PlugIO) { self.io = io }
         func begin(id: Int, seconds: Double, kind: OwnedProgram.Kind) {
-            self.id = id; self.seconds = seconds; self.kind = kind
-            last = ProcessInfo.processInfo.systemUptime
+            self.id = id; self.kind = kind; window = ProgramProgressWindow(seconds: seconds)
             forwarded = -Double.infinity; pendingMark = nil; forwardFailure = nil
             replyStarted = nil
         }
-        func suspendForReply() { replyStarted = ProcessInfo.processInfo.systemUptime }
+        func suspendForReply() { replyStarted = .now }
         func resumeAfterReply() {
-            if let replyStarted { last += ProcessInfo.processInfo.systemUptime - replyStarted }
+            if let replyStarted { window.resume(after: replyStarted) }
             replyStarted = nil
         }
         func record(mark: Double? = nil) throws {
-            last = ProcessInfo.processInfo.systemUptime
+            window.renew()
             if let mark { pendingMark = mark }
             try flush()
         }
         func flush() throws {
             let now = ProcessInfo.processInfo.systemUptime
-            guard let pendingMark, now - forwarded >= min(0.25, seconds / 4) else { return }
+            guard let pendingMark, now - forwarded >= min(0.25, window.seconds / 4) else { return }
             try io.send(["id": id, "type": "progress", "n": pendingMark])
             forwarded = now; self.pendingMark = nil
         }
@@ -183,7 +181,7 @@ final class JavaScriptProgramRuntime {
         try finish(result)
     }
 
-    private func createContext(sdk: String, inputJSON: String?, kind: OwnedProgram.Kind, workspace: String? = nil, dataRoot: String? = nil, measurementSystem: String? = nil) throws -> JSContext {
+    private func createContext(sdk: String, inputJSON: String?, kind: OwnedProgram.Kind, part: Bool = false, home: String? = nil, workspace: String? = nil, dataRoot: String? = nil, measurementSystem: String? = nil) throws -> JSContext {
         guard let setTimeLimit = Self.setTimeLimit, Self.clearTimeLimit != nil else {
             throw failure("unsupported", "JavaScript execution time limits are unavailable.")
         }
@@ -208,9 +206,9 @@ final class JavaScriptProgramRuntime {
                 _ = self.bridge(type: "script_log", fields: (try? self.jsonString(["text": kept])) ?? "{}")
             }
             created.setObject(say, forKeyedSubscript: "__log" as NSString)
-            if kind == .tool {
-                guard let workspace, let dataRoot, let measurementSystem else { throw failure("bad_input", "Authored tools require their workspace, data paths and measurement system from the app.") }
-                created.setObject(FileManager.default.homeDirectoryForCurrentUser.path, forKeyedSubscript: "__home" as NSString)
+            if part {
+                guard let home, let workspace, let dataRoot, let measurementSystem else { throw failure("bad_input", "An ability requires its home, workspace, data paths and measurement system from the app.") }
+                created.setObject(home, forKeyedSubscript: "__home" as NSString)
                 created.setObject(workspace, forKeyedSubscript: "__workspace" as NSString)
                 created.setObject(dataRoot, forKeyedSubscript: "__dataRoot" as NSString)
                 created.setObject(measurementSystem, forKeyedSubscript: "__measurementSystem" as NSString)
@@ -232,12 +230,12 @@ final class JavaScriptProgramRuntime {
         progress.begin(id: id, seconds: program.seconds, kind: program.kind)
         let inputJSON = try message["input"].map {
             try JSONValue(fromFoundation: $0).serialize(pretty: false)
-        } ?? (program.entry == .run ? "{}" : nil)
+        } ?? ([.run, .face].contains(program.entry) ? "{}" : nil)
         let names = String(decoding: try JSONSerialization.data(withJSONObject: ids), as: UTF8.self)
-        let sdk = OwnedProgramRunner.prelude(ids: names, strict: program.kind == .skill,
-                                            input: inputJSON != nil, primitives: program.kind == .tool, turn: program.kind == .turn)
+        let sdk = OwnedProgramRunner.prelude(ids: names, strict: program.isStrict,
+                                            input: inputJSON != nil, primitives: program.isPart, turn: program.kind == .turn)
         let fresh = context == nil
-        if fresh { _ = try createContext(sdk: sdk, inputJSON: inputJSON, kind: program.kind, workspace: message["workspace"] as? String, dataRoot: message["dataRoot"] as? String, measurementSystem: message["measurementSystem"] as? String) }
+        if fresh { _ = try createContext(sdk: sdk, inputJSON: inputJSON, kind: program.kind, part: program.isPart, home: message["home"] as? String, workspace: message["workspace"] as? String, dataRoot: message["dataRoot"] as? String, measurementSystem: message["measurementSystem"] as? String) }
         guard let context, let group = JSContextGetGroup(context.jsGlobalContextRef), let setTimeLimit = Self.setTimeLimit else { throw failure("unsupported", "JavaScript context is unavailable.") }
         setTimeLimit(group, 0.25, Self.expired, progressCell)
         defer { Self.clearTimeLimit?(group) }
@@ -251,21 +249,19 @@ final class JavaScriptProgramRuntime {
             body = context.evaluateScript("(function () {" + program.source + "\n})", withSourceURL: URL(string: "app-script.js"))
         } else if body == nil {
             context.evaluateScript(program.source, withSourceURL: URL(string: "app-script.js"))
-            body = context.objectForKeyedSubscript("run")
+            let entry = program.entry == .face ? "face" : "run"
+            body = context.objectForKeyedSubscript(entry)
             if thrown == nil, body.map({ isFunction($0, in: context) }) != true {
-                throw failure("bad_output", "Owned program must define run(input).")
+                throw failure("bad_output", "Owned program must define \(entry)(input).")
             }
         }
-        let value = thrown == nil ? body?.call(withArguments: program.entry == .run
+        let value = thrown == nil ? body?.call(withArguments: [.run, .face].contains(program.entry)
             ? [context.objectForKeyedSubscript("input")!] : []) : nil
         try checkExecution()
         var done: [String: Any] = ["id": id, "type": "program_done"]
         if let thrown {
             done["exception"] = exception(thrown)
             try io.send(done); return
-        }
-        if program.kind == .tool, value == nil || value?.isUndefined == true {
-            throw failure("bad_output", "The returned value has no JSON form (undefined).")
         }
         if let value, !value.isUndefined {
             let promise = value.isObject && value.objectForKeyedSubscript("then").map { isFunction($0, in: context) } == true
@@ -275,15 +271,11 @@ final class JavaScriptProgramRuntime {
                 let detail = promise ? "Sync-only: define function run(input), use synchronous host/app calls and return plain JSON. Async functions and Promises are unsupported."
                     : thrown != nil ? "The returned value could not be read: \((thrown?.toString() ?? "").prefix(300))"
                     : "The returned value has no JSON form (a function or a symbol)."
-                if program.kind == .tool { throw failure("bad_output", detail) }
                 done["unreadableReturn"] = detail
                 try io.send(done); return
             }
             if let json, json.isString, let text = json.toString() {
                 if text.utf8.count > program.returnLimit {
-                    if program.kind == .tool {
-                        throw failure("output_limit", "The returned value exceeds the \(program.returnLimit)-byte output limit.")
-                    }
                     done["returned"] = String(text.prefix(program.returnLimit))
                     done["returnedNote"] = "The returned value was \(text.utf8.count) bytes; this is its first \(program.returnLimit), as text."
                 } else {
@@ -323,7 +315,7 @@ final class JavaScriptProgramRuntime {
     private func checkExecution() throws {
         if let latched { throw latched }
         if let error = progress.forwardFailure { throw failure("source_unavailable", error.localizedDescription) }
-        if ProcessInfo.processInfo.systemUptime >= progress.deadline { throw failure("timeout", "Sense execution stalled without progress.") }
+        if ContinuousClock.now >= progress.window.deadline { throw failure("timeout", "Sense execution stalled without progress.") }
     }
 
     private func checkException() throws {
@@ -338,7 +330,7 @@ final class JavaScriptProgramRuntime {
         do {
             if let latched { throw latched }
             try progress.flush()
-            guard ProcessInfo.processInfo.systemUptime < progress.deadline else { throw failure("timeout", "Sense execution stalled without progress.") }
+            guard ContinuousClock.now < progress.window.deadline else { throw failure("timeout", "Sense execution stalled without progress.") }
             callID += 1
             let callLimit = progress.kind == .sense ? 2 * 1024 * 1024 : PlugIO.maximumLineBytes
             guard let data = fields.data(using: .utf8), data.count <= callLimit else {
@@ -395,30 +387,18 @@ final class JavaScriptProgramRuntime {
                 }
                 subscribed = true; value = NSNull()
             case "publish":
-                guard var page = body["page"] as? [String: Any] else { throw failure("bad_output", "Sense publish requires a page.") }
-                page["corner"] = try jsonObject(record.corner)
-                if page["things"] == nil || page["things"] is NSNull { page["things"] = [] }
-                if page["folded"] == nil || page["folded"] is NSNull { page["folded"] = [] }
-                if var things = page["things"] as? [[String: Any]] {
-                    for i in things.indices {
-                        if things[i]["verbs"] == nil || things[i]["verbs"] is NSNull { things[i]["verbs"] = [] }
-                    }
-                    page["things"] = things
-                }
-                let decoded = try JSONDecoder().decode(NativePage.self, from: JSONSerialization.data(withJSONObject: page))
-                guard !decoded.address.isEmpty, decoded.text.utf8.count <= NativePage.maximumTextBytes else {
-                    throw failure("bad_output", "Sense page requires an address and at most 40,000 text bytes.")
-                }
+                guard case .object(let page) = JSONValue(fromFoundation: body["page"] ?? NSNull()) else { throw failure("bad_output", "Sense publish requires a page.") }
+                let decoded = try SenseWire.decodePage(page, corner: record.corner)
+                try SenseWire.validatePage(decoded,
+                    textError: "Sense page requires an address and at most 40,000 text bytes.")
                 body["page"] = try jsonObject(decoded)
                 try io.send(body); published = true; try progress.record(); value = NSNull()
             case "notify":
-                guard let news = body["news"] as? [String: Any], let newsAddress = news["address"] as? String,
-                      let summary = news["summary"] as? String, summary.utf8.count <= 4000 else {
-                    throw failure("bad_output", "Sense news requires address and summary (at most 4,000 bytes).")
-                }
-                body["news"] = try jsonObject(SenseNews(senseID: record.id, version: record.version,
-                    address: ContextSecretContentPolicy.redactedFragment(newsAddress),
-                    summary: ContextSecretContentPolicy.redactedFragment(summary), at: Date()))
+                var news = try SenseWire.news(JSONValue(fromFoundation: body["news"] ?? NSNull()), senseID: record.id, version: record.version,
+                    error: "Sense news requires address and summary (at most 4,000 bytes).")
+                news.address = ContextSecretContentPolicy.redactedFragment(news.address)
+                news.summary = ContextSecretContentPolicy.redactedFragment(news.summary)
+                body["news"] = try jsonObject(news)
                 try io.send(body); try progress.record(); value = NSNull()
             case "progress":
                 // No argument means one completed unit; explicit values must
@@ -427,12 +407,7 @@ final class JavaScriptProgramRuntime {
                 if let mark = try entryProgress.advance(to: n) { try progress.record(mark: mark) }
                 value = NSNull()
             case "present":
-                if !(body["view"] is NSNull) {
-                    guard let view = body["view"] as? [String: Any], view["title"] is String,
-                          let html = view["html"] as? String, html.utf8.count <= 256 * 1024 else {
-                        throw failure("bad_output", "Sense view requires title and at most 256 KiB of HTML.")
-                    }
-                }
+                _ = try SenseWire.view(body["view"].map { JSONValue(fromFoundation: $0) }, senseID: record.id, version: record.version)
                 try io.send(body); value = NSNull()
             case "act":
                 guard entryType == "act", body["verb"] is String, body["address"] is String else {
@@ -442,11 +417,11 @@ final class JavaScriptProgramRuntime {
                 guard let result = reply["result"] else { throw failure("bad_input", "Sense action reply requires result (null is allowed).") }
                 value = result
             case "state_get", "state_set":
-                guard let key = body["key"] as? String, !key.isEmpty, key.utf8.count <= 256 else {
+                guard let key = body["key"] as? String, SenseWire.validStateKey(key) else {
                     throw failure("bad_output", "Sense state requires a key of 1–256 bytes.")
                 }
                 if type == "state_set" {
-                    guard let value = body["value"], try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]).count <= 16 * 1024 else {
+                    guard let value = body["value"], try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]).count <= SenseWire.stateValueBytes else {
                         throw failure("bad_output", "Sense state values must be JSON of at most 16 KiB.")
                     }
                 }

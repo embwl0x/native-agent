@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `NativeTimestampFormat.swift` | `NativeTimestampFormat` enum; `flooredOptionalMicrosecondUTCOffset`; `calendarDay` in the Mac's autoupdating current time zone |
 
 /// Existing wire formats stay distinct: changing precision or the UTC suffix
 /// can change stored bytes even when the represented instant is the same.

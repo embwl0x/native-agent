@@ -12,6 +12,7 @@ import TurnTrace
 import Transcripts
 import ProviderRouting
 import Context
+// Blueprint: | `ChatOrchestration+ToolDispatch.swift` | Shared per-iteration tool dispatch and refusal of unoffered folded calls |
 
 extension SwiftNativeTurnEngine {
     // MARK: - Per-iteration dispatch (shared by both loops; U1 step 6)
@@ -70,7 +71,7 @@ extension SwiftNativeTurnEngine {
     ) async -> (blocks: [LLMContentBlock], records: [TurnEngineResult.ToolDispatchRecord]) {
         let planned: [(call: PreparedToolCall, offered: Bool, input: [String: JSONValue], undeclared: [String])] = providerCalls
             .enumerated().compactMap { i, call in
-                guard !ToolCallParser.isIgnorableToolName(call.name) else { return nil }
+                guard !ToolCallParser.isIgnorableToolName(call.name, recordShim: true) else { return nil }
                 let requestedName = providerTools.internalName(forProviderName: call.name)
                 let internalName = CanonicalToolNameDispatcher.canonical(requestedName)
                 let input = Self.inputWithSessionIfNeeded(toolName: internalName, input: call.input, sessionId: sessionId)
@@ -102,34 +103,24 @@ extension SwiftNativeTurnEngine {
             claims[entry.call.pairedId] = receipt
         }
         let prepared = planned.filter { $0.offered && claimed[$0.call.pairedId] == nil }.map(\.call)
-        // Mixed or not is decided on everything the model called in this
-        // step, before unoffered calls are dropped, a list's entries each.
-        let stepToolNames = planned.flatMap { ToolNameAliases.ranTools($0.call.internalName, input: $0.call.dispatchInput) }
-        let slots = await AppDoorReentry.$heldSend.withValue(Self.heldOutboundResult(stepToolNames: stepToolNames)) {
-            await Self.runIterationDispatchGroups(
-                prepared: prepared,
-                modelId: modelId,
-                surface: surface,
-                personaID: personaID,
-                fluidContextTurn: fluidContextTurn,
-                tools: tools,
-                progress: progress,
-                cancelFlagPath: cancelFlagPath,
-                stepToolNames: stepToolNames,
-                onToolUse: { p in
-                    await progress?(.toolUse(name: p.internalName, input: .object(p.dispatchInput)))
-                },
-                onOutcome: { p, result, _ in
-                    // A held send never reached the dispatcher, but she made it.
-                    if case .object(let fields) = result, fields["held_for_results"] == .bool(true) {
-                        ChatToolDispatchTracer.traceUndispatched(tool: p.internalName, input: p.dispatchInput, surface: surface, result: result)
-                    }
-                    await ToolReceipt.$dispatchedCall.withValue(p.ranCall) {
-                        await progress?(.toolResult(name: p.internalName, output: result))
-                    }
+        let slots = await Self.runIterationDispatchGroups(
+            prepared: prepared,
+            modelId: modelId,
+            surface: surface,
+            personaID: personaID,
+            fluidContextTurn: fluidContextTurn,
+            tools: tools,
+            progress: progress,
+            cancelFlagPath: cancelFlagPath,
+            onToolUse: { p in
+                await progress?(.toolUse(name: p.internalName, input: .object(p.dispatchInput)))
+            },
+            onOutcome: { p, result, _ in
+                await ToolReceipt.$dispatchedCall.withValue(p.ranCall) {
+                    await progress?(.toolResult(name: p.internalName, output: result))
                 }
-            )
-        }
+            }
+        )
 
         // Re-interleave in ORIGINAL INDEX ORDER: dispatched slots come back in
         // `prepared` order, refused calls are synthesized in place. Every
@@ -195,13 +186,23 @@ extension SwiftNativeTurnEngine {
         let path = (remPinsDataRoot ?? defaultDataRoot()).appendingPathComponent("workflows/approvals/requests.json")
         let record: ApprovalRecord
         do {
-            guard let found = try SwiftNativeApprovalInbox.loadApprovalRowsChecked(at: path)
-                .compactMap(ApprovalRecord.init(json:)).first(where: { $0.id == card }) else { throw CocoaError(.fileReadNoSuchFile) }
+            guard let found = try SwiftNativeApprovalInbox(root: remPinsDataRoot ?? defaultDataRoot())
+                .recordsUnlocked().first(where: { $0.id == card }) else {
+                return .object(["status": .string("unknown"), "effects": .string("unknown"), "card": .string(card),
+                    "not_run_status": .string("claimed_by_card"), "reason": .string("claimed_card_missing"),
+                    "detail": .string("The loaded approval queue has no card \(card) for this exact call. This proposal did not run again; the earlier outcome is unknown."),
+                    "remedy": Repair.reconcile(instruction: "Read the prior dispatch receipts and inspect the affected state before proposing new work; a missing card does not prove the earlier action did not run.",
+                        nextCall: Self.dispatchReceiptCall())])
+            }
             record = found
         } catch {
             return .object(["status": .string("unknown"), "effects": .string("unknown"), "card": .string(card),
                 "not_run_status": .string("claimed_by_card"),
-                "reason": .string("This exact call already waits on card \(card), which could not be read (\(error.localizedDescription)); it was not run again. Check the card before repeating it.")])
+                "reason": .string("claimed_card_unreadable"),
+                "detail": .string("Card \(card) for this exact call could not be read: \(error.localizedDescription). This proposal did not run again; the earlier outcome is unknown."),
+                "remedy": Repair.reconcile(instruction: "Read the approval store for this card before relying on its decision or repeating the action.",
+                    nextCall: .object(["tool": .string("app"), "input": .object([
+                        "action": .string("files.read"), "args": .object(["path": .string(path.path)])])]))])
         }
         guard record.status != "pending" else {
             guard case .object(var waiting) = held.result else { return held.result }
@@ -211,11 +212,17 @@ extension SwiftNativeTurnEngine {
             return .object(waiting)
         }
         let approved = record.decision == "approved"
-        return .object(["status": .string(approved ? (record.executedAction == nil ? "unknown" : "ok") : "skipped"),
+        return .object(["status": .string(record.executionIsStopped ? "stopped" : approved ? (record.executedAction == nil ? "unknown" : "ok") : "skipped"),
             "effects": .string(approved ? "unknown" : "none"), "card": .string(card),
             "decision": .string(record.decision ?? record.status), "receipt": record.executedAction ?? .null,
             "not_run_status": .string("claimed_by_card"),
-            "detail": .string("This exact call was already decided on card \(card) (\(record.decision ?? record.status)); its receipt is the card's, and it was not run again.")])
+            "reason": .string(record.executionIsStopped ? DataRootLife.stoppedReason : approved && record.executedAction == nil ? "card_outcome_unavailable" : "card_already_decided"),
+            "detail": .string("This exact call was already decided on card \(card) (\(record.decision ?? record.status)); its receipt is the card's, and it was not run again."),
+            "remedy": approved && record.executedAction == nil
+                ? Repair.reconcile(instruction: "Read this card's execution record, then inspect the affected state before repeating an action whose outcome is missing.",
+                    nextCall: .object(["tool": .string("app"), "input": .object([
+                        "action": .string("files.read"), "args": .object(["path": .string(path.path)])])]))
+                : Repair.terminal(instruction: "Use the retained card decision and receipt; this proposal did not run again.")])
     }
 
     /// User, 2026-09-06: Stop must stop the REST of the batch too. Both cancel
@@ -248,7 +255,9 @@ extension SwiftNativeTurnEngine {
             "status": .string("cancelled"),
             "cancelled": .bool(true),
             "error": .string(message),
-            "reason": .string(message),
+            "reason": .string("cancelled_before_start"),
+            "effects": .string("none"),
+            "remedy": Repair.terminal(instruction: "Stop cancelled this call before it started. Leave it stopped unless the person requests new work."),
         ])
     }
 
@@ -259,7 +268,7 @@ extension SwiftNativeTurnEngine {
     /// `effects_unknown` is what retry safety reads; the failure counters keep
     /// ignoring it on the `status: cancelled` bit.
     nonisolated static func interruptedToolResult(_ name: String) -> JSONValue {
-        let message = "tool '\(name)' was interrupted: the turn was stopped after "
+        let message = "tool '\(name)' was stopped: the turn was stopped after "
             + "the call had already started, so whether it took effect is unknown. "
             + "Check before repeating it."
         return .object([
@@ -267,54 +276,32 @@ extension SwiftNativeTurnEngine {
             "cancelled": .bool(true),
             "effects_unknown": .bool(true),
             "error": .string(message),
-            "reason": .string(message),
+            "reason": .string("interrupted_after_start"),
+            "effects": .string("unknown"),
+            "remedy": Repair.reconcile(instruction: "Read this turn's dispatch receipts, then inspect the affected state for any unconfirmed effect before repeating the action.",
+                nextCall: dispatchReceiptCall()),
         ])
     }
 
-    /// 2026-09-25 (turn ed54a985): one reply held `act` click, `screen`, then
-    /// three messages to Claude saying "done, my click returned ok". The
-    /// click had failed; every message was written before any result existed
-    /// and went out anyway. A call that speaks to someone outside the turn is
-    /// therefore not run when the same reply also calls anything else: the
-    /// others run, it comes back unsent, and the model sends again once it has
-    /// read their results. A reply of only such calls runs as written.
-    package nonisolated static let outboundMessageTools: Set<String> = [
-        "agent_message", "claude_message", "codex_message", "omp_message",
-        "invoke_codex",
-        "messages_send", "mail_send", "mail_reply", "agentmail_send",
-        "slack_post_message", "mobile_notify", "phone_request", "mac_notify", "chat_reply",
-    ]
-
-    /// What a held send returns, or nil when the step (every call the model
-    /// made in it, offered or not) is not mixed. An explicit error with
-    /// `held_for_results` retaining the fact that no send was attempted.
-    nonisolated static func heldOutboundResult(stepToolNames: [String]) -> JSONValue? {
-        // A clock read can't change what a message reports, so it never holds
-        // a send (A2A walk 09-25: 5 of 11 sends were held behind time_now).
-        let housekeeping: Set<String> = ["time_now"]
-        let others = stepToolNames.filter { !outboundMessageTools.contains($0) && !housekeeping.contains($0) }
-        guard !others.isEmpty, others.count < stepToolNames.count else { return nil }
-        var seen = Set<String>()
-        let names = others.filter { seen.insert($0).inserted }.joined(separator: ", ")
-        return .object([
-            "status": .string("not_sent"),
-            "error": .string("not sent: run this send in its own step"),
-            "held_for_results": .bool(true),
-            "sent": .bool(false),
-            "detail": .string("Not sent: written in the same step as \(names), before their results existed. "
-                + "Read those results, then run this send in its own step with no other tool calls."),
-        ])
+    /// The current turn's recorded outcomes, without asserting an unrecorded effect.
+    nonisolated static func dispatchReceiptCall() -> JSONValue {
+        var args: [String: JSONValue] = ["kind": .string("tool.dispatch"), "view": .string("receipts")]
+        if let turn = TurnTraceContext.turnId { args["turn_id"] = .string(turn) }
+        return .object(["tool": .string("app"), "input": .object([
+            "action": .string("trace.recent"), "args": .object(args)])])
     }
 
     /// The refusal a declared-but-not-offered `tool_use` gets back. Shaped
-    /// exactly like a dispatch error so the loop, the no-progress guard and
-    /// the transcript treat it as one. Her one tool is `app`: the answer is
+    /// exactly like a dispatch error so the loop and transcript treat it as one.
+    /// Her one tool is `app`: the answer is
     /// her call translated to it (a folded tool's action, workspace's home
     /// item, the catalog's find), else app's home.
     nonisolated static func notOfferedToolResult(_ name: String, input: [String: JSONValue] = [:]) -> JSONValue {
         // The one next step: the same call through app, or none at all.
         let call = ToolNameAliases.appCall(name, input: input)
         return .object([
+            "status": .string("refused"),
+            "reason": .string("tool_not_offered"),
             "error": .string("tool '\(name)' is not offered in this conversation, so it was not run. "
                 + ToolNameAliases.foldedToolHint(name, input: input)),
             "not_offered": .bool(true),
@@ -336,7 +323,11 @@ extension SwiftNativeTurnEngine {
             "error": .string("\(name) takes no \(keys.joined(separator: ", ")), so this block was not run. "
                 + "To call \(name), use only its own parameters."),
             "status": .string("skipped"),
+            "reason": .string("undeclared_call_fields"),
             "effects": .string("none"),
+            "remedy": .object(["kind": .string("correct_arguments"),
+                "instruction": .string("Find the action's accepted parameters, then remove the undeclared fields."),
+                "next_call": .object(["tool": .string("app"), "input": .object(["find": .string(name)])])]),
         ])
     }
 
@@ -388,15 +379,14 @@ extension SwiftNativeTurnEngine {
         progress: ChatOrchestrationProgressHandler?,
         imagesEnabled: Bool = true,
         cancelFlagPath: URL? = nil,
-        stepToolNames: [String]? = nil,
         onToolUse: @Sendable (PreparedToolCall) async -> Void,
         onOutcome: @Sendable (PreparedToolCall, JSONValue, Bool) async -> Void
     ) async -> [DispatchedSlot] {
         // A folded `app` action is judged as the tool it runs: its parallel
         // class, its pixels and whether it is a send are that tool's.
         let ran = prepared.map { $0.ranCall.tool }
-        let baseSafe = ran.map {
-            !Self.isConnectorRead($0) && ParallelToolDispatch.isParallelSafe(internalToolName: $0)
+        let baseSafe = prepared.map {
+            !Self.isConnectorRead($0.ranCall.tool) && ParallelToolDispatch.isParallelSafe(internalToolName: $0.ranCall.tool, input: $0.ranCall.input)
         }
         let fleetOverrides = ParallelToolDispatch.fleetParallelOverrides(
             names: ran,
@@ -418,11 +408,6 @@ extension SwiftNativeTurnEngine {
             imagesEnabled && LocalToolImage.pixelCapableTools.contains(ran[$0])
         })
         let imageRound = LocalToolImage.Round()
-        let heldResult = Self.heldOutboundResult(stepToolNames: stepToolNames ?? ran)
-        let held = heldResult == nil ? [] : Set(prepared.indices.filter {
-            outboundMessageTools.contains(ran[$0])
-        })
-
         for group in groups {
             switch group {
             case .sequential(let idx):
@@ -433,13 +418,6 @@ extension SwiftNativeTurnEngine {
                     await onOutcome(p, cancelled, true)
                     slots.append(DispatchedSlot(
                         index: idx, prepared: p, result: cancelled, isError: true, images: []
-                    ))
-                    continue
-                }
-                if held.contains(idx), let heldResult {
-                    await onOutcome(p, heldResult, true)
-                    slots.append(DispatchedSlot(
-                        index: idx, prepared: p, result: heldResult, isError: true, images: []
                     ))
                     continue
                 }
@@ -495,10 +473,6 @@ extension SwiftNativeTurnEngine {
                                 outcomes[idx] = (p, Self.cancelledToolResult(Self.spokenName(p)), true, [])
                                 continue
                             }
-                            if held.contains(idx), let heldResult {
-                                outcomes[idx] = (p, heldResult, true, [])
-                                continue
-                            }
                             taskGroup.addTask {
                                 let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink(round: imageRound) : nil
                                 let (dispatched, result, isError) = await Self.runSingleDispatch(
@@ -530,7 +504,12 @@ extension SwiftNativeTurnEngine {
                     let outcome = outcomes[idx] ?? (
                         prepared: prepared[idx],
                         result: JSONValue.object([
+                            "status": .string("unknown"),
+                            "reason": .string("dispatch_result_missing"),
+                            "effects": .string("unknown"),
                             "error": .string("parallel dispatch produced no result"),
+                            "remedy": Repair.reconcile(instruction: "Read this turn's dispatch receipts and inspect the affected state; a missing result does not prove the call did not run.",
+                                nextCall: Self.dispatchReceiptCall()),
                         ]),
                         isError: true, images: [LLMContentBlock]()
                     )
@@ -553,7 +532,7 @@ extension SwiftNativeTurnEngine {
               case .object(var failure) = result, failure["status"] == .string("failed"),
               [.int(402), .int(403)].contains(failure["http_status"] ?? .null),
               case .string(let url)? = failure["url"] else { return result }
-        for call in history.reversed() where call.ranCall.tool == "mcp__searxng-local__search" {
+        for call in history.reversed() where call.ranCall.tool == "web_search" {
             guard case .object(let envelope) = call.result, envelope["status"] == .string("ok"),
                   case .object(let search)? = envelope["result"], case .array(let rows)? = search["results"] else { continue }
             let urls = rows.compactMap { row -> String? in
@@ -654,7 +633,11 @@ extension SwiftNativeTurnEngine {
             step = try await journal?.begin(step, peerSources: PeerDataTaint.current?.checkpointSources ?? []) ?? step
         } catch {
             return (prepared, .object(["status": .string("failed"), "effects": .string("none"),
-                "not_run_status": .string("continuation_refused"), "reason": .string(error.localizedDescription)]), true)
+                "not_run_status": .string("continuation_refused"), "reason": .string("continuation_begin_failed"),
+                "stage": .string("begin"), "proposed_step_id": .string(step.id),
+                "detail": .string("The continuation journal could not admit this call: \(error.localizedDescription). The action did not start."),
+                "remedy": Repair.reconcile(instruction: "Read the Desk continuation and its journal error before proposing more work; this call has no effects to repeat.",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["page": .string("desk")])]))]), true)
         }
         let outcome = await runCheckpointedDispatchBody(prepared: prepared, modelId: modelId, surface: surface,
             personaID: personaID, fluidContextTurn: fluidContextTurn, tools: tools, progress: progress,
@@ -685,8 +668,13 @@ extension SwiftNativeTurnEngine {
                 settled: settled, owner: owner, ownerID: text("id"), requestID: text("requestId"),
                 peerSources: PeerDataTaint.current?.checkpointSources ?? [])
         } catch {
-            return (prepared, .object(["status": .string("failed"), "effects": .string("unknown"),
-                "reason": .string(error.localizedDescription), "receipt": outcome.0]), true)
+            return (prepared, .object(["status": .string("failed"),
+                "effects": object["effects"] ?? .string(ChatToolOutcome.neverRan(outcome.0) ? "none" : "unknown"),
+                "reason": .string("continuation_settlement_failed"), "stage": .string("settlement"),
+                "step_id": .string(step.id), "receipt": outcome.0,
+                "detail": .string("The action returned, but its continuation journal could not record settlement: \(error.localizedDescription). The returned receipt remains evidence of its effects."),
+                "remedy": Repair.reconcile(instruction: "Use the retained receipt and inspect the affected state before repeating the action; read the Desk continuation to resolve its journal error.",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["page": .string("desk")])]))]), true)
         }
         return (prepared, outcome.0, outcome.1)
     }
@@ -820,7 +808,7 @@ extension SwiftNativeTurnEngine {
             }
             }
             // A nonthrowing transport can still carry a canonical failure
-            // envelope (including MCP `isError:true`, wrapped or raw). Keep
+            // envelope (including `isError:true`, wrapped or raw). Keep
             // the provider tool-result bit, persisted progress, and traces on
             // the same shared classification.
             // A raised need is not an error and must not reach the model as
@@ -853,12 +841,7 @@ extension SwiftNativeTurnEngine {
     }
 
     private nonisolated static func connectorID(_ name: String) -> String? {
-        for (prefix, id) in [("notion_", "notion"), ("gmail_", "gmail"),
-                             ("google_calendar_", "gcal"), ("mail_", "mail"),
-                             ("github_", "github"), ("slack_", "slack"), ("x_", "x")] {
-            if name.hasPrefix(prefix) { return id }
-        }
-        return nil
+        name.hasPrefix("mail_") ? "mail" : nil
     }
 
     private nonisolated static func inputWithSessionIfNeeded(

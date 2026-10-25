@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ProductionHardeningSummary.swift` | `ProductionHardeningSummary` struct |
 
 public struct ProductionHardeningSummary: Codable, Hashable {
     public var status: String

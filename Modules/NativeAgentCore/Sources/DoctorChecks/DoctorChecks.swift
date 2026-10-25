@@ -10,17 +10,15 @@ import NativeAgentShared
 import PersistenceCore
 import DeviceSyncState
 import Desk
-import GitHubConnector
-import XConnector
-import SlackConnector
 import ProviderRouting
 import PersonaEngine
 // M5: MemoryStoreCheck validates the REAL knowledge-graph store (memory.sqlite
 // kg_entities/kg_relationships) through the reader the app already uses.
-import KnowledgeGraph
 // 2026-07-12: CoreMLEmbedderCheck probes the real bundled-MiniLM load path.
 import MemoryV2
 import Experiences
+import Transcripts
+// Blueprint: | `DoctorChecks.swift` | `SwiftNativeDoctorChecks` actor; `makeDoctorChecks`, `runAll`; runtime JSON and transcript inspection is read-only; persona health never seeds identity; canonical owners alone create or mutate these stores; StorageCheck does not create research/downloads, rich_ui, personal_os, llm, context/evals, context/hints, production/migrations, self_worktrees, native_power/browser/profile or native_power/notifications, and leaves existing contents untouched; onboarded persona health requires the saved profile and validates it through `PersonaCompiler.compileProfile`, reporting its failure; StorageCheck does not create capabilities, graphs, routing, connectors/workspaces, research/downloads, rich_ui, personal_os, llm, context/evals, context/hints, production/migrations, self_worktrees or native_power/browser/profile, and leaves existing contents untouched; CheckResult carries the owner, registered native repair or person recovery step and its experience projection; app defects never create coding requests |
 
 // MARK: - Subsystem #5b: DoctorChecks
 //
@@ -51,12 +49,16 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
     /// normalized by DoctorActionRuntime before they reach consumers.
     public let repair: String?
     public let receipt: String?
+    /// Whether the repair changed app-owned state; nil in older readings.
+    public let repairApplied: Bool?
     public let human_action: String?
     /// Live handler availability observed by DoctorActionRuntime, not inferred
     /// from human instructions or completion receipts. Nil in older reports.
     public let repair_available: Bool?
-    /// Set where `human_action` is a sign-in or permission — the only steps
-    /// Doctor hands to User, gathered into one inbox ask.
+    /// False where unattended repair would discard live continuity.
+    public let automaticRepairEligible: Bool?
+    /// Sign-ins and permissions join the consent inbox ask; app-defect
+    /// recovery steps stay separate from consent.
     public let ask: DoctorAskKind?
     /// Who heals an adverse row (`DoctorOwner.of`). A check declares only
     /// `builder` where a build is the fix; Doctor derives the rest.
@@ -75,8 +77,10 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
         harm: String? = nil,
         repair: String? = nil,
         receipt: String? = nil,
+        repairApplied: Bool? = nil,
         human_action: String? = nil,
         repair_available: Bool? = nil,
+        automaticRepairEligible: Bool? = nil,
         ask: DoctorAskKind? = nil,
         owner: DoctorOwner? = nil,
         repairExperience: Experience? = nil
@@ -88,8 +92,10 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
         self.harm = harm
         self.repair = repair
         self.receipt = receipt
+        self.repairApplied = repairApplied
         self.human_action = human_action
         self.repair_available = repair_available
+        self.automaticRepairEligible = automaticRepairEligible
         self.ask = ask
         self.owner = owner
         self.source = source
@@ -106,7 +112,7 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
         }
         guard !repairAvailable, DoctorSafeRepairPolicy.isAdverse(status) else { return nil }
         if let action = repair?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !action.isEmpty, !action.lowercased().hasPrefix("run repair safe issues") {
+           !action.isEmpty, !DoctorSafeRepairPolicy.isCoreRepairInstruction(action) {
             return action
         }
         return nil
@@ -114,75 +120,65 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
 }
 
 extension CheckResult {
-    private func repairClaim(_ key: String) -> String? {
-        repairExperience?.claims.first { $0.claim.hasPrefix(key + ": ") }
-            .map { String($0.claim.dropFirst(key.count + 2)) }
-    }
-
+    /// The check an owed repair is about: its operation names it; a measured row is itself.
     public var checkID: String {
-        guard let operation = repairClaim("operation"), operation.hasPrefix("doctor.check:") else { return id }
-        return String(operation.dropFirst("doctor.check:".count))
+        if let domain = repairExperience?.outcome?.domain, domain.hasPrefix("doctor.check:") { return String(domain.dropFirst("doctor.check:".count)) }
+        return id
     }
 
     public var repairOwner: String? {
-        repairClaim("owner") ?? (owner == .builder ? "NativeAgent code: " + checkID : source)
+        if repairExperience != nil { return source }
+        return owner == .builder ? "NativeAgent code: " + checkID : source
     }
 
     public var repairCall: String? {
-        if repairExperience != nil { return repairClaim("next_call") }
+        if repairExperience != nil { return nextCall }
         guard DoctorSafeRepairPolicy.isAdverse(status), ask == nil else { return nil }
         if let nextCall { return nextCall }
         if repair_available == true {
             return ToolFailureError.call("app", ["action": .string("doctor.repair"), "args": .object(["check_id": .string(id)])])
         }
-        guard owner == .builder, let repairOwner else { return nil }
-        return Self.builderCall(repairOwner, checkID: id, observed: detail)
-    }
-
-    /// Her lever where only the builder can change the owner: a code defect.
-    public static func builderCall(_ owner: String, checkID: String, observed: String) -> String {
-        ToolFailureError.call("app", ["action": .string("codex.message"), "args": .object([
-            "conversation_mode": .string("new"), "topic": .string("Repair " + checkID),
-            "text": .string("Repair " + owner + ". Observed: " + observed
-                + ". Preserve saved data and all Trust, sign-in and privacy decisions. Fix the owning cause; verify Doctor check "
-                + checkID + " passes afterward. A restart or this request being accepted is not recovery."),
-        ])])
+        return nil
     }
 
     public var repairTap: String? {
-        if repairExperience != nil { return repairClaim("tap") }
-        return ask == nil ? nil : recoveryAction(repairAvailable: false)
+        if repairExperience != nil { return human_action }
+        guard DoctorSafeRepairPolicy.isAdverse(status), ask != nil || repairCall == nil else { return nil }
+        if owner == .builder {
+            return "Ask the person to resolve \(repairOwner ?? checkID). " + (recoveryAction(repairAvailable: false)
+                ?? "Report this app defect and failed check \(checkID) to NativeAgent's maintainer; preserve saved data and all Trust, sign-in and privacy decisions.")
+        }
+        return recoveryAction(repairAvailable: false)
     }
 
     public var remedy: JSONValue? {
         guard DoctorSafeRepairPolicy.isAdverse(status), let repairOwner else { return nil }
-        if let repairTap { return Repair.why(owner: repairOwner, tap: repairTap) }
-        guard repairCall != nil else { return nil }
+        if let repairTap, ask != nil { return Repair.why(owner: repairOwner, tap: repairTap) }
+        guard repairCall != nil || repairTap != nil else { return nil }
         return Repair.remedy(owner: repairOwner,
-                             nextCall: repairCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }, tap: repairTap)
+            nextCall: repairCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }, tap: repairTap,
+            instruction: repair_available == true
+            ? "Press Repair in Diagnostics → Health checks to retry this check."
+            : repairCall == nil ? repairTap
+            : repair ?? human_action ?? "Use the native repair action for \(repairOwner), preserving the original bytes.")
     }
 
     public var repairFace: String {
-        // An owed row's detail is its debt's words, after the current reading when that differs.
-        if repairExperience?.face != nil { return detail }
-        guard case .object(let fix)? = remedy else { return detail }
-        let instruction: String = if case .string(let value)? = fix["instruction"] { value } else { "" }
-        return ([detail, harm, receipt].compactMap { $0 }.joined(separator: " "))
-            + " " + instruction + (repairCall.map { " " + $0 } ?? "")
+        // Evidence is prose; remedies and executable calls have their own fields.
+        detail
     }
 
     /// The reported row: its human step, an executable repair only where one
     /// runs, and its owner. Every writer of a Doctor report settles through it.
     public func settled(liveAvailable: Bool, coreAvailable: Bool) -> CheckResult {
         let humanAction = recoveryAction(repairAvailable: liveAvailable || coreAvailable) ?? (liveAvailable
-            ? "Open Diagnostics → Doctor and press Repair to retry this live service."
-            : coreAvailable && id == "persona_engine"
-            ? "Persona and identity documents require your decision. Open Diagnostics → Doctor and press Repair to create missing persona documents; automatic checks never write them."
+            ? "Press Repair in Diagnostics → Health checks to retry this live service."
             : nil)
         return CheckResult(source: source, nextCall: nextCall, id: id, title: title, status: status, detail: detail, harm: harm,
-                           repair: liveAvailable ? "Run Repair Safe Issues to retry this live service." : (coreAvailable ? repair : nil),
-                           receipt: receipt,
-                           human_action: humanAction, repair_available: liveAvailable || coreAvailable, ask: ask,
+                           repair: liveAvailable ? "Press Repair in Diagnostics → Health checks to retry this live service." : (coreAvailable ? repair : nil),
+                           receipt: receipt, repairApplied: repairApplied,
+                           human_action: humanAction, repair_available: liveAvailable || coreAvailable,
+                           automaticRepairEligible: automaticRepairEligible, ask: ask,
                            owner: DoctorOwner.of(self, repairAvailable: liveAvailable || coreAvailable))
     }
 }
@@ -194,7 +190,7 @@ public enum DoctorAskKind: String, Sendable, Codable, Equatable {
 
 /// Each adverse row's healer and route: `app` repairs it, `owner` (User) gets
 /// the one doctor-ask card, `agent` (Agent) is woken to triage it, `builder`
-/// goes to the harness queue for a code fix.
+/// names an app defect for the person's recovery step.
 public enum DoctorOwner: String, Sendable, Codable, Equatable {
     case app, owner, agent, builder
 
@@ -315,40 +311,9 @@ private enum DoctorJSONShape: Sendable {
 private struct DoctorJSONStoreSpec: Sendable {
     let relativePath: String
     let shape: DoctorJSONShape
-    let defaultValue: JSONValue
 }
 
-public enum DoctorFileRepair {
-    static func timestamp() -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: Date())
-            .replacingOccurrences(of: ":", with: "")
-            .replacingOccurrences(of: ".", with: "")
-    }
-
-    public static func backupExistingFile(_ url: URL) throws -> URL? {
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else {
-            return nil
-        }
-        let backup = url.deletingLastPathComponent()
-            .appendingPathComponent("\(url.lastPathComponent).doctor-bak-\(timestamp())")
-        try FileManager.default.copyItem(at: url, to: backup)
-        return backup
-    }
-
-    fileprivate static func writeJSON(_ value: JSONValue, to url: URL) async throws {
-        try await SwiftNativePersistenceCore().writeJSON(value, to: url)
-    }
-
-    fileprivate static func createJSON(_ value: JSONValue, at url: URL) throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        // Exclusive creation also protects files/symlinks appearing after the check.
-        try value.serializedData(pretty: true).write(to: url, options: [.withoutOverwriting])
-    }
-
+private enum DoctorJSONInspection {
     static func parseJSONFile(_ url: URL) throws -> JSONValue {
         let data = try Data(contentsOf: url)
         return try JSONValue.parse(data)
@@ -370,11 +335,8 @@ public enum DoctorFileRepair {
 let STORAGE_SUBDIRS: [String] = [
     "runs", "memory",
     "chat", "chat/messages", "chat/session_state",
-    "context", "context/cache", "context/evals", "context/feedback", "context/hints",
-    "llm",
-    "research", "research/downloads",
+    "context", "context/cache", "context/feedback",
     "improvements",
-    "self_worktrees",
     "logs",
     "scheduler",
     "config",
@@ -386,28 +348,21 @@ let STORAGE_SUBDIRS: [String] = [
     "trust",
     "backups",
     "release",
-    "connectors", "connectors/workspaces",
+    "connectors",
     "abilities", "skills", "skills/runs",
-    "tools", "tools/runtime", "tools/logs",
-    "capabilities",
-    "routing",
-    "workflows", "workflows/approvals", "workflows/run_state",
+    "tools",
+    "workflows", "workflows/approvals",
     "swarms",
-    "mcp", "mcp/cache", "mcp/consent", "mcp/logs", "mcp/sessions",
-    "rich_ui",
     "research/lab",
-    "graphs", "graphs/embeddings", "graphs/entities",
     "traces",
-    "personal_os",
-    "catalog", "catalog/packs", "catalog/quarantine", "catalog/sources", "catalog/trust",
+    "catalog", "catalog/quarantine", "catalog/sources", "catalog/trust",
     "native_power", "native_power/actions",
-    "native_power/browser", "native_power/browser/profile", "native_power/browser/screenshots", "native_power/browser/sources",
+    "native_power/browser", "native_power/browser/screenshots", "native_power/browser/sources",
     "native_power/intents",
-    "native_power/notifications",
     "connectors/actions",
     "improvements/gauntlet",
     "nextgen", "nextgen/actions", "nextgen/remote",
-    "production", "production/exports", "production/support", "production/migrations",
+    "production", "production/exports", "production/support",
 ]
 
 /// Creates the root and every entry in `STORAGE_SUBDIRS`. Throws on the first directory
@@ -421,18 +376,8 @@ func ensureDirs(_ root: URL) throws {
     }
 }
 
-/// The one real Swift check. Mirrors Python's storage check at
-/// native_agentd.py L29487-29491:
-///   try: ensure_dirs(self.root)
-///        add("storage", "App Storage", "ok",
-///            f"App data is available at {self.root}", ...)
-///   except Exception as exc:
-///        add("storage", "App Storage", "fail",
-///            f"Could not prepare app storage: {exc}")
-///
-/// Swift port calls `ensureDirs(root)` so the full subdirectory tree is
-/// materialized, then proves writability via a UUID-named probe file
-/// (write+delete) to avoid clobbering any preexisting `.doctor_probe`.
+/// Prepares the runtime scaffold and checks writability with a fresh probe.
+/// Retired directories and any existing contents are left for the operator.
 public struct StorageCheck: DoctorCheck {
     public let id: String = "storage"
     public let title: String = "App Storage"
@@ -559,38 +504,18 @@ public struct ChatSessionsCheck: DoctorCheck {
 
     private func failResult(_ reason: String) -> CheckResult {
         CheckResult(source: "chat/sessions.json",
-            nextCall: ToolFailureError.fileRepairCall(root.appendingPathComponent("chat/sessions.json"), dataRoot: root,
-                shape: "This is a JSON array of saved chat session objects, each with its original nonempty id and saved metadata."),
             id: id, title: title, status: "fail",
             detail: "Chat session store failed: \(reason)",
-            harm: "Saved conversations cannot be found or reopened."
-        )
+            harm: "Saved conversations cannot be found or reopened.",
+            human_action: ToolFailureError.fileRepairInstruction(root.appendingPathComponent("chat/sessions.json"),
+                shape: "This is a JSON array of saved chat session objects, each with its original nonempty id and saved metadata."))
     }
 }
 
 // MARK: - PersonaEngineCheck
 
-/// Mirrors Python's persona_engine check at native_agentd.py L29499-29503:
-///   try: packet = self.compiled_personality_packet("chat")
-///        add("persona_engine", "Persona Engine 2.0", "ok",
-///            f"{packet.get('personaKind')} persona compiled for {packet.get('surface')} with fingerprint {packet.get('fingerprint')}.")
-///   except Exception as exc:
-///        add("persona_engine", "Persona Engine 2.0", "fail",
-///            f"Persona compiler failed: {exc}",
-///            "Run Repair Safe Issues to normalize the personality profile.")
-///
-/// DOCUMENTED DIVERGENCE: the daemon's check actually COMPILES the
-/// personality packet — a heavy pipeline (template merge, USER.md cap,
-/// fingerprint hash, etc.) that the persona compiler subsystem has not
-/// migrated to Swift yet. Phase B's Swift check verifies the strict subset
-/// the migrated read-only persona surface CAN attest: persona docs LOAD
-/// and SOUL.md is present. This is strictly weaker than the Python check
-/// (a corrupt USER.md that breaks compilation would still pass here) and
-/// the detail wording is deliberately "Persona docs loaded ..." not
-/// "compiled" so an operator reading the report cannot mistake one for
-/// the other. Byte-equivalence with the Python detail is not achievable
-/// until the persona compiler migrates.
-public struct PersonaEngineCheck: RepairingDoctorCheck {
+/// Reads persona health through its canonical engine; Doctor never seeds identity.
+public struct PersonaEngineCheck: DoctorCheck {
     public let id: String = "persona_engine"
     public let title: String = "Persona Engine 2.0"
     private let engineProvider: @Sendable () -> SwiftNativePersonaEngine
@@ -599,35 +524,9 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
         self.engineProvider = engineProvider ?? { root.map { SwiftNativePersonaEngine.isolated(dataRoot: $0) } ?? SwiftNativePersonaEngine() }
     }
 
-    public func run(repair: Bool) async -> CheckResult {
+    public func run() async -> CheckResult {
         let engine = engineProvider()
         let rootPath = await engine.personaRoot.path
-        if repair {
-            do {
-                let repaired = try seedMissingPersonaDocs(at: await engine.personaRoot)
-                let after = await run(repair: false)
-                if repaired.isEmpty {
-                    return after
-                }
-                return CheckResult(source: after.source, nextCall: after.nextCall,
-                    id: id,
-                    title: title,
-                    status: after.status,
-                    detail: after.detail,
-                    harm: after.harm,
-                    repair: "Seeded missing persona doc(s): \(repaired.joined(separator: ", "))."
-                )
-            } catch {
-                return CheckResult(source: rootPath,
-                    id: id,
-                    title: title,
-                    status: "fail",
-                    detail: "Persona repair failed: \(error.localizedDescription)",
-                    harm: "Her identity documents cannot be loaded.",
-                    repair: "Could not seed missing persona docs.", repair_available: true
-                )
-            }
-        }
         do {
             let docs = try await engine.listPersonaDocs()
             let hasSoul = docs.contains { $0.id == "SOUL" }
@@ -638,14 +537,14 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                     status: "fail",
                     detail: "Persona compiler failed: SOUL.md is absent from \(rootPath)",
                     harm: "Her identity is missing from the conversation.",
-                    repair: "Run Repair Safe Issues to normalize the personality profile."
+                    repair: nil
                 )
             }
             // User, 2026-09-06: a completed onboarding whose profile.json has
-            // gone missing or unreadable is a REPAIR condition, not a fresh
-            // install. Everything downstream substitutes a default profile
-            // silently — the agent is renamed and the configured identity is
-            // gone with no error anywhere. Anchored on the `.onboarded`
+            // gone missing or invalid is a REPAIR condition, not a fresh
+            // install. Use the authoritative compiler's validation, while
+            // requiring saved identity after onboarding rather than defaults.
+            // Anchored on the `.onboarded`
             // sentinel so a machine that never onboarded stays ok. Deliberately
             // NOT auto-repaired: nothing here may invent a name.
             let dataRoot = await engine.dataRootURL
@@ -655,20 +554,20 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                 let profileURL = dataRoot
                     .appendingPathComponent("memory", isDirectory: true)
                     .appendingPathComponent("profile.json")
-                var profileIsReadable = false
-                if let data = try? Data(contentsOf: profileURL),
-                   let object = try? JSONSerialization.jsonObject(with: data),
-                   object is [String: Any] {
-                    profileIsReadable = true
-                }
-                if !profileIsReadable {
+                do {
+                    guard try profileURL.checkResourceIsReachable() else {
+                        throw CocoaError(.fileReadNoSuchFile)
+                    }
+                    _ = try PersonaCompiler.compileProfile(dataRoot: dataRoot)
+                } catch {
                     return CheckResult(source: profileURL.path,
                         id: id,
                         title: title,
                         status: "fail",
-                        detail: "Onboarding completed on this Mac but \(profileURL.path) is missing or unreadable, so the configured agent and user names are gone and a default profile is being used in their place.",
-                        harm: "She is using default names instead of the configured agent and user names.",
-                        repair: "Restore memory/profile.json from a backup, or set the names again in Settings. Repair will not write this file — it must not invent a name."
+                        detail: "Onboarding completed on this Mac but the saved personality profile at \(profileURL.path) is unavailable: \(error.localizedDescription)",
+                        harm: "Her configured identity cannot be loaded reliably.",
+                        human_action: "Open Trust → Advanced → Backups, select a verified backup containing memory/profile.json, then choose Restore → Restore backup to recover the configured names.",
+                        ask: .permission
                     )
                 }
             }
@@ -686,30 +585,11 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                 status: "fail",
                 detail: "Persona compiler failed: \(error.localizedDescription)",
                 harm: "Her identity documents cannot be loaded.",
-                repair: "Run Repair Safe Issues to normalize the personality profile."
+                repair: nil
             )
         }
     }
 
-    private func seedMissingPersonaDocs(at root: URL) throws -> [String] {
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let seeds: [(String, String)] = [
-            ("SOUL.md", "You are a NativeAgent assistant. Keep this identity file updated from the app onboarding flow.\n"),
-            ("USER.md", "The user's profile has not been filled in yet. Use onboarding or chat memory to personalize this safely.\n"),
-            ("VOICE.md", "Speak clearly, directly, and in the user's preferred agent voice.\n"),
-            ("GROWTH.md", "# Growth\n\n"),
-            ("AGENTS.md", "# Agent Notes\n\n"),
-        ]
-        var created: [String] = []
-        for (name, body) in seeds {
-            let path = root.appendingPathComponent(name)
-            if !FileManager.default.fileExists(atPath: path.path) {
-                try Data(body.utf8).write(to: path, options: [.atomic])
-                created.append(name)
-            }
-        }
-        return created
-    }
 }
 
 // MARK: - AbilityFilesCheck
@@ -729,9 +609,16 @@ public struct AbilityFilesCheck: DoctorCheck {
     public func run() async -> CheckResult {
         let failures = AbilityStore.withLock { Self.seedFailures[root.standardizedFileURL.path] ?? [] }
         if !failures.isEmpty {
-            return CheckResult(source: "abilities/", id: id, title: title, status: "fail", detail: failures.joined(separator: "\n"),
+            // Launch records "filename: error"; name each failed seed without
+            // turning an arbitrary error body into the check's prose.
+            let seeds = failures.compactMap { failure in
+                failure.range(of: ": ").map { String(failure[..<$0.lowerBound]) }
+            }
+            return CheckResult(source: "abilities/", id: id, title: title, status: "fail",
+                detail: "Bundled seed installation has \(failures.count) failure(s): "
+                    + (seeds.isEmpty ? "the bundled ability directory could not be read" : seeds.joined(separator: ", ")) + ".",
                 harm: "Bundled parts could not be installed; their capabilities are unavailable.",
-                human_action: "Fix the named bundled seed or installation error and relaunch. Existing parts are preserved.", owner: .builder)
+                human_action: "Tell the person: NativeAgent could not install the named bundled parts; preserve existing parts and the reported installation errors.", owner: .builder)
         }
         do {
             let files = try AbilityStore(dataRoot: root).files()
@@ -743,16 +630,15 @@ public struct AbilityFilesCheck: DoctorCheck {
             return CheckResult(source: failure.owner, nextCall: failure.nextCall,
                 id: id, title: title, status: "fail", detail: error.localizedDescription,
                 harm: "The affected ability cannot load. A failed migration leaves all original stores untouched.",
-                human_action: failure.tap, ask: failure.personDecides ? .permission : nil)
+                human_action: failure.tap ?? failure.instruction, ask: failure.personDecides ? .permission : nil)
         }
     }
 }
 
 // MARK: - RuntimeJSONStoresCheck
 
-/// Verifies the app-owned JSON files that route core runtime behavior.
-/// Creation never overwrites; the full button repair backs up existing files.
-public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
+/// Inspects existing runtime stores without creating or resetting their owners' state.
+public struct RuntimeJSONStoresCheck: DoctorCheck {
     public let id: String = "runtime_json_stores"
     public let title: String = "Runtime JSON Stores"
     private let root: URL
@@ -761,159 +647,49 @@ public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
         self.root = root
     }
 
-    public func run(repair: Bool) async -> CheckResult {
-        await run(repair: repair, replaceExisting: repair)
-    }
-
-    public func createMissing() async -> CheckResult {
-        await run(repair: true, replaceExisting: false)
-    }
-
-    private func run(repair: Bool, replaceExisting: Bool) async -> CheckResult {
-        var missing: [String] = []
+    public func run() async -> CheckResult {
         var malformed: [String] = []
         var wrongShape: [String] = []
-        var repaired: [String] = []
-        var unrepaired: [String] = []
-
         for spec in Self.specs {
             let path = root.appendingPathComponent(spec.relativePath)
-            var isDir: ObjCBool = false
-            let exists = FileManager.default.fileExists(atPath: path.path, isDirectory: &isDir)
-            if !exists {
-                missing.append(spec.relativePath)
-                if repair {
-                    do {
-                        try DoctorFileRepair.createJSON(spec.defaultValue, at: path)
-                        repaired.append("created \(spec.relativePath)")
-                    } catch {
-                        unrepaired.append("\(spec.relativePath): \(error.localizedDescription)")
-                    }
-                }
-                continue
-            }
-            if isDir.boolValue {
-                wrongShape.append(spec.relativePath)
-                if repair {
-                    // A directory at a store path is NOT auto-repairable —
-                    // Doctor will not delete directories. Record it as
-                    // unrepaired so the repair summary cannot claim
-                    // "valid after repair" while it remains (audit 2026-06-10).
-                    unrepaired.append("\(spec.relativePath): path is a directory; move it aside manually")
-                }
-                continue
-            }
+            // Each canonical owner decides how an absent store begins.
+            guard FileManager.default.fileExists(atPath: path.path) else { continue }
             do {
-                let value = try DoctorFileRepair.parseJSONFile(path)
-                if !DoctorFileRepair.value(value, matches: spec.shape) {
+                let value = try DoctorJSONInspection.parseJSONFile(path)
+                if !DoctorJSONInspection.value(value, matches: spec.shape) {
                     wrongShape.append(spec.relativePath)
-                    if replaceExisting {
-                        do {
-                            _ = try DoctorFileRepair.backupExistingFile(path)
-                            try await DoctorFileRepair.writeJSON(spec.defaultValue, to: path)
-                            repaired.append("reset \(spec.relativePath)")
-                        } catch {
-                            unrepaired.append("\(spec.relativePath): \(error.localizedDescription)")
-                        }
-                    }
                 }
             } catch {
                 malformed.append(spec.relativePath)
-                if replaceExisting {
-                    do {
-                        _ = try DoctorFileRepair.backupExistingFile(path)
-                        try await DoctorFileRepair.writeJSON(spec.defaultValue, to: path)
-                        repaired.append("reset \(spec.relativePath)")
-                    } catch {
-                        unrepaired.append("\(spec.relativePath): \(error.localizedDescription)")
-                    }
-                }
             }
-        }
-
-        if !unrepaired.isEmpty {
-            return CheckResult(source: (missing + malformed + wrongShape).joined(separator: ", "),
-                id: id,
-                title: title,
-                status: "fail",
-                detail: "Could not repair \(unrepaired.count) runtime JSON store(s): \(unrepaired.prefix(5).joined(separator: "; "))",
-                harm: "Saved provider, consent or registry choices remain unavailable.",
-                repair: repaired.isEmpty ? nil : "Completed: \(repaired.joined(separator: "; ")).",
-                human_action: malformed.isEmpty && wrongShape.isEmpty ? nil
-                    : "Open Diagnostics → Doctor and press Repair to back up and reset the damaged stores to empty.",
-                repair_available: true, ask: malformed.isEmpty && wrongShape.isEmpty ? nil : .permission
-            )
-        }
-        // "valid after repair" may only be claimed when NOTHING is left
-        // broken — every wrongShape/malformed entry must have been reset (or
-        // recorded in `unrepaired`, which already returned "fail" above).
-        if repair, !repaired.isEmpty, unrepaired.isEmpty,
-           replaceExisting || (malformed.isEmpty && wrongShape.isEmpty) {
-            return CheckResult(source: (missing + malformed + wrongShape).joined(separator: ", "),
-                id: id,
-                title: title,
-                status: "ok",
-                detail: "Runtime JSON stores are valid after repair (\(Self.specs.count) checked).",
-                repair: repaired.joined(separator: "; ")
-            )
         }
         if !malformed.isEmpty || !wrongShape.isEmpty {
             let issueCount = malformed.count + wrongShape.count
-            return CheckResult(source: (missing + malformed + wrongShape).joined(separator: ", "),
+            return CheckResult(source: (malformed + wrongShape).joined(separator: ", "),
                 id: id,
                 title: title,
                 status: "fail",
                 detail: "\(issueCount) runtime JSON store(s) are malformed or wrong-shaped: \((malformed + wrongShape).prefix(8).joined(separator: ", "))",
-                harm: "Saved provider, consent or registry choices cannot be used.",
-                repair: "Run Repair Safe Issues to back up and reset malformed app-owned JSON stores.",
-                receipt: repaired.isEmpty ? nil : "Completed: \(repaired.joined(separator: "; ")).",
-                human_action: "These stores hold provider, consent and registry choices, so Doctor never resets them by itself. Open Diagnostics → Doctor and press Repair to back up and reset them to empty.",
-                ask: .permission
+                harm: "Saved provider, consent or registry choices cannot be used."
             )
         }
-        if !missing.isEmpty {
-            return CheckResult(source: (missing + malformed + wrongShape).joined(separator: ", "),
-                id: id,
-                title: title,
-                status: "warn",
-                detail: "\(missing.count) runtime JSON store(s) are missing but can be recreated: \(missing.prefix(8).joined(separator: ", "))",
-                harm: "Provider, consent or registry choices cannot be saved until their stores exist.",
-                repair: "Run Repair Safe Issues to create missing app-owned JSON stores."
-            )
-        }
-        return CheckResult(source: (missing + malformed + wrongShape).joined(separator: ", "),
+        return CheckResult(
             id: id,
             title: title,
             status: "ok",
-            detail: "Runtime JSON stores are valid (\(Self.specs.count) checked)."
+            detail: "Existing runtime JSON stores have valid top-level shapes."
         )
     }
 
     private static let specs: [DoctorJSONStoreSpec] = [
-        .init(relativePath: "providers/active.json", shape: .object, defaultValue: .object([:])),
-        .init(relativePath: "providers/surfaces.json", shape: .object, defaultValue: .object([:])),
-        // `trust/policy.json` is DELIBERATELY ABSENT. Doctor's repair resets a
-        // malformed store to its spec default, and the spec default for an
-        // object store is `{}` — which TrustCenter's canonical read treats as a
-        // fresh install and re-seeds with `enableAutonomy: true` and
-        // `autonomyDefault: workspace_autonomous`. "Repair Safe Issues" on a
-        // Safe machine therefore handed the person back Work mode with
-        // unattended work on. TrustCenter owns this file and already fails
-        // CLOSED on bytes it cannot read (`loadAuthorizationSnapshot` →
-        // `failClosedTrustPolicy`), so the repair had nothing to add and one
-        // way to raise the fence by itself.
-        .init(relativePath: "scheduler/jobs.json", shape: .array, defaultValue: .array([])),
-        .init(relativePath: "mcp/servers.json", shape: .array, defaultValue: .array([])),
-        .init(relativePath: "mcp/cache/tools.json", shape: .object, defaultValue: .object([:])),
-        .init(relativePath: "mcp/cache/resources.json", shape: .object, defaultValue: .object([:])),
-        .init(relativePath: "mcp/sessions/state.json", shape: .object, defaultValue: .object([:])),
-        .init(relativePath: "mcp/consent/ledger.json", shape: .array, defaultValue: .array([])),
-        .init(relativePath: "notifications/push_tokens.json", shape: .object, defaultValue: .object([:])),
-        .init(relativePath: "mobile_push/tokens.json", shape: .array, defaultValue: .array([])),
-        .init(relativePath: "connectors/registry.json", shape: .array, defaultValue: .array([])),
-        .init(relativePath: "connectors/workspaces.json", shape: .array, defaultValue: .array([])),
-        .init(relativePath: "catalog/registry.json", shape: .array, defaultValue: .array([])),
-        .init(relativePath: "workflows/registry.json", shape: .array, defaultValue: .array([])),
+        .init(relativePath: "providers/active.json", shape: .object),
+        .init(relativePath: "providers/surfaces.json", shape: .object),
+        .init(relativePath: "scheduler/jobs.json", shape: .array),
+        .init(relativePath: "notifications/push_tokens.json", shape: .object),
+        .init(relativePath: "connectors/registry.json", shape: .array),
+        .init(relativePath: "connectors/workspaces.json", shape: .array),
+        .init(relativePath: "catalog/registry.json", shape: .array),
+        .init(relativePath: "workflows/registry.json", shape: .array),
     ]
 }
 
@@ -971,7 +747,7 @@ actor ChatMessagesScanCache {
     }
 }
 
-public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
+public struct ChatMessagesIntegrityCheck: DoctorCheck {
     public let id: String = "chat_messages"
     public let title: String = "Chat Message Logs"
     private let root: URL
@@ -1004,48 +780,19 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
         self.root = root
     }
 
-    public func run(repair: Bool) async -> CheckResult {
-        await run(repair: repair, replaceExisting: repair)
-    }
-
-    public func createMissing() async -> CheckResult {
-        await run(repair: true, replaceExisting: false)
-    }
-
-    private func run(repair: Bool, replaceExisting: Bool) async -> CheckResult {
+    public func run() async -> CheckResult {
         let dir = root
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else {
-            if repair {
-                do {
-                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                    return CheckResult(source: "chat/messages/",
-                        id: id,
-                        title: title,
-                        status: "ok",
-                        detail: "Chat message directory exists and contains 0 JSONL file(s).",
-                        repair: "Created \(dir.path)."
-                    )
-                } catch {
-                    return CheckResult(source: "chat/messages/",
-                        id: id,
-                        title: title,
-                        status: "fail",
-                        detail: "Could not create chat message directory: \(error.localizedDescription)",
-                        harm: "New conversation messages cannot be saved.",
-                        human_action: StorageCheck.accessStep(dir.path), ask: .permission
-                    )
-                }
-            }
             return CheckResult(source: "chat/messages/",
                 id: id,
                 title: title,
                 status: "warn",
                 detail: "Chat message directory is missing at \(dir.path).",
                 harm: "New conversation messages cannot be saved.",
-                repair: "Run Repair Safe Issues to recreate chat message storage."
+                repair: nil
             )
         }
 
@@ -1069,20 +816,14 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
         var totalLines = 0
         var malformedLines = 0
         var malformedFiles: [URL] = []
-        var repairedFiles: [String] = []
 
-        // A1/FIX-1b: the (mtime,size) memo is consulted only on the read-only
-        // path. Repair mode rewrites files, so it always re-parses and lets the
-        // rewritten fingerprint invalidate the old memo naturally.
-        let useCache = !replaceExisting
         var scannedPaths: Set<String> = []
 
         for file in files {
             let cacheKey = Self.cacheKey(file)
             scannedPaths.insert(cacheKey)
             let fingerprint = Self.fingerprint(file)
-            if useCache,
-               let memo = await Self.sharedScanCache.lookup(path: cacheKey, stamp: fingerprint) {
+            if let memo = await Self.sharedScanCache.lookup(path: cacheKey, stamp: fingerprint) {
                 totalLines += memo.totalLines
                 malformedLines += memo.malformedLines
                 if memo.unreadable || memo.malformedLines > 0 { malformedFiles.append(file) }
@@ -1090,7 +831,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
             }
             guard let text = try? String(contentsOf: file, encoding: .utf8) else {
                 malformedFiles.append(file)
-                if useCache, let fingerprint {
+                if let fingerprint {
                     await Self.sharedScanCache.store(
                         path: cacheKey,
                         entry: .init(
@@ -1112,7 +853,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
                 }
             }
             totalLines += fileTotal
-            if useCache, let fingerprint {
+            if let fingerprint {
                 await Self.sharedScanCache.store(
                     path: cacheKey,
                     entry: .init(
@@ -1124,67 +865,23 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
             if fileMalformed > 0 {
                 malformedLines += fileMalformed
                 malformedFiles.append(file)
-                if replaceExisting {
-                    do {
-                        try await SwiftNativePersistenceCore().withFileLock(file) {
-                            // Re-read under the same lock as message appenders;
-                            // the diagnostic scan may predate a committed reply.
-                            let current = try String(contentsOf: file, encoding: .utf8)
-                            let lines = current.split(separator: "\n").map {
-                                String($0).trimmingCharacters(in: .whitespacesAndNewlines)
-                            }.filter { !$0.isEmpty }
-                            let validLines = lines.filter { (try? JSONValue.parse(Data($0.utf8))) != nil }
-                            // Revalidated under the appenders' lock: nothing
-                            // malformed now means nothing to rewrite.
-                            guard validLines.count < lines.count else { return }
-                            _ = try DoctorFileRepair.backupExistingFile(file)
-                            let repairedText = validLines.isEmpty ? "" : validLines.joined(separator: "\n") + "\n"
-                            try Data(repairedText.utf8).write(to: file, options: [.atomic])
-                        }
-                        repairedFiles.append(file.lastPathComponent)
-                    } catch {
-                        return CheckResult(source: "chat/messages/" + file.lastPathComponent,
-                            nextCall: ToolFailureError.fileRepairCall(file, dataRoot: root,
-                                shape: "This transcript holds one saved chat message JSON object per line, retaining the original message identities, roles, content and ordering."),
-                            id: id,
-                            title: title,
-                            status: "fail",
-                            detail: "Could not repair \(file.lastPathComponent): \(error.localizedDescription)",
-                            harm: "Damaged conversation messages remain unreadable.",
-                            repair: repairedFiles.isEmpty ? nil : "Repaired: \(repairedFiles.joined(separator: ", ")).",
-                            repair_available: true
-                        )
-                    }
-                }
             }
         }
 
-        if useCache {
-            await Self.sharedScanCache.retain(
-                paths: scannedPaths, under: Self.cacheKey(dir) + "/"
-            )
-        }
+        await Self.sharedScanCache.retain(
+            paths: scannedPaths, under: Self.cacheKey(dir) + "/"
+        )
 
-        if repair, !repairedFiles.isEmpty {
-            return CheckResult(source: "chat/messages/",
-                id: id,
-                title: title,
-                status: "ok",
-                detail: "Chat message logs are valid after repair (\(files.count) file(s), \(totalLines - malformedLines) valid row(s)).",
-                repair: "Backed up and rewrote malformed JSONL file(s): \(repairedFiles.joined(separator: ", "))."
-            )
-        }
         if malformedLines > 0 || !malformedFiles.isEmpty {
             return CheckResult(source: malformedFiles.map { "chat/messages/" + $0.lastPathComponent }.joined(separator: ", "),
-                nextCall: malformedLines == 0 ? malformedFiles.first.map { ToolFailureError.fileRepairCall($0, dataRoot: root,
-                    shape: "This transcript holds one saved chat message JSON object per line, retaining the original message identities, roles, content and ordering.") } : nil,
                 id: id,
                 title: title,
                 status: "fail",
                 detail: "\(malformedLines) malformed chat JSONL row(s) across \(malformedFiles.count) file(s).",
                 harm: "Parts of saved conversations cannot be read.",
-                repair: "Run Repair Safe Issues to back up malformed JSONL files and keep valid rows."
-            )
+                repair: nil,
+                human_action: malformedLines == 0 ? malformedFiles.first.map { ToolFailureError.fileRepairInstruction($0,
+                    shape: "This transcript holds one saved chat message JSON object per line, retaining the original message identities, roles, content and ordering.") } : nil)
         }
         return CheckResult(source: "chat/messages/",
             id: id,
@@ -1232,15 +929,25 @@ public struct MemoryStoreCheck: DoctorCheck {
                 status: "fail",
                 detail: "Could not prepare memory directory: \(error.localizedDescription)",
                 harm: "Her memories cannot be saved.",
-                repair: nil
+                human_action: StorageCheck.accessStep(memoryDir.path),
+                ask: .permission
             )
         }
 
         var warnings: [String] = []
         if !FileManager.default.fileExists(atPath: sqlite.path) {
             warnings.append("memory.sqlite missing")
-        } else if ((try? FileManager.default.attributesOfItem(atPath: sqlite.path)[.size] as? NSNumber)?.int64Value ?? 0) <= 0 {
-            warnings.append("memory.sqlite is empty")
+        } else {
+            do {
+                guard let size = try FileManager.default.attributesOfItem(atPath: sqlite.path)[.size] as? NSNumber else {
+                    throw CocoaError(.fileReadUnknown)
+                }
+                if size.int64Value <= 0 { warnings.append("memory.sqlite is empty") }
+            } catch {
+                return CheckResult(source: sqlite.path, id: id, title: title, status: "fail",
+                    detail: "The size of \(sqlite.path) could not be read.",
+                    human_action: StorageCheck.accessStep(sqlite.path), ask: .permission)
+            }
         }
 
         // Only interrogate the graph when there is a database to interrogate;
@@ -1266,7 +973,8 @@ public struct MemoryStoreCheck: DoctorCheck {
                     status: "fail",
                     detail: "Knowledge graph tables in memory.sqlite could not be read: \(error.localizedDescription)",
                     harm: "She cannot recall connections between her saved memories.",
-                    repair: nil
+                    human_action: "Open Trust → Advanced → Backups, select a verified backup containing memory/memory.sqlite, then choose Restore → Restore backup.",
+                    ask: .permission
                 )
             }
         }
@@ -1275,9 +983,10 @@ public struct MemoryStoreCheck: DoctorCheck {
             return CheckResult(source: "memory/memory.sqlite",
                 id: id,
                 title: title,
-                status: "unmeasured",
+                status: "fail",
                 detail: "Memory store warning(s): \(warnings.joined(separator: ", ")).",
-                repair: "Run MemoryV2 migration if memory.sqlite is absent — Doctor cannot safely rebuild the store."
+                human_action: "Open Trust → Advanced → Backups, select a verified backup containing memory/memory.sqlite, then choose Restore → Restore backup.",
+                ask: .permission
             )
         }
         return CheckResult(source: "memory/memory.sqlite",
@@ -1306,14 +1015,14 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
 
     /// Warnings derived from the sync engine's own durable state files.
     /// Deliberately ordered most-actionable first.
-    static func localSyncStateWarnings(dataRoot: URL) -> [String] {
+    static func localSyncStateWarnings(dataRoot: URL) -> (details: [String], fault: Bool) {
         var warnings: [String] = []
         let stranded = ICloudSyncStatePaths.completedUnarchivedMsgIds(dataRoot: dataRoot)
         if !stranded.isEmpty {
             warnings.append(
                 "\(stranded.count) iPhone command(s) completed but their completion record could not be filed "
-                + "(\(stranded.prefix(3).joined(separator: ", "))\(stranded.count > 3 ? ", …" : "")). "
-                + "They are marked completed and will not run again; free disk space or fix iCloud permissions."
+                + "with local markers at \(stranded.prefix(3).map { ICloudSyncStatePaths.completedUnarchivedMarker(dataRoot: dataRoot, msgId: $0).path }.joined(separator: ", "))"
+                + "\(stranded.count > 3 ? ", …" : ""); they remain marked completed"
             )
         }
         let skipsURL = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
@@ -1328,32 +1037,35 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                     "iPhone is showing stale \(groups.joined(separator: ", ")) — the last snapshot pass could not "
                     + "build or publish \(groups.count == 1 ? "that group" : "those groups"): "
                     + byReason.keys.sorted().map { "\(byReason[$0, default: []].joined(separator: ", ")) (\($0))" }
-                        .joined(separator: "; ") + "."
+                        .joined(separator: "; ")
                 )
             }
         }
-        return warnings
+        return (warnings, !stranded.isEmpty)
     }
 
     /// Folds local sync-state warnings into the active transport verdict without
     /// downgrading a harder existing status.
     private func merging(_ result: CheckResult) -> CheckResult {
-        let warnings = Self.localSyncStateWarnings(dataRoot: dataRoot)
+        let local = Self.localSyncStateWarnings(dataRoot: dataRoot)
+        let warnings = local.details
         let corrupt = ICloudSyncStatePaths.processedIdsCorruptBackup(dataRoot: dataRoot)
         let history = FileManager.default.fileExists(atPath: corrupt.path)
-            ? " The processed-command list was unreadable and was preserved as processed_ids.corrupt.json — iPhone commands from before that point may be re-run." : ""
+            ? "the processed-command list was unreadable and was preserved as processed_ids.corrupt.json, so iPhone commands from before that point may be re-run" : ""
         guard !warnings.isEmpty || !history.isEmpty else { return result }
-        let status = result.status == "ok" ? "unmeasured" : result.status
+        let status = result.status == "fail" || local.fault ? "fail" : "warn"
         return CheckResult(source: result.source, nextCall: result.nextCall,
             id: result.id,
             title: result.title,
             status: status,
-            detail: "\(result.detail)" + (warnings.isEmpty ? "" : " " + warnings.joined(separator: " ")) + history,
+            detail: ([result.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))] + warnings + (history.isEmpty ? [] : [history])).joined(separator: "; ") + ".",
             harm: result.harm,
             repair: result.repair,
             receipt: result.receipt,
+            repairApplied: result.repairApplied,
             human_action: result.human_action,
             repair_available: result.repair_available,
+            automaticRepairEligible: result.automaticRepairEligible,
             ask: result.ask,
             owner: result.owner
         )
@@ -1390,7 +1102,6 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                 id: id, title: title, status: "warn",
                 detail: "This build is configured for iCloud container \(containerID), but its signature grants \(grantedContainers.joined(separator: ", ")), so it has no CloudKit transport for the phone.",
                 harm: "The phone cannot exchange messages with her through iCloud.",
-                repair: "Install a NativeAgent build whose NativeAgentICloudContainerID matches its signed container.",
                 owner: .builder
             ))
         }
@@ -1402,7 +1113,6 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                 id: id, title: title, status: "warn",
                 detail: "The active \(cloudKit ? "CloudKit" : "iCloud Drive") transport lacks its signed \(service) service or container entitlement.",
                 harm: "The phone cannot exchange messages with her through iCloud.",
-                repair: "Install a signed NativeAgent build granting \(service) and container \(containerID).",
                 owner: .builder
             ))
         }
@@ -1460,6 +1170,7 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                             detail: "Could not create \(rel): \(error.localizedDescription)",
                             harm: "The phone cannot exchange messages with her through iCloud.",
                             repair: created.isEmpty ? nil : "Created: \(created.joined(separator: ", ")).",
+                            repairApplied: !created.isEmpty,
                             repair_available: true
                         )
                     }
@@ -1472,7 +1183,7 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                 title: title,
                 status: "ok",
                 detail: "iCloud/APNS bridge directories are present after repair.",
-                repair: "Created: \(created.joined(separator: ", "))."
+                repair: "Created: \(created.joined(separator: ", ")).", repairApplied: true
             ))
         }
         if !missing.isEmpty {
@@ -1482,7 +1193,7 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                 status: "warn",
                 detail: "Missing iCloud/APNS bridge path(s): \(missing.joined(separator: ", ")).",
                 harm: "The phone cannot exchange messages with her through iCloud.",
-                repair: "Run Repair Safe Issues to recreate bridge directories."
+                repair: "Press Repair in Diagnostics → Health checks to recreate bridge directories."
             ))
         }
         return merging(CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID,
@@ -1499,14 +1210,15 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
             cloudKitResult($0.value, operation: "send (\($0.key))")
         }
         let send = failures.isEmpty
-            ? (snapshot.sendMeasured ? "CloudKit has accepted outbound delivery; iOS receipt is not confirmed."
-                                     : "CloudKit send health is unmeasured.")
-            : failures.map(\.detail).joined(separator: " ")
-        let adverse = ([receive] + failures).first { DoctorSafeRepairPolicy.isAdverse($0.status) }
+            ? (snapshot.sendMeasured ? "CloudKit has accepted outbound delivery; iOS receipt is not confirmed"
+                                     : "CloudKit send health is unmeasured")
+            : failures.map { $0.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) }.joined(separator: "; ")
+        let adverse = ([receive] + failures).first { $0.status == "fail" }
+            ?? ([receive] + failures).first { DoctorSafeRepairPolicy.isAdverse($0.status) }
         return CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID,
             id: id, title: title,
             status: adverse?.status ?? (receive.status == "ok" && snapshot.sendMeasured && failures.isEmpty ? "ok" : "unmeasured"),
-            detail: "\(receive.detail) \(send)",
+            detail: receive.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; " + send + ".",
             harm: adverse?.harm, repair: adverse?.repair,
             human_action: adverse?.human_action, ask: adverse?.ask, owner: adverse?.owner
         )
@@ -1522,10 +1234,10 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
         case .unmeasured:
             // Not measured yet (see the iCloud Drive branch above): a reading.
             status = "unmeasured"
-            detail = "CloudKit \(operation) health is unmeasured. iCloud Drive is not required."
+            detail = "CloudKit \(operation) health is unmeasured; iCloud Drive is not required."
         case .available:
             status = "ok"
-            detail = "CloudKit is active and its last \(operation) completed successfully. iCloud Drive is not required."
+            detail = "CloudKit is active and its last \(operation) completed successfully; iCloud Drive is not required."
         case .signedOut:
             detail = "CloudKit \(operation) has no authenticated iCloud account."
             action = "Open System Settings → Apple Account and sign in to iCloud."
@@ -1550,19 +1262,19 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
             case .managedAccountRestricted:
                 action = "Ask your Apple Account administrator to allow CloudKit for NativeAgent."
                 ask = .permission
-            default: status = "unmeasured"
+            default: status = "fail"
             }
         case .unavailable(let reason):
-            status = "unmeasured"
+            status = "fail"
             detail = "The active CloudKit transport's last \(operation) failed: \(reason)"
         case .pairedElsewhere:
             // The person's choice, not a fault: the phone follows one Mac.
             status = "ok"
             detail = "The iPhone is paired with another Mac (or an earlier install) on this Apple Account; this Mac stays quiet toward it."
-            action = "To use the iPhone with this Mac, choose Use my iPhone with this Mac in Connectors → iPhone. That disconnects it from the other Mac."
+            action = "Choose Use my iPhone with this Mac in Connectors → iPhone to disconnect it from the other Mac and connect it here."
         }
         return CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID + ": " + operation, id: id, title: title, status: status, detail: detail,
-                           harm: status == "warn" ? "The phone cannot exchange messages with her through iCloud." : nil,
+                           harm: DoctorSafeRepairPolicy.isAdverse(status) ? "The phone cannot exchange messages with her through iCloud." : nil,
                            human_action: action, ask: ask, owner: owner)
     }
 }
@@ -1645,25 +1357,22 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
             // or invalid model asset, which only the installation directory set aside fixes.
             let manifestDamaged = dataFile.map { $0.reason.hasPrefix("embedding.json") || $0.reason.hasPrefix("model and vocab") } ?? false
             return CheckResult(source: unusable.map { manifestDamaged ? $0.manifest.path : $0.manifest.deletingLastPathComponent().path } ?? "extras/coreml/embedding.json",
-                nextCall: dataFile.map { file in manifestDamaged
-                    ? ToolFailureError.fileRepairCall(file.manifest, dataRoot: root,
+                id: id, title: "Core ML Embedder (installed model)", status: "fail",
+                detail: "The installed model is unusable (\(error.localizedDescription)); semantic recall is off until it is fixed or removed.",
+                harm: "She cannot search her memories by meaning.",
+                human_action: dataFile.map { file in manifestDamaged
+                    ? ToolFailureError.fileRepairInstruction(file.manifest,
                         shape: "This JSON manifest holds model and vocab file names beside it, a nonempty model_id and a positive integer dimensions. Preserve the selected model; do not substitute another model or invent missing assets.")
-                    : ToolFailureError.fileRepairCall(file.manifest.deletingLastPathComponent(), dataRoot: root,
+                    : ToolFailureError.fileRepairInstruction(file.manifest.deletingLastPathComponent(),
                         shape: "This installed memory model directory is unusable (\(file.reason)). If embedding.json names a model the person installed themselves, leave it and report that. "
                             + "Otherwise move the whole directory intact to a sibling recovery name, never deleting a file, so app embeddings.resume installs the release model again.") },
-                id: id, title: "Core ML Embedder (installed model)", status: "fail",
-                detail: "\(error.localizedDescription). Semantic recall is off until the installed model is fixed or removed.",
-                harm: "She cannot search her memories by meaning.",
                 owner: unusable != nil && dataFile == nil ? .builder : nil
             )
         }
         guard CoreMLEmbeddingProvider.bundledResourcesAvailable(extrasRoot: root) else {
             return CheckResult(source: "NativeAgent app bundle: minilm.mlpackage and minilm_vocab.txt",
                 id: id, title: title, status: "fail",
-                // A2.4: dropped a stale "script/install_minilm.sh" pointer —
-                // that Python-era script no longer exists; the model ships in
-                // the MemoryV2 resource bundle and only a reinstall restores it.
-                detail: "minilm.mlpackage or minilm_vocab.txt is missing from the app bundle — reinstall the app.",
+                detail: "minilm.mlpackage or minilm_vocab.txt is missing from the app bundle.",
                 harm: "She cannot search her memories by meaning.",
                 owner: .builder
             )
@@ -1675,6 +1384,7 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
                 id: id, title: title, status: after.status, detail: after.detail,
                 harm: after.harm,
                 repair: "Wiped the CoreML compile cache and re-probed the model load.",
+                repairApplied: true,
                 repair_available: true
             )
         }
@@ -1686,8 +1396,8 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
         // install that shadows a missing MiniLM is a different situation from
         // one that sits on top of it.
         let floor = CoreMLEmbeddingProvider.bundledFloorResourcesAvailable()
-            ? "Bundled MiniLM floor is present."
-            : "Bundled MiniLM floor is MISSING from the app bundle."
+            ? "the bundled MiniLM floor is present"
+            : "the bundled MiniLM floor is MISSING from the app bundle"
         do {
             // Full real-path probe: compile-cache resolution + MLModel load +
             // WordPiece vocab. Same code the runtime's first embed() runs — so
@@ -1695,14 +1405,14 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
             let provider = try CoreMLEmbeddingProvider.bundled(extrasRoot: root)
             return CheckResult(source: "extras/coreml",
                 id: id, title: title, status: "ok",
-                detail: "\(provider.modelId), \(provider.dimensions)-d, loads: model compiles/loads from cache and the WordPiece vocab parses. \(floor)"
+                detail: "\(provider.modelId), \(provider.dimensions)-d, loads: model compiles/loads from cache and the WordPiece vocab parses; \(floor)."
             )
         } catch {
             return CheckResult(source: "Core ML model \(resolvedModelID) and its compiled cache",
                 id: id, title: title, status: "fail",
-                detail: "\(resolvedModelID) failed to load: \(String(describing: error)). Semantic recall is degraded until this is repaired. \(floor)",
+                detail: "\(resolvedModelID) failed to load (\(String(describing: error))); semantic recall is degraded; \(floor).",
                 harm: "She cannot reliably search her memories by meaning.",
-                repair: "Run Repair Safe Issues to clear the Core ML compile cache and retry loading the model."
+                repair: "Press Repair in Diagnostics → Health checks to clear the Core ML compile cache and retry loading the model."
             )
         }
     }
@@ -1712,7 +1422,7 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
 
 /// Is any append-only op-log feed wedged or growing without bound?
 ///
-/// WHY THIS CHECK EXISTS (gpt-5.5 review 2026-08-02, finding 3): the three
+/// WHY THIS CHECK EXISTS (gpt-5.5 review 2026-08-02, finding 3): the
 /// snapshot+tail stores REFUSE to compact while any row is undecodable — right,
 /// because compacting would delete rows this build cannot read — but refusing
 /// costs liveness, and the only signal was a deduped stderr line plus a couple
@@ -1725,7 +1435,7 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
 /// STATUS SEMANTICS:
 ///   • `fail` — a feed cannot be read at all, or holds rows this build cannot
 ///     use. Compaction is blocked; the feed can only grow.
-///   • `unmeasured` — every feed is decodable but one has grown past
+///   • `warn` — every feed is decodable but one has grown past
 ///     `growthWarnMultiple`× its own compaction threshold (i.e. compaction has
 ///     not run in a long time), or a torn trailing line was seen.
 ///   • `ok` — nothing skipped and every feed is inside its normal band. Missing
@@ -1754,10 +1464,9 @@ public struct OpLogHealthCheck: DoctorCheck {
             }
         }
 
-        // A store whose read THROWS is itself a finding — GitHubCommandStore
-        // fails loud on an undecodable op — so each feed is probed
-        // independently and a throw becomes this feed's fail line, never an
-        // abort of the other two.
+        // A store whose read THROWS is itself a finding, so each feed is
+        // probed independently and a throw becomes this feed's fail line,
+        // never an abort of the other.
         do {
             record(try await SwiftNativeDeskStore(dataRoot: root, changeBus: StoreChangeBus()).opLogHealth())
         } catch {
@@ -1770,12 +1479,6 @@ public struct OpLogHealthCheck: DoctorCheck {
             damaged.append(root.appendingPathComponent("orchestration/task_ledger.jsonl"))
             lines.append("TaskLedger: unreadable — \(error)")
         }
-        do {
-            record(try await GitHubCommandStore(dataRoot: root, changeBus: StoreChangeBus()).opLogHealth())
-        } catch {
-            damaged.append(root.appendingPathComponent("workshop/github_command/ops.jsonl"))
-            lines.append("GitHubCommandStore: unreadable — \(error)")
-        }
 
         let detail = lines.joined(separator: "; ")
         if let file = blocked.first {
@@ -1784,27 +1487,22 @@ public struct OpLogHealthCheck: DoctorCheck {
                 id: id, title: title, status: "fail",
                 detail: "Op-log compaction is blocked: \(detail)",
                 harm: "Saved work may be unreadable and its history will keep growing.",
-                repair: "Run the newest build of NativeAgent.app — "
-                    + "the feed holds rows an older binary cannot decode, and compaction refuses to "
-                    + "delete them. The feed keeps growing until a build that understands them runs.",
                 owner: .builder
             )
         }
         if let file = damaged.first {
             return CheckResult(source: file.path,
-                nextCall: ToolFailureError.fileRepairCall(file, dataRoot: root,
-                    shape: "This is an append-only JSONL operation feed for its saved work store. Preserve the original operation identities, ordering and payloads, including rows from newer versions."),
                 id: id, title: title, status: "fail",
                 detail: "An op-log feed is unreadable: \(detail)",
-                harm: "Saved work may be unreadable and its history will keep growing."
-            )
+                harm: "Saved work may be unreadable and its history will keep growing.",
+                human_action: ToolFailureError.fileRepairInstruction(file,
+                    shape: "This is an append-only JSONL operation feed for its saved work store. Preserve the original operation identities, ordering and payloads, including rows from newer versions."))
         }
         if warned {
             return CheckResult(source: "desk/desk_ops.jsonl",
-                id: id, title: title, status: "unmeasured",
+                id: id, title: title, status: "warn",
                 detail: "An op-log feed has grown well past its compaction threshold: \(detail)",
-                repair: "Usually self-healing — the next write past the threshold compacts. If it "
-                    + "persists, a writer is failing before it reaches the compaction step."
+                owner: .builder
             )
         }
         return CheckResult(source: "desk/desk_ops.jsonl", id: id, title: title, status: "ok", detail: detail)
@@ -1831,19 +1529,12 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
 
         func signIn(_ root: URL) -> String {
             if let control = NativeOAuthFlow.signInControl(providerID: owner, dataRoot: root) { return "Open " + control + "." }
-            let control = owner == "github" ? "Connect with GitHub" : owner == "slack" ? "Save" : "Connect"
-            return "Open Connectors → \(name) → Connect (or Reconnect), then \(control)."
+            return "Open Connectors → \(name) → Connect (or Reconnect)."
         }
     }
 
     private func credentials() -> [Credential] {
         let entries = [
-            Credential(owner: "x", name: "X", path: root.appendingPathComponent("oauth_tokens/x.json")),
-            Credential(owner: "gmail", name: "Gmail", path: root.appendingPathComponent("connectors/gmail/auth.json")),
-            Credential(owner: "calendar", name: "Google Calendar", path: root.appendingPathComponent("connectors/calendar/auth.json")),
-            Credential(owner: "github", name: "GitHub", path: root.appendingPathComponent("connectors/github/auth.json")),
-            Credential(owner: "slack", name: "Slack", path: root.appendingPathComponent("oauth_tokens/slack.json")),
-        ] + [
             ("xai_oauth_direct", "xAI"), ("anthropic_oauth_direct", "Anthropic"),
             ("openai_oauth_direct", "ChatGPT"),
         ].map { owner, name in
@@ -1852,13 +1543,6 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
         }
         return entries.filter { credential in
             let fm = FileManager.default
-            if credential.owner == "github" {
-                return GitHubCredentialStore.metadataPaths(dataRoot: root).contains { fm.fileExists(atPath: $0.path) }
-            }
-            if credential.owner == "slack" {
-                return fm.fileExists(atPath: credential.path.path)
-                    || fm.fileExists(atPath: root.appendingPathComponent("connectors/slack/auth.json").path)
-            }
             guard fm.fileExists(atPath: credential.path.path) else { return false }
             if credential.owner.hasSuffix("_oauth_direct"),
                let data = try? Data(contentsOf: credential.path),
@@ -1870,49 +1554,16 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
         }
     }
 
-    private func status(_ credential: Credential, afterRefresh: Bool = false) async throws -> OAuthCredentialHealth {
-        switch credential.owner {
-        case "gmail", "calendar":
-            return try GoogleOAuthCredentials.credentialStatus(path: credential.path)
-        case "x":
-            let state = try XConnectorActions.credentialStatus(dataRoot: root)
-            return OAuthCredentialHealth(configured: state.configured, expiresAt: state.expiresAt, canRefresh: state.canRefresh)
-        case "github":
-            let state = try await GitHubCredentialStore.shared.credentialStatus(dataRoot: root, requiringOAuth: afterRefresh)
-            return OAuthCredentialHealth(configured: state.configured, expiresAt: state.expiresAt, canRefresh: state.canRefresh)
-        case "slack":
-            try SlackConnectorActions.requireConfiguredToken(dataRoot: root)
-            return OAuthCredentialHealth(configured: true, expiresAt: nil, canRefresh: false)
-        default:
-            return try ProviderOAuthCredentialMaintenance.status(provider: credential.owner, root: root)
-        }
+    private func status(_ credential: Credential) async throws -> OAuthCredentialHealth {
+        try ProviderOAuthCredentialMaintenance.status(provider: credential.owner, root: root)
     }
 
     private func refresh(_ credential: Credential) async throws {
-        switch credential.owner {
-        case "gmail", "calendar":
-            _ = try await GoogleOAuthCredentials.refresh(path: credential.path)
-        case "x":
-            try await XConnectorActions.refreshCredential(dataRoot: root)
-        case "github":
-            try await GitHubCredentialStore.shared.refreshCredential(dataRoot: root)
-        default:
-            try await ProviderOAuthCredentialMaintenance.refresh(provider: credential.owner, root: root)
-        }
+        try await ProviderOAuthCredentialMaintenance.refresh(provider: credential.owner, root: root)
     }
 
     private func requiresSignIn(_ error: Error, credential: Credential) -> Bool {
-        switch credential.owner {
-        case "gmail", "calendar":
-            return (error as? GoogleOAuthCredentials.RefreshError)?.requiresReauthentication == true
-        case "x":
-            return XConnectorActions.refreshRequiresSignIn(error)
-        case "github":
-            if case .refreshRejected = error as? GitHubOAuthDeviceFlow.FlowError { return true }
-            return false
-        default:
-            return ProviderOAuthCredentialMaintenance.requiresSignIn(error)
-        }
+        ProviderOAuthCredentialMaintenance.requiresSignIn(error)
     }
 
     public func run() async -> CheckResult { await run(repair: false) }
@@ -1924,13 +1575,14 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
         var repaired: [String] = []
         var noExpiry: [String] = []
         var refreshable = false
+        var unreadable = false
         var checked = 0
         for credential in credentials() {
             do {
                 var state = try await status(credential)
                 checked += 1
                 guard state.configured else {
-                    findings.append("\(credential.name) has no usable saved credential.")
+                    findings.append("\(credential.name) has no usable saved credential")
                     asks.append(credential.signIn(root))
                     continue
                 }
@@ -1940,13 +1592,14 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
                 }
                 if !state.requiresRefresh, let expiry = state.expiresAt, expiry > now {
                     if !state.canRefresh && expiry.timeIntervalSince(now) <= 7 * 24 * 60 * 60 {
-                        findings.append("\(credential.name) access expires within 7 days and no refresh credential is available.")
+                        findings.append("\(credential.name) access expires within 7 days and no refresh credential is available")
+                        asks.append(credential.signIn(root))
                     }
                     continue
                 }
                 let reason = state.requiresRefresh ? "authorization needs renewal" : "access expired"
                 guard state.canRefresh else {
-                    findings.append("\(credential.name) \(reason) and no refresh credential is available.")
+                    findings.append("\(credential.name) \(reason) and no refresh credential is available")
                     asks.append(credential.signIn(root))
                     continue
                 }
@@ -1959,42 +1612,46 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
                 do {
                     try Task.checkCancellation()
                     try await refresh(credential)
-                    state = try await status(credential, afterRefresh: true)
+                    state = try await status(credential)
                     if state.configured && !state.requiresRefresh && (state.expiresAt.map { $0 > Date() } ?? true) {
                         repaired.append(credential.name)
                         if state.expiresAt == nil { noExpiry.append(credential.name) }
                     } else {
-                        findings.append("\(credential.name) still has no current access credential after refresh.")
+                        findings.append("\(credential.name) still has no current access credential after refresh")
                         if !state.configured || !state.canRefresh { asks.append(credential.signIn(root)) }
                         else { refreshable = true }
                     }
                 } catch {
                     if requiresSignIn(error, credential: credential) {
-                        findings.append("\(credential.name) rejected the saved refresh authorization.")
+                        findings.append("\(credential.name) rejected the saved refresh authorization")
                         asks.append(credential.signIn(root))
                     } else {
                         // Provider bodies and credential material never enter Doctor reports.
-                        findings.append("\(credential.name) refresh could not complete. Retry Repair Safe Issues when the provider is available.")
+                        findings.append("\(credential.name) refresh could not complete")
                         refreshable = true
                     }
                 }
             } catch {
-                findings.append("\(credential.name) credential state is unavailable from its owner.")
+                unreadable = true
+                findings.append("\(credential.name) credential state could not be read from \(credential.path.path)")
+                asks.append(credential.signIn(root))
             }
         }
-        var detail = "\(checked) credential(s) inspected through their owners."
+        var parts = ["\(checked) credential(s) inspected through their owners"]
         if !noExpiry.isEmpty {
-            detail += " No scheduled expiry: \(noExpiry.joined(separator: ", "))."
+            parts.append("no scheduled expiry: \(noExpiry.joined(separator: ", "))")
         }
-        if !repaired.isEmpty { detail += " Refreshed: \(repaired.joined(separator: ", "))." }
-        if !findings.isEmpty { detail += " " + findings.joined(separator: " ") }
+        if !repaired.isEmpty { parts.append("refreshed: \(repaired.joined(separator: ", "))") }
+        parts += findings
+        let actions = asks.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) }
         return CheckResult(source: credentials().map { $0.path.path }.joined(separator: ", "), id: id, title: title,
-                           status: asks.isEmpty ? (findings.isEmpty ? "ok" : "unmeasured") : "warn",
-                           detail: detail,
+                           status: unreadable ? "fail" : findings.isEmpty ? "ok" : "warn",
+                           detail: parts.joined(separator: "; ") + ".",
                            harm: asks.isEmpty ? nil : "She cannot keep using the affected services without renewed access.",
                            repair: refreshable ? DoctorSafeRepairPolicy.oauthRefreshInstruction : nil,
                            receipt: repaired.isEmpty ? nil : "Repaired: refreshed \(repaired.joined(separator: ", ")).",
-                           human_action: asks.isEmpty ? nil : asks.joined(separator: " "),
+                           repairApplied: !repaired.isEmpty,
+                           human_action: asks.isEmpty ? nil : actions.joined(separator: "; ") + ".",
                            ask: asks.isEmpty ? nil : .signIn)
     }
 }
@@ -2020,17 +1677,19 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
             // One-thread-many-surfaces Phase 0: hot session count, 24h mints BY
             // MINT SITE, and the source-flapping detector. Read-only.
             SessionIdentityCheck(root: dataRoot),
-            // 2026-09-02: two per-turn health rows over the turn-trace feed, so a
-            // regression in either can no longer be invisible. Both are read-only,
+            // Read-only Doctor rows over the turn-trace feed, so a
+            // behavior no longer depends on bounded previews. All are read-only,
             // bounded (tailed day files), and run ONLY inside a Doctor pass —
-            // never on a turn, a timer, or the cognition runtime. Both are
+            // never on a turn, a timer, or the cognition runtime. These are
             // `heartbeatEligible == false`: they are for a person reading Doctor,
             // never for an unattended sweep that can wake User.
             //   * PromptPrefixHealthCheck — cross-turn prefix cache reuse.
             //   * SubconsciousVitalsCheck — capsule attachment and felt/Inner/Sound
             //     variety, plus the organism's own chemistry.
+            //   * ModelCompensationsCheck — compensation receipts, without judgment.
             PromptPrefixHealthCheck(root: dataRoot),
             SubconsciousVitalsCheck(root: dataRoot),
+            ModelCompensationsCheck(root: dataRoot),
             ChatMessagesIntegrityCheck(root: dataRoot),
             PersonaEngineCheck(root: root),
             MemoryStoreCheck(root: dataRoot),
@@ -2081,11 +1740,9 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
                 if let oauth = check as? OAuthTokenExpiryCheck {
                     return await oauth.run(repair: true)
                 }
-                // Automatic runs the full repair: every one backs up and
-                // revalidates under the writer's lock before it replaces.
-                // Authority stores and onboarding only create what is missing.
+                // Only registered owner repairs run automatically; onboarding
+                // uses the remaining create-missing handlers.
                 if scope == .automatic, DoctorSafeRepairPolicy.automaticCoreIDs.contains(id),
-                   !DoctorSafeRepairPolicy.createMissingOnlyIDs.contains(id),
                    let repairable = check as? any RepairingDoctorCheck {
                     return await repairable.run(repair: true)
                 }
@@ -2114,6 +1771,7 @@ public func makeDoctorChecks(root: URL? = nil, freshMeasurement: Bool = false) -
             switch check.id {
             case "prompt_prefix_health": PromptPrefixHealthCheck(root: root ?? defaultDataRoot(), cacheTTL: 0)
             case "subconscious_vitals": SubconsciousVitalsCheck(root: root ?? defaultDataRoot(), cacheTTL: 0)
+            case "model.shims": ModelCompensationsCheck(root: root ?? defaultDataRoot(), cacheTTL: 0)
             default: check
             }
         }

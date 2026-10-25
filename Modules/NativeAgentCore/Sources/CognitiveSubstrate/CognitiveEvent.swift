@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `CognitiveEvent.swift` | `CognitiveEvent` and event/turn-kind vocabularies: typed cognition observations, mechanical-row classification and metadata signals |
+
 public enum CognitiveEventKind: String, Sendable, Equatable, CaseIterable {
     case userMessageReceived
     case assistantTurnCompleted

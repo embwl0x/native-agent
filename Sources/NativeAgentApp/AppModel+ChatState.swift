@@ -11,20 +11,17 @@ import PersistenceCore
 import NativeAgentCore
 import MemoryV2
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
 import ToolExecution
 import PersonaEngine
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatSessionWork
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
+import EngineRuntime
 import Research
 import MultimodalTTS
 import TriggerScheduler
@@ -36,22 +33,15 @@ import TelegramBot
 import Dispatcher
 import MacControl
 import Onboarding
-import MacAssistantStatus
+import MacIntegration
 import WorkflowOrchestration
-import Skills
 import Connectors
 import Browser
 import DeviceSync
+// Blueprint: | `AppModel+ChatState.swift` | `AppModel`: `loadDetachedSessionMessages`, `pinChatSessionForDetachedWindow`, `pruneSessionChatState`, `pruneStaleSessionChatState` |
 
 @MainActor
 extension AppModel {
-    func refreshResidentMindAfterProfileRepair() async {
-        await engine.refreshResidentMindAfterProfileRepair(
-            publishProfile: { await self.reloadPersonality() },
-            refreshMind: { await NativeAgentEngine.live.refreshResidentMindAfterOnboardingTransition() }
-        )
-    }
-
     func drainPendingResidentRefreshIfTurnsIdle() {
         engine.drainPendingResidentRefreshIfTurnsIdle(
             publishProfile: { await self.reloadPersonality() },
@@ -62,9 +52,9 @@ extension AppModel {
     /// Publish the profile from this root after launch or repair; a failed
     /// read keeps the visible name rather than clearing the header.
     func reloadPersonality() async {
-        guard let profile = try? await SwiftNativePersonaEngine.readPersonality(dataRoot: engine.dataRoot) else { return }
-        personality = profile
-        teachMemoryHygieneName()
+        let previousName = engine.persona.profile?.name
+        guard (try? await engine.persona.loadProfile()) != nil else { return }
+        teachMemoryHygieneName(previousName: previousName)
     }
 
     /// Drop a session's cached messages. Called when a session is
@@ -111,23 +101,22 @@ extension AppModel {
     }
 
     /// Add a session to the pinned-chat strip from outside ChatView (the
-    /// detached-window controller). The shared pin store updates ChatView's
-    /// reactive `@AppStorage` value and the retention mirror together.
+    /// detached-window controller). The transcript owner publishes membership.
     /// Idempotent — a session already pinned is left as-is.
     @MainActor
     func pinChatSessionForDetachedWindow(_ sessionId: String) {
         guard !sessionId.isEmpty else { return }
-        var ids = ChatSessionRetention.load()
+        var ids = engine.transcripts.pinnedSessionIDs
         let added = !ids.contains(sessionId)
         if added {
             ids.append(sessionId)
         }
-        guard (try? ChatSessionRetention.save(ids)) != nil else { return }
+        guard let encoded = try? engine.transcripts.savePinnedSessionIDs(ids) else { return }
         // 2026-09-06: a pin that ADDS a session asks for transcripts — the
         // published transcript set is chosen from the pins as they were before
         // this save, so publishing the new tab without them put an empty
         // conversation on the phone until some unrelated edge republished.
-        NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: added)
+        _ = engine.transcripts.publishPins(encoded, includeTranscripts: added)
     }
 
     /// Per-session message mutators. Used by `_sendChatBody` so optimistic
@@ -261,7 +250,7 @@ extension AppModel {
     }
 
     /// Re-reads exactly the block `AppModel.swift` reads once at construction
-    /// (`AppModel.swift:106-160` plus `chatProvider` at `:573`). Assignments
+    /// (`AppModel.swift`). Assignments
     /// are value-guarded, and the whole pass is wrapped in a re-entrancy flag
     /// so the UserDefaults write-back in each `didSet` cannot loop.
     func reloadDefaultsBackedSettings() {
@@ -277,9 +266,6 @@ extension AppModel {
             defaults.string(forKey: key) ?? fallback
         }
 
-        let searxng = string("searxngBaseURL", "")
-        if searxngBaseURL != searxng { searxngBaseURL = searxng }
-
         let allowedChats = string("telegramAllowedChats", "")
         if telegramAllowedChats != allowedChats { telegramAllowedChats = allowedChats }
 
@@ -289,27 +275,9 @@ extension AppModel {
         let requireMention = defaults.object(forKey: "telegramRequireMention") as? Bool ?? true
         if telegramRequireMention != requireMention { telegramRequireMention = requireMention }
 
-        // Empty is "no pick of my own": the turn resolves through the Providers
-        // group (2026-09-13). A literal here was a model chosen in code.
-        let model = string("chatModel", "")
-        if chatModel != model { chatModel = model }
-
-        let effort = string("chatReasoningEffort", "high")
-        if chatReasoningEffort != effort { chatReasoningEffort = effort }
-
-        let fastMode = defaults.bool(forKey: "chatFastMode")
-        if chatFastMode != fastMode { chatFastMode = fastMode }
-
         let fileAccess = string("chatFileAccess", "auto")
         if chatFileAccess != fileAccess { chatFileAccess = fileAccess }
 
-        let tgModel = string("telegramModel", "")
-        if telegramModel != tgModel { telegramModel = tgModel }
 
-        let tgEffort = string("telegramReasoningEffort", "high")
-        if telegramReasoningEffort != tgEffort { telegramReasoningEffort = tgEffort }
-
-        let provider = string("chatProvider", "openai_oauth_direct")
-        if chatProvider != provider { chatProvider = provider }
     }
 }

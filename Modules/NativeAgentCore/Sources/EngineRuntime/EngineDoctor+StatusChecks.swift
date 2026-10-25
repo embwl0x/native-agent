@@ -5,6 +5,13 @@ import DoctorChecks
 import NativeAgentShared
 import PersistenceCore
 import DeviceSync
+import ToolExecution
+// Blueprint: | `EngineDoctor+StatusChecks.swift` | `DoctorFacade`: checked Desk attention and Activity facts go through L0 Parts.call to Resources/abilities/diagnostic-narration.js outside view rendering; native measured status, approval/store failures, corruption detection, unknown-outcome reconciliation and parent repair remain here; an unavailable narrator is explicit without being mistaken for a canonical read failure |
+
+private struct DiagnosticNarration: Codable, Sendable {
+    let detail: String
+    let humanAction: String?
+}
 
 extension DoctorFacade {
     public static func statusChecks(dataRoot root: URL, approvals: ApprovalsFacade, repairDesk: Bool,
@@ -20,15 +27,16 @@ extension DoctorFacade {
     private static func deskCheck(approvals: ApprovalsFacade, root: URL, repair: Bool, stuckReason: (DeskItem, [DeskItem]) -> String, safeDetail: (String) -> String) async -> (row: CheckResult, repaired: Bool) {
         let store = SwiftNativeDeskStore(dataRoot: root)
         do {
-            var items = try await store.liveState().items
-            let initialContradictions = contradictoryParents(in: items)
+            var state = try await store.liveState()
+            let initialContradictions = SwiftNativeDeskStore.terminalParentsWithNonTerminalDescendants(in: state)
             var repaired = false
             if repair && !initialContradictions.isEmpty {
                 let ops = try await store.reconcileTerminalParentsWithNonTerminalDescendants()
                 repaired = !ops.isEmpty
-                items = try await store.liveState().items
+                state = try await store.liveState()
             }
-            let contradictions = contradictoryParents(in: items)
+            let items = state.items
+            let contradictions = SwiftNativeDeskStore.terminalParentsWithNonTerminalDescendants(in: state)
             let waiting = items.filter { $0.requiresOwnerInput }
             let blocked = items.filter { $0.status == .blocked && !$0.requiresOwnerInput }
             let pendingApprovals: Int
@@ -37,34 +45,32 @@ extension DoctorFacade {
                     .filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }.count
             } catch {
                 return (CheckResult(source: "workflows/approvals/requests.json",
-                                    nextCall: ToolFailureError.fileRepairCall(root.appendingPathComponent("workflows/approvals/requests.json"), dataRoot: root,
-                                        shape: "A JSON array of saved approval requests with their original identities, payloads and decisions. Preserve all authority and decision fields exactly; never approve, deny or invent a request."),
                                     id: "status.desk_attention", title: "Desk work and decisions", status: "fail",
                                     detail: "Approvals could not be read: \(safeDetail(error.localizedDescription)).",
                                     harm: "Pending decisions cannot be read or safely settled.",
-                                    human_action: "Open Approvals and refresh its pending list; inspect the approval store before changing any saved request."), repaired)
+                                    human_action: ToolFailureError.fileRepairInstruction(root.appendingPathComponent("workflows/approvals/requests.json"),
+                                        shape: "A JSON array of saved approval requests with their original identities, payloads and decisions. Preserve all authority and decision fields exactly; never approve, deny or invent a request.") + " Open Approvals and refresh its pending list; inspect the approval store before changing any saved request."), repaired)
             }
             let id = "status.desk_attention"
             let title = "Desk work and decisions"
-            guard pendingApprovals > 0 || !waiting.isEmpty || !blocked.isEmpty || !contradictions.isEmpty else {
-                return (CheckResult(source: "desk/desk_ops_base.json and desk/desk_ops.jsonl", id: id, title: title, status: "ok",
-                                    detail: "No blocked Desk work, owner decision, or terminal-parent contradiction."), repaired)
+            func group(_ items: [DeskItem]) -> [String: JSONValue] {
+                ["count": .int(Int64(items.count)), "aliases": .array(items.map { .string(String($0.alias)) })]
             }
-            var parts: [String] = []
-            if !waiting.isEmpty { parts.append("\(waiting.count) item(s) wait on your decision: " + labels(waiting)) }
-            if pendingApprovals > 0 { parts.append("\(pendingApprovals) pending approval(s) wait for your decision.") }
-            if !blocked.isEmpty { parts.append("\(blocked.count) blocked item(s): " + blockedDetails(blocked, in: items, stuckReason: stuckReason, safeDetail: safeDetail)) }
-            if !contradictions.isEmpty { parts.append("\(contradictions.count) terminal parent(s) contain open descendants: " + labels(contradictions)) }
-            var actions: [String] = []
-            if !waiting.isEmpty { actions.append("Open Desk and decide items \(labels(waiting)) marked waiting on you.") }
-            if pendingApprovals > 0 { actions.append("Open Approvals and decide the \(pendingApprovals) pending request(s).") }
-            if !blocked.isEmpty { actions.append("Open Desk and resolve \(labels(blocked)) using each recorded blocked reason or waiting party; if neither is recorded, clarify the block in Desk.") }
-            if !contradictions.isEmpty { actions.append("Open Desk and inspect terminal parents \(labels(contradictions)) if Repair Safe Issues cannot reconcile them.") }
+            var blockedFacts = group(blocked)
+            blockedFacts["items"] = .array(blocked.map {
+                .object(["alias": .string(String($0.alias)), "reason": .string(safeDetail(stuckReason($0, items)))])
+            })
+            let narration = await diagnosticNarration(root: root, input: .object([
+                "kind": .string("desk"), "pendingApprovals": .int(Int64(pendingApprovals)),
+                "waiting": .object(group(waiting)), "blocked": .object(blockedFacts), "contradictions": .object(group(contradictions))
+            ]), safeDetail: safeDetail)
             let severity = contradictions.isEmpty ? "ok" : "warn"
-            return (CheckResult(source: "desk/desk_ops_base.json and desk/desk_ops.jsonl", id: id, title: title, status: severity, detail: parts.joined(separator: " "),
+            return (CheckResult(source: "desk/desk_ops_base.json and desk/desk_ops.jsonl", id: id, title: title, status: severity, detail: narration.detail,
                                 harm: severity == "warn" ? "The named Desk work cannot move forward or is marked finished while work remains." : nil,
-                                repair: contradictions.isEmpty ? nil : "Run Repair Safe Issues to reconcile terminal Desk parents with open descendants.",
-                                human_action: actions.joined(separator: " "), repair_available: !contradictions.isEmpty), repaired)
+                                repair: contradictions.isEmpty ? nil : "Press Repair in Diagnostics → Health checks to reconcile terminal Desk parents with open descendants.",
+                                human_action: narration.humanAction,
+                                repair_available: pendingApprovals > 0 || !waiting.isEmpty || !blocked.isEmpty || !contradictions.isEmpty
+                                    ? !contradictions.isEmpty : nil), repaired)
         } catch {
             let file: URL?
             switch error {
@@ -74,38 +80,30 @@ extension DoctorFacade {
                 file = path.flatMap { $0 == store.opsPath.path || $0 == store.basePath.path ? URL(fileURLWithPath: $0) : nil }
             }
             return (CheckResult(source: file?.path ?? "desk/desk_ops_base.json and desk/desk_ops.jsonl",
-                                nextCall: file.map { ToolFailureError.fileRepairCall($0, dataRoot: root,
-                                    shape: "The Desk compaction base holds the saved items and lastCompactedOpId; its JSONL tail holds DeskOp events. Preserve identities, parent links, continuations and recorded outcomes.") },
                                 id: "status.desk_attention", title: "Desk work and decisions", status: "fail",
                                 detail: "Desk's canonical state could not be read: \(safeDetail(error.localizedDescription)).",
                                 harm: "Saved work cannot be read or safely advanced.",
-                                human_action: "Open Desk and inspect its unavailable-state detail; restore its canonical feed from a verified backup if the owner reports corruption."), false)
+                                human_action: [file.map { ToolFailureError.fileRepairInstruction($0,
+                                    shape: "The Desk compaction base holds the saved items and lastCompactedOpId; its JSONL tail holds DeskOp events. Preserve identities, parent links, continuations and recorded outcomes.") }, file == nil
+                                    ? "Open Trust → Advanced → Backups, select a verified backup containing desk/desk_ops_base.json and desk/desk_ops.jsonl, then choose Restore → Restore backup."
+                                    : "Open Desk and inspect its unavailable-state detail before recovering the named canonical feed."].compactMap { $0 }.joined(separator: " "),
+                                ask: file == nil ? .permission : nil), false)
         }
     }
 
-    private static func contradictoryParents(in items: [DeskItem]) -> [DeskItem] {
-        let parents = Dictionary(items.map { ($0.handle, $0.parent) }, uniquingKeysWith: { first, _ in first })
-        var ancestorsOfOpenItems = Set<String>()
-        for item in items where !item.status.isTerminal {
-            var parent = item.parent
-            var seen = Set<String>()
-            while let handle = parent, seen.insert(handle).inserted {
-                ancestorsOfOpenItems.insert(handle)
-                parent = parents[handle] ?? nil
-                if seen.count >= items.count { break }
+    private static func diagnosticNarration(root: URL, input: JSONValue, safeDetail: (String) -> String) async -> DiagnosticNarration {
+        do {
+            return try await NativeAgentEngine.forRoot(root).tools.withPartDoor(envelope: .native("doctor:status-narration")) {
+                switch await Parts(root: root).call(id: "diagnostic-narration", input: input, as: DiagnosticNarration.self) {
+                case .success(let narration): return narration
+                case .failure(let error): throw error
+                }
             }
+        } catch {
+            // An unavailable author is not an unavailable canonical store and
+            // never changes the measured status or repair eligibility.
+            return DiagnosticNarration(detail: "Diagnostic part unavailable: \(safeDetail(error.localizedDescription)).", humanAction: nil)
         }
-        return items.filter { $0.status.isTerminal && ancestorsOfOpenItems.contains($0.handle) }
-    }
-
-    private static func labels(_ items: [DeskItem]) -> String {
-        items.prefix(5).map { "#\($0.alias)" }.joined(separator: ", ")
-            + (items.count > 5 ? " and \(items.count - 5) more" : "")
-    }
-
-    private static func blockedDetails(_ items: [DeskItem], in all: [DeskItem], stuckReason: (DeskItem, [DeskItem]) -> String, safeDetail: (String) -> String) -> String {
-        items.prefix(5).map { "#\($0.alias): " + safeDetail(stuckReason($0, all)) }
-            .joined(separator: "; ") + (items.count > 5 ? "; and \(items.count - 5) more" : "")
     }
 
     private static func activityCheck(root: URL, safeDetail: (String) -> String) async -> CheckResult {
@@ -127,26 +125,26 @@ extension DoctorFacade {
                 return date >= cutoff && date <= Date().addingTimeInterval(60)
             }
             let malformed = readout.malformedRowCount
-            let partial = malformed > 0
-                ? "Activity log \(readout.records.isEmpty ? "unreadable" : "partially readable"): \(malformed) malformed row(s) in its bounded tail. "
-                : ""
-            let latestTitles = (reconciliation + current).sorted { $0.event.createdAt > $1.event.createdAt }.prefix(3)
-                .map { safeDetail($0.event.title) }.joined(separator: "; ")
+            let narration = await diagnosticNarration(root: root, input: .object([
+                "kind": .string("activity"), "malformedCount": .int(Int64(malformed)),
+                "recordCount": .int(Int64(readout.records.count)), "reconciliationCount": .int(Int64(reconciliation.count)),
+                "failureCount": .int(Int64(current.count)), "recent": .array((reconciliation + current).map {
+                    .object(["createdAt": .string($0.event.createdAt), "title": .string(safeDetail($0.event.title))])
+                })
+            ]), safeDetail: safeDetail)
             return CheckResult(source: "activity/events.jsonl",
-                               nextCall: malformed > 0 ? ToolFailureError.fileRepairCall(root.appendingPathComponent("activity/events.jsonl"), dataRoot: root,
-                                   shape: "Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. Preserve unknown outcomes and reconciliation evidence.") : nil,
-                               id: id, title: title, status: malformed > 0 ? "fail" : reconciliation.isEmpty && current.isEmpty ? "ok" : "unmeasured",
-                               detail: partial + "\(reconciliation.count) outcome(s) need reconciliation; \(current.count) failure receipt(s) in the last 15 minutes of the retained activity tail."
-                                   + (latestTitles.isEmpty ? "" : " Latest: \(latestTitles)."),
-                               harm: malformed > 0 ? "Parts of the activity history cannot be reviewed." : nil)
+                               id: id, title: title, status: malformed > 0 ? "fail" : reconciliation.isEmpty ? "ok" : "unmeasured",
+                               detail: narration.detail,
+                               harm: malformed > 0 ? "Parts of the activity history cannot be reviewed." : nil,
+                               human_action: malformed > 0 ? ToolFailureError.fileRepairInstruction(SwiftNativePersistenceCore.activityEventsPath(dataRoot: root),
+                                   shape: "Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. Preserve unknown outcomes and reconciliation evidence.") : nil)
         } catch {
             return CheckResult(source: "activity/events.jsonl",
-                               nextCall: ToolFailureError.fileRepairCall(root.appendingPathComponent("activity/events.jsonl"), dataRoot: root,
-                                   shape: "Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. Preserve unknown outcomes and reconciliation evidence."),
                                id: id, title: title, status: "fail",
                                detail: "The activity log could not be read: \(safeDetail(error.localizedDescription)).",
                                harm: "Recent work and its outcomes cannot be reviewed.",
-                               human_action: "Open Status and refresh Recent activity once; if the log is still unavailable, inspect activity/events.jsonl without replacing its bytes.")
+                               human_action: ToolFailureError.fileRepairInstruction(SwiftNativePersistenceCore.activityEventsPath(dataRoot: root),
+                                   shape: "Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. Preserve unknown outcomes and reconciliation evidence.") + " Open Status and refresh Recent activity once; if the log is still unavailable, inspect activity/events.jsonl without replacing its bytes.")
         }
     }
 

@@ -4,9 +4,13 @@ import ChromeControl
 import CryptoKit
 import Privacy
 import Foundation
+import Senses
 import AttentionRouting
 import Agents
-import ChatOrchestration
+import ChatTurnContracts
+import ChatToolRuntime
+import AgentConversations
+import ChatToolParsing
 import Cognition
 import CognitiveSubstrate
 import MacIntegration
@@ -20,6 +24,10 @@ import StandingBots
 import ToolRegistry
 import TrustCenter
 import DeviceSync
+import ChatTurnRuntime
+import Transcripts
+import TurnTrace
+// Blueprint: | `AppToolExecutor.swift` | `AppToolExecutor` class; shared immutable descriptors; `execute`; chat.post routes to the conversation anchor through Reach's existing speech claim/quota; `macPersonAway` callback; home arrivals from app.installed runs retain bundle/version identity alongside the line without a new action argument; mobileNotify owns app/bridge notification defaults, verified session binding and previews, while AttentionRouter delivers |
 
 /// Core policy and routing for tools backed by the app's platform ports.
 /// Descriptors enter the one lazy catalog through the engine; this executor
@@ -46,6 +54,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     private let doctorStatusProvider: @Sendable (_ repair: Bool?, _ checkID: String?) async throws -> JSONValue
     private let telegramStatusProvider: @Sendable () async throws -> JSONValue
     private let humanConversationReplyHandler: @Sendable ([String: JSONValue]) async throws -> JSONValue
+    private let proactiveSpeechClient: @Sendable (URL) -> SwiftNativeChatOrchestrationClient
     /// Deny, or under Full Mac approve (true), a Desk task's waiting step:
     /// execution id in, receipt out.
     private let workshopStepDecider: @Sendable (String, Bool) async throws -> JSONValue
@@ -63,6 +72,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         doctorStatusProvider: @escaping @Sendable (_ repair: Bool?, _ checkID: String?) async throws -> JSONValue,
         telegramStatusProvider: @escaping @Sendable () async throws -> JSONValue,
         humanConversationReplyHandler: @escaping @Sendable ([String: JSONValue]) async throws -> JSONValue,
+        proactiveSpeechClient: @escaping @Sendable (URL) -> SwiftNativeChatOrchestrationClient,
         workshopStepDecider: @escaping @Sendable (String, Bool) async throws -> JSONValue,
         quietHost: @escaping @MainActor @Sendable () -> (any QuietToolHost)?,
         presentation: any QuietToolPresentationPort,
@@ -87,6 +97,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         self.doctorStatusProvider = doctorStatusProvider
         self.telegramStatusProvider = telegramStatusProvider
         self.humanConversationReplyHandler = humanConversationReplyHandler
+        self.proactiveSpeechClient = proactiveSpeechClient
         self.workshopStepDecider = workshopStepDecider
         self.quietHost = quietHost
         self.presentation = presentation
@@ -94,15 +105,21 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         let root = securityCenter.dataRoot
         let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
         self.actionIndex = memory
+        let pages: @Sendable () async -> [String: QuietToolPage] = {
+            await MainActor.run {
+                Dictionary(([Self.doorInbox] + presentation.pages).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            }
+        }
+        AgentWorkspacePorts.rankParts { message, root in
+            await AppActions.parts(message, pages: await pages(), dataRoot: root, memory: memory)
+        }
         Task {
-            let paths = ["agents/peers.json", "mcp/servers.json", "mcp/cache/tools.json", "config/embeddings.json", "ui/layout.json"]
+            let paths = ["agents/peers.json", "config/embeddings.json", "ui/layout.json"]
                 .map { root.appendingPathComponent($0) }
                 + [defaultPersonaRoot(dataRoot: root).appendingPathComponent("skills/bodies")]
             await memory.installActionIndex(paths: paths,
                 notifications: [AbilityStore.didChange, BotRunQueue.didChange, UserDefaults.didChangeNotification]) {
-                    let pages = await MainActor.run {
-                        Dictionary(([Self.doorInbox] + presentation.pages).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-                    }
+                    let pages = await pages()
                     let inventory = try await AppActions.inventory(dataRoot: root)
                     return try AppActions.actionTexts(inventory.actions, pages: pages,
                         contacts: AgentPeerStore(dataRoot: root).list().map(\.name),
@@ -195,7 +212,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             guard allowed else {
                 return Self.macIntegrationDeniedEnvelope(integration: MacIntegrationID.notifyMobile, mode: "write")
             }
-            return try await runMobileNotify(input: input, surface: surface)
+            return try await Self.mobileNotify(input: input, surface: surface, toolName: "mobile.notify", sender: mobileNotificationSender)
         case "mac_notify":
             let admission = await securityCenter.fullMacYoloAuthority(
                 tool: tool, origin: AppChatToolDispatcher.securityOrigin(surface: surface))
@@ -252,9 +269,11 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         return .object(obj)
     }
 
-    private func runMobileNotify(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    public static func mobileNotify(input: [String: JSONValue], surface: String, toolName: String,
+        sender: (String, String, [String: String]) async throws -> MobileNotificationDeliveryReceipt
+    ) async throws -> JSONValue {
         let input = input.filter { $0.value != .string("") }
-        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mobile.notify")
+        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: toolName)
         let screen = Self.inputString(input["screen"]) ?? "inbox"
         let source = Self.inputString(input["source"]) ?? "chat_tool"
         let urgency = Self.inputString(input["urgency"]) ?? "normal"
@@ -269,7 +288,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines), !sessionId.isEmpty {
             userInfo["sessionId"] = sessionId
         }
-        let receipt = try await mobileNotificationSender(title, message, userInfo)
+        let receipt = try await sender(title, message, userInfo)
         var obj = receipt.deliveryFields()
         obj.merge([
             "tool": .string("mobile.notify"),
@@ -303,7 +322,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             "reason": .string("integration_permission_denied"),
             "integration": .string(integration),
             "mode": .string(mode),
-            "fix": .string("Toggle \(mode.capitalized) ON for \(integration) in Settings → Mac Integration."),
+            "fix": .string("Open Trust → Mac → \(integration) and enable \(mode.capitalized)."),
         ]))
     }
 
@@ -349,14 +368,9 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             let call = ChatToolSessionInjection.apply(toolName: action.tool, input: input,
                                                       sessionId: Self.inputString(input["__session_id"]))
             do {
-                var result = try await perform(action.tool, call)
-                // A read that failed changed nothing: its receipt says so, whatever the inner layer guessed.
-                if action.read, case .object(var fields) = result, fields["status"] == .string("failed"),
-                   fields["effects"] != .string("occurred"), fields["effects"] != .string("partial") {
-                    fields["effects"] = .string("none")
-                    result = .object(fields)
-                }
-                if action.partAction, case .object(let fields) = result, let returned = fields["returned"] {
+                let result = try await perform(action.tool, call)
+                if action.partAction, OwnedProgramInvocation.valueCall?.id != action.tool,
+                   case .object(let fields) = result, let returned = fields["returned"] {
                     var answer: [String: JSONValue] = if case .object(let answer) = returned { answer } else { ["result": returned] }
                     if fields["status"] == .string("ok") || fields["status"] == .string("refused") && answer["status"] == .string("failed") {
                         // The part supplies its payload; only the runner can attest its effects.
@@ -377,6 +391,27 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         try Task.checkCancellation()
         let verb = Self.inputString(action.input["verb"]) ?? ""
         switch action.tool {
+        case "chat_post":
+            let root = securityCenter.dataRoot
+            guard let destination = ConversationAnchor.currentSessionId(dataRoot: root) else {
+                throw ChatOrchestrationError.underlying("The person has no current conversation. Nothing was posted.")
+            }
+            guard let turn = TurnTraceContext.turnId else {
+                throw ChatOrchestrationError.underlying("chat.post requires a current turn. Nothing was posted.")
+            }
+            let message = Self.inputString(input["message"]) ?? ""
+            let result = try await proactiveSpeechClient(root).speakProactively(
+                content: message, caller: .reachOut,
+                idempotencyKey: SwiftNativeChatOrchestrationClient.proactiveSpeechIdempotencyKey(scope: "chat.post:" + turn, content: message),
+                sessionId: destination)
+            switch result {
+            case .posted(let session, let run):
+                return .object(["status": .string("ok"), "effects": .string("occurred"), "session_id": .string(session), "run_id": .string(run)])
+            case .duplicate(let session):
+                return .object(["status": .string("ok"), "effects": .string("none"), "session_id": .string(session), "duplicate": .bool(true)])
+            case .rateLimited(let seconds):
+                return .object(["status": .string("refused"), "effects": .string("none"), "reason": .string("rate_limited"), "seconds_remaining": .int(Int64(seconds))])
+            }
         case "mac_apps":
             let name = Self.inputString(input["name"]) ?? ""
             let every = try await MacAppIndex.shared.apps().filter { name.isEmpty || $0.name.localizedCaseInsensitiveContains(name) }
@@ -423,6 +458,10 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         case "agent_connect" where action.id == "agent.recipe_write":
             return AgentRecipeStore.write(host: Self.inputString(input["host"]) ?? "", document: input["recipe"] ?? .null,
                                           undoing: Self.undoReceipt)
+        case "agent_message" where action.id == "agent.reply":
+            return try await AgentConversationSession.answer(part: SkillRunContext.ability, agent: Self.inputString(input["agent"]),
+                exchange: Self.inputString(input["exchange"]), text: Self.inputString(input["text"]) ?? "", done: input["done"] != .bool(false),
+                dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         case "agent_connect" where action.id == "agent.rename": return try AgentPeerStore(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()).rename(Self.inputString(input["agent"]) ?? "", name: Self.inputString(input["name"]) ?? "")
         case "app_page_read" where action.id == "layout.read":
             return SurfaceLayoutStore.read(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
@@ -441,9 +480,25 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         case "sense_lifecycle":
             return try await runSenseLifecycle(input: input)
         case "app_page_screenshot":
-            return await presentation.pageScreenshot(input: input)
+            let result = await presentation.pageScreenshot(input: input)
+            guard case .object(var fields) = result, fields["remedy"] == nil else { return result }
+            let page = Self.doorText(input["page"])
+            switch Self.doorText(fields["reason"]) {
+            case "unknown_tab":
+                fields["remedy"] = Repair.remedy(owner: "page \(page) tabs",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["page": .string(page)])]), tap: nil,
+                    instruction: "Read this page and choose a key from tabs for args.tab; omit tab only to draw the default tab.")
+            case "render_failed":
+                fields["remedy"] = Repair.remedy(owner: "page \(page) renderer",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["page": .string(page)])]), tap: nil,
+                    instruction: "Read this page as text; offscreen rendering failed before a PNG could be saved.")
+            default: break
+            }
+            return .object(fields)
         case "make_studio":
             return await runMake(verb: verb, input: input)
+        case "studio_intake_read":
+            return await runStudioIntakeRead(input: input, surface: surface)
         case "doctor_status":
             return Self.healthResult(try await doctorStatusProvider(input["repair"] == .bool(true), Self.inputString(input["check_id"])), surface: surface)
         case "my_queue":
@@ -474,14 +529,15 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             let format = DateFormatter()
             format.dateFormat = "yyyy-MM-dd"
             let day = format.string(from: Date())
-            var identity = Data(line.utf8)
-            if case .object(let input) = SkillRunContext.input, input["signal"] == .string("app.installed") {
-                identity = try JSONValue.array([.string(line), input["bundle_id"] ?? .null, input["version"] ?? .null]).serializedData(pretty: false)
+            let eventKey = Self.inputString(input["event_key"])
+            if input["event_key"] != nil, eventKey?.isEmpty != false || (eventKey?.utf8.count ?? 0) > 1024 {
+                return Self.failure("invalid_args", "event_key must be a nonempty string of at most 1024 bytes.")
             }
+            let identity = Data((eventKey ?? line).utf8)
             let digest = SHA256.hash(data: identity).prefix(8).map { String(format: "%02x", $0) }.joined()
-            let id = "part:" + part + ":" + day + ":" + digest
+            let id = "part:" + part + ":" + (eventKey == nil ? day : "event") + ":" + digest
             guard !ResidentWake.knows(id, dataRoot: root) else {
-                return .object(["status": .string("ok"), "effects": .string("none"), "detail": .string("Already on your home today.")])
+                return .object(["status": .string("ok"), "effects": .string("none"), "detail": .string("This arrival is already known on your home.")])
             }
             // The part's thread carries the hop rule, so a part cannot keep waking her.
             var item = ResidentWake.Item(id: id, line: part + ": " + line, thread: "part:" + part, home: true)
@@ -532,20 +588,22 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             let answer = action.tool == "provider"
                 ? await host.provider(verb: verb, input: input) : await host.connections(verb: verb, input: input)
             guard case .object(var body) = answer else {
-                return Self.failure("\(action.tool)_failed", "The app gave no answer for that verb.", extra: ["effects": .string("unknown")])
+                return Self.doorRefusal("handler_result_missing", "\(action.id) returned no structured result; its effects are unknown.",
+                    remedy: "inspect", "Read the owning page and reconcile the affected state before another change.",
+                    next: ["page": .string(action.page)], extra: ["effects": .string("unknown"), "action": .string(action.id), "verb": .string(verb)])
             }
             body["verb"] = .string(verb)
             if action.tool == "connections" { body["decided_by"] = .string("agent") }
             return .object(body)
-        case "upkeep", "mind_run", "skill_manage":
+        case "upkeep", "mind_run", "ability_manage":
             let outcome = switch action.tool {
             case "upkeep": await host.runUpkeep(verb: verb, input: input)
             case "mind_run": await host.runMind(verb: verb, input: input)
             default:
-                await host.manageSkill(verb: verb, input: input, steer: Self.skillSteer(surface: surface))
+                await host.managePart(verb: verb, input: input, steer: Self.skillSteer(surface: surface))
             }
             var body = outcome.fields
-            body["status"] = .string(outcome.ok ? "ok" : "failed")
+            body["status"] = outcome.ok ? .string("ok") : body["status"] ?? .string("failed")
             body["verb"] = .string(verb)
             body["detail"] = .string(outcome.detail)
             return .object(body)
@@ -561,7 +619,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         }
     }
 
-    /// The peers steering this turn, as `skill_manage` weighs them.
+    /// The peers steering this turn, as `ability_manage` weighs them.
     static func skillSteer(surface: String) -> [String] {
         let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                           peerID: ChatToolSessionContext.envelope?.verifiedUserId)
@@ -623,7 +681,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
                 catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
             }
             guard let host = quietHost() else { return Self.unattachedFailure() }
-            let asked = await host.manageSkill(verb: Self.inputString(action.input["verb"]) ?? "",
+            let asked = await host.managePart(verb: Self.inputString(action.input["verb"]) ?? "",
                                                input: input.merging(["preview": .bool(true)]) { $1 },
                                                steer: Self.skillSteer(surface: surface))
             let would = asked.fields.filter { $0.key.hasPrefix("would_") || ["versions", "tools"].contains($0.key) }
@@ -660,15 +718,5 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         default:
             return nil
         }
-    }
-
-    public static func extractSessionId(_ input: [String: JSONValue]) -> String {
-        for key in ["__session_id", "session_id", "sessionId"] {
-            if let raw = AppToolExecutor.inputString(input[key])?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !raw.isEmpty {
-                return raw
-            }
-        }
-        return ""
     }
 }

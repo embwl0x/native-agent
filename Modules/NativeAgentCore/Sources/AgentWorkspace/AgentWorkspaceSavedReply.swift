@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceSavedReply.swift` | `AgentWorkspaceSavedReply` struct; `title`, `evidence` |
 
 /// A selected shelf reference, not another reply store. The normal reader
 /// rechecks identity/access before its bounded answer accompanies a follow-up.

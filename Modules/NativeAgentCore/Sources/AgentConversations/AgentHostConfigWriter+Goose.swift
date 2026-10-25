@@ -1,5 +1,6 @@
 import Foundation
 import Yams
+// Blueprint: | `AgentHostConfigWriter+Goose.swift` | `AgentHostConfigWriter`: `writeGooseEntry`, `removeGooseEntry` |
 
 extension AgentHostConfigWriter {
     static func writeGooseEntry(path: String, name: String, entryJSON: String, backupRecordURL: URL) throws -> Outcome {

@@ -6,6 +6,7 @@ import ApplicationServices
 #endif
 #if canImport(AppKit)
 import AppKit
+// Blueprint: | `MacAccessibilityReader.swift` | Shared AX walker and node/depth/time budgets; package-native window/subtree and direct-child reads use that walker with topology-only snapshots and optional caller-scoped descent, report incomplete reads with search purpose, visited count, unseen floor and reasons, and never collect credential values; passive native reads share its deadline and cancellation; native reply text requires readable static AXValues and checked topology subroles; `SystemMacAXElementSource` owns exact native window inventory and transient menu roots |
 #endif
 
 // MARK: - The perception organ (W1, READ-ONLY)
@@ -746,6 +747,99 @@ public final class MacWorkContinuation: @unchecked Sendable, Equatable {
 }
 
 public enum MacAccessibilityReader {
+    private actor NativeReads {
+        func read<Value: Sendable>(_ body: @Sendable () throws -> Value) throws -> Value {
+            try Task.checkCancellation()
+            return try MacAccessibilityReader.withReadBudget(body)
+        }
+    }
+    private static let nativeReads = NativeReads()
+
+    package static func withReadBudget<Value>(_ body: () throws -> Value) rethrows -> Value {
+        try MacAXLimits.$readDeadline.withValue(
+            MacAXLimits.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds), operation: body)
+    }
+    /// Passive native clients share the hands' deadline and cancellation.
+    /// Only Sendable results leave it; native AX handles stay in the read.
+    package static func read<Value: Sendable>(_ body: @escaping @Sendable () throws -> Value) async throws -> Value {
+        try Task.checkCancellation()
+        let value = try await nativeReads.read(body)
+        try Task.checkCancellation()
+        return value
+    }
+
+    #if canImport(ApplicationServices) && os(macOS)
+    /// Render the shared walk's exact child paths in block/inline reading order.
+    /// Only static text values are read; fields never enter this text channel.
+    package static func nativeText(in root: AXUIElement) throws -> String {
+        try withReadBudget {
+            let (source, snapshot) = try nativeSnapshot(in: root, searching: "the desktop reply text")
+            let children = Dictionary(grouping: snapshot.nodes.filter { !$0.path.isEmpty }, by: { Array($0.path.dropLast()) })
+            var rendered: [[Int]: String] = [:]
+            for node in snapshot.nodes.reversed() {
+                var text = "", previousInline = false
+                if node.attributes.role == kAXStaticTextRole, let ref = node.element, let element = source.element(ref) {
+                    // A failed read throws; an empty static text is just empty.
+                    text = try MacAXAttributeRead.checkedText(element, kAXValueAttribute)
+                } else {
+                    for child in children[node.path] ?? [] {
+                        guard let part = rendered[child.path], !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                        let inline = child.attributes.subrole == "AXCodeStyleGroup" || child.attributes.role == "AXLink"
+                        if text.isEmpty || inline || previousInline || text.last?.isWhitespace == true
+                            || part.first.map({ $0.isWhitespace || $0.isPunctuation }) == true { text += part }
+                        else { text += "\n" + part }
+                        previousInline = inline
+                    }
+                }
+                rendered[node.path] = text
+            }
+            try Task.checkCancellation()
+            guard MacAXLimits.readDeadline.map({ Date() < $0 }) == true else {
+                throw NativeReadFailure(detail: "Accessibility search for the desktop reply text exhausted the shared reader time budget while rendering \(snapshot.nodes.count) elements. Narrow the search to the intended message before continuing.")
+            }
+            return rendered[[]] ?? ""
+        }
+    }
+
+    package struct NativeReadFailure: Error, LocalizedError {
+        package let detail: String
+        package var errorDescription: String? { detail }
+    }
+
+    /// A native window/subtree read through the ordinary hands walker. Read
+    /// topology only: credential values are never collected into a snapshot.
+    /// A caller may exclude a known unrelated region (such as a chat log).
+    package static func elements(in root: AXUIElement, searching: String,
+        descendInto: @escaping (AXUIElement) -> Bool = { _ in true }) throws -> [AXUIElement] {
+        let (source, snapshot) = try nativeSnapshot(in: root, searching: searching, descendInto: descendInto)
+        return snapshot.nodes.compactMap { $0.element.flatMap(source.element) }
+    }
+
+    private static func nativeSnapshot(in root: AXUIElement, searching: String,
+        descendInto: @escaping (AXUIElement) -> Bool = { _ in true }) throws -> (SystemMacAXElementSource, MacAXTreeSnapshot) {
+        try Task.checkCancellation()
+        let deadline = MacAXLimits.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds)
+        return try MacAXLimits.$readDeadline.withValue(deadline) {
+            let source = SystemMacAXElementSource()
+            let snapshot = walk(source: source, root: source.mint(root), limits: .deepPage,
+                read: source.topologyAttributes, deadline: deadline, descendInto: { ref in
+                    source.element(ref).map(descendInto) ?? false
+                })
+            try Task.checkCancellation()
+            guard !snapshot.truncated else {
+                let budget = snapshot.truncationReasons.contains { ["node_cap", "depth_cap", "time_budget"].contains($0) }
+                throw NativeReadFailure(detail: "Accessibility search for \(searching) \(budget ? "exhausted the shared reader budget" : "was incomplete"): read \(snapshot.nodes.count) elements; at least \(snapshot.skippedAtLeast) elements unexamined; reasons: \(snapshot.truncationReasons.joined(separator: ", ")). Limits: \(MacAXLimits.deepPage.maxNodes) elements, depth \(MacAXLimits.deepPage.maxDepth), \(MacAXLimits.readSeconds) seconds. \(budget ? "Narrow the search to the intended section before continuing." : "Check the app's Accessibility tree before continuing.")")
+            }
+            return (source, snapshot)
+        }
+    }
+
+    /// Direct children still need a complete bounded read: an AX failure or a
+    /// child-array cap cannot masquerade as an empty or shorter conversation.
+    package static func childElements(in root: AXUIElement, searching: String) throws -> [AXUIElement] {
+        Array(try elements(in: root, searching: searching, descendInto: { CFEqual($0, root) }).dropFirst())
+    }
+    #endif
     public static func captureContinuation(pid: Int32?, taskReference: String) -> MacWorkContinuation {
         #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
         return MacAXExecutionLane.sync {
@@ -781,7 +875,8 @@ public enum MacAccessibilityReader {
         complete: Bool = false,
         read: ((MacAXElementRef) -> MacAXAttributes?)? = nil,
         deadline: Date? = nil,
-        stopAtCut: Bool = false
+        stopAtCut: Bool = false,
+        descendInto: ((MacAXElementRef) -> Bool)? = nil
     ) -> MacAXTreeSnapshot {
         let limits = complete ? MacAXLimits.deepPage : limits
         let deadline = deadline ?? MacAXLimits.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds)
@@ -824,6 +919,8 @@ public enum MacAccessibilityReader {
             // never spends its budget there (the `menu` organ reads it).
             if attributes.role == "AXMenuBar", !item.path.isEmpty { continue }
             nodes.append(MacAXNode(attributes: attributes, path: item.path, element: item.ref))
+
+            if descendInto?(item.ref) == false { continue }
 
             // An element whose children the app did not report (an AX error
             // or the per-message timeout) is a cut, never an empty subtree.
@@ -1199,7 +1296,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             })
     }
 
-    private func mint(_ element: AXUIElement) -> MacAXElementRef {
+    fileprivate func mint(_ element: AXUIElement) -> MacAXElementRef {
         let element = prepareForRead(element)
         lock.lock()
         defer { lock.unlock() }
@@ -1208,7 +1305,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return MacAXElementRef(id: nextID)
     }
 
-    func element(_ ref: MacAXElementRef) -> AXUIElement? {
+    package func element(_ ref: MacAXElementRef) -> AXUIElement? {
         lock.lock()
         defer { lock.unlock() }
         return table[ref.id]
@@ -1237,6 +1334,26 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         // kAXTrustedCheckOptionPrompt: true) — the TCC grant is User's click in
         // System Settings; code never nags or toggles it.
         AXIsProcessTrusted()
+    }
+
+    package func nativeApplication(pid: Int32) -> AXUIElement? {
+        guard pid != getpid(), isTrusted() else { return nil }
+        return AXUIElementCreateApplication(pid)
+    }
+
+    /// Exact native inventory: a failed AXWindows read is never zero windows.
+    package func nativeWindows(pid: Int32) throws -> [AXUIElement] {
+        try MacAccessibilityReader.withReadBudget {
+            try Task.checkCancellation()
+            let windows = nativeApplication(pid: pid).flatMap {
+                MacAXAttributeRead.copyRaw($0, kAXWindowsAttribute) as? [AXUIElement]
+            }
+            try Task.checkCancellation()
+            guard let windows else {
+                throw MacAccessibilityReader.NativeReadFailure(detail: "The app's AXWindows inventory could not be read. Check NativeAgent Accessibility access before continuing.")
+            }
+            return windows
+        }
     }
 
     public func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32) -> Bool {
@@ -1453,7 +1570,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     /// wrong app onto a correct background read.
     public func appInfo(pid: Int32) -> MacAXAppInfo? {
         #if canImport(AppKit)
-        guard let app = NSRunningApplication(processIdentifier: pid) else { return nil }
+        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return nil }
         return MacAXAppInfo(
             name: app.localizedName ?? app.bundleIdentifier ?? "unknown",
             bundleIdentifier: app.bundleIdentifier,
@@ -1553,12 +1670,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     public func attributes(of ref: MacAXElementRef) -> MacAXAttributes? {
         guard let element = element(ref) else { return nil }
         guard let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
-        // Modifier-only alternates point to the item shown without modifiers.
-        let primaryMenuItem = role == "AXMenuItem"
-            ? MacAXAttributeRead.copyElement(element, kAXMenuItemPrimaryUIElementAttribute) : nil
-        let isHiddenMenuItem = (role == "AXMenuItem" || role == "AXMenuBarItem")
-            && (MacAXAttributeRead.copyBool(element, kAXHiddenAttribute) == true
-                || primaryMenuItem.map { !CFEqual($0, element) } == true)
+        let isHiddenMenuItem = hiddenMenuItem(element, role: role)
         let menuCommandKey: String? = role == "AXMenuItem" ? {
             let identifier = MacAXAttributeRead.copyString(element, kAXIdentifierAttribute) ?? ""
             let key = MacAXAttributeRead.copyString(element, kAXMenuItemCmdCharAttribute) ?? ""
@@ -1599,6 +1711,24 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             isHiddenMenuItem: isHiddenMenuItem,
             menuCommandKey: menuCommandKey
         )
+    }
+
+    /// Native navigation needs the same traversal metadata, without fetching
+    /// any field value. Hidden modifier alternates have one owner here.
+    fileprivate func topologyAttributes(of ref: MacAXElementRef) -> MacAXAttributes? {
+        guard let element = element(ref),
+              let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
+        return MacAXAttributes(role: role, subrole: MacAXAttributeRead.copyString(element, kAXSubroleAttribute),
+            isHiddenMenuItem: hiddenMenuItem(element, role: role))
+    }
+
+    private func hiddenMenuItem(_ element: AXUIElement, role: String) -> Bool {
+        guard role == "AXMenuItem" || role == "AXMenuBarItem" else { return false }
+        // Modifier-only alternates point to the item shown without modifiers.
+        let primary = role == "AXMenuItem"
+            ? MacAXAttributeRead.copyElement(element, kAXMenuItemPrimaryUIElementAttribute) : nil
+        return MacAXAttributeRead.copyBool(element, kAXHiddenAttribute) == true
+            || primary.map { !CFEqual($0, element) } == true
     }
 
     public func maskingAttributes(of ref: MacAXElementRef) -> MacAXAttributes? {

@@ -1,5 +1,7 @@
 import BackgroundWork
 import ApprovalTransactions
+
+// Blueprint: | `InboxView.swift` | `InboxView`: canonical inbox lanes, digest groups, details and single-flight row actions; unknown sources stay visible |
 // PATCH-2026-05-07: proactive-inbox-1 InboxView — proactive inbox card strip
 import SwiftUI
 import Observation
@@ -63,14 +65,6 @@ extension TriggerConfig: @retroactive Identifiable {
             .trimmingCharacters(in: .whitespaces)
         guard let first = words.first else { return id }
         return String(first).uppercased() + words.dropFirst()
-    }
-
-    var systemImage: String {
-        switch name {
-        case "idle_checkin":     return "clock"
-        case "morning_brief":    return "sun.horizon"
-        default:                 return "bolt"
-        }
     }
 }
 
@@ -442,151 +436,6 @@ enum InboxLanePresentation {
     }
 }
 
-/// `engine.inbox.items` is a shared snapshot for badges and compact surfaces;
-/// the mounted Inbox also owns an action-time copy. A confirmed reload can
-/// remove a card before a stale shared snapshot arrives, so that old snapshot
-/// must not put the resolved card back on screen.
-enum InboxAppModelMirror {
-    struct Snapshot: Equatable {
-        let items: [InboxItemRecord]
-        let locallyResolvedIDs: Set<String>
-    }
-
-    /// A successful Inbox read is authoritative. IDs present before the read
-    /// but absent from its result were resolved durably and become tombstones
-    /// for later stale AppModel mirror copies.
-    static func successfulReload(
-        localItems: [InboxItemRecord],
-        reloadedItems: [InboxItemRecord],
-        locallyResolvedIDs: Set<String>
-    ) -> Snapshot {
-        let localIDs = Set(localItems.map(\.id))
-        let reloadedIDs = Set(reloadedItems.map(\.id))
-        let resolved = locallyResolvedIDs.union(localIDs.subtracting(reloadedIDs))
-        return Snapshot(
-            items: reloadedItems.filter { !resolved.contains($0.id) },
-            locallyResolvedIDs: resolved
-        )
-    }
-
-    /// The shared model is allowed to report a genuine empty inbox. The state
-    /// owner equality-gates repeated empty copies, while resolved IDs cannot
-    /// be resurrected by a stale mirror snapshot.
-    static func modelUpdate(
-        modelItems: [InboxItemRecord],
-        locallyResolvedIDs: Set<String>
-    ) -> Snapshot {
-        Snapshot(
-            items: modelItems.filter { !locallyResolvedIDs.contains($0.id) },
-            locallyResolvedIDs: locallyResolvedIDs
-        )
-    }
-}
-
-/// Visible wording for a failed inbox read, one line: what happened and what
-/// to do. When a refresh fails over already rendered cards, say so plainly:
-/// those cards are last-known data, not proof the inbox is current. The
-/// reader's own error text goes to the log, not the page.
-enum InboxLoadFailurePresentation {
-    static func banner(error: any Error, retainedItemCount: Int) -> String {
-        ModuleLog.app("%@", "[inbox] read failed: \(error.localizedDescription)")
-        return retainedItemCount > 0
-            ? "Couldn't refresh, so these notes may be out of date. Try Refresh."
-            : "Couldn't read your notes. Try Refresh."
-    }
-}
-
-/// The InboxView's actual refresh boundary. Keeping records and failure state
-/// together prevents a failed refresh from leaving last-known rows looking
-/// current, and a successful retry clears that adverse state before it
-/// publishes replacement rows.
-@MainActor @Observable
-final class InboxLoadState {
-    enum ContentPresentation: Equatable {
-        case loading
-        case unavailable
-        case empty
-        case content
-    }
-
-    private(set) var items: [InboxItemRecord]
-    private(set) var errorText: String?
-    private(set) var locallyResolvedIDs: Set<String> = []
-    private(set) var hasLoadedSnapshot = false
-    private(set) var isLoading = false
-    @ObservationIgnored private var refreshGeneration: UInt64 = 0
-
-    init(items: [InboxItemRecord] = []) {
-        self.items = items
-        hasLoadedSnapshot = !items.isEmpty
-    }
-
-    func contentPresentation(hasVisibleItems: Bool) -> ContentPresentation {
-        if hasVisibleItems { return .content }
-        if errorText != nil { return .unavailable }
-        return hasLoadedSnapshot ? .empty : .loading
-    }
-
-    @discardableResult
-    func reload(
-        read: @escaping @MainActor () async throws -> [InboxItemRecord]
-    ) async -> Bool {
-        refreshGeneration &+= 1
-        let generation = refreshGeneration
-        let priorItems = items
-        isLoading = true
-        defer {
-            if refreshGeneration == generation { isLoading = false }
-        }
-        do {
-            let loaded = try await read()
-            guard !Task.isCancelled, refreshGeneration == generation else { return false }
-            _ = adopt(InboxAppModelMirror.successfulReload(
-                localItems: priorItems,
-                reloadedItems: loaded,
-                locallyResolvedIDs: locallyResolvedIDs
-            ))
-            hasLoadedSnapshot = true
-            errorText = nil
-            return true
-        } catch {
-            guard !Task.isCancelled, refreshGeneration == generation else { return false }
-            errorText = InboxLoadFailurePresentation.banner(
-                error: error,
-                retainedItemCount: items.count)
-            return false
-        }
-    }
-
-    @discardableResult
-    func replaceItems(_ latest: [InboxItemRecord]) -> Bool {
-        adopt(InboxAppModelMirror.modelUpdate(
-            modelItems: latest,
-            locallyResolvedIDs: locallyResolvedIDs
-        ))
-    }
-
-    func markRead(_ id: String) {
-        if let idx = items.firstIndex(where: { $0.id == id }), items[idx].isUnread {
-            items[idx].status = "read"
-        }
-    }
-
-    @discardableResult
-    private func adopt(_ snapshot: InboxAppModelMirror.Snapshot) -> Bool {
-        var changed = false
-        if locallyResolvedIDs != snapshot.locallyResolvedIDs {
-            locallyResolvedIDs = snapshot.locallyResolvedIDs
-            changed = true
-        }
-        if items != snapshot.items {
-            items = snapshot.items
-            changed = true
-        }
-        return changed
-    }
-}
-
 /// The two locations that talk about another inbox lane must use one bounded
 /// population: visible unread cards. This is a rendered truth contract, not a
 /// second inbox state owner.
@@ -597,7 +446,7 @@ struct InboxView: View {
 
     @Environment(AppModel.self) private var appModel
 
-    @State private var inboxLoadState = InboxLoadState()
+    private var inbox: InboxFacade { appModel.engine.inbox }
     @State private var showAll = false
     @State private var groupFilter: InboxRelatedGroup?
     // G12: defaults to the human lane. The operations feed is one click away,
@@ -623,14 +472,14 @@ struct InboxView: View {
                 .labelsHidden()
                 .fixedSize()
                 Spacer(minLength: 0)
-                if inboxLoadState.isLoading {
+                if inbox.isLoading {
                     ProgressView().controlSize(.small)
                 }
                 Toggle("Show archived", isOn: $showAll)
                     .toggleStyle(.checkbox)
                     .help("Also show notes you archived or dismissed")
                 Button("Refresh") { Task { await load() } }
-                    .disabled(inboxLoadState.isLoading)
+                    .disabled(inbox.isLoading)
             }
             .font(ShellType.label)
             .padding(.horizontal, NativeAgentSpacing.xl)
@@ -645,7 +494,7 @@ struct InboxView: View {
                     }
                     // Lane-aware: an empty "For you" lane with a full System
                     // lane says which lane is empty and points at the other.
-                    switch inboxLoadState.contentPresentation(hasVisibleItems: !prioritySections.isEmpty) {
+                    switch inbox.contentPresentation(hasVisibleItems: !prioritySections.isEmpty) {
                     case .loading:
                         AdvancedWaitingLine("Reading your notes…")
                     case .unavailable:
@@ -661,7 +510,7 @@ struct InboxView: View {
                             detail: emptyStateDetail
                         )
                     case .content:
-                        if let err = inboxLoadState.errorText {
+                        if let err = inbox.refreshErrorText {
                             Text(err)
                                 .font(ShellType.label)
                                 .foregroundStyle(NativeAgentShell.trouble)
@@ -682,9 +531,6 @@ struct InboxView: View {
             }
         }
         .task { await load() }
-        .onChange(of: appModel.engine.inbox.items) { _, latest in
-            inboxLoadState.replaceItems(latest)
-        }
     }
 
     private func groupFilterRow(_ group: InboxRelatedGroup) -> some View {
@@ -719,7 +565,7 @@ struct InboxView: View {
         InboxListRow(
             item: item,
             waiting: waiting,
-            allItems: inboxLoadState.items,
+            allItems: inbox.items,
             dataRootOverride: appModel.dataRootOverride,
             onAction: { Task { await loadAndSync() } },
             onMarkedRead: { markRead(item.id) },
@@ -731,7 +577,7 @@ struct InboxView: View {
 
     private var displayItems: [InboxItemRecord] {
         InboxReviewGroupSelection.displayItems(
-            items: inboxLoadState.items,
+            items: inbox.items,
             lane: lane,
             showAll: showAll,
             groupFilter: groupFilter
@@ -743,7 +589,7 @@ struct InboxView: View {
     private var visibleEverywhere: [InboxItemRecord] {
         InboxLanePresentation.pickerLanes.flatMap {
             InboxReviewGroupSelection.displayItems(
-                items: inboxLoadState.items,
+                items: inbox.items,
                 lane: $0,
                 showAll: showAll,
                 groupFilter: groupFilter
@@ -757,7 +603,7 @@ struct InboxView: View {
 
     private var emptyStateDetail: String {
         let other: InboxLane = lane == .forYou ? .system : .forYou
-        let otherCount = InboxLanePresentation.unreadVisibleCount(in: other, items: inboxLoadState.items)
+        let otherCount = InboxLanePresentation.unreadVisibleCount(in: other, items: inbox.items)
         if otherCount > 0 {
             return "\(otherCount) unread \(otherCount == 1 ? "note is" : "notes are") in \(other.title)."
         }
@@ -767,30 +613,22 @@ struct InboxView: View {
     /// Unread count per lane, over the same visibility rules the list uses —
     /// a dismissed card must not inflate the segment it sits behind.
     private func laneLabel(_ candidate: InboxLane) -> String {
-        let unread = InboxLanePresentation.unreadVisibleCount(in: candidate, items: inboxLoadState.items)
+        let unread = InboxLanePresentation.unreadVisibleCount(in: candidate, items: inbox.items)
         return unread > 0 ? "\(candidate.title) (\(unread) unread)" : candidate.title
     }
 
     func load() async {
-        let loaded = await inboxLoadState.reload {
-            try await appModel.engine.inbox.list()
-        }
-        if loaded && appModel.engine.inbox.items != inboxLoadState.items {
-            appModel.engine.inbox.items = inboxLoadState.items
-        }
+        do { _ = try await inbox.list() }
+        catch { ModuleLog.app("%@", "[inbox] read failed: \(error.localizedDescription)") }
     }
 
     func loadAndSync() async {
         await load()
-        await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots()
+        if let sync = appModel.engine.deviceSync { await sync.engine.writeSnapshots() }
     }
 
-    // ui-honesty 2026-06-10: after the detail sheet's "read" action succeeds,
-    // patch the local copy (and the appModel mirror so badges elsewhere agree)
-    // — the unread dot/bold clear immediately without a full reload.
     private func markRead(_ id: String) {
-        inboxLoadState.markRead(id)
-        appModel.engine.inbox.markRead(id)
+        inbox.markRead(id)
     }
 }
 
@@ -849,13 +687,14 @@ enum InboxRowActionCompletion {
 /// One note on the Inbox page: an alive card, with the soft teal top only
 /// when it waits on the person. Tapping it opens the detail sheet.
 struct InboxListRow: View {
+    @Environment(AppModel.self) private var appModel
     let item: InboxItemRecord
     var waiting = false
     let allItems: [InboxItemRecord]
     let dataRootOverride: URL?
     let onAction: () -> Void
     // ui-honesty 2026-06-10: fired after a successful "read" action so the
-    // parent can patch the local item instead of doing a full reload.
+    // parent can publish the committed read through the shared inbox owner.
     let onMarkedRead: () -> Void
     let onSelectGroup: (InboxRelatedGroup) -> Void
 
@@ -972,7 +811,7 @@ struct InboxListRow: View {
     private func performAction(_ actionID: String) async -> InboxRowActionFlight.Outcome {
         let outcome = await actionFlight.perform {
             try await InboxCardActions.perform(item.id, action: actionID,
-                dataRootOverride: dataRootOverride, effects: AppInboxCardActionEffects())
+                dataRootOverride: dataRootOverride, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
         }
         return InboxRowActionCompletion.apply(
             outcome,

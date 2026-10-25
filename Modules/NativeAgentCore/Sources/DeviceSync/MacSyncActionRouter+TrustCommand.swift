@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentShared
 import TrustCenter
 import MacControl
+// Blueprint: | `MacSyncActionRouter+TrustCommand.swift` | `MobileTrustAction`: checked trust writes |
 
 extension MobileTrustAction {
     public func apply(

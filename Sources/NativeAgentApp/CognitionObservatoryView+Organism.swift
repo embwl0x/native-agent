@@ -1,4 +1,6 @@
 import Foundation
+
+// Blueprint: | `CognitionObservatoryView+Organism.swift` | Observatory organism panel: read-only kernel rows distinguish off, empty, stale and malformed readings |
 // Move-only extraction (tightness Wave C) from CognitionObservatoryView.swift
 
 import Cognition

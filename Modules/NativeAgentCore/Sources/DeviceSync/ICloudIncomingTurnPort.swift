@@ -1,12 +1,15 @@
 import Foundation
 import NativeAgentShared
-import ChatOrchestration
+import ChatTurnRuntime
+// Blueprint: | `ICloudIncomingTurnPort.swift` | Incoming phone turn port: resident chat, helper-owned reply and existing reply/progress publication |
 
 /// Delivery and Mac presentation for the incoming-turn interpreter. The port
 /// does not choose record fields, reply meaning, or input-consumption policy.
 @MainActor
 public protocol ICloudIncomingTurnPort: Sendable {
     func residentChatClient() -> SwiftNativeChatOrchestrationClient
+    func helperReply(message: String, sessionID: String, attachments: [NativeAgentShared.MultimodalAttachment], fileAccess: String,
+                     progress: ChatOrchestrationProgressHandler?) async throws -> ChatResponse
     func publishReply(text: String, sessionID: String?, correlationID: String,
                       metadata: [String: String], attachments: [NativeAgentShared.MultimodalAttachment]) async throws -> BridgeMessage
     func publishProgress(text: String, sessionID: String, correlationID: String,

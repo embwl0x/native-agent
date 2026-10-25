@@ -1,11 +1,12 @@
 import AppKit
 import ApplicationServices
-import ChatOrchestration
+import AgentConversations
 import MacControl
 import NativeAgentCore
 import PersistenceCore
 import ScreenCaptureKit
 import Vision
+// Blueprint: | `GrokDesktopReply.swift` | MacControl owns bounded native window/subtree reads and reply-text traversal; incomplete reads propagate to send and reply receipts; submission-owned shared desktop observation transfers once to its reply reader; a last non-answering reply must match across two idle AX reads at least 300ms apart, with one quiet-boundary read independent of notifications; the three-minute reporting deadline releases foreground ownership without claiming completion; no-notification interval observation ends at that deadline while supported events retain late-answer reach; reader settlement through `settle` saves the answer or partial with its actual read method/wake and releases observation and foreground once |
 
 /// Grok's answer to a desktop send, read back from the same chat it was pasted
 /// into, after the send has returned (the exchange waits; this settles it).
@@ -32,53 +33,56 @@ import Vision
     private struct Scan { let window: AXUIElement; let log: AXUIElement; let composer: AXUIElement?; let turns: [Turn]; let answering: Bool }
     private struct Read: Sendable { let turns: [Turn]; let answering: Bool }
 
-    private static func passiveRead(chat: String) async -> Read? {
-        try? await DesktopPeerReadLane.read {
-            scan(chat: chat).map { Read(turns: $0.turns, answering: $0.answering) }
+    private static func passiveRead(chat: String) async throws -> Read? {
+        try await MacAccessibilityReader.read {
+            try scan(chat: chat).map { Read(turns: $0.turns, answering: $0.answering) }
         }
     }
 
     /// The open chat's turns, oldest first; nil when `chat` is not the open
     /// chat or its transcript can't be read. Never descends into the sidebar.
-    nonisolated private static func scan(chat: String) -> Scan? {
-        // An unreadable event is evidence, not a setup action or a repeated log.
-        guard AXIsProcessTrusted(), let app = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first,
-              let windows = AX.attribute(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) as? [AXUIElement],
-              windows.count == 1, let window = windows.first else { return nil }
-        var queue = [window], log: AXUIElement?, composer: AXUIElement?, current = false, answering = false, visited = 0
-        while !queue.isEmpty, visited < 600 {
-            let node = queue.removeFirst(); visited += 1
-            let role = AX.string(node, kAXRoleAttribute), subrole = AX.string(node, kAXSubroleAttribute)
-            if role == "AXHeading", AX.string(node, kAXDescriptionAttribute) == chat || AX.string(node, kAXTitleAttribute) == chat { current = true }
-            if role == kAXButtonRole, [kAXTitleAttribute, kAXDescriptionAttribute].contains(where: { AX.string(node, $0).hasPrefix("Stop") }) { answering = true }
-            if role == kAXTextAreaRole, AX.string(node, kAXDescriptionAttribute).lowercased() == "prompt" { composer = node }
-            if subrole == "AXApplicationLog" { log = node; continue }
-            if subrole == "AXLandmarkComplementary" { continue }
-            queue.append(contentsOf: children(node))
-        }
-        guard current, let log else { return nil }
-        let turns = children(log).flatMap { [$0] + children($0) }
-            .filter { AX.string($0, kAXSubroleAttribute) == "AXDocumentArticle" }
-            .compactMap { article in
-                guard let body = AX.nodes(article).first(where: { AX.string($0, kAXSubroleAttribute) == "AXApplicationGroup" }) else {
-                    return Turn(user: false, text: "") // an approval or tool card: activity, no words
-                }
-                let label = AX.string(body, kAXDescriptionAttribute)
-                guard label == "Your message" || label.hasSuffix(" message") else { return Turn(user: false, text: "") }
-                return Turn(user: label == "Your message", text: render(body))
+    nonisolated private static func scan(chat: String) throws -> Scan? {
+        try MacAccessibilityReader.withReadBudget {
+            // An unreadable event is evidence, not a setup action or a repeated log.
+            guard SystemMacAXElementSource().isTrusted(), let app = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first else { return nil }
+            let windows = try SystemMacAXElementSource().nativeWindows(pid: app.processIdentifier)
+            guard windows.count == 1, let window = windows.first else { return nil }
+            var log: AXUIElement?, composer: AXUIElement?, current = false, answering = false
+            let tree = try MacAccessibilityReader.elements(in: window, searching: "Grok Bot's current chat and transcript") {
+                !["AXApplicationLog", "AXLandmarkComplementary"].contains(MacAXAttributeRead.text($0, kAXSubroleAttribute))
             }
-        return Scan(window: window, log: log, composer: composer, turns: turns, answering: answering)
+            for node in tree {
+                let role = try MacAXAttributeRead.checkedText(node, kAXRoleAttribute), subrole = try MacAXAttributeRead.checkedText(node, kAXSubroleAttribute)
+                if role == "AXHeading", try MacAXAttributeRead.checkedText(node, kAXDescriptionAttribute) == chat || MacAXAttributeRead.checkedText(node, kAXTitleAttribute) == chat { current = true }
+                if role == kAXButtonRole, try [kAXTitleAttribute, kAXDescriptionAttribute].contains(where: { try MacAXAttributeRead.checkedText(node, $0).hasPrefix("Stop") }) { answering = true }
+                if role == kAXTextAreaRole, try MacAXAttributeRead.checkedText(node, kAXDescriptionAttribute).lowercased() == "prompt" { composer = node }
+                if subrole == "AXApplicationLog" { log = node }
+            }
+            guard current, let log else { return nil }
+            let turns = try MacAccessibilityReader.childElements(in: log, searching: "Grok Bot's transcript rows")
+                .flatMap { [$0] + (try MacAccessibilityReader.childElements(in: $0, searching: "Grok Bot's transcript articles")) }
+                .filter { try MacAXAttributeRead.checkedText($0, kAXSubroleAttribute) == "AXDocumentArticle" }
+                .map { article in
+                    guard let body = try MacAccessibilityReader.elements(in: article, searching: "Grok Bot's message body").first(where: { try MacAXAttributeRead.checkedText($0, kAXSubroleAttribute) == "AXApplicationGroup" }) else {
+                        return Turn(user: false, text: "") // an approval or tool card: activity, no words
+                    }
+                    let label = try MacAXAttributeRead.checkedText(body, kAXDescriptionAttribute)
+                    guard label == "Your message" || label.hasSuffix(" message") else { return Turn(user: false, text: "") }
+                    return Turn(user: label == "Your message", text: try MacAccessibilityReader.nativeText(in: body))
+                }
+            return Scan(window: window, log: log, composer: composer, turns: turns, answering: answering)
+        }
     }
 
     /// At send time: user turns already carrying exactly this text, and the
     /// transcript's place in the window (above the message box).
-    static func outgoingOccurrences(_ message: String, chat: String) -> Int? {
+    static func outgoingOccurrences(_ message: String, chat: String) throws -> Int? {
         func normalized(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
-        return scan(chat: chat).map { $0.turns.filter { $0.user && normalized($0.text) == normalized(message) }.count }
+        return try scan(chat: chat).map { $0.turns.filter { $0.user && normalized($0.text) == normalized(message) }.count }
     }
 
-    static func layout(_ message: String, chat: String) -> Layout? {
-        guard let scan = scan(chat: chat), let window = frame(scan.window), var transcript = frame(scan.log),
+    static func layout(_ message: String, chat: String) throws -> Layout? {
+        guard let scan = try scan(chat: chat), let window = MacAXAttributeRead.frame(scan.window), var transcript = MacAXAttributeRead.frame(scan.log),
               let pid = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first?.processIdentifier else { return nil }
         // The window the message went into, by its id: the passive read looks at that one only.
         let ids = ((CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? []).compactMap { info -> CGWindowID? in
@@ -89,7 +93,7 @@ import Vision
             return info[kCGWindowNumber as String] as? CGWindowID
         }
         guard ids.count == 1 else { return nil }
-        if let composer = scan.composer.flatMap(frame), composer.minY > transcript.minY {
+        if let composer = scan.composer.flatMap(MacAXAttributeRead.frame), composer.minY > transcript.minY {
             transcript.size.height = min(transcript.height, composer.minY - transcript.minY)
         }
         return Layout(baseline: scan.turns.filter { $0.user && same($0.text, message) }.count,
@@ -189,68 +193,87 @@ import Vision
         var outcome: Outcome = .unanswered(partial: "", blocker: nil)
         var firstActivity: Date?
         var timedOut = false
+        var previous: NSRunningApplication?
+        var driver: MacDriverBinding?
+        let deadline = Date().addingTimeInterval(replyTimeout)
+        var readReceipt: JSONValue?
+
+        func releaseForeground() async {
+            let held = previous
+            previous = nil
+            let binding = driver
+            driver = nil
+            await MacDriverContext.$binding.withValue(binding) { await AX.restoreForeground(held) }
+        }
     }
 
     private struct PendingWatch {
         let observation: Observation
-        let events: MacAppSourceEvents
-        let task: Task<Outcome, Never>
-        let previous: NSRunningApplication?
+        let events: DesktopRouteObservation
+        let message: String
+        let layout: Layout
     }
     private static var pendingWatches: [String: PendingWatch] = [:]
 
     /// Subscribe at submission, while Grok still exposes its answering control.
-    /// Keep that foreground until completion or the existing reporting deadline;
+    /// Keep that foreground until completion, retirement or the existing reporting deadline;
     /// cleanup never changes focus after the person has switched applications.
     static func start(message: String, chat: String, layout: Layout, previous: NSRunningApplication?) throws -> String {
-        let events = try MacAppSourceEvents(bundleID: GrokBotRoute.bundleID)
+        let events = try DesktopRouteObservation(bundleID: GrokBotRoute.bundleID)
         let observation = Observation()
-        let live = AgentConversationLiveContext.target
-        let task = Task { @MainActor in
-            if let live { await AgentConversationLiveHub.shared.begin(live, lane: "desktop") }
-            return await watch(message: message, chat: chat, layout: layout, live: live,
-                               observation: observation, events: events)
-        }
+        observation.previous = previous
+        observation.driver = MacDriverContext.binding?.settlementBinding()
         let id = UUID().uuidString
-        pendingWatches[id] = PendingWatch(observation: observation, events: events, task: task, previous: previous)
+        pendingWatches[id] = PendingWatch(observation: observation, events: events, message: message, layout: layout)
         return id
     }
 
     static func abandon(_ id: String?) async {
         guard let id, let pending = pendingWatches.removeValue(forKey: id) else { return }
-        pending.task.cancel()
-        pending.events.cancel()
-        await AX.restoreForeground(pending.previous)
+        await settle { @MainActor in
+            pending.events.stop()
+            await pending.observation.releaseForeground()
+        }
     }
 
-    /// Only Grok's accessibility notifications trigger reads. Screen text can
-    /// report partial activity while Grok is behind other windows, but only an
-    /// last reply stable across two idle scans proves a finished answer.
+    /// Read after registration and on shared desktop wakes. No-notification
+    /// apps are read only within the reply deadline. An idle AX answer arms
+    /// one 300ms quiet read, so a second notification is never required to
+    /// verify the same text with the answering control absent on both reads.
     static func watch(message: String, chat: String, layout: Layout, live: AgentConversationLiveTarget?,
-                      observation: Observation, events: MacAppSourceEvents) async -> Outcome {
-        defer { events.cancel() }
+                      observation: Observation, events: DesktopRouteObservation) async -> Outcome {
         let hub = AgentConversationLiveHub.shared
         var text = ""
         var idleText: String?
+        var idleSince: Date?
         var awaited = layout.baseline == 0
         do {
-            for try await _ in events.stream {
+            while true {
                 guard !Task.isCancelled else { return observation.outcome }
                 var reply: (text: String, active: Bool)?
+                var readBy: String?
                 var blocker: String?
                 var completed = false
                 let previousIdle = idleText
+                let previousIdleSince = idleSince
                 idleText = nil
+                idleSince = nil
                 if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == GrokBotRoute.bundleID {
-                    if let scan = await passiveRead(chat: chat), let found = axReply(scan, message: message, baseline: layout.baseline) {
+                    // A failed read is no evidence this tick (never completion); the deadline still ends the watch.
+                    if let scan = try? await passiveRead(chat: chat), let found = axReply(scan, message: message, baseline: layout.baseline) {
                         if found.last { awaited = true }
                         reply = (found.text, found.active)
+                        readBy = "accessibility"
                         if !found.last {
+                            observation.readReceipt = events.receipt(readBy: "accessibility")
                             observation.outcome = .unanswered(partial: found.text, blocker: "A later message followed this send before its reply completion was confirmed. Its visible text remains a partial reply; nothing was resent.")
                             return observation.outcome
                         }
-                        completed = !scan.answering && !found.text.isEmpty && previousIdle == found.text
-                        if !scan.answering { idleText = found.text }
+                        if !scan.answering {
+                            let since = previousIdle == found.text ? (previousIdleSince ?? Date()) : Date()
+                            idleText = found.text; idleSince = since
+                            completed = !found.text.isEmpty && previousIdle == found.text && Date().timeIntervalSince(since) >= 0.3
+                        }
                         if !scan.answering && !completed && !found.text.isEmpty {
                             blocker = "Grok's reply is visible, but it is not yet stable across two consecutive idle scans. The visible text is a partial reply, not a confirmed finished answer."
                         }
@@ -262,48 +285,50 @@ import Vision
                     case .lines(let lines):
                         if let seen = screenReply(lines, width: layout.transcript.width, message: message, seen: text), seen.last {
                             if seen.text.isEmpty { awaited = true }
-                            if awaited { reply = (seen.text, !seen.text.isEmpty) }
+                            if awaited { reply = (seen.text, !seen.text.isEmpty); readBy = "screen_text" }
                         }
-                        blocker = "Grok is behind other windows. Its visible text can be read on accessibility events, but the window's pixels do not prove that the answer is finished. Open this chat in Grok to observe its completion signal."
+                        blocker = "Grok is behind other windows. Its visible text can be read on desktop wakes, but the window's pixels do not prove that the answer is finished. Open this chat in Grok to observe its completion signal."
                     case .noPermission:
                         blocker = "Screen Recording is off for NativeAgent, so Grok's window could not be read while it was behind other windows. Grant NativeAgent Screen Recording in System Settings (Privacy & Security), or bring Grok to the front so its text can be read."
                     case .windowGone:
                         observation.outcome = .unanswered(partial: text, blocker: windowGone)
                         return observation.outcome
                     case .unreadable:
-                        blocker = "Grok's window text could not be read on this accessibility event. Open this chat in a single Grok window to observe its reply."
+                        blocker = "Grok's window text could not be read on this desktop wake. Open this chat in a single Grok window to observe its reply."
                     }
                 }
-                guard !Task.isCancelled else { return observation.outcome }
                 let changed = reply.map { $0.text != text } ?? false
                 let activity = reply?.active == true && observation.firstActivity == nil
                 if activity { observation.firstActivity = Date() }
-                if let reply { text = reply.text }
+                if let reply {
+                    text = reply.text
+                    if let readBy { observation.readReceipt = events.receipt(readBy: readBy) }
+                }
                 observation.outcome = completed ? .answered(text, at: Date(), by: "accessibility") : .unanswered(partial: text, blocker: blocker)
                 if !observation.timedOut {
                     if let live, activity { await hub.activity(live) }
+                    guard !Task.isCancelled else { return observation.outcome }
                     if let live, changed, !text.isEmpty { await hub.text(live, replace: text) }
                 }
                 if completed { return observation.outcome }
+                if events.pollingReason != nil, Date() >= observation.deadline {
+                    observation.outcome = .unanswered(partial: text, blocker: "Grok's reply was not confirmed within the three-minute observation deadline. The app supports no Accessibility change notifications; bounded interval reads have ended. Any answer stays in that chat; nothing was resent.")
+                    return observation.outcome
+                }
+                var boundary: Date? = Date() < observation.deadline ? observation.deadline : nil
+                if let idleSince, let idleText, !idleText.isEmpty {
+                    let quiet = idleSince.addingTimeInterval(0.3)
+                    boundary = min(boundary ?? quiet, quiet)
+                }
+                try await events.next(until: boundary)
             }
-            observation.outcome = .unanswered(partial: text, blocker: "Grok's accessibility reply observation ended before a finished answer was confirmed. Any answer stays in that chat; nothing was resent.")
         } catch {
-            observation.outcome = .unanswered(partial: text, blocker: "Grok's accessibility reply observation stopped: \(error.localizedDescription) Any answer stays in that chat; nothing was resent.")
+            observation.outcome = .unanswered(partial: text, blocker: "Grok's desktop reply observation stopped: \(error.localizedDescription) Any answer stays in that chat; nothing was resent.")
         }
         return observation.outcome
     }
 
     static let windowGone = "The Grok window this message went into was closed, minimized or moved to another Space, so its answer could not be read. Open that chat's window on this Space; any answer stays in that chat."
-
-    /// A desktop chat's answer, read after its send returned, lands on that
-    /// send's exchange: still the thread's current one, it is the result;
-    /// one the thread has moved past keeps it as its own reply. Either way it
-    /// reaches her as a reply (AgentConversationStore.noteReplies).
-    public static func land(_ receipt: [String: JSONValue], answer: String?, row: String, operation: String,
-                            firstActivity: Date? = nil, dataRoot: URL) throws {
-        try AgentConversationStore(dataRoot: dataRoot).settleExchange(id: row, exchange: operation,
-            reply: answer, receipt: .object(receipt), firstActivity: firstActivity)
-    }
 
     /// A verified desktop send to Grok returns at once as waiting; a tracked
     /// watch then settles that exact exchange with the answer and its timing.
@@ -324,79 +349,79 @@ import Vision
             fields["detail"] = .string("Pasted into \(place). Its answer is not watched on this path; it stays in that chat." + other)
             return .object(fields)
         }
-        fields["reply_deadline"] = .string(ISO8601DateFormatter().string(from: Date().addingTimeInterval(replyTimeout)))
+        guard let pending = pendingWatches.removeValue(forKey: watchID) else {
+            fields["status"] = .string("failed"); fields["terminal"] = .bool(true)
+            fields["detail"] = .string("Grok's reply observation was not retained. The message was sent; any answer stays in that chat.")
+            return .object(fields)
+        }
+        fields["reply_deadline"] = .string(ISO8601DateFormatter().string(from: pending.observation.deadline))
         let base = fields
         fields["status"] = .string("running")
-        fields["detail"] = .string("Pasted into \(place). Accessibility events watch its reply without bringing Grok forward. A confirmed finished answer lands on this exchange by itself; after three minutes, an unconfirmed reply is reported honestly and observation continues. Do not resend." + other)
-        AgentConversationWatches.begin(row: row, operation: operation)
-        func settle(_ outcome: Outcome, firstActivity: Date?, late: Bool) async -> JSONValue {
-            var settled = base
-            var answer: String?
+        fields["reply_observation"] = .string("running")
+        fields["detail"] = .string("Pasted into \(place). Its reply is watched in that same chat without bringing Grok forward. A confirmed finished answer lands on this exchange by itself. Do not resend." + other)
+        let ownership = UUID()
+        let events = pending.events
+        let follower = Task { @MainActor in
+            let observation = pending.observation
+            // One reporting deadline, never a read trigger. The same event
+            // subscription remains alive for an answer arriving after it.
+            let deadline = Task { @MainActor in
+                do { try await Task.sleep(for: .seconds(max(0, observation.deadline.timeIntervalSinceNow))) } catch { return }
+                observation.timedOut = true
+                await settle { @MainActor in await observation.releaseForeground() }
+            }
+            let outcome = await withTaskCancellationHandler {
+                await watch(message: pending.message, chat: chat, layout: pending.layout, live: live,
+                            observation: observation, events: events)
+            } onCancel: {
+                deadline.cancel()
+                Task { @MainActor in events.stop() }
+            }
+            deadline.cancel()
+            var terminal = base
+            var answer: String?, stop: String?
             switch outcome {
             case .answered(let reply, let at, let by):
                 let iso = ISO8601DateFormatter()
                 iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                 answer = reply
-                settled["status"] = .string("answered"); settled["completed"] = .bool(true)
-                settled["reply"] = .string(reply); settled["replied_at"] = .string(iso.string(from: at))
-                settled["read_by"] = .string(by); settled["untrusted_remote_data"] = .bool(true)
-                settled["detail"] = .string("Pasted into \(place), and read \(name)'s answer back from that same chat after its last message stayed unchanged across two consecutive idle scans." + other)
+                terminal["status"] = .string("answered")
+                terminal["reply"] = .string(reply); terminal["replied_at"] = .string(iso.string(from: at))
+                terminal["read_by"] = .string(by); terminal["untrusted_remote_data"] = .bool(true)
+                terminal["detail"] = .string("Pasted into \(place), and read \(name)'s answer back from that same chat after its last message stayed unchanged across two idle Accessibility reads at least 300 ms apart, with no answering control present." + other)
             case .unanswered(let partial, let blocker):
-                settled["status"] = .string("no_reply")
-                settled["detail"] = .string("Pasted into \(place), but no finished answer was confirmed. "
-                    + (blocker ?? "No reply completion signal has been observed.") + " Nothing was resent; "
-                    + "any answer stays in that chat" + (late ? "; accessibility observation continues, and a confirmed answer lands on this exchange whenever it comes." : ".") + other)
-                if let blocker { settled["blocker"] = .string(blocker) }
-                if !partial.isEmpty { settled["partial_reply"] = .string(String(partial.prefix(2000))); settled["untrusted_remote_data"] = .bool(true) }
+                terminal["status"] = .string("no_reply")
+                if Task.isCancelled { stop = "Local reply observation stopped. The message was sent to \(place); any answer stays in that chat." }
+                terminal["detail"] = .string((stop ?? "Pasted into \(place), but no finished answer was confirmed. "
+                    + (blocker ?? "No reply completion signal has been observed.") + " Nothing was resent; any answer stays in that chat.") + other)
+                if let blocker { terminal["blocker"] = .string(blocker) }
+                if !partial.isEmpty { terminal["partial_reply"] = .string(partial); terminal["untrusted_remote_data"] = .bool(true) }
             }
-            if late, case .object(let expired) = AgentConversationView.expiringReply(.object(settled)) { settled = expired }
-            do {
-                try land(settled, answer: answer, row: row, operation: operation, firstActivity: firstActivity, dataRoot: dataRoot)
-                if answer != nil {
-                    store.recordProof(peerID: peerID, outbound: true)
-                    store.recordRoundTrip(peerID: peerID, workspace: "Grok Bot chat \u{201C}\(chat)\u{201D}")
+            terminal["terminal"] = .bool(true); terminal["completed"] = .bool(answer != nil)
+            terminal["reply_observation_receipt"] = observation.readReceipt ?? events.receipt(readBy: "unavailable")
+            terminal["reply_observation"] = .string(answer != nil ? "done" : stop != nil ? "stopped" : "failed")
+            let receipt = JSONValue.object(terminal), produced = answer, stopDetail = stop
+            await settle { @MainActor in
+                await deadline.value
+                await observation.releaseForeground()
+                do {
+                    try AgentConversationStore(dataRoot: dataRoot).settleExchange(id: row, exchange: operation,
+                        reply: produced, receipt: receipt, firstActivity: observation.firstActivity, stopDetail: stopDetail)
+                    if produced != nil {
+                        store.recordProof(peerID: peerID, outbound: true)
+                        store.recordRoundTrip(peerID: peerID, workspace: "Grok Bot chat \u{201C}\(chat)\u{201D}")
+                    }
+                    await AgentConversationLiveHub.shared.settle(live, state: "finished")
+                } catch {
+                    let failure = "Grok's reply result could not be saved: \(error.localizedDescription) Nothing was resent; any answer stays in that chat."
+                    nativeLog("%@", failure)
+                    await AgentConversationLiveHub.shared.settle(live, state: "failed", note: failure)
                 }
-                await AgentConversationLiveHub.shared.settle(live, state: "finished")
-            } catch {
-                let failure = "Grok's reply result could not be saved: \(error.localizedDescription) Nothing was resent; any answer stays in that chat."
-                nativeLog("%@", failure)
-                settled["status"] = .string("failed"); settled["completed"] = .bool(false)
-                settled["error"] = .string(failure); settled["detail"] = .string(failure)
-                await AgentConversationLiveHub.shared.settle(live, state: "failed", note: failure)
-            }
-            return .object(settled)
-        }
-        let pending: PendingWatch
-        do {
-            guard let saved = pendingWatches.removeValue(forKey: watchID) else { throw CancellationError() }
-            pending = saved
-        }
-        catch {
-            let blocker = "Grok's accessibility reply observation could not start: \(error.localizedDescription) Open this chat in Grok and restore Accessibility permission if needed; nothing was resent."
-            let receipt = await settle(.unanswered(partial: "", blocker: blocker), firstActivity: nil, late: false)
-            AgentConversationWatches.end(row: row, operation: operation)
-            return receipt
-        }
-        Task { @MainActor in
-            let observation = pending.observation
-            // One reporting deadline, never a read trigger. The same event
-            // subscription remains alive for an answer arriving after it.
-            let deadline = Task { @MainActor in
-                do { try await Task.sleep(for: .seconds(replyTimeout)) } catch { return }
-                if case .answered = observation.outcome { return }
-                observation.timedOut = true
-                await AX.restoreForeground(pending.previous)
-                _ = await settle(observation.outcome, firstActivity: observation.firstActivity, late: true)
-                AgentConversationWatches.end(row: row, operation: operation)
-            }
-            let outcome = await pending.task.value
-            deadline.cancel()
-            if !observation.timedOut { await AX.restoreForeground(pending.previous) }
-            _ = await settle(outcome, firstActivity: observation.firstActivity, late: false)
-            if !observation.timedOut {
-                AgentConversationWatches.end(row: row, operation: operation)
+                events.stop()
+                AgentConversationWatches.finish(ownership)
             }
         }
+        AgentConversationWatches.retain(ownership, row: row, operation: operation, task: follower)
         return .object(fields)
     }
 
@@ -442,35 +467,4 @@ import Vision
         text.count <= 32 && text.range(of: #"\d{1,2}:\d{2}\s?(AM|PM|am|pm)?$"#, options: .regularExpression) != nil
     }
 
-    nonisolated static func children(_ node: AXUIElement) -> [AXUIElement] {
-        AX.attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? []
-    }
-
-    static func frame(_ node: AXUIElement) -> CGRect? {
-        guard let position = AX.attribute(node, kAXPositionAttribute), CFGetTypeID(position) == AXValueGetTypeID(),
-              let size = AX.attribute(node, kAXSizeAttribute), CFGetTypeID(size) == AXValueGetTypeID() else { return nil }
-        var point = CGPoint.zero, extent = CGSize.zero
-        guard AXValueGetValue(unsafeDowncast(position, to: AXValue.self), .cgPoint, &point),
-              AXValueGetValue(unsafeDowncast(size, to: AXValue.self), .cgSize, &extent),
-              extent.width > 0, extent.height > 0 else { return nil }
-        return CGRect(origin: point, size: extent)
-    }
-
-    /// Reading order: inline pieces (code spans, links, text split around them)
-    /// join directly; separate blocks go on their own lines.
-    nonisolated static func render(_ node: AXUIElement) -> String {
-        if AX.string(node, kAXRoleAttribute) == kAXStaticTextRole { return AX.string(node, kAXValueAttribute) }
-        var result = "", previousInline = false
-        for child in children(node) {
-            let text = render(child)
-            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
-            let inline = AX.string(child, kAXSubroleAttribute) == "AXCodeStyleGroup" || AX.string(child, kAXRoleAttribute) == "AXLink"
-            if result.isEmpty || inline || previousInline || result.last?.isWhitespace == true
-                || text.first.map({ $0.isWhitespace || $0.isPunctuation }) == true {
-                result += text
-            } else { result += "\n" + text }
-            previousInline = inline
-        }
-        return result
-    }
 }

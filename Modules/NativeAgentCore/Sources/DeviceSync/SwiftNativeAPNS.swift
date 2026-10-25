@@ -4,6 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `SwiftNativeAPNS.swift` | APNs delivery, readiness and body configuration use the sender's deliverable target count from notifications/push_tokens.json; work-activity mutations delegate to MacSyncMobileNotificationRelay; an empty canonical set stays empty; mobile_push/tokens.json is neither read, imported nor removed |
 
 struct WorkActivityPushRegistration: Codable, Equatable, Sendable {
     enum StartOutcome: String, Codable, Sendable {
@@ -347,120 +348,10 @@ public actor SwiftNativeAPNSSender {
         }
     }
 
-    func sendWorkActivities(_ rows: [MobileWorkActivity], dataRoot: URL) async -> [String] {
-        do {
-            let config = try APNSConfig.load(from: dataRoot)
-            guard let pairing = try PairingSecretManager.existingSecretBase64() else { return [] }
-            let fingerprint = WorkActivityPushRegistration.fingerprint(pairing)
-            let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
-            let lock = dataRoot.appendingPathComponent("notifications/push-token-registration")
-            let value = try await persistence.readJSON(path, ifMissing: .object([:]))
-            guard case .object(let root) = value else { throw CocoaError(.propertyListReadCorrupt) }
-            let jwt = try providerToken(keyId: config.keyId, teamId: config.teamId, keyPath: config.keyPath)
-            var errors: [String] = []
-            for (deviceID, value) in root.sorted(by: { $0.key < $1.key }) {
-                guard case .object(let entry) = value,
-                      let original = try WorkActivityPushRegistration.read(entry["workActivity"]),
-                      original.pairing == fingerprint else { continue }
-                let ids = Set(rows.map(\.id))
-                let eligibleStartIDs = Set(rows.filter { !$0.content.state.isTerminal && $0.staleDate > Date() }.map(\.id))
-                // Cleanup also runs with no current rows or with opt-in revoked.
-                try await persistence.withFileLock(lock) {
-                    let latest = try await self.persistence.readJSON(path, ifMissing: .object([:]))
-                    guard case .object(var root) = latest, case .object(var entry)? = root[deviceID],
-                          var registration = try WorkActivityPushRegistration.read(entry["workActivity"]),
-                          registration.pairing == fingerprint else { return }
-                    registration.retireInactiveStarts(activeIDs: eligibleStartIDs, now: Date())
-                    entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
-                    root[deviceID] = .object(entry)
-                    try await self.persistence.writeJSON(.object(root), to: path)
-                }
-                guard original.enabled else { continue }
-                let removed = original.activityTokens.keys.filter { !ids.contains($0) }.compactMap { id -> MobileWorkActivity? in
-                    guard var content = original.lastContents[id] else { return nil }
-                    content.state = .unknown
-                    content.status = "Tracking ended — open the app"
-                    content.updatedAt = Date()
-                    return MobileWorkActivity(id: id, sessionID: nil, startedAt: content.updatedAt, content: content)
-                }
-                for row in rows + removed {
-                    if Task.isCancelled { return errors }
-                    let failure: String? = try await persistence.withFileLock(lock) {
-                        let latest = try await self.persistence.readJSON(path, ifMissing: .object([:]))
-                        guard case .object(var root) = latest, case .object(var entry)? = root[deviceID],
-                              var registration = try WorkActivityPushRegistration.read(entry["workActivity"]),
-                              registration.enabled, registration.pairing == fingerprint,
-                              let currentPairing = try PairingSecretManager.existingSecretBase64(),
-                              WorkActivityPushRegistration.fingerprint(currentPairing) == fingerprint else { return nil }
-                        if registration.lastContents[row.id] == row.content { return nil }
-                        if let previous = registration.lastContents[row.id], previous.updatedAt > row.content.updatedAt { return nil }
-                        let token: String
-                        let event: String
-                        if let activityToken = registration.activityTokens[row.id] {
-                            token = activityToken
-                            event = row.content.state.isTerminal || !ids.contains(row.id) ? "end" : "update"
-                        } else {
-                            guard ids.contains(row.id), !row.content.state.isTerminal, row.staleDate > Date(),
-                                  !registration.startedIDs.contains(row.id), let startToken = registration.startToken else { return nil }
-                            token = startToken; event = "start"
-                        }
-                        if event == "start" {
-                            // Reserve before the external effect. A lost response or failed
-                            // final write leaves an unknown start that must not be replayed.
-                            registration.startedIDs.insert(row.id)
-                            if registration.startOutcomes == nil { registration.startOutcomes = [:] }
-                            registration.startOutcomes?[row.id] = .unknown
-                            if registration.startReservations == nil { registration.startReservations = [:] }
-                            registration.startReservations?[row.id] = .init(retainedAt: Date(), expiresAt: row.staleDate)
-                            entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
-                            root[deviceID] = .object(entry)
-                            try await self.persistence.writeJSON(.object(root), to: path)
-                        }
-                        let failure = try await self.sendWorkActivity(row, event: event, token: token, registration: registration, jwt: jwt)
-                        if let failure {
-                            if event == "start" {
-                                // Only an explicit provider rejection permits another start.
-                                registration.startedIDs.remove(row.id)
-                                registration.startOutcomes?.removeValue(forKey: row.id)
-                                registration.startReservations?.removeValue(forKey: row.id)
-                                entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
-                                root[deviceID] = .object(entry)
-                                try await self.persistence.writeJSON(.object(root), to: path)
-                            } else if failure.tokenIsInvalid {
-                                registration.activityTokens.removeValue(forKey: row.id)
-                                // Keep the start reservation: an invalid update
-                                // token does not authorize a duplicate start.
-                                entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
-                                root[deviceID] = .object(entry)
-                                try await self.persistence.writeJSON(.object(root), to: path)
-                            }
-                            return failure.message
-                        }
-                        registration.lastContents[row.id] = row.content
-                        if event == "start" { registration.startOutcomes?[row.id] = .accepted }
-                        if event == "end" { registration.activityTokens.removeValue(forKey: row.id) }
-                        registration.retireInactiveStarts(activeIDs: eligibleStartIDs, now: Date())
-                        entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
-                        root[deviceID] = .object(entry)
-                        try await self.persistence.writeJSON(.object(root), to: path)
-                        return nil
-                    }
-                    if let failure { errors.append(failure) }
-                }
-            }
-            return errors
-        } catch { return [error.localizedDescription] }
-    }
-
-    private struct WorkActivityRejection: Sendable {
-        let message: String
-        let tokenIsInvalid: Bool
-    }
-
-    private func sendWorkActivity(
+    func sendWorkActivity(
         _ row: MobileWorkActivity, event: String, token: String,
         registration: WorkActivityPushRegistration, jwt: String
-    ) async throws -> WorkActivityRejection? {
+    ) async throws -> MacSyncMobileNotificationRelay.WorkActivityRejection? {
         let content = try JSONValue.parse(JSONEncoder().encode(row.content))
         var aps: [String: JSONValue] = [
             "timestamp": .int(Int64(Date().timeIntervalSince1970)), "event": .string(event),
@@ -496,7 +387,7 @@ public actor SwiftNativeAPNSSender {
         guard status == 200 else {
             let reason = Self.rejectionReason(fromResponseBody: data)
             try noteRejection(reason: reason, jwt: jwt)
-            return WorkActivityRejection(
+            return MacSyncMobileNotificationRelay.WorkActivityRejection(
                 message: "\(event): \(reason ?? "HTTP \(status)")",
                 tokenIsInvalid: status == 410 || ["BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"].contains(reason ?? "")
             )
@@ -625,11 +516,20 @@ public actor SwiftNativeAPNSSender {
     }
 
     /// Pairing, current delivery targets and the newest outcome are one presentation read.
-    public func notificationReadiness(dataRoot: URL) async throws -> (supported: Bool, status: String, detail: String, paired: Int) {
-        let paired = try PairedPhoneAuthority.pairedCountChecked(at: dataRoot.appendingPathComponent("paired_phones.json"))
+    /// `strict` (Doctor's reading) treats a malformed token record as a fault; pages and the sender keep tolerating it.
+    public func notificationReadiness(dataRoot: URL, strict: Bool = false) async throws -> (supported: Bool, status: String, detail: String, paired: Int) {
+        let paired: Int
+        do { paired = try PairedPhoneAuthority.pairedCountChecked(at: dataRoot.appendingPathComponent("paired_phones.json")) }
+        catch { throw Self.notificationReadFailure(error, path: dataRoot.appendingPathComponent("paired_phones.json")) }
         guard paired > 0 else { return (false, "not_paired", "No phone is paired.", paired) }
-        let config = try APNSConfig.load(from: dataRoot)
-        let targets = try await loadTokens(dataRoot: dataRoot, config: config)
+        // No config file means direct push was never set up here, not a read failure.
+        guard FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("config/apns.json").path) else {
+            return (false, "not_configured", "Direct push notifications are not set up on this Mac.", paired)
+        }
+        let config: APNSConfig
+        do { config = try APNSConfig.load(from: dataRoot) }
+        catch { throw Self.notificationReadFailure(error, path: dataRoot.appendingPathComponent("config/apns.json")) }
+        let targets = try await loadTokens(dataRoot: dataRoot, config: config, forDoctor: strict)
             .compactMap { config.target(for: $0) }
         guard !targets.isEmpty else { return (false, "needs_token", "A phone is paired, but no push token can receive notifications.", paired) }
         let path = dataRoot.appendingPathComponent("mobile_push/apns_outcomes.jsonl")
@@ -637,10 +537,16 @@ public actor SwiftNativeAPNSSender {
             return (false, "not_checked", "A phone is paired and push is configured; no delivery has been checked.", paired)
         }
         var unchecked = targets
-        for line in try String(contentsOf: path, encoding: .utf8).split(whereSeparator: \.isNewline).reversed() {
-            guard case .object(let outcome) = try JSONValue.parse(Data(line.utf8)),
+        let lines: String
+        do { lines = try String(contentsOf: path, encoding: .utf8) }
+        catch { throw Self.notificationReadFailure(error, path: path) }
+        for line in lines.split(whereSeparator: \.isNewline).reversed() {
+            let value: JSONValue
+            do { value = try JSONValue.parse(Data(line.utf8)) }
+            catch { throw Self.notificationReadFailure(error, path: path) }
+            guard case .object(let outcome) = value,
                   case .array(let receipts)? = outcome["receipts"] else {
-                throw PersistenceCoreError.ioFailure("The latest phone notification outcome is unreadable.")
+                throw Self.notificationReadFailure(CocoaError(.propertyListReadCorrupt), path: path)
             }
             for receipt in receipts {
                 guard case .object(let row) = receipt,
@@ -664,6 +570,14 @@ public actor SwiftNativeAPNSSender {
         return unchecked.count == targets.count
             ? (false, "not_checked", "A phone is paired and push is configured; no delivery has been checked.", paired)
             : (false, "not_confirmed", "The latest push was not confirmed for a current phone token.", paired)
+    }
+
+    private static func notificationReadFailure(_ error: Error, path: URL) -> NSError {
+        NSError(domain: "NativeAgentAPNS", code: -5, userInfo: [
+            NSFilePathErrorKey: path.path,
+            NSLocalizedDescriptionKey: "Phone notification evidence could not be read from \(path.path)",
+            NSUnderlyingErrorKey: error,
+        ])
     }
 
     private func sendOne(
@@ -757,12 +671,9 @@ public actor SwiftNativeAPNSSender {
         return receipt
     }
 
-    private func loadTokens(dataRoot: URL, config: APNSConfig) async throws -> [APNSToken] {
-        let swiftTokens = filteredTokens(try await loadSwiftTokens(dataRoot: dataRoot), config: config)
-        if !swiftTokens.isEmpty {
-            return swiftTokens
-        }
-        return filteredTokens(try await loadLegacyTokens(dataRoot: dataRoot), config: config)
+    private func loadTokens(dataRoot: URL, config: APNSConfig, forDoctor: Bool = false) async throws -> [APNSToken] {
+        // An empty canonical registration set stays empty.
+        return filteredTokens(try await loadSwiftTokens(dataRoot: dataRoot, forDoctor: forDoctor), config: config)
     }
 
     private func filteredTokens(_ tokens: [APNSToken], config: APNSConfig) -> [APNSToken] {
@@ -786,34 +697,21 @@ public actor SwiftNativeAPNSSender {
         return Array(byToken.values).sorted { $0.deviceId < $1.deviceId }
     }
 
-    private func loadLegacyTokens(dataRoot: URL) async throws -> [APNSToken] {
-        let path = dataRoot
-            .appendingPathComponent("mobile_push", isDirectory: true)
-            .appendingPathComponent("tokens.json")
-        let raw = try await persistence.readJSON(path, ifMissing: .array([]))
-        guard case .array(let rows) = raw else { return [] }
-        return rows.compactMap { row in
-            guard case .object(let obj) = row else { return nil }
-            guard let token = Self.string(obj["token"])?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !token.isEmpty else { return nil }
-            return APNSToken(
-                deviceId: Self.string(obj["deviceId"]) ?? Self.string(obj["device_id"]) ?? "ios",
-                pairedDeviceID: Self.string(obj["pairedDeviceID"]),
-                token: token,
-                environment: Self.string(obj["environment"]) ?? Self.string(obj["sandbox"]),
-                bundleId: Self.string(obj["bundleId"]) ?? Self.string(obj["bundle_id"]),
-                source: "legacy_mobile_push_tokens",
-                updatedAt: Self.string(obj["updatedAt"]) ?? Self.string(obj["lastSeen"])
-            )
+    private func loadSwiftTokens(dataRoot: URL, forDoctor: Bool = false) async throws -> [APNSToken] {
+        let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
+        let raw: JSONValue
+        do { raw = try await persistence.readJSON(path, ifMissing: .object([:])) }
+        catch {
+            if forDoctor { throw Self.notificationReadFailure(error, path: path) }
+            throw error
         }
-    }
-
-    private func loadSwiftTokens(dataRoot: URL) async throws -> [APNSToken] {
-        let path = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("push_tokens.json")
-        let raw = try await persistence.readJSON(path, ifMissing: .object([:]))
-        guard case .object(let root) = raw else { return [] }
+        guard case .object(let root) = raw else {
+            if forDoctor { throw Self.notificationReadFailure(CocoaError(.propertyListReadCorrupt), path: path) }
+            return []
+        }
+        if forDoctor, !root.values.allSatisfy(Self.validTokenRecord) {
+            throw Self.notificationReadFailure(CocoaError(.propertyListReadCorrupt), path: path)
+        }
         return root.compactMap { key, value in
             guard case .object(let obj) = value else { return nil }
             guard let token = Self.string(obj["token"])?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -828,6 +726,15 @@ public actor SwiftNativeAPNSSender {
                 updatedAt: Self.string(obj["lastSeen"]) ?? Self.string(obj["updatedAt"])
             )
         }
+    }
+
+    /// Revoked records may retain metadata without a token; malformed records
+    /// must not look like an empty receiving set in Doctor's reading.
+    private static func validTokenRecord(_ value: JSONValue) -> Bool {
+        guard case .object(let row) = value else { return false }
+        guard let token = row["token"] else { return true }
+        if case .string = token { return true }
+        return false
     }
 
     private static func payload(
@@ -911,14 +818,14 @@ public actor SwiftNativeAPNSSender {
         return max(0, Int(now.timeIntervalSince(date)))
     }
 
-    private struct APNSConfig: Sendable {
+    struct APNSConfig: Sendable {
         let teamId: String
         let keyId: String
         var keyPath: String
         let topic: String?
         let environment: String?
 
-        func target(for token: APNSToken) -> APNSTarget? {
+        fileprivate func target(for token: APNSToken) -> APNSTarget? {
             guard !token.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return nil
             }
@@ -1010,7 +917,7 @@ public actor SwiftNativeAPNSSender {
         }
     }
 
-    private struct APNSTarget: Sendable {
+    fileprivate struct APNSTarget: Sendable {
         let token: APNSToken
         let topic: String
         let environment: String
@@ -1022,7 +929,7 @@ public actor SwiftNativeAPNSSender {
         }
     }
 
-    private struct APNSToken: Sendable {
+    fileprivate struct APNSToken: Sendable {
         let deviceId: String
         let pairedDeviceID: String?
         let token: String

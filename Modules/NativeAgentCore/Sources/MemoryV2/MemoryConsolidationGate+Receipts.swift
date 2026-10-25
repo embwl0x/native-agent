@@ -1,10 +1,11 @@
 import Foundation
 import GRDB
 import ApprovalInbox
-import KnowledgeGraph
+import NotificationInbox
 import NativeAgentCore
 import OSLog
 import PersistenceCore
+// Blueprint: | `MemoryConsolidationGate+Receipts.swift` | `MemoryConsolidationGate`: `writeManifest`, `readManifest`, `readReceipt`; cards append through `LiveNotificationInbox` |
 
 extension MemoryConsolidationGate {
     // MARK: - Manifest + receipt
@@ -90,7 +91,7 @@ extension MemoryConsolidationGate {
             try receipt.serializedData(pretty: true)
                 .write(to: receiptPath(dataRoot: dataRoot, runId: runId), options: .atomic)
             if status == "applied" || status == "applied_prior" {
-                reconcileAppliedMaintenanceTruth(
+                MemoryConsolidationHygiene.reconcileAppliedMaintenanceTruth(
                     dataRoot: dataRoot,
                     runId: runId,
                     status: status,
@@ -99,80 +100,6 @@ extension MemoryConsolidationGate {
             }
         } catch {
             logger.error("consolidation receipt write failed for \(runId, privacy: .public): \(String(describing: error), privacy: .public)")
-        }
-    }
-
-    /// Project a terminal, fully reconciled consolidation onto the shared
-    /// maintenance-health receipt. `hygiene_last_run.json` is the canonical
-    /// body/UI health input, so leaving its prior `staged` value behind after
-    /// an approved swap makes healthy memory look permanently degraded.
-    ///
-    /// Existing malformed bytes are preserved and remain fail-closed. The
-    /// exact applied consolidation receipt remains the compatibility proof,
-    /// and a later reconciliation pass retries this projection.
-    static func reconcileAppliedMaintenanceTruth(
-        dataRoot: URL,
-        runId: String,
-        status: String,
-        at: String
-    ) {
-        guard status == "applied" || status == "applied_prior",
-              let appliedAt = Self.parseISO8601(at)
-        else { return }
-        let path = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("hygiene_last_run.json")
-        var object: [String: Any] = [:]
-        if FileManager.default.fileExists(atPath: path.path) {
-            guard let data = try? Data(contentsOf: path),
-                  let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else {
-                logger.error("consolidation health projection refused unreadable hygiene receipt for \(runId, privacy: .public)")
-                return
-            }
-            object = existing
-            // 2026-09-06: reconciliation REPLAYS every applied terminal receipt
-            // on every pass, and this projection used to overwrite the record
-            // unconditionally — so a months-old run re-stamped a NEWER hygiene
-            // status (a deferred run, or a later consolidation) back to
-            // "completed", with the old run's createdAt and nextScheduled. A
-            // replayed receipt may only refresh a record that is not newer than
-            // it is; the same run re-stamping itself carries an equal stamp and
-            // still lands, so crash-window and upgrade recovery are unaffected.
-            //
-            // 2026-09-06: "equal stamp still lands" was too loose. These stamps
-            // are second-resolution ISO strings, so two DIFFERENT runs can carry
-            // the same one — and each replay then overwrote the other's record,
-            // ping-ponging the run id and reason on every pass. An equal stamp
-            // is accepted only from the run that wrote the record; anyone else's
-            // loses to what is already there.
-            if let existingAt = (existing["createdAt"] as? String).flatMap(Self.parseISO8601) {
-                if existingAt > appliedAt { return }
-                if existingAt == appliedAt,
-                   (existing["consolidationRunId"] as? String) != runId {
-                    return
-                }
-            }
-        }
-        object["id"] = (object["id"] as? String) ?? "consolidation-\(runId)"
-        object["status"] = "completed"
-        object["reason"] = status == "applied_prior"
-            ? "approved consolidation was already applied and its projections were reconciled"
-            : "approved consolidation applied and its projections were reconciled"
-        object["version"] = (object["version"] as? String) ?? "swift-memory-v2-consolidator"
-        object["createdAt"] = at
-        object["nextScheduled"] = Self.iso8601(appliedAt.addingTimeInterval(7 * 24 * 60 * 60))
-        object["consolidationRunId"] = runId
-        do {
-            try FileManager.default.createDirectory(
-                at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let data = try JSONSerialization.data(
-                withJSONObject: object,
-                options: [.prettyPrinted, .sortedKeys]
-            )
-            try data.write(to: path, options: .atomic)
-        } catch {
-            logger.error("consolidation health projection failed for \(runId, privacy: .public): \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -284,15 +211,11 @@ extension MemoryConsolidationGate {
     }
 
     /// Card id == approval id so InboxView's approve/reject routes through
-    /// resolveApproval(id). Idempotent whole-file scan inside the flock —
-    /// the same shape as the REM and memory.repair stagers.
+    /// resolveApproval(id). The live inbox owns serialization and retention.
     static func ensureInboxCard(
         dataRoot: URL, approvalId: String, title: String,
         summary: String, detail: String, relatedPath: String
     ) async throws {
-        let inboxPath = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
         let card: JSONValue = .object([
             "id": .string(approvalId),
             "created_at": .string(Self.iso8601(Date())),
@@ -318,9 +241,7 @@ extension MemoryConsolidationGate {
             "status": .string("unread"),
             "read_at": .null,
         ])
-        // Idempotent append via the shared bounded-scan helper (replaces the
-        // per-append whole-inbox slurp; same shape as the REM/memory.repair stagers).
-        try await appendUniqueById(card, to: inboxPath, using: SwiftNativePersistenceCore())
+        try await LiveNotificationInbox.live(dataRoot: dataRoot).appendUnique(card, id: approvalId)
     }
 
 }

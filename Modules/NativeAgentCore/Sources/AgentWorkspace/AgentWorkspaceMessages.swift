@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceMessages.swift` | `AgentWorkspaceMessages` enum; `project` |
 
 /// Navigation over Messages-owned identities. Never derive recipients from a
 /// display name, chat ID, preview text, or embedded action-looking content.

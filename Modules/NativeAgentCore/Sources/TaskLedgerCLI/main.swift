@@ -4,6 +4,8 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 
+// Blueprint: | `main.swift` | `TaskLedgerCLI`: explicit ledger append/claim/list commands, option parsing and shared or explicitly overridden data-root resolution |
+
 @main
 struct TaskLedgerCLI {
     static func main() async {
@@ -205,22 +207,12 @@ struct TaskLedgerCLI {
         return value
     }
 
-    /// Precedence: explicit `--data-root` > `NATIVE_AGENT_DATA_ROOT` env > a
-    /// cwd-relative `./data` LAST-RESORT. The retired Python `task_ledger.py`
-    /// anchored its default to the REPO (`__file__.parent.parent / data`), not
-    /// the cwd — so the canonical invocation `script/task_ledger.sh` exports
-    /// `NATIVE_AGENT_DATA_ROOT=<repo>/data` to preserve that. Do NOT rely on the
-    /// cwd fallback as the repo default: a non-repo cwd would split the
-    /// cross-agent ledger onto a stray `<cwd>/data` + a different flock sidecar.
+    /// Explicit `--data-root` overrides the app's shared process-root resolver.
     static func resolveDataRoot(_ explicit: String?) -> URL {
         if let explicit, !explicit.isEmpty {
             return URL(fileURLWithPath: expandTilde(explicit), isDirectory: true)
         }
-        if let env = ProcessInfo.processInfo.environment["NATIVE_AGENT_DATA_ROOT"], !env.isEmpty {
-            return URL(fileURLWithPath: env, isDirectory: true)
-        }
-        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent("data", isDirectory: true)
+        return PersistenceCore.defaultDataRoot()
     }
 
     static func expandTilde(_ path: String) -> String {
@@ -300,7 +292,7 @@ struct TaskLedgerCLI {
 
         actors: claude, assistant, codex, user
         kinds:  created, claimed, update, blocked, done, cancelled
-        default data root: $NATIVE_AGENT_DATA_ROOT or ./data
+        default data root: $NATIVE_AGENT_DATA_ROOT or NativeAgent's application data root
         """, stderr)
     }
 }

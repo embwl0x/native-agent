@@ -1,10 +1,12 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `ActivityQuery.swift` | `ActivityQueryService.run`: gated activity reads, current-policy re-filtering, bounded rows and honest truncation |
+
 /// W7 — the ONLY read path into the activity store.
 ///
 /// Deliberately a plain value type in THIS module rather than logic living in
-/// the dispatcher: the tool impl in ChatOrchestration is a thin adapter that
+/// the dispatcher: the tool impl in ChatToolRuntime is a thin adapter that
 /// hands over a dictionary and gets a `JSONValue` back, so every rule that
 /// matters (the capture gate, the query-time exclusion re-filter, the row cap,
 /// the honest truncation, the refusal text) is testable headlessly without a
@@ -30,23 +32,23 @@ public struct ActivityQueryService: Sendable {
             switch self {
             case .captureDisabled:
                 return """
-                Activity capture is turned OFF, so there is nothing recorded to answer from. \
-                Turn it on in Trust Center → Activity Capture. Nothing was recorded while it \
-                was off, so enabling it now starts from this moment — it cannot answer about \
-                the past.
+                activity_capture_disabled: Activity capture is off. Only the owner can enable \
+                Trust > Features > Activity capture > Record which apps you use. This action \
+                cannot read history while capture is off; enabling cannot recover activity \
+                from when it was off.
                 """
             case .modelAccessDisabled:
-                return "Activity history is local-only until you enable Trust Center → Activity Capture → Agent Access."
+                return "activity_model_access_disabled: This request has neither activity model access nor admitted Full Mac authority. Only the owner can enable Trust > Features > My access > Let me answer from activity history."
             case .policyUnavailable(let detail):
-                return "activity_query refused because the saved activity policy is unavailable: \(detail)"
+                return "activity_policy_unavailable: \(detail). Ask the owner to repair activity_watch/activity_policy.json from its retained bytes, preserving every saved choice; history access remains blocked until it is readable."
             case .remoteSurfaceRefused(let surface):
                 return """
-                activity_query is Mac-local and is refused on the '\(surface)' surface by \
-                design. The activity store is never exposed through iCloud, chat sync, phone, \
-                or bridge transports. Ask on the Mac; model access is separately consented there.
+                activity_surface_denied: Activity history is refused on '\(surface)' without \
+                admitted Full Mac authority. Ask in NativeAgent's Mac chat; activity model \
+                access is also required there without Full Mac.
                 """
             case .badRange(let detail):
-                return "activity_query: \(detail)"
+                return "activity_range_invalid: \(detail)"
             }
         }
     }
@@ -59,12 +61,9 @@ public struct ActivityQueryService: Sendable {
 
     // MARK: - Surface gate (W7 decision: the bridge REFUSES, it does not 404)
 
-    /// Mac-local only. The build plan (W7, gpt-5.5 BLOCKING B2) settled this:
-    /// routing the tool through the iOS/HTTP bridge means activity data can be
-    /// pulled from the phone and the answer traverses iCloud/chat-sync — which
-    /// breaks "everything stays on the Mac". The refusal is EXPLICIT rather
-    /// than a silent 404 so a future reader sees a decision, not an omission,
-    /// and so User can lift it in one line if he ever wants phone access.
+    /// Identifies remote surfaces for callers without admitted Full Mac.
+    /// The dispatcher checks actual-origin Full Mac admission first; this
+    /// classification alone neither grants nor revokes activity access.
     public static func isRefusedSurface(_ surface: String) -> Bool {
         ConversationSurfaceProfileShim(surface).isRemote
     }

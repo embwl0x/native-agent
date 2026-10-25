@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+// Blueprint: | `ContextSelectionContracts.swift` | `ContextOriginClass` enum; `ContextPacketItem` owns expandable representation and safe leads, and retains memory untrusted sources through body/summary selection |
 
 // MARK: - Need signal and authorization
 
@@ -529,6 +530,70 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
     }
 }
 
+extension ContextPacketItem {
+
+    /// Omitted content is expandable; a whole body never needs its own pointer.
+    public func isExpandable(thresholdChars: Int) -> Bool {
+        representation == .deterministicSummary || expansionLead(thresholdChars: thresholdChars) != nil
+    }
+
+    /// The renderer's lead, only when it saves text. Empty means pointer-only.
+    public func expansionLead(thresholdChars: Int) -> String? {
+        guard thresholdChars > 0, text.count > thresholdChars else { return nil }
+        let summary = self.summary?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let source = (summary?.isEmpty == false) ? summary! : text
+        // Memory keeps its complete decision clause; other atoms use safe sentences/words.
+        let lead = pointer.kind == .memory || pointer.kind == .correction
+            ? source : Self.firstSentences(of: source, upTo: 240)
+        return lead.count < text.count ? lead : nil
+    }
+
+    /// Never cut inside inline code or a URL; an unbroken token has no safe lead.
+    private static func firstSentences(of text: String, upTo limit: Int) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard limit > 0 else { return "" }
+        guard trimmed.count > limit else { return trimmed }
+        let window = String(trimmed.prefix(limit))
+
+        var lastSentenceBoundary: String.Index?
+        var lastSafeWhitespace: String.Index?
+        var insideCodeSpan = false
+        var tokenStart = window.startIndex
+        var index = window.startIndex
+        while index < window.endIndex {
+            let character = window[index]
+            let next = window.index(after: index)
+            if character == "`" {
+                insideCodeSpan.toggle()
+            } else if character.isWhitespace {
+                if !insideCodeSpan { lastSafeWhitespace = index }
+                tokenStart = next
+            } else if character == "." || character == "!" || character == "?" {
+                let endsToken = next == window.endIndex || window[next].isWhitespace
+                // A scheme anywhere in the token this terminator closes means
+                // the terminator is punctuation the URL may own.
+                let tokenIsURL = window[tokenStart..<next].contains("://")
+                if endsToken, !insideCodeSpan, !tokenIsURL {
+                    lastSentenceBoundary = next
+                }
+            }
+            index = next
+        }
+
+        if let lastSentenceBoundary {
+            let sentence = String(window[window.startIndex..<lastSentenceBoundary])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !sentence.isEmpty { return sentence }
+        }
+        if let lastSafeWhitespace {
+            let words = String(window[window.startIndex..<lastSafeWhitespace])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !words.isEmpty { return words }
+        }
+        return ""
+    }
+}
+
 public enum ContextConflictHandling: String, Codable, Sendable {
     case resolved
     case includedUncertainty = "included_uncertainty"
@@ -573,8 +638,6 @@ public struct ContextBudgetUsage: Codable, Equatable, Sendable {
     public let characterLimit: Int
     public let usedCharacters: Int
     public let mandatoryCharacters: Int
-
-    public var remainingCharacters: Int { max(0, characterLimit - usedCharacters) }
 }
 
 /// Generation-pinned lexical material compiled once for the RAM hot path.
@@ -760,7 +823,9 @@ public struct ContextPacket: Codable, Equatable, Sendable {
     public let expandablePointers: [ContextAtomPointer]
     public let conflictSets: [ContextConflictSet]
     public let degradedSources: [ContextDegradedSourceNotice]
+    /// Selection-time accounting, retained when verification excludes items.
     public let budget: ContextBudgetUsage
+    /// Original selection evidence, not the final delivered set; feedback uses these IDs.
     public let receipt: ContextSelectionReceipt
 
     public var characterCount: Int { budget.usedCharacters }
@@ -780,7 +845,9 @@ public enum ContextSelectionError: Error, Equatable, Sendable {
 public struct ContextScoreWeights: Equatable, Sendable {
     public let lexicalExact: Double = 2.4
     public let tokenOverlap: Double = 1.7
-    public let semanticCosine: Double = 1.2
+    /// Meaning weighs what the words weigh (exact 2.4 + overlap 1.7), read
+    /// from the model's floor (`ContextSelection.score`).
+    public let semanticCosine: Double = 4.0
     public let sharedIdentifiers: Double = 1.5
     public let activation: Double = 1.2
     public let authority: Double = 1.0
@@ -868,10 +935,13 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// 10.2 (4.9 on User's turns, 20% none), acknowledgements (0.19-0.22) and
     /// the unrelated design and greeting rules (0.07, 0.22) stay out, drive
     /// recalls 0.64-0.80 land (and 0.34 carried by message coverage).
+    /// That replay embedded bge queries like passages; they now carry bge's
+    /// query instruction (`ManagedEmbeddingProvider.embedQueriesWithEpoch`),
+    /// so the bge value is unmeasured on today's query vectors.
     public let memorySemanticFloors: [String: Double] = ["bge-large-en-v1.5": 0.55, "all-MiniLM-L6-v2": 0.25]
     /// Effective `.memory` row cap on a message of at most
     /// `shortMessageTokenCount` content tokens — the same token set (and the
-    /// same "4") the `messageCoverage` length damp already uses, so a message
+    /// boundary) the `messageCoverage` length damp uses, so a message
     /// too short to evidence coverage is also too short to earn a full memory
     /// lane. Applied as `min(cap, shortMessageMemoryRowCap)`. `0` disables the
     /// cap on its own, and a zero semantic floor disables it too.
@@ -885,7 +955,9 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// 0.20 is from the replay (204 of User's turns, 09-24…10-03, bge-large):
     /// one personal memory on 11% of turns, 15 distinct (the old lane put 1-3
     /// on 47%). Raw cosine at any floor kept answering every turn that
-    /// mentioned Claude with the same memory.
+    /// mentioned Claude with the same memory. Measured before bge queries
+    /// carried their instruction; lift now subtracts a passage-to-passage
+    /// baseline from a query-to-passage cosine.
     public let personalRecallFloor: Double = 0.20
     public let weights: ContextScoreWeights = ContextScoreWeights()
 

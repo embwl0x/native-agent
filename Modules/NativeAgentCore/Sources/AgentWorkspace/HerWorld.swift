@@ -1,6 +1,7 @@
 import ApprovalInbox
 import ChatSessionWork
 import Foundation
+import NativeAgentCore
 import MemoryV2
 import NotificationInbox
 import PersistenceCore
@@ -9,6 +10,7 @@ import StandingBots
 import WorkshopExecution
 import SwarmRuns
 import NativeAgentShared
+// Blueprint: | `HerWorld.swift` | `HerWorld` struct; retained owner picture including contact histories and delegations; `HerMemo` refreshes on file and owner lifecycle invalidations, publishes completion, and tracks pending revisions without page-time source scans; observations share the 30-minute/128-key working window even without a value, and engine shutdown closes admission and cancels passive resources; child watches rebind on membership changes; room acknowledgements preserve stale parts; crew notices preserve canonical SwarmCrew liveness; name books retain their names lock |
 
 /// Home, rooms and the glance draw the same retained owner projections.
 /// Owner invalidations refresh each part independently, outside page assembly.
@@ -27,6 +29,7 @@ struct HerWorld: @unchecked Sendable {
     var answered: [String: Date] = [:]
     var health: [String: AgentLocalHealth] = [:]
     var desk: DeskState?
+    var deskFailure: String?
     var split = HerScreen.DeskSplit()
     var bots: [BotDefinition] = []
     var latest: [UUID: ShelfEntry] = [:]
@@ -44,6 +47,8 @@ struct HerWorld: @unchecked Sendable {
     var phonePlaces: [PhonePlaceEvent] = []
     /// Arrivals no other home line names (a failed wake, a recovery).
     var arrivals: [ResidentWake.Item] = []
+    /// Arrivals she was shown and has not accepted: MY QUEUE, never a repair.
+    var arrivalsToAccept = 0
     /// Agents discovery found and offered, still unanswered: one PEOPLE line each.
     var found: [String] = []
     /// Parts with no value at all yet (never read), by key.
@@ -60,26 +65,65 @@ struct HerWorld: @unchecked Sendable {
 /// Parts of the world by input stamp. A compute that started before another
 /// one stored never overwrites it (a per-key generation), so an older read
 /// cannot replace a newer one.
-final class HerMemo: @unchecked Sendable {
-    static let shared = HerMemo()
+package final class HerMemo: @unchecked Sendable {
+    package static let shared = HerMemo()
+    /// Cancellation can arrive during a read; notification tokens retire once
+    /// without sharing their non-Sendable storage with the reader task.
+    private final class ObservationNotifications: @unchecked Sendable {
+        private let lock = NSLock()
+        private var tokens: [NSObjectProtocol]
+
+        init(names: [Notification.Name], invalidate: @escaping @Sendable () -> Void) {
+            tokens = names.map { name in
+                NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { _ in invalidate() }
+            }
+        }
+
+        func cancel() {
+            let retired = lock.withLock {
+                let retired = tokens
+                tokens.removeAll()
+                return retired
+            }
+            retired.forEach(NotificationCenter.default.removeObserver)
+        }
+
+        deinit { cancel() }
+    }
     private let lock = NSLock()
     private var store: [String: (stamp: [String], value: Any, generation: Int, used: Date, at: Date)] = [:]
     private var generation = 0
-    private var observations: [String: (id: UUID, revision: Int, task: Task<Void, Never>)] = [:]
+    private var observations: [String: (id: UUID, revision: Int, used: Date, task: Task<Void, Never>)] = [:]
+    private var stopped = false
     private var glances: [String: String?] = [:]
     private var glanceOrder: [String] = []
 
     /// Only the recent working window is retained, including transcript and send keys.
     private func prune(_ now: Date) {
-        let previous = Set(store.keys)
-        store = store.filter { now.timeIntervalSince($0.value.used) <= 1800 }
-        while store.count > 128, let oldest = store.min(by: { $0.value.used < $1.value.used }) {
-            store.removeValue(forKey: oldest.key)
+        let keys = Set(store.keys).union(observations.keys)
+        let recent = keys.map { key in
+            (key: key, used: max(store[key]?.used ?? .distantPast, observations[key]?.used ?? .distantPast))
+        }.filter { now.timeIntervalSince($0.used) <= 1800 }.sorted { $0.used > $1.used }
+        let retained = Set(recent.prefix(128).map(\.key))
+        for key in keys.subtracting(retained) {
+            store.removeValue(forKey: key)
+            observations.removeValue(forKey: key)?.task.cancel()
         }
-        for key in previous.subtracting(store.keys) { observations.removeValue(forKey: key)?.task.cancel() }
+    }
+
+    /// Terminal engine retirement closes admission before cancelling readers.
+    package func shutdown() {
+        lock.withLock {
+            stopped = true
+            let tasks = observations.values.map(\.task)
+            observations.removeAll()
+            store.removeAll()
+            tasks.forEach { $0.cancel() }
+        }
     }
 
     private func keep(_ key: String, stamp: [String], value: Any) {
+        guard !stopped else { return }
         generation += 1
         let now = Date()
         store[key] = (stamp, value, generation, now, now)
@@ -91,6 +135,7 @@ final class HerMemo: @unchecked Sendable {
             let now = Date()
             prune(now)
             store[key]?.used = now
+            observations[key]?.used = now
             return (store[key].flatMap { $0.stamp == stamp ? $0.value as? T : nil }, store[key]?.generation ?? 0)
         }
         if let hit { return hit }
@@ -107,6 +152,7 @@ final class HerMemo: @unchecked Sendable {
             let now = Date()
             prune(now)
             store[key]?.used = now
+            observations[key]?.used = now
             return store[key].flatMap { $0.stamp == stamp ? $0.value as? T : nil }
         }
         if let hit { return hit }
@@ -121,6 +167,7 @@ final class HerMemo: @unchecked Sendable {
             let now = Date()
             prune(now)
             store[key]?.used = now
+            observations[key]?.used = now
             let current = stamp ?? [String(observations[key]?.revision ?? 0)]
             return store[key].flatMap { entry in (entry.value as? T).map { ($0, entry.stamp == current, entry.at) } }
         }
@@ -137,37 +184,52 @@ final class HerMemo: @unchecked Sendable {
         lock.withLock {
             prune(Date())
             store[key]?.used = Date()
+            observations[key]?.used = Date()
+            guard !stopped else { return }
             guard observations[key] == nil else { return }
             let id = UUID()
             let task = Task.detached(priority: .utility) { [self] in
+                guard !Task.isCancelled else { return }
                 let events = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
                 let invalidate: @Sendable () -> Void = { [self] in
-                    lock.withLock { if observations[key]?.id == id { observations[key]?.revision += 1 } }
-                    events.continuation.yield(())
-                }
-                let tokens = notifications.map { name in
-                    NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { _ in invalidate() }
-                }
-                defer { tokens.forEach(NotificationCenter.default.removeObserver); events.continuation.finish() }
-                while !Task.isCancelled {
-                    let watched = paths()
-                    let watcher = FileChangeWatcher(paths: watched) { _ in invalidate() }
-                    invalidate()
-                    for await _ in events.stream {
-                        guard paths() == watched else { break }
-                        let revision = lock.withLock { observations[key]?.revision ?? 0 }
-                        let value = await AgentWorkspacePorts.$binding.withValue(ports) { await compute() }
-                        if let value, !Task.isCancelled {
-                            lock.withLock {
-                                if observations[key]?.id == id { keep(key, stamp: [String(revision)], value: value) }
-                            }
-                        }
-                        if !Task.isCancelled { NotificationCenter.default.post(name: AgentWorkspaceScreenPreview.didChange, object: nil) }
+                    let current = lock.withLock {
+                        guard observations[key]?.id == id else { return false }
+                        observations[key]?.revision += 1
+                        return true
                     }
-                    watcher.cancel()
+                    if current { events.continuation.yield(()) }
+                }
+                let notifications = ObservationNotifications(names: notifications, invalidate: invalidate)
+                defer { notifications.cancel(); events.continuation.finish() }
+                await withTaskCancellationHandler {
+                    while !Task.isCancelled {
+                        let watched = paths()
+                        let watcher = FileChangeWatcher(paths: watched) { _ in invalidate() }
+                        invalidate()
+                        await withTaskCancellationHandler {
+                            for await _ in events.stream {
+                                guard !Task.isCancelled else { break }
+                                guard paths() == watched else { break }
+                                let revision = lock.withLock { observations[key]?.revision ?? 0 }
+                                let value = await AgentWorkspacePorts.$binding.withValue(ports) { await compute() }
+                                if let value, !Task.isCancelled {
+                                    lock.withLock {
+                                        if observations[key]?.id == id { keep(key, stamp: [String(revision)], value: value) }
+                                    }
+                                }
+                                if lock.withLock({ !stopped && observations[key]?.id == id }), !Task.isCancelled {
+                                    NotificationCenter.default.post(name: AgentWorkspaceScreenPreview.didChange, object: nil)
+                                }
+                            }
+                        } onCancel: { watcher.cancel() }
+                        watcher.cancel()
+                    }
+                } onCancel: {
+                    notifications.cancel()
+                    events.continuation.finish()
                 }
             }
-            observations[key] = (id, 0, task)
+            observations[key] = (id, 0, Date(), task)
         }
     }
 
@@ -237,9 +299,9 @@ extension HerScreen {
         if let events: [PhonePlaceEvent] = part("phone places", [PhonePlaceHistory.url(dataRoot)], {
             try? PhonePlaceHistory.read(dataRoot)
         }) { world.phonePlaces = events }
-        if let arrivals: [ResidentWake.Item] = part("arrivals", [ResidentWake.url(dataRoot)], {
+        if let arrivals: (items: [ResidentWake.Item], toAccept: Int) = part("arrivals", [ResidentWake.url(dataRoot)], {
             ResidentWake.homeItems(dataRoot)
-        }) { world.arrivals = arrivals }
+        }) { world.arrivals = arrivals.items; world.arrivalsToAccept = arrivals.toAccept }
         if let found: [String] = part("found", [AgentDiscoveryOffer.url(dataRoot)], {
             (AgentDiscoveryOffer.read(dataRoot) ?? [:]).filter(\.value.open).map { AgentDiscoveryOffer.line(id: $0.key, name: $0.value.name) }.sorted()
         }) { world.found = found }
@@ -266,7 +328,7 @@ extension HerScreen {
                 bridges.appendingPathComponent("claude-bridge"), bridges.appendingPathComponent("claude-bridge/bridge.json"),
                 bridges.appendingPathComponent("claude-bridge/token"), at("chat/messages"), ContactReplyReads.url(dataRoot)],
                 notifications: [.nativeAgentChatTranscriptDidChange], {
-            let identity = AgentContactIdentity(dataRoot: dataRoot)
+            let identity = AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)
             let usable = AgentWorkspacePorts.current.tools.usableAgentLanes(dataRoot: dataRoot)
             let people = contacts(identity: identity, usable: usable)
             let threads = Dictionary(uniqueKeysWithValues: people.compactMap { contact in
@@ -289,14 +351,23 @@ extension HerScreen {
         }) ?? [:]
 
         // Parking is drawn from the owner's retained work and execution records.
-        if let desk: (DeskState, Set<String>) = part("desk", [at("desk/desk_ops.jsonl"),
+        if let desk: (state: DeskState?, live: Set<String>, failure: String?) = part("desk", [at("desk/desk_ops.jsonl"),
                 at("desk/desk_ops_base.json")] + files(at("workshop/executions"), file: "execution.json"), {
             let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-            guard let state = try? await store.liveStateUnlocked() else { return nil }
+            let state: DeskState
+            do { state = try await store.liveStateUnlocked() }
+            catch {
+                return (nil, [], readFailure(error, reason: "desk_unavailable", remedy: Repair.remedy(owner: at("desk").path,
+                    nextCall: nil, tap: nil, instruction: ToolFailureError.fileRepairInstruction(at("desk"),
+                        shape: "Desk storage failed: \(error.localizedDescription). Inspect desk_ops.jsonl and desk_ops_base.json; recover only retained work records."))))
+            }
             let live = Set(await SwiftNativeWorkshopRunner(root: dataRoot).listAll()
                 .filter { DeskParking.executionIsLive(status: $0.status) }.compactMap(\.deskHandle))
-            return (state, live)
-        }) { world.desk = desk.0; world.split = deskSplit(desk.0, live: desk.1, now: now) }
+            return (state, live, nil)
+        }) {
+            world.desk = desk.state; world.deskFailure = desk.failure
+            if let state = desk.state { world.split = deskSplit(state, live: desk.live, now: now) }
+        }
 
         if let bots: ([BotDefinition], [UUID: ShelfEntry]) = part("bots",
                 files(at("bots/definitions")) + [at("bots/shelf-index.json")], {
@@ -334,7 +405,7 @@ extension HerScreen {
             return (asks.count, asks.max { $0.created_at < $1.created_at }?.title)
         }) { world.asks = asks.count; world.newestAsk = asks.newest }
         if let crews: [[String: Any]] = part("crews", [at("swarms/live.json"), at("swarms/runs.json")], {
-            try? SwiftNativeSwarmRunsReader(runsPath: at("swarms/runs.json")).readCrews(locked: false)
+            try? SwiftNativeSwarmRunsReader(runsPath: at("swarms/runs.json")).readCrews()
         }) { world.crews = crews }
         else if !world.unread.contains("crews") { world.unread.append("crews") }
         world.running = part("running helpers", [at("bots/run-queue.json")], notifications: [BotRunQueue.didChange]) {
@@ -434,6 +505,7 @@ extension HerScreen {
                     switch entry.runtimeStatus {
                     case .completed: line = slug + (entry.asked == true ? " answered" : " ran") + ": " + clip(entry.headline, 36)
                     case .failed, .interrupted: line = slug + " failed"
+                    case .stopped: line = slug + " stopped"
                     case .waitingForApproval, .waitingOnPerson: line = slug + " waiting on " + person
                     }
                 }
@@ -441,11 +513,13 @@ extension HerScreen {
                                       entry?.statusDetail ?? "-", entry?.approvalID ?? "-", running ? "running" : "idle"].joined(separator: "|"), line: line,
                                    at: (running ? now : entry?.runAt ?? .distantPast).timeIntervalSince1970)
             }
-            for row in world.crews where row["pid"] != nil && current("crews") {
+            for row in world.crews where SwarmCrew.liveness(of: row) != .settled && current("crews") {
                 guard let id = row["id"] as? String else { continue }
                 let name = "crew.\(book.number("crew", id: id) { Set(world.crews.compactMap { $0["id"] as? String }) })"
                 let task = clip(firstLine(row["objective"] as? String ?? "A task"), 36)
-                marks[name] = Mark(fp: "live", line: "", new: name + " started: " + task, gone: name + " finished: " + task,
+                let unknown = SwarmCrew.liveness(of: row) == .unknown
+                let line = unknown ? name + " liveness unknown: " + task : ""
+                marks[name] = Mark(fp: unknown ? "unknown" : "live", line: line, new: unknown ? line : name + " started: " + task, gone: name + " finished: " + task,
                                    at: ((row["createdAt"] as? String).flatMap(date) ?? now).timeIntervalSince1970)
             }
         }
@@ -578,14 +652,14 @@ extension HerScreen {
     // MARK: - The glance line
 
     /// Rides every turn in the dynamic segment: what changed since she last
-    /// looked, what needs her, and her live built/recent abilities.
-    /// - Home changes stay pinned to the turn; ability names are read from
-    ///   their owners at assembly, outside that memo.
+    /// looked, what needs her, and her own parts, best match for `message` first.
+    /// - Home changes stay pinned to the turn; her parts are read from their
+    ///   owners at assembly, outside that memo.
     /// - Never advances what she has seen; never User's screen or activity data.
-    package static func glance(dataRoot: URL, scope: String?, turn: Date?, includingMoments: Bool = true) async -> String? {
-        async let abilities = AgentWorkspacePorts.current.tools.builtAbilities(dataRoot: dataRoot, now: turn ?? Date())
+    package static func glance(dataRoot: URL, scope: String?, turn: Date?, message: String, includingMoments: Bool = true) async -> String? {
+        async let parts = AgentWorkspacePorts.parts(for: message, dataRoot: dataRoot)
         let home = await homeGlance(dataRoot: dataRoot, scope: scope, turn: turn, includingMoments: includingMoments)
-        return await [home, abilities].compactMap { $0 }.joined(separator: "\n")
+        return await [home, parts].compactMap { $0 }.joined(separator: "\n")
     }
 
     private static func homeGlance(dataRoot: URL, scope: String?, turn: Date?, includingMoments: Bool) async -> String? {

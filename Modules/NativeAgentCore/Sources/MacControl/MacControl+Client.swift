@@ -1,10 +1,10 @@
-import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 #if canImport(CoreGraphics)
 import CoreGraphics
+// Blueprint: | `MacControl+Client.swift` | `SwiftNativeMacControl` actor; `dispatch`, `dispatchApprovedInjection`; `MacObservationMode` carries passive read authority without motor binding, wake, capabilities or desktop effects |
 #endif
 
 // MARK: - SwiftNative impl
@@ -342,16 +342,36 @@ public actor SwiftNativeMacControl: MacControlClient {
             return Self.attachingOperation(refused, record: record)
         }
 
-        _ = try await operationStore.transition(
+        // Register before publishing started. The task cannot emit effects until
+        // the durable cancellation state has been reconciled below.
+        let startGate = MacControlOneShot<Bool>()
+        let task = Task<MacControlResult, Error> {
+            guard await startGate.wait() else { throw CancellationError() }
+            try Task.checkCancellation()
+            return try await self.executeAction(normalized, body: operationBody, gateAlreadyChecked: true)
+        }
+        let execution = MacControlInFlightExecution(task: task)
+        MacControlInFlightRegistry.shared.insert(execution, operationId: operationId)
+        defer {
+            task.cancel()
+            startGate.resolve(false)
+            MacControlInFlightRegistry.shared.remove(operationId: operationId)
+        }
+        let started = try await operationStore.transition(
             operationId: operationId,
             to: .started,
             verification: .pending,
-            expectedNextEvidence: "Mac Control terminal result"
+            expectedNextEvidence: "Mac Control terminal result",
+            acknowledgePreStartCancellation: true
         )
-        let task = Task<MacControlResult, Error> {
-            try await self.executeAction(normalized, body: operationBody, gateAlreadyChecked: true)
+        if started.state == .cancelAcknowledged {
+            return Self.cancelledResult(action: normalized, record: started)
         }
-        let execution = MacControlInFlightExecution(task: task)
+        let current = try await operationStore.record(operationId: operationId)
+        if Task.isCancelled || current?.state == .cancelRequested {
+            execution.requestCancellation()
+        }
+        startGate.resolve(true)
         Task { execution.finish(await task.result) }
         let deadlineTask = Task<Void, Never> {
             // Process-backed handlers own the exact timeout themselves. A
@@ -363,10 +383,8 @@ public actor SwiftNativeMacControl: MacControlClient {
             guard !Task.isCancelled else { return }
             execution.reachDeadline()
         }
-        MacControlInFlightRegistry.shared.insert(execution, operationId: operationId)
         defer {
             deadlineTask.cancel()
-            MacControlInFlightRegistry.shared.remove(operationId: operationId)
         }
         let signal = await withTaskCancellationHandler {
             await execution.wait()
@@ -414,10 +432,10 @@ public actor SwiftNativeMacControl: MacControlClient {
 
     public func cancel(operationId: String) async throws -> MacControlCancellationResult {
         guard let operationStore else {
-            throw MacControlError.operation("canonical operation store is not configured")
+            throw MacControlError.operation("mac_operation_store_unconfigured: No operation store is configured. Repair NativeAgent's MacControl assembly before requesting cancellation; inspect the affected app with mac.look for prior effects.")
         }
         guard let current = try await operationStore.record(operationId: operationId) else {
-            throw MacControlError.operation("operation not found")
+            throw MacControlError.operation("mac_operation_not_found: No record exists for this operation_id. Check the original receipt's identity and inspect the affected app with mac.look before further action.")
         }
         if current.state.isTerminal {
             return MacControlCancellationResult(
@@ -447,11 +465,11 @@ public actor SwiftNativeMacControl: MacControlClient {
         // actually stopped, raced to a real completion, or became unknowable.
         // Wait only for the bounded settlement grace; never hang the cancel
         // requester on an adapter that ignores cooperative cancellation.
-        var terminal = try await operationStore.record(operationId: operationId)
-        for _ in 0..<300 where terminal?.state == .cancelRequested {
-            try await Task.sleep(nanoseconds: 5_000_000)
-            terminal = try await operationStore.record(operationId: operationId)
-        }
+        let settled = try await operationStore.waitForCancellationSettlement(
+            operationId: operationId, until: .now.advanced(by: .milliseconds(1_500)))
+        let terminal: MacControlOperationRecord?
+        if let settled { terminal = settled }
+        else { terminal = try await operationStore.record(operationId: operationId) }
         return MacControlCancellationResult(
             operationId: operationId,
             state: terminal?.state ?? .cancelRequested,
@@ -625,7 +643,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         // fable51 item 29 — THE MENU BAR ORGAN. `menu` walks; `menu_press`
         // presses through the same actuator every other act uses.
         case "menu":        return handleMenu(body)
-        case "menu_press":  return handleMenuPress(body)
+        case "menu_press":  return await handleMenuPress(body)
         // fable51 item 33 — THE READ ORGAN. Extract a named document, or
         // scroll-and-accumulate the front window's text; either way it hands
         // back the whole thing and the turn's spill pager retains it.
@@ -807,7 +825,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         outcomeCode: String
     ) async throws -> MacControlResult {
         guard let operationStore else {
-            throw MacControlError.operation("canonical operation store is not configured")
+            throw MacControlError.operation("mac_operation_store_unconfigured: No operation store is configured. Repair NativeAgent's MacControl assembly before recording an outcome; inspect the affected app with mac.look for prior effects.")
         }
         if let current = try await operationStore.record(operationId: operationId),
            current.state.isTerminal {
@@ -875,7 +893,7 @@ public actor SwiftNativeMacControl: MacControlClient {
             || macControlDocumentReadActions.contains(action)
             || macControlAccessibilityInjectionActions.contains(action),
            !(policy.trustPolicy.map { MacControlGate.fullMacActive($0) } ?? false) {
-            let reason = "full_mac_inactive: \(action) requires an active Full Mac trust window"
+            let reason = "full_mac_inactive: \(action) requires Full Mac access enabled in Trust"
             let result = Self.refusalResult(action: action, reason: reason, now: now)
             await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body)
             return .refuse(result)
@@ -886,8 +904,9 @@ public actor SwiftNativeMacControl: MacControlClient {
         let pathKeys = macControlFilePolicyPathKeys(forAction: action)
         // A command line is a write on his side whatever it says: it runs only
         // on the one authorization decision (posture × that declared class),
-        // never on its text. Full Mac runs, Work asks, Safe refuses.
-        if action == "shell", let answer = await provider.authorize(tool: "shell", input: body), answer.level != "auto" {
+        // never on its text. Full Mac runs, Work asks, Safe refuses. Every
+        // action meets "Pause everything" here.
+        if let answer = await provider.authorize(tool: action, input: body), answer.level != "auto" {
             let reason = (answer.level == "confirm" ? "needs_approval: " : "blocked: ") + answer.reason
             let result = Self.refusalResult(action: action, reason: reason, now: now, remedy: answer.remedy)
             await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body)
@@ -1005,6 +1024,8 @@ public actor SwiftNativeMacControl: MacControlClient {
 
     /// Append a refusal under the shared cross-process lock. A failed audit
     /// must not turn a refused action into an executed one.
+    /// Local JSONL evidence: off-disk backup only; no local backup/export/phone copy;
+    /// PrivacyMap: mac_control_audit.
     ///
     /// Preserve the legacy receipt's insertion order, Python JSON separators,
     /// and UTC microsecond timestamp. Do not add fields or pass through the

@@ -5,6 +5,7 @@ import NativeAgentShared
 import PersistenceCore
 import MacControl
 import MacIntegration
+// Blueprint: | `InlineInteractionNeed.swift` | `InlineInteractionNeed` enum; `blocksTurn`, `envelope` |
 
 /// Builds the typed "I need something from you" tool envelope that a dispatch
 /// boundary returns INSTEAD of an error string, and reads it back out.

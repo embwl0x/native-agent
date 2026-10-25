@@ -15,9 +15,13 @@
 // The moments lane (MemoryV2+Moments.swift) is untouched and runs beside this.
 
 import Foundation
+import CoreFoundation
 import NativeAgentCore
 import PersistenceCore
 import CognitiveSubstrate
+import TurnTrace
+
+// Blueprint: | `MemoryV2+MemoryManager.swift` | `MemoryManagerLane`: semantic after-turn memory decisions, grounded correction validation and reconciliation against existing rows |
 
 // MARK: - What the manager returns
 
@@ -143,7 +147,7 @@ public struct AfterTurnMemoryFailure: Error, Codable, Sendable, Hashable {
         case deadline, cancelled, provider, invalidJSON, missingSections
         case invalidCaring, invalidAffect, invalidMemories, invalidMoment
         case authExpired, codexCLISessionExpired, rateLimited, overloaded, contextTooLong
-        case network, refused, invalidProviderResponse, routingUnavailable, modelUnavailable
+        case network, outputLimit, refused, requestRejected, invalidProviderResponse, routingUnavailable, modelUnavailable
     }
     public let reason: Reason
     public let recovery: String
@@ -235,8 +239,8 @@ public enum MemoryManagerLane {
 
     // MARK: parse
 
-    /// Decode the model's reply. Accepts an array (the contract), a bare object
-    /// (small models do it), or `[]`. Throws only when the reply is not JSON at
+    /// Decode the model's reply. Accepts an array (the contract), including
+    /// `[]`. Throws only when the reply is not JSON at
     /// all — an empty array is a valid answer, not a failure.
     public static func parse(_ raw: String) throws -> [MemoryManagerDecision] {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -252,47 +256,45 @@ public enum MemoryManagerLane {
         } catch {
             throw FoundationModelsError.decodeFailed(String(describing: error))
         }
-        let objects: [[String: Any]]
-        if let array = decoded as? [Any] {
-            objects = array.compactMap { $0 as? [String: Any] }
-        } else if let single = decoded as? [String: Any] {
-            objects = [single]
-        } else {
-            return []
+        guard let array = decoded as? [Any] else { return [] }
+        // An empty list is abstention; a candidate that is not the declared
+        // shape is a failed reply, held for retry, never a silent drop.
+        let decisions = array.map { ($0 as? [String: Any]).flatMap(decision(from:)) }
+        guard !decisions.contains(where: { $0 == nil }) else {
+            throw FoundationModelsError.decodeFailed("a memory candidate did not match the declared shape")
         }
-        return objects.compactMap(decision(from:))
+        return decisions.compactMap { $0 }
     }
 
     private static func decision(from object: [String: Any]) -> MemoryManagerDecision? {
-        guard let rawStatement = (object["statement"] ?? object["memory"]) as? String else {
+        guard let rawStatement = object["statement"] as? String else {
             return nil
         }
-        let statement = MemoryTextClip.sentenceClip(
-            rawStatement
-                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            cap: statementCap
-        )
-        guard !statement.isEmpty else { return nil }
-        let action = MemoryManagerAction(
-            rawValue: ((object["action"] as? String) ?? "add")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-        ) ?? .skip
-        let kindRaw = ((object["kind"] as? String) ?? "fact")
+        let normalizedStatement = rawStatement
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let updatesId = (object["updates_id"] as? String ?? object["updatesId"] as? String)?
+        let statement = MemoryTextClip.sentenceClip(normalizedStatement, cap: statementCap)
+        if normalizedStatement.count > statementCap {
+            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("M13"), "site": .string("MemoryV2+MemoryManager.swift:decision")]))
+        }
+        guard !statement.isEmpty else { return nil }
+        guard let actionRaw = object["action"] as? String,
+              let action = MemoryManagerAction(rawValue: actionRaw),
+              let kindRaw = object["kind"] as? String, allowedKinds.contains(kindRaw) else { return nil }
+        let updatesId = (object["updates_id"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let evidence = object["standing_evidence"] as? String
+        guard let number = object["confidence"] as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let confidence = number.doubleValue
+        guard confidence.isFinite, (0...1).contains(confidence) else { return nil }
         return MemoryManagerDecision(
             statement: statement,
-            kind: allowedKinds.contains(kindRaw) ? kindRaw : "fact",
-            whyItMatters: ((object["why_it_matters"] as? String)
-                ?? (object["whyItMatters"] as? String) ?? "")
+            kind: kindRaw,
+            whyItMatters: ((object["why_it_matters"] as? String) ?? "")
                 .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
                 .trimmingCharacters(in: .whitespacesAndNewlines),
-            confidence: MemoryMoments.clamp(MemoryMoments.number(object["confidence"]) ?? 0, low: 0, high: 1),
+            confidence: confidence,
             action: action,
             updatesId: (updatesId?.isEmpty == false) ? updatesId : nil,
             correctionSubject: object["subject"] as? String,

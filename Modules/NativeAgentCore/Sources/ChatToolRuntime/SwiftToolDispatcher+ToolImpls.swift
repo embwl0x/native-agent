@@ -5,12 +5,11 @@ import PersistenceCore
 import PersonaEngine
 import Dispatcher
 import Senses
+// Blueprint: | `SwiftToolDispatcher+ToolImpls.swift` | `SwiftToolDispatcher`: `requireNonSensitiveReadPath`, `impl_read_file` (window parsing, ceilings and omitted defaults belong to `FileSystemActions`), `fileReadPresentation`, shared `impl_file_metadata` for list/info, `impl_trusted_file_mutation` (workspace writes and Trash) |
 
 // MARK: - Basic file tools
 
 extension SwiftToolDispatcher {
-
-    static let maxFileBytes: Int = 64 * 1024
 
     /// 2026-09-06: the same sensitive-subtree fence the Full Mac file tools
     /// apply. Full Mac being OFF chose these basic readers instead, and they
@@ -30,19 +29,8 @@ extension SwiftToolDispatcher {
         let path = try requireString(input, "path")
         let url = try await resolveTrustedFilePath(path)
         try requireNonSensitiveReadPath(url, tool: "read_file")
-        let window: Int
-        switch Self.readFileMaxBytes(input["max_bytes"]) {
-        case .omitted: window = Self.maxFileBytes
-        case .bytes(let n): window = min(max(0, n), Self.maxFileBytes)
-        case .invalid:
-            return .object([
-                "ok": .bool(false), "error_code": .string("bad_input"),
-                "reason": .string("max_bytes must be an integer."),
-            ])
-        }
         var patchedInput = input
         patchedInput["path"] = .string(url.path)
-        patchedInput["max_bytes"] = .int(Int64(window))
         let ctx = ConnectorActionContext(repoRoot: url.deletingLastPathComponent().path, dataRoot: dataRoot.path)
         let fileInput = patchedInput
         if FileReadSourceMaterial.metadataOnly {
@@ -78,29 +66,6 @@ extension SwiftToolDispatcher {
             object["next"] = .object(next)
         }
         return .object(object)
-    }
-
-    /// `max_bytes` as the schema declares it. Numeric strings are accepted
-    /// because compiled procedures serialise every field as one; anything else
-    /// is bad_input rather than a silently-ignored field.
-    enum ReadFileWindow { case omitted, bytes(Int), invalid }
-
-    static func readFileMaxBytes(_ value: JSONValue?) -> ReadFileWindow {
-        switch value ?? .null {
-        case .null: return .omitted
-        case .int(let i): return .bytes(Int(i))
-        case .double(let d):
-            // User, 2026-09-06: a byte count is a whole number. Rounding 10.9
-            // down to 10 silently answered a question nobody asked; a caller
-            // that means 10.9 means something this tool cannot do, so say so.
-            guard let i = Int(exactly: d) else { return .invalid }
-            return .bytes(i)
-        case .string(let s):
-            if s.isEmpty { return .omitted }
-            guard let i = Int(s) else { return .invalid }
-            return .bytes(i)
-        default: return .invalid
-        }
     }
 
     /// No path, or an empty one, lists the folder a relative path starts
@@ -170,11 +135,9 @@ extension SwiftToolDispatcher {
         if tool == "write_file" { _ = try requireString(input, "content") }
         let url = try await resolveTrustedFilePath(path, includeRepoSandbox: false)
         let roots = await trustedWorkspaceRoots()
-        var patchedInput = input
-        patchedInput["path"] = .string(url.path)
         let workspaceRoot = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
         if ["move_file", "copy_file"].contains(tool) {
-            patchedInput["destination"] = .string(try await resolveTrustedFilePath(requireString(input, "destination"), includeRepoSandbox: false).path)
+            _ = try await resolveTrustedFilePath(requireString(input, "destination"), includeRepoSandbox: false)
         }
         let ctx = ConnectorActionContext(
             repoRoot: "",
@@ -187,10 +150,16 @@ extension SwiftToolDispatcher {
             personaRoot: PersonaRootResolver.resolve().path,
             workspaceRoot: workspaceRoot.path
         )
-        if let attachment { return LocalConnectorActions.saveAttachment(attachment, input: patchedInput, ctx: ctx) }
+        if let attachment {
+            var attachmentInput = input
+            attachmentInput["path"] = .string(url.path)
+            return LocalConnectorActions.saveAttachment(attachment, input: attachmentInput, ctx: ctx)
+        }
+        // Pass the original spelling: the I/O handler uses the same resolver
+        // as containment, without reinterpreting an already resolved alias.
         guard let result = LocalConnectorActions.fileSystemDefault.run(
             tool,
-            input: patchedInput,
+            input: input,
             ctx: ctx
         ) else {
             throw AutonomyGateError.toolDenied(

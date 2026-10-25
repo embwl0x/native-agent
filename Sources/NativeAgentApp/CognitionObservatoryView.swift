@@ -1,7 +1,10 @@
 import Foundation
+import EngineRuntime
 import Cognition
 import TurnTrace
 import SwiftUI
+
+// Blueprint: | `CognitionObservatoryView.swift` | `CognitionObservatoryView`: research panel assembly, live dependency reads, override controls and persistence/feedback presentation |
 
 enum CognitionObservatoryPanelID: String, CaseIterable, Sendable {
     case controls
@@ -399,9 +402,8 @@ struct CognitionObservatoryView: View {
 
                 // The agent projection and raw all-items table belong here;
                 // the primary Desk keeps zero debug
-                // chrome. Self-contained; loads its own desk state.
+                // chrome. Both render the engine’s retained Desk revision.
                 DeskDebugPanels(
-                    dataRoot: dependencies.dataRoot,
                     agentDisplayName: dependencies.agentDisplayName
                 )
             }

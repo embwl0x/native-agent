@@ -2,6 +2,8 @@ import Foundation
 @preconcurrency import Speech
 @preconcurrency import AVFoundation
 
+// Blueprint: | `SpeechUtterance.swift` | `SpeechUtterance`: original audio/recognition evidence, submitted wording and compact uncertainty projection without rewriting hypotheses |
+
 /// Recognition is evidence attached to the original audio, never a rewrite of it.
 public struct SpeechUtterance: Codable, Hashable, Sendable {
     public struct Hypothesis: Codable, Hashable, Sendable {
@@ -37,11 +39,19 @@ public struct SpeechUtterance: Codable, Hashable, Sendable {
 
     public var face: String { "Transcript: \(correctedText ?? text)" }
 
+    /// What she reads of a voice message: the transcript and the recognizer's
+    /// doubt (the words it was unsure of, with what else they may have been).
+    /// The full recognition record stays on the attachment; every word's
+    /// timing across every hypothesis was ~60K tokens for a one-minute note.
     public func evidence(audioReference: String) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let recognition = String(decoding: try encoder.encode(self), as: UTF8.self)
-        return "[Voice message · audio: \(self.audioReference ?? audioReference)]\n\(face)\nRecognition evidence (confidence as reported): \(recognition)"
+        var lines = ["[Voice message · audio: \(self.audioReference ?? audioReference)]", face]
+        if let correctedText, correctedText != text { lines.append("Recognized as: \(text)") }
+        let unsure = (hypotheses.first?.segments ?? []).filter { $0.confidence > 0 && $0.confidence < 0.5 }.prefix(24).map { segment in
+            "\(segment.text) (\(String(format: "%.2f", segment.confidence))"
+                + (segment.alternatives.isEmpty ? ")" : "; or " + segment.alternatives.prefix(3).joined(separator: ", ") + ")")
+        }
+        if !unsure.isEmpty { lines.append("Unsure words (confidence as reported): " + unsure.joined(separator: ", ")) }
+        return lines.joined(separator: "\n")
     }
 
     /// One user-initiated capture. The attachment owner takes the bytes; abandoned

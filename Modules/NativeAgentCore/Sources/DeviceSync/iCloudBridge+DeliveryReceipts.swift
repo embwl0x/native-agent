@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `iCloudBridge+DeliveryReceipts.swift` | `iCloudBridge`: `appendChatDeliveryReceipt`, `appendActionResponseDeliveryReceipt`, `appendInboundSuccessReceipt` |
 
 extension iCloudBridge {
     /// The durable receipt seam for both CloudKit and Drive sends. Keeping the

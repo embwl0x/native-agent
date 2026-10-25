@@ -6,6 +6,8 @@ import CognitiveSubstrate
 import Context
 import PersistenceCore
 
+// Blueprint: | `CognitionObservatoryView+Metrics.swift` | `CognitionTensionsPresentation`: same-snapshot capacity/counter models for Observatory metrics and pruning panels |
+
 /// One capacity reading for the Observatory's Tensions & Pruning panel. The
 /// counts come from the same runtime snapshot as the panel, while caps come
 /// from that snapshot's effective cognition configuration.
@@ -36,34 +38,17 @@ enum CognitionTensionsPresentation {
     struct Model: Equatable {
         let inhibitedWorkspaceCount: Int
         let counters: [Counter]
-
-        var leads: [String] { counters.compactMap(\.lead) }
-    }
-
-    static func model(
-        configuration: CognitiveConfiguration,
-        nodeCount: Int,
-        workspaceCount: Int,
-        thoughtSeedCount: Int,
-        inhibitedWorkspaceCount: Int
-    ) -> Model {
-        Model(
-            inhibitedWorkspaceCount: inhibitedWorkspaceCount,
-            counters: [
-                counter(label: "Nodes", count: nodeCount, cap: configuration.maximumActiveNodes),
-                counter(label: "Workspace", count: workspaceCount, cap: configuration.maximumWorkspaceItems),
-                counter(label: "Thought seeds", count: thoughtSeedCount, cap: configuration.maximumThoughtSeeds),
-            ]
-        )
     }
 
     static func model(detail: CognitiveObservatoryDetail) -> Model {
-        model(
-            configuration: detail.configuration,
-            nodeCount: detail.substrate.nodes.count,
-            workspaceCount: detail.workspace.items.count,
-            thoughtSeedCount: detail.thoughtSeeds.count,
-            inhibitedWorkspaceCount: detail.workspace.inhibitedNodeIds.count
+        let configuration = detail.configuration
+        return Model(
+            inhibitedWorkspaceCount: detail.workspace.inhibitedNodeIds.count,
+            counters: [
+                counter(label: "Nodes", count: detail.summary.nodeCount, cap: configuration.maximumActiveNodes),
+                counter(label: "Workspace", count: detail.summary.workspaceCount, cap: configuration.maximumWorkspaceItems),
+                counter(label: "Thought seeds", count: detail.summary.thoughtSeedCount, cap: configuration.maximumThoughtSeeds),
+            ]
         )
     }
 

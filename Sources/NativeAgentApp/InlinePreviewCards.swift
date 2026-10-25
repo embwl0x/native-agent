@@ -5,6 +5,8 @@ import Context
 import NativeAgentShared
 import NativeAgentCore
 
+// Blueprint: | `InlinePreviewCards.swift` | `ApprovalDecisionAction.resolve`: one inline approval resolve/toast/refresh sequence shared by deciding surfaces |
+
 /// The ONE approve/deny path. Resolve, toast, refresh the approvals list and
 /// the health card — in that order, with the same toast vocabulary — so every
 /// surface that offers the buttons (Today's "Waiting for you" card) produces
@@ -29,9 +31,7 @@ enum ApprovalDecisionAction {
             }
             // Refresh the approvals list + health card so the row disappears
             // once the decision lands.
-            if let refreshed = try? await appModel.engine.approvals.list() {
-                await MainActor.run { appModel.engine.approvals.records = refreshed }
-            }
+            await appModel.engine.approvals.refresh()
             await appModel.loadHealthCard()
             return failure
         } catch {

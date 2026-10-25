@@ -5,6 +5,8 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 
+// Blueprint: | `NativeCognitionRuntime+Events.swift` | `NativeCognitiveEventFactory` and runtime event ingestion: payload-free motor/provider observations; domain owners retain outcome authority |
+
 enum NativeCognitiveEventFactory {
     static func remoteAction(
         surface: String,

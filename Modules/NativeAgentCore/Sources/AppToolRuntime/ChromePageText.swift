@@ -1,11 +1,13 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnContracts
+import AgentWorkspace
 import PersistenceCore
 import CryptoKit
 import Senses
 import MacControl
 import Privacy
 import Research
+// Blueprint: | `ChromePageText.swift` | `ChromePageText` enum; one `Projection` shares rendered text and addressable rows with the mirror and envelope; ordered inline prose with link proofs, section-named continuation headers, `project`, `rows`, page and folded-control `next`; `contentVersion` shared by the envelope and Chrome news without rendering |
 
 /// Chrome's ordered prose and action rows, with the same receipt on raw and
 /// sense-served reads. Continuations name structural elements on this URL.
@@ -21,6 +23,12 @@ enum ChromePageText {
         let visible = renderedRows(nodes)
         let rows = rows(nodes, visible: visible)
         return Projection(text: render(snapshot, visible: visible, rows: rows), rows: rows, hasVisibleRows: !visible.isEmpty)
+    }
+
+    /// Chrome's reader waited for the tab to load and its deadline passed first.
+    static func loadUnfinished(_ snapshot: JSONValue) -> Bool {
+        guard case .object(let page) = snapshot, case .object(let rendering)? = page["rendering"] else { return false }
+        return rendering["loaded"] == .bool(false)
     }
 
     /// An independent HTTP read retains its own coverage; it cannot prove
@@ -106,6 +114,9 @@ enum ChromePageText {
                 : "no main or article region on this page: read it with scope page to see its content")
         }
         head.append(where_.joined(separator: " · "))
+        if loadUnfinished(snapshot) {
+            head.append("Still loading: Chrome had not finished loading this page when the read's deadline passed, so this read may be partial. Read it again for the rest.")
+        }
 
         var rows = lines(visible)
         var foot: [String] = []
@@ -183,7 +194,7 @@ enum ChromePageText {
             let summary: [String: JSONValue] = if case .object(let summary)? = page["summary"] { summary } else { [:] }
             let hasContent = projection.hasVisibleRows || !(text(summary["text"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             fields["ok"] = .bool(hasContent)
-            fields["status"] = .string(hasContent ? (summary["truncated"] == .bool(true) ? "partial" : "completed")
+            fields["status"] = .string(hasContent ? (summary["truncated"] == .bool(true) || loadUnfinished(snapshot) ? "partial" : "completed")
                 : (next(page) != nil ? "partial" : "failed"))
             if !hasContent { fields["reason"] = .string("read_window_empty") }
             fields["truncated"] = summary["truncated"] ?? .bool(false)

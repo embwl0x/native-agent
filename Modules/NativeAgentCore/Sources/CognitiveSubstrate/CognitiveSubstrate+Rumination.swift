@@ -48,6 +48,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `CognitiveSubstrate+Rumination.swift` | `CognitiveSubstrate` rumination: unresolved weight, bounded external commitments, answer matching and staged relief |
+
 extension CognitiveSubstrate {
 
     // MARK: - Bounds and constants

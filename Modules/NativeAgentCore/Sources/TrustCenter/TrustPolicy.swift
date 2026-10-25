@@ -1,13 +1,13 @@
 import Foundation
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `TrustPolicy.swift` | Typed UI subset, not full authority: security/provider/personality/iOS-remote blocks remain in the raw checked policy sent to the phone |
 
 // MARK: - TrustPolicy
 
-/// The saved trust policy (`trust/policy.json`) in typed form: the headline
-/// scalars plus every surface block the app renders. Keys the model does not
-/// name stay in the raw policy (`loadTrustPolicyChecked`), which remains the
-/// authority; this is its typed read.
+/// Typed UI subset of `trust/policy.json`. Security, provider, personality and
+/// iOS-remote blocks remain in the raw checked dictionary, the full authority
+/// also sent to the phone; encoding this subset cannot replace it.
 public struct TrustPolicy: Sendable, Codable, Hashable {
     public var permissionLevel: String
     public var autonomyDefault: String?
@@ -293,18 +293,18 @@ public struct TrustMemoryPolicy: Sendable, Codable, Hashable {
 
 // Codable mirror of the daemon's macControlPolicy block in trust_policy()
 public struct TrustMacControlPolicy: Sendable, Codable, Hashable {
-    public var enabled: Bool = false
-    public var applesScriptAllowed: Bool = false
-    public var jxaAllowed: Bool = false
-    public var shortcutsAllowed: Bool = true
-    public var accessibilityAllowed: Bool = false
-    public var systemControlAllowed: Bool = false
-    public var fileOpsAllowed: Bool = false
-    public var shellAllowed: Bool = false
-    public var notificationsAllowed: Bool = true
-    public var spotlightAllowed: Bool = true
-    public var approvalRequiredFor: [String] = ["shell", "file_ops", "applescript", "jxa", "accessibility"]
-    public var remoteFromIosAllowed: Bool = false
+    public var enabled: Bool
+    public var applesScriptAllowed: Bool
+    public var jxaAllowed: Bool
+    public var shortcutsAllowed: Bool
+    public var accessibilityAllowed: Bool
+    public var systemControlAllowed: Bool
+    public var fileOpsAllowed: Bool
+    public var shellAllowed: Bool
+    public var notificationsAllowed: Bool
+    public var spotlightAllowed: Bool
+    public var approvalRequiredFor: [String]
+    public var remoteFromIosAllowed: Bool
 
     var wireValue: [String: Any] {
         [
@@ -339,18 +339,18 @@ public struct TrustMacControlPolicy: Sendable, Codable, Hashable {
     }
 
     public init(
-        enabled: Bool = false,
-        applesScriptAllowed: Bool = false,
-        jxaAllowed: Bool = false,
-        shortcutsAllowed: Bool = true,
-        accessibilityAllowed: Bool = false,
-        systemControlAllowed: Bool = false,
-        fileOpsAllowed: Bool = false,
-        shellAllowed: Bool = false,
-        notificationsAllowed: Bool = true,
-        spotlightAllowed: Bool = true,
-        approvalRequiredFor: [String] = ["shell", "file_ops", "applescript", "jxa", "accessibility"],
-        remoteFromIosAllowed: Bool = false
+        enabled: Bool = MacControlPolicyWireSnapshot.defaults.enabled,
+        applesScriptAllowed: Bool = MacControlPolicyWireSnapshot.defaults.applesScriptAllowed,
+        jxaAllowed: Bool = MacControlPolicyWireSnapshot.defaults.jxaAllowed,
+        shortcutsAllowed: Bool = MacControlPolicyWireSnapshot.defaults.shortcutsAllowed,
+        accessibilityAllowed: Bool = MacControlPolicyWireSnapshot.defaults.accessibilityAllowed,
+        systemControlAllowed: Bool = MacControlPolicyWireSnapshot.defaults.systemControlAllowed,
+        fileOpsAllowed: Bool = MacControlPolicyWireSnapshot.defaults.fileOpsAllowed,
+        shellAllowed: Bool = MacControlPolicyWireSnapshot.defaults.shellAllowed,
+        notificationsAllowed: Bool = MacControlPolicyWireSnapshot.defaults.notificationsAllowed,
+        spotlightAllowed: Bool = MacControlPolicyWireSnapshot.defaults.spotlightAllowed,
+        approvalRequiredFor: [String] = MacControlPolicyWireSnapshot.defaults.approvalRequiredFor,
+        remoteFromIosAllowed: Bool = MacControlPolicyWireSnapshot.defaults.remoteFromIosAllowed
     ) {
         self.enabled = enabled
         self.applesScriptAllowed = applesScriptAllowed

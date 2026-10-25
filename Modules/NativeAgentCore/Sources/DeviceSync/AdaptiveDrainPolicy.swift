@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `AdaptiveDrainPolicy.swift` | `AdaptiveDrainPolicy`: receive deadlines from outstanding work, peer activity and proven push; sender retains lost-push recovery |
+
 /// Receive deadlines exist only while delivery or a transport without proven
 /// push needs them. The sender owns recovery from a lost individual push.
 struct AdaptiveDrainPolicy: Equatable {

@@ -5,6 +5,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
+// Blueprint: | `CognitiveSubstrate+Reflection.swift` | `CognitiveSubstrate`: causal `planReflectionChecked`, frozen per-cause peer/node provenance, judged reflection integration and receipts |
 
 /// Who is asking for the introspective call.
 public enum CognitiveReflectionDemand: String, Sendable, Equatable {
@@ -48,26 +49,20 @@ extension CognitiveSubstrate {
     /// canonical growth-proposal owner; reflection does not manufacture generic
     /// schema/memory/identity mirrors without effect executors.
     private var reflectionProposalInvitation: String { """
-    This is your own private reflection — read the state honestly. If something in it \
-    genuinely warrants a settled standing view, you may close with one line beginning:
+    Reflect privately and honestly. If the supplied state earns a specific, durable standing view, you may close with:
       view: <a standing view of yours that has settled — a durable way you see something, not a task or a rule>
-    It must be specific and earned by the state above. It is a proposal for \(userAddress) to \
-    approve, not an action you take. If genuinely nothing has settled, write no view line — a quiet \
-    pass is a correct, expected outcome. Never invent one to fill space.
+    This is a proposal for \(userAddress) to approve, not an action. If nothing has settled, omit it; never invent a view.
     """ }
 
     /// Phase 5 D1 (experiment on): the same invitation, asking for the view's
     /// reasons — what would change her mind — and open to the world, not
     /// only herself. It no longer calls the view User's to approve.
     private var opinionInvitation: String { """
-    This is your own private reflection — read the state honestly. If something in it \
-    genuinely warrants a settled view — about the world or about yourself — you may close with:
+    Reflect privately and honestly. If the supplied state earns a specific, durable view about the world or yourself, you may close with:
       view: <what you think — a durable way you see something, not a task or a rule>
       because: <why you think it>
       unless: <what evidence or argument would change your mind; for a matter of taste write "taste">
-    It must be specific and earned by the state above. It is yours, not an action you take. \
-    If genuinely nothing has settled, write no view line — a quiet pass is a correct, expected \
-    outcome. Never invent one to fill space.
+    The view is yours, not an action. If nothing has settled, omit it; never invent a view.
     """ }
 
     /// Admission-checked planning. A `.spontaneous` call must be earned by
@@ -84,14 +79,17 @@ extension CognitiveSubstrate {
         let admission = await reflectionAdmission(demand: demand)
         guard admission.admitted else { return .refused(admission) }
         let now = dependencies.now()
-        let capsule = await compileCapsule(
+        let read = await frozenRead(at: now)
+        // Reflection inspects the frozen state without resolving turn cues or
+        // committing presentation cadence.
+        let capsule = compileFrozenCapsulePresentation(
             CognitiveCapsuleRequest(
                 surface: "reflection",
                 userMessage: reason,
                 mode: .inspectOnly,
                 maximumCharacters: min(800, configuration.maximumCapsuleCharacters)
-            )
-        )
+            ), from: read
+        ).capsule
         let frozenEvidence = capsule.provenanceNodeIds
         let nodes = field.peekNodes()
         // A committed wake supplies its own causes. Requested reflection uses
@@ -142,7 +140,7 @@ extension CognitiveSubstrate {
         State preview:
         \(capsule.combined)
         """
-        // compileCapsule is async. Recheck after it returns: another manual or
+        // frozenRead is async. Recheck after it returns: another manual or
         // scheduled planner may have claimed the final slot while this actor was
         // reentrant, or Settings may have disabled/lowered the budget.
         let recheck = await reflectionAdmission(demand: demand)
@@ -180,9 +178,13 @@ extension CognitiveSubstrate {
     @discardableResult
     public func releaseReflectionReservation(request: CognitiveReflectionRequest) async -> Bool {
         await waitForMaintenanceTransition()
-        guard let id = request.reservationId, reflectionReservation?.id == id else { return false }
+        guard ownsReflectionReservation(request) else { return false }
         reflectionReservation = nil
         return true
+    }
+
+    func ownsReflectionReservation(_ request: CognitiveReflectionRequest) -> Bool {
+        request.reservationId.map { reflectionReservation?.id == $0 } ?? false
     }
 
     @discardableResult
@@ -194,12 +196,14 @@ extension CognitiveSubstrate {
         judgment: CognitiveReflectionJudgment? = nil
     ) async -> CognitiveReflectionReceipt? {
         await waitForMaintenanceTransition()
-        let ownedBudgetSlot = request.reservationId.map { reflectionReservation?.id == $0 } ?? false
         let integrationEnabled = configuration.enabled && configuration.reflectiveCallsEnabled
         // Only a request issued by planReflection may consume the public
         // terminal path. A nil token is not a compatibility bypass, and a late
         // expired request cannot integrate or release a newer reservation.
-        guard ownedBudgetSlot else { return nil }
+        guard ownsReflectionReservation(request) else { return nil }
+        defer {
+            if ownsReflectionReservation(request) { reflectionReservation = nil }
+        }
         let selected = Set(judgment?.sources ?? [])
         let sourceNodeIds = Array(Set(selected.flatMap { request.material[$0]?.sourceNodeIds ?? [] }))
             .sorted { $0.uuidString < $1.uuidString }
@@ -218,8 +222,11 @@ extension CognitiveSubstrate {
         )
         if integrationEnabled, !cancelled, let judgment {
             receipt.proposalIds = await parseReflectionProposals(receipt: receipt, source: judgment.reflection)
+            guard ownsReflectionReservation(request) else { return nil }
             if let tone = judgment.affect {
-                await integrateDisposition(tone: tone, at: dependencies.now(), source: "reflection", undoable: true)
+                await integrateDisposition(tone: tone, at: dependencies.now(), source: "reflection", undoable: true,
+                                           reflectionRequest: request)
+                guard ownsReflectionReservation(request) else { return nil }
             }
         }
         receipt.proposalYieldScore = reflectionYieldScore(
@@ -234,13 +241,15 @@ extension CognitiveSubstrate {
         // that has now come back independently becomes her opinion.
         if integrationEnabled, !cancelled, let judgment {
             await settleOpinionReconsideration(receipt: receipt, source: judgment.reflection)
+            guard ownsReflectionReservation(request) else { return nil }
             await formOpinionsFromIndependentRecurrence(trigger: receipt, at: dependencies.now())
+            guard ownsReflectionReservation(request) else { return nil }
         }
-        // Install terminal budget accounting before releasing the reservation.
-        // Proposal/affect/disposition integration above is reentrant; clearing
-        // this earlier let another planner claim the same final daily slot.
-        reflectionReservation = nil
+        // Keep the token through all integration, and release only this token
+        // in defer. A clear or newer reservation supersedes this result.
         if integrationEnabled, !cancelled, let takeaway = judgment?.takeaway {
+            await waitForMaintenanceTransition()
+            guard ownsReflectionReservation(request) else { return nil }
             _ = await addThoughtSeed(
                 kind: .reflectionTakeaway,
                 text: takeaway,
@@ -248,8 +257,11 @@ extension CognitiveSubstrate {
                 sourceNodeIds: sourceNodeIds,
                 sourcePeerIds: request.sourcePeerIds,
                 materialProvenances: selected.sorted(),
-                undoable: true
+                marksSubstrateDirty: true,
+                undoable: true,
+                reflectionRequest: request
             )
+            guard ownsReflectionReservation(request) else { return nil }
         }
         return receipt
     }
@@ -259,13 +271,8 @@ extension CognitiveSubstrate {
     /// checked before the terminal receipt, so a durable receipt can never point
     /// at proposal tissue that failed to land.
     public func persistReflectionResultChecked(_ receipt: CognitiveReflectionReceipt) async throws {
-        guard reflectionReceipts[receipt.id] == receipt else {
-            throw CognitivePersistenceError.artifactWriteFailed(
-                family: "reflection_receipt",
-                detail: "receipt was not integrated through the reservation-owned substrate path"
-            )
-        }
         for proposalId in receipt.proposalIds {
+            try requireIntegratedReflectionReceipt(receipt)
             if let view = standingViews[proposalId] {
                 try await persistArtifactChecked(
                     kind: "standing_view",
@@ -289,6 +296,7 @@ extension CognitiveSubstrate {
                 )
             }
             for event in timelineEvents(for: proposalId) {
+                try requireIntegratedReflectionReceipt(receipt)
                 try await persistArtifactChecked(
                     kind: "developmental_timeline",
                     id: event.id,
@@ -298,6 +306,7 @@ extension CognitiveSubstrate {
                 )
             }
         }
+        try requireIntegratedReflectionReceipt(receipt)
         try await persistArtifactChecked(
             kind: "reflection_receipt",
             id: receipt.id,
@@ -305,6 +314,15 @@ extension CognitiveSubstrate {
             score: 0,
             payload: receipt.toJSON()
         )
+    }
+
+    private func requireIntegratedReflectionReceipt(_ receipt: CognitiveReflectionReceipt) throws {
+        guard reflectionReceipts[receipt.id] == receipt else {
+            throw CognitivePersistenceError.artifactWriteFailed(
+                family: "reflection_receipt",
+                detail: "receipt was not integrated through the reservation-owned substrate path"
+            )
+        }
     }
 
     public func reflectionReceiptSnapshot() async -> [CognitiveReflectionReceipt] {

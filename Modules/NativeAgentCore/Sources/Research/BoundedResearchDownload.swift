@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `BoundedResearchDownload.swift` | `BoundedResearchDownload`: cancellable URLSession delegate download with retained-byte limits enforced before appending |
+
 /// A data-task delegate bounds retained bytes before appending. This avoids
 /// URLSession.data buffering the entire remote response before a later clip.
 final class BoundedResearchDownload: NSObject, URLSessionDataDelegate, @unchecked Sendable {

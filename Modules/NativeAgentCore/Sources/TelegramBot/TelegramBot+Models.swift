@@ -5,6 +5,8 @@ import TurnTrace
 import BackgroundLoops
 import ProviderRouting
 
+// Blueprint: | `TelegramBot+Models.swift` | Telegram wire models: typed API failures/results, sender/update/message/reply context and callback number decoding |
+
 // MARK: - TelegramStatus
 
 public struct TelegramStatus: Sendable, Codable, Equatable {
@@ -196,7 +198,7 @@ public struct TelegramAPIFailure: Error, LocalizedError, CustomStringConvertible
     }
 
     public var errorDescription: String? {
-        var detail = "telegram: \(operation) \(kind.rawValue)"
+        var detail = "telegram_\(kind.rawValue): \(operation)"
         if let httpStatus { detail += " (HTTP \(httpStatus))" }
         if let errorCode { detail += " [Telegram \(errorCode)]" }
         if let telegramDescription, !telegramDescription.isEmpty {
@@ -210,6 +212,19 @@ public struct TelegramAPIFailure: Error, LocalizedError, CustomStringConvertible
             // state.json/errors.jsonl, so a migration hint cannot disappear
             // behind a generic rejection.
             detail += " [migrate_to_chat_id=\(chatID)]"
+        }
+        if let chatID = parameters?.migrateToChatId {
+            detail += ". Update the destination to \(chatID) in Telegram setup."
+        } else if let seconds = parameters?.retryAfter, seconds > 0 {
+            detail += ". Wait \(seconds)s; inspect the Telegram delivery receipt before resending."
+        } else if httpStatus == 401 || errorCode == 401 {
+            detail += ". Replace the rejected bot token in Telegram setup."
+        } else if httpStatus == 403 || errorCode == 403 {
+            detail += ". Check the bot's access to this chat in Telegram."
+        } else if kind == .malformedResponse || kind == .malformedResult {
+            detail += ". Have the runtime owner inspect the \(operation) transport response; delivery is unconfirmed."
+        } else {
+            detail += ". Inspect the \(operation) request and Telegram delivery receipt before resending."
         }
         return detail
     }
@@ -229,10 +244,10 @@ public enum TelegramBotError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .invalidRequest: return "telegram: invalid request"
-        case .notConfigured: return "telegram: bot token / chat not configured"
-        case .invalidResponse(let s): return "telegram: native transport returned unexpected status \(s)"
-        case .unavailable: return "telegram: unavailable"
+        case .invalidRequest: return "telegram_request_invalid: Request or destination is invalid. Check the request fields and allowed destination in Telegram setup."
+        case .notConfigured: return "telegram_not_configured: Bot token or destination is missing. Set both in Telegram setup."
+        case .invalidResponse(let s): return "telegram_http_failed: Transport returned HTTP \(s). Inspect Telegram connection status and the delivery receipt before resending."
+        case .unavailable: return "telegram_delivery_unavailable: Delivery cannot proceed. Inspect the saved reply and destination in Telegram setup."
         case .underlying(let m): return "telegram: \(m)"
         }
     }

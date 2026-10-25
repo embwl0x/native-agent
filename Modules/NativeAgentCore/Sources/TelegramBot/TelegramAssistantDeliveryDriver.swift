@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `TelegramAssistantDeliveryDriver.swift` | `TelegramAssistantDeliveryDriver` actor; `onDelta`, `finalize` |
 
 enum TelegramAssistantDeliveryOutcome: Sendable, Equatable {
     case delivered(messageId: Int?)

@@ -42,7 +42,8 @@ provider request from them.
 ## 1. Anatomy of resident context and a turn
 
 A turn combines a checked provider route, selected Context atoms, bounded
-history, any useful plan hint and optional inner state. The prepared Context
+history and optional inner state. Turn plans feed tracing and result settlement
+without being appended to model context. The prepared Context
 turn leases one generation through the model/action loop; a later source
 change belongs to a later generation.
 
@@ -114,9 +115,9 @@ Knowledge Graph and Context projections do not replace MemoryV2's authority.
 
 Relevant memories can arrive through resident selection. `memory.recall`
 supports deeper retrieval, while `chat.search` and `chat.message` recover
-conversation wording. Skills provide guidance through `skill.read` and can
-carry optional admitted scripts. `skill.save`, `skill.enable`, `skill.run`,
-`skill.resume` and `skill.rollback` manage those procedures; see the
+conversation wording. Skills are built-in guidance, read through `ability.read`; what they writes is a
+ability, saved with `ability.save` and run as `authored.<id>`, with `ability.enable`,
+`ability.resume` and `ability.rollback` in its one lifecycle; see the
 [manifest spec](skill_manifest_spec.md). Skills are not factual memory and
 grant no new authority.
 
@@ -164,18 +165,17 @@ Different kinds of growth return through different owners:
 | Cognitive capsule and organism posture | Optional advisory input to a turn |
 | Dream synthesis | Dream diary |
 | REM consolidation | Reviewable lessons targeting `GROWTH.md` |
-| Skills | Reusable procedural guidance and optional admitted scripts |
-| Authored tools | Active registry entries exposed as `authored.<id>` |
+| Skills | Built-in guidance, read through `ability.read` |
+| Authored abilities | Kept executable parts exposed as `authored.<id>` |
 
 Dream and REM use `DreamREMCycle`. REM stages growth proposals;
 `ApprovalTransactionCoordinator` applies an approved lesson through
 `REMGrowthWriter` and its prompt pin. A diary entry alone does not approve a
 persona change.
 
-Tool authoring follows `tool.propose` → `tool.approve` →
-`authored.<id>`, subject to current authority. MCP tools are generated as
-`mcp.<server>.<tool>` from the mounted server's live list. Neither route adds
-a second model-facing tool schema.
+Ability authoring follows `ability.save` → kept (theirs under Full Mac, else the
+owner's card through `ability.enable`) → `authored.<id>`, subject to current authority. It adds
+no second model-facing tool schema.
 
 Cognitive state remains advisory; Context is derived. Neither replaces persona,
 memory or permission stores. See [Cognition Wiring](COGNITION_WIRING.md),

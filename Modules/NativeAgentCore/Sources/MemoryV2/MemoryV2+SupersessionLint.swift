@@ -24,6 +24,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `MemoryV2+SupersessionLint.swift` | `MemorySupersessionLint` and `MemoryFragmentUsageProtection`: disclosure-scoped retirement matching and protection for used memory fragments |
+
 // MARK: - Tunables
 
 /// Quoted phrase (path a) must be at least this long to bind a retirement to a

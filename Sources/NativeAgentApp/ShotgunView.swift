@@ -1,8 +1,10 @@
 import AppKit
-import ChatOrchestration
+import ChatSessionWork
 import NativeAgentCore
 import NativeAgentShared
 import SwiftUI
+
+// Blueprint: | `ShotgunView.swift` | `ShotgunView`: driving-session transcript/composer, live step and Stop/Resume/Watch controls through existing owners |
 
 /// What Shotgun shows (Shotgun.swift owns the window): her live step as one
 /// line on top, the last ten messages of the chat on screen with her reply
@@ -20,13 +22,11 @@ struct ShotgunView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @AppStorage("nativeagent.darkMode") private var preferDark = true
     @State private var watching = false
     @State private var draft = ""
     @State private var notice: String?
     @State private var sending = false
     @State private var inlineCards = InlineInteractionChatBinding()
-    @State private var mirrorCards: [String: InlineInteractionChatBinding] = [:]
     @FocusState private var composerFocused: Bool
 
     var body: some View {
@@ -45,13 +45,7 @@ struct ShotgunView: View {
         let mirrorRows = all.filter { $0.metadata?.interactionMirror != nil }
         let mirrorSessions = Set(mirrorRows.compactMap { $0.metadata?.interactionMirror?.sessionID }).sorted()
         let waiting = all.contains(where: hasPendingApproval)
-            || inlineCards.cardsByRow.values.contains { $0.contains { $0.needsAttention } }
-            || mirrorRows.contains { message in
-                guard let mirror = message.metadata?.interactionMirror else { return false }
-                guard let binding = mirrorCards[mirror.sessionID] else { return true }
-                return binding.cardsByRow.values.flatMap { $0 }
-                    .first { $0.id == mirror.interactionID }?.needsAttention == true
-            }
+            || all.contains { appModel.engine.transcripts.cards(forRow: $0.id, in: sessionId).contains { $0.needsAttention } }
         let done = !running && !waiting && turn?.isTerminal == true
         Group {
             if controller.collapsed && !running && !waiting {
@@ -60,37 +54,24 @@ struct ShotgunView: View {
                 full(sessionId: sessionId, turn: turn, preview: preview, running: running)
             }
         }
-        .preferredColorScheme(preferDark ? .dark : nil)
+        .preferredColorScheme(AppearanceController.shared.colorScheme)
         .onChange(of: done && controller.isShown, initial: true) { _, now in controller.setDone(now) }
         .onChange(of: draft) { _, _ in notice = nil }
         .inlineCardSetup(inlineCards)
-        .task(id: sessionId) { await inlineCards.refresh(sessionID: sessionId) }
-        // Keep origin bindings alive even while the decision rows are folded away.
-        .task(id: [sessionId] + mirrorRows.map(\.id)) {
-            mirrorCards = Dictionary(uniqueKeysWithValues: mirrorSessions.map { origin in
-                (origin, mirrorCards[origin] ?? InlineInteractionChatBinding())
-            })
-            for origin in mirrorSessions {
-                guard !Task.isCancelled, let binding = mirrorCards[origin] else { return }
-                await binding.refresh(sessionID: origin)
-            }
-        }
-        .onChange(of: appModel.engine.transcripts.structureVersion) { _, _ in
-            inlineCards.refreshSoon(sessionID: sessionId)
-        }
+        .task(id: sessionId) { await appModel.engine.transcripts.refreshCards(in: sessionId) }
         .onReceive(NotificationCenter.default.publisher(for: InlineInteractionWire.changedNotification)) { note in
             guard let origin = note.object as? String else { return }
-            if origin == sessionId { Task { await inlineCards.refresh(sessionID: sessionId) } }
-            if let binding = mirrorCards[origin] { Task { await binding.refresh(sessionID: origin) } }
+            if origin == sessionId || mirrorSessions.contains(origin) {
+                Task { await appModel.engine.transcripts.refreshCards(in: sessionId) }
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
             guard note.object as? String == sessionId else { return }
-            Task { await inlineCards.refresh(sessionID: sessionId) }
+            Task { await appModel.engine.transcripts.refreshCards(in: sessionId) }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
             guard note.object is ShotgunPanel else { return }
             Task { await inlineCards.verifyOnReturn() }
-            for binding in mirrorCards.values { Task { await binding.verifyOnReturn() } }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Shotgun")
@@ -254,7 +235,7 @@ struct ShotgunView: View {
         let shown = Array(all.filter { $0.role == "user" || $0.role == "assistant" }.suffix(10))
         let decisionRows = all.filter { message in
             hasPendingApproval(message) || message.metadata?.interactionMirror != nil
-                || inlineCards.cards(forRow: message.id).contains { $0.needsAttention }
+                || appModel.engine.transcripts.cards(forRow: message.id, in: sessionId).contains { $0.needsAttention }
         }
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
@@ -275,13 +256,7 @@ struct ShotgunView: View {
                     if hasPendingApproval(message) {
                         InlineApprovalCard(message: message)
                     }
-                    if let mirror = message.metadata?.interactionMirror,
-                       let binding = mirrorCards[mirror.sessionID] {
-                        InteractionInboxCard(mirrorOf: .init(sessionID: mirror.sessionID,
-                                                            interactionID: mirror.interactionID),
-                                             hidesAnswered: true, binding: binding)
-                    }
-                    ChatInlineCardHost(cards: inlineCards.cards(forRow: message.id).filter { $0.needsAttention }) { card, action in
+                    ChatInlineCardHost(cards: appModel.engine.transcripts.cards(forRow: message.id, in: sessionId).filter { $0.needsAttention }) { card, action in
                         inlineCards.handle(card: card, action: action, appModel: appModel)
                     }
                 }

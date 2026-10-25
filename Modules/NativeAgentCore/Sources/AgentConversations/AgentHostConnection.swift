@@ -7,6 +7,7 @@ import NativeAgentCore
 import Security
 import PersistenceCore
 import Experiences
+// Blueprint: | `AgentHostConnection.swift` | `AgentHostConnection` enum; `builderWorkspaceRoot`, `isNamedConnect`; Connect resolves host or exact peer identity (a peer only in its own workspace; another folder is that folder's own contact), re-mints a missing key on the same contact, retires proof and rewrites only its connector entry under the settings lock; elevation remains store-owned; disconnect revokes before settings cleanup and keeps failed cleanup owed to the person through RepairOwed and fileRepairInstruction; missing helpers and secure-random failures name the defect and person; `verifySetup` stays read-only |
 
 /// One reversible setup path for discovery and the person's Connect action.
 ///
@@ -34,7 +35,7 @@ public enum AgentHostConnection {
         }
         return tool == "agent_connect" && absent("endpoint") && absent("app_bundle_id")
             && (absent("transport") || input["transport"] == .string("auto"))
-            && (absent("disconnect") || input["disconnect"] == .bool(false))
+            && (absent("disconnect") || input["disconnect"] == .bool(false)) && absent("ability")
     }
 
     public enum Refusal: Error, LocalizedError, Equatable {
@@ -55,7 +56,7 @@ public enum AgentHostConnection {
             case .notInstalled(let name):
                 return "Installation check failed: \(name). Nothing was changed."
             case .linkCommandMissing:
-                return "Helper check failed: \(Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("nativeagent-link").path ?? "app executable unavailable") must be a regular installed nativeagent-link file. Reinstall the complete app bundle, then agent.verify. Nothing was changed."
+                return "Helper check failed: \(Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("nativeagent-link").path ?? "app executable unavailable") must be a regular installed nativeagent-link file. Tell the person this copy of NativeAgent has a missing or invalid contact helper. Nothing was changed."
             case .notInApplications:
                 return "Helper path \(AgentHostDirectory.linkCommandPath() ?? "missing") is under /Volumes or /AppTranslocation. Move the complete app to Applications so its connector path persists, then agent.verify. Nothing was changed."
             }
@@ -166,7 +167,7 @@ public enum AgentHostConnection {
         if row.route == .grokBot {
             return """
             Connect to Grok Bot?
-            I'll create a routine named for NativeAgent in Grok Bot's current chat, using its desktop app. Keep the chat you want open; I will stop if it is ambiguous or has a draft.
+            I'll create a routine named for NativeAgent in this connection's selected Bot chat, using its desktop app. Setup stops if that chat is ambiguous or has a draft.
             Grok Bot will ask you to approve running a small local reply command each time, unless you have chosen otherwise in Grok Bot. Ask-every-time means this is not unattended. I will not change that policy; it is independent of NativeAgent Full Mac.
             Reply command: \(proposal.command) reply
             I'll read the routine's webhook URL and key directly into Keychain through Accessibility. If that cannot be done safely, this card offers one secure paste field. Never paste credentials in chat.
@@ -182,8 +183,7 @@ public enum AgentHostConnection {
             Program: \(proposal.executable?.path ?? "unavailable")
             The program at this path is what will be run. Its absolute path, file identity and digest are re-checked before every launch. If they change, nothing runs until you review a fresh approval. This uses the same trust in files in your folders as any app launch on a Mac.
             \(executableChanges(proposal))
-            Reported version: \(proposal.executable?.version ?? "not reported")
-            \(row.acp!.versionNote(proposal.executable?.version))
+            Version: read from its --version only after you approve. Written against \(row.acp!.referenceVersion) (ACP registry pin).
             Requested mode: \(row.acp!.permissionMode). This is the program's own restriction, not an enforcement guarantee from this app.
             Its conversations get two tools to message this agent and read the answer, with a key belonging only to this connection.
             This app does not edit its settings, restart an existing session, or open network access for this connection. You can disconnect later to revoke its messaging key.
@@ -484,12 +484,15 @@ public enum AgentHostConnection {
                 outcome = try removeEntry(row: row, store: store, peerID: contact.id)
             } catch {
                 let id = "peer-cleanup:" + UUID().uuidString.lowercased()
-                let detail = "Credential revoked for peer:\(contact.id). Settings cleanup remains owed: \(error.localizedDescription). Restore the original ownership receipt, then disconnect this exact peer again; or let go of cleanup and preserve the unproven settings bytes."
+                let detail = "Credential revoked for peer:\(contact.id). Configuration removal failed: \(error.localizedDescription)."
+                let repair = ToolFailureError.fileRepairInstruction(URL(fileURLWithPath: row.expandedConfigPath),
+                    shape: "Contact configuration removal failed: \(error.localizedDescription). Inspect its ownership receipt at \(backupRecordURL(row: row, store: store).path) and named displaced paths. Preserve every displaced version, other contact's entry and secret value; never print secrets, invent ownership or delete an unproven file.")
                 RepairOwed.owe(root, id: id, kind: .act, operation: operation,
-                    owner: backupRecordURL(row: row, store: store).path, words: detail,
-                    nextCall: ToolFailureError.call("app", ["action": .string("repair.let_go"),
-                        "args": .object(["id": .string(id), "reason": .string("Credential revoked; preserve unproven settings bytes.")])]))
-                throw ToolFailureError(detail, effects: .occurred)
+                    owner: row.expandedConfigPath, words: detail, tap: repair)
+                throw ToolFailureError(detail, effects: .partial, owner: row.expandedConfigPath,
+                    tap: repair,
+                    code: "agent_configuration_removal_failed",
+                    instruction: repair, recovery: .repair)
             }
             _ = try store.remove(contact.id)
             if row.format != .shellEnvironment {
@@ -554,8 +557,12 @@ public enum AgentHostConnection {
     /// bearer validator already enforces.
     private static func mintKey() throws -> String {
         var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            throw AgentPeerCredentials.CredentialError.unavailable
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else {
+            throw ToolFailureError("Contact credential generation failed: macOS secure random generator returned \(status).", effects: .none,
+                owner: "macOS secure random generator",
+                tap: "Tell the person: macOS secure random generation failed with status \(status) while creating a contact credential; no credential was created.",
+                code: "agent_credential_generation_failed", instruction: "Report the macOS random-generator failure to the person before connecting; no credential was created.", recovery: .repair)
         }
         return Data(bytes).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")

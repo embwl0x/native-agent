@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+Research.swift` | `CognitiveSubstrate`: `setAblation`, `facultyMeasurementSnapshot`, `runResearchExperiment` |
 
 extension CognitiveSubstrate {
     public func setAblation(_ key: String, enabled: Bool) async {

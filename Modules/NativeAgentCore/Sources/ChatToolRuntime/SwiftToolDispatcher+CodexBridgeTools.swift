@@ -1,21 +1,16 @@
 import AgentWorkspace
 import Foundation
-import Darwin
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
+// Blueprint: | `SwiftToolDispatcher+CodexBridgeTools.swift` | `SwiftToolDispatcher`: `codexBrainControls`, `agentBridgeReplyOrigin`, `runCodexMessage`; inbox admission delegates to `codex_wake_inbox_projection.js`, the sole inbox/history mutation owner, with the helper's directory lock; SubprocessWork settlement retains partial replies and writes the terminal audit and Runs projection |
 
 extension SwiftToolDispatcher {
     // MARK: - Codex return-channel handler
@@ -146,7 +141,6 @@ extension SwiftToolDispatcher {
         for candidate in candidates {
             guard let checkout = GitHubCommandCheckoutResolver.resolve(
                 repository: candidate,
-                headSHA: nil,
                 dataRoot: dataRoot
             ) else { continue }
             let path = checkout.standardizedFileURL.path
@@ -215,8 +209,8 @@ extension SwiftToolDispatcher {
         let isFollowUp = Self.builderConversationReferenceSupplied(in: input)
 
         // Any caller may name an owner/name GitHub repository.
-        // It is NOT a path -- the app resolves it through the same
-        // remote-verified resolver the GitHub Command lane uses, so the trust
+        // It is NOT a path -- the app resolves it through the remote-verified
+        // resolver, so the trust
         // anchor stays "this checkout's git remote really is that repo" rather
         // than "the model said so". An unresolvable or malformed repository
         // yields nil and the send proceeds with today's no-profile behavior.
@@ -228,7 +222,6 @@ extension SwiftToolDispatcher {
             guard Self.isWellFormedRepositorySlug(value) else { return nil }
             guard let checkout = GitHubCommandCheckoutResolver.resolve(
                 repository: value,
-                headSHA: nil,
                 dataRoot: dataRoot
             ) else { return nil }
             return checkout.standardizedFileURL.path
@@ -292,11 +285,10 @@ extension SwiftToolDispatcher {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
         } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_dir_create_failed"),
-                "detail": .string(String(describing: error)),
-            ])
+            return .object(Self.builderFailureFields(error,
+                tool: "codex_message", reason: "inbox_dir_create_failed", effects: .none,
+                owner: dir.path,
+                instruction: "Repair the Codex inbox directory's reported storage error. No message was queued."))
         }
 
         let timestamp = ISO8601DateFormatter().string(from: Date())
@@ -325,64 +317,36 @@ extension SwiftToolDispatcher {
         if let deskHandle { entry["deskHandle"] = .string(deskHandle) }
         if pairReviewer { entry["pairReviewer"] = .bool(true) }
         if completionMode == "receipt_only" { entry["completionMode"] = .string(completionMode) }
-        let inboxEntry = entry
-
-        let persistence = SwiftNativePersistenceCore()
-        let quarantineNote = Self.BuilderInboxQuarantineNote()
-        let appendResult: (status: String, retryWake: Bool, queuedAt: String)
-        do {
-            appendResult = try await Self.withCodexInboxDirectoryLock(bridgeDirectory: dir) {
-                try await persistence.withFileLock(inboxURL) {
-                    let live = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence, quarantine: quarantineNote)
-                    let existing: JSONValue?
-                    if let live { existing = live }
-                    else {
-                        let historyURL = Self.codexInboxHistoryURL(messageId, inboxURL: inboxURL)
-                        let archived: JSONValue?
-                        do { archived = try JSONValue.parse(Data(contentsOf: historyURL)) }
-                        catch CocoaError.fileReadNoSuchFile { archived = nil }
-                        if let archived {
-                            guard case .object(let row) = archived,
-                                  row["id"] == nil || row["messageId"] == nil || row["id"] == row["messageId"],
-                                  row["messageId"] == .string(messageId) || row["id"] == .string(messageId) else {
-                                throw PersistenceCoreError.ioFailure("codex inbox retry identity is unreadable; original bytes preserved")
-                            }
-                            existing = archived
-                        } else { existing = nil }
-                    }
-                    try await Self.compactCodexInbox(inboxURL: inboxURL, persistence: persistence)
-                    if case .object(let object)? = existing {
-                        // Inbox persistence precedes helper admission. An explicit
-                        // retry must keep that exact work order, including its
-                        // reply route and requested brain, even if no helper job
-                        // exists yet to supply canonical duplicate protection.
-                        let operationFields = [
-                            "text", "topic", "conversationId", "workingDirectory",
-                            "executionProfile", "deskHandle", "completionMode", "pairReviewer",
-                            "sessionId", "origin", "brain", "priority",
-                            "model", "reasoningEffort", "serviceTier", "fast",
-                        ]
-                        guard operationFields.allSatisfy({ object[$0] == inboxEntry[$0] }) else {
-                            return ("conflict", false, timestamp)
-                        }
-                        // GitHub commands intentionally may have no chat session;
-                        // equality of the stored origin still binds their route.
-                        return ("duplicate", Self.builderInboxAllowsExplicitWakeRetry(object, requiresSession: false),
-                                Self.stringField("createdAt", in: .object(object)) ?? timestamp)
-                    }
-                    try await persistence.appendJSONL(.object(inboxEntry), to: inboxURL)
-                    return ("appended", false, timestamp)
-                }
-            }
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
+        guard let helper = AgentBridgeRuntime.codexHelperURL(dataRoot: dataRoot) else {
             return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_write_failed"),
-                "detail": .string(String(describing: error)),
+                "status": .string("failed"), "reason": .string("helper_not_found"),
+                "remedy": Self.builderFailureRemedy(owner: "NativeAgent app bundle / codex_thread_wakeup.js", instruction: "The bundled Codex wake helper is missing."),
             ])
         }
+        let receipt = await runAgentWakeupHelper(
+            helper: helper,
+            inputData: try JSONValue.object(["inboxPath": .string(inboxURL.path), "entry": .object(entry)]).serializedData(pretty: false),
+            cwd: dir,
+            cli: "codex", variable: "CODEX_BIN", timeout: 40, launchArguments: ["--append-inbox"]
+        )
+        guard case .object(let fields) = receipt, case .string(let status)? = fields["status"],
+              ["appended", "duplicate", "conflict"].contains(status) else {
+            if case .object(var failure) = ChatToolOutcome.normalizedFailure(receipt, tool: "codex_message"),
+               failure["reason"] == .string("inbox_write_failed"), failure["remedy"] == nil {
+                failure["remedy"] = Self.builderFailureRemedy(owner: inboxURL.path,
+                    instruction: "Repair the reported inbox storage error from retained rows and message identities. Reconcile this message_id before another send; this wake did not launch.")
+                failure["messageId"] = .string(messageId)
+                return .object(failure)
+            }
+            return receipt
+        }
+        let appendResult = (
+            status: status,
+            retryWake: fields["retryWake"] == .bool(true),
+            queuedAt: Self.stringField("queuedAt", in: receipt) ?? timestamp
+        )
+        let quarantineNote = Self.BuilderInboxQuarantineNote()
+        if let path = Self.stringField("quarantinedPath", in: receipt) { quarantineNote.record(path) }
         let path = inboxURL.path
         guard appendResult.status != "conflict" else {
             return .object([
@@ -510,123 +474,6 @@ extension SwiftToolDispatcher {
         return .object(response)
     }
 
-    private static func codexInboxHistoryURL(_ messageID: String, inboxURL: URL) -> URL {
-        let key = SHA256.hash(data: Data(messageID.utf8)).map { String(format: "%02x", $0) }.joined()
-        return inboxURL.deletingLastPathComponent().appendingPathComponent("codex-inbox-history", isDirectory: true)
-            .appendingPathComponent(key + ".json")
-    }
-
-    /// Caller holds both inbox locks. Archive consumed briefs and terminal
-    /// delivery failures with their full retry identity before removing them
-    /// from the hot inbox. Pending deliveries and reply jobs are never pruned here.
-    private static func compactCodexInbox(inboxURL: URL, persistence: SwiftNativePersistenceCore) async throws {
-        let scan = try await persistence.readJSONLReporting(inboxURL)
-        guard scan.report.isClean, scan.rows.allSatisfy({ if case .object = $0 { true } else { false } }) else {
-            throw PersistenceCoreError.ioFailure("codex inbox cannot be compacted; original bytes preserved")
-        }
-        let completed = scan.rows.indices.filter { index in
-            guard case .object(let row) = scan.rows[index] else { return false }
-            return (row["read"] == .bool(true) && stringField("consumedAt", in: scan.rows[index])?.isEmpty == false)
-                || (row["deliveryStatus"] == .string("dead_letter")
-                    && stringField("deliveryTerminalAt", in: scan.rows[index])?.isEmpty == false)
-        }
-        let removing = Set(completed.dropLast(256))
-        guard !removing.isEmpty else { return }
-        var identities = Set<String>()
-        for value in scan.rows {
-            guard case .object(let row) = value,
-                  let id = stringField("messageId", in: value) ?? stringField("id", in: value), !id.isEmpty,
-                  identities.insert(id).inserted,
-                  row["id"] == nil || row["messageId"] == nil || row["id"] == row["messageId"] else {
-                throw PersistenceCoreError.ioFailure("codex inbox retry identity conflicts; original bytes preserved")
-            }
-        }
-        for index in removing.sorted() {
-            let value = scan.rows[index]
-            guard let id = stringField("messageId", in: value) ?? stringField("id", in: value), !id.isEmpty else {
-                throw PersistenceCoreError.ioFailure("codex inbox retry identity conflicts; original bytes preserved")
-            }
-            let destination = codexInboxHistoryURL(id, inboxURL: inboxURL)
-            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true,
-                                                    attributes: [.posixPermissions: 0o700])
-            try await persistence.writeDataAtomicDurable(try value.serializedData(pretty: false), to: destination)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
-        }
-        try await persistence.replaceJSONL(scan.rows.enumerated().filter { !removing.contains($0.offset) }.map(\.element), to: inboxURL)
-    }
-
-    /// The Codex inbox has TWO writers with two different locks: this process
-    /// appends under `flock` on `codex-inbox.jsonl.lock`, and
-    /// `script/codex_thread_wakeup.js` rewrites the WHOLE FILE (read, mark
-    /// read, rename over it) under the mkdir lock `.codex-inbox.lock`. The two
-    /// never excluded each other, so an append that landed between the
-    /// helper's read and its rename was erased — a queued message that
-    /// reported "queued" and then simply did not exist. Node has no `flock`,
-    /// so this side takes the helper's directory lock as well: mkdir is atomic,
-    /// and taking it OUTSIDE the flock keeps one lock order for both writers.
-    ///
-    /// Same protocol as `withDirLock` in the helper: a `pid` file for
-    /// diagnosis, and a lock older than `staleSeconds` is a dead owner's and
-    /// may be removed.
-    ///
-    /// 2026-09-06: a wait that timed out used to proceed WITHOUT the directory
-    /// lock, which is exactly the erase race this lock exists to close — an
-    /// append that lands between the helper's read and its rename is gone, and
-    /// the caller is told "queued". Non-EEXIST `mkdir` failures took the same
-    /// unlocked path. The wait is 30s now, and running out of it fails the tool
-    /// call instead: the message is not lost, because the caller sees the
-    /// failure and still holds it.
-    private static func withCodexInboxDirectoryLock<T: Sendable>(
-        bridgeDirectory: URL,
-        _ body: @Sendable () async throws -> T
-    ) async throws -> T {
-        let waitSeconds: TimeInterval = 30
-        let staleSeconds: TimeInterval = 10 * 60
-        let lockDir: URL = {
-            if let override = ProcessInfo.processInfo.environment["NATIVE_AGENT_CODEX_INBOX_LOCK"],
-               !override.isEmpty {
-                return URL(fileURLWithPath: override)
-            }
-            return bridgeDirectory.appendingPathComponent(".codex-inbox.lock", isDirectory: true)
-        }()
-        let deadline = Date().addingTimeInterval(waitSeconds)
-        var held = false
-        while true {
-            try Task.checkCancellation()
-            if mkdir(lockDir.path, 0o700) == 0 {
-                held = true
-                try? Data("\(getpid())\n\(ISO8601DateFormatter().string(from: Date()))\n\n".utf8)
-                    .write(to: lockDir.appendingPathComponent("pid"), options: .atomic)
-                break
-            }
-            let mkdirErrno = errno
-            guard mkdirErrno == EEXIST else {
-                throw PersistenceCoreError.ioFailure(
-                    "codex inbox lock at \(lockDir.path) could not be taken (errno \(mkdirErrno)); "
-                    + "the message was not queued"
-                )
-            }
-            if let modified = (try? FileManager.default.attributesOfItem(
-                atPath: lockDir.path
-            )[.modificationDate]) as? Date,
-               Date().timeIntervalSince(modified) > staleSeconds {
-                try? FileManager.default.removeItem(at: lockDir)
-                continue
-            }
-            guard Date() < deadline else {
-                throw PersistenceCoreError.ioFailure(
-                    "codex inbox lock at \(lockDir.path) still held after \(Int(waitSeconds))s; "
-                    + "the message was not queued — retry once the Codex helper releases it"
-                )
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        defer {
-            if held { try? FileManager.default.removeItem(at: lockDir) }
-        }
-        try Task.checkCancellation()
-        return try await body()
-    }
 
     private func postCodexMessageArrivalNotification(
         surface: String,
@@ -644,7 +491,7 @@ extension SwiftToolDispatcher {
                 "reason": .string("mac_notifications_write_denied"),
                 "integration": .string(MacIntegrationID.notifyMac),
                 "messageId": .string(messageId),
-                "fix": .string("Toggle Write ON for Mac Notifications in Settings -> Mac Integration."),
+                "fix": .string("Open Trust → Mac → Mac Notifications and enable Write."),
             ])
         }
         guard let bridge = macIntegrationBridge else {
@@ -679,13 +526,12 @@ extension SwiftToolDispatcher {
                 "messageId": .string(messageId),
             ])
         } catch {
-            return .object([
-                "status": .string("failed"),
-                "posted": .bool(false),
-                "reason": .string("mac_notification_failed"),
-                "messageId": .string(messageId),
-                "error": .string(String(describing: error)),
-            ])
+            var fields = Self.builderFailureFields(error,
+                tool: "codex_message", reason: "mac_notification_failed", effects: .unknown,
+                owner: "Codex arrival notification through mac.notify",
+                instruction: "Inspect the reported notification error and its delivery state before another notification. The inbox message was saved.")
+            fields["messageId"] = .string(messageId)
+            return .object(fields)
         }
     }
 
@@ -738,6 +584,7 @@ extension SwiftToolDispatcher {
                store: .codex,
                jobsDirectory: WakeupReplayGuard.jobsDirectory(
                    for: .codex, configRoot: agentBridgeConfigRoot),
+               dataRoot: dataRoot,
                topic: topic,
                text: text,
                conversationId: threadId,
@@ -765,7 +612,7 @@ extension SwiftToolDispatcher {
                     named: "codex_thread_wakeup.js",
                     dataRoot: dataRoot
                 ).path),
-                "fix": .string("Rebuild or reinstall NativeAgent so codex_thread_wakeup.js is at the expected path."),
+                "remedy": Self.builderFailureRemedy(owner: "NativeAgent app bundle / codex_thread_wakeup.js", instruction: "The bundled Codex wake helper is missing."),
             ])
         }
 
@@ -797,11 +644,10 @@ extension SwiftToolDispatcher {
         do {
             inputData = try JSONValue.object(payload).serializedData(pretty: false)
         } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("wakeup_payload_encode_failed"),
-                "error": .string(String(describing: error)),
-            ])
+            return .object(Self.builderFailureFields(error,
+                tool: "codex_message", reason: "wakeup_payload_encode_failed", effects: .none,
+                owner: "Codex wake payload encoding",
+                instruction: "Repair the reported payload encoding error. The inbox message is saved; this wake did not launch."))
         }
 
         let launch = await Self.drivenAgentLaunch(tool: "codex_message", surface: surface,
@@ -833,6 +679,9 @@ extension SwiftToolDispatcher {
     //
     // Spawns `codex exec` as a Process, waits for a bounded non-interactive
     // answer, and writes an audit envelope to data/from_codex/<uuid>.json.
+    // JSON prompt/reply evidence and CLI last-message text stay local: no
+    // backup/export/phone file sync; PrivacyMap: from_codex. Retention is 100 pairs.
+    // The phone receives the separately recorded Runs projection.
     // This is the Codex-side twin of invoke_claude: Agent can ask Codex to
     // work a focused task, then continue with Codex's final reply.
     static func runInvokeCodex(
@@ -895,7 +744,6 @@ extension SwiftToolDispatcher {
 
         var promptParts: [String] = []
         promptParts.append("You are Codex running as a bounded subprocess spawned by NativeAgent.")
-        promptParts.append("Return a concise final answer with what you did, what you checked, and any follow-up.")
         if let commitHash {
             promptParts.append("Anchor commit: \(commitHash)")
         }
@@ -939,135 +787,118 @@ extension SwiftToolDispatcher {
         process.currentDirectoryURL = URL(fileURLWithPath: cwdRaw)
         process.environment = environment
 
-        let outputCapture = InvokeOutputCapture(process: process)
+        let outputCapture = try InvokeOutputCapture(process: process)
 
-        // Watchdog-timeout latch — mirrors invoke_claude so a kill by OUR
-        // watchdog reports as a timeout, not an anonymous subprocess_exit_143
-        // (gpt-5.5 review MED, 2026-07-02).
-        let timedOutFlag = AtomicFlag()
-        let cancellation = InvokeCancellation()
-        let result: JSONValue = await withTaskCancellationHandler {
-          await withCheckedContinuation { (cont: CheckedContinuation<JSONValue, Never>) in
-            let resumed = ResumeGuard()
+        return await SubprocessWork(process).run(timeoutSeconds: timeoutSeconds) { exit in
+            let (stdoutText, stderrText) = outputCapture.finish()
+            let header = stderrText.components(separatedBy: "--------").dropFirst().first ?? ""
+            let fields = Dictionary(header.split(separator: "\n").compactMap { line -> (String, String)? in
+                let pair = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+                return pair.count == 2 && !pair[1].isEmpty ? (pair[0], pair[1]) : nil
+            }, uniquingKeysWith: { first, _ in first })
+            let reportedBrain = CodexBrainControls(model: fields["model"], reasoningEffort: fields["reasoning effort"],
+                serviceTier: fields["service tier"], fast: nil)
+            let brainSource = header.isEmpty ? "unreported" : "codex_cli_header"
+            let lastMessage = (try? String(contentsOf: lastMessageURL, encoding: .utf8)) ?? ""
+            let replyText = lastMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? stdoutText
+                : lastMessage
+            let exitCode = exit.code
+            let durationMs = Int(Date().timeIntervalSince(started) * 1000)
+            let didTimeOut = exit.timedOut
+            let cancelled = exit.stopped
+            let status = cancelled ? "stopped" : exitCode == 0 ? "completed" : "failed"
 
-            process.terminationHandler = { proc in
-                let (stdoutText, stderrText) = outputCapture.finish()
-                let header = stderrText.components(separatedBy: "--------").dropFirst().first ?? ""
-                let fields = Dictionary(header.split(separator: "\n").compactMap { line -> (String, String)? in
-                    let pair = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-                    return pair.count == 2 && !pair[1].isEmpty ? (pair[0], pair[1]) : nil
-                }, uniquingKeysWith: { first, _ in first })
-                let reportedBrain = CodexBrainControls(model: fields["model"], reasoningEffort: fields["reasoning effort"],
-                    serviceTier: fields["service tier"], fast: nil)
-                let brainSource = header.isEmpty ? "unreported" : "codex_cli_header"
-                let lastMessage = (try? String(contentsOf: lastMessageURL, encoding: .utf8)) ?? ""
-                let replyText = lastMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? stdoutText
-                    : lastMessage
-                let exitCode = proc.terminationStatus
-                let durationMs = Int(Date().timeIntervalSince(started) * 1000)
-                // Only report a timeout when the exit was actually fatal —
-                // same clean-exit-vs-watchdog edge guard as invoke_claude.
-                let didTimeOut = timedOutFlag.isSet && exitCode != 0
-                let cancelled = cancellation.isCancelled
-
-                var auditEntry: [String: Any] = [
-                    "runId": runId,
-                    "createdAt": ISO8601DateFormatter().string(from: started),
-                    "completedAt": ISO8601DateFormatter().string(from: Date()),
-                    "durationMs": durationMs,
-                    "exitCode": Int(exitCode),
-                    "cwd": cwdRaw,
-                    "sandbox": sandbox,
-                    "timeoutSeconds": timeoutSeconds,
-                    "timedOut": didTimeOut,
-                    "cancelled": cancelled,
-                    "outcome": cancelled ? "unknown" : "settled",
-                    "prompt": fullPrompt,
-                    "reply": replyText,
-                    "stdout": stdoutText,
-                    "stderr": stderrText,
-                    "lastMessagePath": lastMessageURL.path,
-                    "brainSource": brainSource,
-                ]
-                if let commitHash { auditEntry["commitHash"] = commitHash }
-                if let model = reportedBrain.model { auditEntry["model"] = model }
-                if let effort = reportedBrain.reasoningEffort { auditEntry["reasoningEffort"] = effort }
-                if let tier = reportedBrain.serviceTier { auditEntry["serviceTier"] = tier }
-                if let fast = brain.fast { auditEntry["fast"] = fast }
-                if let data = try? JSONSerialization.data(withJSONObject: auditEntry, options: [.prettyPrinted]) {
-                    try? data.write(to: auditURL)
-                    Self.trimAgentBridgeAudits(in: auditDir)
-                }
-
-                guard resumed.tryResume() else { return }
-                if exitCode == 0 && !cancelled {
-                    cont.resume(returning: .object([
-                        "status": .string("completed"),
-                        "runId": .string(runId),
-                        "reply": .string(replyText),
-                        "durationMs": .int(Int64(durationMs)),
-                        "exitCode": .int(Int64(exitCode)),
-                        "sandbox": .string(sandbox),
-                        "launch": launch.receipt,
-                        "brain": reportedBrain.jsonValue,
-                        "brain_source": .string(brainSource),
-                        "requested_brain": brain.jsonValue,
-                        "auditPath": .string(auditURL.path),
-                    ]))
-                } else {
-                    cont.resume(returning: .object([
-                        "status": .string(cancelled ? "cancelled" : "failed"),
-                        "outcome": .string(cancelled ? "unknown" : "settled"),
-                        "reason": .string(cancelled ? "cancelled_effects_uncertain" : didTimeOut
-                            ? "timeout_after_\(timeoutSeconds)s"
-                            : "subprocess_exit_\(exitCode)"),
-                        "runId": .string(runId),
-                        "reply": .string(replyText),
-                        "stderr": .string(stderrText),
-                        "durationMs": .int(Int64(durationMs)),
-                        "exitCode": .int(Int64(exitCode)),
-                        "timedOut": .bool(didTimeOut),
-                        "sandbox": .string(sandbox),
-                        "brain": reportedBrain.jsonValue,
-                        "brain_source": .string(brainSource),
-                        "requested_brain": brain.jsonValue,
-                        "auditPath": .string(auditURL.path),
-                    ]))
-                }
-            }
-
+            var auditEntry: [String: Any] = [
+                "runId": runId,
+                "createdAt": ISO8601DateFormatter().string(from: started),
+                "completedAt": ISO8601DateFormatter().string(from: Date()),
+                "durationMs": durationMs,
+                "exitCode": Int(exitCode),
+                "cwd": cwdRaw,
+                "sandbox": sandbox,
+                "timeoutSeconds": timeoutSeconds,
+                "timedOut": didTimeOut,
+                "cancelled": cancelled,
+                "status": status,
+                "outcome": "settled",
+                "prompt": fullPrompt,
+                "reply": replyText,
+                "stdout": stdoutText,
+                "stderr": stderrText,
+                "lastMessagePath": lastMessageURL.path,
+                "brainSource": brainSource,
+            ]
+            if let commitHash { auditEntry["commitHash"] = commitHash }
+            if let model = reportedBrain.model { auditEntry["model"] = model }
+            if let effort = reportedBrain.reasoningEffort { auditEntry["reasoningEffort"] = effort }
+            if let tier = reportedBrain.serviceTier { auditEntry["serviceTier"] = tier }
+            if let fast = brain.fast { auditEntry["fast"] = fast }
+            let auditError: String?
             do {
-                try cancellation.launch(process)
-            } catch {
-                outputCapture.stopReading()
-                guard resumed.tryResume() else { return }
-                cont.resume(returning: .object([
-                    "status": .string(error is CancellationError ? "cancelled" : "failed"),
-                    "reason": .string(error is CancellationError ? "cancelled_before_spawn" : "spawn_failed"),
-                    "runId": .string(runId),
-                    "detail": .string(String(describing: error)),
-                ]))
-                return
-            }
+                try JSONSerialization.data(withJSONObject: auditEntry, options: [.prettyPrinted])
+                    .write(to: auditURL, options: .atomic)
+                Self.trimAgentBridgeAudits(in: auditDir)
+                auditError = nil
+            } catch { auditError = String(describing: error) }
 
-            armSubprocessTimeout(process: process, timeoutSeconds: timeoutSeconds) {
-                timedOutFlag.set()
+            var result: JSONValue
+            if exitCode == 0 && !cancelled {
+                result = .object([
+                    "status": .string("completed"),
+                    "runId": .string(runId),
+                    "reply": .string(replyText),
+                    "durationMs": .int(Int64(durationMs)),
+                    "exitCode": .int(Int64(exitCode)),
+                    "sandbox": .string(sandbox),
+                    "launch": launch.receipt,
+                    "brain": reportedBrain.jsonValue,
+                    "brain_source": .string(brainSource),
+                    "requested_brain": brain.jsonValue,
+                    "auditPath": .string(auditURL.path),
+                ])
+            } else {
+                result = .object([
+                    "status": .string(status),
+                    "outcome": .string("settled"),
+                    "reason": .string(didTimeOut ? "timeout_after_\(timeoutSeconds)s" : cancelled ? "stopped"
+                        : exit.launchError != nil ? "spawn_failed" : "subprocess_exit_\(exitCode)"),
+                    "runId": .string(runId),
+                    "reply": .string(replyText),
+                    "stderr": .string(stderrText),
+                    "durationMs": .int(Int64(durationMs)),
+                    "exitCode": .int(Int64(exitCode)),
+                    "timedOut": .bool(didTimeOut),
+                    "sandbox": .string(sandbox),
+                    "brain": reportedBrain.jsonValue,
+                    "brain_source": .string(brainSource),
+                    "requested_brain": brain.jsonValue,
+                    "auditPath": .string(auditURL.path),
+                    "detail": .string(exit.launchError ?? (exit.launched
+                        ? "The process ended. Its partial reply and captured output are saved; any changes already made remain."
+                        : "Stopped before launch. Nothing ran.")),
+                ])
+                if let error = exit.launchError, case .object(var fields) = result {
+                    fields.merge(Self.builderFailureFields(
+                        ToolFailureError(error, effects: .none, code: "spawn_failed"),
+                        tool: "invoke_codex", reason: "spawn_failed", effects: .none,
+                        owner: "Codex process launch at \(codex.path) in \(cwdRaw)",
+                        instruction: "Repair the reported Codex executable or working-directory launch error. Codex did not launch."),
+                        uniquingKeysWith: { _, cause in cause })
+                    result = .object(fields)
+                }
             }
-          }
-        } onCancel: {
-            cancellation.cancel()
+            if let auditError, case .object(var fields) = result {
+                fields["status"] = .string("failed")
+                fields["audit_error"] = .string(auditError)
+                fields["detail"] = .string("The captured reply is returned, but its audit could not be saved: \(auditError)")
+                result = .object(fields)
+            }
+            await Self.appendSpawnRunToLedger(
+                kind: "codex", result: result, model: model,
+                prompt: fullPrompt, startedAt: started, dataRoot: dataRoot)
+            return result
         }
-        // Runs-ledger row — see the invoke_claude twin above for rationale.
-        await Self.appendSpawnRunToLedger(
-            kind: "codex",
-            result: result,
-            model: model,
-            prompt: fullPrompt,
-            startedAt: started,
-            dataRoot: dataRoot
-        )
-        return result
     }
 
     static func codexExecArguments(

@@ -3,6 +3,7 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryStorage+Codecs.swift` | `MemoryStorage`: `validateTemporalEvidence`, `contentHash`, `nowISO8601` |
 
 extension MemoryStorage {
     static func validateTemporalEvidence(_ memory: StoredMemory) throws {
@@ -28,9 +29,7 @@ extension MemoryStorage {
     }
 
     public static func contentHash(_ s: String) -> String {
-        let normalized = s.lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        let normalized = comparisonKey(s, mode: .recall)
         let digest = SHA256.hash(data: Data(normalized.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
@@ -39,12 +38,6 @@ extension MemoryStorage {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f.string(from: Date())
-    }
-
-    static func l2norm(_ v: [Float]) -> Float {
-        var s: Float = 0
-        for x in v { s += x * x }
-        return s.squareRoot()
     }
 
     static func metadataString(

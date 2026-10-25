@@ -1,6 +1,8 @@
 import Darwin
 import Foundation
 
+// Blueprint: | `CheckedFixedSizeSecretFile.swift` | `CheckedFixedSizeSecretFile`: exact regular 0600 secret bytes, missing-only creation and byte-preserving invalid-state failure; caller owns authority lifecycle |
+
 /// Mechanical storage for a fixed-size local secret.
 ///
 /// This type deliberately owns no authority domain and no secret lifecycle.

@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import ChatSessionWork
+// Blueprint: | `TelegramTurnPresentation.swift` | `TelegramTurnPresentationPhase` typealias; canonical lifecycle adapter and native redaction; authored progress wording lives in telegram-progress.js |
 
 // Telegram keeps source-compatible names while the authoritative value model
 // and lifecycle reducer live in the surface-neutral NativeAgentCore target.
@@ -201,123 +202,5 @@ public enum TelegramTurnPresentationReducer {
         if combined.contains("codex") { return "Background work" }
         if combined.contains(" omp") || combined.hasPrefix("omp") { return "Background work" }
         return nil
-    }
-}
-
-public enum TelegramTurnPresentationRenderer {
-    static func userFacingProgress(_ text: String) -> String {
-        text.replacingOccurrences(
-            of: #"(?i)\b(?:invoke_claude|claude_message|invoke_codex|codex_message|omp_message|agent_swarm|Claude|Claude|Codex|OMP)\b"#,
-            with: "background work", options: .regularExpression
-        )
-    }
-    public static let defaultStalledAfter = TurnPresentationReducer.defaultStalledAfter
-
-    public static func render(
-        _ state: TelegramTurnPresentationState,
-        at now: Date,
-        stalledAfter: TimeInterval = defaultStalledAfter
-    ) -> String {
-        let elapsedEnd = state.endedAt ?? max(now, state.startedAt)
-        let elapsed = max(0, elapsedEnd.timeIntervalSince(state.startedAt))
-        let sinceMovement = max(0, now.timeIntervalSince(state.lastMovementAt))
-        let phase = TurnPresentationReducer.effectivePhase(
-            state,
-            secondsSinceMovement: sinceMovement,
-            stalledAfter: stalledAfter
-        )
-
-        var line = sentence(
-            phase: phase,
-            action: state.currentAction,
-            delegate: state.delegateName
-        )
-        if !phase.isTerminal {
-            line += " (\(duration(elapsed)) so far)"
-        }
-        return userFacingProgress(line)
-    }
-
-    /// A bounded, presentation-only expansion for the same work card. It uses
-    /// only reducer-sanitized state: never tool arguments, provider payloads,
-    /// accumulated model text, or hidden reasoning.
-    public static func renderDetails(
-        _ state: TelegramTurnPresentationState,
-        at now: Date,
-        stalledAfter: TimeInterval = defaultStalledAfter
-    ) -> String {
-        let elapsedEnd = state.endedAt ?? max(now, state.startedAt)
-        let elapsed = max(0, elapsedEnd.timeIntervalSince(state.startedAt))
-        let sinceMovement = max(0, now.timeIntervalSince(state.lastMovementAt))
-        let phase = TurnPresentationReducer.effectivePhase(
-            state,
-            secondsSinceMovement: sinceMovement,
-            stalledAfter: stalledAfter
-        )
-        var lines = [
-            sentence(
-                phase: phase,
-                action: state.currentAction,
-                delegate: state.delegateName
-            )
-        ]
-        lines.append("Started \(duration(elapsed)) ago; last update \(duration(sinceMovement)) back.")
-        if let action = state.currentAction, !lines[0].contains(action) {
-            lines.append("Right now: \(action)")
-        }
-        if let delegate = state.delegateName, !lines[0].contains(delegate) {
-            lines.append("Task: \(delegate).")
-        }
-        return userFacingProgress(lines.joined(separator: "\n"))
-    }
-
-    /// What she is doing, in words. The phase enum stays exactly as it is —
-    /// receipts, the card ledger and telemetry still read it — but User never
-    /// sees a state-machine label, because a label makes him translate
-    /// machinery into meaning every time he glances at the card.
-    private static func sentence(
-        phase: TelegramTurnPresentationPhase,
-        action: String?,
-        delegate: String?
-    ) -> String {
-        let detail = action.flatMap { text -> String? in
-            let trimmed = userFacingProgress(text).trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }
-        switch phase {
-        case .acknowledged:
-            return "Got your message, starting now."
-        case .working, .tool:
-            return detail ?? "Still on it."
-        case .delegation:
-            return detail ?? "Working on a longer step…"
-        case .retrying:
-            return detail.map { "That hiccuped, trying again: \($0)" }
-                ?? "That hiccuped, trying again."
-        case .waiting:
-            return detail ?? "Waiting before the task can continue."
-        case .blocked:
-            return detail.map { "Waiting on an approval from you: \($0)" }
-                ?? "Waiting on an approval from you."
-        case .stalled:
-            return detail.map { "Still on it, but it's been quiet: \($0)" }
-                ?? "Still on it, but it's been quiet for a while."
-        case .completed:
-            return "Done."
-        case .failed:
-            return detail.map { "That didn't work: \($0)" } ?? "That didn't work."
-        case .canceled:
-            return "Stopped."
-        case .outcomeUnknown:
-            return detail.map { "The outcome is unclear: \($0)" }
-                ?? "The outcome is unclear."
-        }
-    }
-
-    private static func duration(_ interval: TimeInterval) -> String {
-        let total = max(0, Int(interval.rounded(.down)))
-        if total < 60 { return "\(total)s" }
-        if total < 3_600 { return "\(total / 60)m \(total % 60)s" }
-        return "\(total / 3_600)h \((total % 3_600) / 60)m"
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentShared
+// Blueprint: | `MacSyncActionRouter+Telegram.swift` | `MacSyncActionRouter`: `telegramAction` |
 
 extension MacSyncActionRouter {
     func telegramAction(_ action: InboxAction) async -> [String: String] {

@@ -3,6 +3,8 @@ import Foundation
 import SwiftUI
 import PersistenceCore
 
+// Blueprint: | `ToolInputForm.swift` | `ToolInputForm`: schema-driven argument draft, field validation and explicit submit for tools requiring structured input |
+
 // PATCH-Phase7b: ToolInputForm — shown when a slash-command tool needs multiple
 // or non-string fields that can't be satisfied by free-text alone.
 //
@@ -25,15 +27,13 @@ struct ToolInputForm: View {
         var bools: [String: Bool] = [:]
         var ints: [String: Int] = [:]
     }
-    private var draftSubject: String { "tool-input/\(plan.sessionId)/\(tool.name)" }
+    private var draftSubject: String { "tool-input/\(plan.sessionId)/\(plan.tool.name)" }
     @State private var localDraft: Draft?
     @State private var retainsDraft = false
     private var draft: Binding<Draft> {
         Binding(get: {
-            // A retained draft exists only after its schema was checked, so it
-            // shows (and an edit builds on it) before this presentation's check.
             retainsDraft ? appModel.editDraft(draftSubject, seed: initialDraft())
-                : localDraft ?? appModel.editDraft(draftSubject, seed: initialDraft())
+                : localDraft ?? initialDraft()
         }, set: {
             if retainsDraft { appModel.setEditDraft($0, for: draftSubject) }
             else { localDraft = $0 }
@@ -41,8 +41,9 @@ struct ToolInputForm: View {
     }
     @State private var validationError: String? = nil
 
-    private var tool: ToolCapability { plan.tool }
-    private var schema: ToolInputSchema? { tool.inputSchema }
+    @State private var tool: ToolCapability?
+    @State private var checking = false
+    private var schema: ToolInputSchema? { tool?.inputSchema }
     private var requiredFields: Set<String> { Set(schema?.required ?? []) }
 
     // Ordered property names: required first, then optional.
@@ -60,9 +61,9 @@ struct ToolInputForm: View {
                 Image(systemName: "wrench.and.screwdriver")
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Run \(tool.name)")
+                    Text("Run \(plan.tool.name)")
                         .font(NativeAgentFont.title)
-                    if !tool.description.isEmpty {
+                    if let tool, !tool.description.isEmpty {
                         Text(tool.description)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -70,7 +71,7 @@ struct ToolInputForm: View {
                     }
                 }
                 Spacer()
-                AutonomyFormBadge(autonomy: tool.effectiveAutonomy)
+                if let tool { AutonomyFormBadge(autonomy: tool.effectiveAutonomy) }
             }
             .padding(.horizontal, NativeAgentSpacing.lg)
             .padding(.vertical, NativeAgentSpacing.md)
@@ -80,7 +81,9 @@ struct ToolInputForm: View {
             // Field form
             ScrollView {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-                    if orderedFields.isEmpty {
+                    if tool == nil {
+                        if validationError == nil { ProgressView() }
+                    } else if orderedFields.isEmpty {
                         Text("This tool takes no inputs. Press Run to dispatch immediately.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -118,7 +121,8 @@ struct ToolInputForm: View {
                 Button("Cancel") { appModel.clearEditDraft(draftSubject); onCancel() }
                     .keyboardShortcut(.escape, modifiers: [])
                     .accessibilityIdentifier("tool-input-form-cancel")
-                Button("Run") { attemptSubmit() }
+                Button("Run") { checking = true }
+                    .disabled(tool == nil || checking)
                     .keyboardShortcut(.return, modifiers: [.command])
                     .buttonStyle(.borderedProminent)
                     .hazeTinted(.button)
@@ -128,23 +132,12 @@ struct ToolInputForm: View {
             .padding(.vertical, NativeAgentSpacing.md)
         }
         .frame(minWidth: 460, minHeight: 300)
+        .task(id: checking) { if checking { await attemptSubmit() } }
         .task {
             do {
-                let manifest = try await appModel.engine.tools.loadManifest(detail: "full")
-                guard case .object(let envelope) = manifest, case .array(let tools) = envelope["tools"],
-                      let row = tools.compactMap({ value -> [String: JSONValue]? in
-                          if case .object(let row) = value, row["name"] == .string(tool.name) { return row }
-                          return nil
-                      }).first, let schema = row["parameters"] else {
-                    throw CocoaError(.coderValueNotFound)
-                }
+                let descriptor = try await appModel.engine.tools.inputDescriptor(named: plan.tool.name)
                 guard !Task.isCancelled else { return }
-                if inputSchemaContainsSecret(schema) {
-                    appModel.clearEditDraft(draftSubject)
-                } else {
-                    if let localDraft { appModel.setEditDraft(localDraft, for: draftSubject) }
-                    retainsDraft = true
-                }
+                accept(descriptor)
             } catch {
                 validationError = "Couldn't check input schema: \(error.localizedDescription)"
             }
@@ -162,9 +155,26 @@ struct ToolInputForm: View {
         return draft
     }
 
-    private func attemptSubmit() {
+    private func accept(_ descriptor: ToolCapability) {
+        tool = descriptor
+        retainsDraft = descriptor.inputSchema?.containsSecret == false
+        if !retainsDraft { appModel.clearEditDraft(draftSubject) }
+    }
+
+    private func attemptSubmit() async {
+        guard let tool else { return }
+        defer { checking = false }
         validationError = nil
         do {
+            let current = try await appModel.engine.tools.inputDescriptor(named: tool.name)
+            try Task.checkCancellation()
+            guard current == tool else {
+                localDraft = nil
+                appModel.clearEditDraft(draftSubject)
+                accept(current)
+                validationError = "This tool changed. Review its current inputs before running it."
+                return
+            }
             let inputData = try ChatToolCatalogSnapshot.serializedInput(
                 schema: schema,
                 stringValues: draft.wrappedValue.strings,
@@ -178,7 +188,6 @@ struct ToolInputForm: View {
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // MARK: - Per-field row
 // ---------------------------------------------------------------------------

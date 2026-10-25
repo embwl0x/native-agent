@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceWorkOverview.swift` | `AgentWorkspaceNavigation`: `workReceiptKey`, `placeAction`, `focusWork` |
 
 /// A bounded last-action observation, never task completion or a history index.
 struct AgentWorkspaceWorkReceipt: Sendable, Equatable, Codable {

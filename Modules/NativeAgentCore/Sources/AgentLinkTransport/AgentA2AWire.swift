@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import ProviderRouting
+// Blueprint: | `AgentA2AWire.swift` | `AgentA2AWire` enum; `selectInterface`, `messageRequest` |
 
 /// A2A 1.0 and 0.3 wire projection. Endpoints, parts and metadata remain
 /// untrusted data; the transport must authorize the destination and credentials.

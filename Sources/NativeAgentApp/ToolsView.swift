@@ -6,7 +6,7 @@ import ScreenVision
 import Speech
 import AVFoundation
 import UniformTypeIdentifiers
-import ChatOrchestration
+import ChatToolRuntime
 import ToolRegistry
 import NativeAgentCore
 import NativeAgentShared
@@ -19,6 +19,8 @@ import CoreSpotlight
 import CloudKit
 import TrustCenter
 #endif
+
+// Blueprint: | `ToolsView.swift` | `ToolsView`: runtime/authored tool catalog, search/details, approval/lifecycle controls and operation status receipts |
 
 struct ToolsView: View {
     @Environment(AppModel.self) private var appModel
@@ -244,8 +246,8 @@ enum ToolsCatalogSurfacePresentation {
         case let .unavailable(detail):
             return .unavailable(Detail(
                 title: "The tool list could not be read",
-                detail: detail.map { "The tool list could not be read: \($0). Press Refresh to try again." }
-                    ?? "The tool list could not be read. Press Refresh to try again — if it keeps failing, run the health checks in Diagnostics.",
+                detail: detail.map { "The tool catalog could not be read: \($0). Open Diagnostics → Health checks to inspect the cause; use Refresh after fixing it." }
+                    ?? "No tool catalog loaded. Use Refresh to load it.",
                 systemImage: "exclamationmark.triangle"
             ))
         case .available, .stale:
@@ -322,12 +324,17 @@ enum ToolApprovalPresentation {
         let refusal: String?
     }
 
-    static func control(for tool: ToolRecord) -> Control {
-        let refusal = ToolApprovalEligibility.refusal(for: tool, ownerAuthorized: true)
+    static func review(for tool: ToolRecord) -> [String: JSONValue]? {
+        tool.keepReview
+    }
+
+    static func control(for tool: ToolRecord, keepRefusal: String?) -> Control {
+        let refusal = (tool.candidateDigest ?? tool.codeFingerprint) != nil && review(for: tool) == nil
+            ? "Version unavailable. Refresh Tools before approving." : keepRefusal
         return Control(
             accessibilityIdentifier: "tools.authored.approve.\(tool.id)",
             isEnabled: refusal == nil,
-            help: refusal ?? "Approve this validated proposal and activate it.",
+            help: refusal ?? "Keep this rehearsed version and turn it on.",
             refusal: refusal
         )
     }
@@ -335,27 +342,8 @@ enum ToolApprovalPresentation {
 
 // MARK: - Chat Tool Catalog
 
-/// The catalog envelope is produced by the shared runtime. Keep the decisions
-/// that turn that envelope into visible Settings state as values so they can be
-/// exercised without a SwiftUI snapshot or a second copy of the classification
-/// rules in tests.
+/// Local catalog grouping and search; tool status belongs to the engine.
 enum ChatToolCatalogPresentation {
-    enum ToolStatusBadgeTone: Equatable {
-        case positive
-        case neutral
-        case warning
-        case danger
-    }
-
-    /// The tool catalog is the live authority for this badge. A row with
-    /// incomplete or unrecognised authority fields is not advertised as
-    /// available: a stale or malformed receipt cannot establish usability.
-    struct ToolStatusBadge: Equatable {
-        let title: String
-        let systemImage: String
-        let tone: ToolStatusBadgeTone
-    }
-
     struct Bucket: Identifiable, Equatable {
         let id: String
         let title: String
@@ -461,7 +449,6 @@ enum ChatToolCatalogPresentation {
             }
             return bucket
         }
-        if tool.name.hasPrefix("mcp__") { return .mcp }
         if let bucket = SwiftToolDispatcher.catalogBucket(forRegisteredToolNamed: tool.name) {
             if bucket == .core, catalog.currentlyLoaded.contains(tool.name) {
                 return .alwaysOn
@@ -476,54 +463,6 @@ enum ChatToolCatalogPresentation {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return trimmed.count > limit ? String(trimmed.prefix(limit)) + "…" : trimmed
-    }
-
-    static func toolStatusBadge(for tool: ChatCatalogTool, in catalog: ChatToolCatalogSnapshot) -> ToolStatusBadge {
-        let name = normalized(tool.name)
-        let policyLockedNames = Set((catalog.builderPolicyLocked + catalog.macAppPolicyLocked).map { normalized($0) })
-        if !name.isEmpty, policyLockedNames.contains(name) {
-            return ToolStatusBadge(title: "locked", systemImage: "lock", tone: .warning)
-        }
-        if tool.availableNow == false {
-            return ToolStatusBadge(title: "unavailable", systemImage: "minus.circle", tone: .neutral)
-        }
-
-        let autonomy = normalized(tool.effectiveAutonomy)
-        if autonomy == "blocked" {
-            return ToolStatusBadge(title: "blocked", systemImage: "hand.raised", tone: .danger)
-        }
-        guard tool.availableNow == true, ["", "auto", "confirm"].contains(autonomy) else {
-            return unavailableStatusBadge()
-        }
-        if autonomy == "confirm" {
-            return ToolStatusBadge(title: "approval", systemImage: "checkmark.shield", tone: .warning)
-        }
-
-        let loadState = normalized(tool.loadState)
-        let currentlyLoaded = Set(catalog.currentlyLoaded.map { normalized($0) })
-        if loadState == "loaded" || (!name.isEmpty && currentlyLoaded.contains(name)) {
-            return ToolStatusBadge(title: "active", systemImage: "circle.fill", tone: .positive)
-        }
-        if loadState == "discovery_only" {
-            return ToolStatusBadge(title: "on demand", systemImage: "bolt.circle", tone: .neutral)
-        }
-        guard loadState.isEmpty else { return unavailableStatusBadge() }
-        return ToolStatusBadge(title: "available", systemImage: "checkmark.circle", tone: .neutral)
-    }
-
-    /// Compatibility for existing presentation-only readers. New rendering
-    /// uses `toolStatusBadge(for:in:)` so its text, icon, and tone stay bound
-    /// to one authoritative classification.
-    static func status(for tool: ChatCatalogTool, in catalog: ChatToolCatalogSnapshot) -> String {
-        toolStatusBadge(for: tool, in: catalog).title
-    }
-
-    private static func unavailableStatusBadge() -> ToolStatusBadge {
-        ToolStatusBadge(title: "status unavailable", systemImage: "questionmark.circle", tone: .warning)
-    }
-
-    private static func normalized(_ value: String?) -> String {
-        (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
 }
@@ -829,7 +768,7 @@ private struct ChatToolCatalogSection: View {
 
     @ViewBuilder
     private func statusBadge(for tool: ChatCatalogTool) -> some View {
-        let badge = ChatToolCatalogPresentation.toolStatusBadge(for: tool, in: catalog)
+        let badge = catalog.status(for: tool)
         Text(badge.title)
             .font(ShellType.captionSemibold)
             .foregroundStyle(ToolsStatusTone.color(badge.tone))
@@ -861,29 +800,31 @@ enum AuthoredToolPresentation {
     /// Authored rows are durable registry records, not live dispatcher
     /// receipts. Keep their distinct lifecycle labels explicit rather than
     /// borrowing the catalog's availability wording.
-    static func statusBadge(for tool: ToolRecord) -> ChatToolCatalogPresentation.ToolStatusBadge {
+    static func statusBadge(for tool: ToolRecord) -> (title: String, systemImage: String, tone: ToolCatalogStatus.Tone) {
         let status = tool.status
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         switch status {
         case "active":
-            return .init(title: "active", systemImage: "circle.fill", tone: .positive)
+            return (title: "active", systemImage: "circle.fill", tone: .positive)
+        case "draft":
+            return (title: "draft", systemImage: "clock", tone: .warning)
         case "proposed":
-            return .init(title: "proposed", systemImage: "clock", tone: .warning)
+            return (title: "proposed", systemImage: "clock", tone: .warning)
         case "disabled":
-            return .init(title: "off", systemImage: "pause.circle", tone: .warning)
+            return (title: "off", systemImage: "pause.circle", tone: .warning)
         default:
-            return .init(title: "status unavailable", systemImage: "questionmark.circle", tone: .warning)
+            return (title: "status unavailable", systemImage: "questionmark.circle", tone: .warning)
         }
     }
 
     /// Every authored-tool row is derived from this one action catalog. The
     /// executor repeats its own gates, but the control cannot claim a mutation
     /// is available when its durable precondition is already absent.
-    static func actionCatalog(for tool: ToolRecord) -> [ActionControl] {
+    static func actionCatalog(for tool: ToolRecord, keepRefusal: String?) -> [ActionControl] {
         var controls: [ActionControl] = []
-        if tool.status != "active" {
-            let approval = ToolApprovalPresentation.control(for: tool)
+        if tool.status != "active" || tool.candidateDigest != nil {
+            let approval = ToolApprovalPresentation.control(for: tool, keepRefusal: keepRefusal)
             controls.append(ActionControl(
                 action: .approve,
                 title: "Approve",
@@ -1009,8 +950,28 @@ private struct AuthoredToolsSection: View {
                     .textSelection(.enabled)
             }
 
+            if let review = ToolApprovalPresentation.review(for: tool),
+               case .string(let version)? = review["version"],
+               case .string(let code)? = review["code"],
+               let reach = try? review["reach"]?.serialize(pretty: true) {
+                Text(tool.candidateDigest == nil ? "Version to turn on" : "Waiting version").font(ShellType.labelSemibold)
+                if case .string(let description)? = review["description"] {
+                    Text(description).font(ShellType.label).textSelection(.enabled)
+                }
+                Text("Version: \(version)").font(ShellType.code).textSelection(.enabled)
+                Text("Reach: \(reach)").font(ShellType.code).textSelection(.enabled)
+                DisclosureGroup("Code") {
+                    Text(code).font(ShellType.code).textSelection(.enabled)
+                }
+                if let declarations = try? JSONValue.object(review.filter { !["code", "description", "reach", "version"].contains($0.key) }).serialize(pretty: true) {
+                    DisclosureGroup("Declarations and fixtures") {
+                        Text(declarations).font(ShellType.code).textSelection(.enabled)
+                    }
+                }
+            }
+
             HStack(spacing: 8) {
-                let actionCatalog = AuthoredToolPresentation.actionCatalog(for: tool)
+                let actionCatalog = AuthoredToolPresentation.actionCatalog(for: tool, keepRefusal: appModel.engine.tools.keepRefusal(tool))
                 if let approval = actionCatalog.first(where: { $0.action == .approve }) {
                     Button(approval.title) {
                         Task { await appModel.promoteTool(tool, userRequested: true) }
@@ -1042,7 +1003,7 @@ private struct AuthoredToolsSection: View {
 
 /// One tone table for both tool lists. Four states, three room colours.
 private enum ToolsStatusTone {
-    static func color(_ tone: ChatToolCatalogPresentation.ToolStatusBadgeTone) -> Color {
+    static func color(_ tone: ToolCatalogStatus.Tone) -> Color {
         switch tone {
         case .positive: NativeAgentShell.calm
         case .neutral: NativeAgentShell.secondary

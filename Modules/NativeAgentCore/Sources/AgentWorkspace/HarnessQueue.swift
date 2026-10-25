@@ -1,6 +1,7 @@
 import Foundation
 import Desk
 import NativeAgentCore
+// Blueprint: | `HarnessQueue.swift` | `HarnessQueue` enum, `HarnessFinding` struct; `file`, `resolve`, `fold`: keyed findings refresh in place, preserving closure and person ownership; wake carry opportunities share the existing ledger and its retained material fingerprint, reoffering only changed work; settled experience conditions name their release |
 
 /// One finding, with one Desk identity and the person who can tend it.
 public struct HarnessFinding: Sendable, Equatable {
@@ -28,7 +29,7 @@ extension ResidentWake {
         let step = item.step
         let peers = (step?.peers ?? []).filter { !CapabilityLifecycle.ownerTrusts($0) }
         let provenance = peers.isEmpty ? "" : " Peer steering retained: " + peers.joined(separator: ", ")
-            + ". A one-call approval does not elevate a peer."
+            + ". The answer covers this turn and its carried steps, without permanently trusting the peer."
         // What released it since she last wrote on it (MyQueueReady.release's note).
         let mine = item.notes.filter { $0.author == "agent" }.compactMap { DeskClock.parseISO($0.ts) }.max() ?? .distantPast
         let released = item.notes.filter {
@@ -101,7 +102,8 @@ public enum HarnessQueue {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         let filed = try await store.fileSystemItem(
             kind: .plan, project: project, title: finding.title, summary: finding.summary,
-            assignee: finding.owner.rawValue, findingKey: finding.key,
+            assignee: finding.owner.rawValue, waitingOn: finding.owner == .owner ? "owner" : nil,
+            findingKey: finding.key,
             note: keyNote(finding.key) + "\nfiled by " + finding.source.rawValue,
             refs: finding.refs, reopen: finding.source != .doctor, refreshRefs: refreshRefs
         )
@@ -114,14 +116,6 @@ public enum HarnessQueue {
         for ref in finding.refs where !refreshRefs && ref.kind.token != "step" && !item.refs.contains(where: { $0.kind == ref.kind }) {
             try await store.addRef(item.handle, ref: ref)
             item.refs.append(ref)
-        }
-        let waitingOn = finding.owner == .owner ? "owner" : nil
-        if !filed.reusedEquivalent && item.waitingOn != waitingOn {
-            _ = try await store.setStatus(item.handle, status: item.status,
-                blockedReason: item.blockedReason, waitingOn: waitingOn,
-                progress: item.progress, assignee: finding.owner.rawValue, laneOf: item.laneOf)
-            item.assignee = finding.owner.rawValue
-            item.waitingOn = waitingOn
         }
         ResidentWake.shared.withdraw(dataRoot: dataRoot, key: "harness." + item.handle)
         return item

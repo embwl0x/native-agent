@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 
+// Blueprint: | `WorkshopExecution+DeskTasks.swift` | `WorkshopDirectedTaskSubmitter` and Desk receipt bridge: Desk-first task identity with canonical Workshop execution and terminal evidence |
+
 /// Result of shadow-submitting a user-directed task through the Workshop. The
 /// Desk handle is the durable user-facing identity; `executionId` is only the
 /// compatibility executor key while the old queue storage is being absorbed.
@@ -59,10 +61,6 @@ public struct WorkshopDirectedTaskSubmitter: Sendable {
                     "Desk item \(live.alias) is already closed; omit desk_handle to open a new one")
             }
             item = live
-            _ = try? await store.appendNote(
-                live.handle,
-                text: "Workshop run on this item: \(String(spec.objective.prefix(600)))"
-            )
         } else {
             item = try await store.createItem(
                 kind: .project,
@@ -71,7 +69,14 @@ public struct WorkshopDirectedTaskSubmitter: Sendable {
                 summary: String(spec.objective.prefix(600))
             )
         }
-        _ = try await store.setStatus(item.handle, status: .now)
+        guard let admission = try await store.setStatusIfUnchanged(
+            item.handle, expectedUpdatedAt: item.updatedAt, status: .now,
+            note: reference?.isEmpty == false
+                ? "Workshop run on this item: \(String(spec.objective.prefix(600)))" : nil
+        ) else {
+            throw WorkshopExecutionError.invalidRequest(
+                "Desk item \(item.alias) changed or closed before Workshop admission; read it again before submitting")
+        }
 
         var linkedSpec = spec
         linkedSpec.deskHandle = item.handle
@@ -93,8 +98,9 @@ public struct WorkshopDirectedTaskSubmitter: Sendable {
                 execution: enqueued.record
             )
         } catch {
-            _ = try? await store.setStatus(
+            _ = try? await store.setStatusIfUnchanged(
                 item.handle,
+                expectedUpdatedAt: admission.ts,
                 status: .blocked,
                 blockedReason: String(error.localizedDescription.prefix(600))
             )
@@ -160,63 +166,11 @@ public struct WorkshopDirectedTaskReceipt: Sendable, Equatable {
         self.verificationStatus = verificationStatus
     }
 
-    public func toJSON() -> JSONValue {
-        .object([
-            "kind": .string("directed_task"),
-            "handle": .string(handle),
-            "reservationId": .string(executionId),
-            "executionId": .string(executionId),
-            "status": .string(status),
-            "model": .null,
-            "artifactCount": .int(0),
-            "summary": .string(String(summary.prefix(600))),
-            "ts": .string(completedAt),
-            "createdAt": .string(createdAt),
-            "totalSteps": .int(Int64(totalSteps)),
-            "completedSteps": .int(Int64(completedSteps)),
-            "rerunCount": .int(Int64(rerunCount)),
-            "triggerSource": .string(triggerSource),
-            "wasStub": .bool(wasStub),
-            "verificationStatus": verificationStatus.map { .string($0.rawValue) } ?? .null,
-        ])
-    }
-
-    public static func fromJSON(_ value: JSONValue) -> WorkshopDirectedTaskReceipt? {
-        guard case .object(let object) = value,
-              case .string("directed_task")? = object["kind"] else { return nil }
-        func string(_ key: String) -> String? {
-            if case .string(let value)? = object[key] { return value }
-            return nil
-        }
-        func int(_ key: String) -> Int {
-            switch object[key] ?? .null {
-            case .int(let value): return Int(value)
-            case .double(let value): return Int(exactly: value.rounded(.towardZero)) ?? 0
-            default: return 0
-            }
-        }
-        guard let handle = string("handle"), !handle.isEmpty,
-              let executionId = string("executionId") ?? string("reservationId"), !executionId.isEmpty,
-              let status = string("status"),
-              let completedAt = string("ts") else { return nil }
-        return WorkshopDirectedTaskReceipt(
-            handle: handle,
-            executionId: executionId,
-            status: status,
-            summary: string("summary") ?? "",
-            createdAt: string("createdAt") ?? completedAt,
-            completedAt: completedAt,
-            totalSteps: int("totalSteps"),
-            completedSteps: int("completedSteps"),
-            rerunCount: int("rerunCount"),
-            triggerSource: string("triggerSource") ?? "manual",
-            wasStub: object["wasStub"] == .bool(true),
-            verificationStatus: string("verificationStatus")
-                .flatMap(WorkshopVerificationStatus.init(rawValue:))
-        )
-    }
 }
 
+/// desk_settlement.json uses WorkshopDirectedTaskReceipt JSON; WorkshopReceiptLog
+/// owns receipt_handoff.json with the same schema. Both are locally backed up,
+/// exported and listed by PrivacyMap under workshop/; neither syncs to the phone.
 public enum WorkshopDeskReceiptBridge {
     public static func recordTerminal(
         _ record: WorkshopExecutionRecord,
@@ -229,15 +183,10 @@ public enum WorkshopDeskReceiptBridge {
               !handle.isEmpty else { return }
 
         let persistence = SwiftNativePersistenceCore()
-        let receiptPath = dataRoot
-            .appendingPathComponent("workshop", isDirectory: true)
-            .appendingPathComponent("receipts.jsonl")
-        let timelinePath = dataRoot
-            .appendingPathComponent("workshop", isDirectory: true)
-            .appendingPathComponent("executions", isDirectory: true)
-            .appendingPathComponent(record.id, isDirectory: true)
-            .appendingPathComponent("timeline.jsonl")
-        let timeline = (try? await persistence.readJSONL(timelinePath)) ?? []
+        let timelinePath = ExecutionRecordFile.timelinePath(in: dataRoot
+            .appendingPathComponent("workshop/executions", isDirectory: true)
+            .appendingPathComponent(record.id, isDirectory: true))
+        let timeline = (try? await ExecutionRecordFile.readTimeline(at: timelinePath, using: persistence)) ?? []
         let wasStub = timeline.contains { row in
             if case .object(let object) = row,
                case .string("planner_fallback")? = object["event"] { return true }
@@ -262,28 +211,14 @@ public enum WorkshopDeskReceiptBridge {
             .appendingPathComponent("receipt_handoff.json")
         let settlementPath = timelinePath.deletingLastPathComponent()
             .appendingPathComponent("desk_settlement.json")
-        let receiptJSON = receipt.toJSON()
+        let receiptJSON = WorkshopReceiptLog.directedJSON(receipt)
         if (try? await persistence.readJSON(receiptHandoffPath, ifMissing: .null)) == receiptJSON,
            (try? await persistence.readJSON(settlementPath, ifMissing: .null)) == receiptJSON {
             return
         }
 
         do {
-            try await persistence.withFileLock(receiptPath) {
-                if try await persistence.readJSON(receiptHandoffPath, ifMissing: .null) == receiptJSON {
-                    return
-                }
-                let existing = try await persistence.readJSONL(receiptPath)
-                    .compactMap(WorkshopDirectedTaskReceipt.fromJSON)
-                if !existing.contains(where: {
-                    $0.executionId == receipt.executionId
-                        && $0.status == receipt.status
-                        && $0.verificationStatus == receipt.verificationStatus
-                }) {
-                    try await persistence.appendJSONLDurable(receiptJSON, to: receiptPath)
-                }
-                try await persistence.writeJSON(receiptJSON, to: receiptHandoffPath)
-            }
+            try await WorkshopReceiptLog(dataRoot: dataRoot).append(receipt, handoffPath: receiptHandoffPath)
         } catch {
             FileHandle.standardError.write(Data(
                 "Workshop Desk receipt write failed for \(record.id): \(error)\n".utf8))
@@ -291,7 +226,7 @@ public enum WorkshopDeskReceiptBridge {
 
         do {
             try await persistence.withFileLock(settlementPath) {
-                if try await persistence.readJSON(settlementPath, ifMissing: .null) == receipt.toJSON() {
+                if try await persistence.readJSON(settlementPath, ifMissing: .null) == receiptJSON {
                     return
                 }
                 let status: DeskStatus
@@ -317,7 +252,7 @@ public enum WorkshopDeskReceiptBridge {
                     handle, executionId: record.id, note: "[\(deskNoteStatus(for: record))] \(summary)",
                     status: status, summary: settlementSummary, waitingOn: waitingOn)
                 if settled {
-                    try await persistence.writeJSON(receipt.toJSON(), to: settlementPath)
+                    try await persistence.writeJSON(receiptJSON, to: settlementPath)
                 }
             }
         } catch {

@@ -5,6 +5,7 @@ import NativeAgentCore
 import PersistenceCore
 import MacControl
 import AttentionRouting
+// Blueprint: | `AppConnectorPlatform.swift` | live voice, notification, Mac control and device-sync bindings over core connector/integration policy and status owners; remaining composition belongs to Area 1; notification, EventKit and connector platform bindings over core policy/status owners |
 
 /// TrustCenter's Mac control policy. The connector actions, the Mac
 /// integration bridge and the Mac control routes all gate through it.
@@ -33,9 +34,9 @@ extension AppConnectorStatusPlatform {
 }
 
 extension AppConnectorActionPlatform {
-    init(dataRoot: URL) {
-        self.init(dataRoot: dataRoot, statusPlatform: AppConnectorStatusPlatform(),
-                  router: { .shared }, deviceSync: { NativeAgentEngine.liveDeviceSync },
+    init(engine: NativeAgentEngine) {
+        self.init(dataRoot: engine.dataRoot, statusPlatform: AppConnectorStatusPlatform(),
+                  router: { .shared }, macAssistant: engine.macIntegration,
                   notification: { await NativeAgentNotifications.postMessage(title: $0, body: $1).deliveryFields() })
     }
 }

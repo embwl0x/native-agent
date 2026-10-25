@@ -4,6 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import TriggerScheduler
+// Blueprint: | `NativeAgentScheduledProactiveScan.swift` | `NativeAgentScheduledProactiveScan` enum; `inboxActions`, `evaluate` |
 
 public enum NativeAgentScheduledProactiveScan {
     public struct Opportunity: Sendable, Equatable {

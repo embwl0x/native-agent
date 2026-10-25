@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `ProcedureReplay.swift` | replay status/count and manual dry-run eligibility; canonical executor retains dispatch |
 
 public enum ProcedureReplayStatus: String, Codable, Sendable, Equatable {
     case matched

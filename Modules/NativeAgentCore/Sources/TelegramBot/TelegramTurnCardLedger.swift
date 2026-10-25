@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+// Blueprint: | `TelegramTurnCardLedger.swift` | `TelegramTurnCardLedger` actor; one owner per canonical ledger path across poll-loop replacements serializes `upsert` and `remove`; `TelegramTurnCardRestartRepairer` owns one repair task and shutdown |
 
 struct TelegramPersistedTurnCard: Sendable, Codable, Equatable {
     let turnId: UUID
@@ -41,9 +42,23 @@ enum TelegramTurnCardLedgerError: Error, Sendable, Equatable {
     case capacityExceeded(Int)
 }
 
-/// Bounded, actor-owned identity ledger. It intentionally stores no prompt,
+/// Bounded, actor-owned identity ledger shared across poll-loop replacements.
+/// It intentionally stores no prompt,
 /// action, delegate, reply, token, or provider content.
 actor TelegramTurnCardLedger {
+    private static let ownerLock = NSLock()
+    nonisolated(unsafe) private static var owners: [String: TelegramTurnCardLedger] = [:]
+
+    static func shared(fileURL: URL) -> TelegramTurnCardLedger {
+        let path = fileURL.standardizedFileURL.resolvingSymlinksInPath()
+        return ownerLock.withLock {
+            if let owner = owners[path.path] { return owner }
+            let owner = TelegramTurnCardLedger(fileURL: path)
+            owners[path.path] = owner
+            return owner
+        }
+    }
+
     private struct Envelope: Sendable, Codable {
         let schemaVersion: Int
         let cards: [TelegramPersistedTurnCard]

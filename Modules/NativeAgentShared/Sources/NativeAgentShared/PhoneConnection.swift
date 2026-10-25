@@ -1,6 +1,8 @@
 // PhoneConnection.swift — the one assessment of a phone's connection to its Mac.
 import Foundation
 
+// Blueprint: | `PhoneConnection.swift` | `NAPhoneConnection`: one shared assessment of pairing, transport and accepted exchange, naming the first unmet fact and its repair owner |
+
 /// A phone and its Mac are connected when three facts hold: they share a
 /// pairing, iCloud carries their records, and an exchange between them was
 /// accepted. Each side builds this from its own evidence. Every surface that

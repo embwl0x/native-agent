@@ -3,8 +3,10 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import ApprovalInbox
-import ChatOrchestration
+import ChatTurnRuntime
 import NotificationInbox
+
+// Blueprint: | `InboxCardActions.swift` | `InboxCardActions`: engagement-before-effect ordering, primary action projection and spoken/draft delivery through one inbox claim |
 
 /// Assembly and presentation bindings; the transaction owns ordering and receipts.
 public protocol InboxCardActionEffects: Sendable {

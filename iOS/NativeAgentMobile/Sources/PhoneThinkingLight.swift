@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-/// A leaf driven by signed working evidence. Core Animation owns every frame.
+/// The Live Activity's Mac-projected working state. Core Animation owns every frame.
 struct PhoneThinkingLight: View {
     let correlationIDs: Set<String>
     @ObservedObject private var activity = PhoneTurnActivity.shared

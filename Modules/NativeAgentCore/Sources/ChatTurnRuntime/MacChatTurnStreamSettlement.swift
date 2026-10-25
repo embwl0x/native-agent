@@ -2,6 +2,11 @@ import Foundation
 import ProviderRouting
 import NativeAgentShared
 import MacControl
+import StandingBots
+import PersistenceCore
+import TurnTrace
+import ToolRegistry
+// Blueprint: | `MacChatTurnStreamSettlement.swift` | Mac stream completion, joined persistence and lifecycle settlement; helper conversations enter their own runner with the existing Mac admission |
 
 public protocol MacChatRenderedMessage: MacChatRetryMessage {
     var sessionId: String? { get }
@@ -287,9 +292,48 @@ public extension MacChatStreamAdapter {
         sessionId: String, activityIdentity: MacChatTurnIdentity, replyRowId: String, metaBox: MetaBox,
         hideUserBubble: Bool, serviceTier: @escaping @Sendable () -> String?,
         onTurnActivity: @escaping @Sendable (MacChatTurnActivity) async -> Void,
-        onScreenPreview: @escaping @Sendable (MacScreenPreviewUpdate) async -> Void
+        onScreenPreview: @escaping @Sendable (MacScreenPreviewUpdate) async -> Void,
+        helperSession: @escaping @Sendable (ChatOrchestrationProgressHandler?) -> BotRunnerSession,
+        dataRoot: URL
     ) -> AsyncThrowingStream<MacChatStreamUpdate, Error> {
         let message = text.isEmpty ? "(see attachments)" : text
+        if sessionId.hasPrefix("bot-") {
+            return AsyncThrowingStream { continuation in
+                Task {
+                    defer { metaBox.recordProducerFinished() }
+                    do {
+                        guard let id = UUID(uuidString: String(sessionId.dropFirst(4))) else { throw ChatOrchestrationError.underlying("invalid helper session id") }
+                        let bot = try BotDefinitionStore(dataRoot: dataRoot).get(id)
+                        let shown = ShownToolNames()
+                        let session = helperSession { event in
+                            if case .delta(let text) = event { continuation.yield(.text(text)) }
+                            if let activity = MacChatTurnActivityBoundary.activity(from: event,
+                                identity: activityIdentity, shown: shown, at: Date()) {
+                                await onTurnActivity(activity)
+                            }
+                        }
+                        let reply = try await TurnTraceContext.$turnId.withValue(activityIdentity.turnId) {
+                            try await TurnTraceContext.$replyRow.withValue(.init(turnId: activityIdentity.turnId, messageId: replyRowId)) {
+                            try await session(bot, message)
+                            }
+                        }
+                        if reply.status == .failed || reply.status == .interrupted {
+                            let error = NSError(domain: "NativeAgentStream", code: -1,
+                                userInfo: [NSLocalizedDescriptionKey: reply.detail ?? reply.status.rawValue])
+                            metaBox.recordExplicitStreamError(error.localizedDescription)
+                            continuation.finish(throwing: error)
+                            return
+                        }
+                        if reply.status == .stopped { metaBox.recordCancellationAcknowledged() }
+                        else { metaBox.recordFinalResponse(reply: reply.reply, sessionId: sessionId) }
+                        continuation.finish()
+                    } catch {
+                        metaBox.recordExplicitStreamError(String(describing: error))
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+        }
         return stream(
             sessionId: sessionId, metaBox: metaBox, activityIdentity: activityIdentity,
             onTurnActivity: onTurnActivity, onScreenPreview: onScreenPreview

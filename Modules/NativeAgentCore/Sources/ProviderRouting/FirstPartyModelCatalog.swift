@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `FirstPartyModelCatalog.swift` | `FirstPartyModelCatalog`: shared first-party model capabilities, route controls and image/speech choices for inspection, pickers and request serialization |
+
 /// Canonical first-party model capabilities used by provider inspection,
 /// Mac/iOS/Telegram pickers, preference validation, and request serialization.
 ///
@@ -209,6 +211,11 @@ public enum FirstPartyModelCatalog {
     /// entries provide conservative context/control truth before that cache
     /// exists and for provider-neutral context budgeting.
     public static let moonshotModels: [FirstPartyModelDescriptor] = [
+        // Kimi K3.1 Pro (10-23, platform.kimi.ai quickstart): 1M context;
+        // top-level reasoning_effort low/high/max, default max; thinking is
+        // always on, so "none" is not offered.
+        .init(id: "kimi-k3.1-pro", name: "Kimi K3.1 Pro", contextLength: 1_048_576, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["low", "high", "max"]),
+        .init(id: "kimi-k3.1-pro-highspeed", name: "Kimi K3.1 Pro Highspeed", contextLength: 1_048_576, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["low", "high", "max"]),
         .init(id: "kimi-k3", name: "Kimi K3", contextLength: 1_048_576, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["max"]),
         .init(id: "kimi-k2.7-code-highspeed", name: "Kimi K2.7 Code Highspeed", contextLength: 262_144, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["max"]),
         .init(id: "kimi-k2.7-code", name: "Kimi K2.7 Code", contextLength: 262_144, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["max"]),
@@ -230,6 +237,10 @@ public enum FirstPartyModelCatalog {
         // the field is omitted); the coding pair "high" (their point is
         // speed-balanced coding; max is one pick away).
         .init(id: "kimi-for-coding", name: "Kimi for Coding", contextLength: 262_144, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "high", "max"]),
+        // K3.1 Pro on the subscription (kimi.com/code models page, 10-23):
+        // Plus and above (1M context from Pro), Highspeed from Pro; default max.
+        .init(id: "k3.1-pro", name: "Kimi K3.1 Pro", contextLength: 1_048_576, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["low", "high", "max"]),
+        .init(id: "k3.1-pro-highspeed", name: "Kimi K3.1 Pro (Highspeed)", contextLength: 1_048_576, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["low", "high", "max"]),
         .init(id: "k3", name: "Kimi K3", contextLength: 1_048_576, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["low", "high", "max"]),
         .init(id: "kimi-for-coding-highspeed", name: "Kimi for Coding (Highspeed)", contextLength: 262_144, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "high", "max"]),
     ]

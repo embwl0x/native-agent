@@ -1,6 +1,8 @@
+import NativeAgentCore
 import Foundation
 import PersistenceCore
 import Studio
+// Blueprint: | `StudioWanderLane.swift` | `StudioWanderLane` enum; installation, eligibility, carried-hour state and prompt for studio wandering |
 
 /// The hour's installation, refractory law and durable trace share cognition's
 /// runtime owner. Installation is resolved before reading state; an absent
@@ -220,13 +222,13 @@ public enum StudioWanderLane {
               case .array(let rows)? = object["trace"] else { throw StateError.malformed }
         var last: Date?
         if case .string(let stamp)? = object["last_wander_at"] {
-            guard let parsed = StudioClock.parseISO(stamp) else { throw StateError.malformed }
+            guard let parsed = NativeTimestampFormat.parseISO8601FractionalFirst(stamp) else { throw StateError.malformed }
             last = parsed
         } else if object["last_wander_at"] != nil && object["last_wander_at"] != .null {
             throw StateError.malformed
         }
         let trace = try rows.map { row -> TraceEntry in
-            guard let entry = TraceEntry.fromJSON(row), StudioClock.parseISO(entry.at) != nil else {
+            guard let entry = TraceEntry.fromJSON(row), NativeTimestampFormat.parseISO8601FractionalFirst(entry.at) != nil else {
                 throw StateError.malformed
             }
             return entry
@@ -249,7 +251,7 @@ public enum StudioWanderLane {
                 throw StateError.refractory
             }
             try await persistence.writeJSON(.object([
-                "last_wander_at": .string(StudioClock.nowISO(at)),
+                "last_wander_at": .string(NativeTimestampFormat.sixDigitUTCOffset(at)),
                 "trace": .array(existing.trace.map { $0.toJSON() }),
             ]), to: path)
         }
@@ -274,7 +276,7 @@ public enum StudioWanderLane {
             let trace = (existing.trace + [entry]).suffix(maximumTraceLines)
             try await persistence.writeJSON(
                 .object([
-                    "last_wander_at": .string(StudioClock.nowISO(at)),
+                    "last_wander_at": .string(NativeTimestampFormat.sixDigitUTCOffset(at)),
                     "trace": .array(trace.map { $0.toJSON() }),
                 ]),
                 to: path
@@ -295,7 +297,7 @@ public enum StudioWanderLane {
     public struct Material: Sendable, Equatable {
         /// `openQuestion` / `anomaly` thought-seed texts, newest first.
         public var curiosity: [String]
-        /// `StudioEncounterCandidate.invitationLine` for what is in reach.
+        /// The studio-intake part's invitation for what is in reach.
         public var invitations: [String]
         /// Titles she has written about lately — so she can notice a rut, not
         /// so anything avoids one for her.
@@ -374,8 +376,7 @@ public enum StudioWanderLane {
             judge yet" is a real ending.
 
             Nothing is written down unless you write it. If, and only if, you want this in \
-            your journal, file it yourself with app action studio.journal. Read \
-            app {find:"studio.journal"} for its arguments. Otherwise the hour simply happened.
+            your journal, file it yourself with app action studio.journal. Otherwise the hour simply happened.
 
             End with one short line saying what you did with it.
             """,

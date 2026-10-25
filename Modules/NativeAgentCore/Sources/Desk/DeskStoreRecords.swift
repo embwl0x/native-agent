@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import PersistenceCore
+// Blueprint: | `DeskStoreRecords.swift` | `DeskError` enum |
 
 public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case unknownHandle(String)
@@ -18,7 +19,6 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case pursuitCapReached(openCount: Int)
     case pursuitFieldMissing(reason: String)
     case pursuitDossierInvalid(reason: String)
-    case agentOriginRequiresPursuit(handle: String)
     case genericPathCannotCreateAgent(handle: String)
     case notAPursuit(handle: String)
     case vetoRefusedTerminal(handle: String, status: DeskStatus)
@@ -80,8 +80,6 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: pursuit refused — \(reason)"
         case .pursuitDossierInvalid(let reason):
             return "desk: pursuit evidence refused — \(reason)"
-        case .agentOriginRequiresPursuit(let handle):
-            return "desk: an origin=agent item (\(handle)) must be kind=project and carry a valid pursuit dossier"
         case .genericPathCannotCreateAgent(let handle):
             return "desk: the generic add-item path cannot create an origin=agent pursuit (\(handle)); use openPursuit"
         case .notAPursuit(let handle):

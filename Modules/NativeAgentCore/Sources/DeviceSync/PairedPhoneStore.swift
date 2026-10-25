@@ -3,8 +3,12 @@ import Combine
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `PairedPhoneStore.swift` | Paired-phone array mutations using PairedPhoneAuthority's one Phone schema; local backup/export/phone exclusions and Paired Phones privacy scope are declared here |
 
 /// Main-actor serialization keeps removal and decision verification ordered.
+/// Owns paired_phones.json's Phone array, decoded by PairedPhoneAuthority.
+/// Local backup, export and phone sync exclude this Mac's pairing authority;
+/// PrivacyMap lists Paired Phones.
 @MainActor
 public final class PairedPhoneStore: ObservableObject {
     public typealias Phone = PairedPhoneAuthority.Phone

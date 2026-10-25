@@ -5,6 +5,7 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import TrustCenter
+// Blueprint: | `WorkshopSession.swift` | `WorkshopSession` struct; `run`, `trimSummary` |
 
 // Wave B — the bounded work session (H5, M6).
 //
@@ -242,6 +243,8 @@ public struct WorkshopSession: Sendable {
 /// The file's existence is the authorization ledger: creation is atomic and
 /// its payload is fsync'd before the LLM boundary. Malformed/pre-existing files
 /// fail closed because O_EXCL refuses to replace them.
+/// Authorization claim JSON: local backup/export include workshop/; no phone
+/// sync; PrivacyMap lists Workshop.
 struct WorkshopReservationClaimStore: Sendable {
     let dataRoot: URL
 

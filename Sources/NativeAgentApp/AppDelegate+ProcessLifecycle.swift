@@ -4,6 +4,7 @@ import AppKit
 import ServiceManagement
 import DeviceSync
 import PersistenceCore
+// Blueprint: | `AppDelegate+ProcessLifecycle.swift` | `AppDelegate`: `claimSingleAppInstance`, `presentSingleInstanceWedgedAlert`, `presentPublicReleaseDataRootError` |
 
 private final class SingleInstanceActivationBox: @unchecked Sendable {
     private let lock = NSLock()

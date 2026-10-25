@@ -2,6 +2,7 @@ import PersistenceCore
 import Experiences
 import Foundation
 import NativeAgentCore
+// Blueprint: | `RunLedger.swift` | `RunLedger`: cross-surface completed-run summary |
 
 // MARK: - RunLedger
 
@@ -90,12 +91,12 @@ public enum RunLedger {
                 }
                 try await persistence.writeJSON(.array(rows), to: path)
             }
-            RepairOwed.settle(dataRoot, operation: ledgerOperation, evidence: .init(source: "run", id: id))
+            await RepairOwed.settle(dataRoot, operation: ledgerOperation, evidence: .init(source: "run", id: id)).value
         } catch {
             fputs("[RunLedger] append failed (run \(id), kind \(kind)): \(error)\n", stderr)
-            RepairOwed.owe(dataRoot, id: "run-ledger:" + id, kind: .run, operation: ledgerOperation, owner: path.path,
+            await RepairOwed.owe(dataRoot, id: "run-ledger:" + id, kind: .run, operation: ledgerOperation, owner: path.path,
                            words: "Run \(id) (\(kind), \(status)) was not recorded in the run ledger: \(error.localizedDescription). "
-                               + "Its existing rows are untouched; repair or move aside \(path.path) and the next run records again.")
+                               + "Its existing rows are untouched; repair or move aside \(path.path) and the next run records again.").value
         }
     }
 

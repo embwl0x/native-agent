@@ -8,6 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
 # shellcheck source=lib/development_bundle_signing.sh
 source "$ROOT/script/lib/development_bundle_signing.sh"
+source "$ROOT/script/lib/development_bundle_validation.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 APP_LOG="$ROOT/.runtime/nativeagent-app.log"
@@ -40,28 +41,11 @@ for arg in "$@"; do
   esac
 done
 
-# 2026-07-21 audit: checkout-identity guard. The installed app's
-# Resources/REPO_PATH stamp names the checkout its data-root resolution points
-# at. A kill+launch mode run from a DIFFERENT live clone/worktree would bounce
-# the running app and hand it a bundle stamped with this checkout's data root.
-# Refuse unless --force-checkout-switch; a stamp naming a deleted checkout is
-# not a conflict. --build-only never kills or launches (worktree builds and
-# install_app.sh rely on that), so it is exempt.
+# Build-only never moves the live app, so it is exempt from the shared checkout guard.
 INSTALLED_APP_BUNDLE="$HOME/Applications/$APP_NAME.app"
-if [[ "$MODE" != "--build-only" && "$FORCE_CHECKOUT_SWITCH" != "1" && -f "$INSTALLED_APP_BUNDLE/Contents/Resources/REPO_PATH" ]]; then
-  installed_repo_path="$(head -n 1 "$INSTALLED_APP_BUNDLE/Contents/Resources/REPO_PATH")"
-  if [[ -n "$installed_repo_path" && -d "$installed_repo_path" ]]; then
-    installed_repo_resolved="$(cd "$installed_repo_path" 2>/dev/null && pwd -P || true)"
-    root_resolved="$(cd "$ROOT" && pwd -P)"
-    if [[ -n "$installed_repo_resolved" && "$installed_repo_resolved" != "$root_resolved" ]]; then
-      echo "[build_and_run.sh] ERROR: the installed app belongs to a different checkout:" >&2
-      echo "  installed: $installed_repo_resolved" >&2
-      echo "  this run : $root_resolved" >&2
-      echo "Kill+launch from here would bounce the live app and repoint its data root." >&2
-      echo "Pass --force-checkout-switch to switch the installed app to this checkout." >&2
-      exit 2
-    fi
-  fi
+if [[ "$MODE" != "--build-only" ]]; then
+  nativeagent_require_installed_checkout "$INSTALLED_APP_BUNDLE" "$ROOT" "$FORCE_CHECKOUT_SWITCH" \
+    "[build_and_run.sh]" "Kill+launch from here would bounce the live app and repoint its data root."
 fi
 
 # A Codex/agent workspace sandbox cannot register an AppKit process. Launching
@@ -79,6 +63,8 @@ if ! command -v xcodegen >/dev/null 2>&1; then
   echo "[build_and_run.sh] ERROR: xcodegen is required; install it with: brew install xcodegen" >&2
   exit 1
 fi
+swift "$ROOT/script/generate_turn_part_versions.swift" --repo "$ROOT"
+ruby "$ROOT/script/sync_build_declarations.rb"
 xcodegen --spec "$ROOT/project.yml"
 
 LOCAL_ENV="$ROOT/local/nativeagent.local.env"
@@ -180,24 +166,9 @@ ditto "$BUILT_APP" "$BUNDLE"
 if [[ -d "$BUNDLE/Contents/Resources/embedding" ]]; then
   echo "[embedding] staged $(basename "$EMBEDDING_MODEL_DIR") ($(du -sh "$BUNDLE/Contents/Resources/embedding" | cut -f1))"
 fi
-
-assert_no_python_artifacts() {
-  local bundle="$1" hit
-  hit="$(find "$bundle/Contents/Resources" \
-    \( -type d \( -name python -o -name __pycache__ \) \
-       -o -type f \( -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o -name '*python*' \) \
-       -o -type l -name '*python*' \) \
-    -print -quit 2>/dev/null || true)"
-  if [[ -n "$hit" ]]; then
-    echo "[swift-native] ERROR: Python artifact staged in app bundle: $hit" >&2
-    echo "[swift-native] NativeAgent app artifacts must be Swift-native and zero-Python." >&2
-    exit 1
-  fi
-}
-
 xattr -dr com.apple.quarantine "$BUNDLE" 2>/dev/null || true
 
-assert_no_python_artifacts "$BUNDLE"
+nativeagent_assert_no_python_artifacts "$BUNDLE" "[swift-native]" staged app
 
 # Mac app signing. One shared owner keeps build and install on the exact same
 # identity/profile/entitlement decision tree.

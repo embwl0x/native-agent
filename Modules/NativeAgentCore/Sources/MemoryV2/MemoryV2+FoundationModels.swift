@@ -5,6 +5,8 @@ import NativeAgentCore
 import FoundationModels
 #endif
 
+// Blueprint: | `MemoryV2+FoundationModels.swift` | `AppleFoundationModelsAdapter.classify`: on-device kind labels for existing memory rows; no fact extraction |
+
 // MARK: - Apple Foundation Models adapter (on-device classification)
 //
 // What is LEFT of this adapter, 2026-09-11: `classify`, which the memory kind
@@ -72,23 +74,12 @@ public enum AppleFoundationModelsAdapter {
         #endif
     }
 
-    /// Match a raw model reply against the candidate categories: EXACT
-    /// (case-insensitive, whitespace/punctuation-trimmed) or throw
-    /// `.classificationNoMatch`. The earlier category-as-substring branch
-    /// was removed (gpt-5.5 delta re-review, 2026-06-10): a chatty or
-    /// NEGATED reply ("not a preference") substring-matched "preference" —
-    /// fabricating exactly the kind the no-fabrication contract forbids.
-    /// An unparseable reply drops the row from the proposal card instead.
-    /// Split out so the malformed-reply path is unit-testable on non-AI
-    /// Macs (the model call itself requires Apple Intelligence).
+    /// Accept only a declared category; unparseable replies drop the row.
     static func matchCategory(reply: String, categories: [String]) throws -> String {
-        let trimmed = reply
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: ".\"'`"))
-        if let match = categories.first(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
-            return match
+        guard categories.contains(reply) else {
+            throw FoundationModelsError.classificationNoMatch(reply)
         }
-        throw FoundationModelsError.classificationNoMatch(trimmed)
+        return reply
     }
 
     // MARK: prompts

@@ -3,6 +3,7 @@ import NativeAgentShared
 import PersistenceCore
 import Experiences
 import TurnTrace
+// Blueprint: | `MacSyncEngine+WorkActivity.swift` | `MacSyncEngine`: `startWorkActivityObservation`, `projectWorkshopWorkActivities`, `requestWorkActivityPublication` |
 
 extension MacSyncEngine {
     func startWorkActivityObservation() {
@@ -125,7 +126,7 @@ extension MacSyncEngine {
                     snapshot.unavailable = unavailable
                     let data = try await MobileSnapshotBuilder.shared.encode(snapshot)
                     var changed: Set<String> = []
-                    switch await writeSnapshotData(data, to: "work_activity.json", in: snapshotDir, lifecycleGeneration: generation) {
+                    switch await writeSnapshotData(data, to: "work_activity.json", in: snapshotDir, lifecycleGeneration: generation, readRevision: Date().timeIntervalSince1970) {
                     case .changed: changed.insert("work_activity.json")
                     case .failed(let reason): syncError = "Work activity sync failed: \(reason)"
                     case .unchanged: break
@@ -134,7 +135,7 @@ extension MacSyncEngine {
                         lifecycleGeneration: generation, scope: .standard)
                     guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
                     if configuration.usable {
-                        let errors = await sync.apns.sendWorkActivities(rows, dataRoot: sync.dataRoot)
+                        let errors = await sync.relay.sendWorkActivities(rows, dataRoot: sync.dataRoot)
                         if !errors.isEmpty { syncError = "Live Activity push failed: \(errors.joined(separator: "; "))" }
                     }
                 } while publishedVersion != workActivityVersion

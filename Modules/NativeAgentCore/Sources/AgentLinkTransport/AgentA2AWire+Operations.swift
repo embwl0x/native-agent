@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentA2AWire+Operations.swift` | `AgentA2AWire`: `operationRequest`, `operationResult`, `normalizeTaskList` |
 
 extension AgentA2AWire {
     /// Other 1.0 operations share the same canonical ProtoJSON dictionaries as

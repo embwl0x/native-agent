@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+// Blueprint: | `OrganismLivingDynamics.swift` | `OrganismAnalyticDecay` struct; `value` |
 
 /// Closed-form time law used by organism tissue that should change with wall
 /// time without waking on a polling cadence. The stored value remains an

@@ -3,11 +3,12 @@ import Foundation
 import Observation
 import NativeAgentShared
 import PersistenceCore
-import SelfImprovement
+import EngineRuntime
 import AppToolRuntime
 import MacControl
 import SystemOps
 import BackgroundWork
+// Blueprint: | `ImprovementNextGenModels.swift` | `ImprovementGauntletRun.run`; app-bound process execution and bounded-run logging adapters |
 
 extension ImprovementGauntletRun {
     static func run(dataRoot: URL) async throws -> ImprovementGauntletRun {

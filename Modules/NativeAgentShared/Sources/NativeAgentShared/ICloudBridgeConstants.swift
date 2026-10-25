@@ -4,6 +4,8 @@
 // shared module prevents one side from silently drifting from the other.
 import Foundation
 
+// Blueprint: | `ICloudBridgeConstants.swift` | `NativeAgentICloudBridgeConstants`: shared KVS/Drive wire namespace, mobile source keys and configured background task identifiers |
+
 public enum NativeAgentICloudBridgeConstants {
     public static let defaultContainerID = "iCloud.io.github.embwl0x.nativeagent"
     public static let defaultMobileSourceKey = "mobile_app"

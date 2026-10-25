@@ -88,5 +88,9 @@
     <string>io.github.embwl0x.nativeagent.memory_consolidation</string>
     <string>io.github.embwl0x.nativeagent.self_improvement_sweep</string>
   </array>
+  <key>com.apple.security.device.camera</key>
+  <true/>
+  <key>com.apple.security.personal-information.location</key>
+  <true/>
 </dict>
 </plist>

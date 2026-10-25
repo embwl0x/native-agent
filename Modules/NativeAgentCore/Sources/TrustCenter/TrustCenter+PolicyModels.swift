@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `TrustCenter+PolicyModels.swift` | `TrustCenterDefaultWorkspaceRoots`, `TrustCenterError` |
 
 // MARK: - Default trusted workspace roots
 
@@ -32,16 +33,14 @@ public enum TrustCenterDefaultWorkspaceRoots {
 
 public enum TrustCenterError: Error, LocalizedError {
     case invalidRequest
-    case invalidResponse(status: Int)
-    case unavailable
+    case policyConflict
     case underlying(String)
 
     public var errorDescription: String? {
         switch self {
-        case .invalidRequest: return "trust: invalid request"
-        case .invalidResponse(let s): return "trust: native implementation returned unexpected status \(s)"
-        case .unavailable: return "trust: unavailable"
-        case .underlying(let m): return "trust: \(m)"
+        case .invalidRequest: return "trust_request_invalid: This request cannot be applied to the current Trust policy. Inspect Trust > Access and policy and correct the request."
+        case .policyConflict: return "trust_policy_conflict: Mac control settings changed while you edited. Review current settings at Trust > Mac > Advanced Mac control, reapply your edits, then Save."
+        case .underlying(let m): return m
         }
     }
 }

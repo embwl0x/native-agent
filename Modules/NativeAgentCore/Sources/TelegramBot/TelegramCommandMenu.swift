@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `TelegramCommandMenu.swift` | `TelegramCommandMenuStatus` and `TelegramCommandMenuSync`: command-menu synchronization status contract |
+
 public struct TelegramCommandMenuStatus: Sendable, Codable, Equatable {
     public let commandCount: Int
     public let registryVersion: String

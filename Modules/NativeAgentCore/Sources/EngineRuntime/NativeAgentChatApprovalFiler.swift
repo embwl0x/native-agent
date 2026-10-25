@@ -1,11 +1,13 @@
 import AuthoredCapabilities
 import Foundation
 import ApprovalInbox
-import ChatOrchestration
+import ChatTurnContracts
+import AgentConversations
 import TrustCenter
 import MacControl
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `NativeAgentChatApprovalFiler.swift` | `NativeAgentChatApprovalFiler` actor; `fileApprovalRequest`, `peerRequesterName` |
 
 /// App-owned projection of a chat approval into the canonical ApprovalInbox.
 ///

@@ -1,13 +1,31 @@
 import CryptoKit
-import FeedPolicy
 import Foundation
 import Darwin
 import NativeAgentCore
+// Blueprint: | `PersistenceCore.swift` | Shared JSONValue primitive accessors with explicit numeric coercion/finite policy; JSON/JSONL atomic/durable persistence, strict UTF-8 physical-line tails with rejected-row accounting and directory sync; CapabilityLifecycle guards ability changes and reconciles owner-off attribution; VerifiedPath owns descriptor-relative IO and transfers |
 
-private extension JSONValue {
+package extension JSONValue {
     var objectValue: [String: JSONValue]? { if case .object(let fields) = self { fields } else { nil } }
     var arrayValue: [JSONValue]? { if case .array(let values) = self { values } else { nil } }
     var stringValue: String? { if case .string(let text) = self { text } else { nil } }
+    var boolValue: Bool? { if case .bool(let value) = self { value } else { nil } }
+    var integerValue: Int64? {
+        switch self {
+        case .int(let number): return number
+        case .double(let number): return Int64(exactly: number.rounded(.towardZero))
+        default: return nil
+        }
+    }
+    func numberValue(coercingStrings: Bool, finiteOnly: Bool) -> Double? {
+        let number: Double?
+        switch self {
+        case .int(let value): number = Double(value)
+        case .double(let value): number = value
+        case .string(let value) where coercingStrings: number = Double(value)
+        default: return nil
+        }
+        return number.flatMap { !finiteOnly || $0.isFinite ? $0 : nil }
+    }
 }
 
 extension CapabilityLifecycle {
@@ -67,8 +85,10 @@ extension CapabilityLifecycle {
                                           ownerAuthorized: Bool = false, enabling: Bool = false, preview: Bool = false) throws -> [String: JSONValue] {
         let key = proposed["state"] == nil ? "status" : "state"
         if let attribution = current?["disabledBy"], attribution != .null,
-           ![JSONValue.string("owner"), .string("agent")].contains(attribution) {
-            throw PersistenceCoreError.ioFailure("The ability's off ownership is unreadable. Repair its registry entry before changing it.")
+           !offActors.contains(attribution.stringValue ?? "") {
+            let name = current?["id"]?.stringValue ?? "The ability"
+            throw PersistenceCoreError.ioFailure("\(name)'s off ownership is unreadable: its registry entry says disabledBy \((try? attribution.serialize(pretty: false)) ?? "?"). "
+                + "Set disabledBy to who switched it off (owner, hers or peer; owner when unsure) before changing it. Nothing changed.")
         }
         let ownerOff = current.map(requiresOwnerToEnable) ?? false
         var row = proposed
@@ -87,7 +107,10 @@ extension CapabilityLifecycle {
             }
             row["disabledBy"] = .string("owner")
         } else {
-            row["disabledBy"] = offStatuses.contains(row[key]?.stringValue ?? "") ? .string(ownerAuthorized ? "owner" : "agent") : nil
+            // Off is its actor's: the owner's whenever he acts, else the
+            // non-owner actor the caller recorded, else hers.
+            let recorded = row["disabledBy"]?.stringValue.flatMap { offActors.contains($0) && $0 != "owner" ? $0 : nil }
+            row["disabledBy"] = offStatuses.contains(row[key]?.stringValue ?? "") ? .string(ownerAuthorized ? "owner" : recorded ?? "hers") : nil
             if enabling, !offStatuses.contains(row[key]?.stringValue ?? "") {
                 for field in retirementFields { row.removeValue(forKey: field) }
             }
@@ -240,7 +263,7 @@ public protocol PersistenceCoreProtocol: Sendable {
 /// file is not: a desk that lost three ops looks byte-for-byte as healthy as one
 /// that lost none. This carries the count back out so a store can say so.
 public struct JSONLReadReport: Sendable, Equatable {
-    /// Unparseable lines that are NOT the tolerated trailing partial. Real
+    /// Lines rejected by JSON or row decoding, excluding the tolerated trailing partial. Real
     /// damage: bytes between two good lines that no longer decode.
     public var malformedLineCount: Int
     /// The file's last line was torn (no trailing newline). Tolerated, reported.
@@ -285,6 +308,8 @@ extension PersistenceCoreProtocol {
 public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     public init() {}
 
+    /// Malformed JSON attempts a private quarantine copy before throwing;
+    /// callers needing a nonmutating inspection must read and parse directly.
     public func readJSON(_ path: URL, ifMissing: JSONValue) async throws -> JSONValue {
         let data: Data
         do {
@@ -431,10 +456,18 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     public func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport) {
         guard FileManager.default.fileExists(atPath: path.path) else { return ([], .clean) }
         let data = try Data(contentsOf: path)
+        return Self.decodeJSONL(data) { value, _ in value }
+    }
+
+    /// Shared physical framing for file reads and already-read JSONL bytes.
+    /// The row decoder receives the line byte count plus a newline allowance; nil marks a malformed row.
+    public static func decodeJSONL<Row>(
+        _ data: Data, row: (JSONValue, Int) -> Row?
+    ) -> (rows: [Row], report: JSONLReadReport) {
         var lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
         if lines.last?.isEmpty == true { lines.removeLast() }
         let endsWithNewline = data.last == 0x0A
-        var rows: [JSONValue] = []
+        var rows: [Row] = []
         rows.reserveCapacity(lines.count)
         var malformed = 0
         var trailingPartial = false
@@ -444,7 +477,8 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
                 continue
             }
             if let parsed = try? JSONValue.parse(Data(line)) {
-                rows.append(parsed)
+                if let decoded = row(parsed, line.count + 1) { rows.append(decoded) }
+                else { malformed += 1 }
                 continue
             }
             if index == lines.count - 1 && !endsWithNewline {

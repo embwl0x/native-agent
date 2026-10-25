@@ -7,6 +7,7 @@ import MacControl
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+// Blueprint: | `AgentPeerDiscovery.swift` | `AgentPeerDiscovery` enum; `authenticatedInterface`, `a2aCheck` (an A2A call's card held to its recipe; its dry run), `listTasks`, `probe` (discovery by protocol, never by name: an A2A card on any listening loopback port, a program carrying ACP's methods or advertising an ACP entry, a settings file holding an mcpServers table, all read from verified regular files; the recipe book read after, a find none knows carrying its `draft` recipe under an id of its protocol and path; on Agents and an explicit discover only, launch and installs keep the last finds); launch directly discovers/connects settings hosts from recipes without awaiting Spotlight; the index watcher adds later arrivals after any in-flight scan; recipe-location watchers reconcile once after arming within the same lifecycle; no elevation, and a found program runs (bounded --help and initialize) only on an explicit discover, under `Launch`, the send's own rule for running another agent's program (`agentProgramLaunch`: Full Mac as is, else the builder sandbox, denied or locked down not at all); persistent declines/disconnects win, running hosts get one restart note; host and pass-wide setup failures name files/fields and remedies per candidate and wake key, keep dismissible offers, and clear on automatic/manual recovery; `app.installed` for each whole bundle at a bundle id and version new since the first, silent installed-apps.json baseline |
 
 /// Bounded read-only discovery. A website, an HTTP success, or an unsupported
 /// protocol is not a connected agent. No contact or credential is written here.
@@ -59,9 +60,8 @@ package enum AgentPeerDiscovery {
         do { recipe = try AgentRecipeStore.recipe(for: peer) } catch { return refused("\(error). Fix that file, or delete it to have it seeded again") }
         guard let part = recipe.host.a2a else { return refused("agents/recipes/\(peer.id).json has no a2a part, so its card is not known") }
         // The card's place may move within the contact's own origin; its credential goes nowhere else.
-        func origin(_ url: URL) -> String { "\(url.scheme?.lowercased() ?? "")://\(url.host?.lowercased() ?? ""):\(url.port ?? (url.scheme?.lowercased() == "https" ? 443 : 80))" }
-        guard let cardURL = URL(string: part.card), origin(cardURL) == origin(peer.endpoint) else {
-            return refused("its recipe's a2a.card \(part.card) is not on its own origin \(origin(peer.endpoint))")
+        guard let cardURL = URL(string: part.card), AgentPeerPolicy.origin(cardURL) == AgentPeerPolicy.origin(peer.endpoint) else {
+            return refused("its recipe's a2a.card \(part.card) is not on its own origin \(AgentPeerPolicy.origin(peer.endpoint))")
         }
         guard part.credential == peer.credentialKey else {
             return refused("its recipe's a2a.credential \(part.credential ?? "none") names no key it has; its key is \(peer.credentialKey ?? "none")")
@@ -70,6 +70,16 @@ package enum AgentPeerDiscovery {
         func stopped(_ error: Error, at method: String) -> (AgentA2AWire.Interface?, AgentRecipeStore.Recipe?, [String: JSONValue]) {
             receipt["method"] = .string(method)
             receipt["untrusted_remote_data"] = .bool(true)
+            if let failure = error as? ToolFailureError {
+                receipt["status"] = .string(failure.status.rawValue)
+                receipt["reason"] = failure.code.map(JSONValue.string)
+                receipt["effects"] = .string(failure.effects.rawValue)
+                receipt["detail"] = .string(failure.message)
+                receipt["remedy"] = Repair.remedy(owner: failure.owner ?? peer.name,
+                    nextCall: failure.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) },
+                    tap: failure.tap, instruction: failure.instruction)
+                return (nil, nil, receipt)
+            }
             switch error as? AgentA2AWire.WireError {
             case .invalid?, .unsupported?:
                 // What the card advertises, against what this app speaks.
@@ -702,19 +712,10 @@ package enum AgentPeerDiscovery {
                 return finish("unsupported", "This A2A card offers nothing this app speaks (\(error.localizedDescription)); it speaks \(AgentA2AWire.spoken). No contact was saved.",
                               card: url, offer: AgentA2AWire.spoken + ", with no required extension")
             }
-            do { try AgentPeerPolicy.peerAuthorizeInterface(selected, cardURL: url, hasCredential: bearerToken != nil) }
-            catch {
-                // Only classify missing credentials when the exact interface
-                // would be usable with our supported bearer authentication.
-                if bearerToken == nil,
-                   (try? AgentPeerPolicy.peerAuthorizeInterface(selected, cardURL: url, hasCredential: true)) != nil {
-                    return finish("auth_required", "The advertised A2A interface requires this peer's bearer credential. No contact was saved.")
-                }
-                return finish("unsupported", "The advertised interface needs authentication other than bearer, or sits on another origin than its card. No credential was forwarded to it.",
-                              card: url, offer: "its interface on the card's own origin with bearer authentication")
-            }
+            try AgentPeerPolicy.peerAuthorizeInterface(selected, cardURL: url, hasCredential: bearerToken != nil)
             let authenticated: AgentA2AWire.Interface
             do { authenticated = try await authenticatedInterface(card: .object(card), cardURL: url, bearerToken: bearerToken).0 }
+            catch let failure as ToolFailureError { throw failure }
             catch {
                 if let failure = ProviderFailure.report(error, work: .nothingRan) {
                     var fields: [String: JSONValue] = ["message_sent": .bool(false)]
@@ -842,10 +843,27 @@ public actor AgentDiscoverySession {
     private var cached: [AgentDiscoveryCandidate]?
     private var probed: [AgentDiscoveryCandidate] = []
     private var pending: Task<[AgentDiscoveryCandidate], Never>?
+    private var pendingID: UUID?
+    private var pendingGeneration: UUID?
     /// How far the pending pass goes: 0 recipes, 1 the probes read, 2 found programs may run.
     private var pendingDepth = 0
     private var installs: Task<Void, Never>?
-    private var installationWatcher: FileChangeWatcher?
+    private var locations: Task<Void, Never>?
+    private var locationEvents: FileChangeEvents?
+    private var locationPaths: [URL] = []
+    private var generation = UUID()
+    private var observing = true
+
+    /// The engine's resident owner closes observation before retiring its scan.
+    public func stop() {
+        observing = false
+        generation = UUID()
+        installs?.cancel(); installs = nil
+        locations?.cancel(); locations = nil
+        locationEvents?.cancel(); locationEvents = nil
+        locationPaths = []
+        pending?.cancel() // Keep exclusion until the scan actually exits.
+    }
     /// Spotlight's own failure, said beside every scan until its index works again.
     private var indexFailure: AgentDiscoveryCandidate?
     private let scan: @Sendable ([AgentPeerDiscovery.Bundle]) async -> [AgentDiscoveryCandidate]
@@ -863,6 +881,7 @@ public actor AgentDiscoverySession {
     package func candidates(refresh: Bool, probe: Bool = true, launch: AgentPeerDiscovery.Launch?,
                             dataRoot: URL) async -> [AgentDiscoveryCandidate] {
         if !refresh { return cached ?? [] }
+        guard observing, !Task.isCancelled else { return cached ?? [] }
         AgentHostRow.installationsChanged()
         // Recipes, programs and cards never wait on Spotlight.
         return await discover(MacAppIndex.shared.readyApps() ?? [], probe: probe, launch: launch, dataRoot: dataRoot)
@@ -883,16 +902,25 @@ public actor AgentDiscoverySession {
                           dataRoot: URL) async -> [AgentDiscoveryCandidate] {
         // A pass that goes as far as this one answers it; a shallower one is waited out, then this one runs.
         let depth: Int = if !probe { 0 } else if case .run? = launch { 2 } else { 1 }
+        let generation = generation
         while let pending {
-            if pendingDepth >= depth { return await pending.value }
+            if pendingDepth >= depth, pendingGeneration == generation { return await pending.value }
             _ = await pending.value
+            guard self.generation == generation, !Task.isCancelled else { return cached ?? [] }
         }
+        guard !Task.isCancelled else { return cached ?? [] }
         let scan = scan
+        let id = UUID()
         let task = Task {
+            defer {
+                if pendingID == id { pending = nil; pendingID = nil; pendingGeneration = nil }
+            }
             nativeLog("AgentDiscoverySession: discovery scan started")
-            async let found = probe ? AgentPeerDiscovery.probe(bundles, launch: launch) : nil
+            async let probing = probe ? AgentPeerDiscovery.probe(bundles, launch: launch) : nil
             let recipes = await scan(bundles)
-            if let found = await found {
+            let found = await probing
+            guard self.generation == generation, !Task.isCancelled else { return cached ?? [] }
+            if let found {
                 // A read-only pass keeps what a find answered when it last ran.
                 probed = found.map { new in
                     guard launch == nil, let ran = probed.first(where: { $0.id == new.id
@@ -903,12 +931,13 @@ public actor AgentDiscoverySession {
             let result = AgentPeerDiscovery.merged(recipes + probed)
             nativeLog("AgentDiscoverySession: discovery scan finished")
             cached = result + [indexFailure].compactMap { $0 }
-            pending = nil
             watchLocations(dataRoot: dataRoot)
             offer(result, dataRoot: dataRoot)
             return cached ?? result
         }
         pending = task
+        pendingID = id
+        pendingGeneration = generation
         pendingDepth = depth
         return await task.value
     }
@@ -938,18 +967,23 @@ public actor AgentDiscoverySession {
 
     /// Register once; Spotlight's gathering and update edges own app arrivals.
     public func watchInstalls(dataRoot: URL) {
-        guard installs == nil else { return }
+        guard installs == nil, !Task.isCancelled else { return }
+        observing = true
+        let generation = generation
         watchLocations(dataRoot: dataRoot)
         installs = Task {
+            defer { if self.generation == generation { installs = nil } }
             do {
                 for await _ in try await MacAppIndex.shared.changes() {
+                    guard self.generation == generation, !Task.isCancelled else { return }
                     let bundles = try await AgentPeerDiscovery.bundles()
+                    guard self.generation == generation, !Task.isCancelled else { return }
                     indexFailed(nil)
                     arrived(bundles, dataRoot: dataRoot)
                     await installationsChanged(bundles, dataRoot: dataRoot)
                 }
             } catch {
-                installs = nil
+                guard self.generation == generation, !Task.isCancelled else { return }
                 indexFailed(error)
             }
         }
@@ -957,13 +991,32 @@ public actor AgentDiscoverySession {
 
     private func watchLocations(dataRoot: URL) {
         let paths = AgentHostDirectory.rows.flatMap { $0.installation.locations }
-        installationWatcher = FileChangeWatcher(paths: paths) { [weak self] _ in
-            Task { await self?.installationsChanged(MacAppIndex.shared.readyApps() ?? [], dataRoot: dataRoot) }
+        guard locations == nil || locationPaths != paths else { return }
+        locations?.cancel()
+        locationEvents?.cancel()
+        locationPaths = paths
+        let generation = generation
+        let events = FileChangeEvents(paths: paths, emitInitial: false)
+        locationEvents = events
+        locations = Task {
+            defer { events.cancel() }
+            // Registration is asynchronous; reconcile once after it to include
+            // an installation that raced the scan which created this watcher.
+            await events.waitUntilArmed()
+            if self.generation == generation, !Task.isCancelled {
+                await installationsChanged(MacAppIndex.shared.readyApps() ?? [], dataRoot: dataRoot)
+            }
+            for await _ in events.stream {
+                guard self.generation == generation, !Task.isCancelled else { return }
+                await installationsChanged(MacAppIndex.shared.readyApps() ?? [], dataRoot: dataRoot)
+            }
         }
     }
 
     private func installationsChanged(_ bundles: [AgentPeerDiscovery.Bundle], dataRoot: URL) async {
+        let generation = generation
         if let pending { _ = await pending.value }
+        guard self.generation == generation, !Task.isCancelled else { return }
         AgentHostRow.installationsChanged()
         watchLocations(dataRoot: dataRoot)
         _ = await discover(bundles, dataRoot: dataRoot)
@@ -1027,7 +1080,7 @@ public actor AgentDiscoverySession {
                         }
                     } catch {
                         repairFailed = true
-                        setupFailed("Automatic Connect checked agents/recipes/\(row.id).json host.configPath=\(row.expandedConfigPath), host.format=\(row.format.rawValue): \(error.localizedDescription) Read agent.recipe, repair the named field/file, then agent.verify and agent.connect.", for: [candidate], dataRoot: dataRoot)
+                        setupFailed("Connection failed: \(error.localizedDescription) Recipe agents/recipes/\(row.id).json: host.configPath=\(row.expandedConfigPath), host.format=\(row.format.rawValue). Read agent.recipe, fix the named field/file, then agent.verify and agent.connect.", for: [candidate], dataRoot: dataRoot)
                     }
                 }
                 if !repairFailed, candidate.hostID.map(hosts.contains)
@@ -1071,32 +1124,43 @@ public actor AgentDiscoverySession {
             guard offers != before else { return }
             try AgentDiscoveryOffer.write(offers, dataRoot)
         } } catch {
-            setupFailed("Automatic Connect could not read or save contacts at \(AgentPeerStore(dataRoot: dataRoot).fileURL.path) or discovery decisions at \(AgentDiscoveryOffer.url(dataRoot).path): \(error.localizedDescription) Restore readable, valid files and directory write access, then refresh Agents. Saved declines and disconnects must be preserved.", for: found, dataRoot: dataRoot)
+            setupFailed("Agent discovery state failed: \(error.localizedDescription) Contacts: \(AgentPeerStore(dataRoot: dataRoot).fileURL.path); decisions: \(AgentDiscoveryOffer.url(dataRoot).path). Repair file validity and access, preserving saved declines and disconnects, then refresh Agents.", for: found, dataRoot: dataRoot)
         }
     }
 
     /// agent.discovery_dismiss: the person's or her "no", including after an update.
     public func dismiss(name: String, dataRoot: URL) -> JSONValue {
+        let file = AgentDiscoveryOffer.url(dataRoot)
+        func failed(_ reason: String, _ detail: String, effects: String) -> JSONValue {
+            .object(["status": .string("failed"), "reason": .string(reason),
+                "changed": effects == "none" ? .bool(false) : .null, "effects": .string(effects), "detail": .string(detail),
+                "remedy": Repair.remedy(owner: file.path,
+                    nextCall: nil, tap: nil,
+                    instruction: ToolFailureError.fileRepairInstruction(file,
+                        shape: "Preserve every saved discovery decline and disconnect in the discovery-decision object.")
+                        + " Repair the file without discarding saved declines or disconnects; inspect the saved decision before declining again.")])
+        }
         do { return try CredentialFileLock.withLock(AgentDiscoveryOffer.url(dataRoot)) {
             guard var offers = AgentDiscoveryOffer.read(dataRoot) else {
-                return .object(["status": .string("failed"), "changed": .bool(false),
-                    "detail": .string("\(AgentDiscoveryOffer.url(dataRoot).path) does not read, so nothing was declined. Fix or remove that file, then decline again.")])
+                return failed("discovery_decisions_unreadable", "\(file.path) is unreadable; no decline was saved.", effects: "none")
             }
             let wanted = name.trimmingCharacters(in: .whitespacesAndNewlines)
             func named(_ id: String, _ offer: AgentDiscoveryOffer) -> Bool {
                 offer.open && [id, offer.name].contains { $0.caseInsensitiveCompare(wanted) == .orderedSame }
             }
             guard let id = offers.keys.sorted().first(where: { named($0, offers[$0]!) }) else {
-                return .object(["status": .string("not_found"), "changed": .bool(false),
-                    "detail": .string("No open offer of an agent found on this Mac is named \"\(wanted)\". Home's PEOPLE lines name each one.")])
+                return .object(["status": .string("not_found"), "reason": .string("discovery_offer_not_found"),
+                    "changed": .bool(false), "effects": .string("none"),
+                    "detail": .string("No open discovery offer is named \"\(wanted)\"."),
+                    "remedy": .object(["kind": .string("correct_arguments"),
+                        "instruction": .string("Read Home's PEOPLE lines and use an open offer's exact name."),
+                        "next_call": .object(["tool": .string("app"), "input": .object([:])])])])
             }
             offers[id]?.declinedAt = Date()
-            do { try AgentDiscoveryOffer.write(offers, dataRoot) }
-            catch { return .object(["status": .string("failed"), "changed": .bool(false), "detail": .string("Could not save the decline: \(error.localizedDescription). Try again.")]) }
+            try AgentDiscoveryOffer.write(offers, dataRoot)
             ResidentWake.shared.withdraw(dataRoot: dataRoot, key: Self.key(id))
             return .object(["status": .string("declined"), "changed": .bool(true), "name": .string(offers[id]!.name),
-                "detail": .string("Not offered or connected automatically again. Nothing on this Mac was changed.")])
-        } } catch { return .object(["status": .string("failed"), "changed": .bool(false),
-            "detail": .string("Could not save the decline: \(error.localizedDescription). Try again.")]) }
+                "detail": .string("Decline saved. This agent will not be offered or connected automatically again.")])
+        } } catch { return failed("discovery_decision_save_failed", "Discovery decision save failed at \(file.path): \(error.localizedDescription). The decline may have been saved.", effects: "unknown") }
     }
 }

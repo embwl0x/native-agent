@@ -1,5 +1,7 @@
 import SwiftUI
 
+// Blueprint: | `DisclosureRowToggle.swift` | `DisclosureRowToggle`: whole-label disclosure hit target sharing the DisclosureGroup's existing binding |
+
 // User (2026-08-11): "I have to click on the tiny > to get it to open... I
 // should be able to click on the whole thing." macOS DisclosureGroup only
 // toggles on the chevron; this makes the ENTIRE label row a hit target.

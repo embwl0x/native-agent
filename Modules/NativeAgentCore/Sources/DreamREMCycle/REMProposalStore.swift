@@ -4,6 +4,8 @@ import NativeAgentCore
 import PersistenceCore
 import Transcripts
 
+// Blueprint: | `REMProposalStore.swift` | `REMProposalStore`: canonical proposal JSONL, checked reads, legacy import, approval transitions and bounded compaction |
+
 // Canonical REM proposal store — `<dataRoot>/rem_proposals.jsonl`, one
 // camelCase row per line. This is THE store: REMConsolidator (full weekly
 // pipeline), REMCycleLoop (legacy tick path), and the Mac app's
@@ -259,13 +261,6 @@ public struct REMProposalStore: Sendable {
             byID[r.id] = r
         }
         return order.compactMap { byID[$0] }
-    }
-
-    /// The base's folded rows (empty when no base file exists — a genesis feed).
-    /// Tolerant per-row like the feed; a base file that exists but is entirely
-    /// undecodable is logged loudly (never silently blanking approved pins).
-    func loadBaseRows() -> [REMProposalRow] {
-        readBaseRows() ?? []
     }
 
     /// Distinguishes MISSING base (`[]` — genesis feed, safe to create) from
@@ -810,7 +805,7 @@ public struct REMProposalStore: Sendable {
 /// The compaction snapshot (P-L3). `rows` is the id-keyed set of TERMINAL
 /// proposals folded out of the feed, in first-folded order. ADDITIVE on disk: it
 /// lives in a NEW file beside the feed, so an old feed with no base loads as pure
-/// genesis (`loadBaseRows()` → `[]`).
+/// genesis (`readBaseRows()` → `[]`).
 struct REMProposalCompactionBase: Sendable, Equatable {
     let rows: [REMProposalRow]
 

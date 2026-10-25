@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `REMGrowthWriter.swift` | `REMGrowthWriter.appendApprovedLesson`: exact approved paragraph append to a ready canonical persona root, preserving authored headings |
+
 // Approved lessons append as standalone paragraphs to canonical GROWTH.md.
 // The writer preserves the approved text and existing hand-authored headings;
 // it does not derive a heading from the lesson.

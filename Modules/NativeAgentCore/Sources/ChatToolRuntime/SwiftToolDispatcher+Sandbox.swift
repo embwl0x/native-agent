@@ -1,12 +1,11 @@
 import AuthoredCapabilities
 import AgentWorkspace
 import Foundation
+import TurnTrace
 import Experiences
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
-import MCPDispatcher
-import KnowledgeGraph
 import PersonaEngine
 import ProviderRouting
 import TrustCenter
@@ -15,16 +14,16 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
-import Skills
 import Senses
 import ToolRegistry
-// W7 (2026-08-14) — THE ONLY `import ActivityWatch` in ChatOrchestration, and
+// W7 (2026-08-14) — THE ONLY `import ActivityWatch` in ChatToolRuntime, and
 // ActivityWatchArchitectureTests asserts it stays the only one. The module is
 // reachable from an EXPLICIT tool call and from nowhere else: not from context
 // assembly, not from recall, not from memory promotion, not from the dream
 // cycle. If this import appears in a second file in this module, that guard
 // fails, and it should.
 import ActivityWatch
+// Blueprint: | `SwiftToolDispatcher+Sandbox.swift` | `SwiftToolDispatcher`: `resolveSandboxed`, `stringArray`, `normalizeFullMacPathArgument`, `openScreenWatch` (a part run's watch under the four verbs' access, card and sight); implicit point acts use MacImageFrames' newest session image, acquiring the first through the canonical mac.look pixels:true path before input; explicit unknown image references remain refused |
 
 private struct SwiftToolDispatcherMacControlPolicyProvider: MacControlPolicyProvider {
     let policy: MacControlPolicy
@@ -147,71 +146,6 @@ extension SwiftToolDispatcher {
         return path
     }
 
-    static func suggestedFullMacPathCorrection(
-        for path: String,
-        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
-        fileManager: FileManager = .default
-    ) -> String? {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        guard trimmed.hasPrefix("/") || trimmed.hasPrefix("~") else { return nil }
-
-        var candidates: [String] = []
-        func appendCandidate(_ candidate: String?) {
-            guard let candidate else { return }
-            let normalized = URL(fileURLWithPath: candidate).standardizedFileURL.path
-            guard !normalized.isEmpty, !candidates.contains(normalized) else { return }
-            candidates.append(normalized)
-        }
-
-        let aliasNormalized = Self.normalizeFullMacPathArgument(trimmed, homeDirectory: homeDirectory)
-        appendCandidate(aliasNormalized)
-        appendCandidate(Self.pathByReplacingMismatchedUserHome(aliasNormalized, homeDirectory: homeDirectory))
-
-        for candidate in candidates {
-            if fileManager.fileExists(atPath: candidate) {
-                return candidate
-            }
-            if let withoutDescriptor = Self.pathByDroppingTrailingFolderDescriptor(candidate),
-               fileManager.fileExists(atPath: withoutDescriptor) {
-                return withoutDescriptor
-            }
-        }
-        return nil
-    }
-
-    private static func pathByReplacingMismatchedUserHome(
-        _ path: String,
-        homeDirectory: URL
-    ) -> String? {
-        let components = URL(fileURLWithPath: path).standardizedFileURL.pathComponents
-        guard components.count >= 4,
-              components[0] == "/",
-              components[1] == "Users" else {
-            return nil
-        }
-        let requestedUser = components[2]
-        let currentUser = homeDirectory.standardizedFileURL.lastPathComponent
-        guard requestedUser != currentUser, !currentUser.isEmpty else { return nil }
-
-        var corrected = homeDirectory.standardizedFileURL
-        for component in components.dropFirst(3) {
-            corrected.appendPathComponent(component)
-        }
-        return corrected.path
-    }
-
-    private static func pathByDroppingTrailingFolderDescriptor(_ path: String) -> String? {
-        let url = URL(fileURLWithPath: path).standardizedFileURL
-        let name = url.lastPathComponent
-        let suffix = " folder"
-        guard name.lowercased().hasSuffix(suffix) else { return nil }
-        let base = String(name.dropLast(suffix.count))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !base.isEmpty else { return nil }
-        return url.deletingLastPathComponent().appendingPathComponent(base).path
-    }
-
     private static func normalizedUniqueRoots(_ roots: [URL]) -> [URL] {
         var seen: Set<String> = []
         var out: [URL] = []
@@ -305,6 +239,25 @@ extension SwiftToolDispatcher {
         includeRepoSandbox: Bool = true,
         followFinalLink: Bool = true
     ) async throws -> URL {
+        if !includeRepoSandbox {
+            guard !rawPath.isEmpty else {
+                throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: empty path")
+            }
+            let candidate = NativeAgentWorkspaceRoot.resolveFileMutationPath(rawPath, dataRoot: dataRoot)
+            let workspace = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
+            if !rawPath.hasPrefix("/"), !rawPath.hasPrefix("~") {
+                guard Self.isSelfOrAncestor(root: workspace, of: candidate) else {
+                    throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: relative path escapes the canonical workspace")
+                }
+            } else {
+                let roots = await trustedWorkspaceRoots()
+                guard AbilityStore.fileReachAllows(candidate, write: true)
+                    || roots.contains(where: { Self.isSelfOrAncestor(root: $0, of: candidate) }) else {
+                    throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: '\(rawPath)' is outside trusted workspace roots")
+                }
+            }
+            return candidate
+        }
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: empty path")
@@ -359,7 +312,7 @@ extension SwiftToolDispatcher {
         let expanded = HomePath.expand(trimmed)
         guard expanded.hasPrefix("/") else {
             throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: '\(trimmed)' must be workspace-relative or an absolute/~/ path under a Trust Center workspace root"
+                reason: "SwiftToolDispatcher: '\(trimmed)' must be workspace-relative or an absolute/~/ path under a Trust workspace root"
             )
         }
         let candidate = URL(fileURLWithPath: expanded)
@@ -391,23 +344,7 @@ extension SwiftToolDispatcher {
     }
 
     func canonicalPersonaKind(_ kind: String) -> String {
-        kind
-            .precomposedStringWithCompatibilityMapping
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-    }
-
-    func personaToolPath(kind: String) -> URL? {
-        let personaRoot = personaRootForTools()
-        switch kind {
-        case "soul": return personaRoot.appendingPathComponent("SOUL.md")
-        case "user": return personaRoot.appendingPathComponent("USER.md")
-        case "voice": return personaRoot.appendingPathComponent("VOICE.md")
-        case "growth": return personaRoot.appendingPathComponent("GROWTH.md")
-        case "agents": return personaRoot.appendingPathComponent("AGENTS.md")
-        default:
-            return nil
-        }
+        SwiftNativePersonaEngine.canonicalizeKind(kind)
     }
 
     func personaWriteResultJSON(_ result: PersonaToolWriteResult) -> JSONValue {
@@ -445,12 +382,21 @@ extension SwiftToolDispatcher {
         var outsideWorkspaceDefault: String
     }
 
+    func fullMacYoloAdmitted(tool: String, surface: String) async -> Bool {
+        await ChatFullMacYoloAdmission.admitted(
+            tool: tool,
+            surface: surface,
+            dataRoot: dataRoot,
+            source: "swift_tool_dispatcher"
+        )
+    }
+
     func fullMacToolAccess(surface: String = "chat") async -> FullMacToolAccess {
         let snapshot = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
         let policy = snapshot?.policy ?? [:]
         let admitted = await fullMacYoloAdmitted(tool: "mac_control", surface: surface)
         let macPolicy = MacControlGate.policyForAdmittedFullMac(
-            MacControlPolicy.fromTrustPolicyObject(policy), admitted: admitted
+            MacControlPolicy.fromTrustPolicyObject(policy, dataRoot: dataRoot), admitted: admitted
         )
         let trust = macPolicy.trustPolicy ?? MacControlTrustPolicy()
         let fullMacActive = MacControlGate.fullMacActive(trust)
@@ -484,7 +430,7 @@ extension SwiftToolDispatcher {
                     categories: ["accessibility"], mode: hands ? .write : .read,
                     why: "Screen control lets me read and control apps on your Mac.")
                     ?? ChatToolOutcome.failure(error: AutonomyGateError.toolDenied(
-                        reason: "Trust Center Full Mac Accessibility category is not active for screen.watch"), tool: "screen.watch"))
+                        reason: "Trust Full Mac Accessibility category is not active for screen.watch"), tool: "screen.watch"))
             }
             let host = makeMacControl(policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
                                       auditAppendPath: self.dataRoot.appendingPathComponent("mac_control_audit.jsonl"))
@@ -546,7 +492,7 @@ extension SwiftToolDispatcher {
                 return need
             }
             throw AutonomyGateError.toolDenied(
-                reason: "Trust Center Full Mac mode is not active for \(tool)"
+                reason: "Trust Full Mac mode is not active for \(tool)"
             )
         }
         let workspaceRoot = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
@@ -573,22 +519,25 @@ extension SwiftToolDispatcher {
             personaRoot: PersonaRootResolver.resolve().path,
             workspaceRoot: workspaceRoot.path
         )
-        // Expand a leading `~` in path args BEFORE LocalConnectorActions runs:
-        // it resolves relative paths against repoRoot and does NOT expand `~`,
-        // so "~/Desktop/x" would land at <repoRoot>/~/Desktop/x (a literal `~`
-        // dir) instead of $HOME/Desktop/x. Full-mac file ops (danger-full-access
-        // sandbox) should honor `~` (2026-06-15: caught live — an execution wrote
-        // agent_yolo.txt under the repo's `~/` instead of the real Desktop).
+        // Mutations and their containment check resolve the same exact inputs
+        // against the workspace, independently of the operational repo root.
         var resolvedInput = input
         for key in ["path", "source", "destination", "dest", "src", "to", "from"] {
             if case .string(let p)? = resolvedInput[key] {
+                if ["write_file", "trash_file", "move_file", "copy_file"].contains(tool) {
+                    // The mutation handler resolves the original spelling.
+                    // Only attachment saving still needs an absolute folder.
+                    if attachment != nil {
+                        resolvedInput[key] = .string(NativeAgentWorkspaceRoot.resolveFileMutationPath(p, dataRoot: dataRoot).path)
+                    }
+                    continue
+                }
                 let workspacePath = Self.normalizeWorkspaceAlias(
                     p,
                     workspaceRoot: workspaceRoot
                 )
                 resolvedInput[key] = .string(
-                    Self.normalizeFullMacPathArgument(["trash_file", "move_file", "copy_file"].contains(tool) && !workspacePath.hasPrefix("/") && !workspacePath.hasPrefix("~")
-                        ? workspaceRoot.appendingPathComponent(workspacePath).path : workspacePath)
+                    Self.normalizeFullMacPathArgument(workspacePath)
                 )
             }
         }
@@ -632,25 +581,17 @@ extension SwiftToolDispatcher {
         var out = obj
         out["tool"] = .string(tool)
         out["permission_denied"] = .bool(false)
-        var hint = "This is a path lookup miss, not a Full Mac or Trust Center denial. Check the exact path and retry."
+        var hint = "Path lookup failed. Check the exact path; this is not a Trust denial."
         if case .string(let rawPath)? = input["path"],
            let personaDoc = Self.personaDocumentHint(for: rawPath) {
             out["suggested_tool"] = .string("app")
             out["suggested_input"] = .object(["action": .string("persona.doc"), "args": .object(["doc": .string(personaDoc)])])
             hint = "Persona documents are not workspace files on app-only installs. Use app with suggested_input; do not retry read_file with another relative path."
-        } else if case .string(let rawPath)? = input["path"],
-                  let suggestion = Self.suggestedFullMacPathCorrection(for: rawPath) {
-            out["suggested_path"] = .string(suggestion)
-            hint = "This is a path lookup miss, not a Full Mac or Trust Center denial. Retry once with suggested_path."
         } else if case .string(let error)? = obj["error"], let colon = error.range(of: ": /") {
-            // 2026-09-24: say what IS there, so a miss needs no list_dir to follow.
+            // Distinguish a missing path from a file/directory mismatch.
             let missing = URL(fileURLWithPath: String(error[error.index(before: colon.upperBound)...]))
             let folder = missing.deletingLastPathComponent()
             var isDirectory: ObjCBool = false
-            // Only a folder the read itself could open is named from:
-            // Full Mac reads any non-sensitive folder; otherwise a trusted root.
-            var readable = fullMac
-            if !readable { readable = (try? await resolveTrustedFilePath(folder.path)) != nil }
             var isFolder: ObjCBool = false
             if FileManager.default.fileExists(atPath: missing.path, isDirectory: &isFolder) {
                 // "Not a directory" / "Not a file": it is there, only the wrong
@@ -659,32 +600,9 @@ extension SwiftToolDispatcher {
                     : "\(missing.path) is a file, not a folder. Use read_file on it."
             } else if !FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory) || !isDirectory.boolValue {
                 hint = "Not found, and its folder \(folder.path) does not exist either. Check the folder path."
-            } else if !connectorPathIsSensitiveData(folder, dataRoot: dataRoot),
-                      readable,
-                      let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) {
-                let stem = missing.deletingPathExtension().lastPathComponent.lowercased()
-                let near = names.filter { name in
-                    let other = (name as NSString).deletingPathExtension.lowercased()
-                    return !name.hasPrefix(".") && stem.count >= 3 && other.count >= 3 && (other.contains(stem) || stem.contains(other))
-                }.sorted().prefix(5)
-                // One same-named file with another extension is the answer.
-                let same = near.filter { ($0 as NSString).deletingPathExtension.lowercased() == stem }
-                let pick = same.count == 1 ? same.first : near.count == 1 ? near.first : nil
-                if let pick {
-                    let found = folder.appendingPathComponent(pick).path
-                    out["suggested_path"] = .string(found)
-                    out["nearby"] = .array(near.map { .string($0) })
-                    hint = "\(missing.lastPathComponent) is not there, but \(pick) is: \(found). Read suggested_path."
-                } else if !near.isEmpty {
-                    out["nearby"] = .array(near.map { .string($0) })
-                    hint = "\(missing.lastPathComponent) is not there. Close names in \(folder.path): " + near.joined(separator: ", ") + "."
-                } else {
-                    hint = "Not found. \(folder.path) has \(names.filter { !$0.hasPrefix(".") }.count) items, none named like that; list_dir with name_contains narrows it."
-                }
             }
         }
         out["hint"] = .string(hint)
-        if out["suggested_path"] != nil || out["nearby"] != nil { out["message"] = .string(hint); out["reason"] = .string(hint) }
         return .object(out)
     }
 
@@ -785,7 +703,7 @@ extension SwiftToolDispatcher {
                 why: "Screen control lets me read and control apps on your Mac."
             ) { return need }
             throw AutonomyGateError.toolDenied(
-                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+                reason: "Trust Full Mac Accessibility category is not active for \(tool)"
             )
         }
         func str(_ key: String) -> String? {
@@ -1027,6 +945,12 @@ extension SwiftToolDispatcher {
             }) else {
                 throw AutonomyGateError.toolDenied(reason: "A screen reference requires a handle or an image point; nothing was run")
             }
+            let pointPlaces = steps.isEmpty ? (place.map { [$0] } ?? []) : steps.compactMap(\.place)
+            if pointPlaces.contains(where: { $0.image == nil }), MacImageFrames.frame(nil) == nil {
+                let look = try await impl_mac_four_verbs_tool(tool: "screen", input: ["pixels": .bool(true)], surface: surface)
+                if MacImageFrames.frame(nil) == nil { return look }
+            }
+
             if !steps.isEmpty {
                 reply = await verbs.act(verb: "", target: "", app: str("app"),
                                         front: input["front"] == .bool(true), steps: steps, again: input["again"] == .bool(true))
@@ -1182,7 +1106,7 @@ extension SwiftToolDispatcher {
                 why: "Screen control lets me read and control apps on your Mac."
             ) { return need }
             throw AutonomyGateError.toolDenied(
-                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+                reason: "Trust Full Mac Accessibility category is not active for \(tool)"
             )
         }
         let action: String
@@ -1230,7 +1154,7 @@ extension SwiftToolDispatcher {
                 why: "Screen control lets me read and control apps on your Mac."
             ) { return need }
             throw AutonomyGateError.toolDenied(
-                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+                reason: "Trust Full Mac Accessibility category is not active for \(tool)"
             )
         }
         let impl = { [dataRoot] in
@@ -1329,8 +1253,8 @@ extension SwiftToolDispatcher {
             ) { return need }
             throw AutonomyGateError.toolDenied(
                 reason: !access.accessibilityAllowed
-                    ? "Trust Center Full Mac Accessibility category is not active for \(tool)"
-                    : "Trust Center Full Mac file access is not active for \(tool) with an explicit path; "
+                    ? "Trust Full Mac Accessibility category is not active for \(tool)"
+                    : "Trust Full Mac file access is not active for \(tool) with an explicit path; "
                     + "read what is on screen instead by calling it with no path"
             )
         }
@@ -1391,7 +1315,7 @@ extension SwiftToolDispatcher {
                 why: "Screen control lets me read and control apps on your Mac."
             ) { return need }
             throw AutonomyGateError.toolDenied(
-                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+                reason: "Trust Full Mac Accessibility category is not active for \(tool)"
             )
         }
         let action: String
@@ -1430,6 +1354,36 @@ extension SwiftToolDispatcher {
         return await fullMacYoloAdmitted(tool: "activity_query", surface: "chat")
     }
 
+    private func activityQueryFailure(_ error: ActivityQueryService.QueryError, argumentPath: String = "$") -> ToolFailureError {
+        let file = ActivityWatchPaths.policyURL(dataRoot: dataRoot)
+        switch error {
+        case .captureDisabled:
+            return ToolFailureError(error.description, effects: .none, owner: file.path,
+                tap: "Trust > Features > Activity capture > Record which apps you use", personDecides: true,
+                code: "activity_capture_disabled", status: .refused,
+                instruction: "Only the owner can enable activity capture; enabling cannot recover activity from while it was off.")
+        case .modelAccessDisabled:
+            return ToolFailureError(error.description, effects: .none, owner: file.path,
+                tap: "Trust > Features > My access > Let me answer from activity history", personDecides: true,
+                code: "activity_model_access_disabled", status: .refused,
+                instruction: "Only the owner can enable activity model access.")
+        case .remoteSurfaceRefused:
+            return ToolFailureError(error.description, effects: .none, owner: "Full Mac authority for this request",
+                tap: "NativeAgent > Chat", personDecides: true, code: "activity_surface_denied", status: .refused,
+                instruction: "Ask in NativeAgent's Mac chat; activity model access is required there without admitted Full Mac.")
+        case .policyUnavailable:
+            return ToolFailureError(error.description, effects: .none, owner: file.path,
+                tap: "Finder > Go > Go to Folder > \(file.deletingLastPathComponent().path) > activity_policy.json > Open With > TextEdit",
+                code: "activity_policy_unavailable",
+                instruction: "Ask the owner to preserve the original bytes and repair this policy without changing saved choices.")
+        case .badRange:
+            return ToolFailureError(error.description + " Correct \(argumentPath).", argumentPath: argumentPath,
+                accepted: "A timezone recognized by macOS and a supported range, or finite from/to instants with from < to and at most 366 days between them.",
+                effects: .none, code: "activity_range_invalid",
+                instruction: "Correct the named argument before asking for activity history.", recovery: .correctArguments)
+        }
+    }
+
     /// W7 — `activity_query`: the ONE read path into the ambient activity
     /// watcher's local store.
     ///
@@ -1462,9 +1416,7 @@ extension SwiftToolDispatcher {
         }
         let fullMacAdmitted = await fullMacYoloAdmitted(tool: tool, surface: surface)
         guard fullMacAdmitted || !ActivityQueryService.isRefusedSurface(surface) else {
-            throw AutonomyGateError.toolDenied(
-                reason: ActivityQueryService.QueryError.remoteSurfaceRefused(surface: surface).description
-            )
+            throw activityQueryFailure(.remoteSurfaceRefused(surface: surface))
         }
 
         func stringArg(_ key: String) -> String? {
@@ -1484,11 +1436,9 @@ extension SwiftToolDispatcher {
         let timezone: TimeZone
         if let requestedTimezone = stringArg("timezone") {
             guard let resolved = TimeZone(identifier: requestedTimezone) else {
-                throw AutonomyGateError.toolDenied(
-                    reason: ActivityQueryService.QueryError.badRange(
+                throw activityQueryFailure(.badRange(
                         "unknown IANA timezone \"\(requestedTimezone)\""
-                    ).description
-                )
+                    ), argumentPath: "$.timezone")
             }
             timezone = resolved
         } else {
@@ -1499,23 +1449,19 @@ extension SwiftToolDispatcher {
         let range: (from: Double, to: Double)
         if let fromRaw = stringArg("from") ?? intArg("from").map(String.init) {
             guard let from = ActivityQueryService.parseInstant(fromRaw, timezone: timezone) else {
-                throw AutonomyGateError.toolDenied(
-                    reason: ActivityQueryService.QueryError.badRange(
+                throw activityQueryFailure(.badRange(
                         "could not read `from` = \"\(fromRaw)\". Accepted: epoch seconds, "
                         + "an ISO-8601 instant, or YYYY-MM-DD."
-                    ).description
-                )
+                    ), argumentPath: "$.from")
             }
             let toRaw = stringArg("to") ?? intArg("to").map(String.init)
             let to: Double
             if let toRaw {
                 guard let parsed = ActivityQueryService.parseInstant(toRaw, timezone: timezone) else {
-                    throw AutonomyGateError.toolDenied(
-                        reason: ActivityQueryService.QueryError.badRange(
+                    throw activityQueryFailure(.badRange(
                             "could not read `to` = \"\(toRaw)\". Accepted: epoch seconds, "
                             + "an ISO-8601 instant, or YYYY-MM-DD."
-                        ).description
-                    )
+                        ), argumentPath: "$.to")
                 }
                 to = parsed
             } else {
@@ -1527,13 +1473,11 @@ extension SwiftToolDispatcher {
             guard let resolved = ActivityQueryService.resolveRange(
                 named: name, timezone: timezone, now: now
             ) else {
-                throw AutonomyGateError.toolDenied(
-                    reason: ActivityQueryService.QueryError.badRange(
+                throw activityQueryFailure(.badRange(
                         "unknown range \"\(name)\". Accepted: today, yesterday, last_hour, "
                         + "last_24_hours, last_7_days, last_30_days — or pass explicit "
                         + "`from`/`to`."
-                    ).description
-                )
+                    ), argumentPath: "$.range")
             }
             range = resolved
         }
@@ -1550,7 +1494,7 @@ extension SwiftToolDispatcher {
         } catch let error as ActivityQueryService.QueryError {
             // Surfaced as a tool denial, not a crash and not an empty answer:
             // "capture is off" must never look like "you did nothing today".
-            throw AutonomyGateError.toolDenied(reason: error.description)
+            throw activityQueryFailure(error)
         }
     }
 
@@ -1589,7 +1533,7 @@ extension SwiftToolDispatcher {
                 why: "Screen control lets me read and control apps on your Mac."
             ) { return need }
             throw AutonomyGateError.toolDenied(
-                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+                reason: "Trust Full Mac Accessibility category is not active for \(tool)"
             )
         }
         let action: String

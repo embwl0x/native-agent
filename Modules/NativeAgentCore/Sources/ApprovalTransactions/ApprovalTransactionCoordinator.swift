@@ -8,15 +8,20 @@ import MemoryV2
 import AgentWorkspace
 import ApprovalInbox
 import Desk
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatToolRuntime
+import ChatSessionWork
+import AgentConversations
+import ChatToolParsing
 import TrustCenter
 import ToolRegistry
 import DreamREMCycle
 import WorkshopExecution
 import Dispatcher
 import Browser
-import TelegramBot
 import NotificationInbox
+// Blueprint: | `ApprovalTransactionCoordinator.swift` | `ApprovalTransactionCoordinator` struct; delegates execution-record claim changes to Workshop's executor and terminal browser reads to the browser owner; reconciliation cursor coverage is declared here; `jsonString`, `memoryHygieneReceipt`; Desk resolution observation runs in BackgroundLoops' resident body; admitted Desk decision writes finish through `settle` |
 
 private final class ChatToolApprovalExecutionOwners: @unchecked Sendable {
     private struct Key: Hashable {
@@ -106,7 +111,16 @@ public struct ApprovalTransactionCoordinator: Sendable {
                         detail: "self-improvement \(op) FAILED: missing target for \(op)")
                     return
                 }
-                try await effects.enableSkill(name: target, reviewedDigest: nil, admitScript: false)
+                let reviewedDigest: String?
+                switch apply["reviewedDigest"] {
+                case .string(let digest)? where !digest.isEmpty: reviewedDigest = digest
+                // Old cards and explicit null authorize Markdown guidance only.
+                // Parts refuses code; never fill this from the current catalog.
+                case nil, .null?: reviewedDigest = nil
+                default: throw ApprovalInboxError.malformedResponse("the card has no valid reviewed digest")
+                }
+                try await effects.enableSkill(name: target, reviewedDigest: reviewedDigest)
+                outcomeFields["reviewedDigest"] = reviewedDigest.map(JSONValue.string) ?? .null
             default:
                 nativeLog("[selfImprovement] unknown apply op: \(op)")
                 try? await SwiftNativeApprovalInbox(root: SwiftNativeApprovalInbox.defaultDataRoot()).annotateExecution(
@@ -333,7 +347,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         var detail = "Not approved: \(skill)'s script was not turned on; it stays drafted."
         if rec.decision == ApprovalDecision.approved.rawValue {
             do {
-                try await effects.enableSkill(name: skill, reviewedDigest: digest, admitScript: true)
+                try await effects.enableSkill(name: skill, reviewedDigest: digest)
                 done["installed"] = .bool(true)
                 detail = "Installed \(skill)'s script, digest \(digest.prefix(12))."
             } catch {
@@ -429,18 +443,25 @@ public struct ApprovalTransactionCoordinator: Sendable {
     /// blocked on a new plan otherwise. An item naming more than one approval
     /// stays its owner's call.
     public static func settleDeskWaits(dataRoot: URL) async {
+        guard !Task.isCancelled else { return }
         do {
             let approvals = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: ApprovalFilter())
-            try await SwiftNativeDeskStore(dataRoot: dataRoot).settleWaits { item in
-                let tokens = [item.blockedReason, item.waitingOn].compactMap { $0?.lowercased() }
-                    .flatMap { $0.split { !$0.isHexDigit && $0 != "-" } }.filter { $0.count >= 8 }
-                let named = approvals.filter { row in tokens.contains { row.id.lowercased().hasPrefix($0) } }
-                guard named.count == 1, let row = named.first, let decision = row.decision else { return nil }
-                let line = "Decided: \(decision)" + (row.decidedBy.map { " by \($0)" } ?? "")
-                    + (row.resolvedAt.map { " on \($0.prefix(10))" } ?? "")
-                return ("\(line) (approval \(row.id)).", decision == "approved" ? .todo : .blocked,
-                        decision == "approved" ? nil : "\(line) — needs a new plan")
-            }
+            guard !Task.isCancelled else { return }
+            try await settle {
+                do {
+                    try await SwiftNativeDeskStore(dataRoot: dataRoot).settleWaits { item in
+                        let tokens = [item.blockedReason, item.waitingOn].compactMap { $0?.lowercased() }
+                            .flatMap { $0.split { !$0.isHexDigit && $0 != "-" } }.filter { $0.count >= 8 }
+                        let named = approvals.filter { row in tokens.contains { row.id.lowercased().hasPrefix($0) } }
+                        guard named.count == 1, let row = named.first, let decision = row.decision else { return nil }
+                        let line = "Decided: \(decision)" + (row.decidedBy.map { " by \($0)" } ?? "")
+                            + (row.resolvedAt.map { " on \($0.prefix(10))" } ?? "")
+                        return ("\(line) (approval \(row.id)).", decision == "approved" ? .todo : .blocked,
+                                decision == "approved" ? nil : "\(line) — needs a new plan")
+                    }
+                    return Result<Void, Error>.success(())
+                } catch { return .failure(error) }
+            }.get()
         } catch {
             nativeLog("[deskApprovalWait] Desk waits on decided approvals were not settled: \(error)")
         }
@@ -453,6 +474,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         let events = await ApprovalLifecycleBus.shared.events()
         await settleDeskWaits(dataRoot: dataRoot)
         for await event in events where event.phase == .resolved {
+            guard !Task.isCancelled else { return }
             await settleDeskWaits(dataRoot: dataRoot)
         }
     }
@@ -521,6 +543,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
         return executed + chatTools.executed + connectors
     }
 
+    // Owns the Codable cursor object in workflows/approvals: local backup and
+    // export include it, phone sync excludes it, PrivacyMap lists Approvals.
     struct ApprovalReconciliationCursor: Codable {
         var stamp = ""
         // Optional so old (stamp, id) cursors safely revisit the boundary.
@@ -545,11 +569,6 @@ public struct ApprovalTransactionCoordinator: Sendable {
         dataRoot: URL
     ) async -> [ApprovalRecord] {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        do {
-            try await TelegramPollLoop.importLegacyApprovalContinuations(dataRoot: dataRoot, inbox: inbox)
-        } catch {
-            nativeLog("[approvalReconcile] legacy Telegram continuation import failed; file preserved: \(String(describing: error))")
-        }
         do {
             let cursor = try ApprovalReconciliationCursor.read(dataRoot)
             let rows = try await inbox.list(filter: .resolved)
@@ -669,14 +688,6 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 action: "browser.open_url",
                 shouldReconcile: { _ in true },
                 execute: { await self.reconcileResolvedBrowserRun(from: $0) }),
-            ApprovalExecutionReconcileKind(
-                action: "agentmail.send",
-                shouldReconcile: { _ in true },
-                execute: { await self.applyResolvedAgentMailSend(from: $0) }),
-            ApprovalExecutionReconcileKind(
-                action: ExternalSendApprovalRequest.approvalAction,
-                shouldReconcile: { _ in true },
-                execute: { _ = await applyResolvedExternalSend(from: $0) }),
             // Desk 903 phase 4. Reconcilable like the rest, and refusing like
             // nothing else: an owner-resolved canon card replays into the same
             // annotated refusal rather than into her museum.
@@ -695,50 +706,6 @@ public struct ApprovalTransactionCoordinator: Sendable {
                     await Self.applyResolvedProcedureExactActivation(from: $0, dataRoot: PersistenceCore.defaultDataRoot())
                 }),
         ]
-    }
-
-    /// Executes the pre-external_send_v1 AgentMail approval shape so older
-    /// pending cards can still be replayed safely/idempotently.
-    public func applyResolvedAgentMailSend(
-        from rec: ApprovalRecord,
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
-    ) async {
-        guard rec.action == "agentmail.send",
-              rec.status == "resolved",
-              let decision = rec.decision else { return }
-        guard decision == "approved" else {
-            let op = decision == "denied" ? "agentmail_send_denied" : "agentmail_send_canceled"
-            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                rec.id,
-                executedAction: .object([
-                    "op": .string(op),
-                    "actionId": .string("agentmail.send"),
-                ]),
-                detail: "AgentMail send \(decision); no email sent.")
-            return
-        }
-
-        if let existing = await AgentMailActions.succeededReceiptForApproval(rec.id, dataRoot: dataRoot) {
-            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                rec.id,
-                executedAction: existing,
-                detail: "AgentMail send receipt healed; email was not re-sent.")
-            return
-        }
-
-        let result = await AgentMailActions.executeApprovedSend(from: rec, dataRoot: dataRoot)
-        let status = Self.jsonString(result, "status") ?? "unknown"
-        let detail: String
-        if status == "failed" {
-            let error = Self.jsonString(result, "error") ?? "failed"
-            detail = "AgentMail send FAILED: \(error)"
-        } else {
-            detail = "AgentMail send \(status)."
-        }
-        try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-            rec.id,
-            executedAction: result,
-            detail: detail)
     }
 
     private struct ChatToolApprovalReplay: Sendable {
@@ -1155,11 +1122,17 @@ public struct ApprovalTransactionCoordinator: Sendable {
                     verifiedUserID: replay.verifiedUserId
                 )
             )
+            // The card's steer rides its replay: the verified approval answers
+            // it (the gate elevates), so the calls the approved one makes act
+            // under that answer (one card per command, User 10-20).
+            let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
+            let carried = PeerDataTaint.steer(in: payload["peer"])
             // Approval replay is a fresh detached dispatch, not the original
             // provider turn. Rehydrate only the approved lazy tool for this
             // dispatch so the lazy gate cannot answer `not_loaded`, while no
             // sibling tool receives an accidental capability grant.
-            let result = try await LLMCallContext.$turnActiveTools.withValue([replay.toolName]) {
+            let result = try await PeerDataTaint.$current.withValue(PeerDataTaint(restoring: carried.sources, elevated: carried.elevated)) {
+            try await LLMCallContext.$turnActiveTools.withValue([replay.toolName]) {
                 try await ChatToolSessionContext.$commandSignatureVerified.withValue(true) {
                     try await ChatToolSessionContext.$verifiedChatId.withValue(replay.telegramChatId) {
                         try await ChatToolSessionContext.$verifiedUserId.withValue(replay.verifiedUserId) {
@@ -1203,6 +1176,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                         }
                     }
                 }
+            }
             }
             let receipt = Self.chatToolApprovalExecutionReceipt(
                 toolName: replay.toolName, surface: replay.surface, result: result)
@@ -1359,6 +1333,9 @@ public struct ApprovalTransactionCoordinator: Sendable {
         // No record at all: a card filed before cards kept one (`unrecorded`).
         let carried = PeerDataTaint.steer(in: payload["peer"])
         let steer = PeerDataTaint(restoring: carried.sources + resume.sources, elevated: carried.elevated + resume.elevated)
+        // Approved: the person answered this command's card, so its peers act
+        // for the rest of it (one card per command, User 10-20), as the replay did.
+        if decision == "approved" { steer.checkpointSources.forEach(steer.elevate) }
         // The filing turn's file access; nil for an older card (the host's chat default).
         let fileAccess: String? = if case .string(let mode)? = payload["fileAccess"] { mode } else { nil }
         do {
@@ -1547,17 +1524,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
     /// `waiting_approval` row (persisted at approval-creation time) is NOT
     /// terminal — the navigation never ran and a reconcile may execute it.
     public static func terminalBrowserRun(runID: String, runsPath: URL) async throws -> JSONValue? {
-        guard !runID.isEmpty else { return nil }
-        let raw = try await SwiftNativePersistenceCore().readJSON(runsPath, ifMissing: .array([]))
-        guard case .array(let rows) = raw else { return nil }
-        let terminal: Set<String> = ["succeeded", "failed", "denied", "canceled"]
-        for row in rows where Self.jsonString(row, "id") == runID {
-            if let status = Self.jsonString(row, "status"), terminal.contains(status) {
-                return row
-            }
-            return nil
-        }
-        return nil
+        try await SwiftNativeBrowserClient.terminalRun(id: runID, at: runsPath)
     }
 
     /// Resumes an execution blocked on a step approval (executor port,
@@ -1646,7 +1613,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                     detail: "Desk step denied — step rejected; Desk execution now \(record.status)")
             default: // canceled — leave the Workshop execution blocked; clear the claim
                 // so a later executor pass can re-stage a fresh approval.
-                await Self.clearWorkshopStepApprovalClaim(executionId: executionId, stepId: stepId)
+                await executor.clearStepApprovalClaim(executionId: executionId, stepId: stepId)
                 try? await SwiftNativeApprovalInbox(root: SwiftNativeApprovalInbox.defaultDataRoot()).annotateExecution(
                     rec.id,
                     executedAction: .object([
@@ -1682,7 +1649,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             // unresumed step would dead-end (resume guards reject a stale
             // approval_id). Clear the claim so re-staging works (mirror of
             // the REM clearApprovalStamp failure path).
-            await Self.clearWorkshopStepApprovalClaim(executionId: executionId, stepId: stepId)
+            await executor.clearStepApprovalClaim(executionId: executionId, stepId: stepId)
             try? await SwiftNativeApprovalInbox(root: SwiftNativeApprovalInbox.defaultDataRoot()).annotateExecution(
                 rec.id,
                 executedAction: .object([
@@ -1692,39 +1659,6 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 ]),
                 detail: "Desk step \(decision) FAILED: \(error.localizedDescription) — "
                     + "claim cleared; a later executor pass can re-stage it")
-        }
-    }
-
-    /// Clear the approval_id stamp on a blocked step record (execution.json,
-    /// whole RMW under the cross-process flock) so a future stage isn't
-    /// rejected by the resume guard's approval_id mismatch check.
-    private static func clearWorkshopStepApprovalClaim(executionId: String, stepId: String) async {
-        let path = ExecutionRecordFile.resolve(
-            in: PersistenceCore.defaultDataRoot()
-                .appendingPathComponent("workshop", isDirectory: true)
-                .appendingPathComponent("executions", isDirectory: true)
-                .appendingPathComponent(executionId, isDirectory: true))
-        let persistence = SwiftNativePersistenceCore()
-        do {
-            try await persistence.withFileLock(path) {
-                let raw = try await persistence.readJSON(path, ifMissing: .null)
-                guard case .object(var obj) = raw,
-                      case .array(var steps)? = obj["steps_completed"] else { return }
-                var changed = false
-                for idx in steps.indices {
-                    guard case .object(var sr) = steps[idx],
-                          case .string(let sid)? = sr["step_id"], sid == stepId,
-                          case .string(let st)? = sr["status"], st == "blocked_on_approval" else { continue }
-                    sr["approval_id"] = .string("")
-                    steps[idx] = .object(sr)
-                    changed = true
-                }
-                guard changed else { return }
-                obj["steps_completed"] = .array(steps)
-                try await persistence.writeJSON(.object(obj), to: path)
-            }
-        } catch {
-            nativeLog("[workshopStep] claim clear failed for \(executionId)/\(stepId): \(error)")
         }
     }
 
@@ -1815,7 +1749,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             // 4b): an old card resolves with a result line, never silently.
             try? await SwiftNativeApprovalInbox(root: SwiftNativeApprovalInbox.defaultDataRoot()).annotateExecution(
                 rec.id, executedAction: .object(["op": .string("skill_proposal_retired")]),
-                detail: "The old skill-proposal flow is retired; nothing was saved. Agent writes skills herself now.")
+                detail: "The old skill-proposal flow is retired; nothing was saved. The agent writes her own skills now.")
         } else if rec.action == SwiftNativeApprovalInbox.skillScriptInstallAction {
             await applyResolvedSkillScriptInstall(from: rec)
         } else if rec.action == StudioCanonProposal.approvalAction {
@@ -1829,13 +1763,12 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 from: rec,
                 dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
             )
-        } else if rec.action == ExternalSendApprovalRequest.approvalAction {
-            let outcome = await applyResolvedExternalSend(from: rec)
-            shouldArchiveVisibleCard = outcome
-        } else if rec.action == "agentmail.send" {
-            // Legacy AgentMail cards use their original payload shape. New Slack
-            // and AgentMail sends share connector.external_send above.
-            await self.applyResolvedAgentMailSend(from: rec)
+        } else if rec.action == "connector.external_send" {
+            // Slack posting is no longer built in (10-21): an old card resolves
+            // with a result line, never silently.
+            try? await SwiftNativeApprovalInbox(root: dataRootOverride ?? PersistenceCore.defaultDataRoot()).annotateExecution(
+                rec.id, executedAction: .object(["op": .string("external_send_retired")]),
+                detail: "Slack posting is no longer built in; nothing was sent.")
         } else if Self.chatToolApprovalReplay(from: rec) != nil {
             // Generic chat-tool approvals are the ApprovalFiler path used by
             // chat surfaces: resolve the durable inbox record here, then

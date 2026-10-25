@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+// Blueprint: | `NativeAgentWindowChrome.swift` | `MainWindowContent`, `MenuBarOpenButton`; main-window content and menu-bar opening |
 
 // Wraps ContentView so the main window draws the shell's chrome behind it.
 // Restart App is a worded item in the menu bar's NativeAgent menu

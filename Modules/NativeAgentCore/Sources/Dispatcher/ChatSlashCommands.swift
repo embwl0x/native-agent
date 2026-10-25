@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ChatSlashCommands.swift` | `ChatSlashCommandRegistry` and routing: shared command recognition and execution host contract; surface presentation remains local |
+
 public enum ChatSlashCommandRoute: String, Sendable, CaseIterable {
     case clear, compact, model, think, fast, persona, remember, note, scratch
     case help, tools, nextgen, export, new

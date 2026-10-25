@@ -4,6 +4,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+Workspace.swift` | `CognitiveSubstrate`: `workspaceSnapshot`, `frozenRead` |
 
 /// Exact read-side ownership for cognition maintenance. Analytic affect, node,
 /// and thought-seed reads do not need a checkpoint merely because five minutes
@@ -274,6 +275,18 @@ extension CognitiveSubstrate {
     @discardableResult
     public func runMicrocycleChecked(reason: String) async throws -> CognitiveWorkspaceSnapshot? {
         await waitForMaintenanceTransition()
+        // The existing commit exclusion also single-flights microcycles. Hand
+        // ownership directly to a waiting caller so its dirty follow-up is not
+        // dropped and maintenance cannot enter between holders.
+        if maintenanceCommitInFlight {
+            await withCheckedContinuation { microcycleWaiters.append($0) }
+        } else {
+            maintenanceCommitInFlight = true
+        }
+        defer {
+            if microcycleWaiters.isEmpty { maintenanceCommitInFlight = false }
+            else { microcycleWaiters.removeFirst().resume() }
+        }
         guard configuration.enabled, configuration.backgroundMicrocyclesEnabled else { return nil }
         guard dirtySince != nil else { return nil }
         // R-F2: raise the symmetric commit-exclusion flag for the remainder of
@@ -281,8 +294,6 @@ extension CognitiveSubstrate {
         // maintenance pass must not start — its decay would be reverted on disk
         // when this cycle writes its pre-decay seed rows. Set before the first
         // await so nothing can slip in during seed synthesis either.
-        maintenanceCommitInFlight = true
-        defer { maintenanceCommitInFlight = false }
         let priorDirtySince = dirtySince
         let priorThoughtSeeds = thoughtSeeds
         let priorThoughtSeedRevision = thoughtSeedRevision
@@ -294,15 +305,17 @@ extension CognitiveSubstrate {
         // Clear before any awaiting persistence work: a concurrent event will
         // set it again and must survive this cycle's completion.
         dirtySince = nil
+        var committedThoughtSeedRevision: UInt64?
         if configuration.enabled,
            currentAffect.uncertainty > 0.45 || currentAffect.taskPressure > 0.45 {
-            _ = await addThoughtSeed(
+            let mutation = await addThoughtSeed(
                 kind: currentAffect.uncertainty > currentAffect.taskPressure ? .anomaly : .followUp,
                 text: "Re-check high-pressure cognitive state after \(bounded(reason, maxCharacters: 80))",
                 priority: min(1, max(currentAffect.uncertainty, currentAffect.taskPressure)),
                 sourceNodeIds: workspace.items.prefix(3).map(\.id),
                 marksSubstrateDirty: false
             )
+            committedThoughtSeedRevision = mutation.mutationRevision
         }
         publishAttentionProjection(at: workspace.generatedAt)
         var flushedPresentation = false
@@ -366,8 +379,9 @@ extension CognitiveSubstrate {
         } catch {
             if dirtySince == nil { dirtySince = priorDirtySince }
             if flushedPresentation { capsulePresentationDirty = true }
-            if thoughtSeedRevision != priorThoughtSeedRevision,
-               thoughtSeedRevision == priorThoughtSeedRevision &+ 1 {
+            if let committedThoughtSeedRevision,
+               committedThoughtSeedRevision == priorThoughtSeedRevision &+ 1,
+               thoughtSeedRevision == committedThoughtSeedRevision {
                 thoughtSeeds = priorThoughtSeeds
                 thoughtSeedRevision &+= 1
             }

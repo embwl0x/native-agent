@@ -1,6 +1,7 @@
 import Foundation
 import GRDB
 import PersistenceCore
+// Blueprint: | `MemoryV2+ConsolidationStorageSupport.swift` | `MemoryConsolidationGate`: `consolidationDir`, `candidatesDir`, `candidateRoot` |
 
 extension MemoryConsolidationGate {
     // MARK: paths

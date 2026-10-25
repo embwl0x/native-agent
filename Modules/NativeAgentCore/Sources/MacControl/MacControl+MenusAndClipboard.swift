@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MacControl+MenusAndClipboard.swift` | `SwiftNativeMacControl`: `handleMenu`, `handleMenuPress`, `handleClipboardRead`; surface menu commands await surface-transition notifications within the existing deadline before owned-window readback; Select All keeps its range readback |
 
 extension SwiftNativeMacControl {
     // MARK: - fable51 item 29: the menu bar organ
@@ -193,7 +194,7 @@ extension SwiftNativeMacControl {
     /// refusal shape `act` holds: greyed out is a fact about the app's state,
     /// and pressing anyway would either do nothing (and be reported as done) or
     /// hit whatever the index chain now points at.
-    func handleMenuPress(_ body: [String: JSONValue]) -> MacControlResult {
+    func handleMenuPress(_ body: [String: JSONValue]) async -> MacControlResult {
         let started = now()
         guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "menu_press") }
         func refuse(_ code: String, _ words: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
@@ -376,6 +377,19 @@ extension SwiftNativeMacControl {
         if let refusal = continuation?.refusal() {
             return refuse("continuation_unavailable", refusal)
         }
+        let pid = app.processIdentifier
+        let windowsBefore = accessibilityActSource.windows(pid: pid)
+        let focusedBefore = accessibilityActSource.focusedElement(pid: pid)
+        let shortcut = accessibilityActSource.menuShortcut(target)
+            .flatMap { try? MacKeySyntax.parseChords($0.chord).first }
+        let declaration: MacActClosedLoop.DeclaredEffect =
+            shortcut?.keyCode == 0x00 && shortcut?.modifiers == .command ? .selectAll : .surface(nil)
+        let collector = MacAXEffectCollector()
+        let observation = MacAXEffectObserverGuard(effectObserverSource.install(
+            pid: pid, kinds: MacActClosedLoop.notificationKinds,
+            onNotification: { collector.record($0) }))
+        defer { observation.stop() }
+        let performedAt = now()
         let outcome = accessibilityActSource.perform(target, action: "AXPress")
         guard outcome == .performed else {
             return refuse(
@@ -384,6 +398,27 @@ extension SwiftNativeMacControl {
                 ["requested_path": .string(item.display)]
             )
         }
+        let clock = now
+        // A menu/focus reaction is not the command's surface effect. Keep
+        // observing within the same deadline until that transition arrives,
+        // then enumerate the owning process's windows for the readback.
+        let surfaceCommand: Bool
+        if case .surface = declaration { surfaceCommand = true } else { surfaceCommand = false }
+        let wait = await MacActClosedLoop.waitForEffect(collector: collector,
+            waitMs: MacActClosedLoop.defaultWaitMs, startedAt: performedAt, clock: { clock() },
+            until: surfaceCommand ? MacActClosedLoop.navigationNotificationKinds : [])
+        observation.stop()
+        let windowsAfter = accessibilityActSource.windows(pid: pid)
+        let surfaceChanged = windowsAfter.contains { window in
+            !windowsBefore.contains { $0.handle == window.handle && $0.identity.title == window.identity.title }
+        }
+        let input = focusedBefore.flatMap { accessibilityActSource.textInput($0) }
+        let verdict = MacActClosedLoop.verify(declaration,
+            value: input?.value, selection: input?.selection,
+            surfaceChanged: surfaceChanged ? true : nil,
+            dismissed: windowsBefore.contains { accessibilityActSource.windowPresence($0) == false } ? true : nil,
+            processGone: accessibilitySource.appInfo(pid: pid) == nil,
+            notifications: wait.notifications)
         return MacControlResult(
             ok: true,
             action: "menu_press",
@@ -396,14 +431,8 @@ extension SwiftNativeMacControl {
                     valueChars: MacMenuBar.pathChars(MacMenuBar.findPathDepth)
                 ),
                 "opens_submenu": .bool(item.hasSubmenu),
-                // The press ran the app's handler. Whether the INTENDED
-                // consequence happened is for the next look to say, never for
-                // this result to claim. Said in words too: 10-17, Agent read
-                // the bare 'unverified' as a failed press and routed every
-                // menu through act instead.
-                "verified": .bool(false),
-                "note": .string("Pressed: \(app.name) ran the item's handler. What it opened or changed is for your next look to see, so this result does not claim it."),
-            ]),
+                "effect": .object(["notifications": .array(wait.notifications.map(JSONValue.string))]),
+            ].merging(verdict.receipt) { _, new in new }),
             error: nil,
             durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
@@ -482,11 +511,12 @@ extension SwiftNativeMacControl {
     /// route it back out through a channel with no redactor on it.
     func handleClipboardWrite(_ body: [String: JSONValue]) -> MacControlResult {
         let started = now()
-        func refuse(_ reason: String, _ words: String) -> MacControlResult {
+        func refuse(_ reason: String, _ words: String, effects: String = "none", remedy: JSONValue? = nil) -> MacControlResult {
             MacControlResult(
                 ok: false,
                 action: "clipboard_write",
-                output: .object(["written": .bool(false), "note": .string(words)]),
+                output: .object(["written": .bool(false), "note": .string(words),
+                    "reason": .string(reason), "effects": .string(effects), "remedy": remedy ?? .null]),
                 error: reason,
                 durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
@@ -502,7 +532,12 @@ extension SwiftNativeMacControl {
             )
         }
         guard pasteboardSource.write(text: text) else {
-            return refuse("clipboard_write_refused", "The system refused the clipboard write; nothing changed.")
+            return refuse("clipboard_write_refused", "The clipboard write failed after it may have cleared the previous contents. Read the clipboard before deciding what to write.",
+                effects: "unknown", remedy: .object([
+                    "instruction": .string("Inspect the clipboard's current contents before another write."),
+                    "next_call": .object(["tool": .string("app"), "input": .object([
+                        "action": .string("mac.clipboard_read"), "args": .object([:])])]),
+                ]))
         }
         let readBack = pasteboardSource.read()
         return MacControlResult(

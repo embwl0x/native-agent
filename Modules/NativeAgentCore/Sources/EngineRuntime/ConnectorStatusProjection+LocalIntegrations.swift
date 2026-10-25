@@ -1,14 +1,81 @@
 @preconcurrency import EventKit
 import MacControl
-import ChatOrchestration
 import NativeAgentCore
+import NativeAgentShared
 import Connectors
 import Foundation
 import PersistenceCore
-import MacAssistantStatus
 import MacIntegration
 import DeviceSync
 import AttentionRouting
+import AppToolRuntime
+import ToolExecution
+import Senses
+// Blueprint: | `ConnectorStatusProjection+LocalIntegrations.swift` | connector platform actions, EventKit status, proof cache, local PIM and phone readiness, action evidence; Mac assistant catalog reads invoke the editable `mac-watch-catalog` seed through L0 Parts.call with effects refused; integration recovery parts supply words only over native reasons, preserving operation status/identity/effects, including batch actions, with visible recovery unavailability |
+
+/// The catalog is data, never an execution route for a watch. Even a changed
+/// catalog cannot create a schedule through the status/UI read's host.
+enum MacAssistantParts {
+    static func watchCatalog(dataRoot: URL) async throws -> [MacAssistantWatchRecipe] {
+        try await read(id: "mac-watch-catalog", dataRoot: dataRoot, as: [MacAssistantWatchRecipe].self)
+    }
+
+    /// These native read consumers admit only the selected part itself. Any
+    /// action or primitive effect still needs its own originating gate chain.
+    static func read<Value: Codable & Sendable>(id: String, dataRoot: URL, as type: Value.Type) async throws -> Value {
+        let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot) { tool, _ in
+            tool == id ? nil : .object([
+                "status": .string("refused"), "reason": .string("read_only"),
+                "detail": .string("This read returns data; effects require their own explicit action."),
+                "effects": .string("none")])
+        }
+        let result = await OwnedProgramInvocation.$host.withValue(host) {
+            await Parts(root: dataRoot).call(id: id, input: .object([:]), as: type)
+        }
+        switch result {
+        case .success(let recipes): return recipes
+        case .failure(let error): throw error
+        }
+    }
+
+    /// Only words come back from the part. The operation's status, reason,
+    /// identity and effect evidence remain exactly the native result's.
+    static func recover(_ result: JSONValue, integration: String, dataRoot: URL) async -> JSONValue {
+        func project(_ value: JSONValue, words: [String: String]) -> (value: JSONValue, needsWords: Bool) {
+            guard case .object(var fields) = value else { return (value, false) }
+            var needsWords = false
+            if fields["status"] == .string("failed"), fields["integration"] == .string(integration),
+               case .string(let reason)? = fields["reason"] {
+                needsWords = true
+                if let message = words[reason] { fields["message"] = .string(message) }
+            }
+            if case .array(let items)? = fields["items"] {
+                fields["items"] = .array(items.map { item in
+                    let child = project(item, words: words); needsWords = needsWords || child.needsWords
+                    return child.value
+                })
+            }
+            if case .object(let actions)? = fields["actions"] {
+                fields["actions"] = .object(actions.mapValues { action in
+                    let child = project(action, words: words); needsWords = needsWords || child.needsWords
+                    return child.value
+                })
+            }
+            return (.object(fields), needsWords)
+        }
+        guard project(result, words: [:]).needsWords else { return result }
+        do {
+            let words = try await read(id: integration + "-recovery", dataRoot: dataRoot, as: [String: String].self)
+            return project(result, words: words).value
+        } catch {
+            // A wording failure cannot erase or reinterpret an operation's effects.
+            guard case .object(var fields) = result else { return result }
+            fields["recovery_error"] = .object(["code": .string((error as? PartCallError)?.code ?? "failed"),
+                "message": .string(error.localizedDescription)])
+            return .object(fields)
+        }
+    }
+}
 
 extension ConnectorStatusProjection {
     public static func actionStatusEvidence(actionID: String, root: URL, platform: any ConnectorStatusPlatform) async -> ConnectorActionStatusEvidence? {
@@ -22,42 +89,9 @@ extension ConnectorStatusProjection {
     }
 }
 
-public struct NativeAppLocalPIMStatusProvider: LocalPIMStatusProvider {
-    let root: URL
-    let authorizationStatus: @MainActor @Sendable (String) -> [String: JSONValue]
-
-    public init(root: URL, authorizationStatus: @escaping @MainActor @Sendable (String) -> [String: JSONValue] = LocalPIMConnectorActions.authorizationStatusPayload) {
-        self.root = root
-        self.authorizationStatus = authorizationStatus
-    }
-
-    public func localStatuses() async -> [String: [String: JSONValue]] {
-        let integrations = [("local_mail", MacIntegrationID.mail), ("local_calendar", MacIntegrationID.calendar),
-                            ("local_reminders", MacIntegrationID.reminders)]
-        let permissions: [String: MacIntegrationPermission]
-        do {
-            permissions = try await MacIntegrationPermissionStore(dataRoot: root).snapshotChecked().permissions
-        } catch {
-            return Dictionary(uniqueKeysWithValues: integrations.map {
-                ($0.0, ["status": .string("unavailable"), "detail": .string(error.localizedDescription)])
-            })
-        }
-        return await MainActor.run {
-            Dictionary(uniqueKeysWithValues: integrations.map { id, integration in
-                let status = permissions[integration]?.read == true ? authorizationStatus(id) : [
-                    "status": .string("needs_policy"),
-                    "detail": .string("Read access is disabled in Mac Integrations."),
-                    "nextStep": .string("Enable read access in Mac Integrations."),
-                ]
-                return (id, status)
-            })
-        }
-    }
-}
-
-/// Gmail / Google Calendar proof = the Connectors page's own row: connected,
-/// and health still "ok" after `ConnectorHealthDecay` (a real call succeeded
-/// in the last 7 days). Local files only; one registry read per status call.
+/// A connector's proof = the Connectors page's own row: connected, and health
+/// still "ok" after `ConnectorHealthDecay` (a real call succeeded in the last
+/// 7 days). Local files only; one registry read per status call.
 public actor NativeAppConnectorProofProvider: ConnectorProofProvider {
     private let root: URL
     private var rows: [ConnectorRecord]?
@@ -68,10 +102,7 @@ public actor NativeAppConnectorProofProvider: ConnectorProofProvider {
         self.platform = platform
     }
 
-    public func proofStatus(provider: String) async -> [String: JSONValue] {
-        // The status client says email/calendar; the Google rows are gmail/gcal
-        // ("calendar" is the EventKit row).
-        let id = ["email": "gmail", "calendar": "gcal"][provider] ?? provider
+    public func proofStatus(provider id: String) async -> [String: JSONValue] {
         if rows == nil {
             rows = (try? await ConnectorStatusProjection.readConnectorRecords(root: root, platform: platform)) ?? []
         }
@@ -83,14 +114,7 @@ public actor NativeAppConnectorProofProvider: ConnectorProofProvider {
            proof.succeeded, Date().timeIntervalSince(proof.at) < ConnectorHealthDecay.provenWindow {
             return ["verified": .bool(true)]
         }
-        if let row, ["connected", "configured", "connected_unverified"].contains(row.authState ?? "") {
-            let name = row.name.isEmpty ? id : row.name
-            return [
-                "verified": .bool(false),
-                "nextStep": .string("You're signed in to \(name), but I haven't had a successful read in the last 7 days, so it isn't verified."),
-            ]
-        }
-        return ["verified": .bool(false), "nextStep": .string("Configure connector proof in the NativeAgent app")]
+        return ["verified": .bool(false)]
     }
 }
 
@@ -147,16 +171,16 @@ public struct AppConnectorActionPlatform: ConnectorActionPlatform {
     let dataRoot: URL
     private let statusPlatform: any ConnectorStatusPlatform
     private let router: @Sendable () -> AttentionRouter
-    private let deviceSync: @Sendable () -> DeviceSync
+    private let macAssistant: any MacAssistantStatusClient
     private let notification: @Sendable (String, String) async -> [String: JSONValue]
 
     public init(dataRoot: URL, statusPlatform: any ConnectorStatusPlatform,
-                router: @escaping @Sendable () -> AttentionRouter, deviceSync: @escaping @Sendable () -> DeviceSync,
+                router: @escaping @Sendable () -> AttentionRouter, macAssistant: any MacAssistantStatusClient,
                 notification: @escaping @Sendable (String, String) async -> [String: JSONValue]) {
         self.dataRoot = dataRoot
         self.statusPlatform = statusPlatform
         self.router = router
-        self.deviceSync = deviceSync
+        self.macAssistant = macAssistant
         self.notification = notification
     }
 
@@ -165,11 +189,11 @@ public struct AppConnectorActionPlatform: ConnectorActionPlatform {
     public func macAction(_ action: ConnectorPlatformAction, input: [String: JSONValue]) async throws -> JSONValue {
         switch action {
         case .calendarListUpcoming: return try await LocalPIMConnectorActions.calendarListUpcoming(input: input)
-        case .remindersListDueToday: return try await LocalPIMConnectorActions.remindersListDueToday(input: input)
-        case .mailListRecent: return try await MacAppleScriptBridge.mailListRecent(input: input)
-        case .messagesRecentThreads: return try await MacAppleScriptBridge.messagesRecentThreads(input: input)
-        case .notesListRecent: return try await MacAppleScriptBridge.notesListRecent(input: input)
-        case .notesSearch: return try await MacAppleScriptBridge.notesSearch(input: input)
+        case .remindersListDueToday: return try await LocalPIMConnectorActions.remindersListDueToday(input: input, dataRoot: dataRoot)
+        case .mailListRecent: return await MacAssistantParts.recover(try await MacAppleScriptBridge.mailListRecent(input: input), integration:"mail", dataRoot:dataRoot)
+        case .messagesRecentThreads: return await MacAssistantParts.recover(try await MacAppleScriptBridge.messagesRecentThreads(input: input), integration:"messages", dataRoot:dataRoot)
+        case .notesListRecent: return await MacAssistantParts.recover(try await MacAppleScriptBridge.notesListRecent(input: input), integration:"notes", dataRoot:dataRoot)
+        case .notesSearch: return await MacAssistantParts.recover(try await MacAppleScriptBridge.notesSearch(input: input), integration:"notes", dataRoot:dataRoot)
         case .contactsSearch: return try await MacContactsExecutor.search(input: input)
         }
     }
@@ -188,14 +212,7 @@ public struct AppConnectorActionPlatform: ConnectorActionPlatform {
 
     /// Every provider reads local state the app already owns — no network.
     public func macAssistantStatusClient() -> any MacAssistantStatusClient {
-        makeMacAssistantStatusClient(
-            proofs: NativeAppConnectorProofProvider(root: dataRoot, platform: statusPlatform),
-            push: NativeAppMobilePushStatusProvider(deviceSync: deviceSync()),
-            dispatcherTools: StaticDispatcherToolAvailabilityProvider(
-                availableTools: SwiftToolDispatcher.catalogRegisteredToolNames
-            ),
-            localPIM: NativeAppLocalPIMStatusProvider(root: dataRoot)
-        )
+        macAssistant
     }
 
     public func statusEvidence(actionID: String) async -> ConnectorActionStatusEvidence? {

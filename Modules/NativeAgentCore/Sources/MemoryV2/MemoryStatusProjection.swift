@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `MemoryStatusProjection.swift` | MemoryV2 and embedding runtime status projections and recent misses; hygiene reads use MemoryConsolidationHygiene's schema; embedding settings act through MemoryFacade's canonical owner; `MemoryV2NativeStackSnapshot` reads native stack health |
 
 /// Read-only status and hygiene projections using the existing stores and runtime.
 public enum MemoryStatusProjection {
@@ -19,44 +20,6 @@ public enum MemoryStatusProjection {
         } catch {
             return AfterTurnMemoryRecoveryStatus(status: "unavailable", heldCount: nil, failure: nil)
         }
-    }
-
-    public static func getMemoryVectorStatus(dataRoot: URL) async throws -> MemoryVectorStatus {
-        // An absent feed is unmeasured. A present-but-unreadable feed is
-        // unavailable; neither state may impersonate a ready zero-count store.
-        let path = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("vector_status.json")
-        guard FileManager.default.fileExists(atPath: path.path) else {
-            return MemoryVectorStatus(
-                status: "unmeasured",
-                provider: nil,
-                providerModel: nil,
-                providerConfigured: nil,
-                providerReason: "vector status has not been recorded for this data root",
-                dimensions: nil,
-                nodeCount: nil,
-                entityCount: nil,
-                updatedAt: nil,
-                createdAt: ISO8601DateFormatter().string(from: Date())
-            )
-        }
-        if let data = try? Data(contentsOf: path),
-           let decoded = try? statusDecoder().decode(MemoryVectorStatus.self, from: data) {
-            return decoded
-        }
-        return MemoryVectorStatus(
-            status: "unavailable",
-            provider: nil,
-            providerModel: nil,
-            providerConfigured: false,
-            providerReason: "vector status not available",
-            dimensions: nil,
-            nodeCount: nil,
-            entityCount: nil,
-            updatedAt: nil,
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
     }
 
     public static func getMemoryV2Status(dataRoot: URL) async throws -> MemoryV2Status {
@@ -121,50 +84,7 @@ public enum MemoryStatusProjection {
     }
 
     public static func readHygieneLastRun(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> MemoryHygieneReport? {
-        let path = dataRoot
-            .appendingPathComponent("memory")
-            .appendingPathComponent("hygiene_last_run.json")
-        guard let data = try? Data(contentsOf: path),
-              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else { return nil }
-        let createdAt = (obj["createdAt"] as? String)
-            ?? (obj["created_at"] as? String)
-            ?? (obj["lastRun"] as? String)
-            ?? (obj["last_run"] as? String)
-        // Prefer the report's own nextScheduled; derive lastRun + 7d only when
-        // absent. The cadence is WEEKLY (MemoryConsolidationHygieneRunner
-        // stages one approval card per week) — the old derived +24h made the
-        // Memory tab claim hygiene was overdue six days out of seven.
-        var nextScheduled: String? = (obj["nextScheduled"] as? String)
-            ?? (obj["next_scheduled"] as? String)
-        // Honest-status (2026-07-24): a staged/refused run completed nothing —
-        // its receipt intentionally carries no "next" stamp, and deriving one
-        // here would recreate the false cadence boundary the runner just
-        // stopped writing.
-        let statusValue = (obj["status"] as? String) ?? "idle"
-        if nextScheduled == nil,
-           statusValue != "staged", statusValue != "refused",
-           let createdAt, let dt = ISO8601DateFormatter().date(from: createdAt) {
-            nextScheduled = ISO8601DateFormatter().string(from: dt.addingTimeInterval(7 * 24 * 3600))
-        }
-        return MemoryHygieneReport(
-            id: obj["id"] as? String,
-            status: (obj["status"] as? String) ?? "idle",
-            reason: obj["reason"] as? String,
-            version: obj["version"] as? String,
-            createdAt: createdAt,
-            beforeCount: obj["beforeCount"] as? Int,
-            afterCount: obj["afterCount"] as? Int,
-            normalized: obj["normalized"] as? Int,
-            archivedDuplicates: obj["archivedDuplicates"] as? Int,
-            archivedReflections: obj["archivedReflections"] as? Int,
-            distilledFactsAdded: obj["distilledFactsAdded"] as? Int,
-            decayedMemories: obj["decayedMemories"] as? Int,
-            proposalHygiene: nil,
-            consolidationRunId: (obj["consolidationRunId"] as? String)
-                ?? (obj["consolidation_run_id"] as? String),
-            nextScheduled: nextScheduled
-        )
+        try? MemoryConsolidationHygiene.read(dataRoot: dataRoot)
     }
 
     /// The miss ledger for the ISO `weeks` asked: every time she was given a
@@ -255,11 +175,6 @@ public enum MemoryStatusProjection {
         return tag(text.split { ".,;:—(".contains($0) }.first.map(String.init) ?? text)
     }
 
-    private static func statusDecoder() -> JSONDecoder {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return decoder
-    }
 }
 
 public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
@@ -293,10 +208,6 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         case disabled
         case mock
 
-        public var isHealthy: Bool {
-            if case .working = self { return true }
-            return false
-        }
         public var needsAttention: Bool {
             switch self {
             case .broken, .missing: return true
@@ -387,7 +298,7 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         // resolver — single source of truth, both `bundled` and
         // installedAppFallbackBundle paths covered. An installed model whose
         // manifest is unusable is NOT ready and never reads as the bundled
-        // MiniLM (S12, 2026-09-26); refreshEmbeddingRuntime() below carries
+        // MiniLM (S12, 2026-09-26); applyEmbeddingRuntime() below carries
         // the reason as the load error.
         do {
             if let installed = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
@@ -407,7 +318,7 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         // the model actually loaded and inference works. Pull
         // coreMLLoaded / lastLoadError / loadCount from
         // SwiftNativeMemoryV2's snapshot.
-        await snap.refreshEmbeddingRuntime()
+        snap.applyEmbeddingRuntime(await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).embeddingRuntimeSnapshot())
 
         // Spotlight — the `.spotlight_reindexed` sentinel is written by
         // MemorySpotlightBootstrap on first launch after the
@@ -426,10 +337,8 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         return snap
     }
 
-    public mutating func refreshEmbeddingRuntime() async {
-        guard let runtime = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot() else {
-            return
-        }
+    public mutating func applyEmbeddingRuntime(_ snapshot: EmbeddingRuntimeSnapshot?) {
+        guard let runtime = snapshot else { return }
         runtimeEmbedderDimensions = runtime.dimensions
         embeddingMode = runtime.mode
         requestedEmbeddingBackend = runtime.requestedBackend
@@ -441,22 +350,8 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
 }
 
 extension MemoryStatusProjection {
-    // Swift-native embedding status. The app no longer installs or probes
-    // sentence-transformers/Python extras; the live truth is the MemoryV2
-    // root-resolved embedder. Three terminal states: CoreML MiniLM when the
-    // bundled model loads, explicit mock when the user opted out via config
-    // OR set NATIVE_AGENT_EMBEDDING_MOCK=1, and fail-closed (embed() throws)
-    // when CoreML was requested but resources are missing / load failed and
-    // no env opt-in.
-    //
-    // Every embedding action resolves the root's memory owner, which may
-    // open, migrate and prune the store, so all of them run off the main actor.
-    public static func embeddingsStatus(dataRoot: URL) async throws -> EmbeddingsStatus {
-        return embeddingsStatus(from: try await MemoryStatusProjection.embeddingRuntime(dataRoot: dataRoot))
-    }
-
     /// Project a status from one runtime snapshot.
-    private static func embeddingsStatus(from runtime: EmbeddingRuntimeSnapshot) -> EmbeddingsStatus {
+    public static func embeddingsStatus(from runtime: EmbeddingRuntimeSnapshot) -> EmbeddingsStatus {
         let readiness = MemoryStatusProjection.embeddingReadiness(runtime)
         let requestedCoreML = readiness.requestedCoreML
         // effectiveCoreML must be TRUE only when the runtime is ACTUALLY
@@ -596,24 +491,12 @@ extension MemoryStatusProjection {
         return EmbeddingPlainCopy.notLoadedYetLine
     }
 
-    // DAEMON-DEAD PORT (2026-06-03): configure the Swift embedding runtime.
-    // The managed provider persists <dataRoot>/config/embeddings.json::backend
-    // and immediately releases CoreML when disabled.
-    public static func toggleEmbeddingsBackend(enabled: Bool, dataRoot: URL) async throws -> EmbeddingsToggleResult {
-        let result = try await SwiftNativeMemoryV2.configureEmbeddingBackendAndReindex(enabled: enabled, dataRoot: dataRoot)
-        let report = result.report
-        let detail = "Atomically activated one embedding epoch across \(report.memories) memories, \(report.proposals) proposals, and \(report.tombstones) tombstones."
-        return EmbeddingsToggleResult(ok: true, error: nil, detail: detail, status: embeddingsStatus(from: result.runtime))
-    }
-
 }
 
 public enum EmbeddingPlainCopy {
 
     /// What the embedding runtime is actually doing for search right now.
     public enum SearchState: Equatable {
-        /// The on-device model is serving real vectors.
-        case byMeaning
         /// The user opted out of semantic embeddings in settings.
         case turnedOff
         /// NATIVE_AGENT_EMBEDDING_MOCK opt-in: deterministic test vectors.
@@ -627,8 +510,6 @@ public enum EmbeddingPlainCopy {
     /// Leads with the user's loss, never with a backend name.
     public static func headline(_ state: SearchState) -> String {
         switch state {
-        case .byMeaning:
-            return "Memory search finds results by meaning."
         case .turnedOff:
             return "Memory search by meaning is turned off."
         case .testVectors:
@@ -643,8 +524,6 @@ public enum EmbeddingPlainCopy {
     /// The secondary line. Nil when there is nothing technical worth naming.
     public static func technicalDetail(_ state: SearchState, error: String? = nil) -> String? {
         switch state {
-        case .byMeaning:
-            return nil
         case .turnedOff:
             return "Semantic embeddings are off in settings. Turn them on to use the bundled Core ML MiniLM model."
         case .testVectors:

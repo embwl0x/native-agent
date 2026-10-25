@@ -4,14 +4,13 @@ import SwiftUI
 import ApprovalInbox
 import PersistenceCore
 import NativeAgentShared
+// Blueprint: | `ChatInlineApprovalCard.swift` | mounted approval card, transient interaction state and facade-owned decisions |
 
 // PATCH-2026-05-08: wave2-chat-ux — inline approval card for kind=approval_pending
 struct InlineApprovalCard: View {
     var message: ChatMessage
     @Environment(AppModel.self) private var appModel
     @State private var resolving = false
-    @State private var resolved = false
-    @State private var resolvedDecision = ""
     @State private var resolveError: String? = nil
 
     private var meta: ChatMessageMetadata? { message.metadata }
@@ -33,28 +32,19 @@ struct InlineApprovalCard: View {
     private var state: InlineApprovalPresentation.State {
         InlineApprovalPresentation.state(
             approvalID: approvalId,
-            locallyResolved: resolved,
-            localDecision: resolvedDecision,
             externalStatus: externalApproval?.status,
             externalDecision: externalApproval?.decision
         )
     }
 
     var body: some View {
-        VStack(alignment: .leading) {
-            shellBody
-            if message.content.hasPrefix("Connect to Grok Bot?"),
-               case .resolved(let decision) = state, decision == "approved" {
-                GrokSecureSetupCard(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-            }
-        }
+        shellBody
         // After a launch the chat can draw before the approvals list loads;
         // a card that doesn't know its approval reads the inbox once, so an
         // answered one never comes back asking.
         .task(id: approvalId) {
             guard externalApproval == nil, !approvalId.isEmpty else { return }
-            appModel.engine.approvals.records = (try? await appModel.engine.approvals.list())
-                ?? appModel.engine.approvals.records
+            await appModel.engine.approvals.refresh()
         }
     }
 
@@ -140,14 +130,10 @@ struct InlineApprovalCard: View {
                     if active { appModel.approvalResolutionInFlightIDs.insert(id) }
                     else { appModel.approvalResolutionInFlightIDs.remove(id) }
                 },
-                didResolve: { decision in
-                    resolvedDecision = decision
-                    resolved = true
-                },
                 refreshHealth: { await appModel.loadHealthCard() }
             )
         } catch {
-            // B.3: daemon returned an error — keep card actionable
+            // A failed settlement stays visible on the card.
             resolveError = UserFacingError.message(error, action: "record that decision")
         }
     }

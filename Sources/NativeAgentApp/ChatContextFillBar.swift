@@ -7,7 +7,7 @@ import Speech
 import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
-import ChatOrchestration
+import ChatSessionWork
 import MemoryV2
 import PersistenceCore
 import ProviderRouting
@@ -17,6 +17,8 @@ import CoreSpotlight
 #if canImport(CloudKit)
 import CloudKit
 #endif
+
+// Blueprint: | `ChatContextFillBar.swift` | `ContextFillPresentation` and context strip/ring: measured usage, model window and compaction controls; missing figures stay visibly unavailable |
 
 /// Values shown in the context strip. The strip is a readout, so an absent
 /// provider figure must stay visibly absent instead of becoming a confident
@@ -86,28 +88,21 @@ enum ContextFillCompactionPresentation {
 
 struct ContextFillBar: View {
     let sessionId: String
-    typealias StatusLoader = @MainActor (String, String) async throws -> SessionContextStatus
     typealias CompactAction = @MainActor (String, String, String, Bool) async throws -> ChatSessionCompactionOutcome
 
-    private let statusLoader: StatusLoader?
     private let compactAction: CompactAction?
     @Environment(AppModel.self) private var appModel
-    @State private var status: SessionContextStatus? = nil
+    private var status: SessionContextStatus? { appModel.engine.providers.sessions[sessionId]?.context }
     @State private var isCompacting = false
-    @State private var lastError: String? = nil
+    @State private var compactionError: String? = nil
+    private var lastError: String? { compactionError ?? appModel.engine.providers.sessions[sessionId]?.error }
     @State private var lastErrorWasCompaction = false
-    @State private var refreshToken = 0
-    // Settings › Context window: a change re-sizes the window at once.
-    @AppStorage("nativeagent.contextWindowMode") private var windowMode = ""
-    @AppStorage("nativeagent.compactionThresholdTokens") private var windowSize = 0
 
     init(
         sessionId: String,
-        statusLoader: StatusLoader? = nil,
         compactAction: CompactAction? = nil
     ) {
         self.sessionId = sessionId
-        self.statusLoader = statusLoader
         self.compactAction = compactAction
     }
 
@@ -247,22 +242,7 @@ struct ContextFillBar: View {
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
         .help(status.map { contextHelp($0) } ?? "Loading context status…")
-        .task(id: "\(sessionId):\(appModel.chatModel):\(refreshToken):\(windowMode):\(windowSize)") { await refresh() }
-        .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
-            if let completedSessionId = note.object as? String, completedSessionId != sessionId {
-                return
-            }
-            refreshToken += 1
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(for: .nativeAgentSessionProviderUsageDidChange)
-        ) { note in
-            guard let updatedSessionId = note.object as? String,
-                  updatedSessionId == sessionId else {
-                return
-            }
-            refreshToken += 1
-        }
+        .modifier(ComposerSessionRefresh(sessionID: sessionId))
     }
 
     private func formatExactTokens(_ n: Int) -> String {
@@ -300,58 +280,38 @@ struct ContextFillBar: View {
 
     @MainActor
     private func refresh() async {
-        guard !sessionId.isEmpty else { status = nil; return }
-        do {
-            // Thread the current chat model through so the budget reflects
-            // whatever context_length the live model has (e.g. 200k for
-            // Opus 4.8, 128k for GPT-5.4-mini).
-            let loaded: SessionContextStatus
-            if let statusLoader {
-                loaded = try await statusLoader(sessionId, appModel.chatModel)
-            } else {
-                loaded = try await appModel
-                    .getSessionContext(sessionId: sessionId, model: appModel.chatModel)
-            }
-            // A conversation switched mid-read keeps the newer one's numbers.
-            guard !Task.isCancelled else { return }
-            status = loaded
-            lastError = nil
-            lastErrorWasCompaction = false
-        } catch {
-            lastError = UserFacingError.cause(error, action: "read how full the context is")
-            lastErrorWasCompaction = false
-        }
+        await appModel.engine.providers.refreshSession(sessionId)
     }
 
     @MainActor
     private func compactNow() async {
         guard !isCompacting else { return }
         isCompacting = true; defer { isCompacting = false }
-        lastError = nil
+        compactionError = nil
         lastErrorWasCompaction = false
         do {
             let result: ChatSessionCompactionOutcome
             if let compactAction {
                 result = try await compactAction(
-                    sessionId, appModel.chatModel, appModel.chatProvider, true
+                    sessionId, status?.model ?? "", appModel.engine.providers.sessions[sessionId]?.choice?.provider ?? "", true
                 )
             } else {
                 result = try await appModel
                     .compactSession(
                         sessionId: sessionId,
-                        model: appModel.chatModel,
-                        providerID: appModel.chatProvider,
+                        model: status?.model,
+                        providerID: appModel.engine.providers.sessions[sessionId]?.choice?.provider,
                         force: true
                     )
             }
             if let failure = ContextFillCompactionPresentation.failureMessage(for: result) {
-                lastError = failure
+                compactionError = failure
                 lastErrorWasCompaction = true
                 return
             }
             await refresh()
         } catch {
-            lastError = UserFacingError.cause(error, action: "compact this chat")
+            compactionError = UserFacingError.cause(error, action: "compact this chat")
             lastErrorWasCompaction = true
         }
     }
@@ -362,19 +322,12 @@ struct ContextFillBar: View {
 /// The small context readout on the composer row (User, 2026-09-16: "something
 /// small that shows how much context is used"). A ring that fills as the
 /// session's context fills, the percent beside it, exact tokens on hover.
-/// Same status and the same refresh triggers as `ContextFillBar`; no
+/// Reads the same engine-owned session context as `ContextFillBar`; no
 /// compaction control here — the row stays quiet.
 struct ComposerContextRing: View {
     let sessionId: String
-    /// A bot conversation's own model; nil is the chat model.
-    var model: String? = nil
-    private var windowModel: String { model ?? appModel.chatModel }
     @Environment(AppModel.self) private var appModel
-    @State private var status: SessionContextStatus? = nil
-    @State private var refreshToken = 0
-    // Settings › Context window: a change re-sizes the window at once.
-    @AppStorage("nativeagent.contextWindowMode") private var windowMode = ""
-    @AppStorage("nativeagent.compactionThresholdTokens") private var windowSize = 0
+    private var status: SessionContextStatus? { appModel.engine.providers.sessions[sessionId]?.context }
 
     private var usage: ContextFillPresentation.Usage {
         guard let status else { return .init(percent: 0, fillFraction: 0, isOverBudget: false) }
@@ -416,21 +369,5 @@ struct ComposerContextRing: View {
         .help(helpText)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(helpText)
-        .task(id: "\(sessionId):\(windowModel):\(refreshToken):\(windowMode):\(windowSize)") { await refresh() }
-        .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
-            if let completed = note.object as? String, completed != sessionId { return }
-            refreshToken += 1
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .nativeAgentSessionProviderUsageDidChange)) { note in
-            guard let updated = note.object as? String, updated == sessionId else { return }
-            refreshToken += 1
-        }
-    }
-
-    private func refresh() async {
-        guard !sessionId.isEmpty else { status = nil; return }
-        let refreshed = try? await appModel.getSessionContext(sessionId: sessionId, model: windowModel)
-        guard !Task.isCancelled else { return }
-        status = refreshed
     }
 }

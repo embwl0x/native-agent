@@ -3,6 +3,8 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `ApprovalReplayAuthorizer.swift` | `ApprovalInboxApprovedReplayVerifier`: verifies replay authority against canonical inbox state and effect identity before approved dispatch |
+
 // MARK: - 2026-09-06 — the NON-injection replay exemption is checked too
 
 /// Why this exists.

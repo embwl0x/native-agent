@@ -4,6 +4,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `AgentHostConfigWriter.swift` | `AgentHostConfigWriter` enum; `checkEntry`, `writeEnvironment`, `ensureEnvironment`; absent/exact entries, same-peer reconciliation and stale-install helper replacement; foreign-entry refusal; `checking` validates without writing; removal names missing ownership receipts and preserves unproven bytes |
 
 /// Writing ONE entry into somebody else's configuration file.
 ///
@@ -25,7 +26,8 @@ public enum AgentHostConfigWriter {
         case tooLarge
         case backupFailed
         case writeFailed
-        case cleanupFailed
+        case cleanupFailed(path: String, detail: String)
+        case removalFailed(path: String, displaced: String, detail: String)
         case rollbackFailed(String)
         case changedUnderneath
         case entryExists(String)
@@ -41,12 +43,14 @@ public enum AgentHostConfigWriter {
                 return "Connector collision at \(at). The existing entry belongs to another contact or has no peer ID. Review its ownership or change the recipe's configPath/format; it was left unchanged."
             case .changedUnderneath:
                 return "The settings file changed while I was working; nothing was written."
-            case .unreadable(let detail): return "The configuration file could not be read safely: \(detail). Nothing was changed."
+            case .unreadable(let detail): return "The configuration file could not be read safely: \(detail)."
             case .unparsable(let detail): return "The configuration file could not be parsed: \(detail). Existing bytes were preserved and nothing was changed."
             case .tooLarge: return "The configuration file exceeds the bounded size this writer will edit. Nothing was changed."
             case .backupFailed: return "A timestamped backup could not be written beside the configuration file, so the file was left untouched."
-            case .writeFailed: return "The configuration file could not be replaced atomically. Nothing was changed."
-            case .cleanupFailed: return "The configuration was saved, but its previous file could not be removed."
+            case .writeFailed: return "The configuration replacement failed. Inspect the configuration and its recorded backup before another change."
+            case .cleanupFailed(let path, let detail): return "The configuration was saved, but its previous file remains at \(path): \(detail). Inspect both files before removing the previous file."
+            case .removalFailed(let path, let displaced, let detail):
+                return "Configuration removal failed: \(detail). The file was moved from \(path) to \(displaced); either path may now exist. Inspect both paths before another change."
             case .rollbackFailed(let path): return "The settings changed during replacement and could not be restored safely. The displaced file was preserved at \(path); review both files before retrying."
             }
         }
@@ -398,27 +402,34 @@ public enum AgentHostConfigWriter {
             do { (current, currentIdentity) = try read(path: claimed) }
             catch {
                 // Exclusive restoration cannot overwrite a concurrent host save.
-                _ = renamex_np(claimed, path, UInt32(RENAME_EXCL))
+                if renamex_np(claimed, path, UInt32(RENAME_EXCL)) != 0 {
+                    throw Failure.removalFailed(path: path, displaced: claimed,
+                        detail: "Read failed: \(error.localizedDescription); restoring the original path failed: \(String(cString: strerror(errno))).")
+                }
                 throw error
             }
-            if currentIdentity == identity, current == existing {
-                guard Darwin.unlink(claimed) == 0 else { throw Failure.writeFailed }
-            } else if renamex_np(claimed, path, UInt32(RENAME_EXCL)) != 0 {
-                guard errno == EEXIST else { throw Failure.writeFailed }
-                // Both versions belong to the host. Keep both files and splice
-                // only our entry out of the displaced version as well.
-                if let fresh = try splice(current) {
-                    try replaceAtomically(path: claimed, data: fresh.data, unchangedSince: currentIdentity, original: current)
+            do {
+                if currentIdentity == identity, current == existing {
+                    guard Darwin.unlink(claimed) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+                } else if renamex_np(claimed, path, UInt32(RENAME_EXCL)) != 0 {
+                    guard errno == EEXIST else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+                    // Both versions belong to the host. Keep both files and splice
+                    // only our entry out of the displaced version as well.
+                    if let fresh = try splice(current) {
+                        try replaceAtomically(path: claimed, data: fresh.data, unchangedSince: currentIdentity, original: current)
+                    }
                 }
-            }
-            var now = stat()
-            if lstat(path, &now) == 0 {
-                let (latest, latestIdentity) = try read(path: path)
-                if let fresh = try splice(latest) {
-                    try replaceAtomically(path: path, data: fresh.data, unchangedSince: latestIdentity, original: latest)
+                var now = stat()
+                if lstat(path, &now) == 0 {
+                    let (latest, latestIdentity) = try read(path: path)
+                    if let fresh = try splice(latest) {
+                        try replaceAtomically(path: path, data: fresh.data, unchangedSince: latestIdentity, original: latest)
+                    }
+                } else if errno != ENOENT {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
                 }
-            } else if errno != ENOENT {
-                throw Failure.writeFailed
+            } catch {
+                throw Failure.removalFailed(path: path, displaced: claimed, detail: error.localizedDescription)
             }
         } else {
             try replaceAtomically(path: path, data: result.data, unchangedSince: identity, original: existing)
@@ -610,7 +621,7 @@ public enum AgentHostConfigWriter {
             throw error
         }
         guard Darwin.unlink(temporary) == 0 else {
-            throw Failure.cleanupFailed
+            throw Failure.cleanupFailed(path: temporary, detail: String(cString: strerror(errno)))
         }
     }
 

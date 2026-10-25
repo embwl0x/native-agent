@@ -2,6 +2,7 @@ import Foundation
 @preconcurrency import Dispatch
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `LLMClient+CodexAdapter.swift` | `CodexAdapter`: streaming and buffered Codex runners; pins the shared credential resolver's path for account controls, child-home binding and preparation; never lets the CLI select another credential; NativeAgentCore's ProcessPipeDrain owns shared nonblocking pipe capture without an executor dependency |
 
 /// Incremental UTF-8 decoder for chunked byte streams. A multibyte codepoint
 /// (2-4 bytes) can be split across two reads; naive per-read decoding drops
@@ -222,14 +223,16 @@ public final class CodexAdapter: LLMAdapter {
     private let timeout: TimeInterval
     private let runner: CodexProcessRunner
     private let streamingRunner: CodexStreamingProcessRunner
-    private let processEnvironmentOverride: [String: String]?
+    private let processEnvironment: [String: String]
+    private let dataRootOverride: URL?
 
     public init(
         codexBin: String = "codex",
         timeout: TimeInterval = 180,
         runner: @escaping CodexProcessRunner = CodexAdapter.defaultRunner,
         streamingRunner: @escaping CodexStreamingProcessRunner = CodexAdapter.defaultStreamingRunner,
-        processEnvironmentOverride: [String: String]? = nil
+        processEnvironmentOverride: [String: String]? = nil,
+        dataRootOverride: URL? = nil
     ) {
         self.codexBin = codexBin
         self.timeout = timeout
@@ -239,15 +242,15 @@ public final class CodexAdapter: LLMAdapter {
         // login surface intentionally finds Codex in Homebrew/npm locations.
         // Use the same practical resolution rule for execution so "signed in"
         // cannot be followed by an avoidable ENOENT on the first real turn.
-        // An injected environment remains exact for tests and controlled runs.
-        self.processEnvironmentOverride = processEnvironmentOverride ?? Self.augmentedProcessEnvironment()
+        // An injected base environment keeps its own settings and gets the
+        // same PATH repair; child credential binding is always owned below.
+        self.processEnvironment = Self.augmentedProcessEnvironment(
+            base: processEnvironmentOverride ?? ProcessInfo.processInfo.environment)
+        self.dataRootOverride = dataRootOverride
     }
 
-    /// Public so a caller that must inject its own environment (a bound
-    /// CODEX_HOME, a secondary runtime's root) can build ON TOP of the PATH
-    /// repair rather than replacing it — an injected environment skips the
-    /// augmentation below, and a GUI-launched app's PATH cannot find `codex`
-    /// (User, 2026-09-06).
+    /// The PATH repair every Codex child runs with, injected environment or
+    /// not: a GUI-launched app's PATH cannot find `codex` (User, 2026-09-06).
     public static func augmentedProcessEnvironment(
         base: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
@@ -260,7 +263,8 @@ public final class CodexAdapter: LLMAdapter {
     }
 
     public func complete(prompt: String, system: String?, model: String) async throws -> String {
-        let args = arguments(model: model)
+        let authPath = resolvedAuthPath()
+        let args = arguments(model: model, authPath: authPath)
         let terminator = CodexTerminator()
         let invocation = CodexProcessInvocation(
             executable: codexBin,
@@ -268,9 +272,9 @@ public final class CodexAdapter: LLMAdapter {
             stdin: Self.composedPrompt(system: system, prompt: prompt),
             timeout: ProviderStreamContext.stallOnly ? 0 : timeout,
             terminator: terminator,
-            environment: processEnvironmentOverride
+            environment: childEnvironment(authPath: authPath)
         )
-        try await Self.prepareCodexHome(invocation.environment)
+        try await Self.prepareCodexHome(authPath)
         let result: CodexProcessResult
         do {
             // withTaskCancellationHandler propagates a cancelled consumer Task
@@ -316,11 +320,25 @@ public final class CodexAdapter: LLMAdapter {
         return result.stdout
     }
 
-    /// An app child home (`OpenAIOAuthDirectAdapter.codexChildHome`) gets a
-    /// fresh access-only credential before the CLI starts on it.
-    private static func prepareCodexHome(_ environment: [String: String]?) async throws {
-        guard let home = environment?["CODEX_HOME"], !home.isEmpty else { return }
-        try await OpenAIOAuthDirectAdapter.prepareCodexChildHome(URL(fileURLWithPath: home, isDirectory: true))
+    private func resolvedAuthPath() -> URL {
+        OpenAIOAuthDirectAdapter.preferredAuthPath(
+            dataRoot: dataRootOverride,
+            environment: processEnvironment
+        )
+    }
+
+    private func childEnvironment(authPath: URL) -> [String: String] {
+        var environment = processEnvironment
+        environment["CODEX_HOME"] = OpenAIOAuthDirectAdapter.codexHomeForChild(authPath: authPath).path
+        if let dataRootOverride { environment["NATIVE_AGENT_DATA_ROOT"] = dataRootOverride.path }
+        return environment
+    }
+
+    /// Preparation and execution share the credential pinned before dispatch.
+    private static func prepareCodexHome(_ authPath: URL) async throws {
+        try await OpenAIOAuthDirectAdapter.prepareCodexChildHome(
+            OpenAIOAuthDirectAdapter.codexHomeForChild(authPath: authPath), authPath: authPath
+        )
     }
 
     /// A3.2: classify a non-zero Codex CLI exit from its stdout/stderr. The CLI
@@ -402,7 +420,8 @@ public final class CodexAdapter: LLMAdapter {
         system: String?,
         model: String
     ) -> AsyncThrowingStream<String, Error> {
-        let args = arguments(model: model)
+        let authPath = resolvedAuthPath()
+        let args = arguments(model: model, authPath: authPath)
         let terminator = CodexTerminator()
         let invocation = CodexProcessInvocation(
             executable: codexBin,
@@ -410,7 +429,7 @@ public final class CodexAdapter: LLMAdapter {
             stdin: Self.composedPrompt(system: system, prompt: prompt),
             timeout: ProviderStreamContext.stallOnly ? 0 : timeout,
             terminator: terminator,
-            environment: processEnvironmentOverride
+            environment: childEnvironment(authPath: authPath)
         )
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -418,7 +437,7 @@ public final class CodexAdapter: LLMAdapter {
                     var sawContent = false
                     do {
                         try Task.checkCancellation()
-                        try await Self.prepareCodexHome(invocation.environment)
+                        try await Self.prepareCodexHome(authPath)
                         let upstream = streamingRunner(invocation)
                         for try await chunk in upstream {
                             try Task.checkCancellation()
@@ -613,24 +632,17 @@ public final class CodexAdapter: LLMAdapter {
     /// `--color never` keeps ANSI escapes out of the streamed stdout. Verified
     /// against codex v0.153.2 (`codex exec --help`); its stdout carries only
     /// the agent's final message, all banners go to stderr.
-    private func arguments(model: String) -> [String] {
+    private func arguments(model: String, authPath: URL) -> [String] {
         var args: [String] = ["exec", "--color", "never", "--skip-git-repo-check"]
         if ProviderStreamContext.stallOnly {
             args.append(contentsOf: ["-c", "model_reasoning_summary=\"auto\""])
         }
-        var cacheURL = CodexAccountModelCatalog.cacheCandidate(
-            environment: processEnvironmentOverride ?? ProcessInfo.processInfo.environment
+        let cacheURL = CodexAccountModelCatalog.cacheCandidate(
+            environment: processEnvironment
         )
-        // A child home mirrors `<root>/codex_home`, where the app keeps the
-        // account's credential and model cache.
-        if cacheURL.deletingLastPathComponent().lastPathComponent == "codex_child_home" {
-            cacheURL = cacheURL.deletingLastPathComponent().deletingLastPathComponent()
-                .appendingPathComponent("codex_home", isDirectory: true)
-                .appendingPathComponent("models_cache.json")
-        }
         let accountRow = CodexAccountModelCatalog.matchingModels(
             providerID: "codex",
-            oauthAuthURL: cacheURL.deletingLastPathComponent().appendingPathComponent("auth.json"),
+            oauthAuthURL: authPath,
             fallbackCacheURL: cacheURL
         ).first { $0.id == model }
         if let effort = OpenAIExecutionControls.reasoningEffort(

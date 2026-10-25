@@ -22,11 +22,12 @@ struct WorkshopTaskRecord: Identifiable, Codable, Hashable, Sendable {
     var completedAt: String?
     var receiptCount: Int?
     var currentStepId: String?
+    var requiresApproval: Bool?
 
     enum CodingKeys: String, CodingKey {
         case id, title, objective, status, phase, priority
         case autonomyLevel, permissionProfile, summary
-        case createdAt, updatedAt, completedAt, receiptCount, currentStepId
+        case createdAt, updatedAt, completedAt, receiptCount, currentStepId, requiresApproval
         case autonomy_level, permission_profile, receipt_count
         case created_at, updated_at, completed_at, current_step_id
     }
@@ -61,6 +62,7 @@ struct WorkshopTaskRecord: Identifiable, Codable, Hashable, Sendable {
         self.completedAt = completedAt
         self.receiptCount = receiptCount
         self.currentStepId = currentStepId
+        self.requiresApproval = nil
     }
 
     init(from decoder: Decoder) throws {
@@ -87,6 +89,7 @@ struct WorkshopTaskRecord: Identifiable, Codable, Hashable, Sendable {
             ?? c.decodeIfPresent(Int.self, forKey: .receipt_count)
         currentStepId = try c.decodeIfPresent(String.self, forKey: .currentStepId)
             ?? c.decodeIfPresent(String.self, forKey: .current_step_id)
+        requiresApproval = try c.decodeIfPresent(Bool.self, forKey: .requiresApproval)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -105,6 +108,7 @@ struct WorkshopTaskRecord: Identifiable, Codable, Hashable, Sendable {
         try c.encodeIfPresent(completedAt, forKey: .completedAt)
         try c.encodeIfPresent(receiptCount, forKey: .receiptCount)
         try c.encodeIfPresent(currentStepId, forKey: .currentStepId)
+        try c.encodeIfPresent(requiresApproval, forKey: .requiresApproval)
     }
 }
 
@@ -131,9 +135,11 @@ struct ChatMessageRecord: Identifiable, Codable, Hashable {
     var interactionJSON: String? = nil
     var interactionDescriptorJSON: String? = nil
     var interactionSessionID: String? = nil
+    var toolEvents: [ToolEvent]? = nil
 }
 
 struct ChatMessageRecordMetadata: Codable, Hashable {
+    var turnTraceId: String? = nil
     var attachments: [PersistedAttachmentRecord]? = nil
     var completionState: String? = nil
     var failureWork: String? = nil
@@ -150,12 +156,18 @@ struct PersistedAttachmentRecord: Codable, Hashable {
     var byteSize: Int64?
     var path: String?
     var utterance: SpeechUtterance?
+    var preview: TranscriptAttachmentPreviewRecord?
+}
+
+struct TranscriptAttachmentPreviewRecord: Codable, Hashable {
+    var png: Data?
 }
 
 struct ChatTranscriptSnapshot: Identifiable, Codable, Hashable, Sendable {
     var id: String { sessionId }
     var sessionId: String
     var messages: [ChatMessageRecord]
+    var readError: String? = nil
     /// 2026-09-06: the Mac session's transcript version at publication (see
     /// MacSyncEngine.ChatTranscriptSnapshot). A row carrying `messages: []` is
     /// the Mac stating the transcript is empty; this counter is what makes that
@@ -166,6 +178,8 @@ struct ChatTranscriptSnapshot: Identifiable, Codable, Hashable, Sendable {
     var transcriptGeneration: Int? = nil
     /// The Mac holds rows older than this window. Absent on older Mac builds.
     var hasOlder: Bool? = nil
+    /// Reading copies beside the transcript, never canonical chat messages.
+    var otherRooms: [OtherRoomExchange]? = nil
 }
 
 // MARK: - Turn Inspector W4 — iOS decode-side summary models
@@ -217,20 +231,7 @@ struct TurnSummaryFile: Codable, Hashable, Sendable {
     }
 }
 
-struct SkillRecord: Identifiable, Codable, Hashable, Sendable {
-    var id: String
-    var name: String
-    var status: String
-    var kind: String?
-    var description: String?
-    var triggers: [String]?
-    var riskClass: String?
-    var autoload: Bool?
-    var useCount: Int?
-    var updatedAt: String?
-}
-
-struct ToolRecord: Identifiable, Codable, Hashable {
+struct ToolRecord: Identifiable, Codable, Hashable, Sendable {
     var id: String
     var name: String
     var kind: String?
@@ -295,6 +296,8 @@ struct TrustTrainingPolicy: Codable, Hashable, Sendable {
 }
 
 struct TrustPolicy: Codable, Hashable, Sendable {
+    var resolvedPreset: String?
+    var effectivePermissionLevel: String?
     var permissionLevel: String?
     var autonomyDefault: String?
     var requireBackups: Bool?
@@ -311,6 +314,7 @@ struct TrustPolicy: Codable, Hashable, Sendable {
     var macControlPolicy: TrustMacControlPolicy?
 
     enum CodingKeys: String, CodingKey {
+        case resolvedPreset, effectivePermissionLevel
         case permissionLevel, autonomyDefault, requireBackups, outsideDefault, developerMode
         case workshopPolicy = "missionPolicy" // compatibility wire ID
         case toolPolicy, filePolicy, connectorPolicy, providerPolicy, trainingPolicy, updatedAt, macControlPolicy
@@ -331,6 +335,8 @@ extension TrustPolicy {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        resolvedPreset = try c.decodeIfPresent(String.self, forKey: .resolvedPreset)
+        effectivePermissionLevel = try c.decodeIfPresent(String.self, forKey: .effectivePermissionLevel)
         permissionLevel = try c.decodeIfPresent(String.self, forKey: .permissionLevel)
         autonomyDefault = try c.decodeIfPresent(String.self, forKey: .autonomyDefault)
         requireBackups = try c.decodeIfPresent(Bool.self, forKey: .requireBackups)
@@ -420,10 +426,8 @@ struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
     var id: String
     var name: String
     var kind: String?
-    var status: String?
     var enabled: Bool?
     var healthStatus: String?
-    var lastUsedAt: String?
     var updatedAt: String?
     var authState: String?
     var canToggle: Bool?

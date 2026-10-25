@@ -2,10 +2,13 @@ import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `AbandonedTurnReconciler.swift` | `TurnCheckpoint` retains its originating DataRootLife; reads project stopped/restored across lives, ordinary reconciliation settles through the Stop terminal record before retirement; independent checkpoint discovery, strict day validation, sweep-local terminal index and guarded retirement |
 
 /// The conversation is rebuilt from the transcript; only in-flight state lives here.
 public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public let runId: String
+    public var lifeID: String?
+    public var stoppedReason: String?
     public let turnId: String
     public let sessionId: String
     public let surface: String
@@ -20,20 +23,25 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     /// The steering peers the person's card answered in this run: a resume
     /// continues under that one card, never a second.
     public var answeredPeers: [String]?
+    /// What she attached to this reply with `reply.attach`, in order: a
+    /// resume chooses them again, each behind the attachment fence once more.
+    public var replyChoices: [String]?
     public let commandSignatureVerified: Bool?
     public let declaredRemote: Bool?
     public let helperDefinition: JSONValue?
     public var keptProse = ""
     public var workingCommentaryCharacters = 0
     public var workingNotes = ""
+    /// Persisted sentinel: 1 while a call awaits its receipt, nil otherwise; never a step index.
     public var runningStep: Int?
     public var deliveryPending = false
-    /// Her turn part's log: every event it was handed and what it returned.
-    /// A relaunch replays it through `step` to rebuild the part's state.
+    /// Input events and started-effect identities/digests. Relaunch reruns `step`
+    /// to reconstruct state and effects; returned effect bodies are not stored.
     public var log: [JSONValue]?
 
     public var hasRedeliveryOwner: Bool {
-        guard helperDefinition == nil, case .string(let surface)? = replyRoute["surface"] else { return false }
+        guard stoppedReason == nil, helperDefinition == nil,
+              case .string(let surface)? = replyRoute["surface"] else { return false }
         return AgentBridgeCompletionRoute.Kind(surface: surface)?.hasRedeliveryOwner == true
     }
 
@@ -54,7 +62,8 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public init(runId: String, turnId: String, sessionId: String, surface: String, userMessage: String,
                 envelope: [String: JSONValue], replyRoute: [String: JSONValue], fileAccess: String,
                 capabilityProfile: String?, peerSources: [String]?, commandSignatureVerified: Bool?,
-                declaredRemote: Bool?, helperDefinition: JSONValue?) {
+                declaredRemote: Bool?, helperDefinition: JSONValue?, lifeID: String? = nil) {
+        self.lifeID = lifeID
         self.runId = runId; self.turnId = turnId; self.sessionId = sessionId; self.surface = surface
         self.userMessage = userMessage; self.acceptedAt = Date()
         self.envelope = envelope; self.replyRoute = replyRoute; self.fileAccess = fileAccess
@@ -82,8 +91,9 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public static func read(dataRoot: URL, sessionId: String, turnId: String) throws -> Self? {
         let path = try path(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId)
         guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-        let record = try JSONDecoder().decode(Self.self, from: Data(contentsOf: path))
+        var record = try JSONDecoder().decode(Self.self, from: Data(contentsOf: path))
         guard record.sessionId == sessionId, record.turnId == turnId else { throw CocoaError(.fileReadCorruptFile) }
+        if try !DataRootLife.isCurrent(record.lifeID, in: dataRoot) { record.stoppedReason = DataRootLife.stoppedReason }
         return record
     }
 
@@ -106,6 +116,7 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
         let path = try Self.path(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId)
         if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
     }
+
 }
 
 /// Checkpointed turns resume; a missing checkpoint keeps recovery owed.
@@ -166,6 +177,13 @@ public struct AbandonedTurnReconciler: Sendable {
         let surface: String?
     }
 
+    private static func isSettled(_ event: TurnTraceEvent) -> Bool {
+        guard TurnTraceEvent.isTerminalKind(event.kind) else { return false }
+        if case .object(let payload) = event.payload,
+           payload["status"] == .string("abandoned") || payload["repairPending"] == .bool(true) { return false }
+        return true
+    }
+
     /// Discover checkpoints and reconcile a bounded legacy trace window.
     @discardableResult
     public func sweep(inFlightTurnIds: Set<String> = []) async -> Outcome {
@@ -179,37 +197,22 @@ public struct AbandonedTurnReconciler: Sendable {
         // Read them before selecting candidates so prior passes do not spend
         // the attempt budget again. Today's accepted turns stay outside that window.
         let terminalOnlyDays = scan.newestOffset > 0 ? [0] : []
-        func readDay(_ path: URL, includeAccepted: Bool) throws {
+        func readDay(_ path: URL, includeAccepted: Bool) async throws {
             guard terminalIndex[path] == nil else { return }
             var terminalTurns = Set<String>()
             var replyReadyTurns = Set<String>()
-            if FileManager.default.fileExists(atPath: path.path) {
-                let text = try String(contentsOf: path, encoding: .utf8)
-                for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-                    guard Self.mentionsLifecycleKind(line),
-                          let data = String(line).data(using: .utf8),
-                          let value = try? JSONValue.parse(data),
-                          case .object(let row) = value,
-                          case .string(let kind)? = row["kind"],
-                          case .string(let turnId)? = row["turnId"] else { continue }
-                    switch kind {
-                    case "turn.accepted":
-                        guard includeAccepted, !turnId.isEmpty, turnId != "unknown", accepted[turnId] == nil,
-                              case .string(let stamp)? = row["ts"],
-                              let ts = Self.iso8601(stamp) else { continue }
-                        accepted[turnId] = Accepted(ts: ts,
-                            sessionId: Self.string(row["sessionId"]), surface: Self.string(row["surface"]))
-                    case "turn.terminal", "turn.cancelled", "turn.failed":
-                        // An older build parked a turn on recollection repair; it resumes now.
-                        if case .object(let payload)? = row["payload"],
-                           payload["status"] == .string("abandoned") || payload["repairPending"] == .bool(true) { continue }
-                        terminalTurns.insert(turnId)
-                        if case .object(let payload)? = row["payload"],
-                           payload["status"] == .string("completed") || payload["status"] == .string("waiting") {
-                            replyReadyTurns.insert(turnId)
-                        }
-                    default:
-                        continue
+            let read = try await TurnTraceReplayReader.read(path)
+            guard read.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
+            for event in read.events {
+                let turnId = event.turnId
+                if event.kind == "turn.accepted" {
+                    guard includeAccepted, !turnId.isEmpty, turnId != "unknown", accepted[turnId] == nil else { continue }
+                    accepted[turnId] = Accepted(ts: event.ts, sessionId: event.sessionId, surface: event.surface)
+                } else if Self.isSettled(event) {
+                    terminalTurns.insert(turnId)
+                    if case .object(let payload) = event.payload,
+                       payload["status"] == .string("completed") || payload["status"] == .string("waiting") {
+                        replyReadyTurns.insert(turnId)
                     }
                 }
             }
@@ -223,7 +226,7 @@ public struct AbandonedTurnReconciler: Sendable {
             else { continue }
             let path = lane.path(for: day)
             do {
-                try readDay(path, includeAccepted: dayOffset >= scan.newestOffset)
+                try await readDay(path, includeAccepted: dayOffset >= scan.newestOffset)
                 terminated.formUnion(terminalIndex[path]!.terminated)
             } catch {
                 persistenceFailures.append("\(path.lastPathComponent) is unreadable: \(error.localizedDescription)")
@@ -290,7 +293,7 @@ public struct AbandonedTurnReconciler: Sendable {
         for (turnId, row) in candidates {
             // A turn this process accepted is never abandoned by this process;
             // one a previous process accepted cannot still be running.
-            guard row.ts < processEpoch else {
+            guard row.ts < processEpoch || checkpoints[turnId]?.stoppedReason != nil else {
                 tooRecent += 1
                 continue
             }
@@ -299,8 +302,35 @@ public struct AbandonedTurnReconciler: Sendable {
                     let days = Set([row.ts, checkpoint.updatedAt, today].flatMap { day in
                         [day] + [-1, 1].compactMap { Self.dayCalendar.date(byAdding: .day, value: $0, to: day) }
                     }.map { lane.path(for: $0) })
-                    for path in days { try readDay(path, includeAccepted: false) }
+                    for path in days { try await readDay(path, includeAccepted: false) }
                     let hasTerminal = days.contains { terminalIndex[$0]!.terminated.contains(turnId) }
+                    if let reason = checkpoint.stoppedReason {
+                        let terminal = TurnTraceEvent(turnId: turnId, ts: checkpoint.updatedAt, kind: "turn.cancelled",
+                            sessionId: checkpoint.sessionId, surface: checkpoint.surface,
+                            payload: .object(["status": .string("stopped"), "terminalReason": .string(reason)]))
+                        let result: Result<Void, any Error> = await settle { [lane, dataRoot] in
+                            do {
+                                if !hasTerminal {
+                                    let target = lane.path(for: terminal.ts)
+                                    _ = try await lane.appendGuarded(terminal, alsoLocking: Array(days)) { current in
+                                        guard current.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
+                                        var events = current.events
+                                        for path in days where path != target && FileManager.default.fileExists(atPath: path.path) {
+                                            let read = TurnTraceReplayReader.parse(try Data(contentsOf: path))
+                                            guard read.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
+                                            events += read.events
+                                        }
+                                        return !events.contains { $0.turnId == turnId && Self.isSettled($0) }
+                                    }
+                                }
+                                try checkpoint.remove(dataRoot: dataRoot)
+                                return .success(())
+                            } catch { return .failure(error) }
+                        }
+                        try result.get()
+                        written.append(turnId)
+                        continue
+                    }
                     if hasTerminal, checkpoint.deliveryPending, !checkpoint.hasRedeliveryOwner {
                         // A finished turn whose route cannot redeliver: the retirement row
                         // lands durably (deduped) before the file goes, so a kill between the
@@ -309,7 +339,7 @@ public struct AbandonedTurnReconciler: Sendable {
                             sessionId: checkpoint.sessionId, surface: checkpoint.surface,
                             payload: .object(["reason": .string("no_redelivery_owner")]))
                         let wrote = try await lane.appendGuarded(retired) { current in
-                            !current.split(separator: "\n").contains { $0.contains("\"turn.checkpoint_retired\"") && $0.contains(turnId) }
+                            !current.events.contains { $0.kind == "turn.checkpoint_retired" && $0.turnId == turnId }
                         }
                         if wrote { await TurnTraceBus.shared.deliverToSubscribers(retired) }
                         try checkpoint.remove(dataRoot: dataRoot)
@@ -387,20 +417,6 @@ public struct AbandonedTurnReconciler: Sendable {
             evidence: [.init(source: "turn_traces", id: turnId)], operation: operation(sessionId: sessionId, turnId: turnId),
             owner: owner(sessionId: sessionId, turnId: turnId), words: detail,
             nextCall: repairCall(sessionId: sessionId, turnId: turnId))
-    }
-
-    private static let lifecycleKinds = ["turn.accepted", "turn.terminal", "turn.cancelled", "turn.failed"]
-
-    /// A byte search before any parse. The generic `firstRange(of:)` over a
-    /// line's UTF-8 view cost ~5 s per launch on three busy trace days.
-    private static func mentionsLifecycleKind(_ line: Substring) -> Bool {
-        line.utf8.withContiguousStorageIfAvailable { bytes in
-            lifecycleKinds.contains { kind in
-                kind.utf8.withContiguousStorageIfAvailable { needle in
-                    memmem(bytes.baseAddress, bytes.count, needle.baseAddress, needle.count) != nil
-                } ?? false
-            }
-        } ?? lifecycleKinds.contains { line.contains($0) }
     }
 
     /// Day-offsets from `today` this sweep reads (0 = today), oldest offset
@@ -486,40 +502,5 @@ public struct AbandonedTurnReconciler: Sendable {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let day = TurnTracePersistLane.dayString(from: date)
         try? Data("{\"lastSweptDay\":\"\(day)\"}".utf8).write(to: cursorPath, options: .atomic)
-    }
-
-    /// Does this JSONL text already carry a terminal row for `turnId`? The
-    /// substring pre-check keeps a 20k-line day file from being parsed for a
-    /// turn it never mentions.
-    static func containsTerminal(forTurn turnId: String, in text: String, status: String? = nil) -> Bool {
-        guard text.contains(turnId) else { return false }
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard line.contains(turnId),
-                  let data = String(line).data(using: .utf8),
-                  let value = try? JSONValue.parse(data),
-                  case .object(let row) = value,
-                  case .string(let rowTurnId)? = row["turnId"],
-                  rowTurnId == turnId,
-                  case .string(let kind)? = row["kind"] else { continue }
-            if kind == "turn.terminal" || kind == "turn.cancelled" || kind == "turn.failed" {
-                if let status {
-                    guard case .object(let payload)? = row["payload"], payload["status"] == .string(status) else { continue }
-                }
-                return true
-            }
-        }
-        return false
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        if case .string(let text)? = value, !text.isEmpty { return text }
-        return nil
-    }
-
-    private static func iso8601(_ raw: String) -> Date? {
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let parsed = withFraction.date(from: raw) { return parsed }
-        return ISO8601DateFormatter().date(from: raw)
     }
 }

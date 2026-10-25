@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+Ingest.swift` | `CognitiveSubstrate`: `ingest`, `ingestResident`, `reconsolidatePendingCompletion` |
 
 extension CognitiveSubstrate {
     /// The full redacted reply length and tail let Sound inspect text beyond
@@ -303,7 +304,7 @@ extension CognitiveSubstrate {
             )
             // A turn cannot be the reaction to ITSELF. Both kinds map to the
             // .conversationFocus node kind, so the two turns share a field key unless
-            // the subjects differ per-turn (which ChatOrchestration mints — audit C2).
+            // the subjects differ per-turn (which ChatTurnRuntime mints — audit C2).
             // If a caller ever reverts to per-session subjects, the user turn's own
             // stamp already landed on this node and re-stamping would blend it twice.
             let reactsToItself = outcome?.key == pending.nodeKey

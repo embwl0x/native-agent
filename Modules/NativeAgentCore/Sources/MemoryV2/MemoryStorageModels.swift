@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryStorageModels.swift` | `MemoryV2Defaults` enum |
 
 public enum MemoryV2Defaults {
     public static let personaID = "NativeAgent"
@@ -67,6 +68,8 @@ public struct StoredMemory: Sendable {
     public var embeddingEpoch: String?
     public var status: String
     public var lifecycle: String
+    /// Descriptive validity bounds, validated on write; recall does not expire
+    /// rows or derive context freshness from these dates.
     public var validFrom: String?
     public var validTo: String?
     public var observedAt: String?
@@ -264,6 +267,7 @@ public enum MemoryStorageError: Error, LocalizedError {
     case embeddingActivationInvalid(EmbeddingActivationRefusal, String)
     case invalidTemporalEvidence(String)
     case capacityExceeded
+    case pinOrderExhausted
 
     /// 2026-09-06: why an activation was refused. The launch reconciler retries
     /// a refusal by re-embedding the entire corpus, which is the right answer
@@ -276,21 +280,65 @@ public enum MemoryStorageError: Error, LocalizedError {
         case unusableCandidate
     }
 
-    public var errorDescription: String? {
+    public var failure: ToolFailureError {
         switch self {
-        case .notFound(let id): return "MemoryStorage: not found — \(id)"
-        case .alreadyResolved(let id): return "MemoryStorage: proposal already resolved — \(id)"
-        case .databaseUnavailable(let msg): return "MemoryStorage: database unavailable — \(msg)"
-        case .tombstoned(let id): return "MemoryStorage: content matches a tombstoned claim — \(id)"
-        case .embeddingEpochMismatch(let expected, let actual):
-            return "MemoryStorage: embedding epoch mismatch — expected \(expected), got \(actual ?? "unknown")"
+        case .notFound(let id):
+            return ToolFailureError("Memory record not found: \(id)", effects: .none,
+                nextCall: ToolFailureError.call("app", ["page": .string("memories")]),
+                code: "memory_record_not_found", instruction: "Read current memories and proposals before selecting an id.", recovery: .inspect)
+        case .alreadyResolved(let id):
+            return ToolFailureError("Memory proposal already resolved: \(id)", effects: .none,
+                code: "memory_proposal_resolved", status: .refused,
+                instruction: "Keep the recorded decision; do not resolve this proposal again.", recovery: .terminal)
+        case .databaseUnavailable(let msg):
+            return MemoryV2Error.storeFailure("Memory store unavailable: \(msg)", code: "memory_store_unavailable")
+        case .tombstoned(let id):
+            return MemoryV2Error.forgottenContent("Content matches a forgotten or rejected memory: \(id)")
+        case .embeddingEpochMismatch:
+            return Self.searchFailure("The memory search model and memory store use different search indexes.", code: "memory_search_index_mismatch",
+                instruction: "Rebuild the memory search index for the selected model; inspect Doctor for model or memory store errors first.")
         case .embeddingActivationInvalid(let refusal, let reason):
-            return "MemoryStorage: embedding epoch activation refused (\(refusal.rawValue)) — \(reason)"
+            return Self.searchFailure("Memory search index activation refused: \(reason)",
+                code: refusal == .corpusDrift ? "memory_search_corpus_changed" : "memory_search_vectors_invalid", instruction: refusal == .corpusDrift
+                    ? "Index the current memory store; inspect Doctor if indexing cannot complete."
+                    : "Repair the reported model or vector defect before rebuilding the index; read Doctor for model evidence.")
         case .invalidTemporalEvidence(let reason):
-            return "MemoryStorage: invalid temporal evidence — \(reason)"
+            return ToolFailureError("Invalid memory date evidence: \(reason)", argumentPath: "valid_from / valid_to / observed_at",
+                accepted: "valid ISO 8601 dates; valid_from must not follow valid_to", effects: .none,
+                nextCall: ToolFailureError.call("app", ["page": .string("memories")]),
+                code: "memory_dates_invalid", status: .refused,
+                instruction: "Correct the named date evidence in the original call.", recovery: .correctArguments)
         case .capacityExceeded:
-            return "MemoryStorage: capacity reached — admission would evict a higher-priority protected memory"
+            return ToolFailureError("The memory store limit cannot be met without removing protected memories.", effects: .none,
+                nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
+                code: "memory_capacity_reached", status: .refused,
+                instruction: "Review saved memories; leave this candidate unsaved unless you deliberately choose a memory to forget.", recovery: .inspect)
+        case .pinOrderExhausted:
+            return ToolFailureError("Memory pin ordering reached its integer limit.", effects: .none, owner: "memory store",
+                tap: "Memories ▸ Upkeep and details ▸ Advanced Diagnostics", code: "memory_pin_order_exhausted",
+                instruction: "Repair pin-order values in their existing order, preserving all memories and pins; freeing memory capacity cannot fix this.")
         }
+    }
+
+    static func searchFailure(_ detail: String, code: String, instruction: String) -> ToolFailureError {
+        ToolFailureError(detail, effects: .none, owner: "memory search model",
+            nextCall: ToolFailureError.call("app", ["action": .string("doctor.run")]), code: code, instruction: instruction)
+    }
+
+    /// Technical index identity stays separate from the plain failure detail.
+    public var epochEvidence: JSONValue? {
+        if case .embeddingEpochMismatch(let expected, let actual) = self {
+            return .object(["expected_epoch": .string(expected), "actual_epoch": actual.map(JSONValue.string) ?? .null])
+        }
+        return nil
+    }
+
+    public var errorDescription: String? {
+        let detail = MemoryV2Error.describe(failure)
+        if case .embeddingEpochMismatch(let expected, let actual) = self {
+            return "\(detail)\nEpoch evidence: expected \(expected), actual \(actual ?? "unknown")"
+        }
+        return detail
     }
 }
 

@@ -7,9 +7,14 @@ import Transcripts
 import DeviceSync
 import Foundation
 import Observation
+import ImageIO
+import UniformTypeIdentifiers
 import NativeAgentShared
 import PersistenceCore
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatSessionWork
+// Blueprint: | `ChatModels.swift` | `ChatMessage`: `NativeAppChatMessage`, `ChatMessageMetadata`, `CodingKeys`; decode-only inline cards travel with loaded message revisions and never re-encode onto transcript wire; transcript-owned attachment preview bytes/unavailable status carried to Mac and DeviceSync, bounded to the existing 720px display decode; transport copies can omit optional previews before rejecting history |
 
 public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     public var id: String = UUID().uuidString
@@ -22,6 +27,16 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     public var runId: String? = nil
     public var source: String? = nil
     public var metadata: ChatMessageMetadata? = nil
+    /// Presentation only; travels with the transcript revision, never on its wire.
+    public var inlineCards: [ChatTranscriptProjection.Card] = []
+    private enum CodingKeys: String, CodingKey {
+        case id, sessionId, role, content, createdAt, runId, source, metadata
+    }
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id); hasher.combine(sessionId); hasher.combine(role)
+        hasher.combine(content); hasher.combine(createdAt); hasher.combine(runId)
+        hasher.combine(source); hasher.combine(metadata)
+    }
 
     public init(
         id: String = UUID().uuidString,
@@ -403,8 +418,10 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
     }
 }
 
-/// Per-message persisted attachment summary (no bytes — bytes live elsewhere).
-/// Mirrors the dict that `ChatOrchestrationClient.appendMessage` writes into
+/// Per-message attachment metadata with the transcript owner's display preview.
+/// Source bytes remain at `path`; the bounded preview is a read projection,
+/// carried to DeviceSync with the same message that the Mac renders.
+/// Metadata comes from `ChatOrchestrationClient.appendMessage`'s
 /// `metadata.attachments` in `chat/messages/<sid>.jsonl`. Encoded on the Mac
 /// `ChatMessage.metadata`, snapshotted into iCloud `chat_transcripts.json`,
 /// and decoded by iOS into `ChatMessageRecord.metadata.attachments`.
@@ -416,6 +433,7 @@ public struct PersistedAttachment: Encodable, Hashable, Sendable {
     public var byteSize: Int64
     public var path: String?
     public var utterance: SpeechUtterance?
+    public var preview: TranscriptAttachmentPreview?
 
     public init(id: String, type: String, mime: String, name: String?, byteSize: Int64, path: String? = nil) {
         self.id = id; self.type = type; self.mime = mime; self.name = name; self.byteSize = byteSize; self.path = path
@@ -440,6 +458,9 @@ public struct PersistedAttachment: Encodable, Hashable, Sendable {
         self.mime = mime ?? "application/octet-stream"
         self.name = name
         self.path = path
+        if let value = o["preview"], let bytes = try? value.serializedData(pretty: false) {
+            self.preview = try? JSONDecoder().decode(TranscriptAttachmentPreview.self, from: bytes)
+        }
         if let evidence = o["utterance"] {
             guard let bytes = try? evidence.serializedData(pretty: false),
                   let utterance = try? JSONDecoder().decode(SpeechUtterance.self, from: bytes) else { return nil }
@@ -463,7 +484,52 @@ public struct PersistedAttachment: Encodable, Hashable, Sendable {
         }
         return out
     }
-    enum CodingKeys: String, CodingKey { case id, type, mime, name, byteSize, path, utterance }
+    enum CodingKeys: String, CodingKey { case id, type, mime, name, byteSize, path, utterance, preview }
+}
+
+public struct TranscriptAttachmentPreview: Codable, Hashable, Sendable {
+    public let png: Data?
+    fileprivate init(path: String?) {
+        // Keep the measured 720px decode: a 360pt transcript bubble at 2×.
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: 720,
+        ]
+        let bytes = NSMutableData()
+        if let path, let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+           let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary),
+           let destination = CGImageDestinationCreateWithData(bytes, UTType.png.identifier as CFString, 1, nil) {
+            CGImageDestinationAddImage(destination, image, nil)
+            png = CGImageDestinationFinalize(destination) ? bytes as Data : nil
+        } else {
+            png = nil
+        }
+    }
+}
+
+extension ChatTranscriptProjection {
+    /// Attachment files are refreshed outside the transcript-file cache: their
+    /// contents may change without changing the message's path or JSONL row.
+    func attachmentPreviews() async -> Self {
+        await Task.detached(priority: .userInitiated) {
+            let rows = self.messages.map { original in
+                var message = original
+                message.metadata?.attachments = original.metadata?.attachments?.map { original in
+                    var attachment = original
+                    if attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image" {
+                        attachment.preview = TranscriptAttachmentPreview(path: attachment.path)
+                    }
+                    return attachment
+                }
+                return message
+            }
+            var projection = self
+            projection.messages = rows
+            return projection
+        }.value
+    }
 }
 
 // ChatSession, RuntimeHealth, RunRecord, MemoryRecord moved to NativeAgentShared.
@@ -528,6 +594,15 @@ private func chatRowInt(_ value: JSONValue?) -> Int? {
 
 extension ChatMessage: DeviceSyncTranscriptMessage {
     public var isPersonVisible: Bool { !isHerOwnTurnInput }
+
+    public mutating func omitAttachmentPreviews() {
+        let attachments = metadata?.attachments?.map { original in
+            var attachment = original
+            attachment.preview = nil
+            return attachment
+        }
+        metadata?.attachments = attachments
+    }
 }
 
 extension ChatMessage: MacChatRetryMessage {

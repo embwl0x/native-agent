@@ -1,4 +1,5 @@
 import Cognition
+import NativeAgentCore
 import AppKit
 import PersistenceCore
 import QuickLookUI
@@ -7,6 +8,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
 
+// Blueprint: | `WorkPaneMakeView.swift` | `WorkPaneMakeView`: Make studio refs/version preview and actions over canonical studio state |
+
 /// The Work pane's Make tab: what I made, one version at a time, with the
 /// earlier ones one click back (`MakeStudio`). A mockup renders in an offline
 /// web view; an image from image.generate carries Try again, Variations and
@@ -14,11 +17,9 @@ import WebKit
 struct WorkPaneMakeView: View {
     let ref: String?
     @Environment(AppModel.self) private var appModel
-    @State private var shelf = MakeStudio.Shelf.shared
-    @State private var preparedTitle = ""
-    @State private var preparedImage: NSImage?
-    @State private var preparedFile: URL?
-    @State private var preparedRevision = -1
+    private var shelf: MakeStudio.Shelf { appModel.engine.make }
+    @State private var prepared: MakeStudio.Preview?
+    @State private var previewRead = LatestRead()
     @State private var revision = 0
     /// Index into the ref's versions; nil is the newest.
     @State private var shown: Int?
@@ -26,18 +27,16 @@ struct WorkPaneMakeView: View {
     @State private var saving = false
     @State private var note: String?
 
-    private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
-
     var body: some View {
         Group {
             if let meta = shelf.meta(ref), !meta.versions.isEmpty {
                 let index = min(shown ?? meta.versions.count - 1, meta.versions.count - 1)
                 let version = meta.versions[index]
-                let file = MakeStudio(dataRoot: root).url(meta.ref, version)
+                let file = shelf.file(meta.ref, version)
                 VStack(spacing: 0) {
                     header(meta, index: index, file: file)
                     Divider()
-                    preview(file, folder: MakeStudio(dataRoot: root).folder(meta.ref))
+                    preview(file, folder: shelf.folder(meta.ref))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     if let prompt = version.prompt, MakeStudio.imageTypes.contains(file.pathExtension.lowercased()) {
                         Divider()
@@ -50,17 +49,8 @@ struct WorkPaneMakeView: View {
                 .onChange(of: version) { _, _ in revision &+= 1 }
                 .task(id: "\(file.path) \(revision)") {
                     let revision = revision
-                    preparedTitle = ""
-                    preparedImage = nil
-                    preparedFile = nil
-                    let prepared = await Task.detached(priority: .userInitiated) {
-                        (MakeStudio.title(version, file: file), MakeStudio.imageTypes.contains(file.pathExtension.lowercased()) ? NSImage(contentsOf: file) : nil)
-                    }.value
-                    guard !Task.isCancelled else { return }
-                    preparedTitle = prepared.0
-                    preparedImage = prepared.1
-                    preparedFile = file
-                    preparedRevision = revision
+                    prepared = nil
+                    _ = await previewRead.read({ await shelf.preview(meta.ref, version, revision: revision) }, publish: { prepared = $0 })
                 }
             } else {
                 Text(shelf.fault == nil ? "Nothing made yet." : "Nothing on the shelf could be read.")
@@ -84,7 +74,7 @@ struct WorkPaneMakeView: View {
         .task(id: ref) {
             shown = nil
             note = nil
-            shelf.open(dataRoot: root)
+            shelf.start()
         }
         // A new version lands in front.
         .onChange(of: shelf.meta(ref).map { "\($0.ref) \($0.versions.count)" }) { shown = nil }
@@ -92,12 +82,19 @@ struct WorkPaneMakeView: View {
 
     private func header(_ meta: MakeStudio.Meta, index: Int, file: URL) -> some View {
         HStack(spacing: 8) {
-            Text(preparedFile == file && preparedRevision == revision ? preparedTitle : "")
+            Text(title(file))
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .help(meta.ref)
+            if let fault = titleFault(file) {
+                Text(fault)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .lineLimit(2)
+                    .help(fault)
+            }
             Spacer()
             Button { shown = index - 1 } label: { Image(systemName: "chevron.left") }
                 .disabled(index == 0)
@@ -114,19 +111,32 @@ struct WorkPaneMakeView: View {
         .padding(.vertical, 8)
     }
 
+    private func title(_ file: URL) -> String {
+        guard let prepared, prepared.file == file, prepared.revision == revision,
+              let snapshot = prepared.titleFaces?.snapshots["make-title"] else { return "" }
+        return snapshot.face?.sections.flatMap(\.rows).first?.title ?? ""
+    }
+
+    private func titleFault(_ file: URL) -> String? {
+        guard let prepared, prepared.file == file, prepared.revision == revision,
+              let snapshot = prepared.titleFaces?.snapshots["make-title"],
+              let error = snapshot.error else { return nil }
+        return "Title \(snapshot.status.rawValue): \(error.message)"
+    }
+
     @ViewBuilder
     private func preview(_ file: URL, folder: URL) -> some View {
         let type = file.pathExtension.lowercased()
         if MakeStudio.webTypes.contains(type) {
             MakeMockupView(file: file, folder: folder, revision: revision)
         } else if MakeStudio.imageTypes.contains(type) {
-            if preparedFile == file, preparedRevision == revision, let image = preparedImage {
+            if prepared?.file == file, prepared?.revision == revision, let image = prepared?.image {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
                     .padding(12)
                     .id(revision)
-            } else if preparedFile == file, preparedRevision == revision {
+            } else if prepared?.file == file, prepared?.revision == revision {
                 MakeQuickLookView(file: file, revision: revision)
             }
         } else {
@@ -173,7 +183,7 @@ struct WorkPaneMakeView: View {
     private func tryAgain(_ ref: String, prompt: String) {
         making = true
         note = nil
-        let root = root
+        let root = appModel.engine.dataRoot
         Task {
             let answer: String?
             do {

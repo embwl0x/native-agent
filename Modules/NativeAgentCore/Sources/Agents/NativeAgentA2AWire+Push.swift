@@ -3,6 +3,8 @@ import Darwin
 import PersistenceCore
 import AgentConversations
 
+// Blueprint: | `NativeAgentA2AWire+Push.swift` | `AgentContactCallback` and `AgentContactPushConfig`: durable callback obligations, Keychain destination references and bounded push delivery |
+
 /// A registered callback as the durable task keeps it: only a reference to
 /// its Keychain account (the URL, which may carry a bearer secret, and its
 /// credentials live there), and what it still owes.

@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `MacActReceiptRendering.swift` | `MacActReceiptRendering` enum; `actedReadout`, `actedElementJSON` |
 
 /// Pure rendering of the observed act effect; execution and verification stay
 /// with SwiftNativeMacControl and MacActClosedLoop.

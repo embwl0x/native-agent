@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `BotDefinitionStore.swift` | Definition persistence and editor model/budget/schedule/event admission; launch leaves saved definitions and model choices untouched, with no migration marker |
 
 /// Empty until explicitly populated. Definition and audit rows commit in the same atomic JSON file.
 public struct BotDefinitionStore: Sendable {
@@ -60,11 +61,12 @@ public struct BotDefinitionStore: Sendable {
             guard edited.createdAt == old.createdAt, edited.updatedAt == old.updatedAt,
                   edited.briefVersion == old.briefVersion else { throw StandingBotsError.staleDefinition(edited.id) }
             var next = edited
-            if next.brief != old.brief || next.outputFormat != old.outputFormat {
+            if next.brief != old.brief || next.outputFormat != old.outputFormat || next.personality != old.personality {
                 guard old.briefVersion < Int.max else { throw StandingBotsError.invalidValue("brief version overflow") }
                 next.briefVersion += 1
             }
             next.updatedAt = try updatedTime(at, after: old.updatedAt)
+            if !next.paused || next.cadence != old.cadence || next.eventTrigger != old.eventTrigger { next.offReason = nil }
             try disk.validate(next, validateCron: true)
             document.definition = next
             document.audit.append(BotAuditRow(id: UUID(), at: at, operation: .update, definition: next))
@@ -81,6 +83,7 @@ public struct BotDefinitionStore: Sendable {
             var document = try disk.definition(id)
             document.definition.updatedAt = try updatedTime(at, after: document.definition.updatedAt)
             document.definition.paused = paused
+            if !paused { document.definition.offReason = nil }
             document.audit.append(BotAuditRow(id: UUID(), at: at, operation: paused ? .pause : .resume,
                                              definition: document.definition))
             try disk.write(document, at: disk.definitionPath(id))
@@ -98,54 +101,6 @@ public struct BotDefinitionStore: Sendable {
         NotificationCenter.default.post(name: BotRunQueue.didChange, object: nil)
     }
 
-    /// Run once at launch to remove deleted definitions and pin the comparison helpers.
-    public func migrateLegacyDefinitions() throws {
-        try disk.locked {
-            // TIME (User 10-15): the earlier writers filled this Mac's zone into
-            // every cron given none. Nobody chose it, so it goes, once; read-time
-            // folding would pin it again the day the Mac leaves that zone. Not an
-            // edit: the revision stays, so a pending occurrence keeps its place.
-            let zonesPath = disk.root.appendingPathComponent("cron-zones-migrated.json")
-            if try disk.read(Bool.self, at: zonesPath) != true {
-                for bot in try listUnlocked() {
-                    guard case .cron(let expression, let zone?) = bot.cadence, zone == TimeZone.current.identifier else { continue }
-                    try migrate(bot.id) { $0.cadence = .cron(expression: expression, timeZone: nil) }
-                }
-                try disk.write(true, at: zonesPath)
-            }
-            let completionPath = disk.root.appendingPathComponent("definitions-migrated.json")
-            if let completed = try disk.read(Bool.self, at: completionPath) {
-                guard completed else { throw StandingBotsError.corruptStore("definition migration completion") }
-                return
-            }
-            for bot in try listUnlocked(includeDeleted: true) {
-                if bot.deleted == true {
-                    try FileManager.default.removeItem(at: disk.definitionPath(bot.id))
-                    continue
-                }
-                guard bot.modelPinned == nil else { continue }
-                switch bot.id.uuidString {
-                case "50F92AC7-98A3-408C-B093-930FBE7F6F7F",
-                     "6B575783-9EE3-4993-8D8E-E4B09AA330A9",
-                     "E2D10635-C61A-46CF-AACA-B90A86CD2979":
-                    break
-                default:
-                    continue
-                }
-                try migrate(bot.id) { $0.modelPinned = true; $0.updatedAt = try updatedTime(Date(), after: $0.updatedAt) }
-            }
-            try disk.write(true, at: completionPath)
-        }
-    }
-
-    /// One launch-time rewrite, audited as an update. Caller holds the lock.
-    private func migrate(_ id: UUID, _ edit: (inout BotDefinition) throws -> Void) throws {
-        var document = try disk.definition(id)
-        try edit(&document.definition)
-        document.audit.append(BotAuditRow(id: UUID(), at: Date(), operation: .update, definition: document.definition))
-        try disk.write(document, at: disk.definitionPath(id))
-    }
-
     private func updatedTime(_ at: Date, after old: Date) throws -> Date {
         guard at.timeIntervalSinceReferenceDate.isFinite else { throw StandingBotsError.invalidValue("updatedAt") }
         // A monotonic persisted revision stamp also detects writes in the same clock tick.
@@ -155,10 +110,10 @@ public struct BotDefinitionStore: Sendable {
 }
 
 extension BotDefinitionStore {
-    public static func editorDefinition(_ definition: BotDefinition?, name: String, brief: String,
+    public static func editorDefinition(_ definition: BotDefinition?, name: String, personality: String = "", brief: String,
         provider: String, model: String, think: String, modelPinned: Bool, providerReady: Bool,
         supportedEfforts: [String]?, supportsFast: Bool, fast: Bool?, tokens: String, seconds: String, daily: String,
-        when: String, hours: String, cron: String, zone: String, weekday: Int, clockText: String,
+        when: String, hours: String, cron: String, weekday: Int, clockText: String,
         timingUnchanged: Bool, eventSource: BotEventSource, eventFilter: String, eventKeyword: String,
         tell: Bool, condition: String) throws -> BotDefinition {
         if modelPinned {
@@ -168,8 +123,10 @@ extension BotDefinitionStore {
         }
         let tokenLimit = tokens.isEmpty ? BotRunLimits.maximumTokens : Int(tokens) ?? 0
         let timeLimit = seconds.isEmpty ? BotRunLimits.maximumSeconds : Double(seconds) ?? 0
-        let dailyLimit = daily.isEmpty ? BotRunLimits.dailyTokens : Int(daily) ?? 0
-        guard tokenLimit > 0, timeLimit.isFinite, timeLimit > 0, dailyLimit > 0 else {
+        // Blank means no daily ceiling: only a limit someone sets is enforced
+        // (10-24: an unset ceiling silently became 256K and stopped a helper).
+        let dailyLimit: Int? = daily.isEmpty ? nil : Int(daily) ?? 0
+        guard tokenLimit > 0, timeLimit.isFinite, timeLimit > 0, dailyLimit.map({ $0 > 0 }) ?? true else {
             throw EditorError.message("Limits must be positive numbers, or blank for the defaults.")
         }
         let timing: BotCadence
@@ -180,12 +137,11 @@ extension BotDefinitionStore {
             case "Manual only": timing = .manual
             case "Daily", "Weekdays", "Weekly":
                 timing = try StandingBotSchedule.parse(when == "Weekly"
-                    ? "weekly on \(StandingBotSchedule.weekdays[weekday]) at \(clockText)" : "\(when) at \(clockText)",
-                    timezone: zone)
+                    ? "weekly on \(StandingBotSchedule.weekdays[weekday]) at \(clockText)" : "\(when) at \(clockText)")
             case "Every N hours":
                 guard let value = Double(hours), value.isFinite, value > 0 else { throw EditorError.message("Enter the number of hours.") }
                 timing = .interval(seconds: value * 3600)
-            case "Custom": timing = .cron(expression: cron, timeZone: BotCadence.setZone(zone))
+            case "Custom": timing = .cron(expression: cron)
             // An event-woken bot keeps no schedule: the event is the occurrence.
             case "On an event": timing = .manual
             default: timing = .manual
@@ -194,20 +150,19 @@ extension BotDefinitionStore {
         var trigger: BotEventTrigger?
         if when == "On an event" {
             let target = eventFilter.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !target.isEmpty else {
-                throw EditorError.message(eventSource == .github
-                    ? "Enter the repository as owner/repo." : "Enter the Slack channel ID.")
-            }
-            if eventSource == .slack, !BotEventTrigger.isChannelID(target) {
+            guard !target.isEmpty else { throw EditorError.message("Enter the Slack channel ID.") }
+            if !BotEventTrigger.isChannelID(target) {
                 throw EditorError.message("Enter the Slack channel ID, such as C0123ABCD. In Slack, open the channel, choose View channel details, and copy the ID at the bottom.")
             }
             trigger = BotEventTrigger(source: eventSource,
-                filter: eventSource == .slack ? target.uppercased() : target,
+                filter: target.uppercased(),
                 keyword: eventKeyword)
         }
         var bot = definition ?? BotDefinition(name: name, brief: brief, cadence: timing,
             budget: BotBudget(tokens: tokenLimit, seconds: timeLimit))
         bot.name = name; bot.brief = brief; bot.outputFormat = nil
+        let character = personality.trimmingCharacters(in: .whitespacesAndNewlines)
+        bot.personality = character.isEmpty ? nil : character
         bot.provider = provider; bot.model = model; bot.reasoningEffort = think
         bot.modelPinned = modelPinned
         bot.fast = supportsFast ? (fast ?? false) : false

@@ -1,6 +1,8 @@
 import Foundation
 import CryptoKit
 
+// Blueprint: | `OrganismPersistence.swift` | `OrganismPersistentState`: persisted body field, chemistry, predictions and caring encounter; restore decay and identity validation |
+
 public struct OrganismPersistentState: Codable, Sendable, Equatable {
     static let maximumDecayHours: Double = 72
     private static let maximumPersistedNodes = 96

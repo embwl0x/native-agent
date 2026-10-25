@@ -2,6 +2,7 @@ import TrustPersistence
 import TurnTrace
 import Foundation
 import PersistenceCore
+// Blueprint: | `CapabilityTraceFeed.swift` | `CapabilityTraceFeed` enum; asynchronous timeline over canonical turn evidence and standalone ledger rows |
 
 /// Read model for canonical turn evidence and standalone traces in Capabilities.
 /// Missing, empty, partially malformed, and unreadable evidence deliberately

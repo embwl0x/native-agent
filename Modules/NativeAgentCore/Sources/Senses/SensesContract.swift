@@ -1,9 +1,11 @@
+import AuthoredCapabilities
 import Foundation
 import AppKit
 import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SensesContract.swift` | sense records/contracts and SenseWire page/news/view validators and notebook byte bounds shared at both process boundaries, SensesHub registry projection and exact view-event admission, native catalog, memory provenance and durable unread news |
 
 // The Native World (User, 2026-10-05; design: docs/SENSES.md). NativeAgent makes
 // the whole world native to its agent: every app, file kind, site and stream
@@ -12,6 +14,51 @@ import PersistenceCore
 // part builds against; behaviour lives in the owners named in docs/SENSES.md.
 
 // MARK: - Corners
+
+/// Shape and byte bounds checked independently on both sides of the sense plug.
+public enum SenseWire {
+    public static let newsBytes = 4_000, htmlBytes = 256 * 1_024, stateKeyBytes = 256, stateValueBytes = AbilityStore.notebookValueBytes
+
+    public static func decodePage(_ input: [String: JSONValue], corner: SenseCorner) throws -> NativePage {
+        var fields = input
+        fields["corner"] = try JSONValue.fromEncodable(corner)
+        for key in ["things", "folded"] where fields[key] == nil || fields[key] == .null { fields[key] = .array([]) }
+        if case .array(let things)? = fields["things"] {
+            fields["things"] = .array(things.map { thing in
+                guard case .object(var row) = thing else { return thing }
+                if row["verbs"] == nil || row["verbs"] == .null { row["verbs"] = .array([]) }
+                return .object(row)
+            })
+        }
+        return try JSONDecoder().decode(NativePage.self, from: JSONValue.object(fields).serializedData(pretty: false))
+    }
+
+    public static func validatePage(_ page: NativePage,
+                                    textError: String = "Sense page exceeds the text ceiling; fold it and offer more.") throws {
+        guard !page.address.isEmpty else { throw SenseFailure(code: "bad_output", message: "Sense page requires an address and at most 40,000 text bytes.") }
+        guard page.text.utf8.count <= NativePage.maximumTextBytes else { throw SenseFailure(code: "bad_output", message: textError) }
+    }
+
+    public static func news(_ value: JSONValue?, senseID: String, version: Int,
+                            error: String = "Sense news requires an address and summary.") throws -> SenseNews {
+        guard case .object(let fields)? = value, case .string(let address)? = fields["address"],
+              case .string(let summary)? = fields["summary"], summary.utf8.count <= newsBytes else {
+            throw SenseFailure(code: "bad_output", message: error)
+        }
+        return SenseNews(senseID: senseID, version: version, address: address, summary: summary, at: Date())
+    }
+
+    public static func view(_ value: JSONValue?, senseID: String, version: Int) throws -> SenseInteractiveView? {
+        if value == .null { return nil }
+        guard case .object(let fields)? = value, case .string(let title)? = fields["title"],
+              case .string(let html)? = fields["html"], html.utf8.count <= htmlBytes else {
+            throw SenseFailure(code: "bad_output", message: "Sense view requires title and at most 256 KiB of HTML.")
+        }
+        return SenseInteractiveView(senseID: senseID, version: version, title: title, html: html)
+    }
+
+    public static func validStateKey(_ key: String) -> Bool { !key.isEmpty && key.utf8.count <= stateKeyBytes }
+}
 
 /// One corner of the world a sense serves.
 public enum SenseCorner: Hashable, Codable, Sendable {
@@ -378,7 +425,7 @@ public protocol SenseRegistry: Sendable {
     func sense(for corner: SenseCorner) async throws -> SenseRecord?
     func all() async throws -> [SenseRecord]
     func upsert(_ record: SenseRecord) async throws
-    func recordUse(senseID: String) async
+    func recordUse(senseID: String, version: Int) async throws
 }
 
 /// Optional management surface for lifecycle, versioned code and portable sharing.
@@ -387,11 +434,12 @@ public protocol SenseRegistryManaging: SenseRegistry {
     func allChecked() async throws -> [SenseRecord]
     func upsert(_ record: SenseRecord, codeFiles: [String: Data]) async throws -> SenseRecord
     func versions(id: String) async throws -> [SenseRecord]
-    func recordUse(senseID: String, version: Int) async throws
     func rollback(id: String, version: Int, preview: Bool) async throws -> SenseRecord
     func drop(id: String, version: Int, preview: Bool, ownerAuthorized: Bool) async throws -> SenseRecord
     func setStatus(id: String, version: Int, status: SenseStatus, preview: Bool, ownerAuthorized: Bool) async throws -> SenseRecord
-    func markUnavailable(id: String, version: Int, reason: String) async throws
+    /// Only the same selected helper lifetime may change availability.
+    /// True only when the selected lifetime accepted the availability report.
+    func markUnavailable(id: String, selection: String, reason: String) async throws -> Bool
     func exportBundle(id: String, to destination: URL, userApproved: Bool) async throws -> SenseExportResult
 }
 
@@ -536,15 +584,19 @@ public final class SensesHub: @unchecked Sendable {
             }), !Task.isCancelled else {
                 return "This sense is off or its view has changed."
             }
-            try await receiver.receiveViewEvent(event, for: record, source: source)
+            try await Self.$passiveObservation.withValue(false) {
+                try await receiver.receiveViewEvent(event, for: record, source: source)
+            }
             return nil
         } catch {
             return "This sense could not handle the event: \(error.localizedDescription)"
         }
     }
 
-    /// Watch entries, their source callbacks and restarts are observations,
-    /// independently of which turn originally started the live sense.
+    /// Watch entries, source callbacks, restarts and unattended part wakes are
+    /// observations, independently of the turn that started the live sense.
+    /// On-call admission retains this origin so retirement stops unattended
+    /// work while an accepted human interaction settles with its caller.
     @TaskLocal public static var passiveObservation = false
 
 }

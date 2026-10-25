@@ -6,6 +6,8 @@ import Security
 import NativeAgentShared
 import PersistenceCore
 
+// Blueprint: | `PairingSecretManager.swift` | `PairingSecretManager`: checked device-only HMAC secret ownership, explicit rotation and pairing material publication |
+
 private enum PairingKVSPublishResult: Sendable {
     case skippedCurrent
     case published(version: Int, synced: Bool)
@@ -178,23 +180,6 @@ public enum PairingSecretManager {
         }
     }
 
-    /// Publishes the exact canonical Mac pairing secret through the selected
-    /// device transport. This is the public-release CloudKit equivalent of the
-    /// legacy KVS bootstrap; it does not create a second secret or pairing
-    /// owner. Entitlement and account failures remain transport errors and do
-    /// not fall back to unsigned material.
-    @discardableResult
-    static func publishMaterial(to transport: DeviceSyncTransport) async -> Bool {
-        let secret: Data
-        do {
-            secret = try loadOrGenerateSecret()
-        } catch {
-            nativeLog("[PairingBootstrap] Pairing unavailable; refusing device publish: \(error.localizedDescription)")
-            return false
-        }
-        return await publishMaterial(secret, to: transport)
-    }
-
     @discardableResult
     static func publishMaterial(_ secret: Data, to transport: DeviceSyncTransport) async -> Bool {
         guard secret.count == 32 else { return false }
@@ -208,16 +193,4 @@ public enum PairingSecretManager {
         }
     }
 
-    /// Delete only a currently valid canonical Keychain secret after explicit
-    /// user confirmation. Invalid legacy state remains preserved.
-    static func deleteSecret() throws {
-        try deleteSecret(at: secretURL)
-    }
-
-    static func deleteSecret(at url: URL) throws {
-        try CredentialFileLock.withLock(url) {
-            _ = try existingSecret(at: url)
-            try DeviceSecretKeychain.delete(service: secretService, account: secretAccount(for: url))
-        }
-    }
 }

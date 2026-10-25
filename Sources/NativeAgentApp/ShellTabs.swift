@@ -1,6 +1,8 @@
 import AppKit
 import SwiftUI
 
+// Blueprint: | `ShellTabs.swift` | Shell page/tab components: content-local action rows, shared scroll gutter and tabbed page layout |
+
 extension View {
     /// Page actions stay inside the content pane, so changing sidebar pages
     /// never adds or removes a window toolbar. On a tabbed page they sit at
@@ -46,29 +48,14 @@ final class ShellScrollGutter {
     }
 }
 
+/// One page column: the trailing gutter is the legacy scroller's width, always.
+/// It never follows whether the content overflows: that measurement fed the
+/// margin, the margin rewrapped the text, the rewrap flipped the measurement,
+/// and a page whose height sat at the boundary looped inside one frame until
+/// AppKit aborted (10-23: Providers crashed on open).
 private struct PageScrollColumn: ViewModifier {
-    @State private var overflows = false
-    @State private var height: CGFloat = 0
-
-    private struct Reading: Equatable {
-        var containerHeight: CGFloat
-        var overflows: Bool
-    }
-
     func body(content: Content) -> some View {
-        content
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
-            // Every scroll view inside reports here; only the page's own
-            // (most of the page tall) decides. A chip row or a small inset
-            // list must not.
-            .onScrollGeometryChange(for: Reading.self) { geometry in
-                Reading(containerHeight: geometry.containerSize.height,
-                        overflows: geometry.contentSize.height > geometry.containerSize.height + 0.5)
-            } action: { _, reading in
-                guard reading.containerHeight >= height * 0.6 else { return }
-                overflows = reading.overflows
-            }
-            .contentMargins(.trailing, overflows ? 0 : ShellScrollGutter.shared.width, for: .scrollContent)
+        content.contentMargins(.trailing, ShellScrollGutter.shared.width, for: .scrollContent)
     }
 }
 
@@ -146,8 +133,10 @@ struct ShellTabs<Key: Hashable>: View {
 /// the selected tab's content. Content is keyed by the selection so a tab
 /// switch is a clean swap, never a half-updated page.
 struct ShellTabbedPage<Key: Hashable, Content: View>: View {
+    @Environment(AppModel.self) private var appModel
     let title: String
-    var subtitle: String?
+    var subtitle: String? = nil
+    var subtitlePage: SidebarItem? = nil
     let tabs: [ShellTab<Key>]
     @Binding var selection: Key
     /// The serif header; the tab content hands its line up (`alivePageLine`).
@@ -163,7 +152,7 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
         let shown = quietOffscreenRead
             ? (tabs.first { ($0.key as? String) == quietRailTab } ?? tabs.first)?.key ?? selection
             : selection
-        ShellPageFrame(title: title, subtitle: subtitle, showsBack: false, alive: alive) {
+        ShellPageFrame(title: title, subtitle: subtitlePage.flatMap { appModel.engine.transcripts.presentation.words("page:"+$0.normalized.rawValue) } ?? subtitle, showsBack: false, alive: alive) {
             VStack(alignment: .leading, spacing: 0) {
                 ShellTabs(tabs: tabs, selection: quietOffscreenRead ? .constant(shown) : $selection)
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { tabRowHeight = $0 }
@@ -183,6 +172,12 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
                         .frame(height: tabRowHeight)
                         .padding(.trailing, ShellScrollGutter.shared.width)
                 }
+            }
+        }
+        .quietReadTask(id: subtitlePage?.normalized.rawValue) {
+            if let page=subtitlePage?.normalized {
+                await appModel.engine.transcripts.presentation.prepare("page:"+page.rawValue,
+                    input:.object(["kind":.string("page"),"page":.string(page.rawValue)]))
             }
         }
     }
@@ -223,14 +218,35 @@ extension View {
 
 /// A rail page without tabs: the frame and its title, nothing else added.
 struct ShellRailPage<Content: View>: View {
+    @Environment(AppModel.self) private var appModel
     let title: String
-    var subtitle: String?
+    var subtitle: String? = nil
+    var subtitlePage: SidebarItem? = nil
     var wide: Bool = false
     /// The serif header; the content hands its line up (`alivePageLine`).
     var alive: Bool = false
     @ViewBuilder let content: Content
 
     var body: some View {
-        ShellPageFrame(title: title, subtitle: subtitle, showsBack: false, wide: wide, alive: alive) { content }
+        ShellPageFrame(title: title, subtitle: subtitlePage.flatMap { appModel.engine.transcripts.presentation.words("page:"+$0.normalized.rawValue) } ?? subtitle,
+            showsBack: false, wide: wide, alive: alive) { content }
+            .quietReadTask(id: subtitlePage?.normalized.rawValue) {
+                if let page=subtitlePage?.normalized {
+                    await appModel.engine.transcripts.presentation.prepare("page:"+page.rawValue,input:.object(["kind":.string("page"),"page":.string(page.rawValue)]))
+                }
+            }
+    }
+}
+
+struct ShellRailSubtitle: View {
+    @Environment(AppModel.self) private var appModel
+    let page: SidebarItem
+    var body: some View {
+        Group {
+            if let text=appModel.engine.transcripts.presentation.words("page:"+page.normalized.rawValue) { Text(text) }
+        }.quietReadTask(id:page.normalized.rawValue) {
+            await appModel.engine.transcripts.presentation.prepare("page:"+page.normalized.rawValue,
+                input:.object(["kind":.string("page"),"page":.string(page.normalized.rawValue)]))
+        }
     }
 }

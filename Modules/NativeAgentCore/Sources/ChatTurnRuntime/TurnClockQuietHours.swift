@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `TurnClockQuietHours.swift` | `TurnQuietHoursWindow`: local wall-clock quiet-hours membership, wraparound and exact end deadline shared by native reply admission |
+
 /// The user's declared quiet-hours window, in LOCAL wall-clock hours.
 /// `start > end` wraps midnight (19 → 3 means 7 PM through 3 AM).
 ///

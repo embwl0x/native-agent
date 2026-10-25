@@ -2,6 +2,6 @@
 command = "./script/build_and_run.sh"
 description = "Build and launch the Swift-native NativeAgent app"
 
-[actions.Verify]
+[actions.BuildLaunchCheck]
 command = "./script/build_and_run.sh --verify"
-description = "Build, launch, and verify the Swift-native NativeAgent app"
+description = "Build/sign, launch, check PID after 2 seconds, then quit; refused in Codex shells"

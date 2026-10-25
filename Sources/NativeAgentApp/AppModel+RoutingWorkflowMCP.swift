@@ -10,20 +10,14 @@ import PersistenceCore
 import NativeAgentCore
 import MemoryV2
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
 import ToolExecution
 import PersonaEngine
-import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
 import Research
 import MultimodalTTS
 import TriggerScheduler
@@ -35,11 +29,11 @@ import TelegramBot
 import Dispatcher
 import MacControl
 import Onboarding
-import MacAssistantStatus
+import MacIntegration
 import WorkflowOrchestration
-import Skills
 import Connectors
 import Browser
+// Blueprint: | `AppModel+RoutingWorkflowMCP.swift` | `ResearchSearchFailure`; `AppModel`: research `search`, `resolveApproval`, `resolveApprovalOnce`, `isResolvingApproval` |
 
 enum ResearchSearchFailure: Error, Equatable {
     case blankQuery
@@ -64,12 +58,8 @@ enum ResearchSearchFailure: Error, Equatable {
 extension AppModel {
     @MainActor
     func search(_ query: String) async -> Result<[ResearchSearchResult], ResearchSearchFailure> {
-        let configuredBaseURL = searxngBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let research = SwiftNativeResearchClient(dataRoot: engine.dataRoot)
         return await search(query) { trimmed in
-            if !configuredBaseURL.isEmpty {
-                try await research.saveSearXNGBaseURL(configuredBaseURL)
-            }
             return try await research.search(query: trimmed).results
         }
     }

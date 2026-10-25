@@ -1,5 +1,7 @@
 import SwiftUI
 
+// Blueprint: | `SkillsToolsView.swift` | `SkillsToolsView`: visible selection between reusable guidance and executable tools; each child retains refresh ownership |
+
 /// One navigation destination for Agent's reusable knowledge and executable
 /// capabilities. Skills and tools keep their own page bodies and refresh
 /// owners; this view owns only the visible page selection.

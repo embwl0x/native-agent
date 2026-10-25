@@ -2,9 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `Research.swift` | `SwiftNativeResearchClient` and research values: SearXNG discovery/search, fetched-source receipts and persisted lab run contracts |
+
 // MARK: - Research
 //
-// Swift-native SearXNG autodetect, search/fetch receipts, and research lab
+// Swift-native SearXNG autodetect, search, fetched-source receipts, and research lab
 // persistence. Focused extensions own autodetect, search/fetch parsing,
 // lab execution, activity/trace emission, helpers, and transports.
 
@@ -75,7 +77,7 @@ public struct SearXNGAutodetectResult: Sendable, Equatable {
     }
 }
 
-public struct ResearchSearchResult: Identifiable, Sendable, Hashable {
+public struct ResearchSearchResult: Identifiable, Sendable, Hashable, Codable {
     public var id: String { url }
     public let title: String
     public let url: String
@@ -357,7 +359,7 @@ public actor SwiftNativeResearchClient {
         self.receiptsDir = root.appendingPathComponent("research", isDirectory: true)
         self.configPath = receiptsDir.appendingPathComponent("config.json")
         self.labRunsPath = receiptsDir.appendingPathComponent("lab/runs.json")
-        self.activityPath = root.appendingPathComponent("activity/events.jsonl")
+        self.activityPath = SwiftNativePersistenceCore.activityEventsPath(dataRoot: root)
         self.tracesPath = root.appendingPathComponent("traces/events.jsonl")
     }
 }

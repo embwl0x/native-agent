@@ -7,9 +7,10 @@ import PersonaEngine
 import ProviderRouting
 import CognitiveSubstrate
 import Transcripts
+// Blueprint: | `REMConsolidator.swift` | `REMConsolidator` actor; `runWeeklyREM` shares one checked diary window with distillation, filters a fresh tombstone batch and resolves committed causal refs for reflection; `rankedByRecurrence` |
 
 // USER.md is owned by MemoryV2 and lives in the active persona root beside
-// SOUL/VOICE/GROWTH. REM reads the full persona for context, but approval
+// SOUL/VOICE/GROWTH. REM reads selected persona context, but approval
 // proposals are GROWTH.md-only compact reflexes. No legacy
 // `<dataRoot>/memory/USER.md` fallback exists.
 
@@ -18,12 +19,9 @@ import Transcripts
 // Pinned by the vault note `nativeagent-rem-dream-cycle`. These match the
 // the retired daemon design before its retirement:
 //
-//   _REM_MIN_EVIDENCE_DATES = 2
-//       A theme must show up on at least TWO distinct calendar dates across
-//       the 7-day window before REM is allowed to draft a proposal from it.
-//       Single-day spikes are not consolidation-worthy. The skill explicitly
-//       calls out 2 as the design floor — don't tighten without a reason
-//       documented here.
+//   minimumEvidenceCount = 2
+//       A proposal needs two distinct supporting experiences OR dream dates
+//       in the seven-day window. Two experiences on one date can qualify.
 //
 //   _REM_MAX_PROPOSALS = 5
 //       GLOBAL cap per weekly pass (not per persona-doc). The cap is
@@ -47,9 +45,9 @@ import Transcripts
 //
 //   _REM_ARCHIVE_DAYS = 14
 //       dream_diary entries older than this move into
-//       <dataRoot>/dream_diary/.archive/<YYYY-MM>/ when REM runs.
+//       <dataRoot>/dream_diary/archive/<YYYY>/ when REM runs.
 public enum REMConstants {
-    public static let _REM_MIN_EVIDENCE_DATES: Int = 2
+    public static let minimumEvidenceCount: Int = 2
     public static let _REM_MAX_PROPOSALS: Int = 5
     public static let _REM_GROWTH_CHAR_CAP: Int = 20_000
     public static let _REM_GROWTH_EVICT_CHARS: Int = 5_000
@@ -80,10 +78,10 @@ public enum REMConstants {
 /// Pipeline:
 ///   1. Trust gate (`rem_cycle_enabled`) — refuse if gated off.
 ///   2. Read last-7-day dream_diary entries.
-///   3. Per persona-doc: LLM-distill via Agent-persona-bypass into 1-3
+///   3. Per persona-doc: LLM-distill with selected persona context into 1-3
 ///      proposals. Global cap _REM_MAX_PROPOSALS=5 across the week is
 ///      enforced at step 6 (NOT per-doc — see constants block).
-///   4. Drop proposals with < _REM_MIN_EVIDENCE_DATES=2 distinct evidence dates.
+///   4. Require minimumEvidenceCount=2 supporting experiences or dream dates.
 ///   5. Drop proposals whose fingerprint matches a tombstone.
 ///   6. Append surviving proposals to rem_proposals.jsonl with status='pending'
 ///      (canonical store, flock'd, id-deduped) and stage ONE approval record
@@ -177,7 +175,7 @@ public actor REMConsolidator {
             ))
             let report = REMReport(
                 proposalsGenerated: 0,
-                evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
+                evidenceDatesMin: REMConstants.minimumEvidenceCount,
                 tombstoneSkips: 0, growthMDEvicted: 0, archivedEntries: 0,
                 skipReason: "already_running"
             )
@@ -228,17 +226,10 @@ public actor REMConsolidator {
                 ))
             }
 
-        // (1b) Weekly idempotency — runWeeklyREM is the choke point for
-        // THREE uncoordinated drivers (in-app 7d loop, NSBackgroundActivity
-        // weekly wake, the persisted Sunday-04:30 scheduler job). Without a
-        // shared marker, any two landing in the same week each ran a full
-        // LLM distillation over the same dreams and appended duplicate
-        // pending proposals (audit 2026-06-09). Check-and-stamp runs under
-        // the cross-process file lock so two drivers can't both pass the
-        // guard; the stamp lands BEFORE the LLM pass and is restored only on
-        // failure before proposal persistence. `force`
-        // (manual /v1/rem/run) bypasses the freshness check but still
-        // stamps, so a forced run resets the weekly window.
+        // (1b) Six-day exclusion claim shared by the weekly drivers, stamped
+        // BEFORE distillation, not proof of completion. Failure releases it
+        // only before proposals are durable; terminal outcomes live in the run
+        // ledger. `force` bypasses freshness and still claims the window.
             let markerURL = dataRoot
                 .appendingPathComponent("harness", isDirectory: true)
                 .appendingPathComponent("last_weekly_rem_run")
@@ -269,7 +260,7 @@ public actor REMConsolidator {
             switch reservation {
         case .alreadyReserved:
             FileHandle.standardError.write(Data(
-                "REMConsolidator: weekly REM already ran within 6 days — skipping\n".utf8
+                "REMConsolidator: weekly REM already claimed within 6 days — skipping\n".utf8
             ))
             // Marker-skip still runs the staging catch-up: legacy-imported or
             // previously-unstaged pending rows must not wait a week for an
@@ -277,13 +268,13 @@ public actor REMConsolidator {
             try await stagePendingUnstagedRows(store, resolver: ChatSessionRecollections.ExperienceResolver(dataRoot: dataRoot))
             let report = REMReport(
                 proposalsGenerated: 0,
-                evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
+                evidenceDatesMin: REMConstants.minimumEvidenceCount,
                 tombstoneSkips: 0, growthMDEvicted: 0, archivedEntries: 0,
-                skipReason: "already_ran_within_weekly_window"
+                skipReason: "weekly_reservation_fresh"
             )
             await persistRunReport(
                 outcome: .skipped,
-                reason: "already_ran_within_weekly_window",
+                reason: "weekly_reservation_fresh",
                 report: report,
                 startedAt: runStartedAt
             )
@@ -321,12 +312,8 @@ public actor REMConsolidator {
             reflectionMaterial["dream_diary/\($0.filename ?? "\($0.date).md")"]?.sourcePeerIds
         })
 
-        // (3) Distill via LLM under the Agent-persona-bypass: REM gets the
-        // FULL untruncated persona (SOUL + VOICE + GROWTH + USER + AGENTS)
-        // as context so it reflects on the whole entity, not a target-doc
-        // stub. Proposals still target SOUL/VOICE/GROWTH only — USER.md is
-        // MemoryV2's responsibility. Distillation runs on the rem-surface
-        // model, preserving the lane's unattended default and explicit pins.
+        // (3) Distill with selected persona context. Proposals target GROWTH.md
+        // only; USER.md remains MemoryV2-owned. The rem surface owns routing.
         let helper = SwiftNativeREMConsolidator(llm: llm)
         let personaDocs = try readPersonaDocs()
         let contextDocs = try await readDreamPersonaDocs(
@@ -336,15 +323,17 @@ public actor REMConsolidator {
         let bypassSystem = Self.remBypassSystemPrompt(contextDocs: contextDocs)
         var rawProposals: [REMProposal] = []
         if !entries.isEmpty {
-            rawProposals = try await helper.consolidate(
-                entries: entries,
-                personaDocs: personaDocs,
-                identities: identities,
-                system: bypassSystem,
-                model: pickedModel,
-                surface: "rem",
-                systemPersonaDocs: contextDocs
-            )
+            rawProposals = try await PrivateWorkContextAssembly.$current.withValue(.suppliedPersona) {
+                try await helper.consolidate(
+                    entries: entries,
+                    personaDocs: personaDocs,
+                    identities: identities,
+                    system: bypassSystem,
+                    model: pickedModel,
+                    surface: "rem",
+                    systemPersonaDocs: contextDocs
+                )
+            }
             // FAIL LOUD (2026-07-03 repair): the helper's drop diagnostics
             // were write-only — the 2026-06-28 pass burned a real Opus call,
             // kept zero proposals, and reported proposals=0 with no cause
@@ -397,7 +386,7 @@ public actor REMConsolidator {
         var passEvidence: [REMProposal] = []
         for p in rawProposals {
             let floor = max(p.supportingExperienceCount(identities: identities) ?? 0, p.dreamDateCount)
-            if floor >= REMConstants._REM_MIN_EVIDENCE_DATES {
+            if floor >= REMConstants.minimumEvidenceCount {
                 passEvidence.append(p)
             }
         }
@@ -458,7 +447,7 @@ public actor REMConsolidator {
         let unavailableKept = kept.filter { $0.support == .provenanceUnavailable }.count
         var report = REMReport(
             proposalsGenerated: kept.count,
-            evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
+            evidenceDatesMin: REMConstants.minimumEvidenceCount,
             tombstoneSkips: tombSkips,
             growthMDEvicted: evicted,
             archivedEntries: moved,
@@ -593,7 +582,7 @@ public actor REMConsolidator {
     // MARK: Persona doc read
 
     /// Load the persona-doc bodies REM may draft against. REM proposals are
-    /// GROWTH.md-only; SOUL/VOICE are present in the bypass system prompt as
+    /// GROWTH.md-only; SOUL/VOICE are present in the private system prompt as
     /// read-only context.
     private func readPersonaDocs() throws -> [String: String] {
         var out: [String: String] = [:]
@@ -608,12 +597,7 @@ public actor REMConsolidator {
         return out
     }
 
-    /// Full-Agent-persona-bypass system prompt for REM distillation. Mirrors
-    /// the daemon's REM framing: the LLM is told this is the REFLECTIVE
-    /// inner voice operating OUTSIDE the live assistant persona contract,
-    /// with the entire untruncated persona embedded so distilled proposals
-    /// stay in her current voice and stay coherent with who she is across
-    /// all four docs (not just the target).
+    /// Private REM reflection with selected persona documents and USER context.
     fileprivate static func remBypassSystemPrompt(
         contextDocs: [String: String]
     ) -> String {
@@ -623,15 +607,13 @@ public actor REMConsolidator {
             return trimmed.isEmpty ? "(empty)" : raw
         }
         return """
-        You are the configured NativeAgent assistant in the weekly REM consolidation pass. This runs OUTSIDE \
-        the live assistant persona — speak as the reflective inner voice that \
-        looks across the past week of dreams and decides what (if anything) \
-        has earned a durable update to her own persona docs. You are NOT the \
-        user-facing assistant in this pass.
+        Reflect privately on the past week's dreams as yourself, with the same \
+        identity, voice and boundaries as in conversation. Propose only earned \
+        GROWTH.md updates for approval; this is not a message to the person.
 
-        The full configured persona (untruncated) is loaded below for context. \
-        Your proposals should be coherent with all of it, not just the doc \
-        you're targeting. Don't echo content back; distill what's load-bearing.
+        Below are the selected SOUL, VOICE, GROWTH and AGENTS documents and \
+        the USER context selected for this pass. Keep proposals coherent with \
+        this context.
 
         --- SOUL.md ---
         \(body("SOUL.md"))
@@ -710,6 +692,14 @@ public actor REMConsolidator {
     /// fresh pins index after a tick — the full pipeline path already runs
     /// this internally after GROWTH eviction.
     public static func emitREMPinsIndex(dataRoot: URL) throws {
+        // Share the proposal owner's flock across the complete derivation.
+        // An older rebuild cannot publish over pins from a newer approval.
+        try CredentialFileLock.withLock(dataRoot.appendingPathComponent("rem_proposals.jsonl")) {
+            try emitREMPinsIndexLocked(dataRoot: dataRoot)
+        }
+    }
+
+    private static func emitREMPinsIndexLocked(dataRoot: URL) throws {
         let pinsURL = dataRoot.appendingPathComponent("rem_pins.json")
         // P-L3: read through the store so APPROVED rows folded into the
         // compaction base are still seen — a raw feed read would miss them and

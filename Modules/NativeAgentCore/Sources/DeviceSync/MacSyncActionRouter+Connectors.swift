@@ -1,10 +1,8 @@
 import Foundation
+// Blueprint: | `MacSyncActionRouter+Connectors.swift` | `MacSyncActionRouter`: `connectorAction` |
 
 extension MacSyncActionRouter {
     func connectorAction(_ action: InboxAction) async throws -> [String: String] {
-        if let message = await sync.pairedPhones.authorize(action, requiresPairing: true) {
-            return ["status": "error", "ok": "false", "code": "device_not_verified", "message": message]
-        }
         let payload = action.payload
         let allowedKeys: Set<String> = action.action == "set_connector_enabled"
             ? ["id", "enabled"] : ["id"]

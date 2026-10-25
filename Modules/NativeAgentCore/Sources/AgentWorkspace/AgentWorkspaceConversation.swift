@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceConversation.swift` | `AgentWorkspaceConversation` enum; `project` |
 
 /// Conversation controls retain the navigation owner's selected contact and
 /// conversation. Remote text/locators never choose a recipient or replay a send.
@@ -17,7 +18,8 @@ enum AgentWorkspaceConversation {
         else { phase = "unknown" }
         let waiting = ["sending", "waiting", "queued", "running", "working", "pending", "delivering", "accepted"].contains(phase)
         let needsAttention = ["attention", "failed", "unavailable", "outcome_unknown", "reconnect_required", "needs_setup", "blocked", "denied", "blocked_by_trust", "session_unavailable", "no_outbound_route"].contains(phase)
-            || content["error"] != nil || content["needs_authentication"] == .bool(true)
+            || content["error"] != nil || content["last_send_error"] != nil
+            || (content["last_send_needs_authentication"] ?? content["needs_authentication"]) == .bool(true)
         var latest = input
         latest.removeValue(forKey: "details")
         latest.removeValue(forKey: "history_before")
@@ -80,7 +82,7 @@ enum AgentWorkspaceConversation {
                 ? "Waiting here; the answer returns through the saved connection. No resend needed."
                 : "Your conversation is preserved. Check its saved result before sending anything again.")
         }
-        if needsAttention && (content["needs_authentication"] == .bool(true)
+        if needsAttention && ((content["last_send_needs_authentication"] ?? content["needs_authentication"]) == .bool(true)
             || ["reconnect_required", "needs_setup", "unavailable", "no_outbound_route"].contains(string(content["status"]) ?? phase)) {
             actions.append(.init(label: "Check connections", action: .open(.area("connections"))))
         }

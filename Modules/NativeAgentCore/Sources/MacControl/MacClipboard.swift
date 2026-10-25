@@ -37,6 +37,8 @@ import PersistenceCore
 import AppKit
 #endif
 
+// Blueprint: | `MacClipboard.swift` | `MacClipboardRead` and pasteboard ports: permission-bound clipboard reads/writes, source redaction and bounded text/type projection |
+
 // MARK: - What one look at the pasteboard found
 
 /// A single pasteboard type present on the general pasteboard.
@@ -81,7 +83,7 @@ public protocol MacPasteboardSource: Sendable {
     /// caller REPORTS rather than dressing up as an empty clipboard.
     func read() -> MacPasteboardContents?
     /// Replace the pasteboard's contents with `text`. Returns false when the
-    /// write was refused by the system.
+    /// write failed; the previous contents may already have been cleared.
     func write(text: String) -> Bool
 }
 

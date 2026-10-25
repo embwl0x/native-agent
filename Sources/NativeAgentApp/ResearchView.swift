@@ -17,6 +17,8 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+// Blueprint: | `ResearchView.swift` | `ResearchView`: search/configuration actions and eligibility/status presentation over root-scoped Research owners |
+
 struct ResearchView: View {
     @Environment(AppModel.self) private var appModel
     @State private var query = ""
@@ -25,6 +27,10 @@ struct ResearchView: View {
     @State private var showingSearchConfiguration = false
     @State private var savingSearchConfiguration = false
     @State private var searchServiceStatus: ResearchSearchServiceStatus = .idle
+    private var urlDraft: String {
+        get { appModel.editDraft("research.searxngURL", seed: appModel.searxngBaseURL) }
+        nonmutating set { appModel.setEditDraft(newValue, for: "research.searxngURL") }
+    }
 
     init(showingSearchConfiguration: Bool = false) {
         _showingSearchConfiguration = State(initialValue: showingSearchConfiguration)
@@ -41,7 +47,8 @@ struct ResearchView: View {
 
     private var searchConfigurationPresentation: ResearchSearchConfigurationPresentation {
         ResearchSearchConfigurationPresentation.resolve(
-            baseURL: appModel.searxngBaseURL,
+            baseURL: urlDraft,
+            configuredBaseURL: appModel.searxngBaseURL,
             status: searchServiceStatus,
             isSaving: savingSearchConfiguration
         )
@@ -54,9 +61,9 @@ struct ResearchView: View {
 
     private var searchServiceURL: Binding<String> {
         Binding(
-            get: { appModel.searxngBaseURL },
+            get: { urlDraft },
             set: { value in
-                appModel.searxngBaseURL = value
+                urlDraft = value
                 searchServiceStatus = .idle
             }
         )
@@ -164,6 +171,10 @@ struct ResearchView: View {
         }
         .padding()
         .navigationTitle("Research")
+        .quietReadTask {
+            do { try await appModel.engine.configuration.readSearXNG(dataRoot: appModel.engine.dataRoot) }
+            catch { appModel.setFailureStatus(error, action: "load the search service") }
+        }
     }
 
     private func runSearch() {
@@ -183,9 +194,10 @@ struct ResearchView: View {
 
     private func saveSearchConfiguration() {
         guard !savingSearchConfiguration else { return }
+        let submittedDraft = urlDraft
         let url: String
         do {
-            url = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(appModel.searxngBaseURL)
+            url = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(submittedDraft)
         } catch {
             searchServiceStatus = .saveFailed(error.localizedDescription)
             return
@@ -193,8 +205,12 @@ struct ResearchView: View {
         savingSearchConfiguration = true
         Task {
             do {
-                appModel.searxngBaseURL = try await SwiftNativeResearchClient(dataRoot: appModel.engine.dataRoot)
+                _ = try await SwiftNativeResearchClient(dataRoot: appModel.engine.dataRoot)
                     .saveSearXNGBaseURL(url)
+                try await appModel.engine.configuration.readSearXNG(dataRoot: appModel.engine.dataRoot)
+                if urlDraft == submittedDraft {
+                    appModel.clearEditDraft("research.searxngURL")
+                }
                 searchServiceStatus = .saved
             } catch {
                 searchServiceStatus = .saveFailed(UserFacingError.cause(error, action: "save the search service"))
@@ -207,7 +223,9 @@ struct ResearchView: View {
         guard !isDetectingSearchService, !savingSearchConfiguration else { return }
         searchServiceStatus = .detecting
         Task {
-            searchServiceStatus = .autodetect(await appModel.autodetectSearXNG())
+            let outcome = await appModel.autodetectSearXNG()
+            if case .found = outcome { appModel.clearEditDraft("research.searxngURL") }
+            searchServiceStatus = .autodetect(outcome)
         }
     }
 }
@@ -253,6 +271,7 @@ struct ResearchSearchConfigurationPresentation: Equatable {
 
     static func resolve(
         baseURL: String,
+        configuredBaseURL: String,
         status: ResearchSearchServiceStatus,
         isSaving: Bool
     ) -> Self {
@@ -265,7 +284,7 @@ struct ResearchSearchConfigurationPresentation: Equatable {
             validationError = error.localizedDescription
         }
         return Self(
-            statusText: ResearchSearchServicePresentation.text(baseURL: baseURL, status: status),
+            statusText: ResearchSearchServicePresentation.text(baseURL: configuredBaseURL, status: status),
             validationError: validationError,
             canSave: !isSaving && !trimmed.isEmpty && validationError == nil
         )

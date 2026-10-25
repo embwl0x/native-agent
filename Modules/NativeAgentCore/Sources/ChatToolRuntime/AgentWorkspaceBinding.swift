@@ -5,27 +5,33 @@ import PersistenceCore
 import MacIntegration
 import ToolRegistry
 import TrustCenter
-import XConnector
-import SlackConnector
-import Skills
 import Senses
+import ToolExecution
+import NativeAgentShared
+import AuthoredCapabilities
+// Blueprint: | `AgentWorkspaceBinding.swift` | `ChatWorkspaceBinding` enum; `pending`, `glance`; workspace tool port derives bounded built/recent ability names from canonical tool, skill and sense availability |
 
 package enum ChatWorkspaceBinding {
     package static let ports = AgentWorkspacePorts.Binding(conversations: Conversations(), tools: Tools())
 
+    /// Read for a turn's facts: announced only at delivery (`announceDelivered`).
     package static func pending(dataRoot: URL?, scope: String?) async -> JSONValue? {
         await AgentWorkspacePorts.$binding.withValue(ports) {
-            await AgentWorkspaceArrivals.pending(dataRoot: dataRoot, scope: scope)
+            await AgentWorkspaceArrivals.pending(dataRoot: dataRoot, scope: scope, announce: false)
         }
+    }
+
+    package static func announceDelivered(dataRoot: URL, scope: String, in input: String) async {
+        await AgentWorkspaceNavigation.shared.markAnnounced(dataRoot: dataRoot, scope: scope, in: input)
     }
 
     package static func currentPlace(dataRoot: URL, scope: String) async -> String? {
         await AgentWorkspaceNavigation.shared.currentPlace(dataRoot: dataRoot, scope: scope)
     }
 
-    package static func glance(dataRoot: URL, scope: String, turn: Date?, includingMoments: Bool = true) async -> String? {
+    package static func glance(dataRoot: URL, scope: String, turn: Date?, message: String, includingMoments: Bool = true) async -> String? {
         await AgentWorkspacePorts.$binding.withValue(ports) {
-            await HerScreen.glance(dataRoot: dataRoot, scope: scope, turn: turn, includingMoments: includingMoments)
+            await HerScreen.glance(dataRoot: dataRoot, scope: scope, turn: turn, message: message, includingMoments: includingMoments)
         }
     }
 
@@ -45,6 +51,7 @@ package enum ChatWorkspaceBinding {
                 .init(id: $0.id, name: $0.name, elevationAllowed: $0.elevationAllowed, canAnswerBack: $0.canAnswerBack)
             }
         }
+        func identity(dataRoot: URL) -> AgentContactIdentity { AgentContactIdentity(dataRoot: dataRoot) }
         func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue {
             // The read consumed each message it shows under its own row's stamp.
             await HumanConversationReader.open(sessionID: sessionID, limit: limit, dataRoot: dataRoot)
@@ -65,23 +72,28 @@ package enum ChatWorkspaceBinding {
     }
 
     private struct Tools: AgentWorkspaceToolPort {
+        func readoutFace(_ input: JSONValue, dataRoot: URL) async -> PartCallResult<PartFace> {
+            await WorkspaceFaces.read(input, dataRoot: dataRoot)
+        }
+        func readout(_ input: JSONValue, dataRoot: URL) async throws -> JSONValue {
+            let result: PartCallResult<JSONValue> = await Parts(root: dataRoot).call(id: "workspace-readout", input: input)
+            switch result {
+            case .success(let value): return value
+            case .failure(let error): throw error
+            }
+        }
         func builtAbilities(dataRoot: URL, now: Date) async -> String {
             do {
                 async let tools = SwiftNativeToolRegistry(root: dataRoot).listTools(filter: .all)
                 async let senses = FileSenseRegistry(dataRoot: dataRoot).all()
-                let skills = try InstalledSkillInventory.entries(dataRoot: dataRoot)
                 let callable = Set(SwiftToolDispatcher.authoredTools(dataRoot: dataRoot).map { $0.schema.name })
                 let since = now.addingTimeInterval(-7 * 86_400)
                 var names: [(name: String, changed: Date, builtIn: Bool)] = []
-                for tool in try await tools where callable.contains(tool.id) {
-                    names.append((tool.name + " (tool)", CapabilityLifecycle.date(tool.updatedAt ?? tool.createdAt) ?? .distantPast, false))
-                }
-                for skill in skills where skill.isRunnable {
-                    let row = skill.row
-                    let stamp = row["updatedAt"] ?? row["createdAt"]
-                    let changed = if case .string(let text)? = stamp { CapabilityLifecycle.date(text) ?? .distantPast } else { Date.distantPast }
-                    let builtIn = row["overrides"] == .string("built_in") || SkillScript.originKind(row["origin"]) == "pack"
-                    if !builtIn || changed >= since { names.append((skill.name + " (skill)", changed, builtIn)) }
+                for part in try await tools where callable.contains(part.id) {
+                    let changed = CapabilityLifecycle.date(part.updatedAt ?? part.createdAt) ?? .distantPast
+                    let origin: [String: JSONValue] = if case .object(let row)? = part.extras, case .object(let origin)? = row["origin"] { origin } else { [:] }
+                    let builtIn: Bool = if case .object(let row)? = part.extras { row["overrides"] == .string("built_in") || origin["by"] == .string("pack") } else { false }
+                    if !builtIn || changed >= since { names.append((part.name + " (ability)", changed, builtIn)) }
                 }
                 for sense in try await senses where sense.status == .on {
                     let changed = max(sense.createdAt, sense.enabledAt ?? .distantPast)
@@ -132,28 +144,33 @@ package enum ChatWorkspaceBinding {
         func withWebScheme(_ value: String) -> String { SwiftToolDispatcher.withWebScheme(value) }
         func builderSourceRepoRoot(dataRoot: URL) -> URL? { SwiftToolDispatcher.builderSourceRepoRoot(dataRoot: dataRoot) }
         var listedPeerState: String { AgentPeerContactState.listed.rawValue }
-        func unreadyTools(dataRoot: URL) -> [String: String] {
-            var tools: [String: String] = [:]
-            for (id, label, names) in [
-                ("gmail", "Gmail", ["gmail_search", "gmail_read"]),
-                ("calendar", "Google Calendar", ["google_calendar_calendars", "google_calendar_list",
-                    "google_calendar_read", "google_calendar_free_busy", "google_calendar_send_invitations"]),
-                ("notion", "Notion", ["notion_search", "notion_read_page"])
-            ] where !SwiftToolDispatcher.cloudConnectorConnected(id, root: dataRoot) {
-                // Apple Mail already reads Gmail accounts added to Mail; only this API route is off (10-09).
-                let note = id == "gmail" ? "Gmail API connector not signed in; the owner can request a setup card in chat or open Connectors in Advanced view. Gmail accounts in Apple Mail are read by mail.* already."
-                    : "The owner can sign in to \(label) by requesting a setup card in chat or opening Connectors in Advanced view."
-                for name in names { tools[name] = note }
+    }
+}
+
+/// The helper room and its native preview share one root-scoped pure face.
+/// Source equality controls the source epoch; L0 owns publication and version
+/// invalidation. No world state, observations or action authority live here.
+@MainActor private final class WorkspaceFaces {
+    private static var roots: [URL: WorkspaceFaces] = [:]
+    private let faces: PartFaces
+    private var input: JSONValue?
+    private var epoch: UInt64 = 0
+
+    private init(dataRoot: URL, host: (any OwnedProgramToolHost)?) {
+        faces = PartFaces(dataRoot: dataRoot) { id, input, version in
+            return await OwnedProgramInvocation.$host.withValue(host) {
+                await Parts(root: dataRoot).face(id: id, input: input, version: version)
             }
-            if (try? XConnectorActions.credentialStatus(dataRoot: dataRoot))?.configured != true {
-                for name in ["x_status", "x_me", "x_search", "x_timeline", "x_user_tweets"] {
-                    tools[name] = "The owner can sign in to X by requesting a setup card in chat or opening Connectors in Advanced view."
-                }
-            }
-            if !SlackConnectorActions.canSearch(dataRoot: dataRoot) {
-                tools["slack_search_messages"] = SlackConnectorActions.searchTokenInstruction
-            }
-            return tools
         }
+    }
+
+    static func read(_ input: JSONValue, dataRoot: URL) async -> PartCallResult<PartFace> {
+        let root = dataRoot.standardizedFileURL
+        if roots[root] == nil { roots[root] = WorkspaceFaces(dataRoot: root, host: OwnedProgramInvocation.host) }
+        let owner = roots[root]!
+        if owner.input != input { owner.input = input; owner.epoch += 1 }
+        let snapshot = await owner.faces.sourceChanged(id: "workspace-readout", epoch: owner.epoch, input: input)
+        if snapshot.status == .ready, let face = snapshot.face { return .success(face) }
+        return .failure(snapshot.error ?? .init(code: snapshot.status.rawValue, message: "Workspace face " + snapshot.status.rawValue))
     }
 }

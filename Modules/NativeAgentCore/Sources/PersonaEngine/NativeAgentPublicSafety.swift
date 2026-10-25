@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `NativeAgentPublicSafety.swift` | `NativeAgentPublicSafety`: checked onboarding completion/legacy anchors and neutral organism admission before resident cognition wakes |
+
 public enum NativeAgentPublicSafety {
     public static let publicSafeModeEnvironmentKey = "NATIVEAGENT_PUBLIC_SAFE_MODE"
 

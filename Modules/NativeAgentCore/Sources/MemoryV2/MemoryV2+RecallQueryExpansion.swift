@@ -1,5 +1,6 @@
 import Foundation
-import KnowledgeGraph
+
+// Blueprint: | `MemoryV2+RecallQueryExpansion.swift` | `MemoryRecallQueryExpansion`: persona/user name-aware first-person recall rewrites |
 
 /// The agent asks her memory in the first person ("what does User call me")
 /// while many rows name her in the third ("User uses different names for

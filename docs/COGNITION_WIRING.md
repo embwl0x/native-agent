@@ -68,8 +68,8 @@ flowchart TD
 | Memory → selected context | `ContextFlow/NativeMemoryContextProjection.swift` → Context selector → prepared turn. | Record disclosure, lifecycle eligibility, selection and character budgets. |
 | Body + substrate → capsule/posture | `NativeCognitionRuntime.prepareTurnProjection` → substrate frozen capsule preparation. | One fixed-time projection; successful live turns commit presentation cadence even with an empty capsule, without counting unshown cues as presented. |
 | Selected memory IDs → felt continuity | `ContextFlow/NativeContextMemoryProvenance.swift` → turn delivery accounting → assistant event `memoryRecordIds` → substrate. | Identity stays attached to the exact generation lease; missing mappings do not invent provenance. |
-| Body posture → background work | `OrganismBehaviorPosture.loopBudget` → `NativeCognitionRuntime.backgroundCognitionGate`. | Low-power, thermal and per-lane conserve checks; no chat-admission veto. |
-| Dream/REM commit → replay and reflection | `Cognition/NativeCognitionRuntime+Organism.swift` handles `dreamCompleted`/`remIntegrated`, awaits replay, then schedules reflection. | Replay deadline, reflection single-flight, configuration and resource gates. |
+| Body posture → background work | none: `loopBudget` is always `normal`. | Always on (User 10-24); transcript aging takes no gate. |
+| Dream/REM commit → replay and reflection | `Cognition/NativeCognitionRuntime+Organism.swift` handles `dreamCompleted`/`remIntegrated`, invalidates Reach on dream completion before residual rescheduling, awaits replay, then schedules reflection. | Reach timing/source-read limits; replay deadline, reflection single-flight, configuration and resource gates. |
 
 ## Shared after-turn interpretation
 
@@ -196,13 +196,9 @@ delivery.
 evidence of preparation. Successful application requires canonical storage and
 its derived projections to reconcile.
 
-### The conserve gate
+### Always on
 
-`NativeCognitionRuntime.backgroundCognitionGate` checks Low Power Mode,
-then serious/critical thermal pressure, then body `loopBudget`.
-`sleep` refuses work; `conserve` throttles expensive reflection/replay/cue
-lanes independently with a 45-minute starvation floor. It records the reason
-in cognition receipts. See [ORGANISM.md](ORGANISM.md) for body dynamics.
+They are always on while the Mac is on (User 10-24): their model calls run at the provider, so no power, heat or tiredness gate defers or throttles any background lane. See [ORGANISM.md](ORGANISM.md) for body dynamics.
 
 ## Authority stays with the action owners
 

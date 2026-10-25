@@ -1,5 +1,5 @@
 import AppToolRuntime
-import ChatOrchestration
+import ChatSessionWork
 import SwiftUI
 import ApprovalTransactions
 import ApprovalInbox
@@ -9,6 +9,8 @@ import NativeAgentShared
 import PersistenceCore
 import Studio
 import Senses
+
+// Blueprint: | `WorkPane.swift` | `WorkPaneState` and `WorkPane`: one read-only work column's Steps/Screen/Make selection, explicit visibility and turn-driven auto-open |
 
 // User, 2026-10-04 (plan page, Agent reviewed): the Work pane. A column beside
 // the chat, like Claude's panes, that only READS what the turn is doing —
@@ -154,7 +156,7 @@ struct WorkPane: View {
     @AppStorage(WorkPaneState.widthKey) private var storedWidth = WorkPane.defaultWidth
     @State private var dragWidth: Double?
     @State private var dragStart: Double?
-    @State private var senses = SensesSurfaceState()
+    private var senses: SensesFacade { appModel.engine.senses }
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
     var body: some View {
@@ -217,7 +219,6 @@ struct WorkPane: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Work pane")
         .accessibilityIdentifier("chat.work-pane")
-        .liveTask { await senses.observe() }
     }
 
     /// The hairline between chat and pane, and the handle that resizes it.
@@ -397,8 +398,8 @@ struct WorkPaneMake: View {
 
 /// The room header's Work button. With the pane closed while a turn runs it
 /// is the slim pill — "● Working · what is happening" — and a click opens the
-/// pane. Idle, it is the word Work. It reads the turn itself so the header,
-/// and ChatView above it, never observe turn state.
+/// pane. Idle, it is the word Work. It shares the engine's busy/streaming
+/// visibility with glow and haze; the header and ChatView do not observe it.
 struct WorkPaneHeaderButton: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -407,7 +408,7 @@ struct WorkPaneHeaderButton: View {
     var body: some View {
         let sessionId = appModel.activeChatSessionId
         let turn = appModel.engine.turns.lifecycle(for: sessionId)?.presentation
-        let working = !isOpen && turn.map { !$0.isTerminal } == true
+        let working = !isOpen && (appModel.engine.turns.isBusy(sessionId) || appModel.engine.turns.isStreaming(sessionId))
         Button { WorkPaneState.shared.userToggle(appModel: appModel) } label: {
             HStack(spacing: 6) {
                 if working, let turn {
@@ -453,7 +454,7 @@ struct WorkPaneAutoOpen: View {
     /// The newest Make version seen; `.none` until the studio is first read,
     /// so a first artifact in an empty studio still counts as new.
     @State private var lastMake: String?? = .none
-    @State private var makeShelf = MakeStudio.Shelf.shared
+    private var makeShelf: MakeStudio.Shelf { appModel.engine.make }
 
     var body: some View {
         let turns = appModel.engine.turns
@@ -473,7 +474,7 @@ struct WorkPaneAutoOpen: View {
             }
             // A new Make version while this chat's turn runs pops up in the pane.
             .task {
-                makeShelf.open(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+                makeShelf.start()
             }
             .onChange(of: makeShelf.loaded ? makeShelf.newest.map { "\($0.ref) \($0.versions.count)" } ?? "" : nil, initial: true) { _, signal in
                 guard let signal else { return }

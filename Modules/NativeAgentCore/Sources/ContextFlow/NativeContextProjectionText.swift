@@ -1,4 +1,6 @@
 import Foundation
+import Context
+// Blueprint: | `NativeContextProjectionText.swift` | `NativeContextProjectionText` enum; `clean`, `bounded`; projection triggers delegate to ContextMarkdownCompiler |
 
 /// Shared text rules for rebuildable context projections.
 enum NativeContextProjectionText {
@@ -19,15 +21,10 @@ enum NativeContextProjectionText {
         }
     }
 
-    static func triggers(_ text: String) -> [String] {
-        var seen = Set<String>()
-        var values: [String] = []
-        for token in text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
-            let value = String(token)
-            guard value.count >= 2, seen.insert(value).inserted else { continue }
-            values.append(bounded(value, to: 64))
-            if values.count == 12 { break }
-        }
-        return values
+    static func triggers(_ text: String, minimumLength: Int = 2, excluding: Set<String> = []) -> [String] {
+        ContextMarkdownCompiler.triggerTokens([text], minimumLength: minimumLength,
+            maximumCount: 12, excluding: excluding,
+            tokens: { $0.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init) },
+            bound: { $0 }).map { bounded($0, to: 64) }
     }
 }

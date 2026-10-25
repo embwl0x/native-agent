@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MacSyncInboxAction.swift` | `InboxAction` struct |
 
 // MARK: - InboxAction (must match iOS definition exactly)
 // Redeclared here so Mac side compiles without importing iOS module.

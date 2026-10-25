@@ -440,7 +440,8 @@ async function recoverReplyJobs(config, options = {}) {
         started: jobs.filter((job) => job && !["failed", "already_running"].includes(job.status)).length,
         jobs,
       };
-    }, { waitMs: 0, staleMs: 10 * 60 * 1000 });
+    // A killed helper (bridge stop) leaves its lock behind; its dead owner frees it at once.
+    }, { waitMs: 0, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
   } catch (error) {
     if (error && error.message === "lock_busy") {
       return { status: "already_running", reason: "reply_recovery_lock_busy", lockDir: recoveryLockDir };

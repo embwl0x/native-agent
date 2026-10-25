@@ -5,6 +5,8 @@ import NotificationInbox
 import PersistenceCore
 import ProviderRouting
 
+// Blueprint: | `NativeCognitionRuntime+ProviderVitals.swift` | `NativeCognitionRuntime` provider interoception: passive vitals persistence, health-band transitions and graded somatic ingestion |
+
 // INTEROCEPTION — production wiring for the passive provider vitals organ.
 //
 // `observeProviderCall` (NativeCognitionRuntime+Events) feeds every non-debug
@@ -46,8 +48,8 @@ extension NativeCognitionRuntime {
     /// The stream guard's read port: the sensor is a `let`, so no hop onto
     /// this actor. Unmeasured until the launch read of first outputs lands.
     public nonisolated func firstOutputDeadline(provider: String, model: String,
-                                                streamKind: String?) async -> FirstOutputDeadline {
-        await providerVitalsSensor.firstOutputDeadline(provider: provider, model: model, streamKind: streamKind)
+                                                streamKind: String?, requestBytes: Int) async -> FirstOutputDeadline {
+        await providerVitalsSensor.firstOutputDeadline(provider: provider, model: model, streamKind: streamKind, requestBytes: requestBytes)
     }
 
     /// Diagnostics: each provider's first outputs and cuts, as the guard sees them.

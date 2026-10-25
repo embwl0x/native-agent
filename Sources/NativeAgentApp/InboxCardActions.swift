@@ -6,10 +6,12 @@ import PersistenceCore
 import ApprovalTransactions
 import NotificationInbox
 import BackgroundWork
-import ChatOrchestration
+import ChatTurnRuntime
+// Blueprint: | `InboxCardActions.swift` | `AppInboxCardActionEffects`: mounted navigation and injected engine inbox; callers use the core inbox transaction directly |
 
 /// Mounted presentation and live app bindings for the core inbox transaction.
 struct AppInboxCardActionEffects: InboxCardActionEffects {
+    let inbox: InboxFacade
     var heartbeatActionIDs: Set<String> { HeartbeatCardAction.ids }
     var heartbeatOpenApprovalsActionID: String { HeartbeatCardAction.openApprovals.rawValue }
     var heartbeatRepairActionID: String { HeartbeatCardAction.repair.rawValue }
@@ -24,7 +26,7 @@ struct AppInboxCardActionEffects: InboxCardActionEffects {
     }
 
     func inboxItems(dataRoot: URL) async throws -> [InboxItemRecord] {
-        try await InboxFacade(dataRoot: dataRoot).list()
+        try await inbox.list()
     }
 
     func primaryActionProjection(for item: InboxItemRecord) -> (opensApprovals: Bool, isProactive: Bool) {

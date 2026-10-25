@@ -7,6 +7,7 @@
 // already orders newest-started-first; we render as-given).
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `TurnInspectorView.swift` | Turn summary presentation reads the shared sync projection directly |
 
 enum TurnInspectorPresentation {
     enum ContentState: Equatable {
@@ -87,12 +88,11 @@ enum TurnInspectorPresentation {
 
 
 struct TurnInspectorView: View {
-    @StateObject private var store = TurnInspectorStore()
     private let sync = iCloudSyncEngine.shared
 
     var body: some View {
         AlivePage(title: "Turns", line: "How my recent replies went.", freshnessGroup: "turn_summaries") {
-            switch TurnInspectorPresentation.contentState(for: store.file) {
+            switch TurnInspectorPresentation.contentState(for: file) {
             case .content(let truncated, let visibleCount, let totalCount):
                 AliveSection(
                     "Newest first",
@@ -100,7 +100,7 @@ struct TurnInspectorView: View {
                         ? TurnInspectorPresentation.truncationNotice(visibleCount: visibleCount, totalCount: totalCount)
                         : nil
                 ) {
-                    ForEach(Array((store.file?.summaries ?? []).enumerated()), id: \.element.id) { index, summary in
+                    ForEach(Array((file?.summaries ?? []).enumerated()), id: \.element.id) { index, summary in
                         if index > 0 { AliveDivider() }
                         TurnSummaryRow(summary: summary)
                     }
@@ -118,11 +118,8 @@ struct TurnInspectorView: View {
             }
         }
         .macSyncErrorBanner()
-        .onAppear { Task { await store.refresh() } }
-        .refreshable { await store.refresh() }
-        .onChange(of: sync.turnSummaries) { _, file in
-            store.applySyncedFile(file)
-        }
+        .task { await sync.refreshTurnSummariesSnapshot() }
+        .refreshable { await sync.refreshTurnSummariesSnapshot() }
     }
 }
 
@@ -193,23 +190,17 @@ private struct TurnSummaryRow: View {
     }
 }
 
-// MARK: - Store
-
-@MainActor
-final class TurnInspectorStore: ObservableObject {
-    @Published var file: TurnSummaryFile?
-
-    func refresh() async {
+extension TurnInspectorView {
+    private var file: TurnSummaryFile? {
         #if DEBUG
         if MobileDesignSamples.screen != nil {
-            file = try! JSONDecoder().decode(TurnSummaryFile.self, from: Data("{}".utf8))
-            file?.summaries = MobileDesignSamples.rows([TurnSummaryRecord]()) + Self.moreDesignTurns
-            file?.totalTurnsSeen = file?.summaries.count ?? 0
-            return
+            var sample = try! JSONDecoder().decode(TurnSummaryFile.self, from: Data("{}".utf8))
+            sample.summaries = MobileDesignSamples.rows([TurnSummaryRecord]()) + Self.moreDesignTurns
+            sample.totalTurnsSeen = sample.summaries.count
+            return sample
         }
         #endif
-        await iCloudSyncEngine.shared.refreshTurnSummariesSnapshot()
-        file = iCloudSyncEngine.shared.turnSummaries
+        return iCloudSyncEngine.shared.turnSummaries
     }
 
     #if DEBUG
@@ -222,7 +213,4 @@ final class TurnInspectorStore: ObservableObject {
     )
     #endif
 
-    func applySyncedFile(_ next: TurnSummaryFile?) {
-        file = next
-    }
 }

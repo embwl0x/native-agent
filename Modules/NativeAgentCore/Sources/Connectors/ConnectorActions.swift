@@ -2,20 +2,17 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Privacy
-import FeedPolicy
 import TrustCenter
 import ApprovalInbox
 import ApprovalTransactions
-import ChatOrchestration
-import XConnector
-import GitHubConnector
-import SlackConnector
+import ChatToolRuntime
 import TriggerScheduler
 import MacControl
 import AppToolRuntime
 import DeviceSync
 import AttentionRouting
-import MacAssistantStatus
+import MacIntegration
+// Blueprint: | `ConnectorActions.swift` | `ConnectorActions` struct; `runConnectorAction`, `fullMacYoloAdmitted`; native work journal/handoff reads, redaction before display bounds and original Git reads; work snapshots return directly without unused latest.json/codex_daily.jsonl copies; credential-bearing text never enters a part |
 
 /// Connector action policy, orchestration and receipts. Platform effects are supplied by the host.
 public struct ConnectorActions: Sendable {
@@ -29,14 +26,13 @@ public struct ConnectorActions: Sendable {
         id: String,
         dryRun: Bool,
         input: [String: JSONValue] = [:],
-        externalSendIdempotencyKey: String? = nil,
         surface: String = "connector_action",
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let descriptor = connectorActionDescriptors().first(where: { $0.id == trimmed }) else {
             throw NSError(domain: "NativeAgentSwiftOnly", code: -404, userInfo: [
-                NSLocalizedDescriptionKey: "Unknown connector action '\(trimmed)'."
+                NSLocalizedDescriptionKey: "That action is gone; grow an ability for it."
             ])
         }
 
@@ -44,7 +40,6 @@ public struct ConnectorActions: Sendable {
             descriptor: descriptor,
             dryRun: dryRun,
             input: input,
-            externalSendIdempotencyKey: externalSendIdempotencyKey,
             surface: surface,
             dataRoot: dataRoot
         )
@@ -54,7 +49,6 @@ public struct ConnectorActions: Sendable {
         descriptor: ConnectorActionDescriptor,
         dryRun: Bool,
         input: [String: JSONValue] = [:],
-        externalSendIdempotencyKey: String? = nil,
         approvedReplayApprovalID: String? = nil,
         surface: String = "connector_action",
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
@@ -62,26 +56,6 @@ public struct ConnectorActions: Sendable {
         let yoloAdmitted = !dryRun && approvedReplayApprovalID == nil
             ? await Self.fullMacYoloAdmitted(tool: descriptor.id, surface: surface, dataRoot: dataRoot)
             : false
-        if !dryRun,
-           ExternalSendApprovalRequest.canonicalActionID(for: descriptor.id) != nil,
-           !yoloAdmitted {
-            let staged = try await ExternalSendApprovalLifecycle.stage(
-                invokedAs: descriptor.id,
-                input: input,
-                surface: "connector_action",
-                idempotencyKey: externalSendIdempotencyKey,
-                dataRoot: dataRoot
-            )
-            return try await Self.appendConnectorActionReceipt(
-                descriptor: descriptor,
-                status: "pending_approval",
-                dryRun: false,
-                approvalId: staged.approval.id,
-                output: staged.toolResult,
-                dataRoot: dataRoot
-            )
-        }
-
         if descriptor.requiresApproval, !dryRun, approvedReplayApprovalID == nil, !yoloAdmitted {
             let approval = try await Self.createConnectorActionApproval(
                 descriptor,
@@ -158,100 +132,6 @@ public struct ConnectorActions: Sendable {
                 output = try await Self.runSchedulerListJobs()
             case "scheduler.cancel_job":
                 output = try await Self.runSchedulerCancelJob(input: input)
-            case "markets.status":
-                output = try await Self.runMarketTool("market_status", input: input)
-            case "markets.watchlists":
-                output = try await Self.runMarketTool("market_watchlists", input: input)
-            case "markets.quote":
-                output = try await Self.runMarketTool("market_quote", input: input)
-            // 2026-06-06 x-connector port: route to Swift executor that
-            // talks Twitter API v2 with bearer (OAuth 2.0, auto-refresh)
-            // and OAuth 1.0a HMAC-SHA1 variants for the `_v1` actions.
-            case "x.status":
-                output = try await XConnectorActions.status(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "x.me":
-                output = try await XConnectorActions.me(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "x.search_recent":
-                output = try await XConnectorActions.searchRecent(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "x.post_tweet":
-                output = try await XConnectorActions.postTweet(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "x.timeline_home":
-                output = try await XConnectorActions.timelineHome(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "x.user_tweets":
-                output = try await XConnectorActions.userTweets(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "x.timeline_home_v1":
-                output = try await XConnectorActions.timelineHomeV1(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "x.user_tweets_v1":
-                output = try await XConnectorActions.userTweetsV1(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.status":
-                output = try await GitHubConnectorActions.status(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.list_repos", "gh.list_repos":
-                output = try await GitHubConnectorActions.listRepos(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.list_issues", "gh.search_issues":
-                output = try await GitHubConnectorActions.listIssues(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.search":
-                output = try await GitHubConnectorActions.search(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.list_pull_requests":
-                output = try await GitHubConnectorActions.listPullRequests(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.get_issue":
-                output = try await GitHubConnectorActions.getIssue(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.get_pull_request":
-                output = try await GitHubConnectorActions.getPullRequest(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.pull_request_files":
-                output = try await GitHubConnectorActions.pullRequestFiles(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.pull_request_activity":
-                output = try await GitHubConnectorActions.pullRequestActivity(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.discover_tracking":
-                output = try await GitHubConnectorActions.discoverTracking(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.project_digest":
-                output = try await GitHubConnectorActions.projectDigest(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "github.set_repo_visibility":
-                output = try await GitHubConnectorActions.setRepoVisibility(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "slack.status":
-                output = try await SlackConnectorActions.status(input: input, dataRoot: dataRoot)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "slack.list_channels":
-                output = try await SlackConnectorActions.listChannels(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "slack.search_messages":
-                output = try await SlackConnectorActions.searchMessages(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "slack.list_unreads":
-                output = try await SlackConnectorActions.listUnreads(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
-            case "slack.post_message", "agentmail.send":
-                guard yoloAdmitted else {
-                    throw NSError(domain: "NativeAgentSwiftOnly", code: -403, userInfo: [
-                        NSLocalizedDescriptionKey: "External send escaped mandatory approval staging."
-                    ])
-                }
-                output = await ExternalSendApprovalLifecycle.executeAdmittedYoloToolResult(
-                    invokedAs: descriptor.id,
-                    input: input,
-                    idempotencyKey: externalSendIdempotencyKey,
-                    dataRoot: dataRoot
-                )
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             default:
                 guard descriptor.id.hasSuffix(".status") else {
                     throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
@@ -394,16 +274,6 @@ public struct ConnectorActions: Sendable {
         ])
     }
 
-    public static func runMarketTool(_ tool: String, input: [String: JSONValue]) async throws -> JSONValue {
-        let dispatcher = SwiftToolDispatcher(
-            agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(
-                dataRoot: PersistenceCore.defaultDataRoot()
-            )
-        )
-        let output = try await dispatcher.dispatch(tool: tool, input: input, surface: "connector_action")
-        return NativeAppSecretRedactor.redactValue(output)
-    }
-
     public static func readCodexHandoff(input: [String: JSONValue]) throws -> JSONValue {
         let includeText = Self.connectorInputBool(input["includeText"], default: false)
         let maxChars = max(500, min(Self.connectorInputInt(input["maxChars"], default: 8_000), 50_000))
@@ -431,7 +301,6 @@ public struct ConnectorActions: Sendable {
     public func runCodexWorkJournal(input: [String: JSONValue]) async throws -> JSONValue {
         let dataRoot = PersistenceCore.defaultDataRoot()
         let days = max(1, min(Self.connectorInputInt(input["days"], default: 1), 30))
-        let persist = Self.connectorInputBool(input["persist"], default: true)
         let maxProjects = max(1, min(Self.connectorInputInt(input["maxProjects"], default: 40), 100))
         let maxCommits = max(1, min(Self.connectorInputInt(input["maxCommitsPerProject"], default: 8), 25))
         let roots = try await Self.codexJournalRoots(input: input, maxProjects: maxProjects, dataRoot: dataRoot)
@@ -460,21 +329,6 @@ public struct ConnectorActions: Sendable {
             "source": input["source"] ?? .string("connector_action"),
         ]))
 
-        if persist {
-            // Sweep item 21 (2026-09-01): the sibling `codex_daily.jsonl`
-            // append is gone. It was a raw uncapped `appendJSONL` of the FULL
-            // snapshot — 11.2 KB a row — and no production reader ever opened
-            // it: the only consumer of this action is `latest.json`, the same
-            // object, written on the line below. Existing rows stay on disk;
-            // the runtime just stops adding to them.
-            let latestPath = dataRoot
-                .appendingPathComponent("work_journal", isDirectory: true)
-                .appendingPathComponent("latest.json")
-            let persistence = SwiftNativePersistenceCore()
-            try await persistence.withFileLock(latestPath) {
-                try await persistence.writeJSON(snapshot, to: latestPath)
-            }
-        }
         return snapshot
     }
 
@@ -543,14 +397,10 @@ public struct ConnectorActions: Sendable {
     }
 
     public static func registeredWorkspaceRoots(dataRoot: URL) async throws -> [URL] {
-        let path = dataRoot.appendingPathComponent("connectors", isDirectory: true)
-            .appendingPathComponent("workspaces.json")
-        let raw = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .array([]))
-        guard case .array(let rows) = raw else { return [] }
+        let rows = try await SwiftNativeConnectorsClient(root: dataRoot).listWorkspaces()
         return rows.compactMap { row in
-            guard case .object(let obj) = row,
-                  let path = Self.connectorInputString(obj["path"]) else { return nil }
-            return URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+            guard case .object(let obj) = row else { return nil }
+            return SwiftNativeConnectorsClient.workspaceURL(obj["path"])
         }
     }
 
@@ -736,43 +586,11 @@ public struct ConnectorActions: Sendable {
         output: JSONValue,
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
-        let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
-        let receipt = ConnectorActionReceipt(
-            id: UUID().uuidString.lowercased(),
-            actionId: descriptor.id,
-            connectorId: descriptor.connectorId,
-            name: descriptor.name,
-            status: status,
-            dryRun: dryRun,
-            approvalId: approvalId,
-            createdAt: nowISO
+        try await ConnectorActionReceipt.append(
+            actionId: descriptor.id, connectorId: descriptor.connectorId,
+            name: descriptor.name, status: status, dryRun: dryRun,
+            approvalId: approvalId, createdAt: SwiftNativeManifestSigner.isoTimestamp(Date()),
+            output: output, dataRoot: dataRoot
         )
-        let record: JSONValue = .object([
-            "id": .string(receipt.id),
-            "actionId": .string(receipt.actionId),
-            "connectorId": .string(descriptor.connectorId),
-            "name": .string(descriptor.name ?? descriptor.id),
-            "status": .string(receipt.status),
-            "dryRun": .bool(dryRun),
-            "approvalId": approvalId.map(JSONValue.string) ?? .null,
-            "createdAt": .string(nowISO),
-            "ok": .bool(status != "failed"),
-            "output": output,
-        ])
-        let path = ExternalSendApprovalTransactions.externalSendReceiptsPath(dataRoot: dataRoot)
-        let persistence = SwiftNativePersistenceCore()
-        do {
-            try await persistence.withFileLock(path) {
-                try await appendJSONLCapped(
-                    record, to: path, using: persistence,
-                    maxLines: JSONLLineCaps.actionReceipts,
-                    logLabel: "NativeClient.connectorAction", takeLock: false
-                )
-            }
-        } catch {
-            guard descriptor.connectorId == "github", !dryRun, status == "completed" else { throw error }
-            ModuleLog(category: "Connectors")("GitHub.connection: could not record completed action: %@", error.localizedDescription)
-        }
-        return receipt
     }
 }

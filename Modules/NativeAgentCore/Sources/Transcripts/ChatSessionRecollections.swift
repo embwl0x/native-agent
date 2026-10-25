@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `ChatSessionRecollections.swift` | Recollection row/coverage parsing, incremental scans and lock-protected timestamp formatters |
 
 /// The ONE accessor for a session's consolidated recollections.
 ///
@@ -15,7 +16,7 @@ import PersistenceCore
 /// here instead of re-summarizing material the chat lane already consolidated.
 ///
 /// This lives in PersistenceCore because BOTH sides must agree on the row
-/// shape and neither may import the other (ChatOrchestration → DreamREMCycle is
+/// shape and neither may import the other (ChatTurnRuntime → DreamREMCycle is
 /// the only arrow between them). Writer: `ChatSessionAutocompactor`.
 /// Reader: `DreamCycleRunner`.
 public struct ChatSessionRecollection: Sendable, Equatable {
@@ -379,17 +380,22 @@ public enum ChatSessionRecollections {
     /// (`covers_from <= mark < covers_until`) is admitted WHOLE by the reader,
     /// so its pre-mark turns get dreamed a second time after they were already
     /// dreamed raw. The writer clamps its replacement against this so no such
-    /// row is ever created. Absent, unreadable or unparseable → nil, meaning
-    /// "no mark to respect" — never a reason to fail a consolidation.
-    public static func dreamConsolidationMark(dataRoot: URL) -> Date? {
+    /// row is ever created. Only an absent state has no mark; damage throws.
+    public static func dreamConsolidationMark(dataRoot: URL) throws -> Date? {
         let path = dataRoot
             .appendingPathComponent("dream_diary", isDirectory: true)
             .appendingPathComponent(".dream_state.json")
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
-              case .object(let obj) = parsed
-        else { return nil }
-        return parseTimestamp(obj["lastDreamedAt"])
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+        let parsed: JSONValue
+        do { parsed = try JSONValue.parse(data) }
+        catch { throw PersistenceCoreError.ioFailure("dreamConsolidationMark could not decode \(path.path): \(error)") }
+        guard case .object(let obj) = parsed,
+              let mark = parseTimestamp(obj["lastDreamedAt"]) else {
+            throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: path.path])
+        }
+        return mark
     }
 
     /// True when this recollection's material STRADDLES `mark`: part of it was

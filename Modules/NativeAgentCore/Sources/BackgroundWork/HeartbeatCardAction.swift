@@ -1,5 +1,6 @@
 import BackgroundLoops
 import Foundation
+// Blueprint: | `HeartbeatCardAction.swift` | `HeartbeatCardAction` enum; `cardActions` |
 
 /// The closed action vocabulary emitted on heartbeat-authored inbox cards.
 /// These ids cross the persisted inbox boundary, so an unknown value must be

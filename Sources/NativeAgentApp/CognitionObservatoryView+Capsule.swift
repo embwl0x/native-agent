@@ -6,6 +6,8 @@ import CognitiveSubstrate
 import Context
 import PersistenceCore
 
+// Blueprint: | `CognitionObservatoryView+Capsule.swift` | Observatory capsule/reflection panels and felt-mode gloss: read-only projection with no capsule text or behavior mutation |
+
 extension CognitionObservatoryView {
 
     /// Read-only felt-MODE chip (U3, 2026-07-09): the aboutness beneath the fingerprint's

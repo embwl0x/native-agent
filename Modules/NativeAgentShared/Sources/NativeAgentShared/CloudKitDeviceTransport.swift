@@ -11,6 +11,7 @@ import CryptoKit
 #if canImport(CloudKit) && !os(Linux)
 import CloudKit
 import OSLog
+// Blueprint: | `CloudKitDeviceTransport.swift` | `CloudKitDeviceTransport` class; `observeAccountFailures`, `observeIncoming` (returns subscription readiness), `isChatNotification`, `shouldPersistPullCursor`, `resignalMessage` (original signed envelope; existing query clock renewed) |
 
 private let devicePushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "subscription")
 
@@ -255,11 +256,9 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     // or acknowledged until the traversal completes. A restart safely rescans.
     private var fallbackPullCheckpoints: [String: DeviceCKPullCheckpoint] = [:]
     private var fallbackPullOwners: [String: UUID] = [:]
-    // LWW/dedup cursors for the pairing + status singletons. Pairing is one
-    // mutable record per peer role; status is one record per (peer role, key).
-    // We only re-dispatch when the server modificationDate advances, so a redraw
-    // triggered by a redundant push does not re-fire the same value.
-    private var lastPairingModDate: Date?
+    // LWW/dedup cursors for the status singletons, one record per (peer role,
+    // key). We only re-dispatch when the server modificationDate advances, so a
+    // redraw triggered by a redundant push does not re-fire the same value.
     private var lastStatusModDates: [String: Date] = [:]
     // 2026-09-06: when the last retention sweep ran, so a Mac that drains every
     // eight seconds does not pay for a housekeeping query on every drain. In
@@ -1274,7 +1273,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     }
 
     /// 2026-09-06: read the PEER's currently published pairing secret without
-    /// dispatching it, claiming it, or touching the last-writer-wins clock.
+    /// dispatching or claiming it.
     /// A manually pasted recovery key has to be verified against the material
     /// the peer actually published, and on a build with no KVS entitlement
     /// this record is the only place that material exists.
@@ -1289,27 +1288,17 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         } ?? nil
     }
 
-    /// Pull the PEER's pairing singleton and dispatch to the registered handler
-    /// iff it is newer than the last dispatched version (LWW by server
-    /// modificationDate). Idempotent — a redundant drain does not re-fire the
-    /// same secret. Returns true when the handler was invoked.
+    /// Pull the PEER's pairing singleton and offer it to the registered handler
+    /// on every drain. The record is the truth: the handler compares it with
+    /// the key it holds, so a key replaced by anything else is put back on the
+    /// next drain, not only when the record's date advances. Returns true when
+    /// the handler installed a different key.
     @discardableResult
     public func drainPairing() async -> Bool {
         guard NADeviceSyncRecoveryBudget.hasTime else { return false }
-        guard configured else { return false }  // crash-guard: record(for:) touches CKContainer
-        guard let handler = loadPairingHandler() else { return false }
-        let peerRole: NADeviceRole = role == .mac ? .ios : .mac
-        let recordName = "pairing.\(peerRole.rawValue)"
-        let hit: PeerPairingHit? = await withDeviceCKTimeout("CloudKitDeviceTransport.drainPairing", onFailure: accountFailureReporter) {
-            let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
-            guard let hex = record["secretHex"] as? String,
-                  let data = Self.data(fromHex: hex) else { return nil }
-            return PeerPairingHit(secret: data, modDate: record.modificationDate)
-        } ?? nil
-        guard let hit else { return false }
-        guard pairingIsNewer(hit.modDate) else { return false }
-        guard await handler(hit.secret) else { return false }
-        commitPairingDate(hit.modDate)
+        guard let handler = loadPairingHandler(),
+              let secret = await peekPairingSecret(),
+              await handler(secret) else { return false }
         NADeviceSyncRecoveryBudget.didApplyData?()
         return true
     }
@@ -2030,28 +2019,9 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         return statusHandlers
     }
 
-    /// Checks freshness without consuming the record. The modification date is
-    /// committed only after PairingStore reports a durable Keychain acceptance.
-    private func pairingIsNewer(_ modDate: Date?) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if let modDate, let last = lastPairingModDate {
-            return modDate > last
-        }
-        return true
-    }
-
-    private func commitPairingDate(_ modDate: Date?) {
-        guard let modDate else { return }
-        lock.lock()
-        if lastPairingModDate == nil || modDate > lastPairingModDate! {
-            lastPairingModDate = modDate
-        }
-        lock.unlock()
-    }
-
-    /// Per-key LWW freshness check for status singletons — the same rule as
-    /// pairing, and like pairing it does NOT consume the record. `commitStatusDate`
-    /// is what marks it seen, and only a handler that applied it may call that.
+    /// Per-key LWW freshness check for status singletons. It does NOT consume
+    /// the record: `commitStatusDate` is what marks it seen, and only a handler
+    /// that applied it may call that.
     private func statusIsNewer(key: String, _ modDate: Date?) -> Bool {
         lock.lock(); defer { lock.unlock() }
         if let modDate, let last = lastStatusModDates[key] {
@@ -2255,23 +2225,38 @@ public extension DeviceSyncTransportResolver {
         hasEntitlement: () -> Bool = DeviceCloudKitPreflight.hasCloudKitEntitlement,
         grantsContainer: (String) -> Bool = DeviceCloudKitPreflight.entitlementGrantsContainer
     ) -> DeviceSyncTransport? {
-        guard resolvedKind(environment: environment) == .cloudkit else { return nil }
+        guard runsCloudKit(
+            containerIdentifier: containerIdentifier, environment: environment,
+            hasEntitlement: hasEntitlement, grantsContainer: grantsContainer
+        ) else { return nil }
+        return CloudKitDeviceTransport(
+            role: role, containerIdentifier: containerIdentifier, configured: true)
+    }
+
+    /// The effective transport decision behind `makeCloudKitTransport`: true
+    /// only when CloudKit is selected AND entitled for this container; false
+    /// means the legacy KVS/ubiquity transport runs.
+    static func runsCloudKit(
+        containerIdentifier: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        hasEntitlement: () -> Bool = DeviceCloudKitPreflight.hasCloudKitEntitlement,
+        grantsContainer: (String) -> Bool = DeviceCloudKitPreflight.entitlementGrantsContainer
+    ) -> Bool {
+        guard resolvedKind(environment: environment) == .cloudkit else { return false }
         guard hasEntitlement() else {
             nativeLog("[ck-device] NATIVE_AGENT_DEVICE_SYNC=cloudkit but the CloudKit entitlement is ABSENT — staying on the legacy KVS/ubiquity transport (no CKContainer is touched). This is the 2026-06-03 launch-crash guard.")
-            return nil
+            return false
         }
         guard grantsContainer(containerIdentifier) else {
             nativeLog("[ck-device] CloudKit service is granted but the exact container '\(containerIdentifier)' is absent — refusing to construct CKContainer and staying on the legacy transport.")
-            return nil
+            return false
         }
-        return CloudKitDeviceTransport(
-            role: role, containerIdentifier: containerIdentifier, configured: true)
+        return true
     }
 }
 
 /// Sendable value carriers for the pairing/status singleton drains (returned
 /// across the withDeviceCKTimeout race boundary).
-private struct PeerPairingHit: Sendable { let secret: Data; let modDate: Date? }
 private enum PairingSlot: Sendable { case empty, holds(Data) }
 private struct PeerStatusHit: Sendable { let value: String; let modDate: Date? }
 

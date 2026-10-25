@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import MacControl
+// Blueprint: | `ChatToolSessionContext.swift` | `ChatToolSessionContext` enum; `rendersInlineCards`, `withReplyRoute`; `TurnEnvelope.workIdentity` carries attribution, `answerExperienceID` carries the owed answer through continuations; neither grants authority |
 
 // MARK: - Per-turn tool session context
 
@@ -280,6 +281,11 @@ public struct TurnEnvelope: Sendable, Equatable {
         self.macContinuation = macContinuation
         self.workIdentity = workIdentity
         self.answerExperienceID = answerExperienceID
+    }
+
+    /// Her own native owner (a schedule, a click, a maintenance pass): local, attributed, no transport identity.
+    public static func native(_ workIdentity: String, surface: String = "chat") -> TurnEnvelope {
+        TurnEnvelope(surface: surface, agent: "self", declaredRemote: false, workIdentity: workIdentity)
     }
 
     public func withMacContinuation(_ continuation: MacWorkContinuation) -> TurnEnvelope {

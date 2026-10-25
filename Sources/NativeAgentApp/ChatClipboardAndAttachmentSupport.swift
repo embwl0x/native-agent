@@ -1,7 +1,9 @@
 import AppKit
 import NativeAgentShared
-import ChatOrchestration
+import ChatTurnRuntime
 import UniformTypeIdentifiers
+
+// Blueprint: | `ChatClipboardAndAttachmentSupport.swift` | `ChatComposerSupport` and `ChatClipboard`: shared drop/paste/picker intake, destination capture and off-main image conversion |
 
 typealias ChatComposerSupport = NativeAgentShared.ChatAttachmentTypeResolver
 

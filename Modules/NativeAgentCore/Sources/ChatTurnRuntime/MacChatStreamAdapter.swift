@@ -4,6 +4,7 @@ import Privacy
 import NativeAgentCore
 import TurnTrace
 import MacControl
+// Blueprint: | `MacChatStreamAdapter.swift` | `MacChatStreamAdapter` enum; `stream`, `bridgeChatStreamEvents` |
 
 public enum MacChatStreamAdapter {
     // S.5: the stream's terminal receipt, read by the surface after the stream

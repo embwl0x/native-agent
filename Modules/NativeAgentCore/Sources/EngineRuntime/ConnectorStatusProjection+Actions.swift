@@ -1,5 +1,7 @@
 import Foundation
 import Connectors
+import PersistenceCore
+// Blueprint: | `ConnectorStatusProjection+Actions.swift` | connector action registry, records and checked capability statuses |
 
 public struct ConnectorActionRegistry: Codable, Hashable, Sendable {
     public var status: String
@@ -21,10 +23,7 @@ public struct ConnectorActionRegistry: Codable, Hashable, Sendable {
 
     public static func read(dataRoot: URL, connectors: [ConnectorRecord]) async -> ConnectorActionRegistry {
         let actions = ConnectorActionRecord.records(connectors: connectors)
-        let receiptsPath = dataRoot
-            .appendingPathComponent("connectors", isDirectory: true)
-            .appendingPathComponent("actions", isDirectory: true)
-            .appendingPathComponent("receipts.jsonl")
+        let receiptsPath = ConnectorActionReceipt.receiptsPath(root: dataRoot)
         let receipts: [ConnectorActionReceipt] = await RuntimeReadProjection.tailJSONL(path: receiptsPath, limit: 50)
             .sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
         return ConnectorActionRegistry(

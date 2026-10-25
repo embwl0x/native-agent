@@ -80,10 +80,8 @@ expectations. `NativeCognitionRuntime.attentionSignals` reads the resident
 projection and the turn engine forwards it into Context selection. This is a
 selection hint, not another tool list or a grant of access.
 
-**Background budget.** `OrganismBehaviorPosture.loopBudget` contributes
-`normal`, `conserve` or `sleep` to
-`NativeCognitionRuntime.backgroundCognitionGate`. This gate regulates
-background cognition, not chat admission.
+**Background budget.** `OrganismBehaviorPosture.loopBudget` is always
+`normal`. They are always on while the Mac is on (User 10-24): their model calls run at the provider, so no power, heat or tiredness gate defers or throttles any background lane.
 
 ## The body's own laws
 
@@ -129,8 +127,9 @@ policy. Dream completion does not dose tenderness.
 ## The diurnal clock
 
 `NativeCognitionRuntime+Organism.swift` builds `OrganismDiurnalClock` from
-the current time zone and the existing `TurnQuietHoursWindow` reader. With no
-quiet-hours window it uses the zone and default trough. A kernel with no clock
+the existing `TurnQuietHoursWindow` reader; hours are read on the Mac's local
+clock, whatever zone it is in now. With no quiet-hours window it uses the
+default trough. A kernel with no clock
 has no diurnal contribution.
 
 `OrganismChemistry` supplies projected curiosity/arousal offsets and nightliness.
@@ -142,8 +141,8 @@ a neutral state start declaring a feeling.
 
 `NativeCognitionRuntime+Expectations.swift` composes dated expectations from
 Desk deferrals, scheduled jobs, staged approvals, unanswered completions and
-peer jobs. It refreshes through the existing deadline path with a 15-minute
-minimum interval.
+peer jobs. Source invalidations and eligibility/expiry boundaries refresh it
+through the existing deadline path, retaining the 15-minute minimum interval.
 
 `OrganismPrediction+Horizon.swift` only treats a missing source as settled
 when that source kind was read completely. Expiry means waiting, not a failed
@@ -180,12 +179,9 @@ The adapter refuses `organismResolutionFelt` as somatic input.
 `NativeCognitionRuntime+Organism.swift` drains those resolutions directly into
 the substrate, so a body consequence cannot feed back into itself.
 
-### Background resource gate
+### No background resource gate
 
-`backgroundCognitionGate` checks Low Power Mode and serious/critical thermal
-pressure before organism budgeting. `sleep` skips work. `conserve` throttles
-reflection, replay and cue lanes separately, permitting a lane again after its
-45-minute starvation floor. A thermal refusal does not spend that allowance.
+They are always on while the Mac is on (User 10-24): their model calls run at the provider, so no power, heat or tiredness gate defers or throttles any background lane. Heat still reads in their body sense as a feeling; it never pauses work.
 
 ### Persistence + decay
 

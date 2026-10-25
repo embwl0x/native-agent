@@ -1,15 +1,15 @@
-// Diagnostics owns the compact agent projection and raw all-items table.
-// It loads canonical Desk state independently of the primary Desk page.
+// Diagnostics renders the engine’s retained Desk revision.
 
 import SwiftUI
-import PersistenceCore
 import Desk
+import EngineRuntime
+
+// Blueprint: | `DeskDebugPanels.swift` | `DeskDebugPanels`: diagnostic disclosures over the engine's retained Desk revision |
 
 struct DeskDebugPanels: View {
-    let dataRoot: URL
+    @Environment(AppModel.self) private var appModel
+    private var desk: DeskFacade { appModel.engine.desk }
     let agentDisplayName: String
-    @State private var items: [DeskItem] = []
-    @State private var projection: String = ""
     @State private var showAgentView = false
     @State private var showAllItems = false
 
@@ -19,18 +19,19 @@ struct DeskDebugPanels: View {
                 Text("The Desk, as raw state — the compact projection the agent reads in-context and the underlying records with their aliases and handles.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-                agentViewDisclosure
-                allItemsDisclosure
+                if let reason = desk.board.deskError { Text(reason).foregroundStyle(.orange) }
+                agentViewDisclosure(desk.board)
+                allItemsDisclosure(desk.board)
             }
         }
-        .task { await load() }
+        .task { _ = await desk.loadBoard() }
     }
 
     // MARK: agent's compact view (the projection she actually reads)
 
-    private var agentViewDisclosure: some View {
+    private func agentViewDisclosure(_ board: DeskBoardRead) -> some View {
         DisclosureGroup(isExpanded: $showAgentView) {
-            Text(projection.isEmpty ? "\u{2014}" : projection)
+            Text(board.debugProjection.isEmpty ? "\u{2014}" : board.debugProjection)
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -46,10 +47,10 @@ struct DeskDebugPanels: View {
 
     // MARK: all items (debug) — raw aliases/handles
 
-    private var allItemsDisclosure: some View {
+    private func allItemsDisclosure(_ board: DeskBoardRead) -> some View {
         DisclosureGroup(isExpanded: $showAllItems) {
             LazyVStack(alignment: .leading, spacing: 2) {
-                ForEach(items, id: \.handle) { item in
+                ForEach(board.items, id: \.handle) { item in
                     Text("\(item.alias)  \(item.handle)  \(item.kind.rawValue)  \(item.status.rawValue)  \(item.origin.rawValue)  \(item.project)  —  \(item.title)")
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.secondary)
@@ -68,15 +69,4 @@ struct DeskDebugPanels: View {
         .padding(.top, 2)
     }
 
-    // MARK: load (own desk read — lenient; a broken read leaves the panel empty)
-
-    @MainActor private func load() async {
-        let root = dataRoot
-        let state = await Task.detached(priority: .utility) {
-            try? await SwiftNativeDeskStore(dataRoot: root).liveState()
-        }.value
-        guard !Task.isCancelled, let state else { return }
-        items = state.items
-        projection = DeskProjection.render(state)
-    }
 }

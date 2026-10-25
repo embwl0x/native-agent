@@ -2,6 +2,11 @@ import Foundation
 import CryptoKit
 import Observation
 import PersistenceCore
+import Synchronization
+#if os(macOS)
+import Darwin
+// Blueprint: | `EmbeddingModelDownload.swift` | `EmbeddingModelDownload` actor; `ranges`, `assemble`; operation-scoped status observation and retained, cancellation-aware extraction through actual subprocess exit; shared status text and progress projection |
+#endif
 
 /// One owner task survives navigation; status surfaces observe Core's push stream.
 @MainActor @Observable
@@ -26,7 +31,11 @@ public final class EmbeddingModelDownloadController {
             }
         }
         task = Task {
-            defer { task = nil }
+            defer {
+                observation?.cancel()
+                observation = nil
+                task = nil
+            }
             guard let runtime = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot(),
                   runtime.requestedBackend != ManagedEmbeddingProvider.mockBackend else { return }
             do {
@@ -45,6 +54,8 @@ public final class EmbeddingModelDownloadController {
                     lastDoctorInstallCompleted = converged
                 }
             } catch { /* Core publishes the failure and retains resumable parts. */ }
+            // Read the terminal value before retiring the never-ending stream.
+            status = await downloader.currentStatus()
         }
     }
 
@@ -74,6 +85,8 @@ public final class EmbeddingModelDownloadController {
 }
 
 /// Downloads the standalone release without changing the serving embedding model.
+/// extras/coreml and extras/.coreml-download are local installation state:
+/// excluded from backup/export and phone sync, listed in PrivacyMap.
 public actor EmbeddingModelDownload {
     public struct Status: Sendable {
         public var phase: String = "Not started"
@@ -350,12 +363,8 @@ public actor EmbeddingModelDownload {
             let unpacked = work.appendingPathComponent("unpacked", isDirectory: true)
             try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
             #if os(macOS)
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-            process.arguments = ["-x", "-k", archive.path, unpacked.path]
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { throw Failure.extractionFailed }
+            let extraction = Extraction(archive: archive, destination: unpacked)
+            guard try await extraction.run() == 0 else { throw Failure.extractionFailed }
             #else
             throw Failure.extractionFailed
             #endif
@@ -389,3 +398,64 @@ public actor EmbeddingModelDownload {
         }
     }
 }
+
+#if os(macOS)
+private extension EmbeddingModelDownload {
+    /// The install flight retains this child until actual exit. Cancellation
+    /// kills extraction before install's staging cleanup can remove its files.
+    final class Extraction: @unchecked Sendable {
+        private struct State {
+            var cancelled = false
+            var continuation: CheckedContinuation<Int32, Error>?
+        }
+        private let state = Mutex(State())
+        private let process = Process()
+
+        init(archive: URL, destination: URL) {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            process.arguments = ["-x", "-k", archive.path, destination.path]
+        }
+
+        func run() async throws -> Int32 {
+            let result = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int32, Error>) in
+                    state.withLock { state in
+                        guard !state.cancelled else {
+                            continuation.resume(throwing: CancellationError())
+                            return
+                        }
+                        state.continuation = continuation
+                        process.terminationHandler = { [weak self] child in
+                            self?.finish(status: child.terminationStatus)
+                        }
+                        do { try process.run() }
+                        catch {
+                            process.terminationHandler = nil
+                            state.continuation = nil
+                            continuation.resume(throwing: error)
+                        }
+                    }
+                }
+            } onCancel: {
+                self.state.withLock { state in
+                    state.cancelled = true
+                    // Start and cancel share the lock, including cancellation
+                    // before launch. Never report exit while ditto is writing.
+                    if self.process.isRunning { kill(self.process.processIdentifier, SIGKILL) }
+                }
+            }
+            try Task.checkCancellation()
+            return result
+        }
+
+        private func finish(status: Int32) {
+            let continuation = state.withLock { state in
+                defer { state.continuation = nil }
+                process.terminationHandler = nil
+                return state.continuation
+            }
+            continuation?.resume(returning: status)
+        }
+    }
+}
+#endif

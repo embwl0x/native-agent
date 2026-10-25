@@ -1,7 +1,6 @@
 import Experiences
 import AuthoredCapabilities
 import AppKit
-import CoreGraphics
 import Foundation
 import NativeAgentCore
 import ApprovalInbox
@@ -15,6 +14,7 @@ import WorkshopExecution
 import Senses
 import SwarmRuns
 import NativeAgentShared
+// Blueprint: | `HerScreen.swift` | `HerScreen` enum; `withNames`, `resolve`, compact Senses home projection and readable full senses item from registry/news, sharing the live built-ability line with turn context; shared home/room crew rows and worker details preserve canonical SwarmCrew liveness |
 
 /// Her home screen (2026-09-23, her-screen plan Phase 1): the agent's own
 /// world as one laid-out text page, the way a desktop is a picture for a
@@ -132,7 +132,7 @@ package enum HerScreen {
         for (prefix, tool, field) in [("mac.look", "screen", "app"), ("mac.go", "go", "name")]
             where name == prefix || name.hasPrefix(prefix + " ") {
             let app = raw.trimmingCharacters(in: .whitespacesAndNewlines).dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
-            let title = tool == "go" ? "Bring an app forward" : app.isEmpty ? "Look at an app" : app
+            let title = tool == "go" ? "Open an app" : app.isEmpty ? "Look at an app" : app
             return .action(.perform(tool: tool, input: app.isEmpty ? [:] : [field: .string(app)], title: title,
                                     textField: app.isEmpty ? field : nil, isEffect: tool == "go"))
         }
@@ -248,7 +248,7 @@ package enum HerScreen {
         let (agent, person) = names(dataRoot)
         let world = await readWorld(dataRoot, now: now)
         let seen = await lastSeen(dataRoot)
-        let idle = idleSeconds()
+        let presence = MacPersonInput.presence()
         let connected = BrowserConnectionMirror.connected == true
         let page = ChromePageMirror.page(tab: nil, session: scope)
         var marks = worldMarks(world, dataRoot: dataRoot, person: person, now: now)
@@ -256,8 +256,8 @@ package enum HerScreen {
         // said "no changes"): presence, the Chrome link, the day's badges and
         // this chat's tabs. The glance carries them over, never speaks them.
         var shown: [String: Mark] = [:]
-        if let idle {
-            let word = idle < 300 ? " here" : " away"
+        if let presence {
+            let word = presence.here ? " here" : " away"
             shown["home:presence"] = Mark(fp: word, line: person + word, at: now.timeIntervalSince1970)
         }
         shown["home:browser"] = Mark(fp: connected ? "on" : "off",
@@ -285,7 +285,8 @@ package enum HerScreen {
         if markSeen, world.pending.isEmpty { Self.markSeen(dataRoot, marks: marks, now: now) }
 
         var header = [agent.uppercased(), "Snapshot as of " + now.formatted(.iso8601), freshness(world, now: now)]
-        if let idle { header.append(idle < 300 ? person + " here" : person + " away " + age(idle)) }
+        header.append(presence.map { $0.here ? person + " here" : person + " away " + age($0.seconds) }
+            ?? person + " presence unknown" + (MacPersonInput.idle() == nil ? ": needs Input Monitoring" : ""))
         let defaults = UserDefaults.standard
         if let mode = defaults.string(forKey: "nativeagent.viewMode") { header.append(mode.capitalized + " view") }
         if let seen {
@@ -312,13 +313,14 @@ package enum HerScreen {
                 rows[name] = section(person.uppercased() + " WAITS", ["Desk, approvals and inbox asks; calendar, reminders and mail not read here."] + desk.needs
                     + (desk.more > 0 ? ["+\(desk.more) more waiting on \(person) · item \"desk\""] : []) + ownerRows(world, now: now) + owed.his)
             case "queue":
-                rows[name] = section("MY QUEUE", ["Queued Desk steps, reviews and handoffs; not all autonomous activity."] + (await queueRows(world, dataRoot: dataRoot, person: person, now: now))
+                rows[name] = section("MY QUEUE", ["Queued Desk steps, reviews, arrivals to accept and handoffs; not all autonomous activity."] + (await queueRows(world, dataRoot: dataRoot, person: person, now: now))
                     + (world.moments > 0 ? [pad("moments", 10) + "\(world.moments) waiting for my review · app memory.moments"] : [])
+                    + (world.arrivalsToAccept > 0 ? [pad("arrivals", 10) + "\(world.arrivalsToAccept) waiting for me to accept · item \"arrivals\" · app home.accept"] : [])
                     + (world.reviews.count > 0 ? [pad("memories", 10) + "\(world.reviews.count)\(world.reviews.capped ? "+" : "") to review"] : [])
                     + harnessRow(world)
                     + owed.hers
                     + peopleNeeds)
-            case "working": rows[name] = section("WORKING", ["Crew run records; not all background work."] + crewRows(world, dataRoot: dataRoot, now: now))
+            case "working": rows[name] = section("WORKING", ["Crew run records; not all background work."] + crewRows(world.crews, dataRoot: dataRoot, now: now, liveOnly: true))
             case "open":
                 // Where she left off in this chat: its open windows, unfinished first.
                 rows[name] = section("OPEN", ["This chat's retained places; not Mac windows."] + (windows.isEmpty ? [] : [windows.prefix(3).map { clip($0, 40) }.joined(separator: " · ")
@@ -348,12 +350,11 @@ package enum HerScreen {
                 }
                 let pulses = ["mail": mailPulse(dataRoot: dataRoot, now: now), "calendar": lifePulse("calendar", now: now), "desk": desk.pulse,
                               "browser": browser, "reminders": lifePulse("reminders", now: now)]
-                // Gmail shows once it is connected (User's Gmail is read through Apple Mail).
-                let places = layout.shown("places", profile: profile).map { AppDoorNames.resolve($0.name) }.filter { $0 != "gmail" || AgentWorkspaceReadiness.ready(tool: "gmail_search") }
+                let places = layout.shown("places", profile: profile).map { AppDoorNames.resolve($0.name) }
                 rows[name] = section("PLACES", ["Navigation, Chrome mirror and prior read badges; calendar, reminders and mail not read here."] + placeLines(places).map { $0.map { pulses[$0] ?? $0 }.joined(separator: " · ") })
             case "mac":
                 let mine = touched(dataRoot: dataRoot, now: now)
-                rows[name] = section("MAC", ["Front app/lock state and recorded app reads/actions over \(Int(touchedHours))h; no fresh window-content read.", await macFront(person) + " · Mac apps I acted in: "
+                rows[name] = section("MAC", ["Front app/lock; recorded app reads/actions over \(Int(touchedHours))h; no fresh window content.", await macFront(person) + " · Mac apps my mac verbs read or acted in: "
                     + (mine.isEmpty ? "none" : mine.prefix(4).map { clip($0.app, 30) + ($0.readout.map { " · " + clip($0, 20) } ?? "") }
                         .joined(separator: ", "))])
             default: break
@@ -391,7 +392,7 @@ package enum HerScreen {
             lines += block
         }
         lines.append(rule)
-        lines.append("Open any name: app {item:\"desk.4\"} / \"mail\"; text or fields go in args. Also: windows, people, conversations, arrivals, work, mac. Find here: app {page:\"home\", find:\"…\"}.")
+        lines.append("Open: app {item:\"desk.4\"} or {item:\"mail\"}; text/fields: args. Also: windows, people, conversations, arrivals, work, mac. Find: app {page:\"home\", find:\"…\"}.")
         return lines.joined(separator: "\n")
     }
 
@@ -477,7 +478,12 @@ package enum HerScreen {
     static func owedRows(_ dataRoot: URL, person: String, now: Date) async -> (hers: [String], his: [String]) {
         let open: [Experience]
         do { open = try await ExperienceStore.at(dataRoot).projection() }
-        catch { return (["Repairs owed are unavailable: \(error.localizedDescription) · experiences/experiences.sqlite"], []) }
+        catch {
+            let file = dataRoot.appendingPathComponent("experiences/experiences.sqlite")
+            return ([readFailure(error, reason: "repairs_unavailable", remedy: Repair.remedy(owner: file.path,
+                nextCall: nil, tap: nil, instruction: ToolFailureError.fileRepairInstruction(file,
+                    shape: "The repair ledger could not be read: \(error.localizedDescription). Preserve its records and SQLite journals.")))], [])
+        }
         var hers: [String] = [], his: [String] = []
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -487,13 +493,16 @@ package enum HerScreen {
                 act.claims.first { $0.claim.hasPrefix(name + ": ") }.map { String($0.claim.dropFirst(name.count + 2)) }
             }
             let when = (iso.date(from: act.at) ?? ISO8601DateFormatter().date(from: act.at)).map { " " + age(now.timeIntervalSince($0)) } ?? ""
-            let what = clip(claim("operation") ?? "a call", 30) + " refused" + when + " by " + clip(claim("owner") ?? "?", 60)
+            let what = failureReason(claim("operation") ?? "a call") + " " + (act.outcome?.status ?? "outcome not recorded")
+                + when + " by " + failureReason(claim("owner") ?? "owner not recorded")
             let release = " · or let go: app {action:\"repair.let_go\", args:{id:\"\(act.id)\", reason}}"
             if owed.to == "person" {
                 his.append(pad("repair", 10) + what + " · ask \(person): " + (claim("tap") ?? "?")
-                    + (claim("next_call").map { " · " + $0 } ?? "") + release)
+                    + " · " + failureReason(act.face?.words ?? "")
+                    + (claim("next_call").map { " · " + failureReason($0) } ?? "") + release)
             } else {
-                hers.append(pad("repair", 10) + what + " · " + clip(act.face?.words ?? "", 120) + " · " + (claim("next_call") ?? "read the act")
+                hers.append(pad("repair", 10) + what + " · " + failureReason(act.face?.words ?? "") + " · " + failureReason(claim("next_call") ?? "read the act")
+                    + (claim("tap").map { " · " + failureReason($0) } ?? "")
                     + release)
             }
         }
@@ -546,7 +555,7 @@ package enum HerScreen {
         for index in chats.indices where looked[chats[index].who, default: 0] < 2 {
             looked[chats[index].who, default: 0] += 1
             let tail = chatTail(chats[index].id, dataRoot: dataRoot, bytes: 32_768)
-            chats[index].heard = tail.last { !$0.mine }?.at
+            chats[index].heard = tail.last { !$0.mine }?.date
             chats[index].answered = tail.last?.mine == true
         }
         return chats
@@ -716,6 +725,7 @@ package enum HerScreen {
             switch entry.runtimeStatus {
             case .completed: state = now.timeIntervalSince(entry.runAt) < 3600 ? "✓ done " + ago : StandingBotSchedule.words(bot.cadence) + " · " + ago
             case .failed: state = "✗ failed " + ago
+            case .stopped: state = "✗ stopped " + ago
             case .interrupted: state = "✗ interrupted " + ago
             case .waitingForApproval: state = "waiting approval " + ago
             case .waitingOnPerson: state = "waiting on " + person + " " + ago
@@ -726,19 +736,20 @@ package enum HerScreen {
 
     // MARK: Crews
 
-    private static func crewRows(_ world: HerWorld, dataRoot: URL, now: Date) -> [String] {
-        let live = world.crews.filter { $0["pid"] != nil }
+    static func crewRows(_ all: [[String: Any]], dataRoot: URL, now: Date, liveOnly: Bool = false) -> [String] {
+        let rows = liveOnly ? all.filter { SwarmCrew.liveness(of: $0) != .settled } : Array(all.prefix(10))
         return withNames(dataRoot) { book in
-            live.compactMap { row -> String? in
+            rows.compactMap { row -> String? in
                 guard let id = row["id"] as? String else { return nil }
                 let workers = row["workers"] as? [[String: Any]] ?? []
                 let working = workers.filter { ($0["status"] as? String ?? "working") == "working" }.count
-                let started = (row["createdAt"] as? String).flatMap(date)
-                let n = book.number("crew", id: id) {
-                    Set(world.crews.compactMap { $0["id"] as? String })
-                }
-                return pad("crew.\(n)", 10) + clip(firstLine(row["objective"] as? String ?? "A task"), 40)
-                    + " · \(working) of \(workers.count) working" + (started.map { " · " + age(now.timeIntervalSince($0)) } ?? "")
+                let status = SwarmCrew.liveness(of: row) == .running ? "\(working) of \(workers.count) working"
+                    : crewState(row, fallback: "done") + " · \(workers.count) workers"
+                let at = (liveOnly ? row["createdAt"] as? String
+                    : row["completedAt"] as? String ?? (row["status"] as? String == "interrupted" ? nil : row["createdAt"] as? String)).flatMap(date)
+                let n = book.number("crew", id: id) { Set(all.compactMap { $0["id"] as? String }) }
+                return pad("crew.\(n)", 10) + clip(firstLine(row["objective"] as? String ?? "A task"), liveOnly ? 40 : 44)
+                    + " · " + status + (at.map { " · " + age(now.timeIntervalSince($0)) } ?? "")
             }
         }
     }
@@ -747,6 +758,7 @@ package enum HerScreen {
     /// the output cap: "completed" over two truncated reports read as whole (desk walk 4).
     static func crewState(_ row: [String: Any], fallback: String) -> String {
         let status = row["status"] as? String ?? fallback
+        if status == "interrupted", row["completedAt"] == nil { return "interrupted · completion time unknown" }
         let workers = row["workers"] as? [[String: Any]] ?? []
         let cut = workers.filter { $0["outputTruncated"] as? Bool == true }.count
         guard status == "completed", cut > 0 else { return clip(status, 20) }
@@ -757,7 +769,7 @@ package enum HerScreen {
     static func crewPage(id: String, name: String, dataRoot: URL) -> String? {
         let all: [[String: Any]]
         do { all = try SwiftNativeSwarmRunsReader(runsPath: dataRoot.appendingPathComponent("swarms/runs.json")).readCrews() }
-        catch { return "Crew unavailable: \(error.localizedDescription)" }
+        catch { return readFailure(error, reason: "crew_records_unavailable", remedy: crewStoreRemedy) }
         let row = all.first { $0["id"] as? String == id }
         guard let row else { return nil }
         let workers = row["workers"] as? [[String: Any]] ?? []
@@ -769,25 +781,85 @@ package enum HerScreen {
             let role = nonEmpty(worker["role"] as? String) ?? nonEmpty(worker["name"] as? String) ?? "worker \(index + 1)"
             let said = nonEmpty(worker["output"] as? String) ?? nonEmpty(worker["error"] as? String) ?? ""
             var status = worker["status"] as? String ?? "working"
+            if status == "working", SwarmCrew.liveness(of: row) == .unknown { status = "unknown" }
             if status == "completed", worker["outputTruncated"] as? Bool == true { status = "cut off" }
             lines.append("  \(index + 1) " + pad(clip(role, 16), 18) + pad(clip(status, 12), 11) + clip(firstLine(said), 90))
+            if let error = nonEmpty(worker["error"] as? String) {
+                lines.append(failureFace(.object(["status": .string(status), "reason": .string("crew_worker_error"),
+                    "detail": .string(error), "effects": .string("unknown"), "remedy": Repair.reconcile(instruction: "Read the crew's retained evidence; repair the reported cause without discarding worker results or repeating the work.",
+                        nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("agent.jobs"), "args": .object(["agent": .string("swarm"), "run_id": .string(id)])])]))])))
+            }
         }
         let synthesis = (row["synthesis"] as? [String: Any])?["output"] as? String ?? row["synthesis"] as? String
         if let synthesis = nonEmpty(synthesis) { lines.append("synthesis: " + clip(synthesis.replacingOccurrences(of: "\n", with: " "), 400)) }
-        lines.append("Full record: agent_swarm results. Back to home: app {}.")
+        let read = ToolFailureError.call("app", ["action": .string("agent.jobs"), "args": .object(["agent": .string("swarm"), "run_id": .string(id)])])
+        lines.append("Full record: " + read + ". Back: app {}.")
         return lines.joined(separator: "\n")
     }
 
     // MARK: - Small readers
 
+    /// Adapt read errors to the existing failure envelope, keeping owner evidence.
+    static func readFailure(_ error: any Error, reason: String, remedy: JSONValue) -> String {
+        let typed = error as? ToolFailureError, sense = error as? SenseFailure
+        let cancelled = error is CancellationError || typed?.status == .cancelled || sense?.code == "cancelled"
+        var fields: [String: JSONValue] = [
+            "status": .string(typed?.status.rawValue ?? (cancelled ? "cancelled" : sense?.code == "timeout" ? "timeout" : "failed")),
+            "reason": .string(typed?.code ?? sense?.code ?? reason),
+            "detail": .string(typed?.message ?? sense?.message ?? error.localizedDescription),
+            "effects": .string(typed?.effects.rawValue ?? "unknown"), "remedy": remedy,
+        ]
+        if let typed {
+            fields["argument_path"] = typed.argumentPath.map(JSONValue.string)
+            fields["accepted"] = typed.accepted.map(JSONValue.string)
+            let call = typed.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+            if typed.recovery == .terminal {
+                fields["remedy"] = Repair.terminal(instruction: typed.instruction ?? typed.message)
+            } else if typed.personDecides, let tap = typed.tap {
+                fields["remedy"] = Repair.why(owner: typed.owner ?? reason, tap: tap, instruction: typed.instruction)
+            } else if let owner = typed.owner, typed.recovery == nil || typed.recovery == .repair {
+                fields["remedy"] = Repair.remedy(owner: owner, nextCall: call, tap: typed.tap, instruction: typed.instruction)
+            } else if let call {
+                fields["remedy"] = .object(["kind": .string(typed.recovery?.rawValue ?? "inspect"),
+                    "instruction": .string(typed.instruction ?? "Use next_call."), "next_call": call])
+            } else if let tap = typed.tap {
+                fields["remedy"] = Repair.why(owner: typed.owner ?? reason, tap: tap, instruction: typed.instruction)
+            }
+        }
+        if let sense {
+            if let fix = sense.remedy { fields["remedy"] = fix }
+            fields["input_excerpt"] = sense.inputExcerpt.map(JSONValue.string)
+            fields["provenance"] = sense.provenance.flatMap { try? .fromEncodable($0) }
+        }
+        if cancelled, typed?.nextCall == nil, typed?.tap == nil, sense?.remedy == nil {
+            fields["remedy"] = Repair.terminal(instruction: "Do not repeat the cancelled read automatically.")
+        }
+        if let hint = (error as? LocalizedError)?.recoverySuggestion { fields["hint"] = .string(hint) }
+        return failureFace(.object(fields))
+    }
+
+    static func fileReadFailure(_ error: any Error, reason: String, file: URL, shape: String) -> String {
+        return readFailure(error, reason: reason, remedy: Repair.remedy(owner: file.path,
+            nextCall: nil, tap: nil, instruction: ToolFailureError.fileRepairInstruction(file,
+                shape: shape)
+                + " Restore access or repair the reported file damage, preserving its original bytes and records."))
+    }
+
     static func sensesRows(dataRoot: URL, now: Date, full: Bool = false) async -> [String] {
         let abilities = await AgentWorkspacePorts.current.tools.builtAbilities(dataRoot: dataRoot, now: now)
-        guard let registry = SensesHub.shared.registry else { return [abilities, "have: senses not connected yet"] }
+        guard let registry = SensesHub.shared.registry else {
+            return [abilities, failureFace(.object(["status": .string("unavailable"), "reason": .string("sense_registry_unattached"),
+                "detail": .string("The runtime has no sense registry attached."), "effects": .string("none"),
+                "remedy": Repair.reconcile(instruction: "The app's runtime wiring needs repair; open doctor to inspect it.",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["item": .string("doctor")])]))]))]
+        }
         async let records = registry.all()
         async let news = SenseNewsBoard.shared.latest(limit: SenseNewsBoard.capacity)
         let all: [SenseRecord]
         do { all = try await records }
-        catch { return [abilities, "have: senses unavailable · \(error.localizedDescription)"] }
+        catch { return [abilities, readFailure(error, reason: "sense_registry_unavailable", remedy: Repair.reconcile(
+            instruction: "Inspect the sense registry's reported cause before repairing it.",
+            nextCall: .object(["tool": .string("app"), "input": .object(["item": .string("doctor")])])))] }
         let active = all.filter { $0.status == .on }.sorted { $0.corner.key < $1.corner.key }
         let corners = active.prefix(full ? active.count : 5).map { full ? $0.corner.key : clip($0.corner.key, 36) }.joined(separator: ", ")
         var rows = [abilities, "have: " + (active.isEmpty ? "none yet" : corners)
@@ -799,17 +871,23 @@ package enum HerScreen {
                 .prefix(full ? Int.max : 2).map { full ? $0.summary : clip($0.summary, 60) }
         rows.append("just changed: " + (changes.isEmpty ? "nothing recent" : changes.joined(separator: " · ")))
         rows += all.filter { $0.status == .unavailable }.prefix(full ? all.count : 2).map {
-            "unavailable: \($0.corner.key) · \($0.unavailableReason ?? "repair the sense and switch it on to retry")"
+            failureFace(.object(["status": .string("unavailable"), "reason": .string("sense_unavailable"),
+                "detail": .string($0.unavailableReason ?? "The sense is marked unavailable; no cause was retained."),
+                "owner": .string($0.corner.key), "effects": .string("unknown"),
+                "remedy": Repair.reconcile(instruction: "Read this sense's retained evidence before repairing or enabling it.",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("sense.versions"), "args": .object(["sense_id": .string($0.id)])])]))]))
         }
         if full {
             do {
                 let files = try AbilityStore(dataRoot: dataRoot).files(kind: .sense)
                 rows += files.map(\.partLine)
                 for record in all where !files.contains(where: { $0.id == record.id }) {
-                    let part = try AbilityStore.partHeader(["reach": try .fromEncodable(record.reach)])
-                    rows.append(AbilityStore.File(id: record.id, kind: .sense, metadata: part, body: "", pathExtension: "js").partLine)
+                    rows.append(try AbilityStore.File(id: record.id, kind: .sense,
+                        metadata: ["record": try .fromEncodable(record)], body: "", pathExtension: "js").partLine)
                 }
-            } catch { rows.append("parts unavailable · \(error.localizedDescription)") }
+            } catch { rows.append(readFailure(error, reason: "sense_files_unavailable", remedy: Repair.reconcile(
+                instruction: "Inspect the reported ability-file failure before changing the files.",
+                nextCall: .object(["tool": .string("app"), "input": .object(["item": .string("doctor")])])))) }
         }
         return rows
     }
@@ -836,34 +914,50 @@ package enum HerScreen {
     /// 403s). A built-in lane's record may keep only "failed"; its job keeps
     /// the error, looked up once per message and kept.
     static func sendFailure(_ contact: Contact, receipt: [String: JSONValue], now: Date) -> String? {
-        for key in ["execution_error", "error"] { if case .string(let text)? = receipt[key], !text.isEmpty { return failureReason(text) } }
+        for key in ["execution_error", "error"] {
+            if let evidence = receipt[key], evidence != .null, evidence != .string("") {
+                var fields = receipt
+                if fields["detail"] == nil { fields["detail"] = evidence }
+                if fields["reason"] == nil { fields["reason"] = .string("agent_execution_error") }
+                if fields["effects"] == nil { fields["effects"] = .string("unknown") }
+                if fields["remedy"] == nil {
+                    fields["remedy"] = Repair.reconcile(instruction: "Read execution and delivery evidence before sending another message.",
+                        nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("agent.read"),
+                            "args": .object(["agent": .string(contact.id)])])]))
+                }
+                return failureFace(.object(fields))
+            }
+        }
         guard contact.builtIn, (receipt["run_status"] ?? receipt["status"]) == .string("failed"),
               case .string(let id)? = receipt["matched_message_id"] ?? receipt["id"] else { return nil }
         let key = "sendFailure\u{0}" + id
         if let kept: String = HerMemo.shared.peek(key, stamp: [])?.value { return kept.isEmpty ? nil : kept }
         let error = DelegationStatusProjector().readSnapshot(now: now, agent: contact.id, messageID: id).jobs
             .first { $0.acceptedMessageIDs.contains(id) }?.executionError
-        let reason = error.map(failureReason) ?? ""
+        let reason = error.map { failureFace(.object(["status": .string("failed"), "reason": .string("agent_execution_error"),
+            "detail": .string($0), "effects": .string("unknown"),
+            "remedy": Repair.reconcile(instruction: "Read execution and delivery evidence before sending another message.",
+                nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("agent.jobs"),
+                    "args": .object(["agent": .string(contact.id), "message_id": .string(id)])])]))])) } ?? ""
         HerMemo.shared.put(key, reason)
         return reason.isEmpty ? nil : reason
     }
 
-    /// An error as a person reads it: an HTTP body's own message after its
-    /// code ("403: Your current subscription does not have access…"), else its first line.
-    static func failureReason(_ error: String) -> String {
-        let code = error.range(of: #"^\d{3}\b"#, options: .regularExpression).map { String(error[$0]) + ": " } ?? ""
-        if let found = error.range(of: #""message"\s*:\s*"[^"]+"#, options: .regularExpression),
-           let colon = error[found].firstIndex(of: ":") {
-            let message = error[error.index(after: colon)..<found.upperBound].trimmingCharacters(in: CharacterSet(charactersIn: " \""))
-            return code + clip(firstLine(message), 70)
-        }
-        return clip(firstLine(error), 70)
+    /// Keep the owner's evidence intact, including fixes and executable levers.
+    static func failureFace(_ value: JSONValue) -> String {
+        let evidence: JSONValue
+        if case .object(let fields) = value {
+            let keys: Set<String> = ["status", "reason", "failure_code", "error_code", "code", "detail", "message", "error",
+                "effects", "remedy", "fix", "hint", "owner", "next_call", "tap", "not_run_status", "provenance", "input_excerpt",
+                "recovery_hint", "argument_path", "accepted", "connected", "needs", "needs_input", "needs_authentication"]
+            evidence = .object(fields.filter { keys.contains($0.key) && $0.value != .null })
+        } else { evidence = value }
+        return UntrustedText.neutralized((try? evidence.serialize(pretty: false)) ?? String(describing: evidence))
     }
 
-    private static func idleSeconds() -> Double? {
-        guard let any = CGEventType(rawValue: ~0) else { return nil }
-        let value = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: any)
-        return value.isFinite ? value : nil
+    /// Legacy text can contain a complete owner remedy; never take only its first line.
+    static func failureReason(_ error: String) -> String {
+        UntrustedText.neutralized(error)
     }
 
     static func age(_ seconds: TimeInterval) -> String {

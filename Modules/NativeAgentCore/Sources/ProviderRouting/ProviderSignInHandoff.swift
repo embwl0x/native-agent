@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `ProviderSignInHandoff.swift` | provider sign-in handoff state |
 
 /// Only the handoff's request identity and outcome live here. NativeOAuthFlow
 /// retains exclusive ownership of authentication, cancellation and credentials.

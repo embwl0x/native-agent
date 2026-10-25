@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `ChatCompletionsStreamDecoder.swift` | `ChatCompletionsStreamDecoder`: shared SSE content/reasoning/tool fragments, usage and root errors; terminal/tool alignment validation preserves provider failures |
+
 /// Shared decoder for OpenAI-compatible Chat Completions SSE streams.
 ///
 /// Consumes `choices[0].delta` content, reasoning, and indexed tool fragments;
@@ -14,6 +16,7 @@ public struct ChatCompletionsStreamDecoder {
     /// Human-facing provider name used to prefix a mid-stream error message
     /// (e.g. "Moonshot: quota exceeded for kimi-k3").
     private let providerLabel: String
+    private let retainReasoning: Bool
 
     private struct Accum { var id = ""; var name = ""; var arguments = "" }
     private var toolAccum: [Int: Accum] = [:]
@@ -39,8 +42,7 @@ public struct ChatCompletionsStreamDecoder {
     /// True once a `[DONE]` sentinel has been consumed. When the byte stream
     /// ends with this still false, the adapter throws `streamTruncated`.
     public private(set) var sawDone = false
-    /// Non-empty `reasoning_content` accumulated across all frames (Moonshot's
-    /// reasoning ledger consumes this after the stream completes).
+    /// Accumulated only when the route needs reasoning replay (Moonshot).
     public private(set) var reasoning = ""
     /// Root-level usage captured from any frame that carried it, mapped to the
     /// telemetry shape. `nil` when the stream sent no usage frame — the recorder
@@ -59,8 +61,9 @@ public struct ChatCompletionsStreamDecoder {
         reachedLengthLimit ? .outputLimit : terminalBoundaryReason ?? runaway.toolBoundaryReason
     }
 
-    public init(providerLabel: String) {
+    public init(providerLabel: String, retainReasoning: Bool = false) {
         self.providerLabel = providerLabel
+        self.retainReasoning = retainReasoning
     }
 
     /// Read failures share EOF's finalizer; cancellation and provider verdicts
@@ -95,7 +98,7 @@ public struct ChatCompletionsStreamDecoder {
         /// Non-empty assistant content delta to yield as `.textDelta`.
         public var content: String?
         /// Non-empty `reasoning_content` delta on this frame (also folded into
-        /// `reasoning`). Adapters that surface a thinking liveness signal yield
+        /// `reasoning` when replay is enabled). Adapters that surface a thinking liveness signal yield
         /// `.keepAlive` when this is non-nil.
         public var reasoning: String?
         /// Count of raw `tool_calls` entries in this frame's delta. Moonshot
@@ -154,7 +157,7 @@ public struct ChatCompletionsStreamDecoder {
             return frame
         }
         if let thought = delta["reasoning_content"] as? String, !thought.isEmpty {
-            reasoning += thought
+            if retainReasoning { reasoning += thought }
             frame.reasoning = thought
             sawSemanticOutput = true
         }

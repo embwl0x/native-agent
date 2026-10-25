@@ -2,6 +2,7 @@ import Foundation
 import CognitiveSubstrate
 import DreamREMCycle
 import PersistenceCore
+// Blueprint: | `NativeCognitionRuntime+Replay.swift` | `NativeCognitionRuntime`: `makeReplayIntegrationInput` |
 
 extension NativeCognitionRuntime {
     func makeReplayIntegrationInput(reason: String) async -> CognitiveReplayIntegrationInput {

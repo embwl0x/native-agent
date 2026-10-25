@@ -2,6 +2,8 @@ import Foundation
 import PersistenceCore
 import PersonaEngine
 
+// Blueprint: | `NativeAgentNotificationDefaults.swift` | `NativeAgentNotificationDefaults`: shared agent display name and explicit/default notification title resolution |
+
 /// The title every notification to the Mac or the phone carries: her display
 /// name unless the caller gave a real one.
 public enum NativeAgentNotificationDefaults {

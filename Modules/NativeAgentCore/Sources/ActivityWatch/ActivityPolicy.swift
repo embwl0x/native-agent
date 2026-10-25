@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `ActivityPolicy.swift` | `ActivityPolicy` and `ActivityPolicyStore`: checked capture consent, exclusions, title permissions and policy persistence |
+
 /// W5 privacy policy for the ambient activity watcher.
 ///
 /// Every field defaults to the SAFE value: the feature is off, titles are off,

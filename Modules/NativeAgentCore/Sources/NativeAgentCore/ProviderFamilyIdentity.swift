@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ProviderFamilyIdentity.swift` | `ProviderFamilyIdentity` enum; `normalize` |
 
 // Family projection for matching, not transport or adapter selection.
 package enum ProviderFamilyIdentity {

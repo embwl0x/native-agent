@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `CognitiveSomaticSignalAdapter.swift` | `CognitiveSomaticSignalAdapter` enum; `signal`, `safeSourceComponent` |
 
 public enum CognitiveSomaticSignalAdapter {
     /// Closed producer/adapter contract for cognitive evidence whose somatic

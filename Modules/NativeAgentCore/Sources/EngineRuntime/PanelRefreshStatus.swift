@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `PanelRefreshStatus.swift` | `PanelRefreshStatus` struct |
 
 public struct PanelRefreshStatus: Equatable, Sendable {
     /// When the panel last attempted a refresh.

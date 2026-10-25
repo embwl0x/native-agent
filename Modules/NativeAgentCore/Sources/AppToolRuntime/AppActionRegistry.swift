@@ -1,15 +1,22 @@
-import ChatOrchestration
+import AgentWorkspace
+import AuthoredCapabilities
+import ChatTurnContracts
+import ChatToolRuntime
+import AgentConversations
 import ChromeControl
 import Foundation
+import MacIntegration
 import MemoryV2
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-import Skills
+import PersonaEngine
 import Senses
 import StandingBots
 import ToolRegistry
 import TrustCenter
+import TurnTrace
+// Blueprint: | `AppActionRegistry.swift` | App action definitions and registry (`AppAction`, `AppActions`); dependency contracts omit the retired scriptability field; authored action lookup; one schema-aware semantic/lexical ranking for declared page items, built-ins, admitted tools, enabled skills and current senses, with shared retrieval stop words, a semantic relevance floor and model-epoch action vectors; explicitly requested retired tools are labeled read-only records; file Trash, recurring tasks and named contacts route to their owners; their own parts ranked and rendered from one inventory for the turn glance (`parts`), acknowledging only shown fresh parts; a receipt's `effect` names a run of them part as `part`; chat.post exposes the existing proactive speech seam |
 
 /// One button of NativeAgent's, as the `app` door offers it.
 ///
@@ -30,10 +37,15 @@ public struct AppAction: Sendable {
     public let page: String
     /// The button's words.
     public let label: String
-    /// Searchable scope from the action's owning schema or surface vocabulary.
+    /// Complete search and catalog-version input, including schema words.
     public let scope: String
+    /// Model-facing scope; the schema is returned separately.
+    let returnedScope: String
     public let schema: LLMToolSchema?
     public let partAction: Bool
+    /// The part of hers it runs, by name: a skill, a sense ("" for a door that
+    /// runs whichever part it is given). What it does is the part's, not her hand's.
+    let part: String?
     /// This row declares a direct call to its tool, including fixed input.
     public let folded: Bool
     /// `name`, `a|b` for either, `?` optional, `:type` when not a string;
@@ -65,33 +77,37 @@ public struct AppAction: Sendable {
     public let versionExempt: Bool
     /// Bump for behavior changes, including result semantics, without a schema change.
     public let revision: Int
-    /// A part's reach to User's side (`AppActionBinding.reachesHim`).
-    public let reachesHim: Bool?
+    public let reach: ToolReach
+    public let capabilities: Set<String>
     public let resultSchema: JSONValue
-    var dependencyFiles: Set<String>
 
     init(_ id: String, _ page: String, _ label: String, _ args: [String] = [], owner: Owner = .hers,
-         irreversible: Bool = false, toolClass: ToolClass = .write, screen: Bool = false, warn: String = "", tool: String = "",
+         irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .hers, capabilities: Set<String>? = nil,
+         screen: Bool = false, warn: String = "", tool: String = "",
          input: [String: JSONValue] = [:], rename: [String: String] = [:], read: Bool = false,
          versionExempt: Bool = false, revision: Int = 1, readWhen: [String: JSONValue] = [:], scope: String = "",
          advisory: Bool = false, resultSchema: JSONValue = AppActions.resultEnvelope,
          lifecycle: CapabilityLifecycle.Action? = nil, schema: LLMToolSchema? = nil, partAction: Bool = false,
-         folded: Bool = false, reachesHim: Bool? = nil) {
+         part: String? = nil, folded: Bool = false) {
+        // A door action is a read when it says read:, else a write; it writes the app's own data unless it says otherwise.
+        let toolClass = toolClass ?? (read ? .read : .write)
         self.id = id; self.page = AppDoorNames.resolve(page); self.label = label; self.args = args; self.owner = owner
         self.irreversible = irreversible; self.toolClass = toolClass; self.screen = screen; self.warn = warn; self.tool = tool
         self.input = input; self.rename = rename; self.read = read
         self.versionExempt = versionExempt
         self.revision = revision
         self.readWhen = readWhen
+        self.returnedScope = [scope, schema.map { ToolNameAliases.foldedProse(AppActions.argumentProse($0.description, tool: tool)) } ?? ""].filter { !$0.isEmpty }.joined(separator: " ")
         self.scope = [scope, args.joined(separator: " "), schema?.description ?? "", schema.map { String(decoding: $0.parametersJSON, as: UTF8.self) } ?? ""].filter { !$0.isEmpty }.joined(separator: " ")
         self.schema = schema
         self.partAction = partAction
+        self.part = part
         self.folded = folded
         self.advisory = advisory
         self.resultSchema = resultSchema
         self.lifecycle = lifecycle
-        self.reachesHim = reachesHim
-        dependencyFiles = tool.hasPrefix("mcp__") ? ["mcp/servers.json", "mcp/cache/tools.json"] : []
+        self.reach = reach
+        self.capabilities = capabilities ?? (toolClass == .read ? toolClass.baseCapabilities : toolClass.baseCapabilities.union(["app_data_write"]))
     }
 
     /// A folded tool as an action (`ToolNameAliases.foldedTools` names its
@@ -103,10 +119,12 @@ public struct AppAction: Sendable {
     /// action; each call retains its own gates.
     static func fold(_ tool: String, _ page: String, id: String? = nil, _ label: String? = nil, _ args: [String]? = nil,
                      input: [String: JSONValue] = [:], read: Bool = false,
-                     irreversible: Bool = false, toolClass: ToolClass = .write, screen: Bool = false,
+                     irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .hers, capabilities: Set<String> = ["safe_read", "tool_call"], screen: Bool = false,
                      warn: String = "", schema: LLMToolSchema? = nil, versionExempt: Bool = false,
                      readWhen: [String: JSONValue] = [:], advisory: Bool = false,
                      resultSchema: JSONValue = AppActions.resultEnvelope, lifecycle: CapabilityLifecycle.Action? = nil) -> AppAction {
+        // A fold is a read when it says read:, else a write; it carries the door's own capabilities unless it says otherwise.
+        let toolClass = toolClass ?? (read ? .read : .write)
         let schema = schema ?? AppActions.foldSchemas[tool]
         // Its args by the door's names (`ToolNameAliases.doorArgNames`), each renamed back as it runs.
         let names = ToolNameAliases.doorArgNames[tool] ?? [:]
@@ -118,8 +136,9 @@ public struct AppAction: Sendable {
                          label ?? schema.map { AppActions.firstSentence(ToolNameAliases.foldedProse($0.description)) } ?? tool,
                          (args ?? schema.map { ToolSignature.doorArgs($0.parametersJSON) } ?? []).map(door)
                             + (["screen", "read", "read_file", "read_page", "browser.read_text", "browser.read_links", "browser.chrome_snapshot"].contains(tool)
-                               ? ["raw?:boolean", "wrong?:boolean", "why?:string"] : []),
-                         irreversible: irreversible, toolClass: toolClass, screen: screen, warn: warn, tool: tool, input: input,
+                               ? ["raw?:bool", "wrong?:bool", "why?"] : []),
+                         irreversible: irreversible, toolClass: toolClass, reach: reach, capabilities: capabilities,
+                         screen: screen, warn: warn, tool: tool, input: input,
                          rename: Dictionary(uniqueKeysWithValues: names.map { ($0.value, $0.key) }),
                          read: read, versionExempt: versionExempt, readWhen: readWhen,
                          advisory: advisory, resultSchema: resultSchema, lifecycle: lifecycle, schema: schema, folded: true)
@@ -137,8 +156,8 @@ public struct AppAction: Sendable {
     public var isCard: Bool { tool == "interaction_act" && input["target"] == nil }
     var isItemRead: Bool { tool == "app_page_read" && input["item"] != nil }
 
-    /// The args that carry a key or token (`:secret`). SecurityCenter's
-    /// records and the transcript redact them too.
+    /// Declared credential args (`:secret`). SecurityCenter's records and the
+    /// transcript redact them; typed text is redacted at the injection boundary.
     public var secretArgs: [String] {
         zip(args, argSpecs).filter { $0.0.hasSuffix(":secret") }.flatMap { $0.1.names }
     }
@@ -149,15 +168,23 @@ public struct AppAction: Sendable {
                          tool: tool, fixedInput: input, rename: rename, folded: isFold,
                          descriptor: schema.map { ToolDescriptor(schema: $0, bucket:
                              SwiftToolDispatcher.catalogBucket(forRegisteredToolNamed: tool) ?? AppToolExecutor.buckets[tool] ?? .unclassified) },
-                         toolClass: toolClass, reachesHim: reachesHim)
+                         toolClass: toolClass, reach: reach, capabilities: capabilities)
     }
 
     func readOnly(args: [String: JSONValue]) -> Bool { binding.readOnly(args: args) }
 
-    func effectFields(args: [String: JSONValue] = [:]) -> [String: JSONValue] {
+    /// `effect` is "part" for a call that ran one of her parts (a tool she
+    /// wrote, a part's action, a skill's run): her turn tells hand work by it.
+    /// A part's run that reports its calls is irreversible only if one of them
+    /// was; the declaration's prior is for gating, not for what happened.
+    func effectFields(args: [String: JSONValue] = [:], result: [String: JSONValue] = [:]) -> [String: JSONValue] {
         let read = readOnly(args: args)
+        var irreversible = irreversible
+        if part != nil || authored, case .array(let calls)? = result["calls"] {
+            irreversible = calls.contains { if case .object(let call) = $0 { call["irreversible"] == .bool(true) } else { false } }
+        }
         return ["read_only": .bool(read), "irreversible": .bool(irreversible),
-                "effect": .string(read ? "read" : irreversible ? "irreversible" : "write")]
+                "effect": .string(part != nil || authored ? "part" : read ? "read" : irreversible ? "irreversible" : "write")]
     }
 
     /// `id(args) label`, then what User needs to know about it.
@@ -224,53 +251,56 @@ public enum AppActions {
                   AgentConversationDelivery.lane(for: "peer:" + who.id, dataRoot: dataRoot) != nil else { return nil }
             if action.read {
                 return AppAction(action.id, action.page, "Read \(who.name)'s worklog, newest first", action.args,
-                    warn: action.warn, tool: action.tool, read: true)
+                    toolClass: action.toolClass, reach: action.reach, capabilities: action.capabilities, warn: action.warn, tool: action.tool, read: true)
             }
             return AppAction(action.id, action.page, "Message \(who.name)",
                 ["text", "conversation?", "new_conversation?:bool", "expects_reply?:bool", "options?:object"],
-                tool: "agent_message", input: ["agent": .string(handle)], schema: foldSchemas["agent_message"],
+                toolClass: action.toolClass, reach: action.reach, capabilities: action.capabilities, tool: "agent_message", input: ["agent": .string(handle)], schema: foldSchemas["agent_message"],
                 folded: true)
         }
     }
 
     private static let seedActions: [AppAction] = [
-        AppAction("chrome.history", "browser", "Read Chrome browsing history: top domains, title/URL search or recent pages",
+        AppAction("chrome.history", "browser", "Read Chrome history: top domains, title/URL search or recent pages",
                   ["mode", "query?", "since?", "limit?:int"],
-                  warn: "mode: top_domains (requires since), search (requires query; optional since) or recent. since: inclusive ISO 8601 timestamp with timezone. limit: default 15, maximum 50. Reads only Chrome's Default profile, independent of the extension and tab group; times are local ISO 8601. Top-domain counts are visits since since; page counts are lifetime visits. Requires Full Mac and file-read permission; raises no card. Query deadline: 2 seconds.",
+                  warn: "mode: top_domains (since required), search (query required, since optional) or recent. since: inclusive ISO 8601 with timezone. limit: default 15, max 50. Chrome Default profile only, independent of extension/tab group; local ISO 8601 times. Domain counts: visits since since; page counts: lifetime visits. Requires Full Mac and file-read permission; no card. Deadline: 2 seconds.",
                   tool: "read_file", read: true),
-        AppAction("photos.count", "files", "Count Photos library assets by creation date and media type",
+        AppAction("photos.count", "files", "Count Photos assets by creation date and media type",
                   ["start?", "end?", "media_type?"],
-                  warn: "start/end: ISO 8601 timestamps with timezone, inclusive start and exclusive end. media_type: all (default), image or video. Requests macOS Photos access only when called; limited access counts only shared assets.",
+                  warn: "start/end: ISO 8601 with timezone, start inclusive/end exclusive. media_type: all (default), image or video. Requests macOS Photos access on call; limited access counts only shared assets.",
                   tool: "photos_read", input: verb("count"), read: true),
-        AppAction("photos.recent", "files", "Read newest Photos library asset metadata: date, media type, dimensions, favorite and stored location coordinates",
+        AppAction("photos.recent", "files", "Read newest Photos metadata: creation date, media type, dimensions, favorite and stored location coordinates",
                   ["limit?:int", "start?", "end?", "media_type?"],
-                  warn: "limit: 1–100, default 10, newest creation dates first. start/end: ISO 8601 timestamps with timezone, inclusive start and exclusive end. media_type: all (default), image or video. Reads metadata only; requests macOS Photos access only when called.",
+                  warn: "limit: 1–100, default 10, newest creation first. start/end: ISO 8601 with timezone, start inclusive/end exclusive. media_type: all (default), image or video. Metadata only; requests macOS Photos access on call.",
                   tool: "photos_read", input: verb("recent"), read: true),
         // Today's Inbox: the notes Today and the Desk count. Each id is the
         // word on the note's button; a note read lists its buttons as these ids.
         AppAction("inbox.archive", "inbox", "Archive", ["ids|id", "reason"], tool: "inbox", input: verb("archive")),
-        AppAction("inbox.acknowledge", "inbox", "Acknowledge", ["ids|id", "reason"], tool: "inbox", input: verb("archive")),
+        AppAction("inbox.acknowledge", "inbox", "Archive", ["ids|id", "reason"], tool: "inbox", input: verb("archive")),
         AppAction("inbox.dismiss", "inbox", "Dismiss", ["ids|id", "reason"], tool: "inbox", input: verb("dismiss")),
         AppAction("inbox.mark_read", "inbox", "Mark read (opening a note does this)", ["ids|id", "reason"],
                   tool: "inbox", input: verb("mark_read")),
         AppAction("inbox.repair", "inbox", "Repair", ["id"], tool: "inbox", input: verb("repair")),
-        AppAction("inbox.act", "inbox", "Act", ["id", "action?"], irreversible: true, tool: "inbox", input: verb("act")),
+        AppAction("inbox.act", "inbox", "Act", ["id", "action?"], irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: verb("act")),
         AppAction("inbox.clean_up", "inbox", "Clean Up", ["id"], tool: "inbox", input: press("act")),
         AppAction("inbox.open_approvals", "inbox", "Open Approvals", ["id"], tool: "inbox", input: press("open_approvals")),
         AppAction("inbox.not_now", "inbox", "Not now", ["id", "reason?"], irreversible: true,
-                  warn: "declines the card. The owner's own Not now wakes the conversation that raised it; yours does not: "
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], warn: "declines the card. The owner's own Not now wakes the conversation that raised it; yours does not: "
                       + "the card retires and that request does not run again",
                   tool: "inbox", input: verb("not_now")),
         AppAction("inbox.withdraw", "inbox", "Withdraw my own pending approval", ["id", "reason?"], irreversible: true,
-                  tool: "inbox", input: verb("withdraw")),
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: verb("withdraw")),
         AppAction("inbox.open_on_mac", "inbox", "Open on Mac", ["id"], owner: .his("it opens the card for the owner at the Mac",
                   instead: "inbox.not_now declines it; inbox.archive retires a stale one"), tool: "inbox", input: press("act")),
         AppAction("inbox.approve", "inbox", "Approve", ["id"], owner: .his("it is his consent; he approves on Today or the banner"),
-                  irreversible: true, tool: "inbox", input: press("approve")),
+                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: press("approve")),
         AppAction("inbox.deny", "inbox", "Deny", ["id"], owner: .his("it decides an approval; he answers on Today or the banner"),
-                  irreversible: true, tool: "inbox", input: press("reject")),
+                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: press("reject")),
 
         // Chat: the sidebar and the conversation's own controls.
+        // An idempotent append through Reach's owner, independent of a page version.
+        AppAction("chat.post", "chat", "Tell the person directly", ["message"], irreversible: true,
+                  toolClass: .send, reach: .his, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_post", versionExempt: true),
         AppAction("chat.list", "chat", "Conversations, newest first; query filters by title; pinned:true only pinned, pinned:false only unpinned; filters apply before offset", ["archived?:bool", "pinned?:bool", "query?", "offset?:int"],
                   tool: "chat_conversations", read: true),
         AppAction("chat.new", "chat", "New chat; title names it in the same call", ["title?"], tool: "chat_session", input: verb("new")),
@@ -281,7 +311,7 @@ public enum AppActions {
         AppAction("chat.archive", "chat", "Archive", ["session_id?", "reason?"], tool: "chat_session", input: verb("archive")),
         AppAction("chat.stop", "chat", "Stop", ["session_id?"], tool: "chat_session", input: verb("stop")),
         AppAction("chat.regenerate", "chat", "Regenerate (redo / try again) your last answer", ["session_id?"], irreversible: true,
-                  tool: "chat_session", input: verb("regenerate")),
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_session", input: verb("regenerate")),
         AppAction("chat.steer", "chat", "Steer (queue)", ["turn_id", "session_id?"], tool: "chat_session",
                   input: queue("steer")),
         AppAction("chat.send_next", "chat", "Send next (queue)", ["turn_id?", "session_id?"], tool: "chat_session",
@@ -289,7 +319,7 @@ public enum AppActions {
         // Irreversible (flag audit, 10-02): the queued message is dropped from
         // memory, and nothing keeps User's words to bring back.
         AppAction("chat.remove", "chat", "Remove (queue)", ["turn_id", "session_id?", "reason?"], irreversible: true,
-                  tool: "chat_session", input: queue("remove")),
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_session", input: queue("remove")),
         AppAction("chat.compact", "chat", "Compact now", ["session_id?"], tool: "chat_session", input: verb("compact_now")),
         AppAction("chat.export", "chat", "Export to Markdown", ["session_id?"], tool: "chat_session", input: verb("export")),
         AppAction("chat.detach", "chat", "Open in its own window", ["session_id?"], screen: true,
@@ -297,12 +327,12 @@ public enum AppActions {
         AppAction("chat.close_window", "chat", "Close its window", ["session_id?"], screen: true,
                   tool: "chat_session", input: verb("close_window")),
         AppAction("chat.clear", "chat", "/clear", ["session_id"], irreversible: true,
-                  tool: "chat_session", input: verb("clear")),
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_session", input: verb("clear")),
         // The composer.
         AppAction("chat.draft", "chat", "Draft", ["value", "session_id?", "attachments?:list"],
                   tool: "interaction_act", input: composer("set_draft")),
-        AppAction("chat.send", "chat", "Send", ["value?", "session_id?", "attachments?:list"], irreversible: true, toolClass: .send,
-                  tool: "interaction_act", input: composer("send")),
+        AppAction("chat.send", "chat", "Send", ["value?", "session_id?", "attachments?:list"], irreversible: true,
+                  toolClass: .send, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "interaction_act", input: composer("send")),
         AppAction("chat.model", "chat", "Model (app-wide: every chat)", ["provider", "model", "session_id?"], tool: "interaction_act",
                   input: composer("set_model"), rename: ["provider": "value", "model": "choice"]),
         AppAction("chat.think", "chat", "Thinking level (app-wide: every chat)", ["level", "session_id?"], tool: "interaction_act",
@@ -328,23 +358,25 @@ public enum AppActions {
         // What she makes, in versions; the Work pane's Make tab shows them.
         // Version-exempt: add only appends a version, and never touches one.
         AppAction("make.add", "chat", "Add a file to Make as a new version of ref (a new ref when left out); returns the ref",
-                  ["path", "ref?"], tool: "make_studio", input: verb("add"), versionExempt: true),
+                  ["path", "ref?", "prompt?", "model?"], tool: "make_studio", input: verb("add"), versionExempt: true),
         AppAction("make.read", "chat", "A Make ref's versions: n, path, prompt, created (the newest ref when left out)",
                   ["ref?"],tool: "make_studio", input: verb("read"), read: true),
+        AppAction("studio.intake.read", "personality", "Read neutral consult or corrected complete-history facts for unanswered-work intake; carry snapshot through every page",
+                  ["kind:history|consults", "offset?:number", "snapshot?"], capabilities: ["app_data_read"], tool: "studio_intake_read", read: true),
         // What goes with her answer, by her hand: the reply's face carries it to every door.
         AppAction("reply.attach", "chat", "Attach an image to the reply you are writing now; it goes with your answer wherever this conversation is answered (the Mac chat, Telegram)",
                   ["path"], warn: "One image per call, by its own path: jpg, png, gif, webp, bmp or heic, inside your Trust workspace unless this Mac is in Full Mac.",
                   tool: "read_file", read: true),
         // Her own fix for a place, in her turn; then it's built.
-        AppAction("sense.make", "chat", "Learn to read and understand a new kind of file, binary format, app or page so ordinary reads work from now on. code is a complete sense.js (kit: Contents/Resources/Senses in the app bundle — AUTHORING.md, sense.js starter, builtin/app.js, site.js). It runs on the place you just read (or place, its corner key) and returns the page and an exact trial_id/digest; keep that trial with trial_id, digest and keep:true without resending code. keep:true with code runs and keeps it immediately; show:\"material\" (no code) returns exactly what sense.source.read() gets",
+        AppAction("sense.make", "chat", "Learn to read a file format (including binary), app or page so ordinary reads work. code: complete sense.js; kit: Contents/Resources/Senses in the app bundle (AUTHORING.md, starter sense.js, builtin/app.js, builtin/site.js). Runs on the last-read place or place corner key; returns its page and trial_id/digest. Keep that exact trial with {trial_id,digest,keep:true}, no code. {code,keep:true} runs and keeps immediately. {show:\"material\"}, no code, returns sense.source.read() exactly",
                   ["code?", "trial_id?", "digest?", "keep?:bool", "place?", "why?", "show?", "apps?:list", "reach?:object", "wake?:list", "face?:object", "resident?:bool", "learned?:any", "choices?:any"],
-                  warn: "apps declares bundle ids for sense.apps.read({bundle_id,dictionary:true}) or read-only Apple Events using event_class, event_id and parameters. Standard core getd/cnte/doex events are reads; other events require a tool's write declaration.", tool: "sense_make",
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], warn: "apps declares bundle ids for sense.apps.read({bundle_id,dictionary:true}) or read-only Apple Events using event_class, event_id and parameters. Standard core getd/cnte/doex events are reads; other events require a tool's write declaration.", tool: "sense_make",
                   readWhen: ["show": .string("material"), "trial_id": .null, "digest": .null], lifecycle: .change),
         AppAction("sense.versions", "senses", "Read a sense's current and retained versions", ["sense_id"],tool: "sense_lifecycle", input: ["verb": .string("versions")], read: true),
-        AppAction("sense.quarantine", "chat", "Switch a sense off while retaining its current and previous versions", ["sense_id", "version:number"], tool: "sense_lifecycle", input: ["verb": .string("quarantine")], revision: 2, lifecycle: .change),
+        AppAction("sense.quarantine", "chat", "Turn a sense off while retaining its current and previous versions", ["sense_id", "version:int"], tool: "sense_lifecycle", input: ["verb": .string("quarantine")], revision: 2, lifecycle: .change),
         AppAction("sense.restore", "chat", "Turn the selected sense version back on", ["sense_id"], tool: "sense_lifecycle", input: ["verb": .string("restore")], revision: 2, lifecycle: .restore),
-        AppAction("sense.rollback", "chat", "Swap the current and previous sense versions; an on sense stays on, an off sense needs sense.restore", ["sense_id", "version:number"], tool: "sense_lifecycle", input: ["verb": .string("rollback")], revision: 2, lifecycle: .rollback),
-        AppAction("sense.drop", "chat", "Delete a sense and its run statistics permanently", ["sense_id"], irreversible: true, tool: "sense_lifecycle", input: ["verb": .string("drop")], revision: 2, lifecycle: .drop),
+        AppAction("sense.rollback", "chat", "Swap the current and previous sense versions; an on sense stays on, an off sense needs sense.restore", ["sense_id", "version:int"], tool: "sense_lifecycle", input: ["verb": .string("rollback")], revision: 2, lifecycle: .rollback),
+        AppAction("sense.drop", "chat", "Delete a sense and its run statistics permanently", ["sense_id"], irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "sense_lifecycle", input: ["verb": .string("drop")], revision: 2, lifecycle: .drop),
         AppAction("persona.set", "personality", "Switch persona", ["name"], screen: true, tool: "interaction_act",
                   input: composer("set_persona"), rename: ["name": "value"]),
         AppAction("app.check_updates", "settings", "Check for NativeAgent updates only; macOS uses mac.system_info with check_updates:true, App Store apps use App Store → Updates",tool: "interaction_act",
@@ -374,17 +406,17 @@ public enum AppActions {
         // Irreversible (flag audit, 10-02): the card's own button does what it
         // asked, as inbox.approve does, and nothing presses it back.
         AppAction("permissions.request", "chat", "Ask for a macOS permission in your own words", ["capability", "why", "mode?"],
-                  warn: "capability: accessibility, screenRecording, inputMonitoring, fullDiskAccess, contacts, calendars, reminders, microphone, location, speechRecognition, notifications; Automation: applescript:<bundle_id>. Only the person taps Allow on the Mac; the waiting work continues after the grant.",
+                  capabilities: ["safe_read", "tool_call"], warn: "capability: \(SystemPermissionCapability.requestable); Automation: applescript:<bundle_id>. Only the person taps Allow on the Mac; the waiting work continues after the grant.",
                   tool: "request_interaction", input: ["kind": .string("permission")], folded: true),
         AppAction("card.answer", "chat", "The card's own button (its Do: line)", ["id", "value?:secret", "choice?"],
-                  irreversible: true, warn: "never ask the owner for a key or token in chat: they type it into the card",
+                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], warn: "never ask the owner for a key or token in chat: they type it into the card",
                   tool: "interaction_act", input: card("primary"), rename: ["id": "interaction_id"]),
-        AppAction("card.not_now", "chat", "Not now", ["id", "reason?"], irreversible: true, tool: "interaction_act",
+        AppAction("card.not_now", "chat", "Not now", ["id", "reason?"], irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "interaction_act",
                   input: card("decline"), rename: ["id": "interaction_id"]),
         // Irreversible (flag audit, 10-02): it runs the card's own control as
         // card.answer does, a capability grant included.
         AppAction("card.try_again", "chat", "Try again", ["id", "value?:secret", "choice?"], irreversible: true,
-                  tool: "interaction_act",
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "interaction_act",
                   input: card("retry"), rename: ["id": "interaction_id"]),
 
         // Providers.
@@ -397,33 +429,29 @@ public enum AppActions {
                   owner: .his("he signs in through the browser window Providers → Sign in opens, or pastes the key there")),
         AppAction("provider.disconnect", "providers", "Disconnect", ["provider"],
                   owner: .his("only he can sign back in; he disconnects on Providers"), irreversible: true,
-                  tool: "provider", input: verb("disconnect")),
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "provider", input: verb("disconnect")),
 
-        // Connectors, Telegram, MCP and the paired phone: down, never up.
+        // Connectors, Telegram and the paired phone: down, never up.
         AppAction("connector.off", "connectors", "Turn off", ["id", "reason?"], tool: "connections", input: verb("connector_off")),
         AppAction("connector.on", "connectors", "Turn on", ["id"], owner: .his("it raises Trust; he turns it on in Connectors"),
                   tool: "connections", input: verb("connector_on")),
         AppAction("connector.disconnect", "connectors", "Disconnect", ["id"],
                   owner: .his("only he can sign back in; he disconnects in Connectors", instead: "connector.off stops one"),
-                  irreversible: true, tool: "connections", input: verb("connector_disconnect")),
+                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections", input: verb("connector_disconnect")),
         AppAction("telegram.repair", "telegram", "Rebuild admission index", ["inbox"], tool: "connections",
                   input: verb("telegram_repair")),
         // Irreversible (flag audit, 10-02): a real message to User's Telegram.
-        AppAction("telegram.test", "telegram", "Send test reply", irreversible: true, toolClass: .send, tool: "connections",
+        AppAction("telegram.test", "telegram", "Send test reply", irreversible: true, toolClass: .send, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections",
                   input: verb("telegram_test")),
-        AppAction("telegram.clear_logs", "telegram", "Clear logs", irreversible: true, tool: "connections",
+        AppAction("telegram.clear_logs", "telegram", "Clear logs", irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections",
                   input: verb("telegram_clear_logs")),
         AppAction("telegram.disconnect", "telegram", "Remove the token",
                   owner: .his("only he can sign back in; Connectors → Telegram",
                              instead: "setting.set with setting telegram.enabled, value false stops it"),
-                  irreversible: true, tool: "connections", input: verb("telegram_disconnect")),
+                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections", input: verb("telegram_disconnect")),
         AppAction("pairing.remove", "pairing", "Remove the phone", ["id"],
                   owner: .his("only he can pair it again; Connectors → iPhone"), irreversible: true,
-                  tool: "connections", input: verb("pairing_remove")),
-        AppAction("mcp.warm", "mcp", "Warm", ["server_id"], tool: "connections", input: verb("mcp_warm")),
-        AppAction("mcp.restart", "mcp", "Restart", ["server_id"], tool: "connections", input: verb("mcp_restart")),
-        AppAction("mcp.refresh", "mcp", "Refresh", ["server_id"], tool: "connections", input: verb("mcp_refresh")),
-        AppAction("mcp.repair", "mcp", "Reconstruct saved server records", ["records:array", "expected_sha256"], tool: "connections", input: verb("mcp_repair")),
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections", input: verb("pairing_remove")),
 
         // Upkeep buttons, on the pages that carry them.
         AppAction("doctor.run", "diagnostics", "Run Doctor checks",tool: "doctor_status", input: ["repair": .bool(false)], read: true),
@@ -433,10 +461,10 @@ public enum AppActions {
         AppAction("backup.now", "trust", "Back up now", tool: "upkeep", input: verb("backup_now")),
         AppAction("backup.restore", "trust", "Restore", ["id"],
                   owner: .his("it replaces what is here now; Trust → Advanced → Backups → Restore"), irreversible: true,
-                  warn: "a restore that needs it restarts NativeAgent when this turn ends, 20 seconds at most",
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], warn: "a restore that needs it restarts NativeAgent when this turn ends, 20 seconds at most",
                   tool: "upkeep", input: verb("backup_restore")),
         AppAction("history.clear", "trust", "Delete all recorded activity", irreversible: true,
-                  tool: "upkeep", input: verb("activity_wipe")),
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "upkeep", input: verb("activity_wipe")),
         AppAction("embeddings.pause", "settings", "Pause the memory-search download", tool: "upkeep",
                   input: verb("embeddings_pause")),
         AppAction("embeddings.resume", "settings", "Resume the memory-search download", tool: "upkeep",
@@ -452,14 +480,14 @@ public enum AppActions {
                   read: true),
         AppAction("memory.rewrite", "memories", "Rewrite, pin, unpin or restore a memory",
                   ["id", "text?", "pinned?:bool", "restore?:bool", "reason?"],
-                  warn: "text is the thing itself, one or two sentences, no date, source, ids or preamble; "
+                  capabilities: ["memory_write", "tool_call"], warn: "text is the thing itself, one or two sentences, no date, source, ids or preamble; "
                       + "a restore that matches something forgotten stays archived",
                   // Not version-exempt: a text rewrite or a restore can overwrite
                   // another conversation's correction. The supersede demotion
                   // is memory.commit's supersedes, which is.
                   tool: "rewrite_memory"),
         AppAction("memory.pin", "memories", "Pin a fact about the owner (user fact, preference, relationship, identity, attribute) to your prompt core, in pin order; moments stay in recall", ["id"],
-                  tool: "rewrite_memory", input: ["pinned": .bool(true)]),
+                  capabilities: ["memory_write", "tool_call"], tool: "rewrite_memory", input: ["pinned": .bool(true)]),
 
         // Her mind: Dreams (Personality), Self-Improvement and standing views
         // (Today), the Observatory (Diagnostics → Cognition).
@@ -471,7 +499,7 @@ public enum AppActions {
         AppAction("mind.misses", "today", "Your misses: corrections by lesson, this week against last, each with its history locator",
                  tool: "mind_run", input: verb("misses"), read: true),
         AppAction("mind.decline_view", "today", "Decline a proposed standing view", ["view_id", "reason?"], irreversible: true,
-                  tool: "mind_run", input: verb("decline_view")),
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "mind_run", input: verb("decline_view")),
         AppAction("mind.approve_view", "today", "Approve a standing view", ["view_id"],
                   owner: .his("a standing view is his to sign"), tool: "mind_run", input: verb("approve_view")),
         AppAction("mind.think_now", "diagnostics", "Think now", tool: "mind_run", input: verb("think_now")),
@@ -499,78 +527,57 @@ public enum AppActions {
         AppAction("mind.include_workspace", "diagnostics", "Include your workspace in your thinking again", tool: "mind_run",
                   input: verb("include_workspace")),
         AppAction("mind.clear", "diagnostics", "Clear the thought store",
-                  irreversible: true, tool: "mind_run", input: verb("clear")),
+                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "mind_run", input: verb("clear")),
 
-        // Skills and Tools keep their own action pages.
-        AppAction("skill.enable", "skills", "Enable the rehearsed routine; version optionally pins its exact candidate digest", ["name", "version?"], tool: "skill_manage", input: verb("enable"),
-                  lifecycle: .enable),
-        AppAction("skill.disable", "skills", "Disable", ["name", "reason?"], tool: "skill_manage", input: verb("disable"), lifecycle: .change),
-        AppAction("skill.delete", "skills", "Delete permanently", ["name", "reason?"], irreversible: true, tool: "skill_manage", input: verb("delete"), revision: 2, lifecycle: .drop),
-        // Restoring turns a skill back on, with its script admitted again.
-        AppAction("skill.restore", "skills", "Restore", ["name"], tool: "skill_manage", input: verb("restore"),
-                  revision: 2, lifecycle: .restore),
-        AppAction("skill.rollback", "skills", "Swap the current and previous skill versions; optional version must name the previous version", ["name", "version?"],
-                  tool: "skill_manage", input: verb("rollback"), revision: 2, lifecycle: .rollback),
-        AppAction("skill.drop", "skills", "Delete a skill and its run statistics permanently", ["name", "reason?"],
-                  irreversible: true, tool: "skill_manage", input: verb("drop"), revision: 2, lifecycle: .drop),
-        AppAction("skill.quarantine", "skills", "Switch a skill off while preserving its current and previous versions", ["name", "reason?"],
-                  tool: "skill_manage", input: verb("quarantine"), revision: 2, lifecycle: .change),
-        AppAction("skill.validate", "skills", "Rehearse supplied input matching params; intercepted replies prove no live behavior", ["name", "input?:object", "capture?:bool"],
-                  tool: "skill_manage", input: verb("validate"), lifecycle: .change),
-        // A script skill's run (skills-as-code PR 3, `doorSkill`): only the
-        // actions it declares; every call retains the turn's gates.
-        AppAction("skill.run", "skills", "Run the selected JavaScript routine, input by its signature; each call takes the ordinary turn's gates", ["name", "input|args?:object"],
-                  warn: "preview:true says where each step would hand back or card, and runs nothing",
-                  tool: "skill_manage", input: verb("run")),
-        AppAction("skill.resume", "skills", "Resume a skill run that stopped to ask you or handed a step back",
-                  ["run_id", "answer?:any"], warn: "the step it stopped at returns answer",
-                  tool: "skill_manage", input: verb("resume")),
-        AppAction("tool.quarantine", "diagnostics", "Switch off", ["tool_id", "reason?"], tool: "skill_manage",
-                  input: verb("tool_quarantine"), revision: 2, lifecycle: .change),
-        AppAction("tool.reject", "diagnostics", "Discard a proposed tool version", ["tool_id"], irreversible: true, tool: "skill_manage",
-                  input: verb("tool_reject"), revision: 2, lifecycle: .change),
-        // One lifecycle with skills: restore turns on; rollback swaps current and previous.
-        AppAction("tool.restore", "diagnostics", "Restore", ["tool_id"],
-                  owner: .his("turning a tool you wrote back on is his; Tools page"), tool: "skill_manage",
-                  input: verb("tool_restore"), revision: 2, lifecycle: .restore),
-        AppAction("tool.rollback", "diagnostics", "Swap the current and previous tool versions; optional version must name the previous version", ["tool_id", "version?"],
-                  tool: "skill_manage", input: verb("tool_rollback"), revision: 2, lifecycle: .rollback),
-        AppAction("tool.drop", "diagnostics", "Delete a tool and its run statistics permanently", ["tool_id"],
-                  irreversible: true, tool: "skill_manage", input: verb("tool_drop"), revision: 2, lifecycle: .drop),
-        AppAction("tool.validate", "diagnostics", "Rehearse supplied input or fixtures; intercepted replies prove no live behavior", ["tool_id", "input?:object", "capture?:bool"],
-                  tool: "skill_manage", input: verb("tool_validate"), lifecycle: .change),
-        AppAction("tool.approve", "diagnostics", "Approve", ["tool_id"],
-                  owner: .his("activating a tool you wrote is his; Tools page"), tool: "skill_manage",
-                  input: verb("tool_approve"), lifecycle: .enable),
-        // Her authoring surface: a tool she writes is filed as a proposal and
-        // becomes the action authored.<tool_id> once it is approved.
-        AppAction("tool.propose", "diagnostics", "Learn a new way to act by writing a tool: drive any scriptable Mac app (its documents, presentations, spreadsheets, mail) through AppleScript or Apple Events, or do anything no existing action does",
-                  ["tool_id", "description", "code", "tests?:list", "permissions?:list", "input_schema?:any", "actions?:list", "input?:object", "capture?:bool", "converts?:list", "reach?:object", "wake?:list", "face?:object", "resident?:bool", "learned?:any", "choices?:any"],
-                  warn: "code is tool.js, sync-only JavaScript: define function run(input) returning plain JSON; async functions and Promises are unsupported. host.files calls the file door actions read/list/info/excerpt/grep/spotlight/write/copy/move/trash/patch; host.network serves connect/listen/accept/send/receive/close. host.call(operation, args) uses the same routes. "
-                      + "host.model.call({purpose,prompt|messages,schema?}) thinks on your current chat model and returns text or checked JSON, with no persona added; declare model. messages contain {role,content} strings. "
-                      + "host.fetch({connector?,url,method?,headers?,body?}) returns {status,headers,body}; body is UTF-8 text. Declare connector:<id> for gmail, calendar, notion, slack, x, github or agentmail; the app attaches credentials only to that connector's API hosts. Keyless fetch requires network_public. Redirects are returned, never followed. host.measurementSystem is the Mac's us, metric or other measurement system. "
-                      + "host.calendar.list/search/create/update/delete call calendar.upcoming/upcoming/create/modify/delete; host.reminders.list/search/create/update/delete call reminders.query/query/create/update/delete; host.contacts.search/read/create/update call contacts.search/search/save/save. Each takes that app action's named arguments. Declaring calendar, reminders or contacts includes that page's door dependencies; file reach includes file read dependencies, and write reach includes file mutations. Reach may be named permissions or reach. Every effect keeps its ordinary Trust gate. "
-                      + "host.apps.call({bundle_id,dictionary:true}) reads an app's sdef; events use {bundle_id,event_class,event_id,parameters}. Declare app_read:<bundle_id> or app_write:<bundle_id> in reach.capabilities. Standard core getd/cnte/doex events are reads; modifying or unclassified events require write. App calls never prompt for consent; request permission with target applescript:<bundle_id> for the owner's system grant. "
-                      + "host.apps.call({bundle_id,script}) runs an AppleScript body in the declared app's tell context and always requires app_write:<bundle_id>. Scripting additions, resource imports, script objects and self references are unavailable; every event must address that app's exact process. app_write grants the app's own broad reach: for example, Finder may open files or URLs in other apps in response to its events. "
+        // Her parts (docs/AGENT_IS_THE_APP.md): what a part can do is what it
+        // declares, never which door made it. One save, one keep, one run
+        // (authored.<id>), one read, one lifecycle; ability_manage runs them all.
+        AppAction("ability.save", "tools", "Grow an ability beyond existing actions: apps through AppleScript/Apple Events, programs, servers or services; or keep a route that worked by hand. Resident abilities hold programs/connections until turned off or app quit; reopening at launch requires wake [\"resumed\"] and reopening code",
+                  ["id", "description?", "code?", "edits?:list", "params?:any", "actions?:list", "fixtures?:list", "name?", "triggers?:list", "converts?:list", "create_only?:bool", "reach?:object", "wake?:list", "face?:object", "resident?:bool", "learned?:any", "choices?:any", "input_schema?:any", "permissions?:list"],
+                  warn: "description: one line, at most 500 characters; details in params. code: sync-only JavaScript function run(input) returning JSON (to decline on purpose, return {status:\"refused\",reason:\"revision_required\",detail:\"This ability does not support that input.\",effects:\"none\",remedy:{instruction:\"Read this ability, then revise it for the input.\",next_call:{tool:\"app\",input:{action:\"ability.read\",args:{id:\"your_ability_id\"}}}}}; use the actual cause, detail, effects and id. A person-owned decision uses remedy {instruction,tap}; a terminal refusal uses remedy {kind:\"terminal\",instruction:\"why no further action is appropriate\",next_call:null}. A decline is an answer, not a fault; a throw or {ok:false} reads as broken and owes a repair); save refuses async, await or Promise outside strings/comments before execution. app.<page>.<action>(args) runs any action under ordinary gates; calls are derived from code. app.step(label,guidance), app.decide(question,data), app.expect(ok,what), app.expect_fail(code,fn) make a strict journal; decide hands back its question for ability.resume {run_id,answer}. Calls return action data plus call (action id) and effects (none,occurred,partial,unknown); failures throw catchable AppError with e.reason,e.effects,e.call,e.receipt. host.state.get() and host.state.set(value) persist this ability's JSON. host.files: read/list/info/excerpt/grep/spotlight/write/copy/move/trash/patch. host.network: connect/listen/accept/send/receive/close; connect takes {host,port,tls?,transport?} or {path} for a Mac socket (localhost). host.program.start({command,args?,env?,cwd?}) runs a path or a name on the login PATH, returning {id}. host.program.send and host.network.send take {id,text} or {id,base64}, each through Trust as an effect. host.program.receive({id})/host.network.receive({id}) return the next {text} or non-UTF-8 {base64,binary:true}, with eof and, for programs, stream/exit_code. receive/accept wait up to wait seconds (default 30), then {pending:true}; fetch waits up to wait seconds (default 120) for its whole answer. send waits up to wait seconds (default 30) for acceptance, else ends that program/connection. Over 4 MiB unread program output ends it. host.program.close({id}) ends it and its children; detached sessions can outlive it, as in the shell. Declare shell: requires Full Mac with file operations on, the same shell sandbox, and cwd inside the workspace (default) unless Full Mac lifts the sandbox. host.call(id,args) reaches exactly app.<id>(args) or the named primitive (host.call(\"network.send\",…) is host.network.send(…)), under the same declarations/gates. "
+                      + "host.model.call({purpose,prompt|messages,schema?}) uses your current chat model, without persona, returning text or checked JSON; declare model. messages: {role,content} strings. "
+                      + "host.fetch({url,method?,headers?,body?}) returns {status,headers,body}, body as UTF-8. Keyless calls require network_public, or network_localhost for loopback. Returns redirects without following. "
+                      + "Use {{secret:<name>}} in fetch url/headers/body, network.send text or program args/env/stdin; declare secret:<name>. Values go only to their granted host (https, established TLS, or Mac loopback; never udp) or program, and read back as [secret:<name>]. An absent secret refuses with card.request to ask once. Secret-bearing GET/HEAD with no body is a read; every other secret-bearing call passes Trust as an effect. host.measurementSystem: us, metric or other. app.mac.system_info({person:true}) returns {here,idle_seconds} from the person's input only (never yours), away after 300 seconds idle. Use it: ioreg/event-source idle clocks count your input. "
+                      + "host.calendar.list/search/create/update/delete map to calendar.upcoming/upcoming/create/modify/delete; host.reminders.list/search/create/update/delete to reminders.query/query/create/update/delete; host.contacts.search/read/create/update to contacts.search/search/save/save, using each app action's named arguments. calendar/reminders/contacts declarations include their app action dependencies; file reach includes reads, write reach mutations. reach: {capabilities,readPaths?,hosts?,apps?}; legacy permissions: capabilities list. Every effect passes Trust. "
+                      + "host.apps.call({bundle_id,dictionary:true}) reads sdef; events take {bundle_id,event_class,event_id,parameters}. Declare app_read:<bundle_id> or app_write:<bundle_id> in reach.capabilities. Standard core getd/cnte/doex events are reads; modifying/unclassified events require write. Calls never prompt: request permission with target applescript:<bundle_id> for the owner's macOS grant. "
+                      + "host.apps.call({bundle_id,script}) runs AppleScript in that app's tell context; always requires app_write:<bundle_id>. No scripting additions, resource imports, script objects or self references; every event targets that exact process. app_write grants the app's broad reach: Finder, for example, can open files/URLs in other apps. "
                       + "Event parameters use four-character keys and JSON descriptors: primitives, lists, {type}, {enum}, {record}, or {object:{want,form,seld,from}}. "
-                      + "Omitted or null from means the application itself: host.apps.call({bundle_id:\"com.apple.Keynote\",event_class:\"core\",event_id:\"getd\",parameters:{\"----\":{object:{want:\"prop\",form:\"prop\",seld:{type:\"pnam\"},from:null}}}}) reads the app's name. "
-                      + "screen.watch({app,fps?,seconds?,region?}) keeps your eyes on that app's front window for the run (fps up to 30, default 10; seconds up to 600, default 60; declare screen.watch). "
-                      + "screen.next(timeout?) waits for the newest frame you have not seen, skipping older ones, and returns {watch,seq,at,width,height,screen,read}; with timeout, {timedOut:true} when that many seconds pass without a new frame; null once the watch ends (window gone, time spent, Stop, screen control turned off, or the person's input during a watch with hands; a watch without hands never ends on the person's input). "
-                      + "f.read([...]) answers a list of queries in one call, until the next frame arrives, in frame pixels: {at:[x,y]} gives {r,g,b}; {mean:[x,y,w,h]} {r,g,b,l}; {changed:[x,y,w,h]} the share of pixels changed since the frame before; {text:[x,y,w,h]} redacted on-device text. "
-                      + "With reach hands, hand.click/double_click/right_click/move(x,y), hand.drag(x,y,toX,toY), hand.key(\"cmd+s\"), hand.hold(\"w\",seconds), hand.down(\"w\") and hand.up(\"w\") act on that window in frame pixels at frame speed, with no model call: the code is the reflex, your args the intent. A key held by down is released by up, the run's end, or the person's input. "
+                      + "Omitted/null from targets the application: host.apps.call({bundle_id:\"com.apple.Keynote\",event_class:\"core\",event_id:\"getd\",parameters:{\"----\":{object:{want:\"prop\",form:\"prop\",seld:{type:\"pnam\"},from:null}}}}) reads its name. "
+                      + "screen.watch({app,fps?,seconds?,region?}) watches that app's front window for the run; fps up to 30 (default 10), seconds up to 600 (default 60); declare screen.watch. "
+                      + "screen.next(timeout?) skips older frames and returns the newest unseen {watch,seq,at,width,height,screen,read}; {timedOut:true} after timeout seconds without a new frame. Returns null when the watch ends: window gone, duration spent, Stop, screen control off, or person input with hands. Without hands, person input never ends it. "
+                      + "f.read([...]) batches queries in frame pixels until the next frame: {at:[x,y]} → {r,g,b}; {mean:[x,y,w,h]} → {r,g,b,l}; {changed:[x,y,w,h]} → share changed since the prior frame; {text:[x,y,w,h]} → redacted on-device text. "
+                      + "Declare hands for hand.click/double_click/right_click/move(x,y), hand.drag(x,y,toX,toY), hand.key(\"cmd+s\"), hand.hold(\"w\",seconds), hand.down(\"w\"), hand.up(\"w\"): frame-speed actions on that window in frame pixels, no model call; code is the reflex, args the intent. Keys held by down release on up, run end or person input. "
                       + "const eyes = screen.watch({app:\"Safari\",fps:10,seconds:60}); while (true) { const f = screen.next(); if (!f) break; const [c] = f.read([{at:[120,80]}]); if (c.r > 200 && c.g < 60) hand.click(120,80) } "
-                      + "host.paths.home is the user's absolute home directory; use it to resolve ~ in tool inputs. host.paths.workspace is your own folder for files you make; save there unless the person names a place. Files take their door action's named arguments and return its result: host.files.write({path:\"workspace/note.txt\",content:\"hello\"}). Network send/receive use base64 bytes. "
-                      + "Declare app-action dependencies in actions; declarations never grant them. Omit tests or set capture:true to record one run with input (default {}): "
-                      + "a read runs live and its answer is kept; every effect, nested tool and decision returns a visible placeholder. Later validation replays the sealed capture. This rehearses only the supplied inputs and reached calls; intercepted replies are not behavioral proof. "
-                      + "Or supply {input, expected, calls?:[{operation,args,result}]} fixtures; validation intercepts every host call, "
+                      + "host.paths.home: absolute user home; resolve ~ in tool inputs. host.paths.workspace: your file folder; save there unless the person names another place. Files use app action arguments/results: host.files.write({path:\"workspace/note.txt\",content:\"hello\"}). "
+                      + "actions lists only app actions reached dynamically through host.call; declarations grant no authority. params: input name → string/int/number/bool/list/object (optional with ?), {type,description?}, or a JSON Schema object. Revisions inherit code and unstated declarations (description,params,actions,reach,wake,face,resident,learned,choices) from the latest version; restating replaces, []/{} clears. ability.read {id} reads its code. Use edits:[{old,new}] instead of code: each old must occur exactly once; replacements apply in order and save as a revision. ability.validate intercepts calls: omit fixtures or use capture:true for one input run (default {}): "
+                      + "reads run live and answers are sealed; effects, nested tools and decisions return visible placeholders. Later validation replays that capture, covering only supplied inputs/reached calls; intercepted replies prove no live behavior. "
+                      + "Or supply {input,expected,calls?:[{operation,args,result}]} fixtures to intercept every host call, "
                       + "including app.<action> dependencies as operation app.<action>. reach.capabilities from app_data_read, app_data_write, network_localhost, "
-                      + "network, network_public, computer_files, arbitrary_file_write, shell, screen.watch, hands, and a tool that only reads "
-                      + "declares only app_data_read and/or app_read:<bundle_id>. Any admitted tool is callable from scripts under the same gates. It waits on the Tools page until "
-                      + "tool.approve activates it, then runs as authored.<tool_id>. Part header: reach {capabilities,readPaths,hosts,apps}; wake defaults []; face {page,action?} places its action and may name an unclaimed door action id. input_schema.readOnly declares a read contract; each effect still passes Trust. resident defaults false and retains JS between successful runs. learned.use reports exact-input and reached-call outcomes from ordinary gated runs of the selected version; completion proves execution, not a larger task. Rehearsals, previews and replayed runs earn no competence. choices is reserved JSON. Source limit: 524288 bytes. Legacy permissions is accepted as reach.capabilities. converts optionally lists original source SHA-256 digests from Tools census, binding historical conversion counterparts to this exact candidate.",
-                  tool: "skill_manage", input: verb("tool_propose"), lifecycle: .change),
+                      + "network, network_public, computer_files, arbitrary_file_write, shell, model, calendar, reminders, contacts, screen.watch, hands, secret:<name>, app_read:<bundle_id> or app_write:<bundle_id>. "
+                      + "Read-only code declares each primitive's reach; active abilities are callable from scripts under the same gates. Under Full Mac, your own save is kept and on immediately unless the owner turned it off; only the owner can lift that off. Active code runs as authored.<id>; "
+                      + "below Full Mac or on a turn started by an untrusted agent, it remains unkept; ability.enable files the owner's card. wake defaults []; face {page?,action?,projection?} places the action and may name an unclaimed app action id. projection:true declares face(input) → {sections:[{id,title?,rows:[{id,title,detail?,value?}]}]} from frozen native sources, with no host effects/state. part.call(id,input) calls a declared authored.<id> → {ok:true,value} or {ok:false,error:{code,message}}; input: frozen JSON object, max 4 MiB. host.model.call may pass tools:[\"app\"] and a routing surface, limited by this ability's reach and caller. params {type:\"object\",properties,readOnly:true} declares a read contract; effects still pass Trust. resident defaults false; true retains JS across successful runs and holds opened programs/connections until code closes them, the ability is turned off or replaced, or the app quits. Nonresident held resources end with the run; detached program sessions may outlive it. wake [\"held\"] delivers input.wake {id,kind} for arriving data; read via receive/accept, wait 0 for only available data. wake [\"resumed\"] delivers input.wake at launch; code must reopen resources using saved state. Without it, no launch wake. wake [\"person.away\"]/[\"person.here\"] delivers input.wake {idle_seconds} once per presence change: away at 300 seconds idle, back on person input (never yours). learned.use reports exact-input/reached-call outcomes of ordinary gated runs of the selected version: execution, not proof of a larger task. Intercepted executions, previews and replays earn no competence. choices: reserved JSON. Source max: 524288 bytes. converts: optional original source SHA-256 digests from Tools census, binding conversion counterparts to this exact version.",
+                  tool: "ability_manage", input: verb("save"), lifecycle: .change),
+        AppAction("ability.read", "tools", "One ability of yours: what it declares, its status and versions, and its code in pages; a built-in skill's guidance reads too",
+                  ["id", "offset?:int", "step?:int"], tool: "ability_manage", input: verb("read"), read: true),
+        AppAction("ability.list", "tools", "Your abilities, one row each, and the built-in guidance to read", tool: "ability_manage", input: verb("list"), read: true),
+        AppAction("ability.validate", "tools", "Validate an unkept version on supplied input or one captured run; intercepted replies prove no live behavior",
+                  ["id", "input?:object", "capture?:bool"], tool: "ability_manage", input: verb("validate"), lifecycle: .change),
+        AppAction("ability.enable", "tools", "Keep an unkept version and turn it on: your work under Full Mac unless the owner turned it off, else the owner's card. Code needs its full version digest; omit version only to restore Markdown guidance",
+                  ["id", "version?"], tool: "ability_manage", input: verb("enable"), lifecycle: .enable),
+        AppAction("ability.restore", "tools", "Turn an ability back on via ability.enable; code needs its full version digest; omit version only to restore Markdown guidance", ["id", "version?"],
+                  tool: "ability_manage", input: verb("restore"), revision: 3, lifecycle: .restore),
+        AppAction("ability.disable", "tools", "Turn an ability off, keeping its current and previous versions", ["id", "reason?"],
+                  tool: "ability_manage", input: verb("disable"), revision: 2, lifecycle: .change),
+        AppAction("ability.rollback", "tools", "Swap an ability's current and previous versions; optional version must name the previous version", ["id", "version?"],
+                  tool: "ability_manage", input: verb("rollback"), revision: 2, lifecycle: .rollback),
+        AppAction("ability.drop", "tools", "Delete an ability, its versions and its run state permanently; pending:true discards only its unkept version", ["id", "pending?:bool", "reason?"],
+                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "ability_manage", input: verb("drop"), revision: 2, lifecycle: .drop),
+        AppAction("ability.resume", "tools", "Resume a run stopped at a decision or card preview only if its journal contains no primitive call",
+                  ["run_id", "answer?:any"], warn: "The stopped step returns answer. Any journal call beginning with primitive blocks resume. Before starting a fresh run, inspect prior calls and effects: a fresh run executes from the beginning and may repeat effects; pass the answer as input and account for completed work.",
+                  tool: "ability_manage", input: verb("resume"), part: ""),
 
         // The Desk.
-        AppAction("desk.deny", "desk", "Deny", ["id", "reason?"], irreversible: true,tool: "workshop_reject"),
+        AppAction("desk.deny", "desk", "Deny", ["id", "reason?"], irreversible: true,capabilities: ["safe_read", "tool_call", "workshop_write"], tool: "workshop_reject"),
         AppAction("desk.approve", "desk", "Approve", ["id"], owner: .his("approving a waiting step is his; the Desk"),
                   tool: "workshop_reject", input: decision("approve")),
 
@@ -600,8 +607,8 @@ public enum AppActions {
         AppAction("turn.reconcile", "chat", "Reconcile a saved turn without repeating completed effects", ["session_id", "turn_id?"], tool: "turn_reconcile", versionExempt: true),
         AppAction("home.accept", "desk", "Accept kept arrivals", ["id?"], tool: "arrival_accept", versionExempt: true),
         // A part's one way to her between turns (AGENT_IS_THE_APP contract #2): an arrival, never her context.
-        AppAction("home.arrive", "desk", "From a part's run: one line on your home that wakes you between turns; the same line again is not a second arrival",
-                  ["line"],tool: "resident_wake", versionExempt: true),
+        AppAction("home.arrive", "desk", "From a part's run: one line on your home; event_key deduplicates this occurrence durably within this part, otherwise the same line is offered once per local day",
+                  ["line", "event_key?"],tool: "resident_wake", versionExempt: true),
         AppAction("house.file", "desk", "File something to tend, with who owns it", ["title", "summary", "owner", "refs?:array"],
                  warn: "owner is me, builder or user; refs contains strings or Desk ref objects {kind,…}", tool: "house_file", versionExempt: true),
 
@@ -614,11 +621,8 @@ public enum AppActions {
               ["window_hours?:int", "detail?:compact|full"], read: true),
         .fold("agent_introspect", "diagnostics", "Your live runtime, provider and conversation identity",
               ["detail?:compact|full"], read: true),
-        .fold("list_skills", "skills", "Skill names, triggers, descriptions and status", read: true),
-        .fold("read_skill", "skills", "Skill metadata; source:true explicitly reads code for authoring or review; content:true reads legacy guidance until conversion",
-              ["name", "step?:int", "source?:bool", "content?:bool"], read: true, resultSchema: legacyResultSchema("skill.read")),
         .fold("recent_trace_summary", "diagnostics", "Read saved traces; receipts span all conversations unless session_id is explicit, with non-read actions first and complete retained since windows",
-              ["view?:receipts|shapes", "trace?", "effects_only?:bool", "since?", "limit?:int", "before?", "offset?:int", "completed_turns?:int", "kind?", "name?", "status?", "session_id?", "turn_id?", "receipt_id?", "fields?:[str]"], read: true),
+              ["view?:receipts", "trace?", "effects_only?:bool", "since?", "limit?:int", "before?", "offset?:int", "completed_turns?:int", "kind?", "name?", "status?", "session_id?", "turn_id?", "receipt_id?", "fields?:[str]"], read: true),
         .fold("recent_trace_summary", "diagnostics", id: "trace.model_calls", "Model calls: per-turn counts by purpose and rounds per turn (p50, p90) for the last 24 hours and 7 days, the top five purposes by total milliseconds, and the week's five heaviest asks with their first six calls; reads retained traces without a model call",
               [], input: ["view": .string("model_calls")], read: true),
         .fold("recent_trace_summary", "diagnostics", id: "trace.usage", "Recorded model usage: exact retained call, input, cached input, output token and duration sums, grouped by model, surface or local day; since defaults to today (local midnight) or accepts an ISO-8601 timestamp; reports missing measurements and retention coverage",
@@ -654,8 +658,8 @@ public enum AppActions {
         .fold("scheduler_update_job", "desk"),
         .fold("scheduler_pause_job", "desk"),
         .fold("scheduler_resume_job", "desk"),
-        .fold("scheduler_cancel_job", "desk"),
-        .fold("scheduler_delete_job", "desk"),
+        .fold("scheduler_cancel_job", "desk", "Cancel future runs; keep history and allow schedule.resume; running work continues"),
+        .fold("scheduler_delete_job", "desk", "Cancel future runs; keep history and allow schedule.resume; running work continues"),
         .fold("recall_memory", "memories", "Recall saved facts, decisions and preferences; use studio.recall for journal entries", read: true, advisory: true),
         // Version-exempt: it appends a new memory; supersedes demotes the ids it
         // names, which a repeat leaves demoted.
@@ -683,7 +687,6 @@ public enum AppActions {
         .fold("persona_read", "personality", read: true, resultSchema: legacyResultSchema("persona.read")),
         .fold("persona_write", "personality"),
         .fold("persona_append_section", "personality"),
-        .fold("save_skill", "skills", lifecycle: .change),
         .fold("studio_journal", "personality"),
         .fold("studio_journal_amend", "personality"),
         .fold("studio_recall", "personality", "Recall studio journal entries and creative work; use memory.recall for saved facts and agreements", read: true),
@@ -712,26 +715,29 @@ public enum AppActions {
         // How each agent is reached (agents/recipes/<host>.json), hers to read and
         // fix when an app changes under it. A write is connect-level: below Full
         // Mac its card is connect's (other_app_settings_write).
-        AppAction("agent.recipe", "agents", "How this app reaches an agent: one host's recipe and the version a write replaced, or every host's when host is left out",
+        AppAction("agent.recipe", "agents", "Read a host's connection recipe and the version a write replaced; omit host for all hosts",
                   ["host?"],tool: "agent_contacts", read: true),
-        AppAction("agent.recipe_write", "agents", "Create a host recipe from agent.recipe's shape with a new host.id, or replace one at the version read; replacements keep the previous version for undo",
-                  ["host", "recipe:object"], tool: "agent_connect"),
+        AppAction("agent.recipe_write", "agents", "Create a recipe using agent.recipe's shape and a new host.id, or replace at the version read; keeps the prior version for undo",
+                  ["host", "recipe:object"], reach: .his, capabilities: ["other_app_settings_write", "tool_call"], tool: "agent_connect"),
         // The "no" to an agent discovery found here; only discovery.json changes.
         AppAction("agent.discovery_dismiss", "agents", "Decline an agent found on this Mac; it is not offered or connected automatically again",
                   ["name"],tool: "agent_discovery_dismiss"),
         // A failed send runs the same check itself and retries once.
-        AppAction("agent.verify", "agents", "Dry-run a host recipe before connecting, or a contact's settings, handshake or window controls; sends nothing. A pass names only what was checked; a reply needs its own proof",
+        AppAction("agent.verify", "agents", "Dry-run a host recipe or contact settings, handshake or window controls; sends nothing. A pass proves only the named checks; a reply needs separate proof",
                   ["agent", "workspace?"], tool: "agent_message"),
         .fold("agent_cancel", "agents", "Stop the reply an agent is working on in your conversation with it"),
+        // The answer of a contact reached through one of her abilities, from that ability's code.
+        AppAction("agent.reply", "agents", "From a contact's connecting ability, answer as that contact in its conversation; done:false marks progress",
+                  ["text", "done?:bool", "agent?", "exchange?"], tool: "agent_message"),
         .fold("delegation_status", "agents", read: true),
-        .fold("agent_swarm", "agents", "Run temporary workers on an objective; reasoning_effort sets the run's Think level or each worker's; defaults to Work thinking (providers.work_thinking)"),
+        .fold("agent_swarm", "agents", "Run temporary workers on an objective; reasoning_effort sets Think for the run or each worker, defaulting to Work thinking (providers.work_thinking)"),
         .fold("codex_message", "agents"),
         .fold("invoke_codex", "agents"),
         .fold("omp_message", "agents"),
 
         // Each Mac app and connector is a page.
-        .fold("mail_list_recent", "mail", "Check saved email drafts to a person or email address by reading Apple Mail's drafts with mailbox:\"drafts\"; also inbox or sent; with scope + message_id "
-              + "+ expected_message_id + expected_account_id, one message's body", read: true),
+        .fold("mail_list_recent", "mail", "Read Apple Mail drafts to a person/address with mailbox:\"drafts\"; also inbox or sent. Read one body with scope + message_id "
+              + "+ expected_message_id + expected_account_id", read: true),
         .fold("mail_read_batch", "mail", read: true),
         .fold("mail_search", "mail", read: true),
         .fold("mail_save_attachment", "mail"),
@@ -743,24 +749,12 @@ public enum AppActions {
         .fold("mail_send", "mail", irreversible: true),
         .fold("mail_reply", "mail", irreversible: true),
         .fold("mail_draft", "mail"),
-        .fold("agentmail_list", "mail", read: true),
-        .fold("agentmail_read", "mail", read: true),
-        .fold("agentmail_send", "mail", irreversible: true),
-        .fold("gmail_status", "mail", read: true),
-        .fold("gmail_search", "mail", read: true),
-        .fold("gmail_read", "mail", read: true),
         .fold("mac_calendar_list_upcoming", "calendar", read: true),
         .fold("mac_calendar_calendars", "calendar", read: true),
         .fold("mac_calendar_free_busy", "calendar", read: true),
         .fold("mac_calendar_create_event", "calendar"),
         .fold("mac_calendar_modify_event", "calendar"),
         .fold("mac_calendar_delete_event", "calendar", irreversible: true),
-        .fold("google_calendar_status", "calendar", read: true),
-        .fold("google_calendar_list", "calendar", read: true),
-        .fold("google_calendar_calendars", "calendar", read: true),
-        .fold("google_calendar_free_busy", "calendar", read: true),
-        .fold("google_calendar_read", "calendar", read: true),
-        .fold("google_calendar_send_invitations", "calendar", irreversible: true),
         .fold("mac_reminders_list_due_today", "reminders", read: true),
         .fold("mac_reminders_query", "reminders", read: true),
         .fold("mac_reminders_read", "reminders", read: true),
@@ -779,42 +773,6 @@ public enum AppActions {
         .fold("contacts_delete", "contacts", irreversible: true),
         .fold("messages_recent_threads", "messages", read: true),
         .fold("messages_send", "messages", irreversible: true),
-        .fold("github_status", "github", read: true),
-        .fold("github_list_repos", "github", read: true),
-        .fold("github_list_runs", "github", read: true),
-        .fold("github_run_jobs", "github", read: true),
-        .fold("github_list_notifications", "github", read: true),
-        .fold("github_get_repository", "github", read: true),
-        .fold("github_read_repository_content", "github", read: true),
-        .fold("github_list_commits", "github", read: true),
-        .fold("github_list_issues", "github", read: true),
-        .fold("github_search", "github", read: true),
-        .fold("github_list_pull_requests", "github", read: true),
-        .fold("github_get_issue", "github", read: true),
-        .fold("github_get_pull_request", "github", read: true),
-        .fold("github_pull_request_files", "github", read: true),
-        .fold("github_pull_request_activity", "github", read: true),
-        .fold("github_discover_tracking", "github"),
-        .fold("github_project_digest", "github"),
-        .fold("github_mutate", "github"),
-        .fold("github_set_repo_visibility", "github"),
-        .fold("slack_status", "slack", read: true),
-        .fold("slack_list_channels", "slack", read: true),
-        .fold("slack_search_messages", "slack", read: true),
-        .fold("slack_post_message", "slack", irreversible: true),
-        .fold("notion_status", "notion", read: true),
-        .fold("notion_search", "notion", read: true),
-        .fold("notion_read_page", "notion", read: true),
-        .fold("x_status", "x", read: true),
-        .fold("x_me", "x", read: true),
-        .fold("x_search", "x", read: true),
-        .fold("x_timeline", "x", read: true),
-        .fold("x_user_tweets", "x", read: true),
-        .fold("market_status", "markets", read: true),
-        .fold("market_configure", "markets"),
-        .fold("market_watchlists", "markets", read: true),
-        .fold("market_quote", "markets", read: true),
-        .fold("tradingview_watchlist", "markets", read: true),
         .fold("mac_notify", "notifications"),
         .fold("mobile_notify", "notifications"),
         .fold("phone_request", "pairing"),
@@ -826,11 +784,9 @@ public enum AppActions {
               input: ["kind": .string("location.current"), "wait_seconds": .int(20)], read: true),
         .fold("image_generate", "chat"),
 
-        // Each MCP server's tools are generated from its live list
-        // (`mcp`), SearXNG's on the web page.
-        .fold("read_file", "files", "Read a workspace or user-approved file, an image as pixels you see; query searches its whole text; continue with its returned next arguments, including version", read: true),
-        .fold("list_dir", "files", "List names and dates in an approved folder; sort:newest orders recent arrivals (added, then modified); sort:added orders by date added only, including app bundles; sort:size reads allocated disk usage with a time budget and named partial results", read: true),
-        .fold("file_info", "files", "Read a path's name, directory/regular flags, size and modified date without following its final symbolic link", read: true),
+        .fold("read_file", "files", "Read a workspace/approved file or image pixels; query searches the whole text. Continue with returned next arguments, including version", read: true),
+        .fold("list_dir", "files", "List names/dates in an approved folder. sort:newest orders by added then modified date; sort:added by date added, including app bundles; sort:size reads allocated disk usage within a time budget and names partial results", read: true),
+        .fold("file_info", "files", "Read name, directory/regular flags, size and modified date without following the final symbolic link", read: true),
         .fold("file_excerpt", "files", read: true),
         .fold("grep", "files", read: true),
         .fold("mac_spotlight_search", "files", read: true),
@@ -839,7 +795,7 @@ public enum AppActions {
         .fold("copy_file", "files"),
         .fold("trash_file", "files"),
         .fold("apply_patch", "files", "Apply a unified diff with paths relative to cwd",
-              warn: #"Example app {action:"files.patch",args:{cwd:"/absolute/path/to/repo",patch:"--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"}}; use actual content and ranges; the marker is only for absent final newlines"#),
+              warn: #"Example app {action:"files.patch",args:{cwd:"/absolute/path/to/repo",patch:"--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"}}; supply actual content/ranges; the marker is only for missing final newlines"#),
         .fold("git_status", "shell", read: true),
         .fold("git_diff", "shell", read: true),
         .fold("git_log", "shell", read: true),
@@ -854,6 +810,7 @@ public enum AppActions {
         .fold("restart_app", "shell"),
         .fold("install_app", "shell"),
         .fold("read_page", "web", read: true),
+        .fold("web_search", "web", read: true),
         .fold("maps_route", "web", read: true),
         .fold("maps_search", "web", read: true),
         .fold("browser.status", "browser", read: true),
@@ -868,23 +825,23 @@ public enum AppActions {
         .fold("search_chat_history", "chat", read: true),
         .fold("read_chat_message", "chat", read: true),
         .fold("chat_reply", "chat"),
-        .fold("tool_result_page", "*", "Page a long result retained this turn without repeating its action; continue:true resumes the last read, ignoring page; omit continue to select page/query/raw", read: true),
+        .fold("tool_result_page", "*", "Page a long result retained this turn without rerunning its action; continue:true resumes the last read and ignores page; omit continue to select page/query/raw", read: true),
 
         // Mac control and the tools left over (phase 2 step 6). Each Mac verb
         // re-enters under its own name, so Full Mac's accessibility category,
         // MacAttention and User's saved levels judge it as before.
         // act's whole guide is an item read on the mac page (`guided`); its refusals point to it.
-        .fold("screen", "mac", "Read the live screen in words; lists running apps when NativeAgent is in front. "
-              + "app reads another running app's window without activating it, part zooms in, "
+        .fold("screen", "mac", "Read the live screen as words; lists running apps when NativeAgent is frontmost. "
+              + "app reads a running app's window without activation; part zooms in; "
               + "pixels:true is a picture of the desktop", read: true),
-        .fold("act", "mac", "Act on the live screen by name: verb + target (click, type with text, key, select, "
-              + "scroll…), or a whole flow in ONE call with steps:[…] (names, menu paths 'Format > Make Plain Text', "
-              + "chords, {verb,target,text,mode}), each verified on a fresh read, stopping at the first failure; app "
-              + "names whose window, acted on in front if it is in front, else where it sits (brought forward while "
+        .fold("act", "mac", "Act by name with verb + target (click, type with text, key, select, scroll…), or one flow "
+              + "with steps:[…]: names, menu paths ('Format > Make Plain Text'), chords or {verb,target,text,mode}. "
+              + "Each step verifies on a fresh read; first failure stops the flow. app names the window: "
+              + "act in front if frontmost, otherwise where it sits (brought forward while "
               + "Shotgun is up)", actArgs, screen: true),
-        .fold("go", "mac", "Get to an app, file, folder, http/https URL or System Settings pane, then read the fresh "
-              + "screen; without front it opens or launches behind (in front while Shotgun is up) and reads that app's "
-              + "window; front:true only when the task asks to bring it forward", screen: true),
+        .fold("go", "mac", "Open an app, file, folder, http/https URL or System Settings pane, then read a fresh "
+              + "screen. Without front it opens/launches behind (in front while Shotgun is up) and reads that "
+              + "app's window; use front:true only when asked to bring it forward", screen: true),
         .fold("wait", "mac", read: true),
         .fold("read", "mac", read: true),
         .fold("menu", "mac", read: true),
@@ -892,7 +849,7 @@ public enum AppActions {
         .fold("clipboard_read", "mac", read: true),
         .fold("clipboard_write", "mac"),
         .fold("system_info", "mac", "Read system, network and battery information", read: true),
-        AppAction("mac.apps", "mac", "Every app installed on this Mac; list installed apps or check whether an app is installed, with its name, bundle ID, path, version and scriptability", ["name?", "all?:boolean"],
+        AppAction("mac.apps", "mac", "List installed apps or check one by name; returns name, bundle ID, path, version and scriptability", ["name?", "all?:bool"],
                  tool: "mac_apps", read: true, scope: "installed apps applications what apps do I have; name: optional substring filter"),
         .fold("mac_screenshot_save", "mac"),
         .fold("mac_location", "mac", "Where this Mac is", read: true),
@@ -911,10 +868,11 @@ public enum AppActions {
     ]
 
     /// act's arguments as its schema has them, but verb and target may be left
-    /// out (a flow's steps carry their own), and what it types is secret.
+    /// out (a flow's steps carry their own). The recursive credential detector
+    /// judges typed text, including text/value inside flow steps.
     static let actArgs = foldSchemas["act"].map {
         ToolSignature.doorArgs($0.parametersJSON).map {
-            ["verb", "target"].contains($0) ? $0 + "?" : $0 == "text?" ? "text?:secret" : $0
+            ["verb", "target"].contains($0) ? $0 + "?" : $0
         }
     }
 
@@ -931,28 +889,18 @@ public enum AppActions {
         return lines.filter { names.contains(String($0.prefix { $0 != ":" })) }
     }
 
-    /// Each mounted MCP server's tools as `mcp.<server>.<tool>`, from its live
-    /// list: on the mcp page, SearXNG's search on the web page.
-    /// Each call retains the mounted tool's ordinary admission.
-    public static func mcp(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> [AppAction] {
-        SwiftToolDispatcher.mountedMCPToolSchemas(dataRoot: dataRoot).map { schema in
-            .fold(schema.name, schema.name.hasPrefix("mcp__searxng-local__") ? "web" : "mcp",
-                  firstSentence(schema.description), read: schema.toolClass == .read,
-                  irreversible: schema.toolClass == .destructive, toolClass: schema.toolClass ?? .write, schema: schema)
-        }
-    }
-
     /// Each tool she wrote that is active in her registry, as
     /// `authored.<id>` on its face page (diagnostics by default), flagged by the
     /// dependencies' canonical action flags, or its schema without dependencies.
     /// Admitted tools are scriptable; each call retains its ordinary gates.
     /// Conditional reads are changing dependencies: tool code chooses their args.
     public static func authored(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> [AppAction] {
-        authored(dataRoot: dataRoot, catalog: all + mcp(dataRoot: dataRoot) + senses())
+        authored(dataRoot: dataRoot, catalog: all + senses(), tools: SwiftToolDispatcher.authoredTools(dataRoot: dataRoot))
     }
 
-    private static func authored(dataRoot: URL, catalog: [AppAction]) -> [AppAction] {
-        let tools = SwiftToolDispatcher.authoredTools(dataRoot: dataRoot).filter { tool in
+    private static func authored(dataRoot: URL, catalog: [AppAction],
+                                 tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)]) -> [AppAction] {
+        let tools = tools.filter { tool in
             tool.action.map { id in !catalog.contains { $0.id == id } } ?? true
         }
         let toolsByID = Dictionary(tools.map { ($0.action ?? ToolNameAliases.authoredAction($0.schema.name), $0) },
@@ -964,6 +912,12 @@ public enum AppActions {
             tool.actions.map { dependency in
                 let key = dependency.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 if classified[key] != nil || toolsByID[key] != nil { return key }
+                // An older door classifies as the one form's door that answers it;
+                // skill.run is a part's run, as ability.resume is.
+                if let alias = AppToolExecutor.partAlias(key, [:], root: dataRoot) {
+                    let target = alias.id == "authored." ? "ability.resume" : alias.id
+                    if classified[target] != nil || toolsByID[target] != nil { return target }
+                }
                 return toolsByID.first { ToolNameAliases.authoredTool(key) == $0.value.schema.name }?.key ?? key
             }
         }
@@ -1010,28 +964,32 @@ public enum AppActions {
             // beyond her own data and model, or a dependency that changes his
             // side (a missing one, a part that does, a folded tool outside her
             // core); a read dependency changes nothing.
-            let herReach: Set<String> = ["app_data_read", "app_data_write", "model", "network_localhost"]
             let reachesHim = dependencies.contains { dependency in
                 guard let dependency else { return true }
                 if dependency.read { return false }
-                if let him = dependency.reachesHim { return him }
+                if dependency.authored { return dependency.reach == .his }
                 guard dependency.isFold else { return false }
                 return ![.core, .alwaysOn, .browser].contains(dependency.binding.descriptor?.bucket ?? .unclassified)
-            } || members.flatMap { toolsByID[$0]!.permissions }.contains { !herReach.contains($0) && !$0.hasPrefix("app_read:") }
+            } || PermissionLaw.reach(ofPermissions: members.flatMap { toolsByID[$0]!.permissions }) == .his
             // Unavailable or cyclic dependencies cannot certify a read.
             for member in members {
                 let tool = toolsByID[member]!
                 let declaredRead = if case .object(let schema)? = try? JSONValue.parse(tool.schema.parametersJSON) { schema["readOnly"] == .bool(true) } else { false }
                 let read = !cyclic && !authoredIrreversible && (dependenciesByID[member]!.isEmpty ? declaredRead : dependenciesRead)
+                let schema = LLMToolSchema(name: tool.schema.name, toolClass: reach, reach: reachesHim ? .his : .hers,
+                    capabilities: tool.schema.capabilities, description: tool.schema.description,
+                    parametersJSON: tool.schema.parametersJSON, deferLoading: tool.schema.deferLoading)
                 classified[member] = AppAction(member, tool.page ?? "diagnostics",
                              firstSentence(tool.schema.description), ToolSignature.doorArgs(tool.schema.parametersJSON),
                              irreversible: cyclic || dependenciesIrreversible || authoredIrreversible,
-                             toolClass: reach, screen: dependenciesScreen,
-                             warn: "your tool; declares " + (tool.permissions.isEmpty ? "no permissions" : tool.permissions.joined(separator: ", ")),
+                             toolClass: reach, reach: reachesHim ? .his : .hers,
+                             capabilities: ["safe_read", "tool_call"], screen: dependenciesScreen,
+                             warn: "Resolved class: \(reach); reach: \(reachesHim ? "his" : "hers") (includes action dependencies). Declared primitives: "
+                                + (tool.permissions.isEmpty ? "none" : tool.permissions.joined(separator: ", "))
+                                + "; actions: " + (tool.actions.isEmpty ? "none" : tool.actions.joined(separator: ", ")),
                              // It executes its pinned contract, not a diagnostics-page edit.
-                             tool: tool.schema.name, read: read, versionExempt: true, schema: tool.schema, partAction: tool.action != nil,
-                             reachesHim: reachesHim)
-                classified[member]?.dependencyFiles = dependencies.reduce(into: []) { $0.formUnion($1?.dependencyFiles ?? []) }
+                             tool: tool.schema.name, read: read, versionExempt: true, schema: schema, partAction: tool.action != nil,
+                             folded: false)
             }
         }
         for id in toolsByID.keys { classify(id) }
@@ -1043,7 +1001,8 @@ public enum AppActions {
         let states: Set<String> = ["off", "disabled", "stopped"]
         guard asked.contains(where: states.contains) else { return [] }
         let subject = asked.filter { !states.contains($0) }
-        return try ToolRegistryActions.entries(dataRoot: dataRoot).compactMap { value in
+        guard case .array(let rows) = try AbilityStore(dataRoot: dataRoot).registry(kind: .part) else { return [] }
+        return rows.compactMap { value in
             guard case .object(let row) = value, row["status"] == .string("disabled"),
                   case .string(let id)? = row["id"] else { return nil }
             let description: String = if case .string(let text)? = row["description"] { text } else { "" }
@@ -1059,26 +1018,44 @@ public enum AppActions {
         SwiftToolDispatcher.nativeToolDescriptors.values.filter { ToolNameAliases.foldedTools[$0.name] != nil }
             .map { ($0.name, $0.schema) } + AppToolExecutor.appToolSchemas(includeDoor: false).map { ($0.name, $0) })
 
+    /// Project parameter references once, using the door's accepted names.
+    /// Common words such as "by name" or "a path" retain their prose meaning.
+    static func argumentProse(_ text: String, tool: String) -> String {
+        if let names = ToolNameAliases.doorArgNames[tool] {
+            let words = try! NSRegularExpression(pattern: #"\b[a-z][a-z0-9_]*\b"#)
+            let result = NSMutableString(string: text)
+            for match in words.matches(in: text, range: NSRange(text.startIndex..., in: text)).reversed() {
+                let range = Range(match.range, in: text)!
+                let key = String(text[range])
+                if let name = names[key] {
+                    let before = text[..<range.lowerBound], after = text[range.upperBound...]
+                    let quoted = (before.last == "\"" && after.first == "\"")
+                        || (before.last == "`" && after.first == "`")
+                    let argument = quoted || after.hasPrefix(":") || after.hasPrefix("=")
+                        || after.hasPrefix(" only (") || after.hasPrefix(" peer:")
+                    if !["name", "path"].contains(key) || argument {
+                        result.replaceCharacters(in: match.range, with: name)
+                    }
+                }
+            }
+            return result as String
+        }
+        return text
+    }
+
     /// A folded tool's whole description, its old tool names read as action
-    /// ids; an MCP tool's from its server's live list. A guided action's
+    /// ids. A guided action's
     /// carries every argument's own words too.
     public static func about(_ action: AppAction) -> String? {
         guard action.isFold else { return nil }
         guard let schema = schema(action) else { return nil }
         let lines = argumentGuide(action, schema: schema)
         let args = lines.isEmpty ? "" : "\nArgs:\n" + lines.joined(separator: "\n")
-        // The description speaks the tool's own arg names; the door's differ.
-        let names = ToolNameAliases.doorArgNames[action.tool].map { names in
-            "\nThrough app: " + names.sorted { $0.key < $1.key }.map { "\($0.value) is what this calls \($0.key)" }
-                .joined(separator: "; ") + "."
-        } ?? ""
-        return ToolNameAliases.foldedProse(schema.description + args) + names
+        return ToolNameAliases.foldedProse(argumentProse(schema.description + args, tool: action.tool))
     }
 
     static func schema(_ action: AppAction, dataRoot root: URL = PersistenceCore.defaultDataRoot()) -> LLMToolSchema? {
         return action.binding.descriptor?.schema ?? foldSchemas[action.tool]
-            ?? (ToolNameAliases.mcpAction(action.tool) == nil ? nil
-                : SwiftToolDispatcher.mountedMCPToolSchemas(dataRoot: root).first { $0.name == action.tool })
             ?? (!action.partAction && ToolNameAliases.authoredTool(action.id) == nil ? nil
                 : SwiftToolDispatcher.authoredTools(dataRoot: root).first { $0.schema.name == action.tool }?.schema)
     }
@@ -1182,7 +1159,7 @@ public enum AppActions {
         return .object(["id": .string(action.id), "args_schema": contractSchema(args),
             "result_schema": contractSchema(action.resultSchema), "revision": .int(Int64(action.revision)),
             "read": .bool(action.read), "readWhen": .object(action.readWhen),
-            "irreversible": .bool(action.irreversible), "owner": .bool(action.isHis), "scriptable": .bool(true)])
+            "irreversible": .bool(action.irreversible), "owner": .bool(action.isHis)])
     }
 
     /// The current contract still accepts every call the saved one did: all
@@ -1192,7 +1169,10 @@ public enum AppActions {
     static func acceptsEveryCall(_ current: JSONValue, of saved: JSONValue) -> Bool {
         guard case .object(var now) = current, case .object(var was) = saved,
               case .object(var nowArgs)? = now.removeValue(forKey: "args_schema"),
-              case .object(var wasArgs)? = was.removeValue(forKey: "args_schema"), now == was,
+              case .object(var wasArgs)? = was.removeValue(forKey: "args_schema") else { return false }
+        // Saved contracts can predate unconditional script callability.
+        was.removeValue(forKey: "scriptable")
+        guard now == was,
               case .object(let nowProperties)? = nowArgs.removeValue(forKey: "properties"),
               case .object(let wasProperties)? = wasArgs.removeValue(forKey: "properties"),
               case .array(let nowRequired)? = nowArgs.removeValue(forKey: "required"),
@@ -1203,9 +1183,9 @@ public enum AppActions {
     static func legacyDependencyContract(_ shape: JSONValue) -> JSONValue? {
         guard case .object(var fields) = shape, case .object(let discovery)? = fields.removeValue(forKey: "discovery"),
               case .object(let example)? = discovery["example"], case .string(let id)? = example["action"],
-              let args = discovery["args_schema"], let scriptable = discovery["scriptable"] else { return nil }
+              let args = discovery["args_schema"] else { return nil }
         fields["id"] = .string(id); fields["args_schema"] = contractSchema(args)
-        fields["result_schema"] = legacyResultSchema(id); fields["scriptable"] = scriptable
+        fields["result_schema"] = legacyResultSchema(id)
         return .object(fields)
     }
 
@@ -1246,7 +1226,7 @@ public enum AppActions {
                 if spec.names.count > 1, name == "ids" {
                     props[name] = .object(["type": .string("array"), "items": .object(["type": .string("string")])])
                 }
-                if action.id == "tool.propose", name == "tests" {
+                if action.id == "ability.save", name == "fixtures" {
                     props[name] = .object(["type": .string("array"), "minItems": .int(1), "items": .object([
                         "type": .string("object"), "properties": .object(["input": .object([:]), "expected": .object([:])]),
                         "required": .array([.string("input"), .string("expected")])])])
@@ -1274,7 +1254,7 @@ public enum AppActions {
             example = ["verb": .string("click"), "target": .string("<target>")]
         }
         if action.id == "mac.look" { example["app"] = .string("<running app name or bundle ID>") }
-        if ["skill.run", "skill.validate"].contains(action.id), example["input"] == nil { example["input"] = .object([:]) }
+        if action.id == "ability.validate", example["input"] == nil { example["input"] = .object([:]) }
         if action.id == "bot.list" { example["details"] = .bool(true) }
         if action.id == "chat.new" { example["title"] = .string("<title>") }
         if action.id == "chat.list" { example["pinned"] = .bool(true) }
@@ -1285,7 +1265,7 @@ public enum AppActions {
         var args: [String: JSONValue] = ["type": .string("object"), "properties": .object(props),
             "required": .array(required),
             "additionalProperties": .bool(action.argSpecs.isEmpty &&
-                (action.partAction || ToolNameAliases.mcpAction(action.tool) != nil || ToolNameAliases.authoredTool(action.id) != nil))]
+                (action.partAction || ToolNameAliases.authoredTool(action.id) != nil))]
         if !alternatives.isEmpty { args["allOf"] = .array(alternatives) }
         let bound = action.input.filter { action.argSpecs.flatMap(\.names).contains($0.key) }
         var call: [String: JSONValue] = ["action": .string(action.id), "args": .object(example.merging(bound) { _, bound in bound })]
@@ -1298,14 +1278,10 @@ public enum AppActions {
         if !plural.isEmpty, action.isFold || action.read || !action.readWhen.isEmpty {
             result["door_expansion"] = .object(["scalar_arguments": .array(plural.map(JSONValue.string)),
                 "max_list_arguments": .int(1),
-                "note": .string("For a folded action or a read call, give one eligible scalar argument a nonempty list to run once per value. Each child retains validation and gates. Native array arguments stay arrays.")])
+                "note": .string("For a folded action or read call, one eligible scalar may be a nonempty list: runs once per value with each child's validation and gates. Native array arguments stay arrays.")])
         }
-        if !action.scope.isEmpty { result["scope"] = .string(action.scope) }
-        if action.id == "skill.run", bound["name"] != nil,
-           case .object(let input)? = properties["input"], input["properties"] == .object([:]) {
-            result["input_note"] = .string("No inputs are declared. Read the routine with skill.read {source:true} before running it.")
-        }
-        if !action.read { result["version_note"] = .string("expected_version is optional. For consecutive versioned calls, use the latest action receipt's page_version; a change can replace the previous version.") }
+        if !action.returnedScope.isEmpty { result["scope"] = .string(action.returnedScope) }
+        if !action.read { result["version_note"] = .string("expected_version is optional. Chain versioned calls with the latest receipt's page_version; a change can replace the prior version.") }
         if let blocker {
             result["availability"] = .string("unavailable")
             result["blocker"] = .string(blocker)
@@ -1322,15 +1298,14 @@ public enum AppActions {
 
     /// Named in `app`'s own description, so a cold call needs no read first.
     /// Static: it changes only at a release.
-    public static let hot = ["undo", "time.now", "context.expand", "mind.inner_state", "agent.introspect", "skill.list",
-                             "skill.read", "trace.recent", "desk.read", "memory.recall", "memory.commit",
+    public static let hot = ["undo", "time.now", "context.expand", "mind.inner_state", "agent.introspect", "ability.list",
+                             "ability.read", "trace.recent", "desk.read", "memory.recall", "memory.commit",
                              "bot.reply", "agent.contacts", "agent.message", "agent.read", "agent.connect",
                              "agent.jobs", "mail.recent",
                              "calendar.upcoming", "files.read", "files.list", "files.write", "chat.search",
                              "result.page", "mac.look", "mac.system_info", "mac.volume", "mac.act", "mac.go", "sense.make"].compactMap { action($0) }
 
-    /// An action by id; an MCP tool's (`mcp.<server>.<tool>`, or SearXNG's
-    /// `web.search`) from its server's live list; a tool she
+    /// An action by id; a tool she
     /// wrote (`authored.<id>`) from her registry.
     public static func action(_ id: String, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> AppAction? {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1338,9 +1313,7 @@ public enum AppActions {
         if let handle = ToolNameAliases.agentHandle(key),
            let alias = available(dataRoot: dataRoot).first(where: { $0.id.split(separator: ".").first.map(String.init) == handle && $0.tool == "agent_message" }) { return alias }
         if let sense = senses().first(where: { $0.id.lowercased() == key }) { return sense }
-        if let part = authored(dataRoot: dataRoot).first(where: { $0.id.lowercased() == key || ToolNameAliases.authoredTool(key) == $0.tool }) { return part }
-        guard ToolNameAliases.mcpTool(key) != nil || ToolNameAliases.foldedActionIDs.contains(key) else { return nil }
-        return mcp().first { $0.id.lowercased() == key }
+        return authored(dataRoot: dataRoot).first(where: { $0.id.lowercased() == key || ToolNameAliases.authoredTool(key) == $0.tool })
     }
 
     // Leave synchronous file-backed discovery off the MainActor app door.
@@ -1358,34 +1331,18 @@ public enum AppActions {
         return matches.count == 1 ? matches[0] : nil
     }
 
-    /// Every registered action: the app's own, MCP tools, the ones she wrote,
-    /// and senses' verbs. What find ranks and `pages_version` hashes.
-    static func inventory(dataRoot: URL) async throws -> (actions: [AppAction], mounted: [AppAction], authored: [AppAction]) {
+    /// Every registered action: the app's own, the ones she wrote, and
+    /// senses' verbs. What find ranks and `pages_version` hashes.
+    static func inventory(dataRoot: URL) async throws -> (actions: [AppAction], authored: [AppAction]) {
         let records = try await SensesHub.shared.registry?.all() ?? []
-        let mounted = mcp(dataRoot: dataRoot)
-        let authored = authored(dataRoot: dataRoot, catalog: all + mounted + senses())
-        let templates = Dictionary(uniqueKeysWithValues: ["skill.run", "skill.read"].map { id in
-            let action = all.first { $0.id == id }!
-            guard case .object(let discovered) = discovery(action), case .object(let parameters)? = discovered["args_schema"] else {
-                preconditionFailure("Action discovery must declare its argument schema.")
-            }
-            return (id, (action, parameters))
-        })
+        let authored = authored(dataRoot: dataRoot, catalog: all + senses(),
+            tools: try SwiftToolDispatcher.checkedAuthoredTools(dataRoot: dataRoot).get())
+        // The persona's built-in guidance, each found as the ability.read that opens it.
+        let read = all.first { $0.id == "ability.read" }!
         let text: (JSONValue?) -> String = { if case .string(let value)? = $0 { value } else { "" } }
-        let skills = try InstalledSkillInventory.entries(dataRoot: dataRoot).filter(\.isAvailable).map { entry in
-            var (action, parameters) = templates[entry.isRunnable ? "skill.run" : "skill.read"]!
-            if entry.isRunnable, let script = entry.row["script"], case .object(var properties)? = parameters["properties"] {
-                for name in ["input", "args"] { properties[name] = SkillScript.inputSchema(script) }
-                parameters["properties"] = .object(properties)
-            }
-            let description = text(entry.row["description"])
-            let triggers: [JSONValue] = if case .array(let values)? = entry.row["triggers"] { values } else { [] }
-            return AppAction(action.id, action.page, entry.name + ": " + description, action.args,
-                warn: action.warn, tool: action.tool, input: action.input.merging(["name": .string(entry.name)]) { _, bound in bound },
-                read: action.read,
-                scope: (triggers.map { text($0) } + (entry.row["script"].map(SkillScript.actions) ?? [])).joined(separator: " "),
-                schema: LLMToolSchema(name: action.tool, description: description, parametersJSON: try JSONValue.object(parameters).serializedData(pretty: false)),
-                folded: action.folded)
+        let skills = try InstalledSkillInventory.entries(dataRoot: dataRoot).map { entry in
+            AppAction(read.id, "skills", entry.name + ": " + text(entry.row["description"]), read.args,
+                tool: read.tool, input: read.input.merging(["id": .string(entry.id)]) { _, bound in bound }, read: true)
         }
         let items = AppDoorNames.items.keys.sorted().flatMap { page in
             AppDoorNames.items[page]!.keys.sorted().filter { !$0.contains("<") }.map { item in
@@ -1393,22 +1350,19 @@ public enum AppActions {
                     tool: "app_page_read", input: ["page": .string(page), "item": .string(item)], read: true)
             }
         }
-        return (items + available(dataRoot: dataRoot) + mounted + authored + skills + senses(records: records), mounted, authored)
+        return (items + available(dataRoot: dataRoot) + authored + skills + senses(records: records), authored)
     }
 
     /// A page's actions: its own, and the ones on every page.
     public static func on(page: String) -> [AppAction] {
         let page = AppDoorNames.resolve(page)
-        return on(page: page,
-            mounted: ["mcp", "web"].contains(page) ? mcp() : [],
-            authored: authored())
+        return on(page: page, authored: authored())
     }
 
-    static func on(page: String, mounted: [AppAction], authored: [AppAction]) -> [AppAction] {
+    static func on(page: String, authored: [AppAction]) -> [AppAction] {
         let page = AppDoorNames.resolve(page)
-        return all.filter { $0.page == page || $0.page == "*" || (page == "tools" && $0.page == "diagnostics" && $0.id.hasPrefix("tool.")) }
-            + (["mcp", "web"].contains(page) ? mounted.filter { $0.page == page } : [])
-            + authored.filter { $0.page == page || (page == "tools" && $0.page == "diagnostics") } + senses().filter { $0.page == page }
+        return all.filter { $0.page == page || $0.page == "*" }
+            + authored.filter { $0.page == page || page == "tools" } + senses().filter { $0.page == page }
     }
 
     /// The action ids the words name as they stand ("mac.menu_press").
@@ -1455,7 +1409,8 @@ public enum AppActions {
         pattern: #"(?i)\b(?:no|without|never|avoid|do\s+not|don['’]t|not)(?!\s+only\b)\s+(.+?)(?=[,.;!?\n]|\s+\b(?:but|instead|however|then)\b|$)"#)
 
     /// `degraded` says why the ranking fell back to words alone; nil when the embedder ranked it.
-    static func ranked(_ query: String, pages: [String: QuietToolPage], dataRoot: URL, memory: SwiftNativeMemoryV2)
+    static func ranked(_ query: String, pages: [String: QuietToolPage], dataRoot: URL, memory: SwiftNativeMemoryV2,
+                       inventory snapshot: (actions: [AppAction], authored: [AppAction])? = nil)
         async throws -> (actions: [AppAction], degraded: String?) {
         let range = NSRange(query.startIndex..., in: query)
         let negative = negation.matches(in: query, range: range).compactMap {
@@ -1463,10 +1418,6 @@ public enum AppActions {
         }
         let positive = negation.stringByReplacingMatches(in: query, range: range, withTemplate: "")
         let asked = intentWords(positive)
-        let githubCI = hits(["ci", "actions", "workflow", "workflows"], asked) > 0
-            || (hits(["build", "builds", "failing", "failed", "failure", "failures"], asked) > 0
-                && hits(["github", "repo", "repos", "repository", "repositories"], asked) > 0)
-        let githubCIAction = githubCI ? (hits(["job", "jobs", "step", "steps"], asked) > 0 ? "github.run_jobs" : "github.runs") : ""
         let photos = photosIntent(positive)
         let photosAction = photos ? (hits(["count", "many", "total"], asked) > 0 ? "photos.count" : "photos.recent") : ""
         let mailAsk = hits(["mail", "inbox"], intentWords(query)) > 0
@@ -1500,7 +1451,9 @@ public enum AppActions {
             : hits(["create", "add", "new", "make"], asked) > 0 ? "reminders.list_create" : "") : ""
         let contacts = (try? AgentPeerStore(dataRoot: dataRoot).list())?.map(\.name) ?? []
         let helpers = (try? BotDefinitionStore(dataRoot: dataRoot).list())?.map(\.name) ?? []
-        let actions = try await inventory(dataRoot: dataRoot).actions
+        let checked: (actions: [AppAction], authored: [AppAction])
+        if let snapshot { checked = snapshot } else { checked = try await inventory(dataRoot: dataRoot) }
+        let actions = checked.actions
             .filter { window || !(photos || mailContent) || !["mac.look", "mac.go"].contains($0.id) }
             // "open … in chrome" is her own Chrome tab while its link is up, not User's front window (10-08).
             .filter { window || !chromeOpen || $0.id != "mac.go" }
@@ -1524,7 +1477,7 @@ public enum AppActions {
         let publicRead = (positive.contains("https://") || positive.contains("http://"))
             && hits(["read", "fetch", "public", "url", "article"], asked) > 0
         var routed: Set<String> = []
-        if hits(["skill", "skills"], asked) > 0, hits(["run", "execute"], asked) > 0 { routed.insert("skill.run") }
+        if hits(["ability", "abilities", "skill", "skills", "part", "parts"], asked) > 0, hits(["run", "execute"], asked) > 0 { routed.insert("ability.list") }
         if photos { routed.formUnion(["photos.count", "photos.recent"]) }
         let weather = hits(["weather", "forecast", "temperature", "rain", "sunrise", "sunset", "snow"], asked) > 0
         if weather { routed.insert("weather.forecast") }
@@ -1600,10 +1553,16 @@ public enum AppActions {
             routed.insert("files.write")
         }
         func boost(_ action: AppAction) -> Double {
-            action.id == githubCIAction || action.id == reminderListAction || (sentTexts && action.id == "messages.recent") || (chromeHistory && action.id == "chrome.history") || action.id == mapsAction || action.id == photosAction || (weather && action.id == "weather.forecast") || (timer && action.id == "schedule.create") || (reminder && action.id == "reminders.create") || (ownActions && action.id == "trace.recent") || (usage && action.id == "trace.usage") || (mailDraft && action.id == "mail.draft") || action.id == mailAttachmentAction || (mailSenders && action.id == "mail.senders") ? 2.0
+            action.id == reminderListAction || (sentTexts && action.id == "messages.recent") || (chromeHistory && action.id == "chrome.history") || action.id == mapsAction || action.id == photosAction || (weather && action.id == "weather.forecast") || (timer && action.id == "schedule.create") || (reminder && action.id == "reminders.create") || (ownActions && action.id == "trace.recent") || (usage && action.id == "trace.usage") || (mailDraft && action.id == "mail.draft") || action.id == mailAttachmentAction || (mailSenders && action.id == "mail.senders") ? 2.0
                 : named.contains(action.id) || routed.contains(action.id) ? 1.0 : 0
         }
         // No embedder (or it changed mid-read): rank by words alone, and say so.
+        func rankingFailure(_ detail: String) -> String {
+            AgentWorkspacePorts.readFailure(ToolFailureError(detail, effects: .none, code: "action_ranking_unavailable"),
+                reason: "action_ranking_unavailable", remedy: Repair.reconcile(
+                    instruction: "Use the lexical matches. Read settings for memory search model status and repair the reported model or action-index fault before relying on semantic ranking.",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["page": .string("settings")])])))
+        }
         var embedding: (asked: [[Float]], actions: [[Float]])?
         var degraded: String?
         do {
@@ -1618,9 +1577,9 @@ public enum AppActions {
                 embedding = (embedded.vectors, indexed.vectors)
             } else {
                 await memory.requestActionIndexUpdate()
-                degraded = "The MemoryV2 action index and query vectors changed epoch or returned unusable vectors during find. An index update has been requested."
+                degraded = rankingFailure("Action-index and query epochs differ or vectors are unusable. An index update was requested.")
             }
-        } catch { degraded = error.localizedDescription }
+        } catch { degraded = rankingFailure(error.localizedDescription) }
         var ranked: [(offset: Int, action: AppAction, score: Double)] = []
         for (offset, action) in actions.enumerated() {
             let lexical = Double(score(action, asked, page: pages[action.page]))
@@ -1665,6 +1624,100 @@ public enum AppActions {
     static func matchedActions(_ ranked: [AppAction]) -> [AppAction] {
         var seen = Set<String>()
         return ranked.filter { !$0.isItemRead && seen.insert($0.id).inserted }
+    }
+
+    /// Her own parts, one line each, newly kept first and then the rest,
+    /// each group ordered by find's ranking for `message`, within
+    /// a small budget: her body in front of her at the start of every turn.
+    static func parts(_ message: String, pages: [String: QuietToolPage], dataRoot: URL, memory: SwiftNativeMemoryV2) async -> String {
+        /// What she calls to run it: its own action.
+        func call(_ action: AppAction) -> String? { action.authored ? action.id : nil }
+        do {
+            let snapshot = try await inventory(dataRoot: dataRoot)
+            let own = snapshot.actions.compactMap { action in call(action).map { ($0, action) } }
+            if own.isEmpty {
+                return try AbilityStore(dataRoot: dataRoot).files(kind: .part).isEmpty
+                    ? "Your abilities: no saved abilities."
+                    : "Your abilities: none callable. Read ability.list for saved versions and their status."
+            }
+            let (ranked, degraded) = try await ranked(message, pages: pages, dataRoot: dataRoot, memory: memory, inventory: snapshot)
+            let rank = Dictionary(ranked.compactMap(call).enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+            let kept = try keptParts(dataRoot)
+            func fresh(_ action: AppAction) -> KeptPart? { kept[action.tool] }
+            let ordered = own.enumerated().sorted {
+                (fresh($0.element.1) == nil ? 1 : 0, rank[$0.element.0] ?? .max, $0.offset)
+                    < (fresh($1.element.1) == nil ? 1 : 0, rank[$1.element.0] ?? .max, $1.offset)
+            }.map(\.element)
+            /// Its line: how to run it, and, when every line has room, how to read its code.
+            func line(_ call: String, _ action: AppAction, reads: Bool) -> String {
+                return "- " + (fresh(action).map { $0.mark + ": " } ?? "") + call + (reads ? " (read: ability.read " + action.tool + ")" : "")
+                    + " — " + String(firstSentence(action.schema?.description ?? action.label).prefix(100))
+            }
+            var text = "Your abilities, newly kept first; best match within each group:" + (degraded.map { " Ranked by words only: " + $0 } ?? "")
+            let reads = ordered.reduce(text.count) { $0 + 1 + line($1.0, $1.1, reads: true).count } <= 900
+            let lines = ordered.map { (fresh($0.1), line($0.0, $0.1, reads: reads)) }
+            var shown: [KeptPart] = []
+            for (count, (part, line)) in lines.enumerated() {
+                if text.count + line.count > 900 { text += "\n+\(lines.count - count) more (find)"; break }
+                text += "\n" + line
+                if let part { shown.append(part) }
+            }
+            // Only what this fact carried counts as shown; a part cut off stays new.
+            do { try acknowledge(shown, dataRoot) }
+            catch {
+                let state = AbilityStore(dataRoot: dataRoot).root.appendingPathComponent("state.json")
+                let failure = ToolFailureError("The abilities above were read, but saving their shown markers failed: \(error.localizedDescription) Some markers may already be saved; entries may appear new again.",
+                    effects: .unknown, code: "ability_shown_write_failed")
+                text += "\n" + AgentWorkspacePorts.readFailure(failure, reason: "ability_shown_write_failed",
+                    remedy: Repair.remedy(owner: state.path,
+                        nextCall: nil, tap: nil,
+                        instruction: ToolFailureError.fileRepairInstruction(state,
+                            shape: "It holds ability run accounting. Preserve all run evidence and keptAfter stamps. Reconcile shown markers only from retained turn evidence; never invent markers, reset accounting or change ability authority.")
+                            + " Inspect and repair the shown-marker write failure, preserving run accounting and any markers already saved."))
+            }
+            return text
+        } catch {
+            return "Your abilities could not be read: " + AgentWorkspacePorts.readFailure(error,
+                reason: "ability_inventory_unavailable", remedy: Repair.remedy(owner: "ability inventory",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("ability.list")])]),
+                    tap: nil, instruction: "Read ability.list for the affected source and its repair; preserve saved versions and owner authority."))
+        }
+    }
+
+    /// A part her private moment after a turn kept or revised: its file, the
+    /// stamp read, and how her parts fact marks it.
+    struct KeptPart { let id: String; let stamp: [String: JSONValue]; let mark: String }
+
+    /// The kept parts by name, each new until a later turn of hers has started
+    /// with it shown once.
+    static func keptParts(_ dataRoot: URL) throws -> [String: KeptPart] {
+        let store = AbilityStore(dataRoot: dataRoot), states = try store.states()
+        let turn = TurnTraceContext.turnId
+        let clock = DateFormatter()
+        clock.dateStyle = .none; clock.timeStyle = .short
+        var kept: [String: KeptPart] = [:]
+        for file in try store.files(kind: .part) {
+            guard case .object(let state)? = states[file.id], case .object(let stamp)? = state["keptAfter"],
+                  case .string(let keptTurn)? = stamp["turn"], keptTurn != turn,
+                  case .string(let iso)? = stamp["at"], let at = ISO8601DateFormatter().date(from: iso) else { continue }
+            if case .string(let shown)? = stamp["shown"], shown != turn { continue }
+            kept[file.id] = KeptPart(id: file.id, stamp: stamp, mark: "new — kept after your turn at " + clock.string(from: at))
+        }
+        return kept
+    }
+
+    /// This turn has shown these: each is marked only while its stamp is the
+    /// one read, so a keep that landed since stays new.
+    static func acknowledge(_ parts: [KeptPart], _ dataRoot: URL) throws {
+        guard let turn = TurnTraceContext.turnId else { return }
+        let store = AbilityStore(dataRoot: dataRoot)
+        for part in parts where part.stamp["shown"] == nil {
+            try store.updateState(id: part.id) { fields in
+                guard case .object(let live)? = fields["keptAfter"], live["turn"] == part.stamp["turn"], live["at"] == part.stamp["at"],
+                      live["shown"] == nil else { return }
+                fields["keptAfter"] = .object(live.merging(["shown": .string(turn)]) { $1 })
+            }
+        }
     }
 
     static func matchedWords(_ action: AppAction, _ asked: [String]) -> Int {

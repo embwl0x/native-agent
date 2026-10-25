@@ -3,6 +3,7 @@ import PersistenceCore
 import NativeAgentCore
 import MacControl
 import TrustCenter
+// Blueprint: | `ChromeExtensionFolder.swift` | `ChromeExtensionFolder` enum; `isComplete`; extension completeness, staged replacement and registered-host refresh; incomplete bundles and copy failures name the defect and person recovery step, never a coding request |
 
 public enum ChromeExtensionFolder {
     public static let requiredFiles = ["manifest.json", "src/background.js", "src/protocol.js", "src/browser-workspace.js", "src/page-agent.js", "src/user-touch.js"]
@@ -25,9 +26,7 @@ public enum ChromeExtensionFolder {
         guard let bundled, isComplete(bundled) else {
             throw ToolFailureError("The bundled Chrome extension is incomplete.", effects: .none,
                 owner: "NativeAgent app bundle / NativeAgentChrome",
-                nextCall: ToolFailureError.call("app", ["action": .string("codex.message"), "args": .object([
-                    "conversation_mode": .string("new"),
-                    "text": .string("Restore the missing NativeAgentChrome resources in \(Bundle.main.bundlePath) from a complete app build. Preserve saved data and all Trust and macOS grants. Verify chrome.setup afterward.")])]))
+                instruction: "Tell the person: this copy of NativeAgent has an incomplete bundled Chrome extension. Preserve saved data and all Trust and macOS grants.")
         }
         let fm = FileManager.default
         let destination = visible
@@ -46,9 +45,7 @@ public enum ChromeExtensionFolder {
             try? fm.removeItem(at: staging)
             throw ToolFailureError("Could not copy the Chrome extension: \(error.localizedDescription)", effects: .none,
                 owner: destination.path,
-                nextCall: ToolFailureError.call("app", ["action": .string("codex.message"), "args": .object([
-                    "conversation_mode": .string("new"),
-                    "text": .string("Repair the Chrome extension copy from \(bundled.path) to \(destination.path). File error: \(error.localizedDescription). Preserve existing bytes and all Trust and macOS grants. Verify chrome.setup afterward.")])]))
+                instruction: "Ask the person to repair file access from \(bundled.path) to \(destination.path), preserving existing bytes and all Trust and macOS grants; then run chrome.setup.")
         }
     }
 

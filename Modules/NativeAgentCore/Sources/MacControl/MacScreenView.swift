@@ -13,6 +13,7 @@ import ScreenCaptureKit
 #endif
 #if canImport(AppKit)
 import AppKit
+// Blueprint: | `MacScreenView.swift` | `MacScreenShot`, `MacScreenViewGeometry`; `MacScreenViewTextRedaction` owns field/prose secret-label vocabulary with distinct matching rules and shared AX/OCR caption geometry with caller-unit proximity; session-scoped `MacImageFrames` holds delivered pixel geometry under the semantic observation's reference (desktop images mint their own) |
 #endif
 
 // MARK: - The FUSED VIEW organ (W3.5)
@@ -104,22 +105,41 @@ public enum MacScreenCaptureFailure: Sendable, Equatable, Error, LocalizedError 
     }
 
     public var errorDescription: String? {
-        if case .operationFailed(let operation, let cause) = self { return "\(operation): \(cause)" }
-        return rawValue
+        switch self {
+        case .screenRecordingNotTrusted: "NativeAgent lacks the macOS Screen Recording grant."
+        case .noDisplay: "No display is available to capture."
+        case .captureFailed: "The screen capture source returned no usable image."
+        case .unavailableOnThisPlatform: "Screen capture is unavailable on this platform."
+        case .encodeFailed: "The captured image could not be encoded."
+        case .exceedsByteCap: "The image exceeds the delivery byte limit."
+        case .operationFailed(let operation, let cause): "\(operation): \(cause)"
+        }
     }
 
     public func remedy(app: String? = nil, part: String? = nil) -> JSONValue {
-        var args: [String: JSONValue] = ["pixels": .bool(true)]
-        if let app { args["app"] = .string(app) }
-        if let part { args["part"] = .string(part) }
-        return MacFourVerbsReply.privacyRemedy(rawValue) ?? .object([
-            "kind": .string("inspect"),
-            "instruction": .string("\(errorDescription ?? rawValue). Inspect the requested pixels with next_call; no capture was verified."),
-            "next_call": .object([
-                "tool": .string("app"), "input": .object(["action": .string("mac.look"),
-                    "args": .object(args)]),
-            ]),
-        ])
+        let args: [String: JSONValue] = app.map { ["app": .string($0)] } ?? [:]
+        switch self {
+        case .screenRecordingNotTrusted:
+            return Repair.why(owner: "macOS Screen Recording grant",
+                tap: "System Settings > Privacy & Security > Screen Recording > NativeAgent",
+                instruction: "Ask the owner to enable NativeAgent's Screen Recording grant, then follow macOS's restart instruction if shown.")
+        case .noDisplay:
+            return Repair.why(owner: "Mac display availability", tap: "Mac > connected display",
+                instruction: "Connect or wake a display before requesting pixels; no display was available to capture.")
+        case .unavailableOnThisPlatform:
+            return Repair.terminal(instruction: "Screen capture is unavailable on this platform. Use a Mac with a graphical login session for pixels.")
+        case .exceedsByteCap:
+            return Repair.reconcile(instruction: "The image exceeds the delivery limit. Inspect mac.look's region selector, then request a smaller named part rather than the same capture.",
+                nextCall: .object(["tool": .string("app"), "input": .object(["find": .string("mac.look")])]))
+        case .encodeFailed:
+            return Repair.reconcile(instruction: "Image encoding failed. Inspect the app's menu without capturing pixels; encoding needs repair before another image request.",
+                nextCall: .object(["tool": .string("app"), "input": .object([
+                    "action": .string("mac.menu"), "args": .object(args)])]))
+        case .captureFailed, .operationFailed:
+            return Repair.reconcile(instruction: "\(errorDescription ?? rawValue). Inspect the app's menu without capturing pixels to establish available controls; correct the capture failure before another image request.",
+                nextCall: .object(["tool": .string("app"), "input": .object([
+                    "action": .string("mac.menu"), "args": .object(args)])]))
+        }
     }
 }
 
@@ -376,9 +396,6 @@ public struct MacScreenViewSnapshot: Sendable, Equatable {
 public actor MacScreenViewStore {
     public static let shared = MacScreenViewStore()
 
-    /// A view older than this is not a description of the screen any more.
-    public static let ttlSeconds: TimeInterval = 180
-
     public enum ResolveFailure: String, Sendable, Equatable, Error {
         case noView = "no_view"
         case staleView = "stale_view"
@@ -392,7 +409,7 @@ public actor MacScreenViewStore {
             case .staleView:
                 return "that view is not the latest one — the screen may have changed; call mac_view again"
             case .viewExpired:
-                return "that view is older than \(Int(MacScreenViewStore.ttlSeconds))s — call mac_view again"
+                return "that view is older than \(Int(MacLookFrameStore.ttlSeconds))s — call mac_view again"
             case .unknownMark:
                 return "that mark number is not in the latest view's legend"
             }
@@ -440,7 +457,7 @@ public actor MacScreenViewStore {
     ) -> Result<MacScreenViewMark, ResolveFailure> {
         guard let latest else { return .failure(.noView) }
         guard latest.viewId == viewId else { return .failure(.staleView) }
-        guard now.timeIntervalSince(latest.capturedAt) <= Self.ttlSeconds else {
+        guard now.timeIntervalSince(latest.capturedAt) <= MacLookFrameStore.ttlSeconds else {
             return .failure(.viewExpired)
         }
         guard let hit = latest.mark(mark) else { return .failure(.unknownMark) }
@@ -710,15 +727,6 @@ public enum MacScreenViewBuilder {
         "AXWebArea", "AXCollection",
     ]
 
-    /// Secure fields, by the marker macOS itself publishes plus the labels apps
-    /// use when they roll their own. Over-inclusive on purpose: a false
-    /// positive costs a legend row's readability, a false negative costs a
-    /// password.
-    public static let secretLabelHints: [String] = [
-        "password", "passcode", "passphrase", "secret", "api key", "api-key",
-        "token", "pin code", "security code", "2fa", "one-time code",
-    ]
-
     /// With `value`, a field whose displayed value is all mask glyphs IS a
     /// password box whatever its role, subrole or label say: AppKit and WebKit
     /// publish a secure field's value as bullets, so an unlabelled web
@@ -728,7 +736,7 @@ public enum MacScreenViewBuilder {
         if let shown = value?.trimmingCharacters(in: .whitespaces), !shown.isEmpty,
            shown.allSatisfy({ ["\u{2022}", "\u{25CF}", "\u{00B7}", "\u{2024}", "*"].contains($0) }) { return true }
         guard let label = label?.lowercased(), !label.isEmpty else { return false }
-        return secretLabelHints.contains { label.contains($0) }
+        return MacScreenViewTextRedaction.secretFieldLabelTokens.contains { label.contains($0) }
     }
 
     /// Is this element worth a number? Actionable (it advertises any AX action)
@@ -1108,12 +1116,19 @@ public enum MacScreenViewBuilder {
 /// Everything else passes through. Prose is long, multi-word, and punctuated;
 /// none of the five shapes above can match it.
 public enum MacScreenViewTextRedaction {
+    /// Field names use these hints without the prose caption-length or code-disqualifier rules.
+    public static let secretFieldLabelTokens: [String] = [
+        "password", "passcode", "passphrase", "secret", "api key", "api-key",
+        "token", "pin code", "security code", "2fa", "one-time code",
+    ]
+
     /// Words that make a SHORT nearby line a secret LABEL. Matched only against
     /// labels (≤ `maxLabelChars`), never against the body of a sentence.
-    public static let secretLabelTokens: [String] = [
-        "2fa", "two-factor", "two factor", "one-time", "one time", "otp",
-        "password", "passcode", "passphrase", "api key", "api-key", "apikey",
-        "secret", "token", "recovery", "security code", "verification code",
+    public static let secretLabelTokens = secretFieldLabelTokens.filter {
+        $0 != "pin code" && $0 != "one-time code"
+    } + [
+        "two-factor", "two factor", "one-time", "one time", "otp", "apikey",
+        "recovery", "verification code",
         "auth code", "authentication code", "access key", "private key",
         "pin", "code",
         // W3.5-FIX-R2 3 — the shapes round 1 missed.
@@ -1273,7 +1288,7 @@ public enum MacScreenViewTextRedaction {
     ) -> [MacScreenViewBuilder.VisibleText] {
         func near(_ frames: [MacAXFrame], _ item: MacScreenViewBuilder.VisibleText) -> Bool {
             frames.contains { frame in
-                frame != item.frame && isLabel(frame, forValueAt: item.frame)
+                frame != item.frame && isLabel(frame, forValueAt: item.frame, proximity: proximityPoints)
             }
         }
         return items.enumerated().map { index, item in
@@ -1469,7 +1484,7 @@ public enum MacScreenViewTextRedaction {
         guard case .string = redacted else { return redacted }
         if let frame {
             func near(_ frames: [MacAXFrame]) -> Bool {
-                frames.contains { $0 != frame && isLabel($0, forValueAt: frame) }
+                frames.contains { $0 != frame && isLabel($0, forValueAt: frame, proximity: proximityPoints) }
             }
             if isShortCodeValue(text), near(context.cvvLabelFrames) {
                 return redactedText(text, reason: "labeled_cvv")
@@ -1787,22 +1802,21 @@ public enum MacScreenViewTextRedaction {
 
     // MARK: shapes
 
-    /// Same geometry as `MacScreenViewBuilder.inferLabel`, inverted: there we
-    /// ask "which text names this control", here "is a secret-naming text
-    /// pointing at this value".
-    static func isLabel(_ label: MacAXFrame, forValueAt value: MacAXFrame) -> Bool {
+    /// Shared AX/OCR caption geometry: coordinates and proximity share units,
+    /// with a top-left origin and y increasing downward.
+    static func isLabel(_ label: MacAXFrame, forValueAt value: MacAXFrame, proximity: Double) -> Bool {
         guard label.w > 0, label.h > 0, value.w > 0, value.h > 0 else { return false }
         let sameRow = label.y < value.y + value.h && label.y + label.h > value.y
         let toTheLeft = label.x + label.w <= value.x + 1
         if sameRow, toTheLeft {
             let distance = value.x - (label.x + label.w)
-            return distance >= 0 && distance <= proximityPoints
+            return distance >= 0 && distance <= proximity
         }
         let above = label.y + label.h <= value.y + 1
         let horizontallyOverlapping = label.x < value.x + value.w && label.x + label.w > value.x
         if above, horizontallyOverlapping {
             let distance = value.y - (label.y + label.h)
-            return distance >= 0 && distance <= proximityPoints
+            return distance >= 0 && distance <= proximity
         }
         return false
     }

@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ChatRichContentParser.swift` | `ChatRichContentParser` enum; `blocks`, `listRows`; shared fence, list marker and continuation grammar |
 
 // Shared by the Mac transcript and the iPhone chat (2026-10-04): pure
 // Foundation, no AppKit/UIKit, so both renderers split and sanitize alike.

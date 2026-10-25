@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+// Blueprint: | `NativeAgentDesignTokens.swift` | `Color`: `NativeAgentFont`, `NativeAgentSpacing`, `NativeAgentRadius` |
 
 enum NativeAgentFont {
     static let title = Font.system(.title2, weight: .semibold)

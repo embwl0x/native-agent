@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ProviderAuthStatus.swift` | `ProviderAuthStatus`: shared credential-proof presentation and separately published dispatch eligibility |
+
 public struct ProviderAuthStatus: Codable, Hashable, Sendable {
     public var provider_id: String
     /// How far the credential is proven: ready, saved, failed, rejected or a

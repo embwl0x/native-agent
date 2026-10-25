@@ -1,4 +1,7 @@
 import AppToolRuntime
+import NativeAgentCore
+
+// Blueprint: | `MoodTint.swift` | Mood tint presentation: sampled canonical mood, damping/caps and accessibility-aware glass modifiers without independent feeling state |
 // MoodTint.swift
 // "Mood in the tint" — User and Agent approved the mocks 2026-09-14
 // (mockups/mood-tint/rest.png, warm.png, NOTE.md). This file is the whole
@@ -74,6 +77,7 @@ final class MoodTintWeather {
     /// The room resumes where it was and moves only while the app is running.
     private var updatedAtUptime: TimeInterval
     private var timer: Timer?
+    private let latest = LatestRead()
     private var consumers: Set<UUID> = []
 
     init(defaults: UserDefaults = .standard) {
@@ -116,12 +120,13 @@ final class MoodTintWeather {
     /// the filter goes when nothing holds it up.
     func tick(uptime now: TimeInterval = MoodTintWeather.uptime()) async {
         guard let timer else { return }
-        let reading = await Self.reading()
+        _ = await latest.read({ await Self.reading() }, publish: { reading in
         guard self.timer === timer else { return }
         let elapsedHours = max(0, now - updatedAtUptime) / 3600
         level = Self.damped(previous: level, reading: reading, elapsedHours: elapsedHours)
         updatedAtUptime = now
         defaults.set(level, forKey: Self.levelKey)
+        })
     }
 
     /// The one-pole low-pass, and the whole of the damping:

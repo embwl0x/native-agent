@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentA2AWire+Mapping.swift` | `AgentA2AWire`: `canonicalPart`, `wirePart`, `canonicalState` |
 
 extension AgentA2AWire {
     /// The canonical content shape is 1.0 ProtoJSON. Both directions use this

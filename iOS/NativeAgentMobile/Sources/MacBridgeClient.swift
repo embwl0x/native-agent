@@ -699,13 +699,16 @@ final class MacBridgeClient: ObservableObject {
                     name: a.name ?? "attachment",
                     type: a.type,
                     mime: a.mime,
+                    base64: a.preview?.png?.base64EncodedString(),
                     byteSize: a.byteSize.map(Int.init),
                     utterance: a.utterance
                 )
             }
             var message = ChatMessage(id: uuid, role: role, text: interaction == nil ? rec.content : "", attachments: attachments, runId: rec.runId,
                 interaction: interaction, interactionDescriptor: descriptor, interactionSessionID: rec.interactionSessionID)
+            message.toolEvents = rec.toolEvents ?? []
             if roleStr == "assistant" {
+                message.turnID = rec.metadata?.turnTraceId
                 message.failureDetail = rec.metadata?.error
                 message.completionState = rec.metadata?.failureWork != nil || rec.metadata?.error != nil ? "failed"
                     : rec.metadata?.partial == true || rec.metadata?.cancelled == true ? "incomplete" : rec.metadata?.completionState

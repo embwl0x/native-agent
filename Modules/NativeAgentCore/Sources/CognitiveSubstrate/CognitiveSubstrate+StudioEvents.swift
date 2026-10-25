@@ -47,6 +47,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Studio
+// Blueprint: | `CognitiveSubstrate+StudioEvents.swift` | `CognitiveSubstrate`: `studioJournalFelt`, `studioJournalEvent`, `ingestStudioJournalEntry` |
 
 public extension CognitiveEvent {
     /// Metadata key for a felt valence its OWNER measured rather than the
@@ -120,7 +121,7 @@ public extension CognitiveSubstrate {
         guard !title.isEmpty, !entry.id.isEmpty else { return nil }
         let felt = studioJournalFelt(for: entry)
         let occurredAt = now
-            ?? StudioClock.parseISO(entry.recordedAt)
+            ?? NativeTimestampFormat.parseISO8601FractionalFirst(entry.recordedAt)
             ?? dependencies.now()
         // The summary names the ACT, never the judgment. Her written response
         // stays in the journal, which is the record of it; a continuity node is
@@ -189,17 +190,11 @@ public actor StudioJournalCognitiveBus {
         await shared.setSink(sink)
     }
 
-    public static var isInstalled: Bool {
-        get async { await shared.hasSink }
-    }
-
     /// Publish a filed entry. Never throws and never blocks the journal write's
     /// success: the entry is already durable when this runs.
     public static func publish(_ entry: StudioJournalEntry) async {
         await shared.deliver(entry)
     }
-
-    private var hasSink: Bool { sink != nil }
 
     private func setSink(_ value: @escaping Sink) {
         sink = value

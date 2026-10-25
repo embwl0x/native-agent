@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `ContextProjectionSources.swift` | `ContextCompiledProjectionProvider`: incremental rebuildable source projections, generation-bound exclusions and delivery/publication hooks |
+
 /// Incremental output from a rebuildable non-file Context source projection.
 /// Providers compare their current source of truth with `previousSources` and
 /// return only changed sources plus sources that must leave the next generation.

@@ -1,6 +1,8 @@
 import Foundation
 import CoreGraphics
 
+// Blueprint: | `PersonOnlyWindows.swift` | `PersonOnlyWindows`: registered person-only window exclusion, input/pointer coordination and step-aside hooks without app dependencies |
+
 /// Windows that belong to the person alone — Shotgun, the small chat the app
 /// steps aside into while the agent drives the Mac (User, 10-04). The agent
 /// never sees one (her screen captures leave it out), never clicks one (her

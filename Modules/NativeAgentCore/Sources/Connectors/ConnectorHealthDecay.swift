@@ -2,9 +2,10 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `ConnectorHealthDecay.swift` | `ConnectorHealthDecay` and `ConnectorProofLedger`: credential-backed health from latest actual receipts, decayed by age without polling |
+
 // Credential-backed health follows the latest real action receipt. A failure
-// of authorization or transport supersedes success; proof decays without polling. Local
-// readiness (Telegram configuration or EventKit permission) has its own owner.
+// of authorization or transport supersedes success; proof decays without polling.
 
 public enum ConnectorHealthDecay {
     /// A connector untouched for this long stops reading green. Seven days —
@@ -31,19 +32,11 @@ public enum ConnectorHealthDecay {
     /// it works — rendered "configured, unverified".
     public static let configuredAuth = "configured"
 
-    /// Row key naming WHAT made this row green. Stamped by the runtime overlay
-    /// (`NativeClient.connectorRowWithRuntimeOverlay`), which is the only layer
-    /// that knows whether it derived "ok" from a credential on disk or from a
-    /// live local capability. Deliberately NOT read off the registry file: the
-    /// overlay clears the key before deriving, so a hand-edited registry row
-    /// cannot claim credential proof it does not have.
+    /// Stamped only by the runtime's credential-backed branches. The overlay
+    /// clears the saved key, so registry bytes cannot grant proof.
     public static let proofSourceKey = "healthProofSource"
 
-    /// The one proof source that decays. A token/credential on disk proves a
-    /// sign-in once completed and nothing about now, so its green needs a real
-    /// call to stay green. Every other proof source (an OS permission, a local
-    /// binary, a configured bot) is a claim the machine can still answer for
-    /// directly, and there is no receipt stream that could ever refresh it.
+    /// Credential-backed health requires a real connection receipt.
     public static let credentialProofSource = "credential"
 
     public static func verification(
@@ -59,20 +52,18 @@ public enum ConnectorHealthDecay {
 
     /// Apply the decay to one already-derived registry row.
     ///
-    /// `outcome` is the newest non-dry-run connection outcome. Rows that do not
-    /// claim health "ok", and rows whose green did not come from credential
-    /// presence (no `proofSourceKey == credentialProofSource` stamp from the
-    /// overlay), are returned unchanged.
+    /// `outcome` is the newest non-dry-run connection outcome. Credential-backed
+    /// rows derive health from it, including when no receipt has arrived.
     public static func apply(
         to row: [String: JSONValue],
         outcome: (at: Date, succeeded: Bool, authorizationFailed: Bool)?,
         now: Date,
         window: TimeInterval = provenWindow
     ) -> [String: JSONValue] {
-        guard stringField(row["healthStatus"])?.lowercased() == "ok",
-              stringField(row[proofSourceKey])?.lowercased() == credentialProofSource
+        guard stringField(row[proofSourceKey])?.lowercased() == credentialProofSource
         else { return row }
         var out = row
+        out["authState"] = .string(configuredAuth)
         if let outcome, !outcome.succeeded {
             if outcome.authorizationFailed { out["authState"] = .string("failed") }
             out["healthStatus"] = .string("failed")
@@ -82,8 +73,8 @@ public enum ConnectorHealthDecay {
         let lastSuccessAt = outcome?.at
         switch verification(lastSuccessAt: lastSuccessAt, now: now, window: window) {
         case .fresh:
-            // Keep "ok" — and replace the frozen registry stamp with the
-            // timestamp of the call that actually proved it.
+            out["authState"] = .string("connected")
+            out["healthStatus"] = .string("ok")
             out["lastCheckedAt"] = .string(isoTimestamp(lastSuccessAt!))
         case .stale:
             out["healthStatus"] = .string(unverifiedHealth)
@@ -115,8 +106,8 @@ public enum ConnectorHealthDecay {
 
 /// Reads the newest connector outcome per connector out of
 /// `connectors/actions/receipts.jsonl`. This is the ONLY "the integration
-/// actually worked" signal in the system — every connector action lands a
-/// receipt there through `appendConnectorActionReceipt`.
+/// actually worked" signal in the system — connector actions and Slack HTTP
+/// proofs share ConnectorActionReceipt's schema and append owner.
 public enum ConnectorProofLedger {
     /// Receipt statuses that mean the provider was reached and answered.
     /// `dry_run` is deliberately absent: a dry run never left the machine.
@@ -129,19 +120,12 @@ public enum ConnectorProofLedger {
     /// under-claim, never fabricate a green.
     public static let maxTailBytes = 512 * 1024
 
-    public static func receiptsPath(root: URL) -> URL {
-        root
-            .appendingPathComponent("connectors", isDirectory: true)
-            .appendingPathComponent("actions", isDirectory: true)
-            .appendingPathComponent("receipts.jsonl")
-    }
-
     /// Newest success or connection rejection per family, keyed by `canonicalID`.
     public static func latestByConnector(
         root: URL,
         maxTailBytes: Int = maxTailBytes
     ) -> [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] {
-        latestByConnector(receiptsPath: receiptsPath(root: root), maxTailBytes: maxTailBytes)
+        latestByConnector(receiptsPath: ConnectorActionReceipt.receiptsPath(root: root), maxTailBytes: maxTailBytes)
     }
 
     public static func latestByConnector(
@@ -154,9 +138,6 @@ public enum ConnectorProofLedger {
                   case .object(let row)? = try? JSONValue.parse(data) else { continue }
             guard let connector = string(row["connectorId"]).map(canonicalID),
                   !connector.isEmpty else { continue }
-            // GitHub's HTTP owner records the actual wire result. Action receipts
-            // can describe local work or a cached read, neither of which verifies it.
-            if connector == "github", string(row["actionId"]) != "github.http" { continue }
             // A dry run proves nothing about the live integration.
             if case .bool(true)? = row["dryRun"] { continue }
             guard let status = string(row["status"])?.lowercased(),
@@ -166,7 +147,7 @@ public enum ConnectorProofLedger {
             // Local status success proves no transport; a failed credential
             // check still invalidates an earlier successful call.
             if let action = string(row["actionId"])?.lowercased(),
-               status != "failed", action.hasSuffix(".status"), action != "slack.status", action != "github.status" {
+               status != "failed", action.hasSuffix(".status") {
                 continue
             }
             guard let created = string(row["createdAt"]),
@@ -195,17 +176,9 @@ public enum ConnectorProofLedger {
         return nil
     }
 
-    /// Registry ids and receipt `connectorId`s spell the same integration
-    /// differently (the registry says `gcal`/`gmail`; receipts say
-    /// `calendar`/`email`). Fold both onto one family key so proof recorded
-    /// under one spelling reaches the row under the other.
+    /// Registry ids and receipt `connectorId`s compare as one key, trimmed and lowercased.
     public static func canonicalID(_ raw: String) -> String {
-        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "email", "gmail": return "gmail"
-        case "calendar", "gcal", "google_calendar": return "calendar"
-        case "twitter", "x": return "x"
-        default: return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }
+        ConnectorOAuthRegistry.normalizedConnectorID(raw)
     }
 
     private static func string(_ value: JSONValue?) -> String? {

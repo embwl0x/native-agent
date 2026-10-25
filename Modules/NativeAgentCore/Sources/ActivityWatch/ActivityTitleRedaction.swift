@@ -2,6 +2,8 @@ import Foundation
 import MacControl
 import PersistenceCore
 
+// Blueprint: | `ActivityTitleRedaction.swift` | `ActivityTitleRedaction.redact`: the source boundary that removes secrets before titles enter spans or disk |
+
 /// THE ONLY DOOR a window title may walk through on its way to disk.
 ///
 /// Redaction happens at the SOURCE (per [[perception-organ-secret-redaction]]):

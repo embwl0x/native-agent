@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
+// Blueprint: | `MemoryV2.swift` | `SwiftNativeMemoryV2` actor; `emitDiagnostic` |
 
 // MARK: - Subsystem #8+9: MemoryV2
 //
@@ -298,24 +299,61 @@ public struct MemoryRecallHit: Sendable, Codable, Equatable {
 public enum MemoryV2Error: Error, LocalizedError {
     case invalidQuery
     case recordNotFound
-    case invalidResponse(status: Int)
     case storageUnavailable
     case underlying(String)
 
-    public var errorDescription: String? {
+    static func rejectedCandidate(_ reason: String, effects: ToolFailureError.Effects = .none) -> ToolFailureError {
+        ToolFailureError("Not durable memory: \(reason)", effects: effects,
+            code: "memory_candidate_rejected", status: .refused,
+            instruction: "Keep only a durable fact, preference, decision or experience; do not resubmit this rejected candidate.", recovery: .terminal)
+    }
+
+    static func forgottenContent(_ reason: String, effects: ToolFailureError.Effects = .none) -> ToolFailureError {
+        ToolFailureError(reason, effects: effects, code: "memory_tombstoned", status: .refused,
+            instruction: "Leave forgotten content forgotten; do not resubmit it or a paraphrase.", recovery: .terminal)
+    }
+
+    static func staleSupersession(_ reason: String) -> ToolFailureError {
+        ToolFailureError(reason, effects: .none,
+            nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
+            code: "memory_supersession_stale", status: .refused,
+            instruction: "Read current memories and stage a newly reviewed replacement; do not resubmit the stale proposal.", recovery: .inspect)
+    }
+
+    public var failure: ToolFailureError {
         switch self {
         case .invalidQuery:
-            return "memory: invalid query"
+            return ToolFailureError("Memory text or query is empty.", argumentPath: "text / query", accepted: "nonempty text",
+                effects: .none, nextCall: ToolFailureError.call("app", ["find": .string("memory")]), code: "memory_text_empty", status: .refused,
+                instruction: "Supply nonempty text in the original call.", recovery: .correctArguments)
         case .recordNotFound:
-            return "memory: record not found"
-        case .invalidResponse(let status):
-            return "memory: native implementation returned unexpected status \(status)"
+            return ToolFailureError("The requested memory record or proposal is unavailable.", effects: .none,
+                nextCall: ToolFailureError.call("app", ["page": .string("memories")]),
+                code: "memory_record_unavailable", instruction: "Read current memories and pending proposals before choosing an id.", recovery: .inspect)
         case .storageUnavailable:
-            return "memory: storage unavailable"
+            return Self.storeFailure("The memory store is unavailable.", code: "memory_store_unavailable")
         case .underlying(let m):
-            return "memory: \(m)"
+            return ToolFailureError(m, effects: .unknown,
+                nextCall: ToolFailureError.call("app", ["page": .string("memories")]),
+                code: "memory_operation_failed", instruction: "Inspect the reported cause before repeating this memory operation.", recovery: .inspect)
         }
     }
+
+    static func storeFailure(_ detail: String, code: String) -> ToolFailureError {
+        ToolFailureError(detail, effects: .unknown, owner: "memory store",
+            nextCall: ToolFailureError.call("app", ["page": .string("memories")]), code: code,
+            instruction: "Read memory diagnostics; repair the reported cause without deleting saved memories.")
+    }
+
+    /// Non-tool readers receive the same cause, fix and lever as tool readers.
+    static func describe(_ failure: ToolFailureError) -> String {
+        [failure.code, failure.message, failure.instruction,
+         failure.nextCall.map { "Call: \($0)" } ?? failure.tap.map { "Control: \($0)" }
+            ?? failure.argumentPath.map { "Argument: \($0)" }]
+            .compactMap { $0 }.joined(separator: " ")
+    }
+
+    public var errorDescription: String? { Self.describe(failure) }
 }
 
 // MARK: - SwiftNative impl
@@ -331,12 +369,15 @@ public actor SwiftNativeMemoryV2 {
     internal var canonicalDataRoot: URL?
     internal var canonicalAttachmentReady: Task<Void, Never>?
     internal var userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?
+    internal var memoryProjectionsStopped = false
     var actionIndexSource: (@Sendable () async throws -> [String])?
     var actionIndexWatcher: FileChangeWatcher?
     let actionIndexObservers = Mutex<[NSObjectProtocol]>([])
     var actionIndexUpdate: Task<Void, Never>?
     var actionIndexDirty = false
     var actionIndexFailure: String?
+    /// Terminal engine lifecycle gate, shared by both convergence flights.
+    var embeddingConvergenceStopped = false
     private struct EmbeddingRetryKey: Hashable {
         let epoch: String
         let kind: String
@@ -368,6 +409,8 @@ public actor SwiftNativeMemoryV2 {
     deinit {
         actionIndexObservers.withLock { $0.forEach { NotificationCenter.default.removeObserver($0) } }
         actionIndexWatcher?.cancel()
+        actionIndexUpdate?.cancel()
+        embeddingEpochReconcile?.cancel()
     }
 
     internal init(canonicalDataRoot: URL) {
@@ -402,20 +445,27 @@ public actor SwiftNativeMemoryV2 {
     public func updateMemory(id: String, update: JSONValue) async throws -> MemoryRecord {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        let existingKind: String?
-        if case .object(let patch) = update, Self.patchKind(patch) == nil,
-           patch["text"] != nil || patch["content"] != nil {
-            guard let existing = try await storage.lookupMemoryRecord(id: id) else {
+        var existing: MemoryRecord?
+        if case .object(let patch) = update, patch["text"] != nil || patch["content"] != nil {
+            guard let row = try await storage.lookupMemoryRecord(id: id) else {
                 throw MemoryV2Error.recordNotFound
             }
-            existingKind = existing.memoryKind ?? MemoryRecallScoring.kind(of: existing.extras)
-        } else {
-            existingKind = nil
+            existing = row
         }
-        let update = Self.sanitizedMemoryUpdate(update, existingKind: existingKind)
+        let update = Self.sanitizedMemoryUpdate(
+            update, existingKind: existing.flatMap { $0.memoryKind ?? MemoryRecallScoring.kind(of: $0.extras) })
         let newText = Self.patchText(update)
         var newEmbedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)?
         if let newText { newEmbedding = try await residentWriteEmbedding(newText) }
+        // New words are checked against what was forgotten by their vector
+        // before they replace the old ones; with the model cold they would
+        // replace them unchecked and a late match would archive both. The old
+        // words stay until the vector can be had.
+        if let newText, newEmbedding == nil, newText != existing?.text {
+            requestEmbeddingEpochReconcile()
+            throw MemoryStorageError.searchFailure("Memory unchanged: the memory search model is not loaded to check new wording against forgotten content.",
+                code: "memory_search_model_not_loaded", instruction: "Read Doctor and repair any reported model load error before rewriting.")
+        }
         try await gateUpdatedContentAgainstTombstones(update: update, embedding: newEmbedding, storage: storage)
         let updated = try await storage.updateMemory(
             id: id,
@@ -423,7 +473,7 @@ public actor SwiftNativeMemoryV2 {
             newEmbedding: newEmbedding?.vector,
             embeddingEpoch: newEmbedding?.epoch
         )
-        return newText != nil && newEmbedding == nil ? owedVector(updated) : updated
+        return updated
     }
 
     /// Edits go through the same denylist gates as inserts: without this, a
@@ -442,13 +492,13 @@ public actor SwiftNativeMemoryV2 {
             return nil
         }()
         if let newText, try await storage.isTombstoned(content: newText) {
-            throw MemoryV2Error.underlying("tombstoned: updated content matches a rejection denylist entry")
+            throw MemoryV2Error.forgottenContent("Updated content matches a forgotten or rejected memory.")
         }
         if try await storage.matchesTombstone(
             embedding: embedding.vector,
             embeddingEpoch: embedding.epoch
         ) {
-            throw MemoryV2Error.underlying("tombstoned: updated content is a paraphrase of a rejected claim")
+            throw MemoryV2Error.forgottenContent("Updated content paraphrases a forgotten or rejected memory.")
         }
     }
 
@@ -468,7 +518,7 @@ public actor SwiftNativeMemoryV2 {
     public func embeddingEpoch() -> MemoryEmbeddingEpoch? { embedder?.embeddingEpoch }
 
     /// A write's vector from the resident model only: a cold model is never
-    /// loaded on a write. Nil means the row lands with its vector owed and the
+    /// loaded on a write Nil means the row lands with its vector owed and the
     /// write's record says so (`owedVector`).
     func residentWriteEmbedding(_ text: String) async throws -> (vector: [Float], epoch: MemoryEmbeddingEpoch)? {
         guard residentEmbeddingEpoch() != nil else { return nil }
@@ -481,7 +531,7 @@ public actor SwiftNativeMemoryV2 {
         var record = record
         var extras: [String: JSONValue] = [:]
         if case .object(let current)? = record.extras { extras = current }
-        extras["vector_pending"] = .string("Saved; its search vector is owed until the memory-search model is resident, then MemoryV2 fills it. Until then semantic recall cannot find it.")
+        extras["vector_pending"] = .string("Saved; memory search cannot find it until the memory search model supplies its vector and admission checks finish.")
         record.extras = .object(extras)
         return record
     }
@@ -497,6 +547,11 @@ public actor SwiftNativeMemoryV2 {
     public func embedIfWarm(_ texts: [String]) async -> [[Float]]? {
         guard let managed = embedder as? ManagedEmbeddingProvider else { return nil }
         return await managed.embedIfResident(texts)
+    }
+
+    public func managedEmbeddingRuntime() async throws -> ManagedEmbeddingProvider {
+        guard let managed = embedder as? ManagedEmbeddingProvider else { throw MemoryV2Error.storageUnavailable }
+        return managed
     }
 
     public func embeddingRuntimeSnapshot() -> EmbeddingRuntimeSnapshot? {
@@ -580,6 +635,16 @@ public actor SwiftNativeMemoryV2 {
         return try await embedder.embedWithEpoch(texts)
     }
 
+    /// A turn's message (and its other voice) as a search query: the model's
+    /// query form, scored against vectors from `embedForDerivedContextWithEpoch`.
+    public func embedQueriesWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
+        guard let embedder else { throw MemoryV2Error.storageUnavailable }
+        guard !texts.isEmpty else {
+            return MemoryEmbeddingBatch(epoch: embedder.embeddingEpoch, vectors: [])
+        }
+        return try await embedder.embedQueriesWithEpoch(texts)
+    }
+
     @discardableResult
     public func releaseEmbeddingMemory(reason: String = "manual release") -> EmbeddingRuntimeSnapshot? {
         guard let managed = embedder as? ManagedEmbeddingProvider else {
@@ -604,6 +669,7 @@ public actor SwiftNativeMemoryV2 {
         batchSize: Int = 64
     ) async throws -> MemoryEmbeddingEpochActivationReport {
         try await ensureCanonicalAttachment()
+        try Task.checkCancellation()
         guard let embedder,
               let bridge = storage else {
             throw MemoryV2Error.storageUnavailable
@@ -613,7 +679,9 @@ public actor SwiftNativeMemoryV2 {
         var reusable = embeddingRetryVectors
         embeddingRetryVectors = [:]
         let concreteStorage = await bridge.underlyingStorage()
+        try Task.checkCancellation()
         let corpus = try await concreteStorage.embeddingCorpusSnapshot()
+        try Task.checkCancellation()
         guard corpus.count <= 50_000 else {
             throw MemoryV2Error.underlying("embedding corpus exceeds bounded activation limit")
         }
@@ -627,6 +695,7 @@ public actor SwiftNativeMemoryV2 {
 
         if corpus.isEmpty {
             let probe = try await embedder.embedWithEpoch(["NativeAgent embedding epoch activation"])
+            try Task.checkCancellation()
             candidateEpoch = probe.epoch
         } else {
             let missing = corpus.filter {
@@ -639,13 +708,14 @@ public actor SwiftNativeMemoryV2 {
                 let end = min(missing.count, start + boundedBatch)
                 let rows = Array(missing[start..<end])
                 let batch = try await embedder.embedWithEpoch(rows.map(\.content))
+                try Task.checkCancellation()
                 guard batch.vectors.count == rows.count else {
                     throw MemoryV2Error.underlying(
-                        "embedder returned \(batch.vectors.count)/\(rows.count) candidate vectors"
+                        "The memory search model returned \(batch.vectors.count)/\(rows.count) candidate vectors."
                     )
                 }
                 if let candidateEpoch, candidateEpoch != batch.epoch {
-                    throw MemoryV2Error.underlying("embedding provider epoch changed during candidate build")
+                    throw MemoryV2Error.underlying("The memory search model changed vector spaces while building the index.")
                 }
                 candidateEpoch = batch.epoch
                 for (row, vector) in zip(rows, batch.vectors) {
@@ -659,11 +729,11 @@ public actor SwiftNativeMemoryV2 {
             }
         }
         guard let candidateEpoch else {
-            throw MemoryV2Error.underlying("embedding provider did not identify its vector space")
+            throw MemoryV2Error.underlying("The memory search model did not identify its vector space.")
         }
         try Task.checkCancellation()
         guard embedder.embeddingEpoch == candidateEpoch else {
-            throw MemoryV2Error.underlying("embedding provider epoch changed during candidate build")
+            throw MemoryV2Error.underlying("The memory search model changed vector spaces while building the index.")
         }
         do {
             return try await concreteStorage.activateEmbeddingEpoch(candidateEpoch, staged: staged)
@@ -683,10 +753,14 @@ public actor SwiftNativeMemoryV2 {
     internal func embedOneWithEpoch(
         _ text: String
     ) async throws -> (vector: [Float], epoch: MemoryEmbeddingEpoch) {
-        guard let embedder else { throw MemoryV2Error.storageUnavailable }
+        guard let embedder else {
+            throw MemoryStorageError.searchFailure("No memory search model is attached.",
+                code: "memory_search_model_unavailable", instruction: "Inspect Doctor's memory search model findings before searching again.")
+        }
         let batch = try await embedder.embedWithEpoch([text])
         guard let vector = batch.vectors.first else {
-            throw MemoryV2Error.underlying("embedder returned no vectors")
+            throw MemoryStorageError.searchFailure("The memory search model returned no vectors.",
+                code: "memory_search_vectors_missing", instruction: "Inspect Doctor's model findings; repair the missing vectors before writing memory again.")
         }
         return (vector, batch.epoch)
     }

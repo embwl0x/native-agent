@@ -2,57 +2,20 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - "She speaks" seam (L5 G7)
-//
-// ONE narrow path by which something that is NOT a user turn can put an
-// assistant-authored message into a chat transcript. Everything proactive in
-// this tree is otherwise a card or a banner; this is the single exception, and
-// it is deliberately built to stay one.
-//
-// THREE PROPERTIES THAT MAKE IT SAFE TO EXIST:
-//
-//   1. ONE CALLER. `ProactiveSpeechCaller` has exactly one case
-//      (`.morningBrief`). Adding a second caller is a source edit to this enum,
-//      which is the review checkpoint — not a config flag, not a free-form
-//      string anyone can pass. This is NOT a general broadcast API.
-//
-//   2. RATE LIMITED — ON THE PROACTIVE ROUTE ONLY. At most one UNPROMPTED post
-//      per caller per `proactiveSpeechMinimumIntervalSeconds` (1h), and the
-//      limiter state is persisted so a relaunch can't reset it into a storm
-//      (same reason the trigger scheduler persists `last_fired_at`). A post User
-//      asked for by pressing Act (`.userRequested`) is not a proactive post: it
-//      skips the interval and never advances the proactive clock. Gating an
-//      explicit button press behind an hourly quota would just be a dead
-//      button.
-//
-//   3. IDEMPOTENCY STAMPED. Each post carries a caller-supplied key. Re-posting
-//      a key this caller has recently used is a no-op reporting `.duplicate` —
-//      the same contract the desk-notify loop gets from
-//      `markNotifiedIfUnchanged`: the second attempt neither writes nor lies
-//      about having written. This is what stops the scheduled brief and a
-//      subsequent Act on that same brief's card from both landing.
-//
-// WHAT IS WIRED, DECLARED NOT SILENT: two call sites.
-// `InboxCardActions.postSpokenInboxMessage`, the morning-brief card's Act handler,
-// on the `.userRequested` route (L5 G6); and since Phase 5 E1 (2026-10-03)
-// `NativeCognitionRuntime.deliverReach`, `.reachOut` on the `.scheduled`
-// route — her own message, written on her resident-wake turn, at most once a
-// day. The hourly quota below is now load-bearing behind that lane's gates.
-//
-// FAILURE SEMANTICS: the claim is written BEFORE the transcript append
-// (at-most-once). If the append fails, only proven absence allows rollback
-// under a CAS on our own stamp; an uncertain or committed write keeps it. A
-// crash between the two leaves the claim standing. A missed proactive message
-// is the failure mode we choose over a duplicate one.
+// Blueprint: | `ProactiveAssistantSpeech.swift` | `speakProactively` owns proactive transcript writes, claims, quota and destination reconciliation; Reach and chat.post share reachOut, inbox Act uses morningBrief |
+
+// One owner for assistant speech outside a user turn. Inbox-card Act uses
+// morningBrief/userRequested; Reach and app chat.post share reachOut/scheduled.
+// Only userRequested skips the persisted hourly quota. All callers share the
+// durable idempotency claim and destination reconciliation: duplicates never
+// write again. The claim precedes append; only proven absence releases it.
 
 /// The exhaustive list of code paths allowed to speak unprompted.
 /// Adding a case here is the review gate for widening the seam.
 public enum ProactiveSpeechCaller: String, Sendable, CaseIterable, Equatable {
     case morningBrief = "morning_brief"
-    /// Phase 5 E1 (2026-10-03): her one initiative path. She wrote the message
-    /// on her own resident-wake turn about something worth sharing, after
-    /// every on-device gate passed (NativeCognitionRuntime+Reach.swift). The
-    /// `.scheduled` route, so the hourly quota applies too.
+    /// Her own speech, from Reach or chat.post. Both use the scheduled route
+    /// and the same hourly quota; Reach also retains its own initiative gates.
     case reachOut = "reach_out"
 }
 
@@ -105,9 +68,7 @@ struct ProactiveSpeechClaim: Sendable, Equatable {
         }
     }
 
-    /// Bounded because this file is read on every attempt and must never grow
-    /// without limit. 16 is far more than the ~1/day the one caller produces,
-    /// and enough that an Act on yesterday's card still dedups.
+    /// Bounded recent claims, shared by every entry point for this caller.
     static let recentKeyCap = 16
 
     var jsonValue: JSONValue {

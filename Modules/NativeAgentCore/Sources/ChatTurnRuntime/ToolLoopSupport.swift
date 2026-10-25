@@ -4,6 +4,7 @@ import PersistenceCore
 import TurnTrace
 import ProviderRouting
 import ToolRegistry
+// Blueprint: | `ToolLoopSupport.swift` | `ToolLoopTraceObservation` retains prose and dispatch evidence across every loop throw and owns failed-attempt classification; legacy failed-slot counting stays separate; `ToolDispatchDeadline` |
 
 /// Retains loop evidence across a throw without changing the public error carriers.
 final class ToolLoopTraceObservation: @unchecked Sendable {
@@ -11,13 +12,21 @@ final class ToolLoopTraceObservation: @unchecked Sendable {
     private let lock = NSLock()
     private var payload: [String: JSONValue] = [:]
     private var dispatches: [TurnEngineResult.ToolDispatchRecord] = []
+    private var prose = ""
 
-    func record(_ counters: TurnEngineResult.LoopCounters, dispatches: [TurnEngineResult.ToolDispatchRecord]) {
+    func record(_ counters: TurnEngineResult.LoopCounters, dispatches: [TurnEngineResult.ToolDispatchRecord], reply: String) {
         lock.lock()
         defer { lock.unlock() }
         payload = counters.tracePayload
         payload.merge(Self.toolCounts(dispatches), uniquingKeysWith: { _, new in new })
         self.dispatches = dispatches
+        prose = reply
+    }
+
+    var partialReply: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return prose
     }
 
     var toolDispatches: [TurnEngineResult.ToolDispatchRecord] {
@@ -40,15 +49,18 @@ final class ToolLoopTraceObservation: @unchecked Sendable {
         }
         return [
             "toolAttemptCount": .int(Int64(attempts.count)),
-            "failedToolAttemptCount": .int(Int64(attempts.filter {
-                !ChatToolOutcome.outputLooksSuccessful($0.result)
-                    && !wasStopped($0.result) && !ChatToolOutcome.wasCancelled($0.result)
-            }.count)),
+            "failedToolAttemptCount": .int(Int64(dispatches.filter { isFailedAttempt($0.result) }.count)),
             "skippedToolSlotCount": .int(Int64(dispatches.filter {
                 ChatToolOutcome.neverRan($0.result)
                     || (wasStopped($0.result) && !ChatToolOutcome.effectsUnknown($0.result))
             }.count)),
         ]
+    }
+
+    static func isFailedAttempt(_ output: JSONValue) -> Bool {
+        !ChatToolOutcome.neverRan(output) && !ChatToolOutcome.outputLooksSuccessful(output)
+            && !wasStopped(output) && !ChatToolOutcome.wasCancelled(output)
+            && !ChatToolOutcome.isWaitingOnPerson(output)
     }
 
     /// The loop's Stop envelopes include an error sentence, which outranks status in the shared classifier.
@@ -64,9 +76,6 @@ extension TurnEngineResult.LoopCounters {
             "providerAttemptCount": .int(Int64(providerAttemptCount)),
             "failedProviderAttemptCount": .int(Int64(failedProviderAttemptCount)),
             "providerRoundCount": .int(Int64(providerRoundCount)),
-            "providerRecoveryCount": .int(Int64(providerRecoveryCount)),
-            "providerReplayCount": .int(Int64(providerReplayCount)),
-            "providerContinuationCount": .int(Int64(providerContinuationCount)),
             "contextOverflowRecoveryCount": .int(Int64(contextOverflowRecoveryCount)),
             "toolRoundCount": .int(Int64(toolRoundCount)),
             "roundsAfterToolFailureCount": .int(Int64(roundsAfterToolFailureCount)),
@@ -142,11 +151,6 @@ public enum ToolDispatchDeadline {
         default:
             return false
         }
-    }
-
-    /// Compatibility/readout overload when no concrete tool input is known.
-    static func timeoutNanos(forSurface surface: String) -> UInt64 {
-        timeoutNanos(toolName: "", input: [:], surface: surface)
     }
 
     /// Per-dispatch deadline. Explicit tool timeouts are honored with a 30s
@@ -262,8 +266,7 @@ enum ProviderToolResultProjection {
     static let compactMaxUTF8Bytes = 12_000
 
     static func maxUTF8Bytes(for toolName: String) -> Int {
-        if toolName.hasPrefix("github_")
-            || toolName == "invoke_codex" {
+        if toolName == "invoke_codex" {
             return compactMaxUTF8Bytes
         }
         return defaultMaxUTF8Bytes
@@ -334,182 +337,5 @@ enum ProviderToolResultProjection {
             }
         }
         return (try? JSONValue.object(fields).serialize(pretty: false)) ?? "{}"
-    }
-}
-
-/// Detects a provider repeatedly issuing the exact same tool batch and
-/// receiving the exact same results. Changed arguments or changed output
-/// always reset the streak, preserving legitimate polling, paging, retries,
-/// and iterative work. What it sees is her input each round the streak holds;
-/// whether to go on is hers.
-struct ToolLoopNoProgressGuard {
-    enum Action: Equatable {
-        case none
-        /// `model` is the correction addressed to the agent; `person` is what
-        /// the visible progress stream may say, and is nil whenever the only
-        /// thing to say is "fix your arguments" - that is the agent's job, not
-        /// the reader's (2026-09-13, first-failure pass).
-        case warn(model: String, person: String?)
-    }
-
-    private var previous: [TurnEngineResult.ToolDispatchRecord]?
-    private var identicalRoundCount = 0
-    /// 2026-09-07: the same tool failing with the same error round after round
-    /// is no progress even when the provider rewords the arguments each time
-    /// (78 rounds of `claude_message` denied on a bad `desk_item` never tripped
-    /// the identical-batch streak because the message text drifted).
-    private var previousFailure: (name: String, error: String)?
-    private var sameFailureRoundCount = 0
-
-    mutating func observe(_ records: [TurnEngineResult.ToolDispatchRecord]) -> Action {
-        guard !records.isEmpty else {
-            previous = nil
-            identicalRoundCount = 0
-            previousFailure = nil
-            sameFailureRoundCount = 0
-            return .none
-        }
-        if let failure = Self.uniformFailure(records) {
-            if let previousFailure, previousFailure == failure {
-                sameFailureRoundCount += 1
-            } else {
-                previousFailure = failure
-                sameFailureRoundCount = 1
-            }
-            if sameFailureRoundCount >= 4 {
-                return .warn(
-                    model: "No progress detected: \(failure.name) has failed with the same error \(sameFailureRoundCount) rounds in a row (\(failure.error)). Change the call or stop calling it; rewording the arguments does not change the outcome.",
-                    // Only an evidenced standing blocker is the reader's to
-                    // resolve, once. Everything else is the agent repairing its
-                    // own call, and narrating that to the person just asks them
-                    // to debug a tool they never wrote.
-                    person: sameFailureRoundCount == 4 ? Self.standingBlocker(failure) : nil
-                )
-            }
-        } else {
-            previousFailure = nil
-            sameFailureRoundCount = 0
-        }
-        if let previous, Self.equal(previous, records) {
-            identicalRoundCount += 1
-        } else {
-            previous = records
-            identicalRoundCount = 1
-        }
-
-        if identicalRoundCount >= 8 {
-            return .warn(
-                model: "No progress detected: this exact tool batch has returned the same result \(identicalRoundCount) rounds in a row. Change the arguments, use a narrower query or a different tool, or answer from the results already available.",
-                person: nil
-            )
-        }
-        return .none
-    }
-
-    /// The evidenced blocker in ordinary language, or nil when the error is
-    /// only the agent's own call to repair. Matched on the typed vocabulary the
-    /// dispatchers already emit (not connected, permission, denied, expired
-    /// credentials, unavailable) - never on repetition, which proves nothing
-    /// about the cause.
-    static func standingBlocker(_ failure: (name: String, error: String)) -> String? {
-        let e = failure.error.lowercased()
-        if e.contains("not_connected") || e.contains("not connected") || e.contains("reauth_required") {
-            return "I could not finish that because the account it needs is not connected right now. Connect it and I will pick up where I stopped."
-        }
-        if e.contains("permission_denied") || e.contains("integration_permission_denied")
-            || e.contains("not authorized") || e.contains("permission") {
-            return "I could not finish that because the permission it needs is not granted on this Mac. Grant it and I will pick up where I stopped."
-        }
-        if e.contains("invalid_api_key") || e.contains("authentication_error")
-            || e.contains("status 401") || e.contains("expired") {
-            return "I could not finish that because the credentials it needs were rejected. Reconnect that account and I will pick up where I stopped."
-        }
-        if e.contains("disabled") || e.contains("unavailable") || e.contains("status 503") {
-            return "I could not finish that because the service behind it is unavailable right now. Nothing that already completed was lost."
-        }
-        return nil
-    }
-
-    /// The round's one tool name and one failure string when every record that
-    /// did NOT succeed is the same tool failing the same way; nil otherwise.
-    ///
-    /// Two shapes this used to be blind to, and a failing turn therefore ran
-    /// the full iteration / wall-clock budget:
-    ///
-    /// - A MIXED batch. One working call beside four identical failures is not
-    ///   progress on the four; a record that succeeded is simply not part of
-    ///   the stuck shape, so it is skipped rather than disqualifying the round.
-    /// - The `{"status":"failed"}` envelope. Most dispatchers on this surface
-    ///   report that way and carry no `error` key at all, so the old read — a
-    ///   non-empty `result["error"]` on EVERY record — saw no failure at all.
-    ///   Classification is `ChatToolOutcome.exactResultClass` now, the same one
-    ///   the post-turn evidence reads.
-    ///
-    /// Anything non-terminal in the round (pending, awaiting approval,
-    /// cancelled, unknown) is not a settled failure and stops the read: those
-    /// are the shapes that legitimately change between rounds.
-    private static func uniformFailure(
-        _ records: [TurnEngineResult.ToolDispatchRecord]
-    ) -> (name: String, error: String)? {
-        var seen: (name: String, error: String)?
-        for record in records {
-            switch ChatToolOutcome.exactResultClass(record.result) {
-            case .succeeded:
-                continue
-            case .failed, .refused, .timeout:
-                // An app call is named by its action: two actions are two tools.
-                let action: String? = if record.name == "app", case .string(let id)? = record.input["action"] { id } else { nil }
-                let current = (name: action.map { "app " + $0 } ?? record.name, error: failureText(record.result))
-                if let seen, seen != current { return nil }
-                seen = current
-            case .cancelled, .unknown:
-                return nil
-            }
-        }
-        return seen
-    }
-
-    /// The failing record's own words, for the warning and the stop line —
-    /// and, because the streak is keyed on this string, its identity.
-    ///
-    /// EVERY populated field, not the first one found. The dispatchers' generic
-    /// envelope (`{"status":"failed","reason":"bots_tool_failed","detail":…}`)
-    /// carries the same `reason` for unrelated breakages, so quoting one field
-    /// made four different failures read as one tool failing the same way four
-    /// times and ended a turn that was still getting somewhere. The specific
-    /// `detail` comes before the generic `reason` and `status` so the sentence
-    /// leads with what actually went wrong.
-    private static func failureText(_ result: JSONValue) -> String {
-        guard case .object(let object) = result else { return "failed" }
-        let parts = ["error", "message", "detail", "reason", "status"].compactMap { key -> String? in
-            guard case .string(let text)? = object[key] else { return nil }
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }
-        guard !parts.isEmpty else { return "failed" }
-        return String(ChatSecretRedactor.redactText(parts.joined(separator: " — ")).prefix(200))
-    }
-
-    private static func equal(
-        _ lhs: [TurnEngineResult.ToolDispatchRecord],
-        _ rhs: [TurnEngineResult.ToolDispatchRecord]
-    ) -> Bool {
-        guard lhs.count == rhs.count else { return false }
-        return zip(lhs, rhs).allSatisfy { left, right in
-            left.name == right.name
-                && left.input == right.input
-                && comparableResult(left.result) == comparableResult(right.result)
-        }
-    }
-
-    /// User, 2026-09-06: an approval envelope carries a FRESH `approvalId` every
-    /// time one is filed, so two identical CONFIRM requests never compared equal
-    /// and the streak never grew past one — the guard could not see the one loop
-    /// shape it exists to stop. The id is filing bookkeeping, not the result.
-    private static func comparableResult(_ result: JSONValue) -> JSONValue {
-        guard ChatToolOutcome.isWaitingApproval(result),
-              case .object(var object) = result else { return result }
-        object["approvalId"] = nil
-        return .object(object)
     }
 }

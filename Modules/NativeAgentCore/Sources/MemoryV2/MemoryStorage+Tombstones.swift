@@ -2,38 +2,14 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryStorage+Tombstones.swift` | `MemoryStorage`: `upsertTombstone` |
 
 extension MemoryStorage {
     // MARK: - Tombstones
 
-    public func addTombstone(
-        content: String,
-        reason: String?,
-        embedding: [Float]? = nil,
-        embeddingEpoch: String? = nil
-    ) async throws {
-        try await dbPool.write { db in
-            try Self.requireWritableEpoch(in: db, vector: embedding, epoch: embeddingEpoch)
-            try Self.upsertTombstone(
-                db: db,
-                content: content,
-                reason: reason,
-                embedding: embedding,
-                embeddingEpoch: embeddingEpoch
-            )
-        }
-    }
-
     /// THE single tombstone writer (gpt-5.5 wave1 finding 3: every path must
     /// COALESCE-preserve an existing embedding when the new write carries none —
     /// a plain REPLACE from a nil-embedding caller would wipe the semantic key).
-    public func removeTombstone(content: String) async throws {
-        let hash = Self.contentHash(content)
-        try await dbPool.write { db in
-            try db.execute(sql: "DELETE FROM tombstones WHERE content_hash = ?", arguments: [hash])
-        }
-    }
-
     static func upsertTombstone(
         db: Database,
         content: String,
@@ -113,8 +89,6 @@ extension MemoryStorage {
         if let activeEpoch, queryEpoch != activeEpoch {
             throw MemoryStorageError.embeddingEpochMismatch(expected: activeEpoch, actual: queryEpoch)
         }
-        let qn = l2norm(query)
-        guard qn > 0 else { return false }
         var sql = "SELECT embedding FROM tombstones WHERE embedding IS NOT NULL"
         var arguments: StatementArguments = []
         if let activeEpoch {
@@ -124,21 +98,17 @@ extension MemoryStorage {
         let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
         for row in rows {
             guard let e = decodeEmbedding(row["embedding"]), e.count == query.count else { continue }
-            let en = l2norm(e)
-            guard en > 0 else { continue }
-            var dot: Float = 0
-            for i in 0..<e.count { dot += e[i] * query[i] }
-            if Double(dot) / (Double(qn) * Double(en)) >= threshold { return true }
+            if VectorMath.cosine(query, e) >= threshold { return true }
         }
         return false
     }
 
     /// Fill in the semantic key on tombstones that never got one.
     ///
-    /// The ordinary delete/reject path calls `addTombstone(content:reason:)`
-    /// and lets `embedding` default to nil (both MemoryV2 facades do), while
-    /// `tombstoneMatch` selects `WHERE embedding IS NOT NULL`. Every tombstone
-    /// written that way is invisible to the semantic forget-gate and blocks
+    /// Older builds' delete/reject paths wrote tombstones without an
+    /// `embedding`, and a rejected proposal that never had a vector still
+    /// does, while `tombstoneMatch` selects `WHERE embedding IS NOT NULL`.
+    /// Every tombstone written that way is invisible to the semantic forget-gate and blocks
     /// only its own exact content hash — the gate covers a minority of the set.
     ///
     /// This re-embeds them in bounded batches with the SAME embedder the live

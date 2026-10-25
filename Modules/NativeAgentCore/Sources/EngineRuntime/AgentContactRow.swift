@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
-import ChatOrchestration
+import AgentWorkspace
+import AgentConversations
+// Blueprint: | `AgentContactRow.swift` | Contact identity/health folding, per-door authority and shared status vocabulary; ContactListFacade retains one checked door read, with primary contacts derived from it. |
 
 public struct AgentContactRow: Identifiable, Sendable {
     public let id: String
@@ -8,6 +10,8 @@ public struct AgentContactRow: Identifiable, Sendable {
     public let contact: AgentPeerContact?
     public var candidate: AgentDiscoveryCandidate? = nil
     public var builtIn = false
+    /// The canonical contact row; associated doors retain their own grants.
+    public var primary = true
     /// The newest retained exchange with this contact, from any chat.
     public var lastExchange: String?
     /// Home's own word for this contact (AgentContactHealth): one source, so
@@ -90,11 +94,12 @@ public struct AgentContactRow: Identifiable, Sendable {
         }
         var seen: Set<String> = []
         return all.compactMap { row in
-            // Fold the same evidence before choosing which doors to display.
-            if !everyDoor, let who = row.contact?.who, peers.contains(where: { $0.id == who }) { return nil }
+            // Fold evidence once, retaining each door's own authority verdict.
             let canonical = brain(row)
-            guard everyDoor || seen.insert(canonical).inserted else { return nil }
             var row = row
+            row.primary = !(row.contact?.who.map { who in peers.contains { $0.id == who } } ?? false)
+                && seen.insert(canonical).inserted
+            guard everyDoor || row.primary else { return nil }
             row.candidate = all.filter { brain($0) == canonical }.compactMap(\.candidate).first { $0.setupFailure != nil }
                 ?? row.candidate
             row.health = all.filter { brain($0) == canonical }.compactMap(\.health)
@@ -205,22 +210,6 @@ public struct AgentContactRow: Identifiable, Sendable {
         case .connect: return "Connect to \(name)."
         case .disconnect: return "Disconnect the \(name) agent contact."
         case .test: return "Send \(name) a short test message and tell me what it answers."
-        }
-    }
-}
-
-extension AgentContactRow {
-    public static func read(dataRoot root: URL, everyDoor: Bool = false) async -> Result<[Self], Error> {
-        let discovery = await AgentDiscoverySession.shared.candidates(dataRoot: root)
-        return Result {
-            let peers = try AgentPeerStore(dataRoot: root).list()
-            let lasts = AgentConversationStore.lastExchanges(peers: peers,
-                records: (try? AgentConversationStore(dataRoot: root).records()) ?? [], dataRoot: root).mapValues(\.summary)
-            return AgentContactRow.rows(peers: peers, candidates: discovery, usable: [], dataRoot: root, everyDoor: everyDoor).map { row in
-                var row = row
-                row.lastExchange = row.contact.flatMap { lasts[$0.id] }
-                return row
-            }
         }
     }
 }

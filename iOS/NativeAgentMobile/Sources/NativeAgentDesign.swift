@@ -2,6 +2,7 @@
 
 import SwiftUI
 import UIKit
+// Blueprint: | `NativeAgentDesign.swift` | `View`: `appShimmer` |
 
 /// The app's animated ground stays outside the extension's shared glass tokens.
 struct MobileRoomBackground: View {

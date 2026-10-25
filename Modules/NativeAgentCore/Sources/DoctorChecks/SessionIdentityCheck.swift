@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 
+// Blueprint: | `SessionIdentityCheck.swift` | `SessionIdentityCheck.run`: session mint-site counts and source/row disagreement diagnostics |
+
 // MARK: - One Thread, Many Surfaces — Phase 0 Doctor row
 //
 // docs/build_plans/one-thread-many-surfaces-plan.md §7 Phase 0:
@@ -49,6 +51,14 @@ public struct SessionIdentityCheck: DoctorCheck {
 
         let report = SessionIdentityLedger.flappingReport(dataRoot: root)
         let tally = SessionIdentityLedger.mintTally(dataRoot: root, now: Date())
+        if let path = tally.unreadablePaths.first {
+            return CheckResult(source: tally.unreadablePaths.joined(separator: ", "),
+                id: id, title: title, status: "fail",
+                detail: "Session minting could not be measured because turn-trace day files could not be read: \(tally.unreadablePaths.joined(separator: ", ")).",
+                harm: "Session creation history cannot be checked from the saved turns.",
+                human_action: ToolFailureError.fileRepairInstruction(URL(fileURLWithPath: path),
+                    shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."))
+        }
 
         // Fresh install: no index yet. Honest "ok" with an explicit zero.
         guard indexExists else {
@@ -61,13 +71,11 @@ public struct SessionIdentityCheck: DoctorCheck {
 
         if !report.indexReadable {
             return CheckResult(source: "chat/sessions.json",
-                nextCall: ToolFailureError.fileRepairCall(sessionsPath, dataRoot: root,
-                    shape: "This is a JSON array of saved chat session objects, each with its original nonempty id and saved metadata."),
                 id: id, title: title, status: "fail",
-                detail: "chat/sessions.json is unreadable or malformed."
-                    + " Session identity cannot be measured.",
-                harm: "Saved conversations cannot be reliably identified or reopened."
-            )
+                detail: "chat/sessions.json is unreadable or malformed, so session identity cannot be measured.",
+                harm: "Saved conversations cannot be reliably identified or reopened.",
+                human_action: ToolFailureError.fileRepairInstruction(sessionsPath,
+                    shape: "This is a JSON array of saved chat session objects, each with its original nonempty id and saved metadata."))
         }
 
         var parts: [String] = ["\(report.hotSessionCount) hot session(s)"]

@@ -209,7 +209,7 @@ if [ "$bridge_rc" -eq 0 ]; then
   else
     status WARN "resource pressure" "$resource; expect conserve/sleep loop budget"
   fi
-  resource_causes="$(jq -r '.organism.bodySchema.resourcePressureReading | if type == "object" then "thermal=\(.thermalPressure // "unknown") lowPowerMode=\(if (.lowPowerMode | type) == "boolean" then .lowPowerMode else "unknown" end)" else empty end' "$state_file")"
+  resource_causes="$(jq -r '.organism.bodySchema.resourcePressureReading | if type == "object" then "thermal=\(.thermalPressure // "unknown")" else empty end' "$state_file")"
   if [ -n "$resource_causes" ]; then
     status INFO "resource pressure source" "$resource_causes; not a RAM-usage reading"
   fi

@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `PhonePlaceEvent.swift` | `PhonePlaceEvent` and `PhonePlaceHistory`: authenticated place observations and bounded atomic history written only by the Mac bridge |
+
 /// Source observations, carried only inside an authenticated BridgeMessage.
 public struct PhonePlaceEvent: Codable, Sendable, Identifiable {
     public enum Transition: String, Codable, Sendable { case arrived, left }

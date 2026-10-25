@@ -1,6 +1,8 @@
 import AppKit
 import SwiftUI
 
+// Blueprint: | `NativeAgentMotion.swift` | `NativeAgentMotion`: shared timing/arrival transitions with Reduce Motion-aware layout and retained opacity crossfades |
+
 /// Shared timing and transitions. Layout changes stop under Reduce Motion;
 /// opacity transitions keep their own animation so content still crossfades.
 enum NativeAgentMotion {

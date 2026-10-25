@@ -3,9 +3,32 @@ import Foundation
 import CoreFoundation
 import Network
 import AgentWorkspace
-import ChatOrchestration
+import AgentConversations
+import AgentLinkTransport
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `AgentContactRoutes.swift` | Authenticated contact ingress, MCP/A2A requests, retained reply pagination (failed prose followed by its terminal cause), event waits and transport-confirmed fetch acknowledgements; A2A HTTP waits retain their worker and cancel on connection failure or stop, preserving the reply path on receive half-close without canceling the accepted canonical turn |
+
+private final class AgentContactHTTPWait: @unchecked Sendable {
+    private let lock = NSLock()
+    private var worker: Task<Void, Never>?
+    private var cancelled = false
+
+    func start(_ operation: @escaping @Sendable () async -> Void) {
+        lock.withLock {
+            guard !cancelled, worker == nil else { return }
+            worker = Task {
+                defer { self.lock.withLock { self.worker = nil } }
+                guard !Task.isCancelled else { return }
+                await operation()
+            }
+        }
+    }
+
+    func cancel() {
+        lock.withLock { cancelled = true; worker?.cancel() }
+    }
+}
 
 public struct AgentContactRoutes: Sendable {
     private let token: @Sendable () -> String
@@ -91,9 +114,14 @@ public struct AgentContactRoutes: Sendable {
         if let peerID = principal.peerID { AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true) }
 
         let isGrok = principal.replyOnly
-        // This credential may only answer a pending request, never call MCP,
-        // A2A or general messaging. Identity comes from the verified bearer.
-        if isGrok || path == "/agent/grok-reply" {
+        // Grok Bot is a two-way contact like any other (User 10-24): its
+        // credential answers a pending request here and starts conversations
+        // through the same messaging door (/agent/mcp) every contact uses,
+        // under her Trust's peer posture: untrusted, its turn's first effect
+        // asks the person; trusted in Trust → Connected agents, it acts as the
+        // person would. It never reaches A2A or tools. Identity comes from the
+        // verified bearer.
+        if path == "/agent/grok-reply" || (isGrok && path != "/agent/mcp") {
             guard isGrok, path == "/agent/grok-reply", method == "POST", body.count <= GrokReplyInput.maximumBytes else {
                 BridgeCore.writeJSON(conn, status: 403, obj: ["error": "reply_scope_only"])
                 return
@@ -126,11 +154,12 @@ public struct AgentContactRoutes: Sendable {
             return
         }
         if path.hasPrefix("/a2a/") {
-            Task {
+            Self.request(conn) {
                 let endpoint = AgentContactA2AEndpoint(tasks: self.tasks(), port: port(),
                     grpcPort: grpcPort())
                 let response = await endpoint.handleREST(method: method, target: path, body: body,
                     principal: principal, version: headers["a2a-version"])
+                guard !Task.isCancelled else { return }
                 switch response {
                 case .json(let status, let value, let onSent):
                     Self.writeA2AJSON(conn, status: status, object: value, onSent: { Task { await onSent?() } })
@@ -220,10 +249,11 @@ public struct AgentContactRoutes: Sendable {
                 BridgeCore.writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            Task {
+            Self.request(conn) {
                 let response = await AgentContactA2AEndpoint(tasks: self.tasks(), port: port(),
                     grpcPort: grpcPort())
                     .handle(body, principal: principal, version: headers["a2a-version"])
+                guard !Task.isCancelled else { return }
                 switch response {
                 case .json(let object, let onSent):
                     BridgeCore.writeJSON(conn, status: 200, obj: object, onSent: { Task { await onSent?() } })
@@ -275,6 +305,26 @@ public struct AgentContactRoutes: Sendable {
         }
         routeContact()
         return handled
+    }
+
+    /// The connection owns only its HTTP wait. Canceling it never calls the
+    /// retained task's explicit cancel operation or owns the canonical turn.
+    /// Receive EOF is a half-close: the peer can still read the whole reply.
+    private static func request(_ conn: NWConnection, operation: @escaping @Sendable () async -> Void) {
+        let wait = AgentContactHTTPWait()
+        let previous = conn.stateUpdateHandler
+        conn.stateUpdateHandler = { state in
+            previous?(state)
+            switch state {
+            case .failed, .cancelled: wait.cancel()
+            default: break
+            }
+        }
+        switch conn.state {
+        case .failed, .cancelled: wait.cancel()
+        default: break
+        }
+        wait.start(operation)
     }
 
     typealias PeerTurnContext = ClaudeBridgeMessageRuntime.PeerTurnContext
@@ -350,7 +400,7 @@ public struct AgentContactRoutes: Sendable {
               let run = receipt["run_id"] as? String, !run.isEmpty else { return nil }
         let stored = NativeAgentMCPWire.validSession(session) || NativeAgentA2AWire.validContext(session)
             ? principal.storedConversation(session) : session
-        return { Task { await tasks.recordReplyFetch(session: stored, request: request, run: run) } }
+        return { Task { await tasks.recordReplyFetch(session: stored, request: request, run: run, owner: principal.id) } }
     }
 
     /// The peer doors share A2A's retained execution; the legacy builder handler stays separate.
@@ -510,7 +560,9 @@ public struct AgentContactRoutes: Sendable {
 
     public static func contactReply(_ task: AgentContactTask, requestID: String, sessionID: String,
                              offset: Int, maxChars: Int) -> [String: Any] {
-        let reply = task.state == .failed ? (task.detail ?? "The reply could not be completed. Work: outcome unknown.") : task.text
+        let reply = task.state == .failed
+            ? [task.text, task.detail ?? "The reply could not be completed. Work: outcome unknown."].filter { !$0.isEmpty }.joined(separator: "\n\n")
+            : task.text
         guard offset >= 0, offset <= reply.count, (1...16000).contains(maxChars) else { return ["status": "invalid_request"] }
         let slice = String(reply.dropFirst(offset).prefix(maxChars))
         var receipt: [String: Any] = ["status": task.state.terminal ? "ok" : "pending",

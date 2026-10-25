@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import CognitiveSubstrate
+// Blueprint: | `TurnSettle.swift` | `TurnSettle` enum; `requestedResultIntent`, `takeStreamSuffix`, `transcriptRow` |
 
 /// The settle stage a turn ends through, on every lane: whether it ends
 /// waiting on a card, the terminal it gets then, the sentence the transport

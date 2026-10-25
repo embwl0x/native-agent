@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `NativeAgentNotificationPostResult.swift` | `NativeAgentNotificationPostResult`: confirmed native delivery fields |
 
 public struct NativeAgentNotificationPostResult: Sendable {
     public let identifier: String

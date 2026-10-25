@@ -1,13 +1,17 @@
 import Darwin
 import Foundation
+import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `AppRestartCoordinator.swift` | Shared detached native relauncher observes parent exit before opening; tool restart audit/cooldown/grace and 120-second exit deadline; operator menu/restore retains 30-second deadline; stalled quit aborts relaunch |
 
 // MARK: - AppRestartCoordinator (restart_app / Telegram /restart core)
+// JSON restart receipts and cooldown stamp: local operational state, excluded
+// from backup/export/phone sync; PrivacyMap: restart_audit.
 //
 // Swift app restart support for Telegram /restart and the restart_app tool.
 // The Swift app is an SMAppService login item — quitting does NOT respawn it —
 // so the restart sequence needs a DETACHED relauncher process that outlives
-// the app: it waits for our PID to exit, then `open`s the app
+// the app: it observes our exit within a deadline, then `open`s the app
 // bundle again.
 //
 // ONE core routine for every surface (chat tool `restart_app`, Telegram
@@ -43,6 +47,8 @@ public actor AppRestartCoordinator {
     /// (no fixed timer) is a ledgered follow-up; until then the constant
     /// must stay comfortably above worst-case reply-compose latency.
     public static let terminateGraceSeconds: TimeInterval = 20
+    /// A refused or stalled quit must not leave a surviving helper forever.
+    public static let relaunchExitDeadlineSeconds = 120
     /// Process-wide instance used by the chat dispatch case and the app
     /// layer Telegram bridge. The app layer MUST `configure(...)` it at
     /// launch with the real terminate and relauncher closures (platform
@@ -87,15 +93,55 @@ public actor AppRestartCoordinator {
 
     // MARK: Relauncher command
 
-    /// Wait for exit even when a surface takes longer to send its reply.
-    /// Opening a still-running app would only activate it, losing the restart.
+    /// The same executable runs only the exit observer, before any app state
+    /// or UI is initialized. It survives the parent and aborts on a stalled quit.
     public static func relauncherArgv(pid: Int32, appPath: String) -> [String] {
-        // Single-quote the app path for the shell; escape embedded quotes.
-        let quoted = "'" + appPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        let script = """
-        while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 1; done; exec /usr/bin/open \(quoted)
-        """
-        return ["/bin/sh", "-c", script]
+        exitObserverArgv(pid: pid, appPath: appPath, seconds: relaunchExitDeadlineSeconds)
+    }
+
+    private nonisolated static func exitObserverArgv(pid: Int32, appPath: String, seconds: Int) -> [String] {
+        [Bundle.main.executablePath ?? appPath + "/Contents/MacOS/NativeAgentApp",
+         "--nativeagent-relaunch-after-exit", String(pid), appPath, String(seconds)]
+    }
+
+    /// Called at the executable entry point, before single-instance admission.
+    /// kqueue registration precedes the parent read, closing the exit race.
+    public nonisolated static func runRelaunchHelperIfRequested() -> Bool {
+        let args = CommandLine.arguments
+        guard args.dropFirst().first == "--nativeagent-relaunch-after-exit" else { return false }
+        guard args.count == 5, let pid = Int32(args[2]), pid > 1,
+              let seconds = Int(args[4]), seconds > 0, seconds <= relaunchExitDeadlineSeconds else { return true }
+        let queue = kqueue()
+        guard queue >= 0 else { return true }
+        defer { close(queue) }
+        var change = kevent(ident: UInt(pid), filter: Int16(EVFILT_PROC),
+                            flags: UInt16(EV_ADD | EV_ENABLE | EV_ONESHOT),
+                            fflags: UInt32(NOTE_EXIT), data: 0, udata: nil)
+        let registered = kevent(queue, &change, 1, nil, 0, nil)
+        // A detached child is adopted when its original parent exits. Never
+        // wait on a reused PID; registration errors while it lives abort.
+        if getppid() == pid {
+            guard registered == 0 else { return true }
+            var event = kevent()
+            let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(seconds) * 1_000_000_000
+            while true {
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard now < deadline else { return true }
+                let remaining = deadline - now
+                var timeout = timespec(tv_sec: Int(remaining / 1_000_000_000), tv_nsec: Int(remaining % 1_000_000_000))
+                let count = kevent(queue, nil, 0, &event, 1, &timeout)
+                if count < 0 && errno == EINTR { continue }
+                guard count == 1, event.flags & UInt16(EV_ERROR) == 0,
+                      event.fflags & UInt32(NOTE_EXIT) != 0 else { return true }
+                break
+            }
+        }
+        let path = strdup(args[3])
+        defer { free(path) }
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup("/usr/bin/open"), path, nil]
+        defer { free(argv[0]) }
+        execv("/usr/bin/open", &argv)
+        return true
     }
 
     /// Resolve the bundle to relaunch. In a real .app launch Bundle.main IS
@@ -139,11 +185,18 @@ public actor AppRestartCoordinator {
         // a relauncher without being able to exit would just no-op `open`
         // against a live app while claiming "restarting".
         guard let scheduleTerminate, let spawnRelauncher else {
+            let missing = [
+                self.scheduleTerminate == nil ? "scheduleTerminate" : nil,
+                self.spawnRelauncher == nil ? "spawnRelauncher" : nil,
+            ].compactMap { $0 }.joined(separator: ", ")
             return (.object([
                 "status": .string("failed"),
                 "tool": .string("restart_app"),
                 "reason": .string("restart_unavailable"),
-                "detail": .string("App-layer terminate hook is not configured in this process (headless/test build?). Restart NativeAgent from the Mac app."),
+                "detail": .string("Restart wiring is missing: \(missing)."),
+                "effects": .string("none"),
+                "remedy": Repair.why(owner: "NativeAgent", tap: "Quit NativeAgent and open it again",
+                    instruction: "This process cannot restart itself (no app-launch restart hooks). Ask the person to quit and reopen NativeAgent."),
             ]), nil)
         }
 
@@ -224,13 +277,10 @@ public actor AppRestartCoordinator {
                     let data = try JSONSerialization.data(withJSONObject: auditEntry, options: [.prettyPrinted, .sortedKeys])
                     try data.write(to: auditURL)
                 } catch {
-                    return .object([
-                        "status": .string("failed"),
-                        "tool": .string("restart_app"),
-                        "reason": .string("audit_write_failed"),
-                        "audit_error": .string(String(describing: error)),
-                        "detail": .string("Refusing to restart without an audit receipt."),
-                    ])
+                    return .object(SwiftToolDispatcher.builderFailureFields(error,
+                        tool: "restart_app", reason: "audit_write_failed", effects: .unknown,
+                        owner: auditURL.path,
+                        instruction: "Repair the restart receipt's reported storage error; preserve any partial receipt. No restart was scheduled."))
                 }
 
                 // 3. Cooldown stamp — written only after the audit landed,
@@ -245,12 +295,12 @@ public actor AppRestartCoordinator {
                     let data = try JSONSerialization.data(withJSONObject: stampEntry, options: [.prettyPrinted, .sortedKeys])
                     try data.write(to: stampURL)
                 } catch {
-                    return .object([
-                        "status": .string("failed"),
-                        "tool": .string("restart_app"),
-                        "reason": .string("stamp_write_failed"),
-                        "detail": .string(String(describing: error)),
-                    ])
+                    var fields = SwiftToolDispatcher.builderFailureFields(error,
+                        tool: "restart_app", reason: "stamp_write_failed", effects: .unknown,
+                        owner: stampURL.path,
+                        instruction: "Repair the restart stamp's reported storage error without inventing a restart time. The audit was saved; no restart was scheduled.")
+                    fields["audit_path"] = .string(auditURL.path)
+                    return .object(fields)
                 }
 
                 // 4. Spawn the detached relauncher. On failure, roll the
@@ -260,13 +310,12 @@ public actor AppRestartCoordinator {
                     try spawn(argv)
                 } catch {
                     try? FileManager.default.removeItem(at: stampURL)
-                    return .object([
-                        "status": .string("failed"),
-                        "tool": .string("restart_app"),
-                        "reason": .string("relauncher_spawn_failed"),
-                        "detail": .string(String(describing: error)),
-                        "audit_path": .string(auditURL.path),
-                    ])
+                    var fields = SwiftToolDispatcher.builderFailureFields(error,
+                        tool: "restart_app", reason: "relauncher_spawn_failed", effects: .unknown,
+                        owner: "restart relauncher at \(argv[0]); stamp at \(stampURL.path)",
+                        instruction: "Repair the relauncher's reported launch error and inspect the stamp; its removal was not verified. The audit was saved; no termination was scheduled.")
+                    fields["audit_path"] = .string(auditURL.path)
+                    return .object(fields)
                 }
 
                 // 5. Success envelope. Termination is armed by the CALLER
@@ -278,7 +327,7 @@ public actor AppRestartCoordinator {
                 return .object([
                     "status": .string("restarting"),
                     "tool": .string("restart_app"),
-                    "note": .string("Restarting in ~\(Int(grace))s — keep the final reply brief (one short sentence) so it lands before termination. A detached relauncher reopens \(appPath) once the process exits."),
+                    "note": .string("Restarting in ~\(Int(grace))s — keep the final reply brief (one short sentence) so it lands before termination. A detached relauncher reopens \(appPath) once the process exits; it aborts if quitting takes more than \(Self.relaunchExitDeadlineSeconds)s."),
                     "runId": .string(runId),
                     "reason": .string(effectiveReason),
                     "source": .string(source),
@@ -288,12 +337,10 @@ public actor AppRestartCoordinator {
             }
         } catch {
             // flock acquisition failure — refuse, do not restart unguarded.
-            return (.object([
-                "status": .string("failed"),
-                "tool": .string("restart_app"),
-                "reason": .string("lock_failed"),
-                "detail": .string(String(describing: error)),
-            ]), nil)
+            return (.object(SwiftToolDispatcher.builderFailureFields(error,
+                tool: "restart_app", reason: "lock_failed", effects: .none,
+                owner: stampURL.path,
+                instruction: "Repair the restart lock's reported storage error; preserve the stamp. No restart was scheduled.")), nil)
         }
 
         // 6. Only a real "restarting" envelope earns an arm-terminate
@@ -321,16 +368,15 @@ public actor AppRestartCoordinator {
 }
 
 extension AppRestartCoordinator {
-    /// The operator's menu/restore restart bounds the exit wait to 30 seconds, then opens anyway.
+    /// The operator's menu/restore restart aborts if quitting exceeds 30 seconds.
     public nonisolated static func relaunchApp(
         bundlePath: String = Bundle.main.bundlePath,
         pid: Int32 = ProcessInfo.processInfo.processIdentifier,
         terminate: () -> Void,
         onSpawnFailure: (Error) -> Void
     ) {
-        let script = "i=0; while /bin/kill -0 \"$1\" >/dev/null 2>&1 && [ \"$i\" -lt 150 ]; do /bin/sleep 0.2; i=$((i+1)); done; /usr/bin/open \"$2\""
         do {
-            try spawnDetached(argv: ["/bin/sh", "-c", script, "relaunch", String(pid), bundlePath])
+            try spawnDetached(argv: exitObserverArgv(pid: pid, appPath: bundlePath, seconds: 30))
         } catch {
             onSpawnFailure(error)
             return
@@ -343,7 +389,8 @@ extension AppRestartCoordinator {
     /// tearing down the app's process group when the login item exits —
     /// with stdio redirected to /dev/null (nohup-equivalent, no SIGHUP /
     /// no pipe to a dead parent).
-    public nonisolated static func spawnDetached(argv: [String]) throws {
+    @discardableResult
+    public nonisolated static func spawnDetached(argv: [String]) throws -> pid_t {
         precondition(!argv.isEmpty)
 
         var fileActions: posix_spawn_file_actions_t?
@@ -372,5 +419,24 @@ extension AppRestartCoordinator {
                 userInfo: [NSLocalizedDescriptionKey: "posix_spawn(\(argv[0])) failed: \(String(cString: strerror(rc)))"]
             )
         }
+        // If quit is refused, we remain the parent when the helper aborts.
+        // Observe and reap that exit rather than leaving a zombie until the
+        // next app shutdown. Registration precedes the race-closing read.
+        let spawnedPID = childPID
+        let exit = DispatchSource.makeProcessSource(identifier: spawnedPID, eventMask: .exit, queue: .global(qos: .utility))
+        exit.setEventHandler {
+            var status: Int32 = 0
+            while waitpid(spawnedPID, &status, 0) < 0 && errno == EINTR { }
+            exit.cancel()
+            exit.setEventHandler(handler: nil)
+        }
+        exit.resume()
+        var status: Int32 = 0
+        let reaped = waitpid(spawnedPID, &status, WNOHANG)
+        if reaped == spawnedPID || (reaped < 0 && errno == ECHILD) {
+            exit.cancel()
+            exit.setEventHandler(handler: nil)
+        }
+        return childPID
     }
 }

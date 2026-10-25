@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `PhysiologySelfWriteRegistry.swift` | `PhysiologySelfWriteRegistry`: writer-generation suppression of watcher echoes, without time-window suppression of external writes |
+
 /// C6 (2026-08-28): self-write suppression for event/deadline physiology
 /// watchers, keyed on a WRITER GENERATION — never on a time window.
 ///

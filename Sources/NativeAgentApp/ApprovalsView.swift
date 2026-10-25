@@ -22,6 +22,8 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+// Blueprint: | `ApprovalsView.swift` | `ApprovalsView`: checked approval decisions/history, payload preview and known risk-badge/toast presentation |
+
 /// Approval risk arrives as durable, open-vocabulary storage data. The panel
 /// must turn it into a human claim and a known badge style before rendering;
 /// raw producer tokens are neither a label nor a color contract.
@@ -189,153 +191,52 @@ enum ApprovalHistoryRowPresentation {
     }
 }
 
-/// The mounted Approvals panel observes the exact inbox path its reader uses.
-/// The source arms before its initial read, so a cross-surface decision racing
-/// panel appearance is replayed instead of leaving a stale pending card.
-enum ApprovalRequestsLiveRefresh {
-    @MainActor
-    static func observe(
-        approvals: ApprovalsFacade,
-        refresh: @escaping @MainActor @Sendable () async -> Void
-    ) async {
-        let approvalPath = await approvals.requestsPath()
-        await EventDeadlinePhysiology.refreshOnChanges(paths: [approvalPath], refresh: refresh)
-    }
-}
-
-/// Bounded, visible wording for a failed approval read. Retained records are
-/// last-known, not evidence that the approval inbox is currently healthy.
-enum ApprovalLoadFailurePresentation {
-
-    static func banner(error: any Error, retainedApprovalCount: Int) -> String {
-        let detail = UserFacingError.cause(error, action: "load approvals")
-        let retained = retainedApprovalCount == 1
-            ? "Approvals couldn't refresh — showing 1 previously loaded approval."
-            : retainedApprovalCount > 1
-                ? "Approvals couldn't refresh — showing \(retainedApprovalCount) previously loaded approvals."
-                : "Approvals couldn't load."
-        return "\(retained) \(detail)"
-    }
-}
-
-/// The mounted Approvals panel's refresh boundary. A failed reload leaves its
-/// last successful rows visible but labels them as stale; a successful retry
-/// clears the adverse state before publishing replacement rows.
-@MainActor @Observable
-final class ApprovalLoadState {
-    private(set) var approvals: [ApprovalRecord]
-    private(set) var refreshErrorText: String?
-    private(set) var actionErrorText: String?
-    private(set) var hasLoadedSnapshot = false
-    private(set) var isRefreshing = false
-    @ObservationIgnored private var refreshGeneration: UInt64 = 0
-
-    var errorText: String? { actionErrorText ?? refreshErrorText }
-
-    init(approvals: [ApprovalRecord] = []) {
-        self.approvals = approvals
-        hasLoadedSnapshot = !approvals.isEmpty
-    }
-
-    var summaryTitle: String {
-        if refreshErrorText != nil {
-            return hasLoadedSnapshot ? "Approval refresh failed" : "Approval status unavailable"
-        }
-        guard hasLoadedSnapshot else { return "Checking approvals…" }
-        let count = WorkOverviewRead.waitingApprovals(approvals).count
-        return count == 0 ? "No actions need approval" : "\(count) \(count == 1 ? "action needs" : "actions need") approval"
-    }
-
-    var summaryDetail: String {
-        if refreshErrorText != nil {
-            return hasLoadedSnapshot
-                ? "Showing previously loaded approvals. Choose Refresh to check for changes."
-                : "Approvals could not be loaded. Choose Refresh to try again."
-        }
-        guard hasLoadedSnapshot else { return "Checking which actions need your permission." }
-        return "Review requests to use tools, change memories, control your Mac or browser, make changes in connected apps, work on Desk tasks, or improve the agent."
-    }
-
-    @discardableResult
-    func reload(
-        read: @escaping @MainActor () async throws -> [ApprovalRecord]
-    ) async -> Bool {
-        refreshGeneration &+= 1
-        let generation = refreshGeneration
-        isRefreshing = true
-        defer {
-            if refreshGeneration == generation { isRefreshing = false }
-        }
-        do {
-            let loaded = try await read()
-            guard !Task.isCancelled, refreshGeneration == generation else { return false }
-            approvals = loaded
-            hasLoadedSnapshot = true
-            refreshErrorText = nil
-            return true
-        } catch {
-            guard !Task.isCancelled, refreshGeneration == generation else { return false }
-            refreshErrorText = ApprovalLoadFailurePresentation.banner(
-                error: error,
-                retainedApprovalCount: approvals.count
-            )
-            return false
-        }
-    }
-
-    func showActionFailure(_ text: String) {
-        actionErrorText = text
-    }
-
-    func clearActionError() {
-        actionErrorText = nil
-    }
-}
-
 // PATCH-2026-05-09: design-system-pass ApprovalsView — NativePanel cards, design tokens
 struct ApprovalsView: View {
     var focusedID: String? = nil
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
-    @State private var approvalLoadState = ApprovalLoadState()
+    @State private var actionErrorText: String?
+    private var approvals: ApprovalsFacade { appModel.engine.approvals }
     @State private var decidingID: String?
+    private var errorText: String? { actionErrorText ?? approvals.refreshErrorText }
 
     private var summaryColor: Color {
-        if approvalLoadState.refreshErrorText != nil { return .red }
-        guard approvalLoadState.hasLoadedSnapshot else { return .secondary }
+        if approvals.refreshErrorText != nil { return .red }
+        guard approvals.hasLoadedSnapshot else { return .secondary }
         return pending.isEmpty ? .green : .orange
     }
 
     private var summaryIcon: String {
-        if approvalLoadState.refreshErrorText != nil { return "exclamationmark.triangle.fill" }
-        guard approvalLoadState.hasLoadedSnapshot else { return "clock" }
+        if approvals.refreshErrorText != nil { return "exclamationmark.triangle.fill" }
+        guard approvals.hasLoadedSnapshot else { return "clock" }
         return pending.isEmpty ? "checkmark.shield.fill" : "exclamationmark.shield.fill"
     }
 
     /// Her own decisions (her canon) are hers: no button here resolves them.
     private var pending: [ApprovalRecord] {
-        approvalLoadState.approvals.filter {
+        approvals.records.filter {
             OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) && (focusedID == nil || $0.id == focusedID)
         }
     }
 
     private var recent: [ApprovalRecord] {
-        approvalLoadState.approvals.filter { $0.status.lowercased() != "pending" && (focusedID == nil || $0.id == focusedID) }
+        approvals.records.filter { $0.status.lowercased() != "pending" && (focusedID == nil || $0.id == focusedID) }
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-                if let focusedID, approvalLoadState.hasLoadedSnapshot,
-                   !approvalLoadState.approvals.contains(where: { $0.id == focusedID }) {
+                if let focusedID, approvals.hasLoadedSnapshot,
+                   !approvals.records.contains(where: { $0.id == focusedID }) {
                     Text("This decision is no longer available.").foregroundStyle(.secondary)
                 }
                 HStack {
                     Text("Approvals").font(NativeAgentFont.title).foregroundStyle(NativeAgentShell.text)
                     Spacer()
                     StatusBadge(
-                        text: approvalLoadState.hasLoadedSnapshot ? "\(approvalLoadState.approvals.count) total" : "Not checked",
-                        status: approvalLoadState.hasLoadedSnapshot && approvalLoadState.refreshErrorText == nil ? "ok" : "info"
+                        text: approvals.hasLoadedSnapshot ? "\(approvals.records.count) total" : "Not checked",
+                        status: approvals.hasLoadedSnapshot && approvals.refreshErrorText == nil ? "ok" : "info"
                     )
                     Button {
                         Task { await refreshApprovals() }
@@ -344,7 +245,7 @@ struct ApprovalsView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .disabled(approvalLoadState.isRefreshing)
+                    .disabled(approvals.isRefreshing)
                     if !pending.isEmpty {
                         StatusBadge(text: "\(pending.count) pending", status: "warn")
                     }
@@ -359,14 +260,14 @@ struct ApprovalsView: View {
                             .foregroundStyle(summaryColor)
                             .frame(width: 26)
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(approvalLoadState.summaryTitle)
+                            Text(approvals.summaryTitle)
                                 .font(NativeAgentFont.section)
-                            Text(approvalLoadState.summaryDetail)
+                            Text(approvals.summaryDetail)
                                 .font(NativeAgentFont.body)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        if approvalLoadState.isRefreshing {
+                        if approvals.isRefreshing {
                             ProgressView()
                                 .controlSize(.small)
                         }
@@ -374,7 +275,7 @@ struct ApprovalsView: View {
                 }
                 .padding(.horizontal, NativeAgentSpacing.xl)
 
-                if let errorText = approvalLoadState.errorText {
+                if let errorText {
                     NativePanel(tint: .red) {
                         Label(errorText, systemImage: "exclamationmark.triangle.fill")
                             .font(NativeAgentFont.body)
@@ -407,7 +308,7 @@ struct ApprovalsView: View {
                                 }
                             }
                         }
-                    } else if pending.isEmpty, approvalLoadState.hasLoadedSnapshot, approvalLoadState.refreshErrorText == nil {
+                    } else if pending.isEmpty, approvals.hasLoadedSnapshot, approvals.refreshErrorText == nil {
                         NativePanel(tint: .secondary) {
                             Label("No approval history yet. Risky actions will be listed here after they are approved or denied.", systemImage: "clock")
                                 .font(NativeAgentFont.body)
@@ -422,23 +323,19 @@ struct ApprovalsView: View {
         .navigationTitle("Approvals")
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
-            await ApprovalRequestsLiveRefresh.observe(approvals: appModel.engine.approvals) {
-                await refreshApprovals()
-            }
+            await refreshApprovals()
         }
     }
 
     @MainActor
     private func refreshApprovals() async {
-        if await approvalLoadState.reload(read: { try await appModel.engine.approvals.list() }) {
-            appModel.engine.approvals.records = approvalLoadState.approvals
-        }
+        await approvals.refresh()
     }
 
     @MainActor
     private func resolveApproval(id: String, decision: String) async {
         decidingID = id
-        approvalLoadState.clearActionError()
+        actionErrorText = nil
         defer { decidingID = nil }
         switch await appModel.resolveApprovalOnce(id: id, decision: decision) {
         case .applied(let resolved):
@@ -448,7 +345,7 @@ struct ApprovalsView: View {
             )
             ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
             await refreshApprovals()
-            if toast.kind == .error { approvalLoadState.showActionFailure(toast.text) }
+            if toast.kind == .error { actionErrorText = toast.text }
             await appModel.loadHealthCard()
         case .noOpInFlight(let inFlightID):
             appModel.systemToasts.push(info: ApprovalsFacade.Resolution.noOpInFlight(id: inFlightID).visibleMessage)
@@ -462,7 +359,7 @@ struct ApprovalsView: View {
             )
             ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
             await refreshApprovals()
-            approvalLoadState.showActionFailure(toast.text)
+            actionErrorText = toast.text
         }
     }
 }

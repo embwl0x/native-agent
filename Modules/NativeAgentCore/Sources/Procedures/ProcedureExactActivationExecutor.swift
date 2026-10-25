@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `ProcedureExactActivationExecutor.swift` | `ProcedureExactActivationExecutor` enum; `activate` |
 
 /// Revalidates the canonical evidence before installing the immutable manifest
 /// and replaceable pointer. Approval binding is supplied by ApprovalTransactions.

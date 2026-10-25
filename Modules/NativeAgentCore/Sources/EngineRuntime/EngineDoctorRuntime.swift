@@ -7,7 +7,6 @@ import BackgroundLoops
 import PersistenceCore
 import DoctorChecks
 import BackgroundWork
-import ChatOrchestration
 import Cognition
 import ProviderRouting
 import MacControl
@@ -16,6 +15,8 @@ import AgentConversations
 import AgentWorkspace
 import Synchronization
 import Experiences
+import TelegramBot
+// Blueprint: | `EngineDoctorRuntime.swift` | EngineDoctorRuntime and EngineDoctorPlatformPort own live health interpretation, repair admission, Support Snapshot reuse and pending-transition wake; one manager/receipt read supplies both the loop check and DoctorFacade verdicts. |
 
 /// Platform observations and callbacks; Doctor owns interpretation and repair admission.
 public protocol EngineDoctorPlatformPort: Sendable {
@@ -93,15 +94,29 @@ extension EngineDoctorRuntime {
 
     public func doctorDataRootCheck() -> CheckResult {
         let marker = dataRoot.appendingPathComponent("install").appendingPathComponent(InstallPaths.publicReleaseDataMarker)
-        if let data = try? Data(contentsOf: marker),
-           let saved = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           saved["reason"] as? String == "public_release_blank_slate_first_run",
-           let backup = saved["backupPath"] as? String, !backup.isEmpty,
-           FileManager.default.fileExists(atPath: backup) {
+        do {
+            let data = try Data(contentsOf: marker)
+            guard let saved = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let reason = saved["reason"] as? String,
+                  ["public_release_blank_slate_first_run", "public_release_marker_written_in_place"].contains(reason),
+                  reason != "public_release_blank_slate_first_run" || (saved["backupPath"] as? String)?.isEmpty == false else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+            if reason == "public_release_blank_slate_first_run", let backup = saved["backupPath"] as? String,
+               FileManager.default.fileExists(atPath: backup) {
+                return CheckResult(source: marker.path,
+                    id: "install.data_root", title: "Data root", status: "ok",
+                    detail: "An earlier launch moved saved data to the recorded backup location: \(backup).")
+            }
+        } catch CocoaError.fileReadNoSuchFile {
+            return CheckResult(source: marker.path, id: "install.data_root", title: "Data root", status: "ok",
+                detail: "No earlier data-root move marker exists at \(marker.path).")
+        } catch {
             return CheckResult(source: marker.path,
-                id: "install.data_root", title: "Data root", status: "ok",
-                detail: "An earlier launch moved saved data. Recorded backup location: \(backup)"
-            )
+                id: "install.data_root", title: "Data root", status: "fail",
+                detail: "The data-root move marker is unreadable or malformed: \(marker.path).",
+                human_action: ToolFailureError.fileRepairInstruction(marker,
+                    shape: "This JSON object records installation history, including its reason and any earlier data-root move's backupPath. Preserve the original history and backup location; never invent a move or backup."))
         }
         return CheckResult(source: marker.path,id: "install.data_root", title: "Data root", status: "ok",
                            detail: "No existing backup from an earlier data-root move was found.")
@@ -130,34 +145,12 @@ extension EngineDoctorRuntime {
     }
 
     public func doctorSearchURL() async throws -> String? {
-        try await RuntimeReadProjection.configuration(dataRoot: dataRoot).searxngBaseURL
+        try SwiftNativeResearchClient.checkedSearxngBaseURL(root: dataRoot)
     }
 
     public func doctorProbeSearch(base: String) async -> Bool {
         await SwiftNativeResearchClient(dataRoot: dataRoot)
-            .checkSearXNG(base: base)
-    }
-
-    public func doctorProbeCodexSearch() async -> Bool {
-        await WebSearchRoutes.codexSignedIn(dataRoot: dataRoot)
-    }
-
-    public func doctorSearchSetupReading() async -> String? {
-        let owned = NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: dataRoot)
-        guard !FileManager.default.fileExists(atPath: owned.path),
-              OpenAIOAuthDirectAdapter.cliAdoptionConsent(dataRoot: dataRoot) == .allowed,
-              OpenAIOAuthDirectAdapter.hasUsableTokens(at: OpenAIOAuthDirectAdapter.defaultUserCodexHome()
-                .appendingPathComponent("auth.json")) else { return nil }
-        // Chat's provider as routing serves the turn now, never the adoption:
-        // an adopted Codex CLI sign-in says nothing about which account chat uses.
-        let chat: String
-        do {
-            let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedRoutingSnapshotReadOnly()
-            chat = "Chat runs on " + (ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, "chat") ?? "no active provider")
-        } catch {
-            chat = "Chat's provider could not be read (\(Self.safeDetail(error.localizedDescription)))"
-        }
-        return chat + "; general search needs a separate NativeAgent ChatGPT sign-in, which the adopted Codex CLI sign-in does not provide, and no search has been measured."
+            .checkSearXNG(base: base, answering: true)
     }
 
     /// Doctor state: the local SearXNG URL for which Docker was checked and
@@ -287,28 +280,44 @@ extension EngineDoctorRuntime {
             return DoctorExecutableRepair(checkID: check.id) {
                 let facade = TelegramFacade(dataRoot: dataRoot)
                 let manager = port.doctorManager
+                // The poll notice and the state file it then clears both wake the check.
+                let events = EventDeadlinePhysiology.storeAndFileEvents(
+                    paths: [dataRoot.appendingPathComponent("telegram/state.json")],
+                    notifications: [TelegramLongPollSession.successfulPoll])
                 let before = try await facade.load(manager: manager)
+                try Task.checkCancellation()
                 guard before.enabled, before.tokenConfigured else {
                     return .unverified("Repair skipped: Telegram configuration changed.")
                 }
-                if !(await manager.registered().contains("telegram_poll")) {
+                let registered = await manager.registered()
+                try Task.checkCancellation()
+                if !registered.contains("telegram_poll") {
                     let outcome = await port.doctorRestartLoop(id: "telegram_poll")
+                    try Task.checkCancellation()
                     guard outcome.didRestart else {
                         return .unverified("Repair failed: \(outcome.surfaceMessage ?? "Telegram poller could not restart.")")
                     }
                 }
                 _ = await manager.start()
+                try Task.checkCancellation()
                 // Observe the owner's ordinary bounded long poll, never send
                 // a second getUpdates request or force a duplicate tick.
-                let deadline = ContinuousClock.now.advanced(by: .seconds(35))
-                repeat {
-                    let after = try await facade.load(manager: manager)
-                    if after.lastPollAt != nil, after.lastPollAt != before.lastPollAt,
-                       after.pollerEnabled, after.actionableError == nil {
-                        return .completed("Completed: restarted Telegram's poller and confirmed a successful poll.")
-                    }
-                    try await Task.sleep(for: .seconds(1))
-                } while ContinuousClock.now < deadline
+                let result = await raceAgainstTimeout(seconds: 35) {
+                    var iterator = events.makeAsyncIterator()
+                    repeat {
+                        try Task.checkCancellation()
+                        let after = try await facade.load(manager: manager)
+                        try Task.checkCancellation()
+                        if after.lastPollAt != nil, after.lastPollAt != before.lastPollAt,
+                           after.pollerEnabled, after.actionableError == nil { return true }
+                    } while await iterator.next() != nil
+                    return false
+                }
+                if case .value(true) = result {
+                    return .completed("Completed: restarted Telegram's poller and confirmed a successful poll.")
+                }
+                if case .failure(let detail) = result { throw TelegramBotError.underlying(detail) }
+                if case .cancelled = result { throw CancellationError() }
                 return .unverified("Repair attempted: Telegram's poller was started, but no successful poll was confirmed within 35 seconds.")
             }
         case "live.bridges":
@@ -317,16 +326,35 @@ extension EngineDoctorRuntime {
             }.map(\.name)
             guard !names.isEmpty else { return nil }
             return DoctorExecutableRepair(checkID: check.id) {
+                // The bridges publish their descriptors from their ready callbacks.
+                // Watch those existing transitions, then read authoritative listener health.
+                let changes = FileChangeEvents(paths: [
+                    AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: dataRoot).appendingPathComponent("bridge.json"),
+                    dataRoot.appendingPathComponent("browser_ipc.json"),
+                ])
+                defer { changes.cancel() }
+                await changes.waitUntilArmed()
+                try Task.checkCancellation()
                 // Start methods retain their own gates, callbacks and tokens.
-                for name in names { await port.doctorStartBridge(name: name) }
-                let deadline = ContinuousClock.now.advanced(by: .seconds(3))
-                repeat {
-                    let rows = await doctorBridgeSnapshots().filter { names.contains($0.name) }
-                    if rows.allSatisfy({ $0.health.boundPort != nil }) {
-                        return .completed("Completed: rebound \(names.joined(separator: ", ")) and verified the listening ports.")
-                    }
-                    try await Task.sleep(for: .milliseconds(100))
-                } while ContinuousClock.now < deadline
+                for name in names {
+                    try Task.checkCancellation()
+                    await port.doctorStartBridge(name: name)
+                }
+                try Task.checkCancellation()
+                let result = await raceAgainstTimeout(seconds: 3) {
+                    var iterator = changes.stream.makeAsyncIterator()
+                    repeat {
+                        try Task.checkCancellation()
+                        let rows = await doctorBridgeSnapshots().filter { names.contains($0.name) }
+                        try Task.checkCancellation()
+                        if rows.allSatisfy({ $0.health.boundPort != nil }) { return true }
+                    } while await iterator.next() != nil
+                    return false
+                }
+                if case .value(true) = result {
+                    return .completed("Completed: rebound \(names.joined(separator: ", ")) and verified the listening ports.")
+                }
+                if case .cancelled = result { throw CancellationError() }
                 return .unverified("Repair attempted: \(names.joined(separator: ", ")) did not confirm a bound port within 3 seconds.")
             }
         case DoctorLoopHealth.doctorCheckID:
@@ -372,28 +400,41 @@ extension EngineDoctorRuntime {
                 return health.problem.map { (peers.first { "peer:" + $0.id == agent }?.name ?? agent) + ": " + $0 }
             }
             // A message waiting for its recipient's session is owed, not damage; only
-            // an agent connection that owes repair is a problem here.
+            // an agent connection that owes repair is a problem here. This row measures;
+            // each owed obligation projects its own remedy, so none is copied here.
             source = "experiences/experiences.sqlite"
             for owed in try await ExperienceStore.at(root).projection() where owed.owes["repair"]?.phase.isSettled == false
                 && owed.claims.contains(where: { $0.claim.hasPrefix("operation: peer.") || $0.claim.hasPrefix("operation: agent.") }) {
-                problems.append(owed.face?.words ?? "An agent connection still owes repair.")
+                let operation = owed.claims.first { $0.claim.hasPrefix("operation: ") }?.claim ?? "agent connection"
+                problems.append("\(operation) still owes repair (\(owed.id))")
             }
-            return CheckResult(source: "agents/peers.json and agents/local-health.json",id: "live.agent_connections", title: "Agent connections", status: problems.isEmpty ? "ok" : "unmeasured",
-                detail: problems.isEmpty ? "No broken reply path is recorded; setup alone does not prove a reply." : problems.joined(separator: "\n"))
+            return CheckResult(source: "agents/peers.json, agents/local-health.json and experiences/experiences.sqlite",
+                id: "live.agent_connections", title: "Agent connections", status: problems.isEmpty ? "ok" : "fail",
+                detail: problems.isEmpty ? "No broken reply path is recorded; setup alone does not prove a reply."
+                    : "Agent connection evidence: " + problems.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) }.joined(separator: "; ") + ".")
         } catch {
             return CheckResult(source: source,
-                nextCall: source == "experiences/experiences.sqlite" ? nil : ToolFailureError.fileRepairCall(root.appendingPathComponent(source), dataRoot: root,
-                    shape: "Retain the saved peer contacts, conversations or local-health observations in this file, with their original identities and recorded states. Preserve credentials, admission and elevation choices exactly; never grant authority or invent a reply."),
-                id: "live.agent_connections", title: "Agent connections", status: "warn",
+                id: "live.agent_connections", title: "Agent connections", status: "fail",
                 detail: "Agent connection evidence is unavailable: \(Self.safeDetail(error.localizedDescription))",
-                harm: "Her saved helper contacts and conversations cannot be read.", repair: nil)
+                harm: "Her saved helper contacts and conversations cannot be read.", repair: nil,
+                human_action: ToolFailureError.fileRepairInstruction(root.appendingPathComponent(source),
+                    shape: source == "experiences/experiences.sqlite"
+                        ? "This SQLite experience store retains original experiences, claims, evidence and obligation phases. Preserve their identities and settlement history."
+                        : "Retain the saved peer contacts, conversations or local-health observations in this file, with their original identities and recorded states. Preserve credentials, admission and elevation choices exactly; never grant authority or invent a reply."))
         }
     }
 
     public func doctorBackgroundLoopsCheck() async -> CheckResult {
-        await DoctorLoopHealth.doctorCheck(
-            dataRoot: dataRoot
-        )
+        let observations = await port.doctorManager.status()
+        let receipts = DoctorLoopHealth.recentFailureDates(
+            receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl"))
+        let now = Date()
+        await MainActor.run {
+            port.doctorEngine.doctor.loopVerdicts = DoctorLoopHealth.evaluate(
+                observations: observations, recentFailureDates: receipts, now: now)
+        }
+        return DoctorLoopHealth.doctorCheck(
+            observations: observations, recentFailureDates: receipts, now: now)
     }
 
     public func doctorBackgroundLoopChecks() async -> [CheckResult] {
@@ -417,8 +458,8 @@ extension EngineDoctorRuntime {
                 + (pulse.note.isEmpty ? "" : " (\(pulse.note))")
                 + (pulse.cadence.map { ", every \(DoctorLoopHealth.describeAge($0))" } ?? "") + (overdue ? " — overdue" : ""), pulse.organ)
         }.sorted { ($0.0 ? 0 : 1, $0.1) < ($1.0 ? 0 : 1, $1.1) }
-        return CheckResult(source: "Organ pulse registrations",id: "live.pulses", title: "Organ pulses", status: rows.isEmpty || rows.contains(where: \.0) ? "unmeasured" : "ok",
-                           detail: rows.isEmpty ? "No organ has pulsed yet." : rows.map(\.1).joined(separator: "\n"))
+        return CheckResult(source: "Organ pulse registrations",id: "live.pulses", title: "Organ pulses", status: rows.isEmpty ? "unmeasured" : rows.contains(where: \.0) ? "warn" : "ok",
+                           detail: rows.isEmpty ? "No organ has pulsed yet." : rows.map(\.1).joined(separator: "; ") + ".")
     }
 
     public func doctorInspectorCheck() async -> CheckResult {

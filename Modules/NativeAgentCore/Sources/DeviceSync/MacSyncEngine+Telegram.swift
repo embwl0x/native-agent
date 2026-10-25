@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MacSyncEngine+Telegram.swift` | `MacSyncEngine`: `telegramSnapshotData` |
 
 extension MacSyncEngine {
     func telegramSnapshotData() async -> SnapshotGroupBuild {

@@ -10,8 +10,9 @@ import AppKit
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
-import KnowledgeGraph
+import MemoryV2
 import PersistenceCore
+// Blueprint: | `MacSyncEngine+Notifications.swift` | `MacSyncEngine`: `sendNotificationToPairedDevices` |
 
 extension MacSyncEngine {
     @discardableResult

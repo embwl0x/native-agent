@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `CompactDurationFormatter.swift` | `CompactDurationFormatter.string`: shared rounded compact duration wording with finite/range admission |
+
 /// Compact duration wording shared by Mac and iOS presentation.
 public enum CompactDurationFormatter {
     public static func string(_ seconds: Double) -> String {

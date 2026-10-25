@@ -1,12 +1,14 @@
 import AgentLinkTransport
 import Foundation
+import NativeAgentCore
 import Security
 import PersistenceCore
+// Blueprint: | `AgentPeerTransport.swift` | `AgentPeerCredentials`: credential uniqueness and availability; bearer comparison delegates to `BridgeCore` |
 
 
 /// Dedicated per-peer secrets. Never consults generic provider or bridge keys.
 public enum AgentPeerCredentials {
-    public static let unavailableDetail = "unavailable now - its credential could not be resolved; agent.connect repairs a missing key on this same contact"
+    public static let unavailableDetail = "Contact credential is unresolved. agent.connect repairs a confirmed missing key; resolve Keychain access errors before reconnecting."
 
     /// The bearer-only door and current contact projections share this check.
     public static func resolve(_ token: String, peers: [AgentPeerContact],
@@ -15,9 +17,7 @@ public enum AgentPeerCredentials {
         let matches = peers.filter { peer in
             guard peer.credentialKey == AgentPeerContact.credentialKey(for: peer.id),
                   let stored = try? readCredential(peer.id) else { return false }
-            let a = Array(stored.utf8), b = Array(token.utf8)
-            guard a.count == b.count else { return false }
-            return zip(a, b).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
+            return BridgeCore.constantTimeEquals(stored, token)
         }
         return matches.count == 1 ? matches.first : nil
     }
@@ -40,12 +40,27 @@ public enum AgentPeerCredentials {
         return "\(legacyService).\(bundleID)"
     }
     public enum CredentialError: Error, LocalizedError, Equatable {
-        case invalidPeer, invalidToken, unavailable
+        case invalidPeer, invalidToken
+        case unavailable(OSStatus)
         public var errorDescription: String? {
             switch self {
-            case .invalidPeer: return "Peer credential identity is invalid."
-            case .invalidToken: return "Peer bearer credential is invalid."
-            case .unavailable: return "Peer credential could not be accessed in the dedicated Keychain store."
+            case .invalidPeer: return "Contact credential identity is invalid."
+            case .invalidToken: return "Contact bearer credential is invalid."
+            case .unavailable(let status): return "Contact credential access failed in Keychain (\(status)): \(SecCopyErrorMessageString(status, nil) as String? ?? "No system explanation")."
+            }
+        }
+        var failure: ToolFailureError {
+            switch self {
+            case .invalidPeer, .invalidToken:
+                return ToolFailureError(errorDescription!, effects: .none,
+                    nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]),
+                    code: self == .invalidPeer ? "agent_credential_identity_invalid" : "agent_credential_token_invalid",
+                    instruction: "Read contacts; use the contact's exact peer ID and a valid bearer token.", recovery: .inspect)
+            case .unavailable:
+                return ToolFailureError(errorDescription!, effects: .unknown, owner: "Contact credentials in Keychain",
+                    tap: "Keychain Access → login → unlock and review NativeAgent's credential access",
+                    code: "agent_credential_access_failed",
+                    instruction: "Resolve the reported Keychain error; preserve existing credentials. Reconnect only when the key is confirmed missing.")
             }
         }
     }
@@ -53,7 +68,7 @@ public enum AgentPeerCredentials {
         try query(peerID: peerID, service: service)
     }
     static func query(peerID: String, service: String) throws -> [String: Any] {
-        guard UUID(uuidString: peerID)?.uuidString.lowercased() == peerID else { throw CredentialError.invalidPeer }
+        guard UUID(uuidString: peerID)?.uuidString.lowercased() == peerID else { throw CredentialError.invalidPeer.failure }
         return [kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service,
                 kSecAttrAccount as String: AgentPeerContact.credentialKey(for: peerID),
@@ -66,8 +81,14 @@ public enum AgentPeerCredentials {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = item as? Data,
-              let token = String(data: data, encoding: .utf8), AgentPeerHTTP.validToken(token) else { throw CredentialError.unavailable }
+        guard status == errSecSuccess else { throw CredentialError.unavailable(status).failure }
+        guard let data = item as? Data,
+              let token = String(data: data, encoding: .utf8), AgentPeerHTTP.validToken(token) else {
+            throw ToolFailureError("Saved credential peer:\(peerID) is not a valid bearer token.", effects: .none,
+                owner: "Keychain \(service) / \(AgentPeerContact.credentialKey(for: peerID))",
+                tap: "Keychain Access → login → \(service) → \(AgentPeerContact.credentialKey(for: peerID))",
+                code: "agent_saved_credential_invalid", instruction: "Repair the named Keychain entry with the contact's valid token; preserve existing credential evidence.")
+        }
         return token
     }
     /// Prefer the install-scoped key; retain the legacy form indefinitely.
@@ -109,7 +130,7 @@ public enum AgentPeerCredentials {
     public static func write(_ token: String, peerID: String) throws {
         let query = try query(peerID: peerID)
         defer { cache.forget(peerID) }
-        guard AgentPeerHTTP.validToken(token) else { throw CredentialError.invalidToken }
+        guard AgentPeerHTTP.validToken(token) else { throw CredentialError.invalidToken.failure }
         let attributes = [kSecValueData as String: Data(token.utf8)]
         var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
@@ -119,7 +140,7 @@ public enum AgentPeerCredentials {
             item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
             status = SecItemAdd(item as CFDictionary, nil)
         }
-        guard status == errSecSuccess else { throw CredentialError.unavailable }
+        guard status == errSecSuccess else { throw CredentialError.unavailable(status).failure }
     }
     /// A peer's other secrets (a callback's credentials) live in this same
     /// dedicated store, each under its own account, never in a data file.
@@ -133,7 +154,7 @@ public enum AgentPeerCredentials {
             item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
             status = SecItemAdd(item as CFDictionary, nil)
         }
-        guard status == errSecSuccess else { throw CredentialError.unavailable }
+        guard status == errSecSuccess else { throw CredentialError.unavailable(status).failure }
     }
 
     public static func readSecret(account: String) throws -> Data? {
@@ -143,13 +164,18 @@ public enum AgentPeerCredentials {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = item as? Data else { throw CredentialError.unavailable }
+        guard status == errSecSuccess else { throw CredentialError.unavailable(status).failure }
+        guard let data = item as? Data else {
+            throw ToolFailureError("Keychain returned no credential data for \(account).", effects: .none,
+                owner: "Keychain \(service) / \(account)", tap: "Keychain Access → login → \(service) → \(account)",
+                code: "agent_saved_credential_data_invalid", instruction: "Repair the named credential entry without discarding its existing evidence.")
+        }
         return data
     }
 
     public static func deleteSecret(account: String) throws {
         let status = SecItemDelete(secretQuery(account) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw CredentialError.unavailable }
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw CredentialError.unavailable(status).failure }
     }
 
     private static func secretQuery(_ account: String) -> [String: Any] {
@@ -162,7 +188,7 @@ public enum AgentPeerCredentials {
         defer { cache.forget(peerID) }
         try revoke(service: service) { service in
             let status = SecItemDelete(try query(peerID: peerID, service: service) as CFDictionary)
-            guard status == errSecSuccess || status == errSecItemNotFound else { throw CredentialError.unavailable }
+            guard status == errSecSuccess || status == errSecItemNotFound else { throw CredentialError.unavailable(status).failure }
         }
     }
     static func revoke(service: String, delete: (String) throws -> Void) throws {

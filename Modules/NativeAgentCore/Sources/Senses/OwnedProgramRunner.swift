@@ -3,15 +3,17 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `OwnedProgramRunner.swift` | Invocation-bound selection/dependency proof shared until canonical catalog revision changes; shared program execution, resident helper leases invalidated by canonical ability changes/removal, and what a resident ability holds (`holding`, one broker per resident life) kept in the same slot, selected under the store lock, surviving a failed run's dropped helper; retirement closes admission and retains teardown through completion before replacement publication, and terminal quit (`endResidents`) removes the catalog observer and drains teardown; helper-owned one-second process-tree RSS sampling remains because no equivalent threshold event is confirmed; fresh per-call authority/journal and resume freshness; host calls carry the part and its input in SkillRunContext; `host.state.get/set` for tools and skills reaches AbilityStore's notebook by part id (scratch for preview/validation); skill resume replays saved state results then persists new state operations normally, without renewing stalled execution; authored tools receive frozen home/workspace paths and their requesting data root; rooted file calls resolve app_data/workspace before the door, retaining path-array listing compatibility through ordinary paging; `ReadContent` collects owner-declared envelope projections and content dependencies, sharing normalization with replay argument comparisons without changing replies; a ledger row for a batch call carries its receipts' effects |
 
 /// One helper implementation, with isolated contexts. Sense subscriptions keep
 /// a process through their adapter; resident tools and skills retain the same
 /// transport between calls. Authority is supplied afresh on every run.
 public struct OwnedProgramRunner: OwnedProgramRunning {
     public static let sourceLimit = AbilityStore.sourceLimit
+    /// Script action/read caps and default I/O bounds. Abilities bypass the
+    /// action/read caps; ability and turn I/O uses OwnedProgram's 4 MiB bounds.
     public static let actionLimit = 50
     public static let readLimit = 100
-    public static let wallSeconds = 60.0
     public static let returnLimit = 16 * 1024
     public static let logLimit = 2 * 1024
     public static let inputLimit = 16 * 1024
@@ -19,16 +21,32 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
 
     /// The selection and dependency proof belong to the invocation. Concurrent
     /// calls share its refresh; a failed refresh stays failed until an owner changes.
+    /// Invocation cancellation cancels that flight; a retired generation can
+    /// never validate a newer revision, even if its refresh ignored cancellation.
     public actor Binding {
         private var revision: [String]
         private var checked: Task<Void, Error>?
+        private var generation = UUID()
         public init(revision: [String]) { self.revision = revision }
+        deinit { checked?.cancel() }
         public func check(_ revision: [String], refresh: @escaping @Sendable () async throws -> Void) async throws {
+            try Task.checkCancellation()
             if self.revision != revision {
+                checked?.cancel()
                 self.revision = revision
-                checked = Task { try await refresh() }
+                generation = UUID()
+                checked = Task {
+                    try Task.checkCancellation()
+                    try await refresh()
+                    try Task.checkCancellation()
+                }
             }
-            try await checked?.value
+            let generation = self.generation
+            if let checked {
+                try await withTaskCancellationHandler { try await checked.value } onCancel: { checked.cancel() }
+            }
+            try Task.checkCancellation()
+            guard self.generation == generation else { throw CancellationError() }
         }
     }
 
@@ -40,45 +58,163 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
 
     private final class Residents: @unchecked Sendable {
         private let lock = NSLock()
-        private var slots: [String: (program: OwnedProgram, process: OwnedProgramProcess, busy: Bool)] = [:]
+        private var closed = false
+        private var observer: NSObjectProtocol?
+        private var teardowns: [String: (id: UUID, task: Task<Void, Never>)] = [:]
+        /// One resident program: its helper while it has one, and what it
+        /// holds (an ability's programs and connections), which outlives a
+        /// helper a failed run dropped.
+        private struct Slot {
+            let program: OwnedProgram
+            var process: OwnedProgramProcess?
+            var held: (value: AnyObject, end: @Sendable () async -> Void)?
+            var busy = false
+            /// Stops its helper; returns what ends what it held.
+            func stop() -> (@Sendable () async -> Void)? { process?.stop(); return held?.end }
+        }
+        private var slots: [String: Slot] = [:] {
+            didSet { for key in Array(vacancies.keys) where slots[key]?.busy != true && teardowns[key] == nil { vacancies.removeValue(forKey: key)?.forEach { $0.resume() } } }
+        }
+        /// The slots a wake was turned away from, busy with another call, and
+        /// the wakes waiting for one to free.
+        private var turnedAway: Set<String> = []
+        private var vacancies: [String: [CheckedContinuation<Void, Never>]] = [:]
         init() {
-            _ = NotificationCenter.default.addObserver(forName: AbilityStore.didChange, object: nil, queue: nil) { [weak self] change in
+            observer = NotificationCenter.default.addObserver(forName: AbilityStore.didChange, object: nil, queue: nil) { [weak self] change in
                 guard let key = change.object as? String, let self else { return }
-                self.lock.withLock { self.slots.removeValue(forKey: key)?.process.stop() }
+                self.lock.withLock { self.retire(key) }
             }
+        }
+        /// Under the pool lock: remove admission before starting retained teardown.
+        private func retire(_ key: String) {
+            guard let slot = slots[key] else { return }
+            if let end = slot.stop() {
+                let id = UUID()
+                teardowns[key] = (id, Task {
+                    await end()
+                    self.lock.withLock {
+                        guard self.teardowns[key]?.id == id else { return }
+                        self.teardowns.removeValue(forKey: key)
+                        self.vacancies.removeValue(forKey: key)?.forEach { $0.resume() }
+                    }
+                })
+            }
+            slots.removeValue(forKey: key)
+        }
+        func settle(_ store: AbilityStore, program: OwnedProgram) async throws {
+            try Task.checkCancellation()
+            let key = store.root.appendingPathComponent(program.id).path
+            while let flight = try AbilityStore.withLock({ () throws -> Task<Void, Never>? in
+                // Revalidate after every teardown await before retiring or
+                // publishing anything: a stale caller cannot retire its successor.
+                try selected(store, program)
+                return try lock.withLock {
+                    guard !closed else { throw CancellationError() }
+                    if let slot = slots[key], slot.program != program { retire(key) }
+                    return teardowns[key]?.task
+                }
+            }) {
+                await flight.value
+                try Task.checkCancellation()
+            }
+        }
+        private func admit(_ key: String) throws {
+            guard !closed, teardowns[key] == nil else { throw CancellationError() }
+        }
+        /// Under the store's lock: only the selected version takes, or replaces, its slot.
+        private func selected(_ store: AbilityStore, _ program: OwnedProgram) throws {
+            guard let selected = try store.read(id: program.id), selected.kind == .part,
+                  selected.record?["codeFingerprint"] == .string(program.version), selected.bodyDigest == program.digest,
+                  selected.metadata["resident"] == .bool(true),
+                  [JSONValue.string("active"), .string("installed")].contains(selected.record?["status"] ?? .null) else {
+                throw SenseFailure(code: "state_changed", message: "The selected ability was stopped or replaced. Nothing more ran.")
+            }
+        }
+        func holding<Held: AnyObject & Sendable>(_ store: AbilityStore, program: OwnedProgram, make: () -> Held,
+                                                 end: @escaping @Sendable (Held) async -> Void) async throws -> Held {
+            try await settle(store, program: program)
+            return try AbilityStore.withLock {
+                try selected(store, program)
+                return try lock.withLock {
+                    let key = store.root.appendingPathComponent(program.id).path
+                    try admit(key)
+                    if let slot = slots[key], slot.program != program { retire(key); throw CancellationError() }
+                    if slots[key] == nil { slots[key] = Slot(program: program) }
+                    if let value = slots[key]?.held?.value as? Held { return value }
+                    let value = make()
+                    slots[key]?.held = (value, { await end(value) })
+                    return value
+                }
+            }
+        }
+        func turnAway(_ key: String) { lock.withLock { _ = turnedAway.insert(key) } }
+        func waitIfTurnedAway(_ key: String) async -> Bool {
+            guard lock.withLock({ turnedAway.remove(key) != nil }) else { return false }
+            await withCheckedContinuation { (vacancy: CheckedContinuation<Void, Never>) in
+                lock.withLock { if !closed && (slots[key]?.busy == true || teardowns[key] != nil) { vacancies[key, default: []].append(vacancy) } else { vacancy.resume() } }
+            }
+            return true
+        }
+        func end() async {
+            let (observer, flights) = lock.withLock {
+                closed = true
+                let observer = self.observer; self.observer = nil
+                for key in Array(slots.keys) { retire(key) }
+                for waiting in vacancies.values { waiting.forEach { $0.resume() } }
+                vacancies.removeAll(); turnedAway.removeAll()
+                return (observer, teardowns.values.map(\.task))
+            }
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            for flight in flights { await flight.value }
         }
         func take(_ store: AbilityStore, program: OwnedProgram, create: () throws -> OwnedProgramProcess) throws -> OwnedProgramProcess {
             // Selection and lease publication share the mutation lock, in store/pool order.
             try AbilityStore.withLock {
-                if program.isResident {
-                    guard let selected = try store.read(id: program.id), selected.kind.rawValue == program.kind.rawValue,
-                          selected.record?["codeFingerprint"] == .string(program.version), selected.bodyDigest == program.digest,
-                          selected.metadata["resident"] == .bool(true),
-                          selected.record?["status"] == .string("active") || (program.kind == .skill && selected.record?["status"] == .string("installed")) else {
-                        throw SenseFailure(code: "state_changed", message: "The selected part was stopped or replaced. Nothing more ran.")
-                    }
-                }
+                try selected(store, program)
                 return try lock.withLock {
                     let key = store.root.appendingPathComponent(program.id).path
+                    try admit(key)
                     if let slot = slots[key] {
-                        guard !slot.busy else { throw SenseFailure(code: "busy", message: "Resident part \(program.id) is already running; wait for its call to finish.") }
-                        if slot.program == program, slot.process.isRunning, slot.process.failure == nil {
+                        guard !slot.busy else { throw SenseFailure(code: "busy", message: "Resident ability \(program.id) is already running; wait for its call to finish.") }
+                        if slot.program == program, let process = slot.process, process.isRunning, process.failure == nil {
                             slots[key]?.busy = true
-                            return slot.process
+                            return process
                         }
-                        slot.process.stop(); slots.removeValue(forKey: key)
+                        slot.process?.stop(); slots[key]?.process = nil
+                        if slot.program != program { retire(key); throw CancellationError() }
                     }
                     let process = try create()
-                    if program.isResident { slots[key] = (program, process, true) }
+                    slots[key, default: Slot(program: program)].process = process
+                    slots[key]?.busy = true
                     return process
                 }
             }
         }
+        /// A resumed run's lease: its slot busy for it as for a live run, so
+        /// the two never overlap on what it holds; its helper its own.
+        func lease(_ store: AbilityStore, program: OwnedProgram) throws -> String {
+            try AbilityStore.withLock {
+                try selected(store, program)
+                return try lock.withLock {
+                    let key = store.root.appendingPathComponent(program.id).path
+                    try admit(key)
+                    guard slots[key]?.busy != true else { throw SenseFailure(code: "busy", message: "Resident ability \(program.id) is already running; wait for its call to finish.") }
+                    slots[key, default: Slot(program: program)].busy = true
+                    return key
+                }
+            }
+        }
+        func unlease(_ key: String, program: OwnedProgram) {
+            lock.withLock { if slots[key]?.program == program { slots[key]?.busy = false } }
+        }
         func release(_ key: String, process: OwnedProgramProcess, keep: Bool) {
             lock.withLock {
                 guard slots[key]?.process === process else { return }
-                if keep { slots[key]?.busy = false }
-                else { slots.removeValue(forKey: key)?.process.stop() }
+                slots[key]?.busy = false
+                if keep { return }
+                // A failed run drops its helper and context; what it holds stays.
+                process.stop(); slots[key]?.process = nil
+                if slots[key]?.held == nil { slots.removeValue(forKey: key) }
             }
         }
     }
@@ -97,6 +233,26 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
     }
 
     public func hold() throws -> Held { Held(try spawn()) }
+
+    /// What a resident program holds beside its helper (an ability's programs
+    /// and connections), in its resident slot: one for its resident life, made
+    /// on its first live run of the selected version and ended with the slot,
+    /// when its ability changes (off, a new version, dropped) or the app quits;
+    /// never by a run, a failed one included.
+    public static func holding<Held: AnyObject & Sendable>(_ program: OwnedProgram, dataRoot: URL, make: () -> Held,
+                                                           end: @escaping @Sendable (Held) async -> Void) async throws -> Held {
+        try await residents.holding(AbilityStore(dataRoot: dataRoot), program: program, make: make, end: end)
+    }
+
+    /// The app is quitting: every resident helper ends, and what each held.
+    public static func endResidents() async { await residents.end() }
+
+    /// Whether the wake that just ran ability `id` was turned away, its
+    /// resident slot busy with another call: if so, returns true once that
+    /// call ends, and the wake is admitted afresh.
+    public static func waitedForSlot(_ id: String, dataRoot: URL) async -> Bool {
+        await residents.waitIfTurnedAway(AbilityStore(dataRoot: dataRoot).root.appendingPathComponent(id).path)
+    }
 
     private func spawn() throws -> OwnedProgramProcess {
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("program-\(UUID().uuidString)")
@@ -118,16 +274,36 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         await run(program, input: input, preview: false, replay: nil, host: host, held: held)
     }
 
+    /// What woke the part this run serves: its signal, time and payload. It
+    /// reaches the part as `input.wake`, beside its own declared input and past
+    /// every params check, and never reaches a part that part runs in turn.
+    @TaskLocal public static var wake: JSONValue?
+
+    /// Whether a run was turned away before any of it ran, its resident slot busy with another call.
+    public static func turnedAway(_ receipt: JSONValue) -> Bool {
+        guard case .object(let fields) = receipt, case .object(let error)? = fields["error"] else { return false }
+        return error["reason"] == .string("busy") && error["origin"] == .string("runtime")
+    }
+
     private func run(_ program: OwnedProgram, input: JSONValue?, preview: Bool, replay: Replay?,
                      host: any OwnedProgramHostProfile, held: Held?) async -> JSONValue {
+        if let wake = Self.wake, program.isPart {
+            var fields: [String: JSONValue] = if case .object(let fields)? = input { fields } else { [:] }
+            fields["wake"] = wake
+            let receipt = await Self.$wake.withValue(nil) {
+                await run(program, input: .object(fields), preview: preview, replay: replay, host: host, held: held)
+            }
+            // A resume is no wake's delivery: none waits on its slot.
+            if replay == nil, Self.turnedAway(receipt) {
+                Self.residents.turnAway(AbilityStore(dataRoot: dataRoot).root.appendingPathComponent(program.id).path)
+            }
+            return receipt
+        }
         var receipt = await execute(program, input: input, preview: preview, replay: replay, host: host, held: held)
         // An ad hoc app script is not a part: it leaves no evidence on any ability.
-        if !preview, program.kind != .script, !(host is OwnedProgramFixtures) {
-            do { try AbilityStore(dataRoot: dataRoot).recordRun(id: program.id, version: program.version, receipt: receipt, input: replay == nil ? input : nil) }
-            catch {
-                var fields: [String: JSONValue] = if case .object(let fields) = receipt { fields } else { [:] }
-                fields["accounting_error"] = .string(error.localizedDescription); receipt = .object(fields)
-            }
+        if !preview, program.kind != .script, program.entry != .face, !(host is OwnedProgramFixtures) {
+            receipt = await AbilityStore(dataRoot: dataRoot).settleRun(id: program.id, version: program.version,
+                receipt: receipt, input: replay == nil ? input : nil)
         }
         return receipt
     }
@@ -135,7 +311,16 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
     private func execute(_ program: OwnedProgram, input: JSONValue?, preview: Bool,
                          replay: Replay?, host: any OwnedProgramHostProfile, held: Held?) async -> JSONValue {
         let actions = ActionTasks()
-        let journal = Journal(source: program.source, preview: preview, kind: program.kind,
+        let receipt = await executeEffect(program, input: input, preview: preview, replay: replay, host: host, held: held, actions: actions)
+        // Child host calls own their settlement too. Stop can end the helper
+        // immediately, but its caller waits for those children before returning.
+        await settle { await actions.finish() }
+        return receipt
+    }
+
+    private func executeEffect(_ program: OwnedProgram, input: JSONValue?, preview: Bool,
+                         replay: Replay?, host: any OwnedProgramHostProfile, held: Held?, actions: ActionTasks) async -> JSONValue {
+        let journal = Journal(source: program.source, preview: preview, program: program,
                               replay: replay, host: host, actionsInFlight: actions, notebookRoot: dataRoot, partID: program.id)
         do {
             try program.validate()
@@ -143,7 +328,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 throw SenseFailure(code: "bad_input", message: "Persistent senses require their source-bound runner adapter.")
             }
             if let input {
-                let limit = program.kind == .tool || program.kind == .turn ? program.returnLimit : Self.inputLimit
+                let limit = program.inputLimit
                 guard case .object = input, try input.serializedData(pretty: false).count <= limit else {
                     throw SenseFailure(code: "invalid_input", message: "A program's input must be a JSON object of at most \(limit) bytes.")
                 }
@@ -153,9 +338,17 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             let resident = program.isResident && live
             let store = AbilityStore(dataRoot: dataRoot)
             let key = store.root.appendingPathComponent(program.id).path
+            if program.isResident, !preview, held == nil, !(host is OwnedProgramFixtures) {
+                try await Self.residents.settle(store, program: program)
+            }
+            // A resident ability's resume replays in a helper of its own, under its slot's lease.
+            let leased = program.isResident && replay != nil && !preview && held == nil && !(host is OwnedProgramFixtures)
+                ? try Self.residents.lease(store, program: program) : nil
+            defer { if let leased { Self.residents.unlease(leased, program: program) } }
             let process: OwnedProgramProcess
             if let held { process = held.process }
-            else if live { process = try Self.residents.take(store, program: program, create: spawn) }
+            // Only a resident program's run reaches the resident pool.
+            else if resident { process = try Self.residents.take(store, program: program, create: spawn) }
             else { process = try spawn() }
             if preview || host is OwnedProgramFixtures { journal.notebookRoot = process.scratch }
             var keep = false
@@ -171,7 +364,9 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                         "id": .int(1), "type": .string("run"), "program": try .fromEncodable(program),
                         "actionIDs": .array(host.actionIDs.map(JSONValue.string)),
                     ]
-                    if program.kind == .tool {
+                    if program.isPart {
+                        // The helper's own HOME is its run scratch; the person's home comes from here.
+                        message["home"] = .string(FileManager.default.homeDirectoryForCurrentUser.path)
                         message["workspace"] = .string(try NativeAgentWorkspaceRoot.prepare(dataRoot: dataRoot).path)
                         message["dataRoot"] = .string(dataRoot.path)
                         message["measurementSystem"] = .string(Locale.autoupdatingCurrent.measurementSystem == .us ? "us" : Locale.autoupdatingCurrent.measurementSystem == .metric ? "metric" : "other")
@@ -215,11 +410,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                             if type == "app_call", case .string(let kind)? = fields["kind"],
                                case .string(let id)? = fields["action"], case .string(let args)? = fields["args"],
                                case .int(let line)? = fields["line"] {
-                                guard kind != "primitive" || program.kind == .tool else {
-                                    throw SenseFailure(code: "bad_output", message: "Only a tool host can serve declared primitives.")
-                                }
-                                guard kind != "state" || [.tool, .skill].contains(program.kind) else {
-                                    throw SenseFailure(code: "bad_output", message: "Only tools and skills use host.state.")
+                                guard !["primitive", "state"].contains(kind) || program.isPart else {
+                                    throw SenseFailure(code: "bad_output", message: "Only an ability reaches host primitives and host.state.")
                                 }
                                 // Host work is progress; only unaccompanied JS can stall.
                                 let waitStarted = try process.suspend(1)
@@ -228,8 +420,10 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                                         .serialize(pretty: false))
                                 } else {
                                     reply = await SkillRunContext.$partID.withValue(program.id) {
-                                        await SkillRunContext.$input.withValue(input) {
-                                            .string(await journal.call(kind: kind, id: id, args: args, line: Int(line)))
+                                        await SkillRunContext.$ability.withValue(program.isPart ? program.id : nil) {
+                                            await SkillRunContext.$input.withValue(input) {
+                                                .string(await journal.call(kind: kind, id: id, args: args, line: Int(line)))
+                                            }
                                         }
                                     }
                                 }
@@ -258,6 +452,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         private let lock = NSLock()
         private var active: (task: Task<Void, Never>, reply: CheckedContinuation<JSONValue, Never>)?
         private var cancelled = false
+        private var settling: [Task<Void, Never>] = []
         var isCancelled: Bool { lock.withLock { cancelled } }
         private static let cancellation = JSONValue.object([
             "status": .string("failed"), "reason": .string("cancelled"), "not_run_status": .string("cancelled"),
@@ -301,9 +496,16 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             let action = lock.withLock {
                 cancelled = true
                 defer { active = nil }
+                if let active { settling.append(active.task) }
                 return active
             }
             action?.task.cancel(); action?.reply.resume(returning: Self.cancellation)
+        }
+
+        func finish() async {
+            cancel()
+            let tasks = lock.withLock { settling }
+            for task in tasks { await task.value }
         }
     }
 
@@ -387,7 +589,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
 
     /// A call's effects from its whole receipt: unknown, then partial, then
     /// occurred outranks what an outer level said.
-    static func effects(_ fields: [String: JSONValue]) -> JSONValue? {
+    package static func effects(_ fields: [String: JSONValue]) -> JSONValue? {
         let said = resultChain(fields).map { text($0["effects"]) }.filter { !$0.isEmpty }
         return (["unknown", "partial", "occurred"].first(where: said.contains) ?? said.first).map(JSONValue.string)
     }
@@ -553,7 +755,11 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         let lines: [Substring]
         let preview: Bool
         let strict: Bool
-        let tool: Bool
+        /// One of her parts: bounded by its progress and
+        /// its receipt ledger, never by a count of calls.
+        let part: Bool
+        let programEntry: OwnedProgram.Entry
+        let partVersion: String
         let replay: [JSONValue]
         let answer: JSONValue
         let recheckReads: Bool
@@ -596,17 +802,28 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         var readContent: JSONValue = .null
         var readProjections: JSONValue = .array([])
         let replayContent = ReadContent()
-        /// Where the stopped run's own writes landed, by journal position: a
-        /// read it made before one of them on the same page or item replays as
-        /// saved, since its own write explains the difference.
-        let ownWrites: [(at: Int, page: String, item: String?)]
+        /// A strict run's own versions: each page's newest, from its own reads
+        /// and its writes' page_version. A write goes on its page's; one it
+        /// passes itself must be one the run read; never a fresh read.
+        var newest: [String: String] = [:]
+        var seen: Set<String> = []
+        /// The last write whose own version no longer read: target, was, now.
+        var stale: [String: JSONValue]?
+        /// Where the stopped run's own writes landed, by journal position, and
+        /// the page_version each left: a read it made before one of them on the
+        /// same page or item replays as saved, since its own write explains the
+        /// difference, once what its last such write left still reads the same.
+        let ownWrites: [(at: Int, page: String, item: String?, version: String?)]
 
         var isCancelled: Bool { Task.isCancelled }
 
-        init(source: String, preview: Bool, kind: OwnedProgram.Kind, replay: Replay?,
+        init(source: String, preview: Bool, program: OwnedProgram, replay: Replay?,
              host: any OwnedProgramHostProfile, actionsInFlight: ActionTasks, notebookRoot: URL, partID: String) {
             self.lines = source.split(separator: "\n", omittingEmptySubsequences: false)
-            self.preview = preview; self.strict = kind == .skill; self.tool = kind == .tool
+            self.preview = preview; self.strict = program.isStrict
+            self.part = program.isPart
+            self.programEntry = program.entry
+            self.partVersion = program.version
             self.replay = replay?.journal ?? []; self.answer = replay?.answer ?? .null
             self.recheckReads = replay?.recheckReads ?? true
             self.host = host; self.actionsInFlight = actionsInFlight
@@ -617,8 +834,16 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                       case .object(let row)? = fields["row"],
                       ["ok", "unconfirmed"].contains(word(row["status"]) ?? "")
                           || ["occurred", "partial", "unknown"].contains(word(row["effects"]) ?? "") else { return nil }
-                return (at, target.page, target.item)
+                let out = word(fields["out"]).map(OwnedProgramRunner.readValue)
+                let version: String? = if case .object(let value)? = out { word(value["page_version"]) } else { nil }
+                return (at, target.page, target.item, version)
             }
+            for version in OwnedProgramRunner.ownVersions(replay?.journal ?? []) { own(version) }
+        }
+
+        func own(_ version: String) {
+            newest[String(OwnedProgramRunner.versionScope(version).split(separator: "/").first ?? "")] = version
+            seen.insert(version)
         }
 
         func complete(_ fields: [String: JSONValue]) {
@@ -659,12 +884,17 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
 
         func fail(_ failure: SenseFailure) {
             if failure.code != "cancelled", stopped?["reason"] == .string("cancelled") { stopped = nil }
-            if failure.code == "timeout" { timedOut = true }
+            if failure.code == "timeout" {
+                timedOut = true
+                error = ["reason": .string(failure.code), "message": .string(failure.message)]
+                error?["remedy"] = failure.remedy
+            }
             else if failure.code == "cancelled" {
                 stopped = ["reason": .string("cancelled"), "detail": .string("The turn was stopped, so the script was ended.")]
             } else if stopped == nil {
                 error = ["reason": .string(failure.code), "message": .string(String(failure.message.prefix(400)))]
-                if tool { error?["origin"] = .string("runtime") }
+                error?["remedy"] = failure.remedy
+                if part { error?["origin"] = .string("runtime") }
             }
         }
 
@@ -688,6 +918,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         /// call that can land or stop, and a resumed one answers them from
         /// its journal (`Replay`).
         func call(kind: String, id: String, args: String, line: Int) async -> String {
+            // host.call(id, args) is app.<id>(args) unless id is one of the host's own primitives.
+            let kind = kind == "primitive" && host.primitiveAction(id) == nil ? "action" : kind
             let id = kind == "action" ? (host.canonicalAction(id)) : id
             guard strict, ["action", "primitive", "read", "find", "decide", "state"].contains(kind), stopped == nil else {
                 return await dispatch(kind: kind, id: id, args: args, line: line)
@@ -696,7 +928,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             guard replayed < replay.count else {
                 let rows = ledger.count
                 let out = await dispatch(kind: kind, id: id, args: args, line: line)
-                journal.append(.object(["call": signature, "out": .string(out),
+                retain(.object(["call": signature, "out": .string(out),
                                         "row": ledger.count > rows ? ledger[ledger.count - 1] : .null,
                                         "read_content": readContent, "read_projections": readProjections]))
                 return out
@@ -705,7 +937,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             guard case .object(let entry) = replay[replayed], sameCall(entry["call"], signature),
                   case .string(var out)? = entry["out"] else {
                 let detail = "This resumed run took another path than the one that stopped, at call \(replayed + 1) of "
-                    + "\(replay.count), so nothing more ran. Run the skill again from the start."
+                    + "\(replay.count), so nothing more ran. Read the recorded effects before deciding what remains."
                 stopped = ["line": .int(Int64(line)), "source": sourceLine(line), "reason": .string("diverged"),
                            "detail": .string(detail)]
                 return encode(["ok": .bool(false), "reason": .string("diverged"), "detail": .string(detail),
@@ -723,6 +955,18 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             } else {
                 read = host.action(id)?.read == true
             }
+            let reread = recheckReads && Self.status(row) != "answered"
+                && (kind == "read" || kind == "find" || (["action", "primitive"].contains(kind) && read))
+                && (kind != "action" || host.action(id)?.advisory != true)
+            /// What it went on from reads differently now: nothing more runs.
+            func changed(_ name: String, was: JSONValue, now: JSONValue) -> String {
+                let detail = "\(name) reads differently than when this run stopped, so nothing more ran: what it "
+                    + "went on from has changed. Read the recorded effects before deciding what remains."
+                stopped = ["line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
+                           "reason": .string("state_changed"), "detail": .string(detail), "was": was, "now": now]
+                return encode(["ok": .bool(false), "reason": .string("state_changed"), "detail": .string(detail),
+                               "stopped": .bool(true)], line: line, n: n)
+            }
             if replayed == replay.count {
                 // Where it stopped: her answer, never the call, a read included.
                 out = encode(["ok": .bool(true), "value": answer], line: line, n: n)
@@ -731,31 +975,27 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     fields["status"] = .string("answered")
                     row = .object(fields)
                 }
-            } else if recheckReads, Self.status(row) != "answered",
-                      kind == "read" || kind == "find" || (["action", "primitive"].contains(kind) && read),
-                      kind != "action" || host.action(id)?.advisory != true,
-                      !writtenLater(replay[replayed - 1], at: replayed - 1) {
+            } else if reread, let mine = writtenLater(replay[replayed - 1], at: replayed - 1) {
+                // A read the run itself later wrote over replays as saved, below, once what
+                // its last such write left reads the same now: a change since is another's.
+                if let left = mine.version, let now = await currentVersion(left), now != left {
+                    return changed("read " + OwnedProgramRunner.versionScope(left), was: .string(left), now: .string(now))
+                }
+            } else if reread {
                 // Authoritative reads must still match; advisory answers replay as saved.
-                // (A read the run itself later wrote over replays as saved, below.)
                 let now = await dispatch(kind: kind, id: id, args: args, line: line)
                 // Refusals before dispatch have no read content; the refusal itself must match.
                 guard stopped == nil, let content = entry["read_content"], readContent == content,
                       content != .null || replayContent.normalize(OwnedProgramRunner.readValue(now))
                           == replayContent.normalize(OwnedProgramRunner.readValue(out)) else {
                     let name = kind == "action" ? id : ledger.last.flatMap { if case .object(let row) = $0 { word(row["call"]) } else { nil } } ?? kind
-                    let detail = "\(name) reads differently than when this run stopped, so nothing more ran: what it "
-                        + "went on from has changed. Run the skill again from the start if it still fits."
-                    stopped = ["line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
-                               "reason": .string("state_changed"), "detail": .string(detail),
-                               "was": OwnedProgramRunner.brief(out), "now": OwnedProgramRunner.brief(now)]
-                    return encode(["ok": .bool(false), "reason": .string("state_changed"), "detail": .string(detail),
-                                   "stopped": .bool(true)], line: line, n: n)
+                    return changed(name, was: OwnedProgramRunner.brief(out), now: OwnedProgramRunner.brief(now))
                 }
                 // Both saved and fresh bindings share the result owner's content contract.
                 replayContent.include(entry["read_projections"] ?? .null)
                 replayContent.include(readProjections)
                 // Passing reads return fresh bindings for the resumed run's later actions.
-                journal.append(.object(["call": signature, "out": .string(now), "row": ledger.last ?? .null,
+                retain(.object(["call": signature, "out": .string(now), "row": ledger.last ?? .null,
                                         "read_content": readContent, "read_projections": readProjections]))
                 return now
             }
@@ -769,7 +1009,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 }
             }
             replayContent.include(entry["read_projections"] ?? .null)
-            journal.append(.object(["call": signature, "out": .string(out), "row": row,
+            retain(.object(["call": signature, "out": .string(out), "row": row,
                                     "read_content": entry["read_content"] ?? .null,
                                     "read_projections": entry["read_projections"] ?? .array([])]))
             return out
@@ -786,12 +1026,28 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             return was == now
         }
 
-        /// Whether the stopped run itself wrote, after this read, the page or
-        /// item it read (a landed write, exempt or versioned).
-        func writtenLater(_ entry: JSONValue, at index: Int) -> Bool {
-            guard let read = OwnedProgramRunner.target(entry, host: host), !read.write else { return false }
-            return ownWrites.contains { $0.at > index && $0.page == read.page
+        /// Where the stopped run itself wrote, after this read, the page or
+        /// item it read (a landed write, exempt or versioned): the last such.
+        func writtenLater(_ entry: JSONValue, at index: Int) -> (at: Int, page: String, item: String?, version: String?)? {
+            guard let read = OwnedProgramRunner.target(entry, host: host), !read.write else { return nil }
+            return ownWrites.last { $0.at > index && $0.page == read.page
                 && (read.item == nil || $0.item == nil || $0.item == read.item) }
+        }
+
+        /// The version a read of `version`'s page or item returns now; nil when
+        /// it returns none of that scope, so nothing can be told. One that no
+        /// longer reads at all (the page or item gone) reads as "": changed.
+        func currentVersion(_ version: String) async -> String? {
+            let scope = OwnedProgramRunner.versionScope(version)
+            let parts = scope.split(separator: "/", maxSplits: 1).map { JSONValue.string(String($0)) }
+            guard let page = parts.first else { return nil }
+            var input: [String: JSONValue] = ["page": page, host.scriptKey: .bool(true)]
+            if parts.count > 1 { input["item"] = parts[1] }
+            guard case .object(let read) = await actionsInFlight.perform(input, host: host) else { return nil }
+            guard let now = word(read["version"]) else {
+                return read["status"] == .string("failed") || read["ok"] == .bool(false) ? "" : nil
+            }
+            return OwnedProgramRunner.versionScope(now) == scope ? now : nil
         }
 
         /// A ledger row's status; an answered one replays as saved, never run again.
@@ -808,8 +1064,15 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
 
         func append(_ row: JSONValue) {
             guard !unjournaled else { return }
-            if tool { ledgerBytes += (try? row.serializedData(pretty: false).count) ?? 0 }
+            if part { ledgerBytes += (try? row.serializedData(pretty: false).count) ?? 0 }
             ledger.append(row)
+        }
+
+        /// A strict run's replay entry: its full reply, args and projections
+        /// are kept too, so they count against the same budget as the ledger.
+        func retain(_ entry: JSONValue) {
+            if part { ledgerBytes += (try? entry.serializedData(pretty: false).count) ?? 0 }
+            journal.append(entry)
         }
 
         /// One call, run: checks the stop and the limits, hands the call to
@@ -818,8 +1081,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             readContent = .null
             readProjections = .array([])
             unjournaled = kind == "primitive" && host.primitiveAction(id)?.journaled == false
-            if tool, ledgerBytes >= 4 * 1024 * 1024 {
-                stopped = ["reason": .string("output_limit"), "detail": .string("The tool's receipt ledger reached 4 MiB; no further call ran.")]
+            if part, ledgerBytes >= 4 * 1024 * 1024 {
+                stopped = ["reason": .string("output_limit"), "detail": .string("The run's receipt ledger reached 4 MiB; no further call ran.")]
                 return encode(["ok": .bool(false), "reason": .string("output_limit"),
                                "detail": stopped?["detail"] ?? .null, "stopped": .bool(true)], line: line, n: ledger.count + 1)
             }
@@ -857,13 +1120,14 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 return refuse("stopped", "The script stopped at line \(at); no app call runs after that.", stop: true)
             }
             if kind == "state" {
+                if programEntry == .face { return refuse("projection_only", "A face reads only its frozen sources, never a notebook.", stop: true) }
                 guard case .array(let values)? = try? JSONValue.parse(Data(args.utf8)),
                       id == "get" && values.isEmpty || id == "set" && values.count == 1 else {
                     return refuse("bad_state", "Use host.state.get() or host.state.set(value).", stop: false)
                 }
                 do {
-                    let value = try await PartNotebooks.shared.access(dataRoot: notebookRoot, id: partID,
-                        setting: id == "set", value: values.first ?? .null)
+                    let value = try AbilityStore.notebook(dataRoot: notebookRoot, id: partID,
+                        setting: id == "set", value: values.first ?? .null, failure: { SenseFailure(code: $0, message: $1) })
                     return answer(["ok": .bool(true), "value": value])
                 } catch { return refuse("bad_state", error.localizedDescription, stop: false) }
             }
@@ -964,20 +1228,17 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             switch kind {
             case "primitive":
                 name = id
-                guard host.primitiveAction(id) != nil, given.count == 1 else {
-                    // A refusal names the door: a part reaches the Mac through app.<page>.<action>({…}), never host.call.
-                    let door = id.split(separator: ".").map(String.init)
-                    let hint = door.count == 2 ? " Reach it through the door instead: app.\(door[0]).\(door[1])({…}), one named-argument object; app.read('\(door[0])') shows its arguments." : " Reach the Mac through the door: app.<page>.<action>({…}); app {} lists the pages."
-                    return refused("unsupported", "This host does not admit primitive \(id) with these arguments." + hint, call: name)
+                guard given.count <= 1 else {
+                    return refused("invalid_args", "\(id) takes one named-argument object; nothing ran.", call: name)
                 }
-                guard tool || actions < OwnedProgramRunner.actionLimit else {
+                guard part || actions < OwnedProgramRunner.actionLimit else {
                     return halt("action_limit", "A script does at most \(OwnedProgramRunner.actionLimit) actions.", call: name)
                 }
                 actions += 1
                 input = [:]
             case "action":
                 name = id
-                guard tool || actions < OwnedProgramRunner.actionLimit else {
+                guard part || actions < OwnedProgramRunner.actionLimit else {
                     return halt("action_limit", "A script does at most \(OwnedProgramRunner.actionLimit) actions.", call: name)
                 }
                 switch host.doorInput(id: id, given: given) {
@@ -986,6 +1247,15 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     // A program is calling, as on its reads.
                     if !host.scriptKey.isEmpty { input[host.scriptKey] = .bool(true) }
                 case .failure(let problem): return refused(problem.reason, problem.detail, call: name)
+                }
+                // A strict run's write goes on the version of the page it read.
+                let callArgs: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
+                if strict, let action = host.action(id), action.versioned, !action.readOnly(callArgs) {
+                    if case .string(let given)? = input["expected_version"], !given.isEmpty {
+                        guard seen.contains(given) else {
+                            return refused("not_own_version", "\(id) passed a version this run never read; an ability's write goes on its own read's version. It was not run.", call: name)
+                        }
+                    } else if let version = newest[action.page] { input["expected_version"] = .string(version) }
                 }
                 actions += 1
                 if preview { input["preview"] = .bool(true) }
@@ -999,7 +1269,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     return refused("invalid_args", "app.read takes page and optional item, not extra arguments. Use app.<action>({args}) "
                         + "to select a target. Nothing was read.", call: name)
                 }
-                guard tool || reads < OwnedProgramRunner.readLimit else {
+                guard part || reads < OwnedProgramRunner.readLimit else {
                     return halt("read_limit", "A script does at most \(OwnedProgramRunner.readLimit) reads.", call: name)
                 }
                 reads += 1
@@ -1023,13 +1293,11 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
 
             let readContent = ReadContent()
             let receipt: JSONValue = await ReadContent.$current.withValue(readContent) {
-                if kind == "primitive" {
-                    if preview, write {
-                        return .object(["status": .string("preview"), "effects": .string("none"), "result": .null])
-                    } else {
-                        return await actionsInFlight.primitive(id, arguments: given[0], preview: preview, host: host)
-                    }
-                } else { return await actionsInFlight.perform(input, host: host) }
+                if kind == "primitive", preview, write, host.primitiveAction(id)?.program != true {
+                    return .object(["status": .string("preview"), "effects": .string("none"), "result": .null])
+                }
+                if kind == "primitive" { return await actionsInFlight.primitive(id, arguments: given.first ?? .null, preview: preview, host: host) }
+                return await actionsInFlight.perform(input, host: host)
             }
             // The returned effects are authoritative, even for a statically read-only call.
             let envelope: JSONValue = if kind == "primitive", case .object(let fields) = receipt {
@@ -1063,12 +1331,20 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             /// call it made (an id she can pass back) and what it changed.
             func hand(_ receipt: JSONValue) -> JSONValue {
                 guard kind == "action" || kind == "primitive", case .object(var fields) = host.answer(receipt) else { return receipt }
+                if kind == "primitive" { return fields["result"] ?? .null }
                 fields["call"] = .string(name)
                 fields["effects"] = row["effects"] ?? .string(write ? "occurred" : "none")
                 return .object(fields)
             }
             if kind == "action" || kind == "primitive" { record(receipt, envelope: envelope, into: &row) } else if case .object(let read) = receipt {
                 if let version = read["version"] { row["version"] = version }
+            }
+            if strict, case .object(let fields) = receipt {
+                if kind == "read", case .string(let version)? = fields["version"] { own(version) }
+                if kind == "action", host.evidence(receipt).successful, case .string(let version)? = fields["page_version"] { own(version) }
+                if kind == "action", word(fields["reason"]) == "stale_version", let was = word(input["expected_version"]) {
+                    stale = ["target": .string(OwnedProgramRunner.versionScope(was)), "was": .string(was), "now": fields["current_version"] ?? .null]
+                }
             }
             switch outcome {
             case .ok, .preview:
@@ -1127,6 +1403,11 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             if let read = fields["read_only"] { row["read_only"] = read }
             if let changed = fields["changed"] { row["changed"] = changed }
             if case .object(let envelope) = envelope, let effects = OwnedProgramRunner.effects(envelope) { row["effects"] = effects }
+            // A batch answers through its receipts: its row carries what they did.
+            else if case .array(let children)? = fields["receipts"] {
+                let said = children.compactMap { if case .object(let child) = $0 { OwnedProgramRunner.effects(child) } else { nil } }
+                row["effects"] = [JSONValue.string("unknown"), .string("partial"), .string("occurred")].first(where: said.contains) ?? said.first
+            }
             // A strict run keeps each call's effects and real ids, however
             // long its result.
             if strict {
@@ -1169,6 +1450,14 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     }
                     if !at.isEmpty { row["at"] = .object(at) }
                 }
+                // So do the images a generation made: they go with her reply.
+                if case .object(let body) = result, case .array(let images)? = body["images"] {
+                    let made = images.compactMap { image -> JSONValue? in
+                        guard case .object(let made) = image, let path = made["path"] else { return nil }
+                        return .object(["path": path])
+                    }
+                    if !made.isEmpty { row["images"] = .array(made) }
+                }
             }
             if case .object(let effects)? = fields["side_effects"] {
                 var seen: [String: JSONValue] = [:]
@@ -1179,6 +1468,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         }
 
         func receipt() -> JSONValue {
+            // Aborted replay retains effects beyond the point where it stopped.
+            let ledger = self.ledger + replay.dropFirst(journal.count).compactMap { $0.objectValue?["row"] }
             /// A call's receipted effect, regardless of static read policy or success.
             func took(_ fields: [String: JSONValue]) -> Bool {
                 ["occurred", "partial"].contains(text(fields["effects"]))
@@ -1240,9 +1531,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 if refusedAfterStop > 0 { stopped["refused_after"] = .int(Int64(refusedAfterStop)) }
                 out["stopped"] = .object(stopped)
             }
-            if timedOut {
-                out["detail"] = .string("The script ran past \(Int(OwnedProgramRunner.wallSeconds)) seconds and was stopped; "
-                    + "the calls listed before that point ran.")
+            if timedOut, let detail = error?["message"].flatMap(word) {
+                out["detail"] = .string(detail + " Calls already recorded retain their reported effects.")
             }
             if let error { out["error"] = .object(error) }
             let partial = ledger.contains { if case .object(let fields) = $0 { fields["effects"] == .string("partial") } else { false } }
@@ -1259,12 +1549,10 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 // A stop that is User's is not fixed by trying again: that
                 // line is his to do, and the rest may still be hers.
                 let stopReason = stopped.flatMap { word($0["reason"]) } ?? ""
-                // The code that ended it on the receipt itself (not_scriptable,
-                // owners_screen), so failure_code is that code, not tool_failed.
+                // Keep the receipt's own stop code as failure_code.
                 let code = stopReason.isEmpty ? error.flatMap { word($0["reason"]) } ?? "" : stopReason
                 if !code.isEmpty { out["reason"] = .string(code) }
                 let users = host.floorReasons.contains(stopReason) || stopReason == "needs_glass"
-                let alone = code == "not_scriptable"
                 let cardPreview = preview && code == "would_card"
                 let cardInstruction = "Preview stopped at a call that would raise the owner's approval card; no card was filed. "
                     + "Run the action outside preview when you want to request their approval."
@@ -1277,29 +1565,32 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 let which = n.map { "Call \($0)" + (at?["call"].flatMap(word).map { " (\($0))" } ?? "") }
                     ?? "Line \(at?["line"].flatMap(word) ?? "?")"
                 let drop = "\(which) is the owner's (\(stopReason)): drop that call and run the rest if you still want it."
-                let own = "\(which) can't run in a script: run it as its own app call, outside the script, "
-                    + "and the rest without it."
                 let check = (unknown + unsure).joined(separator: ", ")
                     + (unknown.isEmpty ? " ended with its effects unknown" : " got no answer") + ", so whether it took effect is unknown: "
                     + "read the page to check before running it again, then do only what is left."
                 // Reads that landed changed nothing.
                 let nothing = landed.isEmpty ? "Nothing landed. " : "Nothing changed. "
                 out["remedy"] = .object([
-                    "kind": .string(users ? "drop_owners_line" : alone ? "run_alone" : asked ? "decide"
+                    "kind": .string(users ? "drop_owners_line" : asked ? "decide"
                         : cardPreview ? "request_approval" : "read_ledger"),
                     "instruction": .string(changed.isEmpty
                         ? (!unknown.isEmpty || !unsure.isEmpty ? check
-                            : users ? nothing + drop : alone ? nothing + own : asked ? nothing + ask
+                            : users ? nothing + drop : asked ? nothing + ask
                             : cardPreview ? cardInstruction : nothing + (at?["instruction"].flatMap(word)
                                 ?? "Fix what stopped it, then run it again."))
                         : "The calls in changed took effect; don't run them again. "
-                            + (!unknown.isEmpty || !unsure.isEmpty ? check : users ? drop : alone ? own : asked ? ask
+                            + (!unknown.isEmpty || !unsure.isEmpty ? check : users ? drop : asked ? ask
                                 : "Read the page, then do only what is left.")),
                     "next_call": .null,
                 ])
-                if code == "unknown_action", let recovery = at?["remedy"] {
+                if let recovery = at?["remedy"], recovery != .null {
                     out["remedy"] = recovery
                     out["nearest"] = at?["nearest"]
+                }
+                if timedOut, part, at?["remedy"] == nil || at?["remedy"] == .null {
+                    out["remedy"] = Repair.reconcile(
+                        instruction: "Read ability \(partID) version \(partVersion) and its recorded effects. Revise the reported cause with ability.save, then keep the reviewed version; do not replay observed effects.",
+                        nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("ability.read"), "args": .object(["id": .string(partID)])])]))
                 }
                 // A strict run hands back: its step, what landed by real id,
                 // and the one question when it asked one.
@@ -1323,6 +1614,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                         back["question"] = stopped?["detail"] ?? .null
                         if decideData != .null { back["data"] = decideData }
                     }
+                    if code == "stale_version", let stale { back["difference"] = .object(stale) }
                     out["hand_back"] = .object(back)
                 }
             }
@@ -1392,7 +1684,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         let host = !primitives ? (strict ? state + "Object.defineProperty(globalThis, \"host\", {value: Object.freeze({state: partState})});" : "") : state + """
           function primitive(operation, args) {
             if (operation.indexOf("files.") === 0) return door(operation, args);
-            return invoke("primitive", operation, [args === undefined ? null : args]).result;
+            return invoke("primitive", operation, args === undefined ? [] : [args]);
           }
           function primitives(space) {
             return Object.freeze(new Proxy({}, {get: function (_, operation) {
@@ -1424,7 +1716,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
           Object.defineProperty(globalThis, "host", {value: Object.freeze({call: primitive, state: partState,
             measurementSystem: __measurementSystem,
             paths: Object.freeze({home: __home, workspace: __workspace}),
-            files: primitives("files"), network: primitives("network"), apps: primitives("apps"),
+            files: primitives("files"), network: primitives("network"), program: primitives("program"), apps: primitives("apps"),
             model: primitives("model"), fetch: function (args) { return primitive("fetch", args); },
             calendar: Object.freeze({
               list: function (args) { return door("calendar.upcoming", args); },
@@ -1443,6 +1735,18 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
               read: function (args) { return door("contacts.search", args); },
               create: function (args) { return door("contacts.save", args); },
               update: function (args) { return door("contacts.save", args); }})}), writable: false, configurable: false});
+          Object.defineProperty(globalThis, "part", {value: Object.freeze({
+            call: function (id, input) {
+              if (typeof id !== "string" || !/^[a-z][a-z0-9_-]{1,63}$/.test(id))
+                return {ok: false, error: {code: "bad_input", message: "part.call requires an exact part id."}};
+              if (!input || typeof input !== "object" || Array.isArray(input))
+                return {ok: false, error: {code: "bad_input", message: "part.call input is a JSON object."}};
+              try { return primitive("part.call", {id: id, input: input}); }
+              catch (error) { return {ok: false, error: {code: error.reason || "failed", message: error.message}}; }
+            }
+          // A convenience name never takes a name from her code: her own
+          // declaration of `part` or `screen` replaces it in her sandbox.
+          }), writable: true, configurable: true});
           Object.defineProperty(globalThis, "screen", {value: Object.freeze({
             watch: function (args) { return primitive("screen.watch", args); },
             next: function (timeout) {
@@ -1451,7 +1755,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
               if (f.timedOut) return Object.freeze(f);
               f.read = function (queries) { return primitive("frame.read", {watch: f.watch, seq: f.seq, queries: queries}); };
               return Object.freeze(f);
-            }})});
+            }}), writable: true, configurable: true});
           function point(verb) { return function (x, y, toX, toY) {
             return primitive("hand." + verb, verb === "drag" ? {x: x, y: y, to_x: toX, to_y: toY} : {x: x, y: y}); }; }
           function keys(verb) { return function (keys, seconds) {
@@ -1485,6 +1789,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
           }
           \(host)\(reach)
           var api = {
+            // Script API: authored app.call is refused by ability.save; dynamic abilities use host.call.
             call: function (id) { return invoke("action", id, Array.prototype.slice.call(arguments, 1)); },
             read: function () { return invoke("read", "", Array.prototype.slice.call(arguments)); },
             find: function (words) { return invoke("find", "", [words]); },
@@ -1532,7 +1837,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
     fileprivate let scratch: URL
     private var onFailure: @Sendable (SenseFailure) -> Void
     private var terminalFailure: SenseFailure?
-    private var execution: (id: Int, kind: OwnedProgram.Kind, seconds: Double, last: ContinuousClock.Instant)?
+    private var execution: (id: Int, kind: OwnedProgram.Kind, progress: ProgramProgressWindow)?
     private var deadlineTask: Task<Void, Never>?
     private var resources: Task<Void, Never>?
     var pid: Int32 { process.processIdentifier }
@@ -1579,7 +1884,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
                 _ = ProcessTreeReaper.quiesceAndKill(ProcessTreeReaper.snapshot(rootPID: pid, retaining: tree))
             }
             lock.unlock()
-            sink.yield(.ended("Sense helper at \(helper.path) exited (\(process.terminationStatus)): \(tail) Repair the app installation or sense source, then switch the sense on to retry."))
+            sink.yield(.ended("Sense helper at \(helper.path) exited (\(process.terminationStatus)): \(tail) Tell the person about this NativeAgent helper failure; preserve its error output."))
             sink.finish()
             lock.withLock { deadlineTask?.cancel(); resources?.cancel() }
             writeQueue.sync { closeWriter() }
@@ -1598,8 +1903,10 @@ final class OwnedProgramProcess: @unchecked Sendable {
             writeSource = source
             try process.run()
             ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(pid)
-            lock.lock(); tree = ProcessTreeReaper.snapshot(rootPID: pid); lock.unlock()
-            if let memoryBytes { resources = Task.detached(priority: .utility) { [weak self] in
+            lock.lock(); tree = ProcessTreeReaper.snapshot(rootPID: pid)
+            // Process-tree RSS has no confirmed equivalent threshold event. Retain the
+            // one-second sample, owned and cancelled by this helper transport.
+            if let memoryBytes, !stopping { resources = Task.detached(priority: .utility) { [weak self] in
                 while !Task.isCancelled {
                     do { try await Task.sleep(for: .seconds(1)) } catch { return }
                     guard let self else { return }
@@ -1620,6 +1927,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
                     }
                 }
             } }
+            lock.unlock()
         }
         catch {
             process.terminationHandler = nil
@@ -1630,7 +1938,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
             // Resource exhaustion passes; anything else needs a repair.
             let cause = (error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError ?? error as NSError
             let busy = cause.domain == NSPOSIXErrorDomain && [EAGAIN, ENOMEM, EMFILE, ENFILE].contains(Int32(cause.code))
-            throw SenseFailure(code: busy ? "spawn_busy" : "spawn_failed", message: "Sense helper at \(helper.path) could not launch: \(error.localizedDescription) Repair the app installation or macOS execution permissions, then switch the sense on to retry.")
+            throw SenseFailure(code: busy ? "spawn_busy" : "spawn_failed", message: "Tell the person: NativeAgent's sense helper at \(helper.path) could not launch: \(error.localizedDescription)")
         }
     }
 
@@ -1696,7 +2004,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
     func begin(id: Int, kind: OwnedProgram.Kind, seconds: Double, onFailure: (@Sendable (SenseFailure) -> Void)? = nil) {
         lock.withLock {
             if let onFailure { self.onFailure = onFailure }
-            execution = (id, kind, seconds, .now)
+            execution = (id, kind, ProgramProgressWindow(seconds: seconds))
             armDeadlineLocked()
         }
     }
@@ -1705,7 +2013,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
         try Task.checkCancellation()
         try lock.withLock {
             guard !stopping, execution?.id == id else { throw CancellationError() }
-            execution?.last = .now
+            execution?.progress.renew()
         }
     }
 
@@ -1720,7 +2028,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
     func resume(_ id: Int, since started: ContinuousClock.Instant) throws {
         try lock.withLock {
             guard !stopping, var current = execution, current.id == id else { throw CancellationError() }
-            current.last = current.last.advanced(by: max(current.last, started).duration(to: .now))
+            current.progress.resume(after: started)
             execution = current
             armDeadlineLocked()
         }
@@ -1748,15 +2056,15 @@ final class OwnedProgramProcess: @unchecked Sendable {
             while !Task.isCancelled {
                 guard let deadline = self?.lock.withLock({ () -> ContinuousClock.Instant? in
                     guard let current = self?.execution, current.id == id, self?.stopping == false else { return nil }
-                    return current.last.advanced(by: .seconds(current.seconds))
+                    return current.progress.deadline
                 }) else { return }
                 do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
                 guard !Task.isCancelled else { return }
                 self?.lock.withLock {
                     guard !Task.isCancelled, let current = self?.execution, current.id == id,
-                          ContinuousClock.now >= current.last.advanced(by: .seconds(current.seconds)) else { return }
+                          ContinuousClock.now >= current.progress.deadline else { return }
                     self?.failLocked(SenseFailure(code: "timeout", message: current.kind == .sense
-                        ? "Sense helper stalled without progress." : "Owned program exceeded its execution window."))
+                        ? "Sense helper stalled without progress." : "Owned program stalled without progress."))
                 }
             }
         }

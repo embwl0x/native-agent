@@ -4,11 +4,12 @@
 // owners can verify their outcomes.
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `SkillLifecycleView.swift` | Shared typed skill catalog, local filters/loading state, ID-resolved details with unavailable state |
 
 // MARK: - Snapshot model
 
 /// Decoded from the skills snapshot — one entry per skill in the manifest.
-struct SkillManifestEntry: Codable, Identifiable, Hashable {
+struct SkillManifestEntry: Codable, Identifiable, Hashable, Sendable {
     var id: String
     var name: String
     var description: String?
@@ -49,12 +50,6 @@ struct SkillManifestEntry: Codable, Identifiable, Hashable {
         try c.encodeIfPresent(state, forKey: .state)
         try c.encodeIfPresent(version, forKey: .version)
     }
-}
-
-/// Thin wrapper so the store can hold a [String: Any] response if the endpoint
-/// returns a dict-of-dicts rather than an array. We try array first.
-private struct SkillListResponse: Decodable {
-    var skills: [SkillManifestEntry]
 }
 
 // MARK: - Filter enum
@@ -174,7 +169,7 @@ enum SkillSourcePresentation {
 
 @MainActor
 final class SkillLifecycleStore: ObservableObject {
-    @Published var skills: [SkillManifestEntry] = []
+    var skills: [SkillManifestEntry] { iCloudSyncEngine.shared.skills }
     @Published var isLoading = false
     @Published var bannerError: String?
 
@@ -188,28 +183,17 @@ final class SkillLifecycleStore: ObservableObject {
 
         let engine = iCloudSyncEngine.shared
         if pollIncoming { await iCloudBridge.shared.pollIncomingNow() }
-        if let arr: [SkillManifestEntry] = await engine.loadSnapshotArrayAsync(named: "skills_snapshot.json") {
-            guard !Task.isCancelled else { return }
-            withAnimation(AppMotion.snappy) { skills = Self.mergedSkills(learned: arr, manifest: []) }
-            return
-        }
-        if let wrapped: SkillListResponse = await engine.loadSnapshotObjectAsync(named: "skills_snapshot.json") {
-            guard !Task.isCancelled else { return }
-            withAnimation(AppMotion.snappy) { skills = Self.mergedSkills(learned: wrapped.skills, manifest: []) }
-            return
-        }
-        if skills.isEmpty {
+        let refreshed = await engine.refreshCatalogSnapshot()
+        if !refreshed && skills.isEmpty {
             bannerError = "No skills synced yet — Mac is publishing."
         }
     }
 
-    /// A prior paired snapshot is no longer current once pairing is absent.
-    /// Clearing it prevents an old Mac catalog from looking live behind an
-    /// unpaired warning banner.
+    /// Pairing invalidation clears the shared catalog; this gate owns only
+    /// the screen's explanation while unpaired.
     @discardableResult
     func applyPairingGate(isPaired: Bool) -> Bool {
         guard isPaired else {
-            skills = []
             bannerError = "Pair iPhone with the Mac to see skills."
             return false
         }
@@ -217,29 +201,6 @@ final class SkillLifecycleStore: ObservableObject {
         return true
     }
 
-    private static func mergedSkills(learned: [SkillManifestEntry], manifest: [SkillManifestEntry]) -> [SkillManifestEntry] {
-        var seen: Set<String> = []
-        var merged: [SkillManifestEntry] = []
-
-        func append(_ skill: SkillManifestEntry) {
-            let key = (skill.id.isEmpty ? skill.name : skill.id).lowercased()
-            guard !seen.contains(key) else { return }
-            seen.insert(key)
-            // A missing or blank producer provenance is meaningful: retain it
-            // so the screen can say Unknown instead of inventing "learned".
-            merged.append(skill)
-        }
-
-        // Learned skills are the useful runtime catalog; manifest skills are
-        // connector/tool packs and should supplement, not hide, that list.
-        for skill in learned {
-            append(skill)
-        }
-        for skill in manifest {
-            append(skill)
-        }
-        return merged
-    }
 }
 
 // MARK: - Top-level view
@@ -252,7 +213,7 @@ struct SkillLifecycleView: View {
     private let sync = iCloudSyncEngine.shared
 
     @State private var filter: SkillFilter = .all
-    @State private var selectedSkill: SkillManifestEntry?
+    @State private var selectedSkillID: String?
 
     private var allSkills: [SkillManifestEntry] { MobileDesignSamples.rows(store.skills) }
 
@@ -291,7 +252,7 @@ struct SkillLifecycleView: View {
                     }
                     ForEach(Array(filtered.enumerated()), id: \.element.id) { index, skill in
                         if index > 0 { AliveDivider() }
-                        SkillRow(skill: skill) { selectedSkill = skill }
+                        SkillRow(skill: skill) { selectedSkillID = skill.id }
                     }
                 }
             }
@@ -304,11 +265,15 @@ struct SkillLifecycleView: View {
             await store.refresh(pairingStore: pairingStore,
                                 pollIncoming: sync.groupTransportDeliveryAt["catalog"] == nil)
             #if DEBUG
-            if ProcessInfo.processInfo.arguments.contains("-designDetail") { selectedSkill = allSkills.first }
+            if ProcessInfo.processInfo.arguments.contains("-designDetail") { selectedSkillID = allSkills.first?.id }
             #endif
         }
-        .sheet(item: $selectedSkill) { skill in
-            SkillLifecycleDetailSheet(skill: skill)
+        .sheet(isPresented: Binding(get: { selectedSkillID != nil }, set: { if !$0 { selectedSkillID = nil } })) {
+            if let skill = allSkills.first(where: { $0.id == selectedSkillID }) {
+                SkillLifecycleDetailSheet(skill: skill)
+            } else {
+                AliveCalmState(title: "Skill unavailable", line: "This skill is no longer in the published catalog.")
+            }
         }
     }
 

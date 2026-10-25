@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import Procedures
 
+// Blueprint: | `ApprovalInbox+ProcedureExactActivation.swift` | `SwiftNativeApprovalInbox` exact procedure activation cards and decisions, bound to the saved proposal and preview |
+
 public enum ProcedureExactActivationApprovalError: String, Error, Sendable, Equatable {
     case invalidProposal = "invalid_proposal"
     case approvalNotApproved = "approval_not_approved"

@@ -4,6 +4,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+// Blueprint: | `AgentACPClient.swift` | `AgentACPClient` actor; `startupTimeoutReceipt`, `turn` (recipe-driven; no message is a dry run), `learned`; `Mismatch`: nothing sent |
 
 private extension JSONValue {
     var objectValue: [String: JSONValue]? {

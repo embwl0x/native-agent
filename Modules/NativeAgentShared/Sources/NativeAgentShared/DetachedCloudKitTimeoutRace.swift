@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `DetachedCloudKitTimeoutRace.swift` | `DetachedCloudKitTimeoutOutcome` enum |
 
 public enum DetachedCloudKitTimeoutOutcome<T: Sendable>: Sendable {
     case success(T)

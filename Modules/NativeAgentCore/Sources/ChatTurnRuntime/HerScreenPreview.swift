@@ -1,6 +1,7 @@
 import AgentWorkspace
 import Foundation
 import NativeAgentShared
+// Blueprint: | `HerScreenPreview.swift` | shared screen/room text projection |
 
 /// Binds the conversation and tool owners for the app's read-only screen door.
 public enum HerScreenPreview {

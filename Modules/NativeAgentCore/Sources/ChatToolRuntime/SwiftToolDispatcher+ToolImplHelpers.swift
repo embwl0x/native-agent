@@ -1,17 +1,16 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SwiftToolDispatcher+ToolImplHelpers.swift` | `SwiftToolDispatcher`: `optionalNumber`, `jsonString`, `jsonInt` |
 
 // MARK: - Shared tool implementation helpers
 
 extension SwiftToolDispatcher {
-    /// Number coercion for confidence/importance (accepts double, int, or a
-    /// numeric string). Mirrors optionalInt's tolerant shape.
+    /// Read a JSON number for confidence/importance.
     static func optionalNumber(_ value: JSONValue?) -> Double? {
         switch value {
         case .some(.double(let d)): return d
         case .some(.int(let i)): return Double(i)
-        case .some(.string(let s)): return Double(s)
         default: return nil
         }
     }
@@ -23,9 +22,8 @@ extension SwiftToolDispatcher {
 
     static func jsonInt(_ value: JSONValue?) -> Int? {
         switch value {
-        case .some(.int(let i)): return Int(i)
-        case .some(.double(let d)): return Int(exactly: d.rounded(.towardZero))
-        case .some(.string(let s)): return Int(s)
+        case .some(.int(let i)): return Int(exactly: i)
+        case .some(.double(let d)): return Int(exactly: d)
         default: return nil
         }
     }

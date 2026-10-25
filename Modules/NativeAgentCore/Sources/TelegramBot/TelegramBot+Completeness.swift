@@ -1,6 +1,8 @@
 import Foundation
 import ProviderRouting
 
+// Blueprint: | `TelegramBot+Completeness.swift` | `TelegramCommandRegistry` and completeness dependencies: slash parsing, provider/memory/restart ports and compatible model selection |
+
 // MARK: - TelegramBot+Completeness
 //
 // Slash-command completeness wiring for SwiftNativeTelegramBot. Media and
@@ -189,7 +191,6 @@ public enum TelegramSlashCommandHandler: String, Sendable, Codable, Equatable {
 public struct TelegramSlashCommandDefinition: Sendable, Equatable {
     public let name: String
     public let aliases: [String]
-    public let summary: String
     public let args: String?
     public let handler: TelegramSlashCommandHandler
     public let showInMenu: Bool
@@ -197,14 +198,12 @@ public struct TelegramSlashCommandDefinition: Sendable, Equatable {
     public init(
         name: String,
         aliases: [String] = [],
-        summary: String,
         args: String? = nil,
         handler: TelegramSlashCommandHandler,
         showInMenu: Bool = true
     ) {
         self.name = name
         self.aliases = aliases
-        self.summary = summary
         self.args = args
         self.handler = handler
         self.showInMenu = showInMenu
@@ -217,9 +216,6 @@ public struct TelegramSlashCommandDefinition: Sendable, Equatable {
         return "/\(name)"
     }
 
-    public var botCommand: TelegramBotCommand {
-        TelegramBotCommand(command: name, description: summary)
-    }
 }
 
 public struct TelegramParsedSlashCommand: Sendable, Equatable {
@@ -248,38 +244,38 @@ public enum TelegramCommandRegistry {
     /// the way to reach those settings now is to say what you want
     /// ("use opus", "think harder"), which lands on the same writers.
     public static let definitions: [TelegramSlashCommandDefinition] = [
-        .init(name: "stop", aliases: ["cancel"], summary: "Stop the current task", handler: .stop),
+        .init(name: "stop", aliases: ["cancel"], handler: .stop),
         // `/reset` and `/clear` used to wipe the session file the Mac and
         // phone share; they now start a fresh conversation like `/new`.
-        .init(name: "new", aliases: ["start", "reset", "clear"], summary: "Start a fresh conversation", handler: .new),
-        .init(name: "retry", aliases: ["again"], summary: "Try your last message again", handler: .retry),
-        .init(name: "approve", aliases: ["approved", "allow"], summary: "Approve a pending request", args: "<id>", handler: .approve),
-        .init(name: "deny", aliases: ["denied", "reject", "rejected"], summary: "Deny a pending request", args: "<id>", handler: .deny),
-        .init(name: "help", aliases: ["h"], summary: "What you can type here", handler: .help),
+        .init(name: "new", aliases: ["start", "reset", "clear"], handler: .new),
+        .init(name: "retry", aliases: ["again"], handler: .retry),
+        .init(name: "approve", aliases: ["approved", "allow"], args: "<id>", handler: .approve),
+        .init(name: "deny", aliases: ["denied", "reject", "rejected"], args: "<id>", handler: .deny),
+        .init(name: "help", aliases: ["h"], handler: .help),
 
         // Retired spellings — dispatchable, never advertised.
-        .init(name: "status", aliases: ["stats"], summary: "Show the agent's current activity", handler: .status, showInMenu: false),
-        .init(name: "model", summary: "Show/select Telegram provider model", args: "[number|provider model]", handler: .model, showInMenu: false),
-        .init(name: "sessions", aliases: ["recent"], summary: "List recent chat sessions", handler: .sessions, showInMenu: false),
-        .init(name: "resume", aliases: ["switch"], summary: "Bind this chat to an existing session", args: "<id>", handler: .resume, showInMenu: false),
-        .init(name: "provider", summary: "Show current Telegram provider", handler: .provider, showInMenu: false),
-        .init(name: "brain", summary: "Show active model and provider", handler: .brain, showInMenu: false),
-        .init(name: "think", summary: "Set reasoning effort", args: "<low|medium|high|xhigh|max|ultra>", handler: .think, showInMenu: false),
-        .init(name: "fast", summary: "Toggle provider priority processing", args: "<on|off>", handler: .fast, showInMenu: false),
-        .init(name: "persona", summary: "Show or set Telegram persona", args: "[name]", handler: .persona, showInMenu: false),
-        .init(name: "remember", summary: "Save a durable memory", args: "<text>", handler: .remember, showInMenu: false),
-        .init(name: "note", summary: "Save a note", args: "<text>", handler: .note, showInMenu: false),
-        .init(name: "scratch", summary: "Write session scratchpad data", args: "<key> <value>", handler: .scratch, showInMenu: false),
-        .init(name: "tools", summary: "Show tool/progress controls", handler: .tools, showInMenu: false),
-        .init(name: "session", summary: "Show or change Telegram session state", args: "status|new|reset", handler: .session, showInMenu: false),
-        .init(name: "compact", summary: "Compact current session context", handler: .compact, showInMenu: false),
-        .init(name: "restart", summary: "Restart NativeAgent app (owner only)", args: "[reason]", handler: .restart, showInMenu: false),
+        .init(name: "status", aliases: ["stats"], handler: .status, showInMenu: false),
+        .init(name: "model", args: "[number|provider model]", handler: .model, showInMenu: false),
+        .init(name: "sessions", aliases: ["recent"], handler: .sessions, showInMenu: false),
+        .init(name: "resume", aliases: ["switch"], args: "<id>", handler: .resume, showInMenu: false),
+        .init(name: "provider", handler: .provider, showInMenu: false),
+        .init(name: "brain", handler: .brain, showInMenu: false),
+        .init(name: "think", args: "<low|medium|high|xhigh|max|ultra>", handler: .think, showInMenu: false),
+        .init(name: "fast", args: "<on|off>", handler: .fast, showInMenu: false),
+        .init(name: "persona", args: "[name]", handler: .persona, showInMenu: false),
+        .init(name: "remember", args: "<text>", handler: .remember, showInMenu: false),
+        .init(name: "note", args: "<text>", handler: .note, showInMenu: false),
+        .init(name: "scratch", args: "<key> <value>", handler: .scratch, showInMenu: false),
+        .init(name: "tools", handler: .tools, showInMenu: false),
+        .init(name: "session", args: "status|new|reset", handler: .session, showInMenu: false),
+        .init(name: "compact", handler: .compact, showInMenu: false),
+        .init(name: "restart", args: "[reason]", handler: .restart, showInMenu: false),
     ]
 
-    public static var commands: [TelegramBotCommand] {
+    public static var menuCommandNames: [String] {
         definitions
             .filter(\.showInMenu)
-            .map(\.botCommand)
+            .map(\.name)
     }
 
     public static func definition(for rawName: String) -> TelegramSlashCommandDefinition? {
@@ -309,18 +305,6 @@ public enum TelegramCommandRegistry {
         )
     }
 
-    /// /help lists the menu-visible set and nothing else, so it can never
-    /// drift from the command menu Telegram shows.
-    public static func helpText() -> String {
-        let lines = definitions
-            .filter(\.showInMenu)
-            .map { "\($0.usage) - \($0.summary)" }
-        return (lines + [
-            "",
-            "Anything else, just say it: \"use opus\", \"think harder\", \"go fast\", \"use the default persona\", \"what model\".",
-        ]).joined(separator: "\n")
-    }
-
     /// 2026-09-06: the `@bot` a slash command is addressed to, if any
     /// (`/stop@OtherBot` -> "OtherBot"). A group delivers every bot command to
     /// every bot in the room, so the poll loop compares this against its own
@@ -348,201 +332,6 @@ public enum TelegramCommandRegistry {
     }
 }
 
-private struct TelegramResolvedModelSelection: Sendable, Equatable {
-    let providerId: String?
-    let providerDisplayName: String?
-    let modelId: String
-    let modelName: String?
-    let isCurrent: Bool
-}
-
-private let telegramModelMenuMaxChoices = 30
-
-private func telegramDisplayModelSelections(
-    from menu: TelegramModelMenu
-) -> [TelegramResolvedModelSelection] {
-    var out: [TelegramResolvedModelSelection] = []
-    var seen: Set<String> = []
-    for provider in menu.providers {
-        for model in provider.models {
-            let key = "\(provider.id)\u{0}\(model.id)"
-            guard !seen.contains(key) else { continue }
-            if out.count < telegramModelMenuMaxChoices || model.isCurrent {
-                seen.insert(key)
-                out.append(TelegramResolvedModelSelection(
-                    providerId: provider.id,
-                    providerDisplayName: provider.displayName,
-                    modelId: model.id,
-                    modelName: model.name,
-                    isCurrent: model.isCurrent || (
-                        model.id == menu.currentModel
-                        && telegramProviderIdsMatch(provider.id, menu.currentProvider)
-                    )
-                ))
-            }
-        }
-    }
-    return out
-}
-
-private func telegramAllModelSelections(
-    from menu: TelegramModelMenu
-) -> [TelegramResolvedModelSelection] {
-    menu.providers.flatMap { provider in
-        provider.models.map { model in
-            TelegramResolvedModelSelection(
-                providerId: provider.id,
-                providerDisplayName: provider.displayName,
-                modelId: model.id,
-                modelName: model.name,
-                isCurrent: model.isCurrent || (
-                    model.id == menu.currentModel
-                    && telegramProviderIdsMatch(provider.id, menu.currentProvider)
-                )
-            )
-        }
-    }
-}
-
-private func telegramRenderModelMenu(_ menu: TelegramModelMenu) -> String {
-    let choices = telegramDisplayModelSelections(from: menu)
-    guard !choices.isEmpty else {
-        return "Surface: \(menu.surface)\nModel: \(menu.currentModel)\nProvider: \(menu.currentProvider)"
-    }
-
-    let currentProviderName = menu.providers.first {
-        telegramProviderIdsMatch($0.id, menu.currentProvider)
-    }?.displayName ?? menu.currentProvider
-    var lines = [
-        "Telegram model: \(telegramModelLabel(id: menu.currentModel, name: nil))",
-        "Provider: \(currentProviderName) (\(menu.currentProvider))",
-        "",
-        "Choose with /model <number>:",
-    ]
-
-    for (idx, choice) in choices.enumerated() {
-        let providerLabel = choice.providerDisplayName ?? choice.providerId ?? "Provider"
-        let current = choice.isCurrent ? " (current)" : ""
-        lines.append("\(idx + 1). \(providerLabel): \(telegramModelLabel(id: choice.modelId, name: choice.modelName))\(current)")
-    }
-
-    let total = telegramAllModelSelections(from: menu).count
-    if total > choices.count {
-        lines.append("+ \(total - choices.count) more; use /model <provider> <model-id>")
-    }
-    lines.append("")
-    lines.append("Direct: /model <provider> <model-id>")
-    return lines.joined(separator: "\n")
-}
-
-private func telegramResolveModelSelection(
-    args: [String],
-    menu: TelegramModelMenu?
-) -> TelegramResolvedModelSelection? {
-    guard let first = args.first?.trimmingCharacters(in: .whitespacesAndNewlines),
-          !first.isEmpty else {
-        return nil
-    }
-
-    if let menu {
-        if let index = Int(first) {
-            let choices = telegramDisplayModelSelections(from: menu)
-            if index >= 1, index <= choices.count {
-                return choices[index - 1]
-            }
-            return nil
-        }
-
-        if let provider = telegramProviderChoice(matching: first, in: menu) {
-            if args.count == 1 {
-                guard let model = provider.models.first else { return nil }
-                return TelegramResolvedModelSelection(
-                    providerId: provider.id,
-                    providerDisplayName: provider.displayName,
-                    modelId: model.id,
-                    modelName: model.name,
-                    isCurrent: model.isCurrent
-                )
-            }
-            let rawModel = args.dropFirst().joined(separator: " ")
-            if let model = telegramModelChoice(matching: rawModel, in: provider) {
-                return TelegramResolvedModelSelection(
-                    providerId: provider.id,
-                    providerDisplayName: provider.displayName,
-                    modelId: model.id,
-                    modelName: model.name,
-                    isCurrent: model.isCurrent
-                )
-            }
-            return TelegramResolvedModelSelection(
-                providerId: provider.id,
-                providerDisplayName: provider.displayName,
-                modelId: rawModel,
-                modelName: nil,
-                isCurrent: false
-            )
-        }
-
-        let raw = args.joined(separator: " ")
-        let matches = telegramAllModelSelections(from: menu).filter {
-            telegramTextMatches(raw, $0.modelId)
-                || telegramTextMatches(raw, $0.modelName ?? "")
-        }
-        if matches.count == 1 {
-            return matches[0]
-        }
-    }
-
-    return TelegramResolvedModelSelection(
-        providerId: nil,
-        providerDisplayName: nil,
-        modelId: first,
-        modelName: nil,
-        isCurrent: false
-    )
-}
-
-private func telegramProviderChoice(
-    matching raw: String,
-    in menu: TelegramModelMenu
-) -> TelegramModelProviderChoice? {
-    if let exact = menu.providers.first(where: {
-        telegramTextMatches(raw, $0.id) || telegramTextMatches(raw, $0.displayName)
-    }) {
-        return exact
-    }
-    let normalized = telegramNormalizeProviderId(raw)
-    let matches = menu.providers.filter { telegramNormalizeProviderId($0.id) == normalized }
-    if matches.count == 1 { return matches[0] }
-    return nil
-}
-
-private func telegramModelChoice(
-    matching raw: String,
-    in provider: TelegramModelProviderChoice
-) -> TelegramModelChoice? {
-    provider.models.first {
-        telegramTextMatches(raw, $0.id) || telegramTextMatches(raw, $0.name)
-    }
-}
-
-private func telegramModelLabel(id: String, name: String?) -> String {
-    let trimmedId = id.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let name else {
-        return id
-    }
-    let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmedName.isEmpty,
-          trimmedName != trimmedId else {
-        return id
-    }
-    return "\(trimmedName) [\(trimmedId)]"
-}
-
-private func telegramTextMatches(_ lhs: String, _ rhs: String) -> Bool {
-    lhs.trimmingCharacters(in: .whitespacesAndNewlines)
-        .caseInsensitiveCompare(rhs.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
-}
 
 private func telegramProviderIdsMatch(_ lhs: String, _ rhs: String) -> Bool {
     telegramNormalizeProviderId(lhs) == telegramNormalizeProviderId(rhs)
@@ -692,48 +481,46 @@ extension SwiftNativeTelegramBot {
         case "model":
             guard let routing = deps?.routing else { return nil }
             let menu = await routing.modelMenuForSurface(surface)
-            if let selection = telegramResolveModelSelection(args: args, menu: menu) {
-                do {
+            let decision: TelegramModelPickerDecision
+            do { decision = try await modelPicker("command", menu: menu, args: args) }
+            catch { return "Telegram model picker failed: \(error.localizedDescription)" }
+            do {
+                if let selection = decision.selection {
+                    try Task.checkCancellation()
                     try await routing.saveModelSelection(
                         surface: surface,
                         provider: selection.providerId,
                         model: selection.modelId
                     )
-                    let providerSuffix = selection.providerId.map { " @ \($0)" } ?? ""
-                    return "Chat model set to \(selection.modelId)\(providerSuffix). Providers → Chat now uses this model for Mac, iPhone, Telegram, and Slack."
-                } catch {
-                    return "Failed to set Telegram model: \(error.localizedDescription)"
                 }
+                return decision.reply
+            } catch {
+                return "Failed to set Telegram model: \(error.localizedDescription)"
             }
-            if !args.isEmpty {
-                return "Unknown model selection. Send /model to see available choices."
-            }
-            if let menu {
-                return telegramRenderModelMenu(menu)
-            }
-            guard let info = await routing.modelForSurface(surface) else { return nil }
-            return "Surface: \(surface)\nModel: \(info.model)\nProvider: \(info.provider)"
 
         case "think":
             guard let routing = deps?.routing else {
-                return "Model routing is unavailable; reasoning was not changed."
+                return "think_routing_unavailable: Think was not changed. Open Providers → Chat to check model routing."
             }
             guard let capabilities = await telegramModelCapabilities(
                 routing: routing,
                 surface: surface
             ) else {
-                return "/think is unsupported for the selected model."
+                return "think_capabilities_unavailable: The selected model's Think controls are unknown. Open Providers → Chat to check the selected model."
             }
             let valid = Set(capabilities.reasoningEfforts)
+            if valid.isEmpty {
+                return "think_unsupported: The selected model has no Think control. Send /model to choose a model with Think."
+            }
             guard let arg = args.first, valid.contains(arg.lowercased()) else {
-                return "/think is unsupported for this model; choose one of \(valid.sorted().joined(separator: "|"))"
+                return "think_invalid: Choose a supported Think level. Send /think <\(valid.sorted().joined(separator: "|"))>."
             }
             let effort = arg.lowercased()
             do {
                 try await routing.saveModelConfig(surface: surface, key: "reasoning_effort", value: effort)
-                return "Reasoning effort set to \(effort)"
+                return "Think set to \(effort)"
             } catch {
-                return "Failed to set reasoning effort: \(error.localizedDescription)"
+                return "think_save_failed: \(error.localizedDescription). Open Providers → Chat to check the saved Think level."
             }
 
         case "fast":
@@ -761,7 +548,8 @@ extension SwiftNativeTelegramBot {
             return "Brain: \(info.model)@\(info.provider)"
 
         case "help":
-            return TelegramCommandRegistry.helpText()
+            do { return try await commandProjection().help }
+            catch { return "Telegram commands part unavailable: \(error.localizedDescription)" }
 
         default:
             return nil

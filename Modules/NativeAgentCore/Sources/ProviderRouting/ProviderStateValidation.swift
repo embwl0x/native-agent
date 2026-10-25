@@ -3,6 +3,7 @@ import Darwin
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `ProviderStateValidation.swift` | `ProviderStateValidation` enum; `dataIfPresent`, `credential` |
 
 /// Checked inputs for provider credential mutations. Listing and routing retain
 /// their own read contracts; unrelated registry rows are never a mutation gate.

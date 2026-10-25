@@ -6,6 +6,8 @@
 // which does NOT conflict with this String overload.
 import SwiftUI
 
+// Blueprint: | `ColorHex.swift` | `Color.init(hex:)`: shared six/eight-digit String color decoding for Mac and iPhone |
+
 public extension Color {
     /// Initialize from a 6- or 8-digit hex string, e.g. "FF3300" or "FFFF3300".
     /// Returns nil for invalid input.

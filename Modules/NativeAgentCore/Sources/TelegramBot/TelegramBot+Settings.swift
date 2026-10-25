@@ -1,5 +1,5 @@
 import Foundation
-import CoreFoundation
+// Blueprint: | `TelegramBot+Settings.swift` | Mobile operation prerequisites delegate saved field validation to `TelegramConfig.validateSavedConfiguration` |
 
 /// A Telegram settings mutation was rejected before it could make the saved
 /// inbound authorization narrower, wider, or unreadable by accident. Keeping
@@ -15,15 +15,15 @@ public enum TelegramConfigurationError: Error, Equatable, LocalizedError, Sendab
     public var errorDescription: String? {
         switch self {
         case .invalidAllowedChatID(let value):
-            return "Telegram allowed chat ID is not numeric: \(value)"
+            return "telegram_chat_id_invalid: Allowed chat ID '\(value)' is not numeric. Use Check sender in Telegram setup and enter that chat ID."
         case .invalidAllowedUserID(let value):
-            return "Telegram allowed user ID is not numeric: \(value)"
+            return "telegram_user_id_invalid: Allowed user ID '\(value)' is not numeric. Use Check sender in Telegram setup and enter that user ID."
         case .existingConfigurationUnreadable:
-            return "saved Telegram settings are unreadable; refusing to overwrite them"
+            return "telegram_settings_unreadable: Saved settings cannot be read and were not overwritten. Repair telegram/config.json before saving in Telegram setup."
         case .persistenceFailed(let detail):
-            return "Telegram settings could not be saved: \(detail)"
+            return "telegram_settings_save_failed: \(detail). Inspect telegram/config.json and its directory access before saving in Telegram setup."
         case .destinationRequired:
-            return "Add an allowed chat or user ID before turning Telegram on. Send your bot a message, then use Check sender in Telegram setup to find your ID."
+            return "telegram_destination_required: No allowed chat or user ID is set. Message your bot, then use Check sender in Telegram setup and add that ID."
         }
     }
 }
@@ -31,8 +31,6 @@ public enum TelegramConfigurationError: Error, Equatable, LocalizedError, Sendab
 public struct TelegramNumericIDParseResult: Equatable {
     public let canonicalIDs: [String]
     public let invalidTokens: [String]
-
-    public var isConfigured: Bool { !canonicalIDs.isEmpty }
 }
 
 public func parseTelegramNumericIDs(_ value: String) -> TelegramNumericIDParseResult {
@@ -70,66 +68,6 @@ extension TelegramConfig {
         try TelegramConfig.validateSavedConfiguration(dataRoot: root)
         guard TelegramConfig.loadFromDisk(dataRoot: root, includeDisconnected: true) != nil else {
             throw TelegramConfigurationError.existingConfigurationUnreadable
-        }
-        guard let data = try? Data(contentsOf: url),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              let fields = object as? [String: Any]
-        else {
-            throw TelegramConfigurationError.existingConfigurationUnreadable
-        }
-        for key in ["enabled", "require_mention", "voice_transcription_enabled", "voice_enabled"] {
-            // Missing fields retain legacy defaults; present authority must
-            // be a JSON boolean, never a coerced number or decoder fallback.
-            guard let raw = fields[key] else { continue }
-            guard let value = raw as? NSNumber,
-                  CFGetTypeID(value) == CFBooleanGetTypeID() else {
-                throw TelegramConfigurationError.existingConfigurationUnreadable
-            }
-        }
-        // Validate every spelling the codec consumes, even when a canonical
-        // spelling shadows it. A fallback must never erase damaged settings.
-        for key in ["bot_token", "token", "model", "reasoning_effort", "reasoningEffort",
-                    "voice_transcription_backend", "voice_backend", "voice_transcription_model", "voice_model"] {
-            if let value = fields[key], !(value is String) {
-                throw TelegramConfigurationError.existingConfigurationUnreadable
-            }
-        }
-        for key in ["voice_max_bytes", "voice_max_mb"] {
-            guard let value = fields[key] else { continue }
-            if key == "voice_max_bytes" {
-                if let number = value as? NSNumber,
-                   CFGetTypeID(number) != CFBooleanGetTypeID(),
-                   number.int64Value > 0,
-                   number.compare(NSNumber(value: number.int64Value)) == .orderedSame { continue }
-                if let string = value as? String, let bytes = Int(string), bytes > 0 { continue }
-            } else {
-                let megabytes: Double?
-                if let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
-                    megabytes = number.doubleValue
-                } else if let string = value as? String {
-                    megabytes = Double(string)
-                } else { megabytes = nil }
-                if let megabytes, megabytes.isFinite,
-                   let bytes = Int(exactly: (megabytes * 1024 * 1024).rounded(.towardZero)), bytes > 0 { continue }
-            }
-            throw TelegramConfigurationError.existingConfigurationUnreadable
-        }
-        for key in ["allowed_chat_ids", "allowed_user_ids"] {
-            // Missing lists are valid legacy deny-all defaults; present lists
-            // must decode completely before any setting can be rewritten.
-            guard let raw = fields[key] else { continue }
-            guard let values = raw as? [Any] else {
-                throw TelegramConfigurationError.existingConfigurationUnreadable
-            }
-            for value in values {
-                if let number = value as? NSNumber,
-                   CFGetTypeID(number) != CFBooleanGetTypeID(),
-                   number.compare(NSNumber(value: number.int64Value)) == .orderedSame {
-                    continue
-                }
-                if let string = value as? String, Int64(string) != nil { continue }
-                throw TelegramConfigurationError.existingConfigurationUnreadable
-            }
         }
     }
 

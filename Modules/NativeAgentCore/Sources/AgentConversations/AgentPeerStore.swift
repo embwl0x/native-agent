@@ -4,6 +4,11 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `AgentPeerStore.swift` | Canonical contact decoding, identity projections and proof; authenticated inbound proof connects hosts without a command line too. `isReady` checks route/key proof, unavailable mark and ACP startability, while `AgentContactHealth` owns version/digest freshness. `list` prepares/chmods its directory before reading; summaries retain every contact with reachability and owner trust separately |
+
+// AgentPeerStore owns agents/peers.json's checked contact array. Local backup
+// and export exclude contacts; phone sync projects helpers, never this file or
+// credentials. PrivacyMap lists Agent Contacts.
 
 public enum AgentPeerTransport: String, Codable, Sendable {
     case a2a
@@ -87,6 +92,11 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     /// A2A card URL, NativeAgent bridge base URL, or desktop app://bundle ID.
     public var endpoint: URL
     public var transport: AgentPeerTransport
+    /// HOW she reaches it when that is one of her abilities (its id), instead
+    /// of the built-in route `transport` names, which stays saved for moving
+    /// back. Its thread, identity, trust and proof stay the contact's.
+    /// `AgentPeerStore.route` is its only writer.
+    public var ability: String?
     /// Reference only. Credential values must never enter this document.
     public var credentialKey: String?
     /// Exact resolved executable disclosed and approved when connecting this named host.
@@ -102,6 +112,9 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     /// Nonsecret setup state. The routine URL and key live only in Keychain.
     public var grokSetup: String?
     public var grokConversation: String?
+    /// nil: submission has not begun; false: its outcome is unconfirmed;
+    /// true: the request or routine was confirmed. Connect resumes without
+    /// resending a request whose submission may already have happened.
     public var grokBootstrapConfirmed: Bool?
     /// THE PERSON'S OWN GRANT, and the only thing that can raise an inbound
     /// peer turn off the restricted `agent-bridge` surface. Absent means no —
@@ -141,6 +154,7 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     var connectionProbe: AgentConnectionProbe?
     public var unavailableAt: String?
 
+    /// Route/key proof, no unavailable mark and ACP startability; AgentContactHealth owns version/digest freshness.
     public var isReady: Bool {
         if transport == .acp && !canStartTurn { return false }
         guard let proof = roundTripProof ?? mcpReturnProof else { return false }
@@ -165,12 +179,10 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
 
     /// HONEST STATES, in the words the agent can act on without knowing what a
     /// transport is. A handshake, an entry, a saved endpoint: all of them are
-    /// `setUp`. Only a reply that actually arrived makes a contact `connected`.
+    /// `setUp`. A real inbound message or round trip makes a contact `connected`.
     public var state: AgentPeerContactState {
-        if transport == .mcpHost && !canStartTurn,
-           AgentPeerStore.hostRowID(endpoint).flatMap({ AgentHostDirectory.row(named: $0)?.format }) != .shellEnvironment { return .setUp }
-        // Inbound credentials prove a contact's return path. Local command
-        // and ACP routes still need their own completed round-trip proof.
+        // Inbound credentials prove a contact's return path. ACP routes
+        // still need their own completed round-trip proof.
         let inboundContact = transport != .acp && transport != .desktop
             && credentialKey == Self.credentialKey(for: id) && provenInboundAt != nil
         if unavailableAt == nil && (isReady || inboundContact) { return .connected }
@@ -235,20 +247,55 @@ public enum AgentPeerStoreError: String, Error, LocalizedError, Sendable {
     case tooManyContacts, configurationTooLarge, unreadableConfiguration
     public var errorDescription: String? {
         switch self {
-        case .invalidContact: return "Peer identity or name is invalid."
-        case .invalidEndpoint: return "Network peer endpoint must be HTTPS or explicit loopback HTTP without credentials, query, or fragment; desktop requires an exact app bundle identifier."
-        case .invalidCredentialReference: return "Peer credential reference must belong to this peer's dedicated namespace."
-        case .invalidConfiguration: return "Peer configuration is invalid; existing bytes have been preserved."
-        case .tooManyContacts: return "Peer contact limit reached."
-        case .configurationTooLarge: return "Peer configuration exceeds its bounded size."
-        case .unreadableConfiguration: return "Peer configuration cannot be read safely; existing bytes have been preserved."
+        case .invalidContact: return "Contact identity, name or conversation settings are invalid."
+        case .invalidEndpoint: return "Endpoint does not match this contact's transport. Network routes require HTTPS or explicit loopback HTTP without credentials, query or fragment; desktop routes require an exact app bundle identifier; recipe routes require a valid host identity and any configured starting folder."
+        case .invalidCredentialReference: return "Credential reference must belong to this contact's dedicated namespace."
+        case .invalidConfiguration: return "Saved contacts are invalid; existing bytes were preserved."
+        case .tooManyContacts: return "Contact limit reached (128)."
+        case .configurationTooLarge: return "Saved contacts exceed 1048576 bytes."
+        case .unreadableConfiguration: return "Saved contacts cannot be read safely; existing bytes were preserved."
         }
+    }
+
+    func failure(file: URL? = nil) -> ToolFailureError {
+        let read = ToolFailureError.call("app", ["action": .string("agent.contacts")])
+        var instruction: String
+        switch self {
+        case .tooManyContacts:
+            instruction = "Read contacts, then disconnect an unused contact with agent.connect using its name and disconnect:true."
+        case .invalidConfiguration, .configurationTooLarge, .unreadableConfiguration:
+            instruction = "Ask the person to repair the contact array and file access while preserving every saved contact and the original bytes."
+        case .invalidContact:
+            instruction = "Read contacts and correct the invalid ID, name, route or conversation label; preserve the saved identity."
+        case .invalidEndpoint:
+            instruction = "Use the endpoint shape required by this contact's transport; read contacts for its saved route."
+        case .invalidCredentialReference:
+            instruction = "Read contacts, then reconnect the affected contact with its own dedicated credential."
+        }
+        let damaged = [.invalidConfiguration, .configurationTooLarge, .unreadableConfiguration].contains(self)
+        if damaged, let file {
+            instruction = ToolFailureError.fileRepairInstruction(file,
+                shape: "The file must be a JSON array of at most 128 valid AgentPeerContact records, at most 1048576 bytes; preserve IDs and credential references.")
+        }
+        let code = switch self {
+        case .invalidContact: "agent_contact_invalid"
+        case .invalidEndpoint: "agent_endpoint_invalid"
+        case .invalidCredentialReference: "agent_credential_reference_invalid"
+        case .invalidConfiguration: "agent_configuration_invalid"
+        case .tooManyContacts: "agent_contact_limit"
+        case .configurationTooLarge: "agent_configuration_too_large"
+        case .unreadableConfiguration: "agent_configuration_unreadable"
+        }
+        return ToolFailureError(errorDescription!, effects: file == nil ? .none : .unknown, owner: file?.path ?? "Agent contacts",
+            nextCall: damaged ? nil : read, code: code, instruction: instruction, recovery: damaged ? .repair : .inspect)
     }
 }
 
 /// The sole configured external-peer address book: agents/peers.json is a JSON
 /// array. Unknown fields and invalid rows fail closed rather than being erased
 /// by a subsequent mutation. All mutations share the canonical sidecar lock.
+/// peers.json: excluded from local backup/export; off-disk includes it;
+/// phone sync carries contact projections. PrivacyMap lists peers.json.
 public struct AgentPeerStore: Sendable {
     public static let maximumContacts = 128
     public static let maximumNameLength = 120
@@ -260,6 +307,7 @@ public struct AgentPeerStore: Sendable {
         fileURL = dataRoot.appendingPathComponent("agents/peers.json")
     }
 
+    /// Prepares the directory and enforces 0700 permissions before the locked read.
     public func list() throws -> [AgentPeerContact] {
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) { try read() }
@@ -316,9 +364,10 @@ public struct AgentPeerStore: Sendable {
                 // workspace or endpoint requires a new contact and key.
                 if peers[index].credentialKey != nil,
                    (!Self.sameRoute(peers[index], contact) || peers[index].credentialKey != contact.credentialKey) {
-                    throw AgentPeerStoreError.invalidContact
+                    throw AgentPeerStoreError.invalidContact.failure(file: fileURL)
                 }
                 merged.allowElevation = peers[index].allowElevation
+                merged.ability = peers[index].ability
                 merged.provenInboundAt = resetProof ? nil : peers[index].provenInboundAt
                 merged.provenOutboundAt = resetProof ? nil : peers[index].provenOutboundAt
                 merged.roundTripProof = resetProof ? nil : peers[index].roundTripProof
@@ -328,13 +377,14 @@ public struct AgentPeerStore: Sendable {
                 peers[index] = merged
             } else {
                 merged.allowElevation = nil
+                merged.ability = nil
                 merged.provenInboundAt = nil
                 merged.provenOutboundAt = nil
                 merged.roundTripProof = nil
                 merged.mcpReturnProof = nil
                 merged.connectionProbe = nil
                 merged.unavailableAt = nil
-                guard peers.count < Self.maximumContacts else { throw AgentPeerStoreError.tooManyContacts }
+                guard peers.count < Self.maximumContacts else { throw AgentPeerStoreError.tooManyContacts.failure(file: fileURL) }
                 peers.append(merged)
             }
             try write(peers)
@@ -350,7 +400,7 @@ public struct AgentPeerStore: Sendable {
         return try CredentialFileLock.withLock(fileURL) {
             var peers = try read()
             guard let index = peers.firstIndex(where: { $0.id == id && $0.transport == .grokBot }),
-                  allowDisconnected || peers[index].grokSetup != "disconnected" else { throw AgentPeerStoreError.invalidContact }
+                  allowDisconnected || peers[index].grokSetup != "disconnected" else { throw AgentPeerStoreError.invalidContact.failure(file: fileURL) }
             try edit(&peers[index])
             try Self.validate(peers[index])
             try write(peers)
@@ -367,6 +417,19 @@ public struct AgentPeerStore: Sendable {
             guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return nil }
             if allowed, let failure = peers[index].elevationUnavailable(peers: peers) { throw failure }
             peers[index].allowElevation = allowed ? true : nil
+            try write(peers)
+            return peers[index]
+        }
+    }
+
+    /// THE ONLY WRITER of a contact's route: one of her abilities, or nil for
+    /// its built-in route. Nil when the contact is gone.
+    public func route(peerID: String, ability: String?) throws -> AgentPeerContact? {
+        try prepareDirectory()
+        return try CredentialFileLock.withLock(fileURL) {
+            var peers = try read()
+            guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return nil }
+            peers[index].ability = ability
             try write(peers)
             return peers[index]
         }
@@ -422,7 +485,7 @@ public struct AgentPeerStore: Sendable {
         return try CredentialFileLock.withLock(fileURL) {
             var peers = try read()
             guard let index = peers.firstIndex(where: { $0.id == peerID && $0.transport == .mcpHost }) else {
-                throw AgentPeerStoreError.invalidContact
+                throw AgentPeerStoreError.invalidContact.failure(file: fileURL)
             }
             let nonce = AgentHostDirectory.probeToken + ":" + UUID().uuidString.lowercased()
             peers[index].connectionProbe = AgentConnectionProbe(nonce: nonce, endpoint: peers[index].endpoint,
@@ -512,10 +575,10 @@ public struct AgentPeerStore: Sendable {
         return try CredentialFileLock.withLock(fileURL) {
             var peers = try read()
             let matches = peers.filter { Self.sameRoute($0, contact) }
-            guard matches.count <= 1 else { throw AgentPeerStoreError.invalidConfiguration }
+            guard matches.count <= 1 else { throw AgentPeerStoreError.invalidConfiguration.failure(file: fileURL) }
             if let existing = matches.first { return existing }
-            guard !peers.contains(where: { $0.id == contact.id }) else { throw AgentPeerStoreError.invalidContact }
-            guard peers.count < Self.maximumContacts else { throw AgentPeerStoreError.tooManyContacts }
+            guard !peers.contains(where: { $0.id == contact.id }) else { throw AgentPeerStoreError.invalidContact.failure(file: fileURL) }
+            guard peers.count < Self.maximumContacts else { throw AgentPeerStoreError.tooManyContacts.failure(file: fileURL) }
             // A discovered peer is never elevated. See `setElevation`.
             var fresh = contact
             fresh.allowElevation = nil
@@ -563,7 +626,7 @@ public struct AgentPeerStore: Sendable {
     }
 
     @discardableResult public func remove(_ id: String) throws -> Bool {
-        guard Self.validID(id) else { throw AgentPeerStoreError.invalidContact }
+        guard Self.validID(id) else { throw AgentPeerStoreError.invalidContact.failure(file: fileURL) }
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) {
             var peers = try read()
@@ -584,15 +647,15 @@ public struct AgentPeerStore: Sendable {
               contact.name.utf8.count <= maximumNameLength * 4,
               contact.name == contact.name.trimmingCharacters(in: .whitespacesAndNewlines),
               !contact.name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
-        else { throw AgentPeerStoreError.invalidContact }
+        else { throw AgentPeerStoreError.invalidContact.failure() }
         if contact.transport == .desktop || contact.transport == .desktopChat {
-            guard desktopBundleID(contact.endpoint) != nil else { throw AgentPeerStoreError.invalidEndpoint }
-            guard contact.credentialKey == nil else { throw AgentPeerStoreError.invalidCredentialReference }
+            guard desktopBundleID(contact.endpoint) != nil else { throw AgentPeerStoreError.invalidEndpoint.failure() }
+            guard contact.credentialKey == nil else { throw AgentPeerStoreError.invalidCredentialReference.failure() }
             if let label = contact.conversationLabel {
                 guard !label.isEmpty, label.utf8.count <= 480,
                       label == label.trimmingCharacters(in: .whitespacesAndNewlines),
                       !label.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
-                    throw AgentPeerStoreError.invalidContact
+                    throw AgentPeerStoreError.invalidContact.failure()
                 }
             }
             return
@@ -601,18 +664,18 @@ public struct AgentPeerStore: Sendable {
             guard contact.endpoint.absoluteString == "grok://grok-bot",
                   contact.credentialKey == AgentPeerContact.credentialKey(for: contact.id),
                   ["creating", "secure-paste", "set up", "disconnected"].contains(contact.grokSetup ?? "") else {
-                throw AgentPeerStoreError.invalidContact
+                throw AgentPeerStoreError.invalidContact.failure()
             }
             if let label = contact.conversationLabel {
                 guard !label.isEmpty, label.utf8.count <= 480,
                       label == label.trimmingCharacters(in: .whitespacesAndNewlines),
                       !label.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
-                    throw AgentPeerStoreError.invalidContact
+                    throw AgentPeerStoreError.invalidContact.failure()
                 }
             }
             return
         }
-        guard contact.conversationLabel == nil else { throw AgentPeerStoreError.invalidContact }
+        guard contact.conversationLabel == nil else { throw AgentPeerStoreError.invalidContact.failure() }
         if contact.transport == .mcpHost || contact.transport == .acp {
             // An identity, not an address: nothing here is ever dialled, and
             // the key this contact owns is the only thing that resolves an
@@ -622,17 +685,17 @@ public struct AgentPeerStore: Sendable {
                   contact.endpoint.absoluteString == scheme + "://" + host,
                   contact.endpoint.absoluteString.utf8.count <= maximumEndpointLength,
                   host.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 45 })
-            else { throw AgentPeerStoreError.invalidEndpoint }
+            else { throw AgentPeerStoreError.invalidEndpoint.failure() }
             let row = hostRowID(contact.endpoint).flatMap { id in AgentHostDirectory.rows.first { $0.id == id } }
             // Saved retired identities remain checked and removable; upsert rejects them.
             guard row != nil || allowRetiredHost,
-                  contact.transport != .acp || row == nil || row?.acp != nil else { throw AgentPeerStoreError.invalidEndpoint }
+                  contact.transport != .acp || row == nil || row?.acp != nil else { throw AgentPeerStoreError.invalidEndpoint.failure() }
             if row?.requiresWorkspace == true || (row == nil && contact.hostWorkspace != nil) {
                 guard let folder = contact.hostWorkspace, folder.hasPrefix("/"),
-                      !folder.contains("\0"), folder.utf8.count <= 4096 else { throw AgentPeerStoreError.invalidEndpoint }
-            } else if contact.hostWorkspace != nil { throw AgentPeerStoreError.invalidEndpoint }
+                      !folder.contains("\0"), folder.utf8.count <= 4096 else { throw AgentPeerStoreError.invalidEndpoint.failure() }
+            } else if contact.hostWorkspace != nil { throw AgentPeerStoreError.invalidEndpoint.failure() }
             if let key = contact.credentialKey, key != AgentPeerContact.credentialKey(for: contact.id) {
-                throw AgentPeerStoreError.invalidCredentialReference
+                throw AgentPeerStoreError.invalidCredentialReference.failure()
             }
             return
         }
@@ -643,9 +706,9 @@ public struct AgentPeerStore: Sendable {
               parts.port.map({ (1...65535).contains($0) }) ?? true,
               parts.scheme?.lowercased() == "https" ||
                 (parts.scheme?.lowercased() == "http" && ["localhost", "127.0.0.1", "[::1]", "::1"].contains(host))
-        else { throw AgentPeerStoreError.invalidEndpoint }
+        else { throw AgentPeerStoreError.invalidEndpoint.failure() }
         if let key = contact.credentialKey, key != AgentPeerContact.credentialKey(for: contact.id) {
-            throw AgentPeerStoreError.invalidCredentialReference
+            throw AgentPeerStoreError.invalidCredentialReference.failure()
         }
     }
 
@@ -657,57 +720,67 @@ public struct AgentPeerStore: Sendable {
         let directory = fileURL.deletingLastPathComponent()
         var info = stat()
         if lstat(directory.path, &info) == 0 {
-            guard info.st_mode & S_IFMT == S_IFDIR else { throw AgentPeerStoreError.unreadableConfiguration }
+            guard info.st_mode & S_IFMT == S_IFDIR else { throw AgentPeerStoreError.unreadableConfiguration.failure(file: fileURL) }
         } else {
-            guard errno == ENOENT else { throw AgentPeerStoreError.unreadableConfiguration }
+            guard errno == ENOENT else { throw AgentPeerStoreError.unreadableConfiguration.failure(file: fileURL) }
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                     attributes: [.posixPermissions: 0o700])
         }
-        guard chmod(directory.path, 0o700) == 0 else { throw AgentPeerStoreError.unreadableConfiguration }
+        guard chmod(directory.path, 0o700) == 0 else { throw AgentPeerStoreError.unreadableConfiguration.failure(file: fileURL) }
     }
 
-    private func read() throws -> [AgentPeerContact] {
+    fileprivate func read() throws -> [AgentPeerContact] {
         let fd = Darwin.open(fileURL.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW)
         if fd < 0 {
             if errno == ENOENT { return [] }
-            throw AgentPeerStoreError.unreadableConfiguration
+            throw AgentPeerStoreError.unreadableConfiguration.failure(file: fileURL)
         }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? handle.close() }
         var info = stat()
         guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
-            throw AgentPeerStoreError.unreadableConfiguration
+            throw AgentPeerStoreError.unreadableConfiguration.failure(file: fileURL)
         }
-        guard info.st_size <= Self.maximumConfigurationBytes else { throw AgentPeerStoreError.configurationTooLarge }
+        guard info.st_size <= Self.maximumConfigurationBytes else { throw AgentPeerStoreError.configurationTooLarge.failure(file: fileURL) }
         var data = Data()
         while let chunk = try handle.read(upToCount: min(65536, Self.maximumConfigurationBytes + 1 - data.count)), !chunk.isEmpty {
             data.append(chunk)
-            guard data.count <= Self.maximumConfigurationBytes else { throw AgentPeerStoreError.configurationTooLarge }
+            guard data.count <= Self.maximumConfigurationBytes else { throw AgentPeerStoreError.configurationTooLarge.failure(file: fileURL) }
         }
         do {
-            let allowed = Set(["id", "name", "who", "handles", "endpoint", "transport", "credentialKey", "conversationLabel",
+            let allowed = Set(["id", "name", "who", "handles", "endpoint", "transport", "ability", "credentialKey", "conversationLabel",
                                "approvedExecutablePath", "acpWorkingDirectory", "acpExecutable",
                                 "hostWorkspace", "grokSetup", "grokConversation", "grokBootstrapConfirmed",
                                 "allowElevation", "provenInboundAt", "provenOutboundAt",
                                 "roundTripProof", "mcpReturnProof", "connectionProbe", "unavailableAt"])
             guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                   rows.allSatisfy({ Set($0.keys).isSubset(of: allowed) }) else {
-                throw AgentPeerStoreError.invalidConfiguration
+                throw AgentPeerStoreError.invalidConfiguration.failure(file: fileURL)
             }
             let peers = try JSONDecoder().decode([AgentPeerContact].self, from: data)
             guard peers.count <= Self.maximumContacts, Set(peers.map(\.id)).count == peers.count else {
-                throw AgentPeerStoreError.invalidConfiguration
+                throw AgentPeerStoreError.invalidConfiguration.failure(file: fileURL)
             }
             for peer in peers { try Self.validate(peer, allowRetiredHost: true) }
             return peers
-        } catch { throw AgentPeerStoreError.invalidConfiguration }
+        } catch { throw AgentPeerStoreError.invalidConfiguration.failure(file: fileURL) }
     }
 
     private func write(_ peers: [AgentPeerContact]) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(peers)
-        guard data.count <= Self.maximumConfigurationBytes else { throw AgentPeerStoreError.configurationTooLarge }
+        guard data.count <= Self.maximumConfigurationBytes else { throw AgentPeerStoreError.configurationTooLarge.failure(file: fileURL) }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
+    }
+}
+
+extension AgentContactIdentity {
+    public init(dataRoot: URL) {
+        let contacts = (try? AgentPeerStore(dataRoot: dataRoot).read()) ?? []
+        self.init(peers: contacts.map { peer in
+            ["id": peer.id, "name": peer.name, "who": peer.who, "endpoint": peer.endpoint.absoluteString,
+             "transport": peer.transport.rawValue].compactMapValues { $0 }
+        }, handles: Dictionary(uniqueKeysWithValues: contacts.map { ($0.id, $0.handles ?? []) }))
     }
 }

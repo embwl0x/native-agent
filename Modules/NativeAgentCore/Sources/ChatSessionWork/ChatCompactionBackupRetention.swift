@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
+// Blueprint: | `ChatCompactionBackupRetention.swift` | `ChatCompactionBackupRetention` enum; `enforce` |
 
 /// Result of one bounded sweep over pre-compaction transcript backups.
 public struct ChatCompactionBackupRetentionReport: Sendable, Equatable {

@@ -16,6 +16,8 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+// Blueprint: | `WorkshopHubView.swift` | `DeskRootRoutePresentation` and `NewWorkshopTaskSheet`: root-navigation token and explicit task submission with retained draft/error state |
+
 /// A route to the Desk is a route to its root, not merely to whatever Desk
 /// fold happened to be left open. ContentView advances this token for every
 /// Desk selection; DeskPageView consumes it by closing its folds.

@@ -2,7 +2,7 @@
 {
   "id": "notice",
   "kind": "tool",
-  "version": 1,
+  "version": 3,
   "reach": {"capabilities": ["app_data_read", "app_data_write"], "readPaths": [], "hosts": [], "apps": []},
   "wake": ["app.installed"],
   "face": {"page": "agents"},
@@ -14,7 +14,9 @@
   }
 }
 */
-function run(input) {
+function run(given) {
+    // Woken, what arrived is the wake's record; called, it is the call's own input.
+    const input = given.wake || given;
     if (input.signal !== "app.installed" && input.verb !== "dismiss")
         return {status: "ok", effects: "none"};
     if (input.verb !== "dismiss" && input.scriptable !== true) {
@@ -42,7 +44,7 @@ function run(input) {
             return {status: "ok", effects: "none"};
         }
         if (typeof input.name !== "string" || !input.name) throw new Error("A display name is required.");
-        app.home.arrive({line: (input.name + " " + input.version).replace(/[\r\n\u2028\u2029]/g, " ") + " arrived. Want me to grow into it?"});
+        app.home.arrive({event_key: key, line: (input.name + " " + input.version).replace(/[\r\n\u2028\u2029]/g, " ") + " arrived. Want me to grow into it?"});
         state[key] = "offered";
     }
     host.files.write({root: "app_data", path, content: JSON.stringify(state)});

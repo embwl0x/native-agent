@@ -11,6 +11,12 @@ struct SharedChatItem: Codable, Identifiable, Sendable {
 enum SharedChatInbox {
     static let maxItems = 4
     static let maxTextBytes = 64 * 1024
+    static let identityNameKey = "nativeagent.lastAgentName"
+    static let identityPairingKey = "nativeagent.lastAgentName.pairing"
+    static var identityDefaults: UserDefaults? {
+        guard let group = Bundle.main.object(forInfoDictionaryKey: "NativeAgentAppGroupID") as? String else { return nil }
+        return UserDefaults(suiteName: group)
+    }
 
     static func container() throws -> URL {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "NativeAgentAppGroupID") as? String,
@@ -77,13 +83,8 @@ enum SharedChatInbox {
     }
 
     static func agentName() throws -> String {
-        let url = try container().appendingPathComponent("ShareAgentName.txt")
-        guard FileManager.default.fileExists(atPath: url.path) else { return "NativeAgent" }
-        return try String(contentsOf: url, encoding: .utf8)
-    }
-
-    static func rememberAgentName(_ name: String) throws {
-        try Data(name.utf8).write(to: container().appendingPathComponent("ShareAgentName.txt"), options: .atomic)
+        guard identityDefaults?.string(forKey: identityPairingKey) != nil else { return "NativeAgent" }
+        return NativeAgentIdentity.displayName(identityDefaults?.string(forKey: identityNameKey))
     }
 
     static func failure(_ message: String) -> NSError {

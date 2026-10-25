@@ -3,6 +3,7 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import OSLog
+// Blueprint: | `MemoryConsolidationGate+Database.swift` | `MemoryConsolidationGate`: `transactionalTableSwap`, `backupLiveStore`, `sweepBackups`; snapshots included in local backup/export, excluded from off-disk backup and phone sync |
 
 extension MemoryConsolidationGate {
     /// Thrown by transactionalTableSwap when the IN-TRANSACTION fingerprint
@@ -127,6 +128,8 @@ extension MemoryConsolidationGate {
     /// Transactionally-consistent pre-swap backup via the SQLite online
     /// backup API (robust against concurrent WAL writers — the fix wave-1's
     /// checkpoint+copy comment wished for).
+    /// Pre-consolidation snapshots: local backup/export and memory PrivacyMap;
+    /// excluded from off-disk backup and phone sync.
     static func backupLiveStore(liveStorage: MemoryStorage, dataRoot: URL) throws -> String {
         let suffix = UUID().uuidString.lowercased().prefix(8)
         let dir = dataRoot

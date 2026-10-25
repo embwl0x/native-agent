@@ -2,6 +2,7 @@ import Foundation
 import MacControl
 import PersistenceCore
 import Senses
+// Blueprint: | `SwiftToolDispatcher+Senses.swift` | `SwiftToolDispatcher`: sense corner resolution and authorized raw material adapters |
 
 extension SwiftToolDispatcher {
     func senseAppCorner(_ input: [String: JSONValue]) -> SenseCorner? {

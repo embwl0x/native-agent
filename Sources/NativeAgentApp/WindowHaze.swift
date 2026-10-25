@@ -1,4 +1,6 @@
 import AppToolRuntime
+
+// Blueprint: | `WindowHaze.swift` | Window haze components: shared glass backdrop, palette/saturation and appearance-aware window surface rendering |
 // WindowHaze.swift
 // "Alive glass", first half — User approved the mockup 2026-09-23. Behind every
 // column's content sits ONE single-hue haze that drifts like soft light in

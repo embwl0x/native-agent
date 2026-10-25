@@ -1,6 +1,8 @@
 import AppKit
 import SwiftUI
 
+// Blueprint: | `NativeDisclosureTriangle.swift` | `NativeDisclosureTriangle`: AppKit disclosure button bridge sharing the row's expansion binding |
+
 /// The Mac's own disclosure triangle (NSButton, disclosure bezel) for rows
 /// that fold in place but keep their own layout, where a DisclosureGroup
 /// would move the triangle off the title (User 09-27: all controls native).

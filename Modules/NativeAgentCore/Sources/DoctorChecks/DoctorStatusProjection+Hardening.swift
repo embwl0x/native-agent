@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `DoctorStatusProjection+Hardening.swift` | `DoctorStatusProjection`: `getProductionHardening` |
 
 extension DoctorStatusProjection {
     public static func getProductionHardening(dataRoot: URL) async throws -> ProductionHardeningSummary {

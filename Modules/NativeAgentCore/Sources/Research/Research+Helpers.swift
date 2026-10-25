@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
+// Blueprint: | `Research+Helpers.swift` | `SwiftNativeResearchClient`: `trimTrailingSlash`, `makeURL`, `isoTimestamp` |
 
 extension SwiftNativeResearchClient {
     // MARK: Helpers
@@ -27,7 +28,6 @@ extension SwiftNativeResearchClient {
 
     /// Match Python's `now_iso()`: `datetime.now(timezone.utc).isoformat()` —
     /// ISO-8601 with fractional seconds, `+00:00` suffix (not `Z`).
-    /// Same convention as `SwiftNativeMCPDispatcher.isoTimestamp`.
     public nonisolated static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
@@ -38,10 +38,8 @@ extension SwiftNativeResearchClient {
 
     // MARK: Receipt retention (2026-07-21 audit)
 
-    /// Bound on per-call search/fetch receipt files in `receiptsDir`
-    /// (`data/research/<id>.json` + `data/research/source-<id>.json`).
-    /// Before this cap every search() / fetchURL() call appended one JSON
-    /// file with no retention — an unbounded pile under data/.
+    /// Bound on fetched-source receipts and retained legacy search receipts
+    /// in `receiptsDir`; search results are returned without a duplicate file.
     static let receiptRetentionLimit = 200
 
     /// Receipt folders with an aging pass in flight: one at a time per folder.
@@ -50,7 +48,7 @@ extension SwiftNativeResearchClient {
     /// Keep the newest `receiptRetentionLimit` receipt files; delete the
     /// rest. Housekeeping: it runs on its own, off this call's return path, so
     /// an arrived result never waits on a directory scan, and a prune failure
-    /// never fails the search/fetch that just succeeded. Only receipt-shaped
+    /// never fails the fetch that just succeeded. Only receipt-shaped
     /// files are eligible (`source-*.json`, or `<uuid>.json`): `config.json`
     /// and the `lab/` subdirectory share the directory and are never touched.
     nonisolated func pruneReceiptsIfNeeded() {

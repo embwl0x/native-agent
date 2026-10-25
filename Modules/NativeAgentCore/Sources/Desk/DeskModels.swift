@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `DeskModels.swift` | `DeskStatus`: `DeskKind`, `CadenceMode`, `NotifyLevel` |
 
 // MARK: - Agent Desk — durable, event-sourced user-directed tracking
 //
@@ -288,6 +289,9 @@ public struct DeskRef: Sendable, Equatable {
 /// Carried work's words, readiness, planned call and originating turn. An
 /// inferred step keeps its source sentence; every step keeps its peer steering.
 public struct DeskStep: Sendable, Equatable {
+    public var lifeID: String?
+    public var status: String?
+    public var reason: String?
     public var words: String
     /// `next_turn`, `own_turn`, `when_user_messages[ <door>]`, `after_card`, `at <ISO time>`.
     public var when: String
@@ -321,11 +325,14 @@ public struct DeskStep: Sendable, Equatable {
                   source: jsonString(obj, "source"), peers: jsonStringArray(obj, "peers"),
                   elevated: jsonStringArray(obj, "elevated"), session: jsonString(obj, "session"),
                   origin: jsonString(obj, "origin"), filedAt: jsonString(obj, "filedAt"), replyRoute: obj["replyRoute"])
+        lifeID = jsonString(obj, "lifeID")
+        status = jsonString(obj, "status")
+        reason = jsonString(obj, "reason")
     }
 
     var fields: [String: JSONValue] {
         var obj: [String: JSONValue] = ["words": .string(words), "when": .string(when)]
-        for (key, value) in [("card", card), ("action", action), ("source", source), ("session", session), ("origin", origin), ("filedAt", filedAt)] {
+        for (key, value) in [("card", card), ("action", action), ("source", source), ("session", session), ("origin", origin), ("filedAt", filedAt), ("lifeID", lifeID), ("status", status), ("reason", reason)] {
             if let value, !value.isEmpty { obj[key] = .string(value) }
         }
         if !peers.isEmpty { obj["peers"] = .array(peers.map(JSONValue.string)) }

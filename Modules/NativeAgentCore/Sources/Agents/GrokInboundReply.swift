@@ -2,16 +2,22 @@ import AgentWorkspace
 import GrokLink
 import CryptoKit
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import AgentConversations
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `GrokInboundReply.swift` | Root-retained handover tasks deduplicate by message until actual exit; canonical `TurnAdmission.admittedRun` registers accepted runs for Stop/quit before session admission; `settle` writes their terminal handover result and releases ownership; the continuation lifecycle closes admission, cancels and joins them before closing live publication |
 
 public struct GrokInboundReply: Sendable {
     let clients: any AgentContactClients
-    /// Hand-overs this root is running, so a launch pass never starts a second one.
+    /// This root retains each hand-over through canonical turn admission and
+    /// completion delivery, so a launch pass never starts a second one.
     private let running = Running()
 
     init(clients: any AgentContactClients) { self.clients = clients }
+
+    func stop() async { await running.stop() }
 
     /// Local correlation is authority; stdin cannot choose the conversation.
     /// Claim before enqueue so ambiguous delivery cannot duplicate a turn.
@@ -65,13 +71,14 @@ public struct GrokInboundReply: Sendable {
     /// says durably whether it has become her turn yet.
     private func handOver(_ pending: GrokPendingRequest, text: String, peer: AgentBridgePrincipal, dataRoot: URL,
                           continuation: AgentConversationContinuation) {
-        guard running.claim(pending.messageID) else { return }
-        Task {
-            defer { running.release(pending.messageID) }
+        running.start(pending.messageID) {
             let store = GrokRequestStore(dataRoot: dataRoot), id = pending.messageID
-            // Taken: `shown` already named the door that showed it to her.
-            if await GrokBotRoute.takenByWaiter(peer: peer.id, messageID: id, dataRoot: dataRoot) { return }
+            var terminal = "handed over"
             do {
+                if await GrokBotRoute.takenByWaiter(peer: peer.id, messageID: id, dataRoot: dataRoot) {
+                    throw AgentConversationContinuation.NotStarted()
+                }
+                try Task.checkCancellation()
                 // Its answer goes back to the door it was asked from, kept with the request.
                 guard let route = pending.route else {
                     throw AgentConversationStore.Failure(message: "this request was sent before its asking door was kept with it, so the answer has no way back. It is saved here; tell the person in the conversation it was asked from.")
@@ -79,14 +86,14 @@ public struct GrokInboundReply: Sendable {
                 let digest = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
                 let answered = try await continuation.answer("grok-reply:" + id, digest: digest, session: pending.conversationID,
                                                              route: route, principal: "peer:" + peer.id) { runID, binding in
-                    try await TurnAdmission.shared.run(sessionID: pending.conversationID, waitForCapacity: true) {
+                    try await TurnAdmission.admittedRun(dataRoot: dataRoot, sessionID: pending.conversationID,
+                                                        runID: runID, waitForCapacity: true) {
                         // Only a still-pending hand-over starts a turn; a wait or a room
                         // in the turn that just finished may have taken it meanwhile.
                         let claimed = try store.update(id, peer: peer.id) {
-                            if $0.handOver == "pending" { $0.handOver = "handing over" }
+                            if $0.handOver == "pending" { $0.handOver = "running"; $0.runID = runID }
                         }
-                        guard claimed.handOver == "handing over" else { throw AgentConversationContinuation.NotStarted() }
-                        _ = try? store.update(id, peer: peer.id) { $0.runID = runID; $0.handOver = "handed over" }
+                        guard claimed.handOver == "running", claimed.runID == runID else { throw AgentConversationContinuation.NotStarted() }
                         return try await request(pending, text: text, peer: peer, route: route, runID: runID, binding: binding, dataRoot: dataRoot)
                             .chat(on: clients.bridgeChatClient())
                     }
@@ -94,24 +101,28 @@ public struct GrokInboundReply: Sendable {
                 if case .held = answered {
                     throw AgentConversationStore.Failure(message: "its delivery is already recorded as in progress or uncertain; no second turn was started.")
                 }
-            } catch is AgentConversationContinuation.NotStarted { return } catch is CancellationError {
-                // A claimed hand-over may already have enqueued. Keep its durable
-                // marker so launch recovery cannot repeat ambiguous delivery.
-                return
+            } catch is AgentConversationContinuation.NotStarted { terminal = "taken by wait or room" }
+            catch is CancellationError {
+                terminal = "stopped: the answer is saved; any admitted turn keeps what it produced, and no second turn will be started"
             } catch {
+                terminal = "not handed over: " + error.localizedDescription
+            }
+            let result = terminal
+            await settle {
                 _ = try? store.update(id, peer: peer.id) {
-                    if ["pending", "handing over"].contains($0.handOver ?? "") {
-                        $0.handOver = "not handed over: " + error.localizedDescription
-                    }
+                    if ["pending", "running"].contains($0.handOver ?? "") { $0.handOver = result }
+                }
+                await MainActor.run {
+                    NotificationCenter.default.post(name: .chatTurnCompleted, object: pending.conversationID)
                 }
             }
-            await MainActor.run { NotificationCenter.default.post(name: .chatTurnCompleted, object: pending.conversationID) }
         }
     }
 
     /// Once per launch: answers saved but not yet her turn go again; one cut
     /// off mid-hand-over is marked, never repeated (it may already be her turn).
     func resumeHandOvers(dataRoot: URL, continuation: AgentConversationContinuation) {
+        running.open()
         let store = GrokRequestStore(dataRoot: dataRoot)
         do { try store.pruneSettled() }
         catch { nativeLog("Grok request retention failed: %@", error.localizedDescription) }
@@ -119,11 +130,12 @@ public struct GrokInboundReply: Sendable {
         let contacts = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
         for file in files where file.pathExtension == "json" {
             guard let data = try? Data(contentsOf: file), data.count <= 96 * 1024,
-                  let saved = try? JSONDecoder().decode(GrokPendingRequest.self, from: data), let text = saved.reply,
-                  ["pending", "handing over"].contains(saved.handOver ?? "") else { continue }
-            if saved.handOver == "handing over" {
+                  let identity = try? JSONDecoder().decode(GrokPendingRequest.self, from: data),
+                  let saved = try? store.read(identity.messageID, peer: identity.peerID), let text = saved.reply,
+                  ["pending", "running", "handing over"].contains(saved.handOver ?? "") else { continue }
+            if ["running", "handing over"].contains(saved.handOver ?? "") {
                 _ = try? store.update(saved.messageID, peer: saved.peerID) {
-                    if $0.handOver == "handing over" { $0.handOver = "interrupted: the answer is saved; the app stopped while handing it over, so it may not have reached her as a turn" }
+                    $0.handOver = "interrupted: the answer is saved; the app stopped while handing it over, so it may not have reached her as a turn"
                 }
                 continue
             }
@@ -142,9 +154,33 @@ public struct GrokInboundReply: Sendable {
     }
 
     private final class Running: @unchecked Sendable {
-        private let lock = NSLock(); private var ids: Set<String> = []
-        func claim(_ id: String) -> Bool { lock.withLock { ids.insert(id).inserted } }
-        func release(_ id: String) { lock.withLock { _ = ids.remove(id) } }
+        private let lock = NSLock()
+        private var tasks: [String: Task<Void, Never>] = [:]
+        private var closed = false
+        func open() { lock.withLock { closed = false } }
+
+        func start(_ id: String, operation: @escaping @Sendable () async -> Void) {
+            lock.withLock {
+                guard !closed, tasks[id] == nil else { return }
+                // Creation and retention share the lock with shutdown. Even a
+                // synchronous exit cannot release before the handle is kept.
+                tasks[id] = Task {
+                    await operation()
+                    await settle { self.release(id) }
+                }
+            }
+        }
+
+        private func release(_ id: String) { lock.withLock { _ = tasks.removeValue(forKey: id) } }
+
+        func stop() async {
+            let pending = lock.withLock {
+                closed = true
+                return Array(tasks.values)
+            }
+            pending.forEach { $0.cancel() }
+            for task in pending { await task.value }
+        }
     }
 
     /// Her turn on the answer, in the conversation that asked, answering to its door.

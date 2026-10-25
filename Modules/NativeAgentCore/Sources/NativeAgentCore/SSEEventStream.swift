@@ -4,6 +4,7 @@
 // This layer does FRAMING ONLY — event-type routing, `[DONE]` sentinels,
 // telemetry, and error mapping are protocol semantics and stay in callers.
 import Foundation
+// Blueprint: | `SSEEventStream.swift` | Shared SSE framing and `ProviderStreamContext`; transport opening and activity for every event/comment; optional round-scoped diagnostic event capture before provider decoding |
 
 /// Transport activity is independent of reply content. Bound by the stream
 /// guard before creating an adapter, and inherited by its transport task.
@@ -12,6 +13,8 @@ public enum ProviderStreamContext {
     /// The provider admitted the request: a validated 2xx body is being read.
     @TaskLocal public static var admitted: (@Sendable () -> Void)?
     @TaskLocal public static var stallOnly: Bool = false
+    /// The HTTP request went out and its response head is awaited.
+    @TaskLocal public static var sending: (@Sendable () -> Void)?
     @TaskLocal public static var diagnosticEvent: (@Sendable (SSEEvent) -> Void)?
     /// The transport validated the route, chose the adapter and is sending.
     @TaskLocal public static var dispatched: (@Sendable () -> Void)?

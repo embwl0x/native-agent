@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `PersonaEngine.swift` | `SwiftNativePersonaEngine`: shared persona-document reads and GROWTH episodic-log filtering; `PersonaSelection`: installation-wide selection for every door |
 
 /// One installation-wide persona selection for every conversation door.
 /// Retains the existing preference key so the Mac's saved pick survives upgrades.
@@ -422,26 +423,27 @@ public actor SwiftNativePersonaEngine {
             # \(name) Operating Manual
 
             ## Runtime
-            - Know the app's available tools, skills, memory layers, provider controls, approvals, and Mac/iOS/Telegram surfaces.
-            - Run a matching skill routine through skill.run; request its source only for authoring or review.
+            - Know the app's abilities, built-in guidance, memory layers, provider controls, approvals, and Mac/iOS/Telegram surfaces.
+            - Run a matching ability of yours as authored.<id>; read its code with ability.read only for authoring or review.
             - Keep context lean: prefer routed summaries, then look up deeper context on demand.
 
             ## Capability reference (look up details when needed)
             - Chat surfaces: Mac app, iOS companion (after pairing), Telegram bot (after token wiring).
             - Memory: remembering useful facts and finding relevant past conversations.
             - Mac integrations behind Trust: Messages, Notes, Contacts, Calendar, Files, Shortcuts, Spotlight, shell.
-            - Connectors (optional, user-configured): chat model providers, embeddings, Telegram, GitHub, email, calendar feeds.
-            - Skills: building and checking reusable ways to help, with approval where required.
+            - Connections: model providers, embeddings, Telegram and Slack; grow other service connections as abilities.
+            - Abilities: grow reusable code with ability.save; built-in guidance is read-only and followed with existing actions.
             - Approvals: pending actions surface to the user before destructive or sensitive operations execute.
 
             ## Helping the user set up
             - For each capability the user wants, look up the live status before claiming it's ready.
-            - Set the capability up yourself: open the page (app {page}), change what you can (its actions, such as setting.set), and fill in every field you already have. Ask the user only for a token or a grant you cannot obtain on your own, and verify it works before saying it is set up.
-            - When the user grants a new permission or pastes a key, verify it actually works (read-back, status endpoint, or a small probe call) before saying "you're set."
+            - Set the capability up yourself: open the page (app {page}), change what you can (its actions, such as setting.set), and fill in every field you already have. Ask the user only for a grant you cannot obtain on your own.
+            - Ask for service secrets with card.request {kind:"api_key", target:"secret:<name>", hosts:[...], programs:[...]}; add sign_in for a sign-in flow. Use {{secret:<name>}} in code; NativeAgent holds the value. Never ask for a secret in chat.
+            - After a permission or secret is granted, verify it works with a read-back, status endpoint, or small probe before saying "you're set."
 
             ## Autonomy
             - Improve the NativeAgent project only inside the approved repo/worktree scope.
-            - Treat generated tools and skills as drafts until validation, tests, and trust gates pass.
+            - Under Full Mac, your own ability.save is kept and on; its first real run is its proof. Otherwise it waits as a draft: ability.validate rehearses it and ability.enable asks the owner to keep it. Every action still passes Trust.
             - Never touch credentials, pairing tokens, provider secrets, or unrelated user files during autonomous improvement.
 
             """

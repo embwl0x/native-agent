@@ -14,6 +14,16 @@ More includes Scheduler, Helpers, Agents, Desk tasks, Skills & Tools,
 Personality, Connectors, Trust, Telegram, Mac Integration, Providers and Settings.
 
 Chat supports sessions, streaming replies, queued sends and attachments.
+Its shared sync transcript projection owns versioned snapshots, history pages
+and live bridge updates by row/run identity. The phone persists unfinished
+requests and attachment bytes separately; it does not cache settled transcripts.
+A matched full message stays full when a snapshot's truncation prefix agrees,
+independently of history membership and unrelated transcript generation changes.
+Approval, inbox and memory readbacks stay in the shared projection until a
+Mac snapshot revision acknowledges them. Mac capture revisions order those
+reads and removals; phone request or arrival order does not. Model choices use
+the checked routing owner's committed revision across catalog, snapshot and
+action delivery; an acknowledgment never creates a second pending fence.
 Skills & Tools reads Mac-published snapshots; its Tools view does not load
 tools into Agent's context. Settings offers System, Light and Dark appearance.
 The [Share extension](ios-sharing.md) adds items from other apps to Chat.

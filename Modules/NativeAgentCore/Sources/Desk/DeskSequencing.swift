@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `DeskSequencing.swift` | `DeskSequencing.compute`: derived blockedness, cycles and subtree plans from stored edges; unblocking never writes a separate operation |
+
 // MARK: - DeskSequencing — the "what's next" derivation (PURE, never stored)
 //
 // The Desk answers "what exists"; this answers "what's next".

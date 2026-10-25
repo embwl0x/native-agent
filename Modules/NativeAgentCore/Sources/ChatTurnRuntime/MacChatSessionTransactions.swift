@@ -2,11 +2,15 @@ import Foundation
 import Observation
 import Transcripts
 import NativeAgentShared
+import NativeAgentCore
+// Blueprint: | `MacChatSessionTransactions.swift` | selection intent/transactions, load-completion waiter and running-session navigation; `LatestRead` owns session-index publication, and committed create/rename changes use `write`; selection and durable rename intents retain their independent action identities |
 
 /// Canonical transcript operations, implemented by the existing Core facade.
 @MainActor
 public protocol MacChatSessionStore: AnyObject {
     var sessions: [NativeAgentShared.ChatSession] { get set }
+    /// Called only inside the index owner's LatestRead publication closure.
+    func publishSessionIndexRead(_ sessions: [NativeAgentShared.ChatSession])
     func hasCachedTranscript(for sessionID: String) -> Bool
     func list() async throws -> [NativeAgentShared.ChatSession]
     func create(title: String, sourceKey: String?) async throws -> NativeAgentShared.ChatSession
@@ -47,6 +51,8 @@ actor ChatRenameMutationGate {
 @MainActor
 @Observable
 public final class MacChatSessionTransactions {
+    @ObservationIgnored public let indexRead = LatestRead()
+
     private let chatRenameMutationGate = ChatRenameMutationGate()
     private var chatRenameIntentGeneration: [String: Int] = [:]
 
@@ -80,7 +86,13 @@ public final class MacChatSessionTransactions {
     }
 
     public func create(store: any MacChatSessionStore, title: String = "New Chat") async throws -> NativeAgentShared.ChatSession {
-        try await store.create(title: title, sourceKey: "app")
+        let session = try await store.create(title: title, sourceKey: "app")
+        indexRead.write {
+            if !store.sessions.contains(where: { $0.id == session.id }) {
+                store.sessions.insert(session, at: 0)
+            }
+        }
+        return session
     }
 
     public func reconcileStartupSession(
@@ -88,7 +100,6 @@ public final class MacChatSessionTransactions {
     ) async throws -> (session: NativeAgentShared.ChatSession, created: Bool) {
         if let session = existingMainSession(in: store.sessions) { return (session, false) }
         let session = try await create(store: store)
-        store.sessions = [session]
         return (session, true)
     }
 
@@ -181,11 +192,12 @@ public final class MacChatSessionTransactions {
         }
         do {
             let updated = try await store.update(id: sessionId, title: cleanTitle, archived: nil)
-            if let refreshed = try? await store.list() {
-                store.sessions = refreshed
-            } else if let index = store.sessions.firstIndex(where: { $0.id == sessionId }) {
-                store.sessions[index] = updated
+            indexRead.write {
+                if let index = store.sessions.firstIndex(where: { $0.id == sessionId }) { store.sessions[index] = updated }
             }
+            _ = await indexRead.read({ try? await store.list() }, publish: { refreshed in
+                if let refreshed { store.publishSessionIndexRead(refreshed) }
+            })
             present("Renamed chat session", true)
         } catch {
             present("Rename failed: \(error.localizedDescription)", false)

@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import NativeAgentShared
 import QuickLook
+// Blueprint: | `ChatBubbleViews.swift` | `BubbleView` struct |
 
 // MARK: - Bubble
 
@@ -17,6 +18,7 @@ struct BubbleView: View, Equatable {
     /// A turn another door (the Mac, Telegram) is streaming into this chat.
     /// It paces like her own live reply until its saved answer lands.
     var isLiveTurn = false
+    var cardsAvailable = true
     @State private var images: [(summary: ChatAttachmentSummary, image: UIImage)] = []
     @State private var attachmentCountWithoutPreview = 0
     @State private var audioPreview: URL?
@@ -25,6 +27,7 @@ struct BubbleView: View, Equatable {
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message && lhs.streamingHint == rhs.streamingHint
             && lhs.isTimedOut == rhs.isTimedOut && lhs.isLiveTurn == rhs.isLiveTurn
+            && lhs.cardsAvailable == rhs.cardsAvailable
     }
 
     /// The Mac Simple thread: the agent's words are plain large text with
@@ -33,7 +36,7 @@ struct BubbleView: View, Equatable {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             VStack(alignment: .leading, spacing: 8) {
-                if let card = message.interaction, let descriptor = message.interactionDescriptor,
+                if cardsAvailable, let card = message.interaction, let descriptor = message.interactionDescriptor,
                    let session = message.interactionSessionID {
                     MobileInteractionCard(card: card, descriptor: descriptor, sessionID: session)
                 }
@@ -181,10 +184,10 @@ private struct MobileInteractionCard: View {
     @StateObject private var settingsStore = SettingsStore()
 
     private var locallyRequired: Bool {
-        [.internetAccounts, .chromeSetup, .pairDevice, .connectorOAuth].contains(descriptor.control)
+        [.internetAccounts, .chromeSetup, .pairDevice, .keyring, .macPermissionGrant].contains(descriptor.control)
     }
     private var editable: Bool {
-        card.state.name == "pending" || card.state.failureReason != nil || (card.state.name == "running" && locallyRequired)
+        card.state.name == "pending" || card.state.isRetryable || (card.state.name == "running" && locallyRequired)
     }
     private var fields: [(String, String, Bool)] {
         if descriptor.control == .providerAPIKey { return [("value", "API key or setup token", true)] }
@@ -207,6 +210,7 @@ private struct MobileInteractionCard: View {
             else if card.state == .superseded { Text("Replaced by a newer request.").foregroundStyle(.secondary) }
             else if card.state.isUnknown { Text("This build cannot answer this card.").foregroundStyle(.secondary) }
             else {
+                if case .stopped(let reason) = card.state { Text("Stopped: " + reason).foregroundStyle(.secondary) }
                 if let reason = card.state.failureReason { Text(reason).foregroundStyle(.orange) }
                 if let note = card.persistenceNote { Text(note).font(.footnote).foregroundStyle(.secondary) }
                 if card.kind == .permission {
@@ -254,7 +258,7 @@ private struct MobileInteractionCard: View {
                             .pickerStyle(.menu)
                         }
                     } else {
-                        Button(card.primaryActionLabel) { answer("primary") }
+                        Button(card.state.name == "stopped" ? "Resume" : card.primaryActionLabel) { answer("primary") }
                     }
                 } else { Text(descriptor.unavailableReason ?? "This control is unavailable.") }
                 Button("Not now") { answer("decline") }
@@ -327,18 +331,13 @@ private struct AttachmentImagePreview: View {
 
 // MARK: - Inline chat approvals
 //
-// Sweep 2026-09-01 item 36. The Mac renders the approval a turn is waiting on
-// straight onto that turn's card (MacChatTurnApproval); iOS had zero approval
-// references in the whole chat surface, so the phone's only answer to "she is
-// blocked on you" was to switch to the Activity tab and hunt for the row.
-//
-// This adds no store and no authority. It is a pure projection over the
-// approvals `iCloudSyncEngine` already publishes, plus a card that dispatches
-// through the SAME signed `approveApproval` / `rejectApproval` action the
-// Activity tab uses. Activity → Approvals stays the canonical list.
+// The Mac selects an approval by exact session and request time relative to
+// its turn start (lastRequestedAt, or createdAt for a first request). Its
+// published turn ID links that selection to transcript provenance on the phone.
 
 enum MobileChatApprovalProjection {
     /// Questions, expirations and failed executions belonging to this conversation.
+    /// Approvals can outlive the turn linkage used to place their cards.
     static func pendingApprovals(
         sessionId: String?,
         approvals: [ApprovalRequest]
@@ -352,16 +351,10 @@ enum MobileChatApprovalProjection {
         }
     }
 
-    /// The turn an inline approval hangs under.
-    ///
-    /// The Mac fences an approval to a turn by comparing the row's `createdAt`
-    /// against that turn's start. The iOS transcript carries no per-message
-    /// timestamp at all, so the phone cannot prove which *earlier* turn raised
-    /// a given row. The one turn it can prove is the newest assistant turn —
-    /// the one in flight or just finished — so the card anchors there and
-    /// nowhere else rather than guessing at a bubble it cannot substantiate.
-    static func anchorMessageID(in messages: [ChatMessage]) -> UUID? {
-        messages.last(where: { $0.role == .assistant })?.id ?? messages.last?.id
+    /// Attach only to a message carrying the Mac-selected turn's identity.
+    static func anchorMessageID(for approval: ApprovalRequest, in messages: [ChatMessage]) -> UUID? {
+        guard let turnID = approval.chatOriginTurnId else { return nil }
+        return messages.last(where: { $0.role == .assistant && $0.turnID == turnID })?.id
     }
 
     /// Same decision ownership as Activity and the Approvals screen.
@@ -370,7 +363,7 @@ enum MobileChatApprovalProjection {
     }
 }
 
-/// One pending approval, rendered on the turn that raised it. Approve / Deny
+/// One Mac-selected turn approval. Approve / Deny
 /// go through `iCloudSyncEngine`'s signed action channel; "In Activity" hands
 /// the user to the canonical queue via the existing open-activity intent.
 struct InlineChatApprovalCard: View {

@@ -3,6 +3,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import TurnTrace
+// Blueprint: | `TextMarkerCodec.swift` | `TextMarkerCodec` struct; `calls`, `throughLastMarker` |
 
 /// The text-marker tool-call protocol (the Claude subscription), in one place: the
 /// catalog rides the system prompt as prose, calls come back as `<tool_use>`
@@ -32,8 +34,8 @@ struct TextMarkerCodec: Sendable {
     // MARK: - Calls
 
     /// The round's marker calls in wire order, `<tool_use>` and `<invoke>`.
-    func calls(in text: String) -> [ParsedToolCall] {
-        ToolCallParser.parse(text, parseInvoke: true).map { call in
+    func calls(in text: String, recordShims: Bool = true) -> [ParsedToolCall] {
+        ToolCallParser.parse(text, parseInvoke: true, recordShims: recordShims).map { call in
             guard call.undeclaredKeys.isEmpty else { return call }
             let schema = schemas.first(where: { $0.name == call.name })
                 .flatMap { try? JSONSerialization.jsonObject(with: $0.parametersJSON) as? [String: Any] }
@@ -45,7 +47,11 @@ struct TextMarkerCodec: Sendable {
                 for (key, raw) in call.invokeRawText {
                     guard (properties[key] as? [String: Any])?["type"] as? String == "string" else { continue }
                     switch input[key] {
-                    case .int?, .double?, .bool?, .null?: input[key] = .string(raw)
+                    case .int?, .double?, .bool?, .null?:
+                        input[key] = .string(raw)
+                        if recordShims {
+                            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L13"), "site": .string("TextMarkerCodec.swift:calls")]))
+                        }
                     default: continue
                     }
                 }
@@ -66,12 +72,7 @@ struct TextMarkerCodec: Sendable {
         }
     }
 
-    /// A round that called tools, cut after its last marker. Bare
-    /// `<tool_use>`/`<invoke>` calls have no outer block for the API to stop
-    /// on (a `</tool_use>` stop would drop parallel calls), so text after the
-    /// last marker was written before any result existed — 2026-09-23
-    /// claude-drive: an invented report of all five results. It is neither
-    /// shown nor replayed.
+    /// Restore the outer closing tag swallowed by the API stop.
     func throughLastMarker(_ text: String) -> String {
         ToolCallParser.throughLastToolMarker(text)
     }
@@ -81,26 +82,13 @@ struct TextMarkerCodec: Sendable {
     /// Moves the prose in `pending` that may reach the surface out of it and
     /// returns it ("" when nothing is safe yet).
     ///
-    /// Final flush (`force`): EVERYTHING that remains. A real tool marker is
-    /// discarded via pendingDelta.removeAll() on the tool-call path BEFORE any
-    /// force flush runs, so when we reach here the iteration finished
-    /// tool-free and any "<tool"-looking text is prose that must be shown.
-    /// (Previously this short-circuited on "<tool" even when force==true, so a
-    /// reply merely MENTIONING "<tool" never streamed — frozen bubble then an
-    /// instant dump via .final. audit #6, 2026-06-14.)
-    ///
-    /// Otherwise: prose up to the earliest point that could begin a tool
+    /// Releases prose up to the earliest point that could begin a tool
     /// marker or Markdown pseudo-call, holding that candidate until the
     /// iteration end disambiguates it (real marker -> parsed, malformed block
-    /// -> bounced, ordinary prose -> shown by the force pass). Keep a <=16-char
-    /// cross-chunk tail so a candidate forming at the boundary is not split.
-    static func releasableProse(holding pending: inout String, force: Bool) -> String {
+    /// -> bounced, ordinary prose -> released by the loop). Keep up to 16
+    /// trailing characters, or a longer partial marker prefix, across chunks.
+    static func releasableProse(holding pending: inout String) -> String {
         guard !pending.isEmpty else { return "" }
-        if force {
-            let flush = pending
-            pending = ""
-            return flush
-        }
         let holdFrom: String.Index
         if let r = ToolCallParser.earliestPotentialProtocolMarker(in: pending) {
             holdFrom = r.lowerBound
@@ -135,7 +123,8 @@ struct TextMarkerCodec: Sendable {
     /// 2026-09-22: once per round, not per result (51 copies in one turn);
     /// names only the marker form the protocol teaches.
     func closeRound(_ carrier: inout String) {
-        carrier += "\n\nUse these verified results. If more work is needed, put the next calls in one <function_calls> block using <tool_use name=\"TOOL\">{\"arg\":\"value\"}</tool_use>, then end at </function_calls>. Otherwise answer directly.\n"
+        carrier += "\n\nIf work remains, send the next <function_calls> block and end at </function_calls>.\n"
+        TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P11"), "site": .string("TextMarkerCodec.swift:closeRound")]))
     }
 
     // MARK: - Bounces
@@ -258,8 +247,9 @@ struct TextMarkerCodec: Sendable {
             ? "open its page with app {\"page\": \"<page>\"} or find its action with app {\"find\": \"<what you want done>\"}."
             : "call a known tool name directly (calling loads it)."
         let gitLine = appDoor
-            ? "For recent commits use app git.log, for repo state app git.status, and for diffs app git.diff. Do not ask for raw shell/git commands when those answer it."
-            : "For recent commits use git_log, for repo state use git_status, and for diffs use git_diff. Do not ask for raw shell/git commands unless a shell tool is explicitly listed."
+            ? ""
+            : "Do not ask for raw shell/git commands unless a shell tool is explicitly listed."
+        TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P10"), "site": .string("TextMarkerCodec.swift:renderFloor")]))
         return """
         \(AnthropicOAuthDirectAdapter.textToolProtocolHeader)
         - This provider request intentionally does not include provider-native tools. Do not infer that tools are unavailable.
@@ -271,11 +261,10 @@ struct TextMarkerCodec: Sendable {
         - End your reply at </function_calls>. NativeAgent runs the calls and returns their results in the next message; never write results yourself.
         - Do not wrap tool markers in Markdown or code fences.
         - Do not narrate fake calls such as tool_name(...), "runs git log", or "loads coding tools"; those are not executable.
-        - COMPLETION CONTRACT: every reply must be EITHER tool_use marker(s) OR your complete final answer. You have no background execution — work you describe but do not call never happens. A reply that only announces or narrates in-progress work ("checking now", "reading the files now", "going through it") is invalid and NativeAgent bounces it back to you. Do the work in THIS reply: emit the next tool call, or deliver the finished answer.
+        - Each reply contains either executable calls or the complete answer. Describing work does not run it. Your turn part may continue privately after reply.end; only dispatched effects happen, and they do not alter the delivered reply.
         \(DelegatedCampaignGuidance.rendered)
-        - After NativeAgent returns a tool result, use the result to answer or emit another exact marker.
-        - \(gitLine)
-        - Skills provide guidance only. They never grant tools, permissions, approval bypasses, or safety authority.
+        \(gitLine)
+        - Built-in Markdown is guidance; executable abilities need an offered run route. Guidance grants no tools, permissions, approval bypasses or safety authority.
         Available Swift tools:
         \(renderedRows)
         """

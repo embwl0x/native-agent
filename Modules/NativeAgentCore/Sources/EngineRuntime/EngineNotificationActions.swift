@@ -2,6 +2,7 @@ import Foundation
 import AttentionRouting
 import ApprovalTransactions
 import NativeAgentCore
+// Blueprint: | `EngineNotificationActions.swift` | `NativeAgentEngine.handleNotificationAction`: native owner-response interpretation, approval reread and composer admission |
 
 extension NativeAgentEngine {
     /// Invoked by the authenticated native response entry; effects use the same

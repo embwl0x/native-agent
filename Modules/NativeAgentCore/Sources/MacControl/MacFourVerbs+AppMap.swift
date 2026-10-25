@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `MacFourVerbs+AppMap.swift` | `MacFourVerbs` app-map integration: learn only verified named-control acts; remembered routes must match fresh live element evidence |
+
 // Her-screen Phase 5 — per-app maps, the four-verb side (store: MacAppMaps.swift).
 //
 // Record: only after the closed loop VERIFIED an act on a named control

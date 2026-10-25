@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+// Blueprint: | `NativeOAuthPlatformPort.swift` | `NativeOAuthPlatformPort` protocol; `runAuthSession`, `isCanceledLogin`; shared `makeLoopbackSession`, `openBrowser`, `runLoopbackAuthSession` defaults; `OAuthLoopbackSession` protocol |
 
 /// Platform effects used by the Core sign-in policy. Session entry points
 /// retain their MainActor isolation; listeners retain their own cancellation.

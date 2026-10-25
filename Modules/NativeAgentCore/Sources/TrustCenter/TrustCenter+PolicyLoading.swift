@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TrustCenter+PolicyLoading.swift` | Canonical checked policy bytes, decode/shape validation and normalization, also used by SavedTrustPolicyAuthority's exact-byte validation cache; absent files and validated empty objects receive fresh-install additions |
 
 /// Why a securityPolicy value is effective for one canonical authorization
 /// read. This keeps code defaults from being misreported as saved operator
@@ -35,18 +36,29 @@ public struct TrustPolicyAuthorizationSnapshot: Sendable, Equatable {
 }
 
 extension SwiftNativeTrustCenter {
+    private nonisolated static func policyReadFailure(_ code: String, _ detail: String) -> ToolFailureError {
+        ToolFailureError(detail, effects: .none, owner: "trust/policy.json",
+            tap: "Trust > Access and policy > Preserve damaged policy and authorize Safe",
+            code: code, instruction: "Ask the owner to preserve the damaged policy and authorize Safe.")
+    }
+
     /// Reads the authoritative saved policy without conflating a missing file
     /// with damaged authority state. Missing is the only bootstrap-empty case.
     public nonisolated static func loadRawPolicyChecked(at path: URL) throws -> [String: JSONValue] {
         guard let data = try policyBytesChecked(at: path) else { return [:] }
+        return try decodeRawPolicyChecked(data)
+    }
+
+    /// One decode/shape owner for canonical loading and exact-byte gate caching.
+    nonisolated static func decodeRawPolicyChecked(_ data: Data) throws -> [String: JSONValue] {
         let decoded: JSONValue
         do {
             decoded = try JSONDecoder().decode(JSONValue.self, from: data)
         } catch {
-            throw TrustCenterError.underlying("saved trust policy is malformed")
+            throw Self.policyReadFailure("trust_policy_malformed", "Saved Trust policy is not valid JSON: \(error.localizedDescription)")
         }
         guard case .object(let object) = decoded else {
-            throw TrustCenterError.underlying("saved trust policy must be a JSON object")
+            throw Self.policyReadFailure("trust_policy_invalid_root", "Saved Trust policy must be a JSON object.")
         }
         try validateAuthorityPolicyShape(object)
         return object
@@ -58,7 +70,9 @@ extension SwiftNativeTrustCenter {
         var metadata = stat()
         if lstat(path.path, &metadata) != 0 {
             guard errno == ENOENT else {
-                throw TrustCenterError.underlying("saved trust policy cannot be inspected")
+                throw ToolFailureError("Saved Trust policy cannot be inspected: \(String(cString: strerror(errno))).",
+                    effects: .none, owner: path.path, tap: "Finder > Go > Go to Folder > \(path.deletingLastPathComponent().path) > policy.json > Get Info > Sharing & Permissions",
+                    code: "trust_policy_uninspectable", instruction: "Ask the owner to repair file access; preserve the policy bytes and authority.")
             }
             return nil
         }
@@ -79,7 +93,9 @@ extension SwiftNativeTrustCenter {
             }
             data = bytes
         } catch {
-            throw TrustCenterError.underlying("saved trust policy is unreadable")
+            throw ToolFailureError("Saved Trust policy could not be read: \(error.localizedDescription). It must be a regular file of at most 1 MiB.",
+                effects: .none, owner: path.path, tap: "Finder > Go > Go to Folder > \(path.deletingLastPathComponent().path) > policy.json > Get Info",
+                code: "trust_policy_unreadable", instruction: "Ask the owner to repair the named file; preserve its bytes and authority.")
         }
         return data
     }
@@ -92,7 +108,7 @@ extension SwiftNativeTrustCenter {
     /// older policies can receive new defaults during normalization.
     ///
     /// This is HALF the rule. The other half is
-    /// `validateKnownAuthorityPolicyTypes`, and both run for every reader —
+    /// `validateKnownAuthorityPolicyTypes`, and both define valid authority for every reader —
     /// canonical loads here and the point-of-use gates, which come through
     /// `SavedTrustPolicyAuthority.read`.
     public nonisolated static func validateAuthorityPolicyShape(
@@ -107,8 +123,8 @@ extension SwiftNativeTrustCenter {
         for key in ["developerMode", "enableAutonomy"] {
             guard let value = policy[key] else { continue }
             guard case .bool = value else {
-                throw TrustCenterError.underlying(
-                    "saved trust policy field \(key) must be a JSON boolean"
+                throw Self.policyReadFailure("trust_policy_invalid_field",
+                    "Saved Trust policy field \(key) must be a JSON boolean."
                 )
             }
         }
@@ -128,7 +144,6 @@ extension SwiftNativeTrustCenter {
             ["skillBuilderPolicy"],
             ["swarmPolicy"],
             ["inboxPolicy"],
-            ["mcpPolicy"],
             ["macControlPolicy"],
             ["macControlPolicy", "riskGatePolicy"],
             ["securityPolicy"],
@@ -141,8 +156,8 @@ extension SwiftNativeTrustCenter {
             for (index, component) in path.enumerated() {
                 guard let value = current[component] else { break }
                 guard case .object(let nested) = value else {
-                    throw TrustCenterError.underlying(
-                        "saved trust policy block \(path.joined(separator: ".")) must be a JSON object"
+                    throw Self.policyReadFailure("trust_policy_invalid_block",
+                        "Saved Trust policy block \(path.joined(separator: ".")) must be a JSON object."
                     )
                 }
                 if index < path.count - 1 {
@@ -206,8 +221,8 @@ extension SwiftNativeTrustCenter {
              (.string, .string):
             return
         default:
-            throw TrustCenterError.underlying(
-                "saved trust policy field \(path) has the wrong JSON type"
+            throw Self.policyReadFailure("trust_policy_invalid_field",
+                "Saved Trust policy field \(path) has the wrong JSON type."
             )
         }
     }
@@ -302,7 +317,7 @@ extension SwiftNativeTrustCenter {
             .appendingPathComponent("policy.json")
     }
 
-    /// What a root with NO saved policy file starts with, over and above the
+    /// What an absent or empty saved policy starts with, over and above the
     /// merge defaults. 2026-09-13: a fresh install may work unattended
     /// (bots, practice runs, background improvement). A legacy file that
     /// merely lacks the key is NOT fresh — it keeps the false it has always
@@ -323,7 +338,7 @@ extension SwiftNativeTrustCenter {
     ]
 
     /// - Parameter freshInstall: true only when the caller has proven no
-    ///   policy file exists on disk.
+    ///   policy file exists on disk, or its validated object is empty.
     func normalizedTrustPolicy(
         saved savedDict: [String: JSONValue],
         defaults: [String: JSONValue],
@@ -416,7 +431,6 @@ extension SwiftNativeTrustCenter {
             "v2_enabled": .bool(false),
         ])
         policy["inboxPolicy"] = .object(["enabled": .bool(false)])
-        policy["mcpPolicy"] = .object(["allow_lifecycle_ops": .bool(false)])
         policy["swarmPolicy"] = .object([
             "enabled": .bool(false),
             "maxAgents": .int(0),

@@ -4,17 +4,44 @@ import CryptoKit
 import MacControl
 import PersistenceCore
 import TurnTrace
+// Blueprint: | `BuilderWorktreeAllocator.swift` | `BuilderWorktreeAllocator` actor; `resolve`, `bind`; allocation reserves config root/agent/conversation before suspension and waiters reread the winning assignment; checkout reservations exclude reuse/allocation/binding from retirement through Git awaits, with freshness reread while held; unreadable or invalid retained pointers refuse continuity with the exact field and fileRepairInstruction for the person, never a coding-agent repair call |
 
 /// The narrow isolation seam for asynchronous coding builders.
 ///
 /// A new Codex, Claude, or OMP conversation gets one ordinary Git worktree. The
 /// bridge stores only a conversation -> path pointer so later messages can
 /// return to the same checkout. There is intentionally no Factory lifecycle,
-/// manifest, receipt schema, scheduler, or cleanup policy here.
+/// manifest, receipt schema, or scheduler here. Idle checkout retirement shares
+/// checkout ownership with allocation, reuse and conversation binding.
 /// Omitted and ordinary non-Git directories retain their original cwd
 /// semantics; Git evidence with an unsuccessful probe fails closed.
+/// Two-line path/token pointers and Git worktrees are local builder state:
+/// excluded from app backup/export/phone sync; PrivacyMap: bridge_worktrees.
 actor BuilderWorktreeAllocator {
     static let shared = BuilderWorktreeAllocator()
+
+    // Aliases of one checkout share its token. Keep ownership across Git
+    // suspensions; actor isolation alone does not exclude retirement.
+    private var checkoutReservations: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var allocationReservations: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    private func reserveCheckout(_ token: String) async {
+        if checkoutReservations[token] == nil {
+            checkoutReservations[token] = []
+            return
+        }
+        await withCheckedContinuation { checkoutReservations[token, default: []].append($0) }
+    }
+
+    private func releaseCheckout(_ token: String) {
+        if var waiters = checkoutReservations[token], !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            checkoutReservations[token] = waiters
+            next.resume()
+        } else {
+            checkoutReservations[token] = nil
+        }
+    }
 
     enum Agent: String, Sendable {
         case codex
@@ -60,6 +87,27 @@ actor BuilderWorktreeAllocator {
         defaultDirectory: String?,
         configRoot: URL
     ) async throws -> AllocationResult {
+        // Reserve the conversation before the first suspension, independently
+        // of the requested repository. A waiter rereads the winning pointer.
+        let identity = conversationId ?? "message:\(messageId)"
+        let allocationKey = pointerURL(agent: agent, identity: identity, configRoot: configRoot)
+            .standardizedFileURL.resolvingSymlinksInPath().path
+        if allocationReservations[allocationKey] != nil {
+            await withCheckedContinuation {
+                allocationReservations[allocationKey, default: []].append($0)
+            }
+        } else {
+            allocationReservations[allocationKey] = []
+        }
+        defer {
+            if var waiters = allocationReservations[allocationKey], !waiters.isEmpty {
+                let next = waiters.removeFirst()
+                allocationReservations[allocationKey] = waiters
+                next.resume()
+            } else {
+                allocationReservations[allocationKey] = nil
+            }
+        }
         let baseDirectory = requestedDirectory ?? defaultDirectory
 
         if isFollowUp, let conversationId,
@@ -81,25 +129,18 @@ actor BuilderWorktreeAllocator {
                 if requestedPath != assignedPath {
                     var noted = existing
                     noted.ignoredRequestedDirectory = requestedPath
-                    touchPointer(agent: agent, identity: conversationId, configRoot: configRoot)
                     return .assigned(noted)
                 }
             }
-            // The pointer's mtime is this conversation's last-touch evidence,
-            // which retirement reads. Reuse never rewrote the file, so an
-            // actively used checkout looked as idle as an abandoned one.
-            touchPointer(agent: agent, identity: conversationId, configRoot: configRoot)
             return .assigned(existing)
         }
         guard let baseDirectory else { return .unchanged(nil) }
 
-        let identity = conversationId ?? "message:\(messageId)"
         if let existing = try await existingAssignment(
             agent: agent,
             identity: identity,
             configRoot: configRoot
         ) {
-            touchPointer(agent: agent, identity: identity, configRoot: configRoot)
             return .assigned(existing)
         }
 
@@ -146,6 +187,9 @@ actor BuilderWorktreeAllocator {
             "\(repoRoot.lastPathComponent)-wt-\(agent.rawValue)-\(token)",
             isDirectory: true
         )
+
+        await reserveCheckout(token)
+        defer { releaseCheckout(token) }
 
         if !FileManager.default.fileExists(atPath: worktreeRoot.path) {
             let branchExists = await git(
@@ -240,7 +284,15 @@ actor BuilderWorktreeAllocator {
         agent: Agent,
         conversationId: String,
         configRoot: URL
-    ) -> AllocationResult {
+    ) async -> AllocationResult {
+        await reserveCheckout(assignment.token)
+        defer { releaseCheckout(assignment.token) }
+        guard FileManager.default.fileExists(atPath: assignment.workingDirectory) else {
+            return .failed(
+                reason: "builder_worktree_verification_failed",
+                detail: "The assigned builder checkout no longer exists; the conversation was not bound."
+            )
+        }
         do {
             try writePointer(
                 assignment,
@@ -286,6 +338,14 @@ actor BuilderWorktreeAllocator {
               }) else {
             throw pointerFailure(pointer, field: "line 2 (token)", detail: "Expected 16 lowercase hexadecimal characters.")
         }
+        await reserveCheckout(token)
+        defer { releaseCheckout(token) }
+        // Retirement may have finished while this reuse waited. Reread under
+        // checkout ownership before checking Git or publishing a fresh touch.
+        if !pathEntryExists(pointer, fileManager: .default) { return nil }
+        guard try String(contentsOf: pointer, encoding: .utf8) == raw else {
+            throw pointerFailure(pointer, field: "contents", detail: "The assignment changed while waiting to reuse its checkout.")
+        }
         let directory = URL(fileURLWithPath: workingDirectory)
             .standardizedFileURL
             .resolvingSymlinksInPath()
@@ -308,15 +368,15 @@ actor BuilderWorktreeAllocator {
             throw pointerFailure(pointer, field: "lines 1–2 (assignment)",
                                  detail: "Expected branch nativeagent/\(agent.rawValue)-\(token) in a checkout ending -wt-\(agent.rawValue)-\(token); found branch \(branch.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) at \(root.stdout.trimmingCharacters(in: .whitespacesAndNewlines)).")
         }
+        touchPointer(agent: agent, identity: identity, configRoot: configRoot)
         return Assignment(workingDirectory: directory.path, token: token)
     }
 
     private func pointerFailure(_ pointer: URL, field: String, detail: String) -> ToolFailureError {
-        ToolFailureError("Builder assignment is unreadable or invalid; no builder was started. \(detail) Repair the preserved assignment or its Git checkout, then send the original message again.",
+        ToolFailureError("Builder assignment is unreadable or invalid; no builder started. \(detail) Repair the retained assignment or checkout before resending.",
                          effects: .none, owner: "\(pointer.path) > \(field)",
-                         nextCall: ToolFailureError.call("app", ["action": .string("codex.invoke"), "args": .object([
-                            "cwd": .string(pointer.deletingLastPathComponent().path), "context": .string("\(pointer.path) > \(field): \(detail)"),
-                            "text": .string("Repair only this builder assignment from retained Git and pointer evidence. Preserve the original pointer bytes in a new hidden sibling backup before editing. Do not guess a repository, branch or token; do not reset, discard work, switch branches or assign another checkout. If the intended assignment cannot be established, preserve it and name the missing evidence. Report the repaired pointer and verified checkout; do not send the original builder message. A builder response does not prove continuity; the original dispatch must verify it again.")])]))
+                         code: "builder_assignment_invalid", instruction: ToolFailureError.fileRepairInstruction(pointer,
+                            shape: "Builder assignment field \(field) is invalid: \(detail). Establish the assignment only from retained Git and pointer evidence. Never guess repository, branch or token, discard work, switch branches, assign another checkout or resend the message."))
     }
 
     private func writePointer(
@@ -429,23 +489,7 @@ actor BuilderWorktreeAllocator {
         let cutoff = now.addingTimeInterval(-Self.retirementIdleSeconds)
         let expectedCommon = URL(fileURLWithPath: commonDirectory)
             .standardizedFileURL.resolvingSymlinksInPath().path
-        // A worktree can be named by more than one pointer (the bootstrap
-        // `message:<id>` alias and the later `codex:<thread>` binding). Its
-        // idleness is the NEWEST touch across all of them, never one pointer's
-        // (GPT-5.6 review: a stale alias must not retire a live checkout).
-        var newestTouch: [String: Date] = [:]
         let pointerFiles = entries.filter { $0.pathExtension == "path" }
-        for pointer in pointerFiles {
-            guard let touched = (try? pointer.resourceValues(
-                forKeys: [.contentModificationDateKey]
-            ))?.contentModificationDate,
-                  let raw = try? String(contentsOf: pointer, encoding: .utf8),
-                  let first = raw.split(separator: "\n", omittingEmptySubsequences: false).first
-            else { continue }
-            let directory = URL(fileURLWithPath: String(first).trimmingCharacters(in: .whitespacesAndNewlines))
-                .standardizedFileURL.resolvingSymlinksInPath().path
-            newestTouch[directory] = max(newestTouch[directory] ?? .distantPast, touched)
-        }
         var removed = 0
         for pointer in pointerFiles.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             if removed >= Self.retirementRemovalsPerSweep { break }
@@ -453,12 +497,33 @@ actor BuilderWorktreeAllocator {
             guard let firstLine = raw.split(separator: "\n", omittingEmptySubsequences: false).first else { continue }
             let pointedDirectory = URL(fileURLWithPath: String(firstLine).trimmingCharacters(in: .whitespacesAndNewlines))
                 .standardizedFileURL.resolvingSymlinksInPath().path
-            guard let touchedAt = newestTouch[pointedDirectory], touchedAt < cutoff else { continue }
             let lines = raw.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
             guard lines.count >= 2 else { continue }
             let recordedDirectory = lines[0].trimmingCharacters(in: .whitespacesAndNewlines)
             let token = lines[1].trimmingCharacters(in: .whitespacesAndNewlines)
             guard !recordedDirectory.isEmpty, token.count == 16 else { continue }
+            // A reuse already checking Git wins. Otherwise retirement owns
+            // this checkout through every Git await and pointer deletion.
+            guard checkoutReservations[token] == nil else { continue }
+            checkoutReservations[token] = []
+            defer { releaseCheckout(token) }
+            guard let aliases = try? FileManager.default.contentsOfDirectory(
+                at: pointerDirectory, includingPropertiesForKeys: nil
+            ).filter({ $0.pathExtension == "path" }) else { continue }
+            // Recompute freshness while reserved, including aliases published
+            // since the sweep began. Fresh URLs avoid cached resource values.
+            var newestTouch: Date?
+            for alias in aliases {
+                guard let aliasRaw = try? String(contentsOf: alias, encoding: .utf8),
+                      let first = aliasRaw.split(separator: "\n", omittingEmptySubsequences: false).first,
+                      URL(fileURLWithPath: String(first).trimmingCharacters(in: .whitespacesAndNewlines))
+                        .standardizedFileURL.resolvingSymlinksInPath().path == pointedDirectory,
+                      let touched = (try? URL(fileURLWithPath: alias.path).resourceValues(
+                        forKeys: [.contentModificationDateKey]
+                      ))?.contentModificationDate else { continue }
+                newestTouch = max(newestTouch ?? .distantPast, touched)
+            }
+            guard let touchedAt = newestTouch, touchedAt < cutoff else { continue }
             let directory = URL(fileURLWithPath: recordedDirectory)
                 .standardizedFileURL.resolvingSymlinksInPath()
             if keptPaths.contains(directory.path) { continue }
@@ -510,7 +575,7 @@ actor BuilderWorktreeAllocator {
             if remove.status == 0 {
                 // Drop EVERY pointer that named this checkout, not just the
                 // one that led here, so no alias is left dangling.
-                for alias in pointerFiles {
+                for alias in aliases {
                     if let aliasRaw = try? String(contentsOf: alias, encoding: .utf8),
                        let aliasFirst = aliasRaw.split(separator: "\n", omittingEmptySubsequences: false).first,
                        URL(fileURLWithPath: String(aliasFirst).trimmingCharacters(in: .whitespacesAndNewlines))

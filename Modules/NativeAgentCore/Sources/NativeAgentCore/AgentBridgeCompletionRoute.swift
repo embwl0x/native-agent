@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `Modules/NativeAgentCore/Sources/NativeAgentCore/AgentBridgeCompletionRoute.swift` | Shared completion route/requester identity and lifecycle projection; `isValidIOSDeviceRouteKey`; recovery, reporting and delivery admission share DataRootLife's stopped/restored result for unfinished prior-life sends; let_go remains terminal |
 
 public struct AgentBridgeCompletionRoute: Sendable, Equatable, Codable {
   /// Current iOS clients mint an exact per-device route as `iphone` or
@@ -88,20 +89,22 @@ public struct CodexCompletionLifecycleProjection: Decodable, Sendable {
   private struct Delivery: Decodable, Sendable { let status: String; let delivery: String }
   private struct Artifact: Decodable, Sendable { let phase: String }
   public let deliveryId: String
+  public let lifeID: String?
   public let principal: String?
   public let source: String?
   public let updatedAt: String
-  private let phase: String
+  private var phase: String
   private let response: Answer?
   private let responseRunId: String?
   private let sessionId: String?
   private let delivery: Delivery?
   private let artifacts: [String: Artifact]
 
-  public init(deliveryId: String, principal: String?, source: String?, updatedAt: String,
+  public init(deliveryId: String, lifeID: String? = nil, principal: String?, source: String?, updatedAt: String,
               phase: String, response: (runId: String, sessionId: String?, output: String, attachmentIds: [String])?, responseRunId: String?,
               sessionId: String?, delivery: (status: String, delivery: String)?, artifacts: [String: String]) {
     self.deliveryId = deliveryId
+    self.lifeID = lifeID
     self.principal = principal
     self.source = source
     self.updatedAt = updatedAt
@@ -115,6 +118,7 @@ public struct CodexCompletionLifecycleProjection: Decodable, Sendable {
   }
 
   public var status: String? {
+    if phase == "stopped" { return "stopped" }
     if delivery?.status == "let_go" { return "let_go" }
     if phase == "failed_before_answer" { return "failed_before_answer" }
     if delivery?.status == "completed" { return "delivered" }
@@ -134,7 +138,15 @@ public struct CodexCompletionLifecycleProjection: Decodable, Sendable {
     delivery?.delivery == "route_journal" && ["completed", "sent_unconfirmed"].contains(delivery?.status ?? "")
   }
 
-  public var permitsDelivery: Bool { delivery?.status != "let_go" }
+  public var permitsDelivery: Bool { phase != "stopped" && delivery?.status != "let_go" }
+
+  package func reading(in dataRoot: URL) throws -> Self {
+    var row = self
+    if try !DataRootLife.isCurrent(lifeID, in: dataRoot), !["delivered", "let_go"].contains(status ?? "") {
+      row.phase = "stopped"
+    }
+    return row
+  }
 
   public static func permitsDelivery(sessionId: String?, runId: String?, configRoot: URL, dataRoot: URL) throws -> Bool {
     guard let sessionId, let runId else { return true }
@@ -145,7 +157,7 @@ public struct CodexCompletionLifecycleProjection: Decodable, Sendable {
   }
 
   public var unsettledRunId: String? {
-    ["delivered", "failed_before_answer", "let_go"].contains(status ?? "") ? nil : response?.runId ?? responseRunId
+    ["delivered", "failed_before_answer", "let_go", "stopped"].contains(status ?? "") ? nil : response?.runId ?? responseRunId
   }
 
   public func knownPrincipal(dataRoot: URL) throws -> String? {
@@ -182,7 +194,7 @@ public struct CodexCompletionLifecycleProjection: Decodable, Sendable {
         let data = try Data(contentsOf: url)
         let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         if object?["schema"] as? String == "codex-completion-lifecycle.corrupt.v1" { continue }
-        rows.append(try JSONDecoder().decode(Self.self, from: data))
+        rows.append(try JSONDecoder().decode(Self.self, from: data).reading(in: dataRoot))
       }
     }
     return rows

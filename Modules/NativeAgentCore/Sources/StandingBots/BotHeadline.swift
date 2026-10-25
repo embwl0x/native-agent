@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `BotHeadline.swift` | `BotHeadline` enum; `make` |
 
 /// The one line a bot card shows for a reply (2026-09-11, found by Agent
 /// driving her first bot: the headline was the first 240 bytes of a markdown

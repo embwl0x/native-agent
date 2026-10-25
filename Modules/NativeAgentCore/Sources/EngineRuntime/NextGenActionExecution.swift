@@ -8,6 +8,7 @@ import ApprovalInbox
 import TrustCenter
 import Browser
 import DoctorChecks
+// Blueprint: | `NextGenActionExecution.swift` | capability action probes and execution receipts; release.gate is retired because release/checklist.json has no producer and an absent checklist cannot establish a gate |
 
 // The Capabilities panel's NextGen probes: each backed id has a read-only
 // executor here, gated by approval and recorded as a receipt.
@@ -171,14 +172,6 @@ extension NativeAgentEngine {
                     "growth": try JSONValue.fromEncodable(try await RuntimeReadProjection.swiftPersonalityGrowth(runtime: NativeAgentEngine.liveCognition)),
                 ])
 
-            case "release.gate":
-                return .object([
-                    "actionId": .string(id),
-                    "releaseChecklist": try JSONValue.fromEncodable(try RuntimeReadProjection.readLocalJSON(
-                        dataRoot.appendingPathComponent("release/checklist.json"), fallbackJSON: "{}"
-                    ) as ReleaseChecklist),
-                ])
-
             case "execution.durable.checkpoint":
                 return .object([
                     "actionId": .string(id),
@@ -237,7 +230,7 @@ extension NativeAgentEngine {
     }
 
     private nonisolated func resolveNextGenAction(id: String) async throws -> ResolvedNextGenAction {
-        let phases = try await NextGenStatusProjection(dataRoot: dataRoot).getNextGenPhases()
+        let phases = try await nextGen.getNextGenPhases()
         for phase in phases {
             if let action = phase.actions?.first(where: { $0.id == id }) {
                 return ResolvedNextGenAction(action: action, phase: phase)
@@ -258,7 +251,6 @@ extension NativeAgentEngine {
         "memory.explain",
         "truth.audit", "privacy.trust.audit", "mac.control.policy.audit",
         "personality.drift.audit",
-        "release.gate",
         "execution.durable.checkpoint",
         "trace.failure.rootcause", "traces.grade",
         "capability.marketplace.audit", "capability.signature.verify",

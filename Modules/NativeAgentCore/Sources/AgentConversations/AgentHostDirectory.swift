@@ -4,6 +4,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import os
+// Blueprint: | `AgentHostDirectory.swift` | `AgentHostDirectory` enum; `bridgeDiscoveryDirectory`, `peerDescriptorDirectory`; `installation.evidence` is discovery/Connect/verify's one installation check; install markers must resolve to executable files or app bundles with executable programs, never profiles; recipe `executables`, `discoveryWords`, `searchPaths` and `messagingPermissionsPath` replace inferred program names, fixed discovery words, ambient path additions and a hardcoded host permission file |
 
 /// KNOWN AGENTS ARE DATA.
 ///
@@ -213,8 +214,36 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     }
 
     public struct GrokRoutine: Codable, Sendable, Equatable {
-        public var mainChat, routines, details, openRoutine, deleteRoutine, webhookURL, webhookKey: String
-        public var backToRoutines, backToDetails, closeDetails, close, scrollToBottom: String
+        public var mainChat, routines, webhookURL, webhookKey: String
+        public var list, pause: Control?
+        public var navigation: [Step]?
+        public var copyURL, copyKey: String?
+
+        public struct Control: Codable, Sendable, Equatable {
+            public var roles: [String]
+            public var label, subrole: String?
+        }
+        public struct Step: Codable, Sendable, Equatable {
+            public enum Scope: String, Codable, Sendable { case window, routineRow, menu }
+            public enum Action: String, Codable, Sendable { case press = "AXPress", showMenu = "AXShowMenu", cancel = "AXCancel" }
+            public var name: String
+            public var scope: Scope
+            public var control: Control
+            public var action: Action
+            public var alreadyOpen: Control?
+            public var dismissal: Dismissal?
+        }
+        public struct Dismissal: Codable, Sendable, Equatable {
+            public var control: Control
+            public var action: Step.Action
+            /// A menu disappears when an item is selected.
+            public var ifPresent: Bool
+        }
+
+        // Old recipe fields remain decodable so the existing seed merge can
+        // remove unchanged fields while preserving an owner's edited copy.
+        public var details, openRoutine, deleteRoutine: String?
+        public var backToRoutines, backToDetails, closeDetails, close, scrollToBottom: String?
     }
 
     /// Where an A2A contact's card is, its credential by reference only (the
@@ -338,14 +367,7 @@ public enum AgentHostDirectory {
             installMarkers: [], configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "Grok Bot asks before running the local reply command under its current policy.",
             documentation: "https://cursor.com/help/grok-bot/routines", settingsSupported: false,
-            declaredRoute: .grokBot, bundleIDs: ["com.anysphere.sand"],
-            // Seen on the installed app (09-20): the main Bot's sidebar chat, its
-            // Details tab's Routines section, the link Grok posts to a routine
-            // it created, and the panel's webhook fields and closing buttons.
-            grokRoutine: .init(mainChat: "Grok Bot", routines: "Routines", details: "Details",
-                openRoutine: "Open routine ", deleteRoutine: "Delete routine", webhookURL: "Webhook URL",
-                webhookKey: "Webhook key", backToRoutines: "Back to Routines", backToDetails: "Back to details",
-                closeDetails: "Close details", close: "Close", scrollToBottom: "Scroll to bottom")),
+            declaredRoute: .grokBot, bundleIDs: ["com.anysphere.sand"]),
         AgentHostRow(id: "muse", displayName: "Muse",
             description: "Meta's assistant, reached through its Mac app in a chat of its own.", aliases: ["meta muse", "meta ai"],
             installMarkers: [], configPath: "", format: .sessionMCP,

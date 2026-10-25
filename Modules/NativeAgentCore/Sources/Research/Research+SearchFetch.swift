@@ -2,8 +2,28 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import MacControl
+// Blueprint: | `Research+SearchFetch.swift` | SwiftNativeResearchClient: checkedSearxngBaseURL is the search configuration reader used by search, Settings, connector status and Doctor; localServerIsDown, search returns results without a duplicate receipt file; fetchURL retains source receipts with explicit reader locators |
 
 extension SwiftNativeResearchClient {
+    /// The one reader of `research/config.json`'s search URL: nil when the file or key is absent,
+    /// the trimmed URL when present, and a fault naming the file when it is unreadable or malformed.
+    public nonisolated static func checkedSearxngBaseURL(root: URL) throws -> String? {
+        let path = root.appendingPathComponent("research", isDirectory: true)
+            .appendingPathComponent("config.json")
+        do {
+            let data = try Data(contentsOf: path)
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["searxng_base_url"] == nil || object["searxng_base_url"] is String else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+            return (object["searxng_base_url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch CocoaError.fileReadNoSuchFile {
+            return nil
+        } catch {
+            throw ToolFailureError("Search configuration is unreadable or malformed", effects: .none, owner: path.path)
+        }
+    }
+
     static func localServerIsDown(_ error: Error, url: URL) -> Bool {
         ["localhost", "127.0.0.1", "::1", "[::1]"].contains(url.host ?? "")
             && (error as? URLError)?.code == .cannotConnectToHost
@@ -11,14 +31,12 @@ extension SwiftNativeResearchClient {
     // MARK: search
 
     public func search(query: String, categories: String? = nil, timeRange: String? = nil) async throws -> ResearchSearchResponse {
-        // Pull base from config; empty/missing → ResearchClientError.notConfigured
-        // (matches Python's `raise ValueError("SearXNG base URL is not configured")`).
-        let raw = try await persistence.readJSON(configPath, ifMissing: .object([:]))
-        guard case .object(let obj) = raw,
-              case .string(let rawBase) = obj["searxng_base_url"] ?? .null else {
-            throw ResearchClientError.notConfigured
+        var base = trimTrailingSlash(try Self.checkedSearxngBaseURL(root: receiptsDir.deletingLastPathComponent()) ?? "")
+        // Nothing saved yet: find the local instance the way the Research page
+        // does (it saves what answers), so search works without a setup step.
+        if base.isEmpty, let found = try? await autodetectSearXNG(), found.found, let url = found.baseURL {
+            base = trimTrailingSlash(url)
         }
-        let base = trimTrailingSlash(rawBase)
         if base.isEmpty { throw ResearchClientError.notConfigured }
 
         var parameters = [("q", query), ("format", "json")]
@@ -62,20 +80,6 @@ extension SwiftNativeResearchClient {
                 results.append(parseResult(entry))
             }
         }
-
-        // Receipt write: {id, query, url, results, createdAt} →
-        // data/research/<id>.json. Matches the retired daemon.
-        let receiptID = UUID().uuidString.lowercased()
-        let receiptObj: JSONValue = .object([
-            "id": .string(receiptID),
-            "query": .string(query),
-            "url": .string(url.absoluteString),
-            "results": .array(results.map { $0.toJSON() }),
-            "createdAt": .string(Self.isoTimestamp(Date())),
-        ])
-        let receiptPath = receiptsDir.appendingPathComponent("\(receiptID).json")
-        try await persistence.writeJSON(receiptObj, to: receiptPath)
-        pruneReceiptsIfNeeded()
 
         // SearXNG sends [[engine, reason], ...].
         var unresponsive: [String] = []

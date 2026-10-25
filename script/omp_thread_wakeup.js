@@ -20,6 +20,7 @@ const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
 const { nowISO: now, jsonOut: out, ensureDir: ensure, claimWakeJob: claim, readWakeJSON: readJSON, postWakeCompletion, missingWakeCompletionOrigin, processTreeOrder, safeFilePart, createWakeLivePoster, createWakeEventWaiter, processStartIdentity, writeSyncedAndClose, fsyncDirectorySync } = require("./wake_worker_common.js");
+const { dataRootLife, lifeOf } = require("./wake_worker_common.js");
 
 const ROOT = process.env.NATIVE_AGENT_OMP_BRIDGE_DIR || path.join(os.homedir(), ".config", "omp-bridge");
 const JOBS = path.join(ROOT, "wake-jobs");
@@ -505,6 +506,7 @@ function missingCompletionOrigin(sessionId) {
 }
 
 function postBridge(text, sessionId, payload, deliveryId = `omp:${payload.messageId}`) {
+  if (lifeOf(payload.lifeID) !== dataRootLife()) return Promise.resolve({ status: "stopped", reason: "restored" });
   const missingOrigin = missingCompletionOrigin(sessionId);
   if (missingOrigin) return Promise.resolve(missingOrigin);
   sessionId = sessionId.trim();
@@ -519,6 +521,7 @@ function postBridge(text, sessionId, payload, deliveryId = `omp:${payload.messag
   try { url = new URL(target); } catch { return Promise.resolve({ status: "failed", reason: "bridge_url_invalid" }); }
   const body = JSON.stringify({
     text, sender: "omp", sessionId,
+    lifeID: payload.lifeID,
     origin: payload.origin,
     deliveryId,
     completion: { messageIds: [payload.messageId] },
@@ -532,6 +535,10 @@ function postBridge(text, sessionId, payload, deliveryId = `omp:${payload.messag
 async function runJob(payload, file, claimId) {
   const admitted = readJSON(file);
   if (!admitted || admitted.claimId !== claimId) return { status: "failed", reason: "claim_lost", messageId: payload.messageId };
+  if (lifeOf(admitted.lifeID) !== dataRootLife()) {
+    updateJob(file, { state: "stopped", status: "stopped", reason: "restored" }, claimId);
+    return { status: "stopped", reason: "restored", messageId: payload.messageId };
+  }
   if (!["claimed", "dispatching"].includes(admitted.state)) return { status: "skipped", reason: "execution_already_admitted", messageId: payload.messageId, existingState: admitted.state || "unknown" };
   const slug = topicSlug(payload.topic);
   const lock = acquireLock(slug, payload.messageId);
@@ -653,6 +660,10 @@ async function recoverExistingJob(file, payload, record, claimId) {
   try {
     const job = readJSON(file);
     if (!job || job.claimId !== existing.claimId) return { status: "skipped", reason: "claim_changed", messageId: payload.messageId, jobPath: file };
+    if (lifeOf(job.lifeID) !== dataRootLife()) {
+      updateJob(file, { state: "stopped", status: "stopped", reason: "restored" }, job.claimId);
+      return { status: "stopped", reason: "restored", messageId: payload.messageId, jobPath: file };
+    }
     if (job.state === "settled" && job.bridge && job.bridge.reason === "missing_origin_session") {
       return { status: "blocked", reason: "missing_origin_session", messageId: payload.messageId,
         bridge: job.bridge, jobPath: file, note: job.bridge.note };
@@ -717,12 +728,13 @@ async function main() {
   try { payload = JSON.parse(fs.readFileSync(0, "utf8")); } catch { return out({ status: "skipped", reason: "invalid_json" }); }
   if (!payload || !String(payload.text || "").trim()) return out({ status: "skipped", reason: "missing_text" });
   payload.messageId = String(payload.messageId || crypto.randomUUID());
+  payload.lifeID = dataRootLife();
   await pruneTerminalHistory();
   const retired = retiredJob(payload.messageId);
   if (retired) return out(retired);
   const file = jobPath(payload.messageId);
   const claimId = crypto.randomUUID();
-  const record = { schemaVersion: 2, messageId: payload.messageId, claimId, state: "claimed", createdAt: now(), claimantPid: process.pid, payload };
+  const record = { schemaVersion: 2, lifeID: payload.lifeID, messageId: payload.messageId, claimId, state: "claimed", createdAt: now(), claimantPid: process.pid, payload };
   if (!claim(file, record)) {
     const resolution = await recoverExistingJob(file, payload, record, claimId);
     if (!resolution.recoveredPayload) return out(resolution);

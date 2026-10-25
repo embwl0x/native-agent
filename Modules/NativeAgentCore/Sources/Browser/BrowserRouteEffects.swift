@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `BrowserRouteEffects.swift` | visible browser port; shared begin/finish/cancel lifecycle over BrowserActiveRunRegistry |
 
 /// Physical browser work and app integration; route decisions belong to Browser.
 public protocol BrowserRouteEffects: Sendable {

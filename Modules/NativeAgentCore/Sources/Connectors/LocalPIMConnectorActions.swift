@@ -6,6 +6,8 @@ import NativeAgentShared
 import PersistenceCore
 import Privacy
 import MacIntegration
+import ToolExecution
+// Blueprint: | `LocalPIMConnectorActions.swift` | `LocalPIMConnectorActions` enum; `calendarListUpcoming`, `calendarCalendars`, `remindersListWrite`; calendar reads retain physical enumeration through settlement and return the rows already produced; due-today/overdue composition requires its caller's data root, calls that root's editable `due-reminders` part through L0 and requests up to 200 rows from one native snapshot; general reminder query keeps permissions, queue-confined EventKit filtering/serialization and native access/time-zone facts |
 
 @MainActor
 public enum LocalPIMConnectorActions {
@@ -20,6 +22,7 @@ public enum LocalPIMConnectorActions {
         let window = try calendarListWindow(input: input)
         let store = LocalPIMStore()
         let granted = try await store.requestCalendarAccess(.read)
+        try Task.checkCancellation()
         guard granted else {
             return permissionEnvelope(
                 actionId: "mac.calendar_list_upcoming",
@@ -35,7 +38,7 @@ public enum LocalPIMConnectorActions {
         if let calendarID, !store.calendars(for: .event).contains(where: { $0.calendarIdentifier == calendarID }) {
             return .object(["status": .string("failed"), "reason": .string("Unknown calendar_id.")])
         }
-        let events = await upcomingEventRows(window: window, calendarName: calendarName, calendarID: calendarID,
+        let events = try await upcomingEventRows(window: window, calendarName: calendarName, calendarID: calendarID,
             query: inputString(input["query"]) ?? "", limit: limit)
 
         var payload: [String: JSONValue] = [
@@ -63,29 +66,37 @@ public enum LocalPIMConnectorActions {
     /// limit) on `@MainActor` froze the UI for the length of the query. EventKit
     /// reads are safe off the main thread when the caller owns its own store
     /// instance — process-wide authorization is unchanged — so the query runs in
-    /// a detached task and only the rendered JSON comes back.
+    /// an owned detached task and only the rendered JSON comes back. EventKit's
+    /// synchronous enumeration cannot be interrupted: cancellation keeps this
+    /// operation awaiting settlement and retains the rows it produced.
     nonisolated private static func upcomingEventRows(
         window: CalendarListWindow,
         calendarName: String?,
         calendarID: String?,
         query: String,
         limit: Int
-    ) async -> [JSONValue] {
-        await Task.detached(priority: .userInitiated) { () -> [JSONValue] in
+    ) async throws -> [JSONValue] {
+        try Task.checkCancellation()
+        let read = Task.detached(priority: .userInitiated) { () throws -> [JSONValue] in
+            try Task.checkCancellation()
             let calendarMatches: (@Sendable (String) -> Bool)? = calendarName.flatMap { name in
                 guard !name.isEmpty else { return nil }
                 let needle = name.lowercased()
                 return { $0.lowercased().contains(needle) }
             }
-            return LocalPIMStore.withEvents(start: window.start, end: window.end, calendarIDs: calendarID.map { [$0] }, calendarMatches: calendarMatches) { events, _ in
-                events
+            let rows = LocalPIMStore.withEvents(start: window.start, end: window.end, calendarIDs: calendarID.map { [$0] }, calendarMatches: calendarMatches) { events, _ -> [JSONValue] in
+                return events
                     .filter { query.isEmpty || ($0.title ?? "").localizedCaseInsensitiveContains(query)
                         || ($0.notes ?? "").localizedCaseInsensitiveContains(query) }
                     .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
                     .prefix(limit)
                     .map { eventJSON($0) }
             }
-        }.value
+            return rows
+        }
+        return try await withTaskCancellationHandler {
+            try await settle { await read.result }.get()
+        } onCancel: { read.cancel() }
     }
 
     public static func calendarCalendars(input: [String: JSONValue]) async throws -> JSONValue {
@@ -116,6 +127,7 @@ public enum LocalPIMConnectorActions {
         guard try await store.requestCalendarAccess(.read) else {
             return permissionEnvelope(actionId: "mac.calendar_free_busy", source: "calendar", status: calendarAuthorizationState())
         }
+        try Task.checkCancellation()
         let available = store.calendars(for: .event).map(\.calendarIdentifier)
         var seen = Set<String>()
         let calendarIDs = values.isEmpty ? available : values.compactMap { inputString($0) }.filter { seen.insert($0).inserted }
@@ -123,9 +135,10 @@ public enum LocalPIMConnectorActions {
         guard unknown.isEmpty else {
             return .object(["status": .string("failed"), "reason": .string("Unknown calendar_id: \(unknown.joined(separator: ", ")). Omit calendar_ids to check every calendar.")])
         }
-        let rows = await Task.detached(priority: .userInitiated) {
-            LocalPIMStore.withEvents(start: start, end: end, calendarIDs: calendarIDs, calendarMatches: nil) { events, observedCalendarIDs in
-                calendarIDs.map { calendarID -> JSONValue in
+        let read = Task.detached(priority: .userInitiated) { () throws -> [JSONValue] in
+            try Task.checkCancellation()
+            let rows = LocalPIMStore.withEvents(start: start, end: end, calendarIDs: calendarIDs, calendarMatches: nil) { events, observedCalendarIDs -> [JSONValue] in
+                return calendarIDs.map { calendarID -> JSONValue in
                     let intervals = events.filter { $0.calendar.calendarIdentifier == calendarID && $0.status != .canceled && $0.availability != .free }
                     let unknown = !observedCalendarIDs.contains(calendarID)
                         || intervals.contains { eventAvailability($0.availability) == "unknown" || $0.startDate == nil || $0.endDate == nil }
@@ -137,62 +150,25 @@ public enum LocalPIMConnectorActions {
                             "availability": .string(eventAvailability(event.availability))]) })])
                 }
             }
-        }.value
+            return rows
+        }
+        let rows = try await withTaskCancellationHandler {
+            try await settle { await read.result }.get()
+        } onCancel: { read.cancel() }
         return .object(["status": .string("completed"), "scope": .string("local_events"), "start": .string(iso(start)), "end": .string(iso(end)), "timeZone": .string(TimeZone.current.identifier), "calendars": .array(rows)])
     }
 
-    public static func remindersListDueToday(input: [String: JSONValue]) async throws -> JSONValue {
-        let store = LocalPIMStore()
-        let granted = try await store.requestReminderAccess()
-        guard granted else {
-            return permissionEnvelope(
-                actionId: "mac.reminders_list_due_today",
-                source: "reminders",
-                status: reminderAuthorizationState()
-            )
+    /// The requesting root's part owns the local-day view; the query below remains the
+    /// native permission, EventKit confinement and serialization boundary.
+    public static func remindersListDueToday(input: [String: JSONValue], dataRoot: URL) async throws -> JSONValue {
+        let packet: JSONValue = .object(["request": .object(input),
+            "now": .string(iso(Date())), "timeZone": .string(TimeZone.current.identifier)])
+        switch await Parts(root: dataRoot).call(id: "due-reminders", input: packet, as: JSONValue.self) {
+        case .success(let value): return NativeAppSecretRedactor.redactValue(value)
+        case .failure(let error):
+            throw PartCallError(code: NativeAppSecretRedactor.redactText(error.code),
+                message: NativeAppSecretRedactor.redactText(error.message))
         }
-
-        let includeCompleted = inputBool(input["include_completed"] ?? input["includeCompleted"], defaultValue: false)
-        let limit = clampedInt(input["limit"] ?? input["max"], defaultValue: 50, min: 1, max: 200)
-        let listName = inputString(input["list_name"] ?? input["listName"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let calendars = filteredCalendars(
-            store.calendars(for: .reminder),
-            matching: listName
-        )
-        let endOfToday = Calendar.current.date(
-            byAdding: .day,
-            value: 1,
-            to: Calendar.current.startOfDay(for: Date())
-        ) ?? Date().addingTimeInterval(24 * 3600)
-        guard let reminders = await fetchDueReminderJSON(
-            store: store,
-            calendars: calendars,
-            includeCompleted: includeCompleted,
-            endOfToday: endOfToday,
-            limit: limit
-        ) else {
-            return .object([
-                "status": .string("failed"),
-                "actionId": .string("mac.reminders_list_due_today"),
-                "reason": .string("Reminders read is unavailable."),
-            ])
-        }
-
-        return .object([
-            "status": .string("completed"),
-            "actionId": .string("mac.reminders_list_due_today"),
-            "source": .string("eventkit"),
-            "access": .string(reminderAuthorizationState()),
-            "includeCompleted": .bool(includeCompleted),
-            "scope": .string("due_today_and_overdue"),
-            "due_end": .string(iso(endOfToday)),
-            "timeZone": .string(TimeZone.current.identifier),
-            "count": .int(Int64(reminders.rows.count)),
-            "total": .int(Int64(reminders.total)),
-            "has_more": .bool(reminders.rows.count < reminders.total),
-            "reminders": .array(reminders.rows),
-        ])
     }
 
     public static func remindersQuery(input: [String: JSONValue]) async throws -> JSONValue {
@@ -216,7 +192,9 @@ public enum LocalPIMConnectorActions {
         let listName = inputString(input["list_name"])?.trimmingCharacters(in: .whitespacesAndNewlines)
         let calendars = filteredCalendars(store.calendars(for: .reminder), matching: listName)
         let offset = clampedInt(input["offset"], defaultValue: 0, min: 0, max: Int.max)
-        let limit = clampedInt(input["limit"], defaultValue: 20, min: 1, max: 100)
+        let limit = clampedInt(input["limit"], defaultValue: 20, min: 1, max: 200)
+        let access = reminderAuthorizationState()
+        let timeZone = TimeZone.current.identifier
         return await withCheckedContinuation { continuation in
             store.fetchReminders(in: calendars, incompleteOnly: !includeCompleted) { reminders in
                 guard let reminders else {
@@ -246,6 +224,7 @@ public enum LocalPIMConnectorActions {
                 let next = offset + rows.count
                 continuation.resume(returning: .object([
                     "status": .string("completed"), "actionId": .string(actionId), "source": .string("eventkit"),
+                    "access": .string(access), "timeZone": .string(timeZone),
                     "includeCompleted": .bool(includeCompleted), "count": .int(Int64(rows.count)),
                     "total": .int(Int64(matching.count)), "offset": .int(Int64(offset)),
                     "next_offset": next < matching.count ? .int(Int64(next)) : .null,
@@ -989,12 +968,19 @@ public enum LocalPIMConnectorActions {
         }
     }
 
-    public static func authorizationStatusPayload(localId: String) -> [String: JSONValue] {
+    /// Render the already-read OS grant shared by the engine's permission pages.
+    public static func authorizationStatusPayload(localId: String, wizardStatus: String) -> [String: JSONValue] {
+        let state: String = switch wizardStatus {
+        case "granted", "authorized": "ready"
+        case "not_determined": "probe_needed"
+        case "limited", "denied", "restricted": "needs_permission"
+        default: "unknown"
+        }
         switch localId {
         case "local_calendar":
-            return statusPayload(source: "calendar", state: calendarAuthorizationState())
+            return statusPayload(source: "calendar", state: state)
         case "local_reminders":
-            return statusPayload(source: "reminders", state: reminderAuthorizationState())
+            return statusPayload(source: "reminders", state: state)
         default:
             return [:]
         }
@@ -1088,50 +1074,6 @@ public enum LocalPIMConnectorActions {
         return filtered.isEmpty ? [] : filtered
     }
 
-    private static func fetchDueReminderJSON(
-        store: LocalPIMStore,
-        calendars: [EKCalendar]?,
-        includeCompleted: Bool,
-        endOfToday: Date,
-        limit: Int
-    ) async -> (rows: [JSONValue], total: Int)? {
-        // Objects stay on EventKit's queue; filter and render to Sendable
-        // values before resuming Core, preserving the platform's isolation.
-        await withCheckedContinuation { continuation in
-            store.fetchReminders(in: calendars, incompleteOnly: false) { reminders in
-                guard let reminders else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                let values = Self.processReminders(
-                    reminders,
-                    includeCompleted: includeCompleted,
-                    endOfToday: endOfToday,
-                    limit: limit
-                )
-                continuation.resume(returning: values)
-            }
-        }
-    }
-
-    /// Process reminder values on the platform completion queue.
-    nonisolated private static func processReminders(
-        _ reminders: [EKReminder],
-        includeCompleted: Bool,
-        endOfToday: Date,
-        limit: Int
-    ) -> (rows: [JSONValue], total: Int) {
-        let matching = reminders
-            .filter { reminder in
-                if !includeCompleted && reminder.isCompleted { return false }
-                guard let due = reminder.dueDateComponents?.date else { return false }
-                return due < endOfToday
-            }
-            .sorted {
-                ($0.dueDateComponents?.date ?? .distantFuture) < ($1.dueDateComponents?.date ?? .distantFuture)
-            }
-        return (matching.prefix(limit).map { reminderJSON($0) }, matching.count)
-    }
 
     nonisolated private static func eventAvailability(_ availability: EKEventAvailability) -> String {
         switch availability {

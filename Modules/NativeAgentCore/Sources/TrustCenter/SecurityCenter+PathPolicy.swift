@@ -1,28 +1,48 @@
 import Foundation
 import PersistenceCore
+import ToolRegistry
+// Blueprint: | `SecurityCenter+PathPolicy.swift` | SecurityCenter owns byte-exact, component-wise containment of resolved absolute I/O paths for capability effects and Mac Control file admission; supported file mutations use NativeAgentWorkspaceRoot's execution resolver and relative base; unknown relative capability paths count as outside; `capabilityWritesOutsideAppData`, `pathIsInsideRoots`, `pathLikeStrings` |
 
 extension SwiftNativeSecurityCenter {
     /// Her line for the paths a call names: true when one lands beyond her
-    /// data root and Trust's workspace roots. A `..` cannot be followed with
-    /// confidence, so it counts as beyond.
+    /// data root and Trust's workspace roots. File mutations share execution's
+    /// resolver; relative paths with no known I/O base still count as beyond.
     static func capabilityWritesOutsideAppData(
+        tool: String,
         input: [String: JSONValue],
         dataRoot: URL,
         trustedWorkspaceRoots: [URL] = []
     ) -> Bool {
-        let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
-        for path in pathLikeStrings(in: .object(input)) {
-            let expanded = HomePath.expand(path.trimmingCharacters(in: .whitespacesAndNewlines))
-            if expanded.split(separator: "/").contains("..") { return true }
-            guard expanded.hasPrefix("/") else { continue }
-            let normalized = URL(fileURLWithPath: expanded)
-                .standardizedFileURL
-                .resolvingSymlinksInPath().path
-            if isSelfOrAncestor(rootPath: root, candidatePath: normalized) { continue }
-            if trustedWorkspaceRoots.contains(where: { isSelfOrAncestor(rootPath: $0.path, candidatePath: normalized) }) { continue }
-            return true
+        let binding = tool == "app" ? AppActionBinding.action(input: input) : nil
+        let operation = ToolNameAliases.canonical(binding?.tool ?? tool)
+        var pathInput = input
+        if ["write_file", "copy_file", "move_file", "trash_file"].contains(operation) {
+            var arguments = binding?.arguments(object(input["args"])) ?? input
+            let keys = ["copy_file", "move_file"].contains(operation) ? ["path", "destination"] : ["path"]
+            for key in keys {
+                if case .string(let raw)? = arguments[key] {
+                    arguments[key] = .string(NativeAgentWorkspaceRoot.resolveFileMutationPath(raw, dataRoot: dataRoot).path)
+                }
+            }
+            if binding != nil { pathInput["args"] = .object(arguments) }
+            else { pathInput = arguments }
         }
-        return false
+        return pathLikeStrings(in: .object(pathInput)).contains { raw in
+            let expanded = (raw as NSString).expandingTildeInPath
+            guard expanded.hasPrefix("/") else { return true }
+            let resolved = URL(fileURLWithPath: expanded).standardizedFileURL.resolvingSymlinksInPath().path
+            return !pathIsInsideRoots(resolved, roots: [dataRoot] + trustedWorkspaceRoots)
+        }
+    }
+
+    /// Compare the resolved, standardized absolute path the caller will open.
+    /// Preserve its bytes: whitespace and Unicode spelling are part of a name.
+    static func pathIsInsideRoots(_ resolvedPath: String, roots: [URL]) -> Bool {
+        guard resolvedPath.hasPrefix("/") else { return false }
+        return roots.contains {
+            isSelfOrAncestor(rootPath: $0.standardizedFileURL.resolvingSymlinksInPath().path,
+                             candidatePath: resolvedPath)
+        }
     }
 
     static func pathLikeStrings(in value: JSONValue) -> [String] {

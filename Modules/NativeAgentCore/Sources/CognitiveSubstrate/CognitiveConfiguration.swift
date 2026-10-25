@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `CognitiveConfiguration.swift` | `CognitiveConfiguration`: cleaned cognition settings, reflection spend ceilings and personality experiment gates |
+
 public struct CognitiveConfiguration: Sendable, Equatable {
     public var enabled: Bool
     public var persistenceEnabled: Bool

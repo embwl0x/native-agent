@@ -1,7 +1,9 @@
 import Foundation
 
+// Blueprint: | `MacControlPolicyWireSnapshot.swift` | `MacControlPolicyWireSnapshot`: shared policy snapshot decoding/defaults; TrustCenter retains policy authority |
+
 /// Decoding compatibility for Mac Control snapshots; TrustCenter retains policy authority.
-/// Platform models own their direct-construction defaults and encoding surfaces.
+/// Shared immutable defaults keep phone decoding and TrustCenter's schema equal.
 public struct MacControlPolicyWireSnapshot: Decodable, Sendable {
     public let enabled: Bool
     public let applesScriptAllowed: Bool
@@ -15,6 +17,14 @@ public struct MacControlPolicyWireSnapshot: Decodable, Sendable {
     public let spotlightAllowed: Bool
     public let approvalRequiredFor: [String]
     public let remoteFromIosAllowed: Bool
+
+    public static let defaults = Self(
+        enabled: false, applesScriptAllowed: false, jxaAllowed: false,
+        shortcutsAllowed: true, accessibilityAllowed: false, systemControlAllowed: false,
+        fileOpsAllowed: false, shellAllowed: false, notificationsAllowed: true,
+        spotlightAllowed: true,
+        approvalRequiredFor: ["shell", "file_ops", "applescript", "jxa", "accessibility"],
+        remoteFromIosAllowed: false)
 
     private enum CodingKeys: String, CodingKey {
         case enabled
@@ -31,19 +41,22 @@ public struct MacControlPolicyWireSnapshot: Decodable, Sendable {
         case remoteFromIosAllowed = "remote_from_ios_allowed"
     }
 
+}
+
+extension MacControlPolicyWireSnapshot {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
-        applesScriptAllowed = try c.decodeIfPresent(Bool.self, forKey: .applesScriptAllowed) ?? false
-        jxaAllowed = try c.decodeIfPresent(Bool.self, forKey: .jxaAllowed) ?? false
-        shortcutsAllowed = try c.decodeIfPresent(Bool.self, forKey: .shortcutsAllowed) ?? true
-        accessibilityAllowed = try c.decodeIfPresent(Bool.self, forKey: .accessibilityAllowed) ?? false
-        systemControlAllowed = try c.decodeIfPresent(Bool.self, forKey: .systemControlAllowed) ?? false
-        fileOpsAllowed = try c.decodeIfPresent(Bool.self, forKey: .fileOpsAllowed) ?? false
-        shellAllowed = try c.decodeIfPresent(Bool.self, forKey: .shellAllowed) ?? false
-        notificationsAllowed = try c.decodeIfPresent(Bool.self, forKey: .notificationsAllowed) ?? true
-        spotlightAllowed = try c.decodeIfPresent(Bool.self, forKey: .spotlightAllowed) ?? true
-        approvalRequiredFor = try c.decodeIfPresent([String].self, forKey: .approvalRequiredFor) ?? ["shell", "file_ops", "applescript", "jxa", "accessibility"]
-        remoteFromIosAllowed = try c.decodeIfPresent(Bool.self, forKey: .remoteFromIosAllowed) ?? false
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? Self.defaults.enabled
+        applesScriptAllowed = try c.decodeIfPresent(Bool.self, forKey: .applesScriptAllowed) ?? Self.defaults.applesScriptAllowed
+        jxaAllowed = try c.decodeIfPresent(Bool.self, forKey: .jxaAllowed) ?? Self.defaults.jxaAllowed
+        shortcutsAllowed = try c.decodeIfPresent(Bool.self, forKey: .shortcutsAllowed) ?? Self.defaults.shortcutsAllowed
+        accessibilityAllowed = try c.decodeIfPresent(Bool.self, forKey: .accessibilityAllowed) ?? Self.defaults.accessibilityAllowed
+        systemControlAllowed = try c.decodeIfPresent(Bool.self, forKey: .systemControlAllowed) ?? Self.defaults.systemControlAllowed
+        fileOpsAllowed = try c.decodeIfPresent(Bool.self, forKey: .fileOpsAllowed) ?? Self.defaults.fileOpsAllowed
+        shellAllowed = try c.decodeIfPresent(Bool.self, forKey: .shellAllowed) ?? Self.defaults.shellAllowed
+        notificationsAllowed = try c.decodeIfPresent(Bool.self, forKey: .notificationsAllowed) ?? Self.defaults.notificationsAllowed
+        spotlightAllowed = try c.decodeIfPresent(Bool.self, forKey: .spotlightAllowed) ?? Self.defaults.spotlightAllowed
+        approvalRequiredFor = try c.decodeIfPresent([String].self, forKey: .approvalRequiredFor) ?? Self.defaults.approvalRequiredFor
+        remoteFromIosAllowed = try c.decodeIfPresent(Bool.self, forKey: .remoteFromIosAllowed) ?? Self.defaults.remoteFromIosAllowed
     }
 }

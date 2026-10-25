@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ProviderCatalogStatus.swift` | `NAProviderCatalogStatusCodec`: credential-free provider/model/surface metadata over existing device status transport |
+
 /// Credential-free provider/model metadata projected from the authoritative Mac
 /// into the paired iOS companion. This rides the existing NAStatus transport so
 /// public CloudKit builds do not depend on an iCloud Drive snapshot mount.
@@ -7,15 +9,18 @@ public struct NAProviderCatalogStatus: Codable, Equatable, Sendable {
     public static let currentVersion = 1
 
     public var version: Int
+    public var routingRevision: Double
     public var providers: [NAProviderCatalogProvider]
     public var surfaces: [String: NAProviderSurfaceSelection]
 
     public init(
         version: Int = currentVersion,
         providers: [NAProviderCatalogProvider],
-        surfaces: [String: NAProviderSurfaceSelection]
+        surfaces: [String: NAProviderSurfaceSelection],
+        routingRevision: Double
     ) {
         self.version = version
+        self.routingRevision = routingRevision
         self.providers = providers
         self.surfaces = surfaces
     }

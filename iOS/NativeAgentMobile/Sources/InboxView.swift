@@ -19,14 +19,15 @@
 import SwiftUI
 import UserNotifications
 import NativeAgentShared
+// Blueprint: | `InboxView.swift` | Inbox presentation, notifications and submission state; rows and ID-selected details read the shared sync projection |
 
 
 // MARK: - Store
 
 @MainActor
 final class InboxStore: ObservableObject {
-    @Published var items: [InboxItemRecord] = []
-    @Published private(set) var hasLoadedSnapshot = false
+    var items: [InboxItemRecord] { iCloudSyncEngine.shared.inboxItems }
+    var hasLoadedSnapshot: Bool { iCloudSyncEngine.shared.inboxSnapshotLoaded }
     @Published var isLoading = false
     @Published var bannerError: String? = nil
 
@@ -47,7 +48,6 @@ final class InboxStore: ObservableObject {
         defer { isLoading = false }
         guard pairingStore.usesICloudTransport else {
             bannerError = "Pair to view"
-            applyFetchedItems([])
             return
         }
         await iCloudSyncEngine.shared.refreshInboxSnapshot()
@@ -57,16 +57,7 @@ final class InboxStore: ObservableObject {
     func applySyncedInboxFromSnapshot(animated: Bool = true, notifyNewArrivals: Bool = true) {
         let fetched = iCloudSyncEngine.shared.inboxItems
         NSLog("[InboxStore] refresh via iCloud fetched=%d", fetched.count)
-        if shouldIgnoreTransientEmptySnapshot(
-            fetched: fetched,
-            snapshotLoaded: iCloudSyncEngine.shared.inboxSnapshotLoaded
-        ) {
-            NSLog("[InboxStore] ignoring transient empty iCloud inbox before first snapshot load known=%d current=%d", knownIDs.count, items.count)
-            bannerError = iCloudSyncEngine.shared.syncError
-            return
-        }
         applyFetchedItems(fetched, animated: animated, notifyNewArrivals: notifyNewArrivals)
-        if iCloudSyncEngine.shared.inboxSnapshotLoaded { hasLoadedSnapshot = true }
         bannerError = iCloudSyncEngine.shared.syncError
     }
 
@@ -76,7 +67,7 @@ final class InboxStore: ObservableObject {
         guard pairingStore.usesICloudTransport else { bannerError = "Pair to view"; return }
         do {
             _ = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: "dismiss")
-            await refresh(client: client, pairingStore: pairingStore)
+            applySyncedInboxFromSnapshot()
         } catch {
             bannerError = "Failed to dismiss: \(error.localizedDescription)"
         }
@@ -87,7 +78,7 @@ final class InboxStore: ObservableObject {
         do {
             let response = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: "act")
             openInteraction(response, id: id, actionID: "act")
-            await refresh(client: client, pairingStore: pairingStore)
+            applySyncedInboxFromSnapshot()
         } catch {
             bannerError = "Failed to act: \(error.localizedDescription)"
         }
@@ -98,8 +89,7 @@ final class InboxStore: ObservableObject {
         do {
             let response = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: actionID)
             openInteraction(response, id: id, actionID: actionID)
-            applySuccessfulLocalAction(id: id, actionID: actionID)
-            await refresh(client: client, pairingStore: pairingStore)
+            applySyncedInboxFromSnapshot()
         } catch {
             bannerError = "Failed: \(error.localizedDescription)"
         }
@@ -110,28 +100,6 @@ final class InboxStore: ObservableObject {
         MobileNotifiedChatSessionIntent.stage(session)
         NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: "chat")
         NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil, userInfo: ["screen": "chat"])
-    }
-
-    /// Project an already accepted Mac action while the next signed snapshot
-    /// catches up. This does not treat a transport acknowledgement as success.
-    func applySuccessfulLocalAction(id: String, actionID: String) {
-        let nextStatus: String?
-        switch actionID {
-        case "archive", "repair":
-            nextStatus = "archived"
-        case "dismiss":
-            nextStatus = "dismissed"
-        case "act", "approve", "reject", "deny", "read":
-            nextStatus = "read"
-        default:
-            nextStatus = nil
-        }
-        guard let nextStatus else { return }
-        let now = ISO8601DateFormatter().string(from: Date())
-        items = items.map { item in
-            guard item.id == id else { return item }
-            return item.replacingStatus(nextStatus, readAt: item.read_at ?? now)
-        }
     }
 
     func applyFetchedItems(
@@ -167,16 +135,7 @@ final class InboxStore: ObservableObject {
         knownIDs = fetchedIDs
         UserDefaults.standard.set(Array(Array(fetchedIDs).sorted().suffix(500)), forKey: "NativeAgentMobile.inboxKnownIDs")
 
-        if animated {
-            withAnimation(AppMotion.snappy) { items = fetched }
-        } else {
-            items = fetched
-        }
         scheduleLocalNotifications(notificationPlan)
-    }
-
-    func shouldIgnoreTransientEmptySnapshot(fetched: [InboxItemRecord], snapshotLoaded: Bool) -> Bool {
-        fetched.isEmpty && !snapshotLoaded && (!knownIDs.isEmpty || !items.isEmpty)
     }
 
     // MARK: - Local notifications
@@ -271,7 +230,7 @@ struct InboxView: View {
     @EnvironmentObject private var store: InboxStore
     private let sync = iCloudSyncEngine.shared
     @State private var groupFilter: InboxRelatedGroup?
-    @State private var selectedDetailItem: InboxItemRecord?
+    @State private var selectedDetailItemID: String?
     @State private var showsAllEarlier = false
 
     /// When `true` (the default — used by tab roots), wraps the content in a
@@ -353,15 +312,17 @@ struct InboxView: View {
         }
         .onDisappear { store.isVisible = false }
         .onAppear    { store.isVisible = true  }
-        .sheet(item: $selectedDetailItem) { item in
-            InboxDetailSheet(item: item, allItems: store.items, onOpenGroup: { group in
-                selectedDetailItem = nil
-                withAnimation(AppMotion.snappy) {
-                    groupFilter = group
-                    showsAllEarlier = false
+        .sheet(isPresented: Binding(get: { selectedDetailItemID != nil }, set: { if !$0 { selectedDetailItemID = nil } })) {
+            if let id = selectedDetailItemID {
+                InboxDetailSheet(itemID: id, onOpenGroup: { group in
+                    selectedDetailItemID = nil
+                    withAnimation(AppMotion.snappy) {
+                        groupFilter = group
+                        showsAllEarlier = false
+                    }
+                }) {
+                    selectedDetailItemID = nil
                 }
-            }) {
-                selectedDetailItem = nil
             }
         }
     }
@@ -377,7 +338,7 @@ struct InboxView: View {
                 )
             }
         }, onView: {
-            selectedDetailItem = item
+            selectedDetailItemID = item.id
         })
         .swipeActions(edge: .trailing) {
             Button("Dismiss") {
@@ -623,17 +584,14 @@ struct InboxCardRow: View {
 }
 
 struct InboxDetailSheet: View {
-    let item: InboxItemRecord
-    let allItems: [InboxItemRecord]
+    let itemID: String
     let onOpenGroup: (InboxRelatedGroup) -> Void
     let onDone: () -> Void
 
-    private var relatedGroups: [InboxRelatedGroup] {
-        InboxDetailGroupProjection.groups(item: item, allItems: allItems)
-    }
-
     var body: some View {
         NavigationStack {
+            Group {
+            if let item = iCloudSyncEngine.shared.inboxItems.first(where: { $0.id == itemID }) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     VStack(alignment: .leading, spacing: 8) {
@@ -663,6 +621,7 @@ struct InboxDetailSheet: View {
                             .aliveCard()
                     }
 
+                    let relatedGroups = InboxDetailGroupProjection.groups(item: item, allItems: iCloudSyncEngine.shared.inboxItems)
                     if !relatedGroups.isEmpty {
                         VStack(alignment: .leading, spacing: 10) {
                             AliveEyebrow("Related")
@@ -696,6 +655,10 @@ struct InboxDetailSheet: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
+            }
+            } else {
+                ContentUnavailableView("Item unavailable", systemImage: "tray")
+            }
             }
             .alivePageChrome(title: "Inbox Item", root: false)
             .toolbar {

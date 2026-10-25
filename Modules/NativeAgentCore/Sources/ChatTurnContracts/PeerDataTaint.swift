@@ -1,26 +1,12 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `PeerDataTaint.swift` | `PeerDataTaint` class; `withScope`, `mark` (latches any sender the owner does not trust, recognized or not, but their own `self` and bots), `markConsumed` (latches nothing: a read steers nothing), `elevate` (the person answered the run's card); one restore initializer retains provenance and answers without a read-latch marker; ability write refusal reads current origin principal and live/carried peer steering |
 
-/// TASK-LOCAL PROVENANCE FOR A PEER'S WORDS.
-///
-/// `agent_message` / `agent_read` already label their result
-/// `untrusted_remote_data: true` — but that label rode back into the ordinary
-/// tool loop as prose, where the model is free to act on it. A remote agent's
-/// reply is DATA, and the one thing data must never be is the authority for
-/// the next tool call.
-///
-/// So the label is bound to the TURN instead of to a string. The moment a turn
-/// consumes a peer result, this box latches; from then until the turn ends,
-/// `PeerDataTaintDispatcher` refuses the effect classes a peer could otherwise
-/// have talked the model into: local effects, durable memory/persona writes,
-/// disclosure reads, and external sends. The refusal says why, so the model
-/// relays the peer's request to the person instead of executing it.
-///
-/// The scope is exactly one turn: a task-local reference box, latched at most
-/// once, discarded when the turn's task tree ends. That IS the "until the next
-/// authenticated human turn" boundary — the next human turn starts with a
-/// fresh box. A durable successor of the same task restores its latched sources.
+/// Task-local origin steering and the person's answer for one run.
+/// Only a turn an untrusted agent starts is steered; reading words latches
+/// nothing. Its one card quotes the turn's input, and `elevate` ends the
+/// steering. Checkpoints retain both the provenance and the answered set.
 public final class PeerDataTaint: @unchecked Sendable {
     private let lock = NSLock()
     private var sources: [String] = []
@@ -29,29 +15,19 @@ public final class PeerDataTaint: @unchecked Sendable {
 
     public init() {}
 
-    public convenience init(restoring sources: [String]) {
+    /// Restore this run's provenance and the peers its card already covered.
+    public convenience init(restoring sources: [String], elevated: [String] = []) {
         self.init()
         let peers = Array(Set(sources.map(Self.principal))).sorted()
         for peer in peers {
             if Self.ownerTrusts(peer) { self.elevated.append(peer) }
             else { self.sources.append(peer) }
         }
-        restored = !peers.isEmpty
-    }
-
-    /// A steer an earlier turn carried in, not one this turn latched itself.
-    /// Set once, before the box is shared.
-    public private(set) var restored = false
-
-    /// A later turn under the steer an earlier one carried (`carried`): its
-    /// steering peers, and the peers the person's answer covered.
-    public convenience init(restoring sources: [String], elevated: [String]) {
-        self.init(restoring: sources)
         for peer in elevated { elevate(peer: peer) }
     }
 
     /// The steer this turn leaves on work it hands to a later one, a card or
-    /// a queued step (Wave 2 #8): its latched peers, the peer whose bridge
+    /// a queued step (Wave 2 #8): its origin peers, the peer whose bridge
     /// turn it is (`peerBridge`, which latches nothing of its own), and the
     /// peers the person elevated.
     public static func carried(peerBridge: Bool, peerID: String?) -> (sources: [String], elevated: [String]) {
@@ -107,7 +83,7 @@ public final class PeerDataTaint: @unchecked Sendable {
     /// The floor (senses, tools, skills, Trust) still holds.
     public func elevate(peer: String) {
         let name = Self.principal(peer.trimmingCharacters(in: .whitespacesAndNewlines))
-        guard Self.isAgent(name) else { return }
+        guard Self.steers(name) else { return }
         lock.lock(); defer { lock.unlock() }
         if !elevated.contains(name) { elevated.append(name) }
     }
@@ -152,7 +128,7 @@ public final class PeerDataTaint: @unchecked Sendable {
                     ?? (["agent", "peer"].contains(agent) ? "another agent" : agent))
             }
         }
-        return Array(Set(sources.filter { $0 != "self" && !$0.hasPrefix("bot:") && isAgent($0) })).sorted()
+        return Array(Set(sources.filter(steers))).sorted()
     }
 
     public static var abilityWriteCheck: @Sendable () -> String? {
@@ -181,24 +157,13 @@ public final class PeerDataTaint: @unchecked Sendable {
         }
     }
 
-    public static var ownerAuthorized: Bool {
-        let envelope = ChatToolSessionContext.envelope
-        return envelope?.agent == "peer"
-            && (envelope?.verifiedUserId.map { ownerTrusts("peer:" + $0) } ?? false)
-            && current?.isTainted != true
-    }
-
-    /// User 10-08: only an agent bridge he has not trusted can latch a turn.
-    /// Web, mail, files, memory, helpers, wakes and scheduled work never do;
-    /// the Trust mode's own gates are the only other approvals. Installed by
-    /// the engine (`PeerTrust`); until then only a peer handle counts.
-    public static var isAgent: @Sendable (String) -> Bool {
-        get { hookLock.withLock { agentHook } }
-        set { hookLock.withLock { agentHook = newValue } }
-    }
-    nonisolated(unsafe) private static var agentHook: @Sendable (String) -> Bool = {
-        $0.lowercased().hasPrefix("peer:") || ["another agent", "a remote peer", unrecorded].contains($0.lowercased())
-    }
+    /// User 10-08: only a sender he has not trusted can latch a run: an agent
+    /// that starts a turn, or a sender a wake names that is not allowlisted.
+    /// Web, mail, files, memory, helpers and scheduled work are never marked;
+    /// the Trust mode's own gates are the only other approvals. Her own hands
+    /// (`self`, her bots) never steer; any other form does, recognized or
+    /// not, since no one the person trusted is unrecognized.
+    static func steers(_ source: String) -> Bool { !source.isEmpty && source != "self" && !source.hasPrefix("bot:") }
 
     /// A latch names a who, never a label: whatever locator the body wrote
     /// (an attested id, a lane, a contact's name) is resolved to the one
@@ -216,7 +181,7 @@ public final class PeerDataTaint: @unchecked Sendable {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let name = Self.principal(trimmed)
-        guard Self.isAgent(name) else { return }
+        guard Self.steers(name) else { return }
         keep(line: line)
         let trusted = Self.ownerTrusts(name)
         lock.lock(); defer { lock.unlock() }
@@ -226,17 +191,6 @@ public final class PeerDataTaint: @unchecked Sendable {
         }
         guard !sources.contains(name) else { return }
         sources.append(name)
-    }
-
-    /// Carried elevation is an identity record for this run, not a saved
-    /// permission grant: the person answered the command's card.
-    public static func markElevated(peer: String, line: String = "") {
-        current?.markElevated(peer: peer, line: line)
-    }
-
-    public func markElevated(peer: String, line: String = "") {
-        keep(line: line)
-        elevate(peer: peer)
     }
 
     public var elevatedSources: [String] {

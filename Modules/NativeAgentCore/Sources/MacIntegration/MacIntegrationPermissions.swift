@@ -3,14 +3,17 @@ import NativeAgentShared
 import Speech
 import AVFoundation
 import ApplicationServices
+import CoreBluetooth
 import CoreGraphics
 import CoreLocation
 import EventKit
 import Contacts
 import OSLog
 import PersistenceCore
+import Photos
 import MacControl
 import UserNotifications
+// Blueprint: | `MacIntegrationPermissions.swift` | integration authority store plus one system-permission map for card admission, panes and checking; durable permission writes emit the existing root-scoped permission-change signal; kept Mac CoreLocation reader with a locked authorization cache and Location Services acquisition; Messages directory access probe, bundle-specific Automation verification, Trust-only categories left to Trust, and notification authorization |
 
 // MARK: - Mac Integration permissions
 //
@@ -57,9 +60,9 @@ public struct MacIntegrationPermissionReadiness: Sendable {
     public func refusal(integration: String, mode: MacIntegrationPermissionMode) -> String? {
         guard (mode == .read ? operatorReadOff : operatorWriteOff).contains(integration) else { return nil }
         if integration == MacIntegrationID.mail, mode == .write {
-            return "Mail Write is off by the operator's switch. I can write the draft text in chat or save it to a file. For Mail content, use mail.recent, mail.search or mail.read directly; do not open or screen-read Mail."
+            return "operator_permission_off: Mail Write is off. Only the owner can enable Trust > Mac > Apps and features > Mail > Write. For Mail content, use mail.recent, mail.search or mail.read; do not open or screen-read Mail."
         }
-        return "\(MacIntegrationID.displayName(for: integration)) \(mode.rawValue.capitalized) is off by the operator's switch; only the operator can turn it back on."
+        return "operator_permission_off: \(MacIntegrationID.displayName(for: integration)) \(mode.rawValue.capitalized) is off. Only the owner can enable Trust > Mac > Apps and features > \(MacIntegrationID.displayName(for: integration)) > \(mode.rawValue.capitalized)."
     }
 }
 
@@ -96,6 +99,7 @@ public enum MacIntegrationPermissionStoreError: Error, Sendable, Equatable, Loca
     case invalidRoot
     case invalidKnownEntry(String)
     case invalidKnownAxis(integrationID: String, axis: String)
+    case wouldGainAxes([String])
 
     public var errorDescription: String? {
         switch self {
@@ -109,6 +113,8 @@ public enum MacIntegrationPermissionStoreError: Error, Sendable, Equatable, Loca
             return "The saved Mac Integration permission for \(id) must be a JSON object."
         case .invalidKnownAxis(let id, let axis):
             return "The saved Mac Integration permission \(id).\(axis) must be a Boolean."
+        case .wouldGainAxes(let axes):
+            return "A lower-only permission change cannot give \(axes.joined(separator: " and ")) access."
         }
     }
 }
@@ -297,8 +303,7 @@ public actor MacIntegrationPermissionStore {
         self.dataRoot = defaultDataRoot()
     }
 
-    /// Test seam — pin a specific data root (and optionally a custom
-    /// persistence impl). Not used in production.
+    /// Pin the authority owner to the engine's data root.
     public init(dataRoot: URL, persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()) {
         self.persistence = persistence
         self.dataRoot = dataRoot
@@ -372,17 +377,18 @@ public actor MacIntegrationPermissionStore {
 
     // MARK: - Write
 
-    /// Persist a per-integration permission. Writes under flock via
-    /// PersistenceCore. Read/write are clamped to axis support so a caller
-    /// can't accidentally grant write to spotlight (or read to scheduler).
-    public func set(integrationId: String, read: Bool, write: Bool) async throws {
-        _ = try await setWithReceipt(
+    /// Persist only the selected axis; the other axis and its operator override
+    /// stay as freshly read under the authority file's lock.
+    @discardableResult
+    public func set(integrationId: String, read: Bool?, write: Bool?, onlyRemovingAxes: Bool = false) async throws -> MacIntegrationPermission {
+        try await setWithReceipt(
             integrationId: integrationId,
             read: read,
             write: write,
             actionID: UUID().uuidString.lowercased(),
             surface: "mac_ui",
-            provenance: .local()
+            provenance: .local(),
+            onlyRemovingAxes: onlyRemovingAxes
         )
     }
 
@@ -397,15 +403,18 @@ public actor MacIntegrationPermissionStore {
     /// grant the person had already given (and the mirror case revoked read).
     /// The merge happens inside the same lock as the read, so a concurrent
     /// grant on the other axis cannot be lost between them.
+    /// `onlyRemovingAxes` refuses any requested grant absent from the current
+    /// effective axes under that same lock, including explicit operator OFFs.
     @discardableResult
     public func setWithReceipt(
         integrationId: String,
-        read: Bool,
-        write: Bool,
+        read: Bool?,
+        write: Bool?,
         actionID: String,
         surface: String,
         provenance: MacIntegrationPermissionMutationProvenance,
-        onlyAddingAxes: Bool = false
+        onlyAddingAxes: Bool = false,
+        onlyRemovingAxes: Bool = false
     ) async throws -> MacIntegrationPermission {
         guard MacIntegrationID.all.contains(integrationId) else {
             throw NSError(
@@ -440,7 +449,7 @@ public actor MacIntegrationPermissionStore {
         }
 
         let path = storePath
-        return try await persistence.withFileLock(path) {
+        let permission = try await persistence.withFileLock(path) {
             // Read-modify-write inside the lock so concurrent writers don't
             // clobber each other's keys.
             // Missing is the only bootstrap-empty case. Existing unreadable,
@@ -455,24 +464,35 @@ public actor MacIntegrationPermissionStore {
                 let defaults = MacIntegrationID.defaultPermission(for: integrationId)
                 let beforeRead: Bool = {
                     guard MacIntegrationID.supportsRead(integrationId),
-                          case .bool(let value)? = current["read"] else { return defaults.read }
+                          case .bool(let value)? = current["read"] else { return onlyRemovingAxes ? false : defaults.read }
                     return value
                 }()
                 let beforeWrite: Bool = {
                     guard MacIntegrationID.supportsWrite(integrationId),
-                          case .bool(let value)? = current["write"] else { return defaults.write }
+                          case .bool(let value)? = current["write"] else { return onlyRemovingAxes ? false : defaults.write }
                     return value
                 }()
                 return MacIntegrationPermission(read: beforeRead, write: beforeWrite)
             }()
+            var overrides = Self.operatorOverrides(in: dict)
+            if onlyRemovingAxes {
+                var gained: [String] = []
+                if requestedRead == true, !effectiveBefore.read || overrides[integrationId]?["read"] == false {
+                    gained.append("read")
+                }
+                if requestedWrite == true, !effectiveBefore.write || overrides[integrationId]?["write"] == false {
+                    gained.append("write")
+                }
+                guard gained.isEmpty else { throw MacIntegrationPermissionStoreError.wouldGainAxes(gained) }
+            }
             // Additive writes merge onto the generation just read, under this
             // same lock, so the axis the card did not ask about survives.
             let clampedRead = onlyAddingAxes
-                ? (effectiveBefore.read || requestedRead)
-                : requestedRead
+                ? (effectiveBefore.read || requestedRead == true)
+                : requestedRead ?? effectiveBefore.read
             let clampedWrite = onlyAddingAxes
-                ? (effectiveBefore.write || requestedWrite)
-                : requestedWrite
+                ? (effectiveBefore.write || requestedWrite == true)
+                : requestedWrite ?? effectiveBefore.write
             var receipts: [JSONValue] = {
                 guard case .array(let rows)? = dict["_mutationReceipts"] else { return [] }
                 return rows
@@ -506,20 +526,19 @@ public actor MacIntegrationPermissionStore {
             // independently of the bounded receipt journal. Permission cards
             // only touch the axis they actually request. An agent may add an
             // untouched default, but cannot undo a person's explicit OFF.
-            var overrides = Self.operatorOverrides(in: dict)
             var integrationOverrides = overrides[integrationId] ?? [:]
             if provenance.kind == "agent" {
-                guard !(requestedRead && integrationOverrides["read"] == false),
-                      !(requestedWrite && integrationOverrides["write"] == false) else {
+                guard !(requestedRead == true && integrationOverrides["read"] == false),
+                      !(requestedWrite == true && integrationOverrides["write"] == false) else {
                     throw NSError(domain: "MacIntegrationPermissionStore", code: -4,
                         userInfo: [NSLocalizedDescriptionKey:
                             "The operator turned this permission off. Only an explicit operator choice can turn it back on."])
                 }
             } else {
-                if MacIntegrationID.supportsRead(integrationId), !onlyAddingAxes || requestedRead {
+                if MacIntegrationID.supportsRead(integrationId), let requestedRead, !onlyAddingAxes || requestedRead {
                     integrationOverrides["read"] = requestedRead
                 }
-                if MacIntegrationID.supportsWrite(integrationId), !onlyAddingAxes || requestedWrite {
+                if MacIntegrationID.supportsWrite(integrationId), let requestedWrite, !onlyAddingAxes || requestedWrite {
                     integrationOverrides["write"] = requestedWrite
                 }
             }
@@ -564,6 +583,8 @@ public actor MacIntegrationPermissionStore {
             try await self.persistence.writeJSON(.object(dict), to: path)
             return MacIntegrationPermission(read: clampedRead, write: clampedWrite)
         }
+        NotificationCenter.default.post(name: SystemPermissionPreflight.permissionDidChange, object: dataRoot)
+        return permission
     }
 
     // MARK: - Disk reader
@@ -779,6 +800,13 @@ public enum SystemPermissionCapability: String, CaseIterable, Sendable {
     case reminders
     case contacts
     case notifications
+    case bluetooth
+    case camera
+    case photos
+
+    /// The names `permissions.request` takes, read off this list so a new
+    /// class is offered the day it exists.
+    public static let requestable = allCases.filter { $0 != .automation }.map(\.rawValue).joined(separator: ", ")
 
     public var displayName: String {
         switch self {
@@ -794,6 +822,9 @@ public enum SystemPermissionCapability: String, CaseIterable, Sendable {
         case .reminders: return "Reminders"
         case .contacts: return "Contacts"
         case .notifications: return "Notifications"
+        case .bluetooth: return "Bluetooth"
+        case .camera: return "Camera"
+        case .photos: return "Photos"
         }
     }
 
@@ -812,6 +843,9 @@ public enum SystemPermissionCapability: String, CaseIterable, Sendable {
         case .reminders: return "Privacy_Reminders"
         case .contacts: return "Privacy_Contacts"
         case .notifications: return nil
+        case .bluetooth: return "Privacy_Bluetooth"
+        case .camera: return "Privacy_Camera"
+        case .photos: return "Privacy_Photos"
         }
     }
 }
@@ -895,6 +929,9 @@ public enum SystemPermissionPreflight {
         case "speech_recognition": return .speechRecognition
         case "microphone": return .microphone
         case "notifications", "notify_mac": return .notifications
+        case "bluetooth": return .bluetooth
+        case "camera": return .camera
+        case "photos": return .photos
         default: return nil
         }
     }
@@ -946,6 +983,30 @@ public enum SystemPermissionPreflight {
         case .microphone:
             switch AVCaptureDevice.authorizationStatus(for: .audio) {
             case .authorized: return .granted
+            case .denied: return .denied
+            case .restricted: return .restricted
+            case .notDetermined: return .notDetermined
+            @unknown default: return .unknown
+            }
+        case .camera:
+            switch AVCaptureDevice.authorizationStatus(for: .video) {
+            case .authorized: return .granted
+            case .denied: return .denied
+            case .restricted: return .restricted
+            case .notDetermined: return .notDetermined
+            @unknown default: return .unknown
+            }
+        case .bluetooth:
+            switch CBManager.authorization {
+            case .allowedAlways: return .granted
+            case .denied: return .denied
+            case .restricted: return .restricted
+            case .notDetermined: return .notDetermined
+            @unknown default: return .unknown
+            }
+        case .photos:
+            switch PHPhotoLibrary.authorizationStatus(for: .readWrite) {
+            case .authorized, .limited: return .granted
             case .denied: return .denied
             case .restricted: return .restricted
             case .notDetermined: return .notDetermined
@@ -1107,11 +1168,12 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
     private let manager = CLLocationManager()
     private var waiters: [CheckedContinuation<JSONValue, Never>] = []
     private var deadline: Task<Void, Never>?
-    /// The kept manager's status, readable from any thread; a manager made per
-    /// read answered notDetermined for a moment after launch.
+    /// The kept manager's status, protected by statusLock on every thread; a
+    /// manager made per read answered notDetermined for a moment after launch.
+    nonisolated private static let statusLock = NSLock()
     nonisolated(unsafe) private static var knownStatus: CLAuthorizationStatus?
     public nonisolated static var authorizationStatus: CLAuthorizationStatus {
-        if let knownStatus { return knownStatus }
+        if let knownStatus = statusLock.withLock({ knownStatus }) { return knownStatus }
         Task { @MainActor in _ = shared }
         return CLLocationManager().authorizationStatus
     }
@@ -1124,7 +1186,7 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
         super.init()
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyKilometer
-        Self.knownStatus = manager.authorizationStatus
+        Self.statusLock.withLock { Self.knownStatus = manager.authorizationStatus }
     }
 
     public static func requestAuthorization() {
@@ -1168,7 +1230,7 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
     }
 
     public func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        Self.knownStatus = manager.authorizationStatus
+        Self.statusLock.withLock { Self.knownStatus = manager.authorizationStatus }
         // A card waiting on this permission settles on the answer, whoever gave it.
         NotificationCenter.default.post(name: SystemPermissionPreflight.permissionDidChange, object: nil)
     }

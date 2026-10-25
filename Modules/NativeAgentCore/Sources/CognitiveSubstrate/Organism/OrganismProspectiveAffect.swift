@@ -11,6 +11,8 @@
 
 import Foundation
 
+// Blueprint: | `OrganismProspectiveAffect.swift` | `OrganismProspectiveAffect`: pure prediction/horizon modulation of projected chemistry, without changing stored chemical state |
+
 enum OrganismProspectiveAffect {
 
     // MARK: - Tuning knobs (the ONE prospective surface)
@@ -196,7 +198,7 @@ enum OrganismProspectiveAffect {
     //   canonicalToken("tool.<toolName>")  →  "tool-<dashed-tool-name>"
     // (OrganismPredictiveBody.upsertPending → pendingID; CognitiveSomaticSignalAdapter
     // .sourceOrgan(for:) is the SOLE producer of the "tool.<toolName>" form — it forwards
-    // metadata["toolName"], which is the real chat-tool name, e.g. "github_get_issue",
+    // metadata["toolName"], which is the real chat-tool name, e.g. "git_log",
     // "recall_memory", "mac_calendar_create_event"). We strip the "tool-" prefix and take
     // the tool name's leading family segment as the group word. The family prefix is,
     // by the tool catalog's own naming convention (SwiftToolDispatcher+*ToolCatalog —
@@ -205,20 +207,16 @@ enum OrganismProspectiveAffect {
     //
     // GROUP MAPPING TABLE (family segment → group word; fallback = the family segment
     // itself, which is already a real consumable word):
-    //   github_*                    → "github"      (github family verbatim)
     //   git, git_*                  → "git"
     //   desk_*                      → "desk"
     //   mail_*                      → "mail"
-    //   agentmail_*                 → "mail"        (email tools; "agentmail" is a machine prefix)
     //   recall_*  (recall_memory…)  → "memory"      (operate on the memory store)
     //   commit_memory               → "memory"
     //   mac_<x>_*  (calendar/…)     → <x>           (mac_ is a heterogeneous shell; the
     //                                                second segment — calendar, reminders,
     //                                                spotlight, focus, notify, quit — is the
     //                                                content-bearing word, not "mac")
-    //   tradingview_*               → "market"
-    //   market_*                    → "market"
-    //   music_/notes_/contacts_/messages_/slack_/persona_/mission_/scheduler_/context_/x_/agent_/…
+    //   music_/notes_/contacts_/messages_/slack_/persona_/mission_/scheduler_/context_/agent_/…
     //                               → family verbatim (already the real word)
     //   bare "tool" (no toolName)   → "tools"        (a live-but-unnamed tool expectation)
     // Overrides collapse machine prefixes onto the human word; everything else falls
@@ -263,22 +261,14 @@ enum OrganismProspectiveAffect {
         guard let family = segments.first, !family.isEmpty else { return "tools" }
 
         switch family {
-        case "github": return "github"
         case "git": return "git"
-        case "agentmail": return "mail"
         case "recall", "commit": return "memory"
-        case "tradingview": return "market"
         // Verb-prefixed core tools (gpt-5.5 review LOW, 2026-07-10): the bare
         // first segment ("read", "write", "list", "apply") is a weak query
         // word — map them onto the content word their outputs co-occur with.
         case "read", "write", "list", "glob", "grep", "apply": return "files"
         case "shell", "bash", "exec": return "shell"
         case "invoke": return "agents"
-        case "mcp":
-            // mcp__<server>__<tool> canonicalizes to mcp-<server>-…; the server
-            // name is the content-bearing segment.
-            if segments.count >= 2, !segments[1].isEmpty { return segments[1] }
-            return "tools"
         case "mac":
             // mac_<domain>_* — the domain segment (calendar/reminders/spotlight/focus/
             // notify/quit) is the content word; "mac" alone matches nothing useful.

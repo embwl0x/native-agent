@@ -1,9 +1,11 @@
 import Foundation
+import MemoryV2
 import Observation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
+// Blueprint: | `Onboarding.swift` | Typed onboarding client; durable completion/reset transactions, profile repair and recovery verdicts; profile preparation/commits use PersonaEngine, USER commits use UserMDGenerator; starter notes append through the persona document owner's lock |
 
 /// Settings sends an explicit replay edge to the main-content tour mount.
 @MainActor
@@ -227,6 +229,8 @@ public enum OnboardingError: Error, Sendable, Equatable, LocalizedError {
 
 // MARK: - SwiftNative
 
+/// Completion/reset controls are excluded from local backup/export and
+/// phone sync, listed in PrivacyMap. Domain owners commit profile and USER.
 public struct SwiftNativeOnboardingClient: Sendable {
     private let personaRoot: URL
     private let dataRoot: URL
@@ -960,9 +964,9 @@ public struct SwiftNativeOnboardingClient: Sendable {
 
     /// What a USER.md on disk actually is.
     ///
-    /// USER.md has two writers with opposite meanings. Onboarding writes it
-    /// once from a persona template (prose about the user). `UserMDGenerator`
-    /// then OWNS it: every regeneration replaces the whole file with an
+    /// UserMDGenerator commits USER.md from two content sources. Onboarding
+    /// supplies the initial persona template (prose about the user), then
+    /// `UserMDGenerator` renders every regeneration with an
     /// `<!-- USER_MD_AUTOGEN_START -->…END` body (a heading plus one bullet
     /// per active, recall-eligible, durable memory whose kind is in the
     /// person-kind allowlist — see `userIdentityKinds` in
@@ -970,7 +974,7 @@ public struct SwiftNativeOnboardingClient: Sendable {
     /// `<!-- USER_PREAMBLE_START -->…END` region if one is already there.
     ///
     /// So the only thing USER.md's content can prove is which of those two
-    /// wrote it last — never that onboarding completed. See the `startOnboarding`
+    /// supplied it last — never that onboarding completed. See the `startOnboarding`
     /// comment for why no gate treats it as proof.
     enum UserDocShape: Equatable {
         /// No file. Nothing to protect, nothing to prove.
@@ -1353,7 +1357,18 @@ public struct SwiftNativeOnboardingClient: Sendable {
             throw OnboardingError.ioFailure("\(path.lastPathComponent) disappeared after onboarding transaction preparation")
         }
 
-        try atomicWriteText(intent.content, to: path)
+        if intent.role == "profile" || intent.role == "user" {
+            do {
+                if intent.role == "user" {
+                    try UserMDGenerator.atomicReplaceIfChanged(intent.content, existingBytes: nil, at: path)
+                } else {
+                    try SwiftNativePersonaEngine.atomicWriteText(intent.content, to: path)
+                }
+            }
+            catch { throw OnboardingError.ioFailure("write \(path.lastPathComponent) failed: \(error.localizedDescription)") }
+        } else {
+            try atomicWriteText(intent.content, to: path)
+        }
         let committed = try Data(contentsOf: path)
         guard sha256(committed) == intent.sha256 else {
             throw OnboardingError.ioFailure("\(path.lastPathComponent) failed post-write verification")
@@ -1397,82 +1412,15 @@ public struct SwiftNativeOnboardingClient: Sendable {
         }
     }
 
-    private struct ProfileUpdatePlan: Sendable {
-        let content: String
-        let baseSHA256: String?
-    }
-
-    /// Strictly load + normalize profile.json and prepare its exact replacement
-    /// bytes. Existing malformed/non-object JSON is never treated as `{}`:
-    /// those bytes may be important user state and are preserved fail-closed.
-    ///
-    /// Uses `PersonaCompiler.normalize` + `CompiledPersonalityProfile` for the
-    /// normalization step — same canonical seed `default_personality()` and
-    /// same field-level caps the daemon applies on every `personality()` read.
     private static func makeProfileUpdatePlan(
-        profilePath: URL,
-        agentName: String,
-        personaType: String,
-        userName: String
-    ) throws -> ProfileUpdatePlan {
-        var raw: [String: Any] = [:]
-        var baseSHA256: String?
-        if FileManager.default.fileExists(atPath: profilePath.path) {
-            let data: Data
-            do {
-                data = try Data(contentsOf: profilePath)
-            } catch {
-                throw OnboardingError.ioFailure("read existing profile.json failed: \(error.localizedDescription)")
-            }
-            baseSHA256 = sha256(data)
-            let decoded: Any
-            do {
-                decoded = try JSONSerialization.jsonObject(with: data)
-            } catch {
-                throw OnboardingError.ioFailure("existing profile.json is malformed; preserving original bytes")
-            }
-            guard let object = decoded as? [String: Any] else {
-                throw OnboardingError.ioFailure("existing profile.json is not an object; preserving original bytes")
-            }
-            raw = object
+        profilePath: URL, agentName: String, personaType: String, userName: String
+    ) throws -> (content: String, baseSHA256: String?) {
+        do {
+            return try SwiftNativePersonaEngine.onboardingProfileUpdate(
+                profilePath: profilePath, agentName: agentName, personaType: personaType, userName: userName)
+        } catch let PersonaWriteError.ioFailure(detail) {
+            throw OnboardingError.ioFailure(detail)
         }
-        // First normalize to current canonical shape.
-        let current = PersonaCompiler.normalize(raw: raw, defaults: .defaults)
-
-        // Override fields per Python L20343-L20347.
-        let kindMap: [String: String] = ["female": "Female", "male": "Male", "ai": "AI"]
-        let newKind = kindMap[personaType] ?? "AI"
-        let voiceMap: [String: String] = [
-            "female": "Warm, observational, judgment-forward.",
-            "male": "Direct, dry, holds ground.",
-            "ai": "Precise, characterful, honest.",
-        ]
-        let newVoice = voiceMap[personaType] ?? voiceMap["ai"]!
-
-        // Build the on-disk dict. Re-runs normalize semantics: save_personality
-        // in Python does {existing ∪ body} → normalize → write. We constructed
-        // `current` from normalize(raw) so it already matches the
-        // first-normalize step; now apply body overrides and normalize once more.
-        var merged = SwiftNativePersonaEngine.profileToRawDict(current)
-        merged["name"] = agentName
-        merged["personaKind"] = newKind
-        merged["voice"] = newVoice
-        merged["updatedAt"] = NativeTimestampFormat.fractionalZulu(Date())
-        let renormalized = PersonaCompiler.normalize(raw: merged, defaults: .defaults)
-        var finalDict = SwiftNativePersonaEngine.profileToRawDict(renormalized)
-        // The USER's name (not the agent's `name`). Injected AFTER normalize so
-        // it survives regardless of the compiler's known-key set — the substrate
-        // reads this to address the user in her inner voice (never hardcode a
-        // name in the capsule/reflection cues). Trimmed; empty → omit.
-        let trimmedUserName = userName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedUserName.isEmpty {
-            finalDict["userName"] = trimmedUserName
-        }
-
-        let json = JSONValue(fromFoundation: finalDict)
-        let bytes = try json.serializedData(pretty: false)
-        let text = String(decoding: bytes, as: UTF8.self)
-        return ProfileUpdatePlan(content: text, baseSHA256: baseSHA256)
     }
 
     /// `<dataRoot>/memory/profile.json` → `name` (the daemon data root, NOT
@@ -1518,7 +1466,7 @@ public struct SwiftNativeOnboardingClient: Sendable {
         AbilityOverviewEntry(
             id: "connectors",
             title: "Connect services",
-            detail: "Optional providers and connectors for chat models, Telegram, GitHub, email, calendar, and more.",
+            detail: "Optional providers and connectors for chat models, Telegram, email, calendar, and more.",
             systemImage: "point.3.connected.trianglepath.dotted"
         ),
         AbilityOverviewEntry(
@@ -1550,7 +1498,7 @@ extension SwiftNativeOnboardingClient {
         notes: String,
         complete: (String, String) async throws -> OnboardingCompleteResult,
         reload: () async -> [PersonaDocSpec]?,
-        save: (String, String) async -> Bool,
+        append: (String, String) async -> Bool,
         failureMessage: (Error) -> String
     ) async -> StarterOutcome {
         do {
@@ -1574,9 +1522,11 @@ extension SwiftNativeOnboardingClient {
                 return .created
             }
 
-            let draft = soul.content + "\n\n## From setup\n" + trimmedNotes + "\n"
-            guard await save(soul.id, draft) else {
-                return .notesUnsaved(documentID: soul.id, draft: draft)
+            let section = "\n\n## From setup\n" + trimmedNotes + "\n"
+            // Only the section crosses the suspension; the append owner reads
+            // the current SOUL under its write lock. The snapshot is for recovery only.
+            guard await append(soul.id, section) else {
+                return .notesUnsaved(documentID: soul.id, draft: soul.content + section)
             }
             return .created
         } catch {

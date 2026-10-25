@@ -2,6 +2,7 @@ import Foundation
 import CoreServices
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MacAppIndex.swift` | One in-process live Spotlight metadata query over local volumes; rows excluding bundles inside packages materialize only on gathering/update edges on its owning queue; cancellation removes async initial-gather waiters; startup failure retires query/tokens and completes gathering once; terminal `shutdown()` closes admission, stops query/tokens and finishes streams on that queue (engine caller integration remains required); sync/async reads and exact lookup share kept rows; newest-only edges emit when bundle id/version/path changes; actionable index failures propagate; `mac.apps` names its Spotlight source; Launch Services remains the launch fallback after an index miss |
 
 /// The Mac's app index, kept live by Spotlight. No app is opened or activated.
 public final class MacAppIndex: @unchecked Sendable {
@@ -74,6 +75,9 @@ public final class MacAppIndex: @unchecked Sendable {
     private var snapshot: [App]?
     private var observers: [NSObjectProtocol] = []
     private var listeners: [UUID: AsyncStream<Void>.Continuation] = [:]
+    private var gathering = true
+    private var stopped = false
+    private var gatherWaiters: [UUID: AsyncThrowingStream<Void, Error>.Continuation] = [:]
 
     private init() {
         gathered.enter()
@@ -84,8 +88,9 @@ public final class MacAppIndex: @unchecked Sendable {
             MDQuerySetDispatchQueue(query, queue)
             for name in [kMDQueryDidFinishNotification, kMDQueryDidUpdateNotification] {
                 observers.append(NotificationCenter.default.addObserver(forName: Notification.Name(name! as String), object: query, queue: nil) { [self] notification in
+                    guard !stopped, failure == nil else { return }
                     let changed = materialize()
-                    if notification.name.rawValue == kMDQueryDidFinishNotification as String { gathered.leave() }
+                    if notification.name.rawValue == kMDQueryDidFinishNotification as String { finishGather() }
                     if changed { for continuation in listeners.values { continuation.yield(()) } }
                 })
             }
@@ -95,31 +100,97 @@ public final class MacAppIndex: @unchecked Sendable {
 
     private func failedToStart() {
         failure = MacControlError.ioFailure("The Mac's app index could not start. Check Spotlight indexing in System Settings → Spotlight, then try again.")
+        stopQuery()
+        finishGather()
+    }
+
+    private func finishGather() {
+        guard gathering else { return }
+        gathering = false
         gathered.leave()
+        let pending = Array(gatherWaiters.values)
+        gatherWaiters.removeAll()
+        for waiter in pending { waiter.finish(throwing: failure) }
+    }
+
+    private func initialGather() async throws {
+        try Task.checkCancellation()
+        let id = UUID()
+        let (stream, continuation) = AsyncThrowingStream<Void, Error>.makeStream()
+        continuation.onTermination = { [self] _ in queue.async { self.gatherWaiters[id] = nil } }
+        // Enqueue registration before entering the cancellable stream wait, so
+        // its termination removal cannot overtake insertion.
+        queue.async { [self] in
+            if gathering { gatherWaiters[id] = continuation }
+            else { continuation.finish(throwing: failure) }
+        }
+        for try await _ in stream {}
+        try Task.checkCancellation()
+    }
+
+    private func stopQuery() {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
+        if let query { MDQueryStop(query) }
+        query = nil
+    }
+
+    /// Terminal domain shutdown. Session/view stop does not own this resident
+    /// query; the engine termination drain must call this explicitly.
+    public func shutdown() async {
+        await withCheckedContinuation { done in
+            queue.async { [self] in
+                stopped = true
+                failure = failure ?? CancellationError()
+                stopQuery()
+                finishGather()
+                listeners.values.forEach { $0.finish() }
+                listeners.removeAll()
+                rows.removeAll()
+                snapshotLock.withLock { snapshot = nil }
+                done.resume()
+            }
+        }
     }
 
     /// Initial gathering and subsequent updates use this same query.
     public func changes() async throws -> AsyncStream<Void> {
-        try await withCheckedThrowingContinuation { result in
-            gathered.notify(queue: queue) { [self] in
-                if let failure { return result.resume(throwing: failure) }
-                let id = UUID()
-                result.resume(returning: AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-                    listeners[id] = continuation
-                    continuation.yield(())
-                    continuation.onTermination = { [self] _ in queue.async { self.listeners[id] = nil } }
-                })
-            }
+        try await initialGather()
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        continuation.onTermination = { [self] _ in queue.async { self.listeners[id] = nil } }
+        do {
+            return try await withTaskCancellationHandler(operation: { () async throws -> AsyncStream<Void> in
+                try Task.checkCancellation()
+                let answer: AsyncStream<Void> = try await withCheckedThrowingContinuation { (result: CheckedContinuation<AsyncStream<Void>, Error>) in
+                    queue.async { [self] in
+                        if let failure { return result.resume(throwing: failure) }
+                        guard case .enqueued = continuation.yield(()) else {
+                            result.resume(throwing: CancellationError()); return
+                        }
+                        listeners[id] = continuation
+                        result.resume(returning: stream)
+                    }
+                }
+                try Task.checkCancellation()
+                return answer
+            }, onCancel: { continuation.finish() })
+        } catch {
+            continuation.finish()
+            throw error
         }
     }
 
     public func apps() async throws -> [App] {
-        try await withCheckedThrowingContinuation { result in
-            gathered.notify(queue: queue) { [self] in
+        try await initialGather()
+        let answer: [App] = try await withCheckedThrowingContinuation { result in
+            queue.async { [self] in
                 if let failure { result.resume(throwing: failure) }
                 else { result.resume(returning: rows) }
             }
         }
+        try Task.checkCancellation()
+        return answer
     }
 
     /// The kept rows if the first gather has finished, else nil: a lookup on a hot

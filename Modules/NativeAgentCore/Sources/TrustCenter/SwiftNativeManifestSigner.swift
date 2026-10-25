@@ -1,22 +1,22 @@
 import Foundation
 import CryptoKit
+import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SwiftNativeManifestSigner.swift` | `SwiftNativeManifestSigner` actor; 32-byte regular 0600 signing authority with explicit backup/export/sync/privacy decisions; `canonicalBytes`, `compactCanonicalJSON`, read-only `existingSigningKey` for proof checks |
 
 // MARK: - SwiftNativeManifestSigner
 //
-// Swift-native manifest signing and verification. Canonical byte behavior is
-// pinned by TrustCenterTests against staged signing keys.
+// Owns tools/.manifest_signing_key: exactly 32 binary bytes, regular 0600 file.
+// Local backup includes it; export and phone sync exclude it. PrivacyMap counts it under Tools, including hidden files.
 
 public enum ManifestSigningError: Error, LocalizedError {
     case canonicalizationFailed(String)
     case keyUnavailable(String)
-    case ioFailed(String)
 
     public var errorDescription: String? {
         switch self {
-        case .canonicalizationFailed(let m): return "manifest signing: canonicalization failed: \(m)"
-        case .keyUnavailable(let m): return "manifest signing: key unavailable: \(m)"
-        case .ioFailed(let m): return "manifest signing: io failed: \(m)"
+        case .canonicalizationFailed(let m): return "manifest_canonicalization_failed: \(m). Replace the named value in the signing input with a finite JSON number before signing."
+        case .keyUnavailable(let m): return "manifest_signing_key_unavailable: \(m). Ask the owner to repair or restore the original 32-byte signing key as a regular 0600 file at tools/.manifest_signing_key; never replace an existing signing identity."
         }
     }
 }
@@ -43,7 +43,7 @@ public actor SwiftNativeManifestSigner {
         body.removeValue(forKey: "signedAt")
         body["signatureVersion"] = .int(2)
         var out = String()
-        try encode(.object(body), into: &out)
+        try encode(.object(body), into: &out, path: "$")
         return Data(out.utf8)
     }
 
@@ -55,11 +55,11 @@ public actor SwiftNativeManifestSigner {
     /// stay identical to `capability_pack_signature()`.
     public static func compactCanonicalJSON(_ value: JSONValue) throws -> Data {
         var out = String()
-        try encode(value, into: &out)
+        try encode(value, into: &out, path: "$")
         return Data(out.utf8)
     }
 
-    private static func encode(_ value: JSONValue, into out: inout String) throws {
+    private static func encode(_ value: JSONValue, into out: inout String, path: String) throws {
         switch value {
         case .null:
             out += "null"
@@ -69,7 +69,10 @@ public actor SwiftNativeManifestSigner {
             out += String(i)
         case .double(let d):
             if !d.isFinite {
-                throw ManifestSigningError.canonicalizationFailed("non-finite double")
+                throw ToolFailureError("Signing input has a non-finite number at \(path). Replace it with a finite JSON number; keep any existing signing key.",
+                    argumentPath: path, accepted: "A finite JSON number.", effects: .unknown,
+                    code: "manifest_canonicalization_failed",
+                    instruction: "Replace the named value with a finite JSON number before signing; preserve any existing signing key.", recovery: .correctArguments)
             }
             if d == d.rounded() && abs(d) < 1e16 {
                 out += String(format: "%.1f", d)
@@ -82,7 +85,7 @@ public actor SwiftNativeManifestSigner {
             out += "["
             for (i, el) in arr.enumerated() {
                 if i > 0 { out += "," }
-                try encode(el, into: &out)
+                try encode(el, into: &out, path: "\(path)[\(i)]")
             }
             out += "]"
         case .object(let dict):
@@ -94,7 +97,9 @@ public actor SwiftNativeManifestSigner {
                 if i > 0 { out += "," }
                 JSONValue.encodeString(k, into: &out)
                 out += ":"
-                try encode(dict[k]!, into: &out)
+                var key = String()
+                JSONValue.encodeString(k, into: &key)
+                try encode(dict[k]!, into: &out, path: "\(path)[\(key)]")
             }
             out += "}"
         }
@@ -102,23 +107,36 @@ public actor SwiftNativeManifestSigner {
 
     // MARK: - key
 
-    /// Load the exact regular 0600 signing key, or durably create it when and
-    /// only when the key is missing. Existing invalid authority is unavailable
-    /// and remains byte-preserved; it is never silently rotated.
+    /// Exactly 32 regular 0600 bytes; create only if missing. Invalid authority stays
+    /// byte-preserved and unavailable, never rotated. Local backup carries tools;
+    /// off-disk backup, export and phone sync exclude the key. PrivacyMap lists tools.
     public func loadOrCreateSigningKey() throws -> Data {
-        let keyPath = dataRoot
-            .appendingPathComponent("tools", isDirectory: true)
-            .appendingPathComponent(".manifest_signing_key")
         do {
             return try CheckedFixedSizeSecretFile.loadOrCreate(at: keyPath, byteCount: 32) {
                 let key = SymmetricKey(size: .bits256)
                 return key.withUnsafeBytes { Data($0) }
             }
-        } catch let error as CheckedFixedSizeSecretFile.Unavailable {
-            throw ManifestSigningError.keyUnavailable(error.localizedDescription)
         } catch {
-            throw ManifestSigningError.keyUnavailable(error.localizedDescription)
+            throw signingKeyFailure(error, effects: .unknown)
         }
+    }
+
+    private nonisolated func signingKeyFailure(_ error: any Error, effects: ToolFailureError.Effects) -> ToolFailureError {
+        ToolFailureError("Manifest signing key is unavailable: \(error.localizedDescription)",
+            effects: effects, owner: keyPath.path,
+            tap: "Finder > Go > Go to Folder > \(keyPath.deletingLastPathComponent().path) > .manifest_signing_key > Get Info",
+            code: "manifest_signing_key_unavailable",
+            instruction: "Ask the owner to repair or restore the original 32-byte signing key as a regular 0600 file; never replace an existing signing identity.")
+    }
+
+    /// Local backup only; excluded from production export and phone sync.
+    /// PrivacyMap lists tools as nonexportable. Metadata watches use this path.
+    public nonisolated var keyPath: URL { dataRoot.appendingPathComponent("tools/.manifest_signing_key") }
+
+    /// Read-only proof checks never create signing authority.
+    public nonisolated func existingSigningKey() throws -> Data? {
+        do { return try CheckedFixedSizeSecretFile.peekExisting(at: keyPath, byteCount: 32) }
+        catch { throw signingKeyFailure(error, effects: .none) }
     }
 
     // MARK: - sign / verify
@@ -127,8 +145,8 @@ public actor SwiftNativeManifestSigner {
         var signed = manifest
         signed["signatureVersion"] = .int(2)
         signed["signedAt"] = .string(Self.isoTimestamp(clock()))
-        let keyData = try loadOrCreateSigningKey()
         let canonical = try Self.canonicalBytes(signed)
+        let keyData = try loadOrCreateSigningKey()
         let mac = HMAC<SHA256>.authenticationCode(
             for: canonical, using: SymmetricKey(data: keyData)
         )
@@ -154,9 +172,12 @@ public actor SwiftNativeManifestSigner {
         if ver != "2" {
             return ["Manifest signatureVersion must be 2."]
         }
-        guard let keyData = try CheckedFixedSizeSecretFile.peekExisting(
-            at: dataRoot.appendingPathComponent("tools/.manifest_signing_key"), byteCount: 32) else {
-            throw ManifestSigningError.keyUnavailable("Signing authority is missing. Restore the original key or validate a new candidate; verification never creates authority.")
+        guard let keyData = try existingSigningKey() else {
+            throw ToolFailureError("Manifest signing authority is missing; verification never creates it.",
+                effects: .none, owner: keyPath.path,
+                tap: "Finder > Go > Go to Folder > \(keyPath.deletingLastPathComponent().path) > .manifest_signing_key",
+                code: "manifest_signing_key_missing",
+                instruction: "Ask the owner to restore the original 32-byte signing key as a regular 0600 file; verification cannot establish a new identity.")
         }
         let canonical = try Self.canonicalBytes(manifest)
         let mac = HMAC<SHA256>.authenticationCode(

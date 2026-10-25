@@ -1,11 +1,13 @@
 import Foundation
 import ApprovalInbox
+import ChatTurnRuntime
 import ChatSessionWork
 import NativeAgentCore
 import PersistenceCore
 import Privacy
 import TelegramBot
 import Transcripts
+// Blueprint: | `ApprovalChatCards.swift` | Approval-card projection and notifications; transcript appends delegate to the chat owner, projection generations to ChatSessionIndexFile |
 
 /// User, 10-03: "any approval the agent needs should pop right up in chat."
 ///
@@ -85,27 +87,25 @@ public enum ApprovalChatCards {
     /// never a button: Telegram cannot show the whole script.
     private static func promptTelegram(_ record: ApprovalRecord, telegram: TelegramApprovalFiler, dataRoot: URL) async {
         guard !telegramPrompted(record), let owner = ownerDM(dataRoot: dataRoot) else { return }
+        guard !Task.isCancelled else { return }
         do {
             try await telegram.promptChatCard(redactedForTelegram(record), chatId: owner,
                                               payload: NativeAppSecretRedactor.redactArguments(decisionPayload(record)))
-            var mark: [String: JSONValue] = ["telegramPromptedAt": .string(ISO8601DateFormatter().string(from: Date()))]
-            if record.action != SwiftNativeApprovalInbox.skillScriptInstallAction {
-                mark["telegramChatId"] = .string(String(owner))
-            }
-            try await SwiftNativeApprovalInbox(root: dataRoot).markChatCard(record.id, mark)
         } catch {
             nativeLog("[approval-chat-card] Telegram prompt failed: %@", error.localizedDescription)
         }
     }
 
-    /// When the bot starts: each pending approval that never reached User's DM
-    /// gets its prompt, once.
+    /// When the bot starts: pending approvals and inline cards missing delivery
+    /// get their prompt once; delivered inline cards finish outstanding settlement.
     public static func promptPending(dataRoot: URL, telegram: TelegramApprovalFiler) async {
         guard let rows = try? await SwiftNativeApprovalInbox(root: dataRoot).list(filter: ApprovalFilter(status: "pending"))
         else { return }
         for row in rows where !row.isAgentsOwnDecision {
+            guard !Task.isCancelled else { return }
             await promptTelegram(row, telegram: telegram, dataRoot: dataRoot)
         }
+        await promptPendingInteractions(dataRoot: dataRoot, telegram: telegram)
     }
 
     /// Delivered to his DM: marked only after the send succeeded.
@@ -203,38 +203,18 @@ public enum ApprovalChatCards {
         let path = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
             .appendingPathComponent("\(sessionID).jsonl")
         let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            if let uniqueRunID {
-                let rows = try await persistence.readJSONL(path)
-                guard !rows.contains(where: {
-                    guard case .object(let existing) = $0 else { return false }
-                    return existing["runId"] == .string(uniqueRunID)
-                }) else { return }
-                try await persistence.appendJSONLDurable(row, to: path)
-            } else {
-                try await persistence.appendJSONL(row, to: path)
-            }
-        }
+        try await SwiftNativeChatOrchestrationClient.appendTranscriptRow(
+            row, to: path, persistence: persistence, uniqueRunID: uniqueRunID)
         await publishTranscriptChanges(sessionIDs: [sessionID], dataRoot: dataRoot)
     }
 
     /// Card projections change without a new message. Advance the same version
     /// the phone's transcript cache and ordering already consume.
     static func publishTranscriptChanges(sessionIDs: Set<String>, dataRoot: URL) async {
-        let path = dataRoot.appendingPathComponent("chat/sessions.json")
         let persistence = SwiftNativePersistenceCore()
         do {
-            try await persistence.withFileLock(path) {
-                var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
-                var changed = false
-                for index in rows.indices {
-                    guard case .string(let id)? = rows[index]["id"], sessionIDs.contains(id) else { continue }
-                    changed = ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index]) || changed
-                }
-                guard changed else { return }
-                try await persistence.writeDataAtomicDurable(
-                    ChatSessionIndexFile.serializedData(for: rows), to: path)
-            }
+            try await ChatSessionIndexFile.recordProjectionChanges(
+                sessionIDs: sessionIDs, dataRoot: dataRoot, persistence: persistence)
         } catch {
             nativeLog("[approval-chat-card] transcript generation bump failed: %@", error.localizedDescription)
         }

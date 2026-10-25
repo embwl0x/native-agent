@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceActionReadback.swift` | `AgentWorkspaceActionReadback` enum; `dispatchEffect`, `followUp` |
 
 /// Completes an already-dispatched action with its owner's current view. This
 /// never repeats an effect, changes tabs, or replaces a receipt with a claim of
@@ -96,7 +97,7 @@ enum AgentWorkspaceActionReadback {
         }
         if (owner["ok"] == .bool(true) || status == "ok" || status == "completed"),
            owner["error"] == nil, owner["error_code"] == nil,
-           ["write_file", "save_skill", "commit_memory", "desk_note", "desk_update_item", "desk_set_status", "desk_add_ref", "desk_add_item", "bot_create", "bot_update", "bot_pause"].contains(tool) {
+           ["write_file", "commit_memory", "desk_note", "desk_update_item", "desk_set_status", "desk_add_ref", "desk_add_item", "bot_create", "bot_update", "bot_pause"].contains(tool) {
             var source = AgentWorkspaceEnvironment.readback(tool: tool, input: input)
             if tool == "bot_create", let id = string(owner["id"]), UUID(uuidString: id) != nil {
                 source = .record(tool: "bot_list", input: ["id": .string(id)], title: string(owner["name"]) ?? "Created helper")
@@ -136,19 +137,11 @@ enum AgentWorkspaceActionReadback {
         var readInput: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
         var location = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot", input: readInput, title: title)
         do {
+            // The read waits for Chrome to finish loading the tab.
             var snapshot = try await perform("browser.chrome_snapshot", readInput)
             guard matches(snapshot, tab: tab, sequence: sequence) else {
                 return .init(location: location, result: unavailable(receipt: receipt,
                     detail: "The action returned, but its exact page could not be read. Read this page again to continue; the action will not be repeated.", observation: snapshot))
-            }
-            if object(object(snapshot)["rendering"] ?? .null)["readyState"] == .string("loading") {
-                try await Task.sleep(nanoseconds: 350_000_000)
-                let next = try await perform("browser.chrome_snapshot", readInput)
-                if matches(next, tab: tab, sequence: sequence) { snapshot = next }
-                else {
-                    return .init(location: location, result: unavailable(receipt: receipt,
-                        detail: "The page changed while loading. Read this page again to continue; the action will not be repeated.", observation: next))
-                }
             }
             let snapshotRow = object(snapshot)
             let reading = object(snapshotRow["reading"] ?? .null)

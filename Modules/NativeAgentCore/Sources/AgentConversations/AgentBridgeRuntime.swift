@@ -3,6 +3,7 @@ import CryptoKit
 import PersistenceCore
 import MacControl
 import Darwin
+// Blueprint: | `AgentBridgeRuntime.swift` | `AgentBridgeRuntime` enum; helper discovery and shared execution; wake-runner process identity; OMP reply-job recovery |
 
 /// Discovery and helper execution for the external coding organs NativeAgent
 /// may invoke. This owner does not authenticate, install software, grant
@@ -29,6 +30,7 @@ public enum AgentBridgeRuntime {
         let dataRoot = PersistenceCore.defaultDataRoot()
         guard AgentConversationDelivery.lane(for: "omp", dataRoot: dataRoot) != nil else { return }
         var environment = AgentBridgeRuntime.processEnvironment()
+        environment["NATIVE_AGENT_DATA_ROOT"] = dataRoot.path
         let configRoot = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
         environment.merge(InstallPaths.current.bridgeEnvironment(configRoot: configRoot)) { existing, _ in existing }
         let directory = environment["NATIVE_AGENT_OMP_BRIDGE_DIR"].map { URL(fileURLWithPath: $0) }
@@ -89,6 +91,12 @@ public enum AgentBridgeRuntime {
             environment["NATIVE_AGENT_AGENT_NAME"] = environment["NATIVE_AGENT_AGENT_NAME"] ?? names.agent
             environment["NATIVE_AGENT_USER_NAME"] = environment["NATIVE_AGENT_USER_NAME"] ?? names.user
         }
+        var inspectionArgs: [String: JSONValue] = [:]
+        if case .object(let payload) = try? JSONValue.parse(inputData), case .string(let id)? = payload["messageId"] {
+            inspectionArgs["message_id"] = .string(id)
+        }
+        let inspection: JSONValue = .object(["tool": .string("app"), "input": .object([
+            "action": .string("agent.jobs"), "args": .object(inspectionArgs)])])
         let result: ProcessRunResult
         do {
             result = try await SystemProcessAdapter().run(
@@ -102,44 +110,50 @@ public enum AgentBridgeRuntime {
             )
         } catch is CancellationError {
             return .object([
-                "status": .string("failed"),
+                "status": .string("cancelled"),
                 "reason": .string("helper_cancelled"),
                 "helper": .string(helper.path),
                 "admissionOutcome": .string("unknown"),
-                "message": .string("The helper was cancelled after possible dispatch. Inspect the original message's delegation status before any resend."),
+                "effects": .string("unknown"),
+                "detail": .string("The helper was cancelled; work admission is unconfirmed."),
+                "remedy": Repair.reconcile(instruction: "Inspect the original message's job before any resend.", nextCall: inspection),
             ])
         } catch {
             return .object([
                 "status": .string("failed"),
-                "reason": .string("helper_spawn_failed"),
+                "reason": .string("helper_process_failed"),
                 "helper": .string(helper.path),
+                "admissionOutcome": .string("unknown"), "effects": .string("unknown"),
                 "error": .string(String(describing: error)),
+                "detail": .string("The helper process failed; work admission is unconfirmed."),
+                "remedy": Repair.reconcile(instruction: "Inspect the original message's job before any resend.", nextCall: inspection),
             ])
         }
 
-        return builderWakeupHelperReceipt(result: result, helper: helper)
+        return builderWakeupHelperReceipt(result: result, helper: helper, inspection: inspection)
     }
 
     /// Pure interpretation of the shared process owner's evidence. A helper
     /// exit code is never a substitute for its structured admission receipt.
-    private static func builderWakeupHelperReceipt(result: ProcessRunResult, helper: URL) -> JSONValue {
+    private static func builderWakeupHelperReceipt(result: ProcessRunResult, helper: URL, inspection: JSONValue) -> JSONValue {
         let stderrText = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-        func unavailable(_ reason: String) -> JSONValue {
+        func unavailable(_ reason: String, _ detail: String) -> JSONValue {
             var envelope: [String: JSONValue] = [
                 "status": .string("failed"),
                 "reason": .string(reason),
                 "helper": .string(helper.path),
                 "exitCode": .int(Int64(result.exitCode)),
                 "admissionOutcome": .string("unknown"),
-                "note": .string("No trustworthy helper receipt was received. Work may already have been admitted; inspect the original message's delegation status before any resend."),
+                "effects": .string("unknown"), "detail": .string(detail + " Work admission is unconfirmed."),
+                "remedy": Repair.reconcile(instruction: "Inspect the original message's job before any resend.", nextCall: inspection),
             ]
             if !stderrText.isEmpty {
                 envelope["stderrPreview"] = .string(String(stderrText.prefix(500)))
             }
             return .object(envelope)
         }
-        if result.timedOut { return unavailable("helper_timeout") }
-        if result.stdoutTruncated { return unavailable("helper_output_truncated") }
+        if result.timedOut { return unavailable("helper_timeout", "The helper exceeded its execution deadline.") }
+        if result.stdoutTruncated { return unavailable("helper_output_truncated", "The helper's output exceeded its byte limit.") }
 
         let stdoutText = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         let lastLine = stdoutText.split(separator: "\n").last.map(String.init) ?? ""
@@ -149,15 +163,15 @@ public enum AgentBridgeRuntime {
             .compactMap { $0.data(using: .utf8) }
             .compactMap { try? JSONValue.parse($0) }
             .first
-        guard let parsed else { return unavailable("helper_returned_no_json") }
+        guard let parsed else { return unavailable("helper_returned_no_json", "The helper returned no JSON receipt.") }
         guard case .object(var object) = parsed,
               case .string(let status)? = object["status"],
               !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return unavailable("helper_invalid_receipt")
+            return unavailable("helper_invalid_receipt", "The helper receipt has no nonempty status.")
         }
         if result.exitCode != 0 && !["failed", "skipped"].contains(status) {
-            guard case .object(var failure) = unavailable("helper_exit_conflict") else {
-                return unavailable("helper_exit_conflict")
+            guard case .object(var failure) = unavailable("helper_exit_conflict", "The helper's exit code contradicts its receipt.") else {
+                return unavailable("helper_exit_conflict", "The helper's exit code contradicts its receipt.")
             }
             failure["helperReportedReceipt"] = parsed
             return .object(failure)

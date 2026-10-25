@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ApprovalInbox
+// Blueprint: | `ChatApprovalContracts.swift` | `AutonomyDecision` enum |
 
 // MARK: - AutonomyDecision
 

@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
+// Blueprint: | `SchedulerDueJobRunner+CycleHelpers.swift` | `SchedulerDueJobRunner`: `pruneRetiredRows`, `nextEpoch`, `containsLastRunToday`; dream/REM diary and inbox helpers |
 
 extension SchedulerDueJobRunner {
     /// Keep recent one-shot completions; held outcomes are never age-retired.
@@ -10,6 +11,7 @@ extension SchedulerDueJobRunner {
 
     static func pruneRetiredRows(
         _ rows: [JSONValue],
+        liveActions: Set<String>,
         now: Date
     ) -> (rows: [JSONValue], retired: [JSONValue]) {
         var kept: [JSONValue] = []
@@ -30,6 +32,17 @@ extension SchedulerDueJobRunner {
                 || (!enabled && SchedulerJobRuntime.string(obj["completedAt"]) == nil
                     && !(SchedulerJobRuntime.string(obj["disabledReason"]) ?? "").isEmpty) {
                 kept.append(row)
+                continue
+            }
+            // A job naming a gone action pauses whole, so she can replace it with what she grows.
+            if enabled, JobKind(rawValue: kind) == .connectorAction, case .object(let payload)? = obj["payload"],
+               let action = SchedulerJobRuntime.string(payload["actionId"]) ?? SchedulerJobRuntime.string(payload["action_id"]),
+               !liveActions.contains(action) {
+                var paused = obj
+                paused["enabled"] = .bool(false)
+                paused["pausedAt"] = .string(NativeTimestampFormat.fractionalZulu(now))
+                paused["disabledReason"] = .string("its action \(action) is gone; grow an ability for it and schedule that instead")
+                kept.append(.object(paused))
                 continue
             }
             let lastRun = SchedulerJobRuntime.string(obj["lastRunAt"]).flatMap(parseISODate)
@@ -152,7 +165,9 @@ extension SchedulerDueJobRunner {
     }
 
     static func extractDreamTitleAndSummary(_ text: String) -> (title: String, summary: String) {
-        let lines = text
+        // A day's entry can hold several dream sections; the receipt names the newest.
+        let newest = text.range(of: "\n## ", options: .backwards).map { String(text[$0.lowerBound...]) } ?? text
+        let lines = newest
             .split(whereSeparator: \.isNewline)
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -195,14 +210,14 @@ extension SchedulerDueJobRunner {
             }
             lines.append("No dream file was created. Repair remains owed; app mind.dream runs the pass again.")
             if sessionsProcessed > 0 {
-                lines.append("Recent sessions scanned: \(sessionsProcessed).")
+                lines.append("Recent conversations scanned: \(sessionsProcessed).")
             }
         } else if entriesWritten > 0 {
-            lines.append("Dream cycle wrote \(entriesWritten) entr\(entriesWritten == 1 ? "y" : "ies") across \(sessionsProcessed) recent session\(sessionsProcessed == 1 ? "" : "s").")
+            lines.append("Dream cycle wrote \(entriesWritten) entr\(entriesWritten == 1 ? "y" : "ies") across \(sessionsProcessed) recent conversation\(sessionsProcessed == 1 ? "" : "s").")
         } else {
             lines.append("Dream cycle ran, but there were no new dream entries to write.")
             if sessionsProcessed > 0 {
-                lines.append("Recent sessions scanned: \(sessionsProcessed).")
+                lines.append("Recent conversations scanned: \(sessionsProcessed).")
             }
         }
         for entry in entries.prefix(3) {

@@ -3,6 +3,7 @@ import Transcripts
 import CognitiveSubstrate
 import NativeAgentCore
 import TrustCenter
+// Blueprint: | `TurnRequest.swift` | `TurnRequest`: shared turn binding; `TurnAdmission`: per-session serialization, bounded admission queues and release/cancellation capacity signals for durable arrivals |
 
 enum TurnRelevanceContext {
     @TaskLocal static var queryUserMessage: String?
@@ -125,7 +126,7 @@ public struct TurnRequest: Sendable {
             // The turn's input is the agent's words: the card quotes them.
             taint.keep(line: message)
             for source in sources { taint.mark(peer: source) }
-            for source in origin.elevatedPeerSources ?? [] { taint.markElevated(peer: source) }
+            for source in origin.elevatedPeerSources ?? [] { taint.elevate(peer: source) }
             // Recorded steering, including an empty record, is authoritative.
             return try await Self.bound(PeerDataTaint.$current, taint) {
                 try await bindContext(operation)
@@ -250,7 +251,7 @@ public actor TurnAdmission {
     /// conversations (`restorationComplete`), a new turn in one waits here:
     /// nothing new is admitted there ahead of what was already said.
     private var restoring = true
-    private var heldWhileRestoring: [CheckedContinuation<Void, Never>] = []
+    private var heldWhileRestoring: [UUID: CheckedContinuation<Void, Error>] = [:]
 
     public struct Full: LocalizedError {
         public var errorDescription: String? { "This chat has too many waiting turns. No new turn was started." }
@@ -293,7 +294,7 @@ public actor TurnAdmission {
     /// The launch recovery has restored every contact conversation's backlog.
     public func restorationComplete() {
         restoring = false
-        let held = heldWhileRestoring
+        let held = heldWhileRestoring.values
         heldWhileRestoring.removeAll()
         for continuation in held { continuation.resume() }
     }
@@ -320,8 +321,16 @@ public actor TurnAdmission {
     private func acquire(_ key: String, id: UUID, runID: String?, waitForCapacity: Bool) async throws {
         try Task.checkCancellation()
         while restoring, ChatSessionRetention.isContactSession(key), !(runID.map { backlog[key]?.contains($0) == true } ?? false) {
-            await withCheckedContinuation { heldWhileRestoring.append($0) }
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    if Task.isCancelled { continuation.resume(throwing: CancellationError()) }
+                    else { heldWhileRestoring[id] = continuation }
+                }
+            } onCancel: {
+                Task { await self.cancel(key, id: id) }
+            }
         }
+        try Task.checkCancellation()
         while active[key] != nil || !admissible(key, runID: runID) {
             let hasCapacity = (waiting[key]?.count ?? 0) < 8 && waiting.values.reduce(0, { $0 + $1.count }) < 32
             guard hasCapacity || waitForCapacity else { throw Full() }
@@ -344,6 +353,10 @@ public actor TurnAdmission {
     }
 
     private func cancel(_ key: String, id: UUID) {
+        if let continuation = heldWhileRestoring.removeValue(forKey: id) {
+            continuation.resume(throwing: CancellationError())
+            return
+        }
         if let continuation = capacityWaiters.removeValue(forKey: id) {
             continuation.resume(throwing: CancellationError())
             return

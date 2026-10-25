@@ -1,14 +1,38 @@
-import ChatOrchestration
+import Dispatcher
+import ChatTurnRuntime
+import ChatTurnContracts
 import Foundation
 import PersistenceCore
 import Studio
+import TrustCenter
+import MemoryV2
+
+// Blueprint: | `AppToolExecutor+Make.swift` | `AppToolExecutor` Make actions: studio ref reads/writes, intake reads and reply image attachment behind the workspace fence |
 
 extension AppToolExecutor {
+    @MainActor
+    func runStudioIntakeRead(input: [String: JSONValue], surface: String) async -> JSONValue {
+        guard MemoryRecordDisclosurePolicy.localPrivateSurfaces.contains(MemoryRecordDisclosurePolicy.canonicalSurface(surface)) else {
+            return Self.failure("private_surface_required", "Studio intake is available only on private surfaces.")
+        }
+        let root = securityCenter.dataRoot
+        do {
+            let offset: Int
+            if case .int(let value)? = input["offset"], let exact = Int(exactly: value) { offset = exact }
+            else if input["offset"] == nil { offset = 0 }
+            else { throw PersistenceCoreError.ioFailure("Studio intake offset must be an integer.") }
+            return try await SwiftNativeStudioStore(dataRoot: root).encounterIntakePage(
+                kind: Self.inputString(input["kind"]) ?? "", offset: offset, snapshot: Self.inputString(input["snapshot"]))
+        } catch {
+            return Self.failure("studio_intake_unavailable", error.localizedDescription, extra: ["effects": .string("none")])
+        }
+    }
+
     /// make.add and make.read, in process: the Make studio's refs and their
     /// versions (`MakeStudio`), which the Work pane's Make tab shows.
     @MainActor
     func runMake(verb: String, input: [String: JSONValue]) async -> JSONValue {
-        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let root = securityCenter.dataRoot
         let studio = MakeStudio(dataRoot: root)
         let ref = Self.inputString(input["ref"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         if verb == "read" {
@@ -32,25 +56,38 @@ extension AppToolExecutor {
                 }),
             ]
             // What the shelf could not read stays on the receipt beside what it could.
-            if let fault = MakeStudio.Shelf.shared.fault { receipt["shelf_fault"] = .string(fault) }
+            if let fault = quietHost()?.makeShelfFault { receipt["shelf_fault"] = .string(fault) }
             return .object(receipt)
         }
         let path = Self.inputString(input["path"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !path.isEmpty else { return Self.failure("invalid_input", "Pass path: the file to add to Make.") }
-        let fullMac = await Self.freshQuietPosture(dataRoot: root)?.name == Self.fullMacModeName
         let file: URL
-        switch await Self.fencedAttachment(path, fullMac: fullMac, dataRoot: root) {
-        case .success(let found): file = found
-        case .failure(let refusal): return Self.failure(refusal.reason, refusal.detail)
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+        if MakeStudio.generatedImagePaths.contains(candidate.path),
+           (try? candidate.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true,
+           !connectorPathIsSensitiveData(candidate, dataRoot: root) {
+            // Only the native receipt's actual outputs have this provenance;
+            // every arbitrary file still goes through the workspace fence.
+            file = candidate
+        } else {
+            switch await SwiftNativeSecurityCenter.fencedAttachment(path, dataRoot: root) {
+            case .success(let found): file = found
+            case .failure(let refusal): return Self.failure(refusal.reason, refusal.detail)
+            }
         }
         do {
-            let added = try studio.add(file, ref: ref.isEmpty ? nil : ref)
+            let added = try studio.add(file, ref: ref.isEmpty ? nil : ref,
+                prompt: Self.inputString(input["prompt"]), model: Self.inputString(input["model"]))
             return .object(["status": .string("ok"), "ref": .string(added.ref), "version": .int(Int64(added.version.n)),
                             "path": .string(studio.url(added.ref, added.version).path)])
         } catch let refusal as MakeStudio.Refusal {
-            return Self.failure(refusal.reason, refusal.message)
+            return Self.doorRefusal(refusal.reason, refusal.message, remedy: "inspect",
+                "Read Make's latest retained piece before choosing a destination; omit ref only for a new piece.",
+                next: ["action": .string("make.read")])
         } catch {
-            return Self.failure("make_show_failed", error.localizedDescription + " Nothing was added.", extra: ["effects": .string("unknown")])
+            return Self.ownedFailure(error, code: "make_add_failed", owner: studio.root.path,
+                instruction: "Read Make's retained versions and resolve the reported storage error before adding another copy; this add was not verified.",
+                next: ["action": .string("make.read"), "args": .object(ref.isEmpty ? [:] : ["ref": .string(ref)])], effects: .unknown)
         }
     }
 
@@ -64,8 +101,7 @@ extension AppToolExecutor {
             return Self.failure("no_reply", "Only a turn answering a conversation has a reply to attach to. Nothing was attached.")
         }
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let fullMac = await Self.freshQuietPosture(dataRoot: root)?.name == Self.fullMacModeName
-        switch await Self.fencedAttachment(path, fullMac: fullMac, dataRoot: root) {
+        switch await SwiftNativeSecurityCenter.fencedAttachment(path, dataRoot: root) {
         case .failure(let refusal): return Self.failure(refusal.reason, refusal.detail)
         case .success(let file):
             guard ChatGeneratedImageArtifacts.attachment(file) != nil else {

@@ -1,41 +1,15 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import Skills
+import PersonaEngine
 import ToolRegistry
 import WorkflowOrchestration
+// Blueprint: | `CapabilityRecords+Dynamic.swift` | Read-only capability projections; workflow and catalog registries use their owners' checked schemas, never default over damaged saved state |
 
-// MARK: - Wave 13: dynamic source ports for capability_records() aggregator
-//
-// Byte-shape ports of the 7 dynamic Python sources called by the
-// capability_records() aggregator at the retired daemon
-// (read 2026-05-31):
-//
-//   1. InstalledSkillInventory (canonical registry and body inventory)
-//   3. list_tools
-//   4. manifest_registered_skills
-//   5. list_workflows
-//   6. list_mcp_servers
-//   7. list_capability_catalog
-//
-// Each returns a list-of-dicts in Python; here we return [JSONValue.object]
-// because the aggregator only consumes ~6 well-known keys per source and
-// the on-disk records are schema-loose (any extra daemon-written keys
-// round-trip via the dict bag — preserving lossless re-emit).
-//
-// Read-side semantics mirror Python exactly:
-//   - read_json with default [] / {} (PersistenceCore.readJSON)
-//   - sort key + DESC ordering matches Python's sorted(...)
-//   - default merge (R-M-W) is honored on the four read-then-write paths
-//     (#3 list_tools is read-only; #4 manifest_registered_skills is also
-//     read-only — it just merges two existing files into one in-memory dict)
-//
-// The two on-disk-merge sources (catalog_sources, capability_trust_roots)
-// are in CapabilityCatalog.swift because they need write+flock symmetry.
-// list_workflows / list_mcp_servers / list_capability_catalog also do
-// read-merge-write per the Python — those WRITES are intentionally NOT
-// reproduced in Swift (read-only port to keep the aggregator side-effect
-// free; the daemon still writes when it serves its own routes).
+// Read-only capability aggregation. Authored parts and saved workflow templates
+// come from their owners; extra JSON fields remain intact in the projections.
+// WorkflowOrchestration alone reads, validates and mutates the workflow registry.
 
 // MARK: - Helpers (file-local)
 
@@ -148,7 +122,8 @@ public func listTools(
     dataRoot: URL,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
 ) async throws -> [[String: JSONValue]] {
-    try ToolRegistryActions.entries(dataRoot: dataRoot).compactMap {
+    guard case .array(let rows) = try AbilityStore(dataRoot: dataRoot).registry(kind: .part) else { return [] }
+    return rows.compactMap {
         if case .object(let fields) = $0 { return fields }
         return nil
     }.sorted { lhs, rhs in
@@ -160,41 +135,22 @@ public func listTools(
 
 // MARK: - Source #5: list_workflows
 //
-// Reads <dataRoot>/workflows/registry.json with WorkflowOrchestration's
-// defaults, unchanged-seed migration and merge. The workflow client owns
-// write-back; capability aggregation only reads the sorted projection.
+// Reads saved <dataRoot>/workflows/registry.json rows through WorkflowOrchestration's
+// checked schema and stable timestamp sort. Neither listing nor capability
+// aggregation seeds defaults or writes the registry.
 public func listWorkflows(
     dataRoot: URL,
-    nowISO: String,
-    persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
+    nowISO: String
 ) async throws -> [[String: JSONValue]] {
-    let path = dataRoot
-        .appendingPathComponent("workflows", isDirectory: true)
-        .appendingPathComponent("registry.json")
-    let raw = try await persistence.readJSON(path, ifMissing: .array([]))
-    let saved: [JSONValue]
-    if case .array(let items) = raw {
-        saved = items
-    } else {
-        saved = []
-    }
-    let defaults = WorkflowDefaults.defaults(now: nowISO)
-    return WorkflowMerge.mergeRegistry(defaults: defaults, saved: saved).sorted.compactMap {
+    try SwiftNativeWorkflowOrchestrationClient.readProjection(dataRoot: dataRoot, nowISO: nowISO).compactMap {
         if case .object(let record) = $0 { return record }
         return nil
     }
 }
 
-// MARK: - Source #6: list_mcp_servers
-//
-// The MCP owner lists its servers (MCPDispatcher's `listMCPServersAsDicts`);
-// the caller hands that listing in, so TrustCenter imports no executor.
-
 // MARK: - Source #7: list_capability_catalog
 //
-// Port of the retired daemon. Reads <dataRoot>/catalog/registry.json,
-// merges with default_catalog_items() (4 entries), sorts by name/id ascending.
-// READ-ONLY in Swift (Python writes back; carve documented same as workflows).
+// Read the catalog owner's checked schema, merge defaults, sort by name/id.
 public func listCapabilityCatalog(
     dataRoot: URL,
     nowISO: String,
@@ -203,16 +159,7 @@ public func listCapabilityCatalog(
     let path = dataRoot
         .appendingPathComponent("catalog", isDirectory: true)
         .appendingPathComponent("registry.json")
-    let raw = try await persistence.readJSON(path, ifMissing: .array([]))
-    let savedDicts: [[String: JSONValue]]
-    if case .array(let items) = raw {
-        savedDicts = items.compactMap {
-            if case .object(let o) = $0 { return o }
-            return nil
-        }
-    } else {
-        savedDicts = []
-    }
+    let savedDicts = try await CapabilityCatalogStoreReader.loadRegistryChecked(path, persistence: persistence)
 
     var byID: [String: [String: JSONValue]] = [:]
     for item in savedDicts {
@@ -246,7 +193,7 @@ public func listCapabilityCatalog(
     }
 }
 
-/// Port of the retired daemon default_catalog_items(). Four
+/// Port of the retired daemon default_catalog_items(). Three
 /// static catalog items. `nowISO` is the static `now_iso()` stamp.
 public func defaultCatalogItems(nowISO: String) -> [[String: JSONValue]] {
     let now: JSONValue = .string(nowISO)
@@ -269,17 +216,6 @@ public func defaultCatalogItems(nowISO: String) -> [[String: JSONValue]] {
             "description": .string("Templates for approval-gated multi-step workflows and run receipts."),
             "status": .string("available"),
             "riskClass": .string("app_data_write"),
-            "installed": .bool(false),
-            "provenance": .string("nativeagent-foundation"),
-            "createdAt": now,
-        ],
-        [
-            "id": .string("mcp-builder-pack"),
-            "name": .string("MCP Builder Pack"),
-            "kind": .string("connector_pack"),
-            "description": .string("Scaffolds MCP server entries and readiness checks without autoloading them into chat."),
-            "status": .string("available"),
-            "riskClass": .string("network_localhost"),
             "installed": .bool(false),
             "provenance": .string("nativeagent-foundation"),
             "createdAt": now,
@@ -310,10 +246,8 @@ private func capabilityTrustMetadata(_ source: [String: JSONValue]) -> [String: 
 //   1. feature_surface_records (19)
 //   2. InstalledSkillInventory                                    (kind: skill)
 //   3. list_tools()[:150]                                            (kind: tool)
-//   4. manifest_registered_skills().get("skills", {})[:150]          (kind: tool|skill)
 //   5. list_workflows()[:100]                                        (kind: workflow)
 //   6. connector_actions_registry().actions[:200]                    (kind: tool)
-//   7. list_mcp_servers()[:50]                                       (kind: mcp)
 //   8. list_capability_catalog()                                     (kind: catalog)
 //
 // Final sort: by str(updatedAt or name or "") DESC.
@@ -322,8 +256,7 @@ public func capabilityRecordsFull(
     personaRoot: URL? = nil,
     nowISO: String,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
-    connectorActionStatuses: @Sendable () async throws -> [String: String],
-    mcpServers: @Sendable () async throws -> [[String: JSONValue]]
+    connectorActionStatuses: @Sendable () async throws -> [String: String]
 ) async throws -> [[String: JSONValue]] {
 
     var records: [[String: JSONValue]] = []
@@ -409,49 +342,9 @@ public func capabilityRecordsFull(
         records.append(rec)
     }
 
-    // 4. manifest_registered_skills → kind: tool|skill
-    for entry in skills.prefix(150) {
-        let manifestName = entry.name
-        let entryObj = entry.row
-        // kind = entry.type or entry.kind or "skill"
-        let kindRaw = jsonString(entryObj, "type").isEmpty
-            ? (jsonString(entryObj, "kind").isEmpty ? "skill" : jsonString(entryObj, "kind"))
-            : jsonString(entryObj, "type")
-        var rec = capabilityTrustMetadata(entryObj)
-        rec["id"] = .string("manifest:\(manifestName)")
-        rec["sourceId"] = .string(manifestName)
-        let nameRaw = jsonString(entryObj, "name")
-        rec["name"] = .string(
-            promptSafeCapabilityText(nameRaw.isEmpty ? manifestName : nameRaw, limit: 160)
-        )
-        rec["kind"] = .string(kindRaw == "tool" ? "tool" : "skill")
-        // status = entry.state or entry.status or "drafted"
-        let entryStatus = jsonString(entryObj, "state").isEmpty
-            ? (jsonString(entryObj, "status").isEmpty ? "drafted" : jsonString(entryObj, "status"))
-            : jsonString(entryObj, "state")
-        rec["status"] = .string(entryStatus)
-        let descRaw = jsonString(entryObj, "description")
-        let descSource = descRaw.isEmpty ? "Manifest-registered \(kindRaw)." : descRaw
-        rec["description"] = .string(
-            promptSafeCapabilityText(descSource, limit: 500)
-        )
-        let triggers = jsonStringArray(entryObj, "triggers")
-        rec["triggers"] = triggers.isEmpty
-            ? .array([.string(manifestName)])
-            : .array(triggers.map { .string($0) })
-        let perms = jsonStringArray(entryObj, "permissions")
-        rec["permissions"] = .array(perms.map { .string($0) })
-        rec["riskClass"] = .string(kindRaw == "tool" ? "manifest_tool" : "instruction")
-        rec["autoload"] = .bool(false)
-        let updated = jsonString(entryObj, "updatedAt")
-        let installed = jsonString(entryObj, "installedAt")
-        rec["updatedAt"] = .string(updated.isEmpty ? installed : updated)
-        records.append(rec)
-    }
-
     // 5. list_workflows → kind: workflow
     let workflows = try await listWorkflows(
-        dataRoot: dataRoot, nowISO: nowISO, persistence: persistence
+        dataRoot: dataRoot, nowISO: nowISO
     )
     for workflow in workflows.prefix(100) {
         var rec = capabilityTrustMetadata(workflow)
@@ -515,41 +408,6 @@ public func capabilityRecordsFull(
         rec["lastUsedAt"] = .null
         // Python: action.get("updatedAt") — static actions have no updatedAt
         rec["updatedAt"] = .null
-        records.append(rec)
-    }
-
-    // 7. list_mcp_servers → kind: mcp
-    let servers = try await mcpServers()
-    for server in servers.prefix(50) {
-        var rec = capabilityTrustMetadata(server)
-        let sid = jsonString(server, "id")
-        rec["id"] = .string("mcp:\(sid)")
-        rec["sourceId"] = .string(sid)
-        rec["name"] = server["name"] ?? .null
-        rec["kind"] = .string("mcp")
-        // status = server.status or server.healthStatus or "configured"
-        let sstat = jsonString(server, "status")
-        let shealth = jsonString(server, "healthStatus")
-        let resolvedSStatus = !sstat.isEmpty ? sstat :
-            (!shealth.isEmpty ? shealth : "configured")
-        rec["status"] = .string(resolvedSStatus)
-        // description = f"{transport} MCP endpoint with {toolCount} tool(s)."
-        let transport = jsonString(server, "transport")
-        let toolCount = jsonInt(server, "toolCount")
-        rec["description"] = .string("\(transport) MCP endpoint with \(toolCount) tool(s).")
-        rec["triggers"] = .array([server["name"] ?? .null])
-        // permissions: ["network_localhost"] if transport != stdio else []
-        rec["permissions"] = transport != "stdio"
-            ? .array([.string("network_localhost")])
-            : .array([])
-        let riskClass = jsonString(server, "riskClass")
-        rec["riskClass"] = .string(riskClass.isEmpty ? "network_localhost" : riskClass)
-        rec["autoload"] = .bool(false)
-        rec["useCount"] = .int(0)
-        rec["lastUsedAt"] = .null
-        let updated = jsonString(server, "updatedAt")
-        let created = jsonString(server, "createdAt")
-        rec["updatedAt"] = .string(updated.isEmpty ? created : updated)
         records.append(rec)
     }
 

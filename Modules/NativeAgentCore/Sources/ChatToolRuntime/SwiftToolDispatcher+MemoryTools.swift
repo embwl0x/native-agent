@@ -6,9 +6,7 @@ import PersistenceCore
 import TurnTrace
 import ToolRegistry
 import MemoryV2
-import MCPDispatcher
 import Context
-import KnowledgeGraph
 import PersonaEngine
 import ProviderRouting
 import TrustCenter
@@ -17,10 +15,31 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
+// Blueprint: | `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`: `cappedRecallK`, `recallHitsJSON`, `provenanceMetadata` |
 
 // MARK: - Memory tools
 
 extension SwiftToolDispatcher {
+    /// Project typed memory causes through the shared tool envelope.
+    static func memoryFailure(_ error: any Error) -> JSONValue {
+        let cause: any Error
+        switch error {
+        case let error as MemoryV2Error: cause = error.failure
+        case let error as MemoryStorageError: cause = error.failure
+        case let error as EmbeddingError: cause = error.failure
+        case let error as UserMDGeneratorError: cause = error.failure
+        case let error as MemoryConsolidationGateError: cause = error.failure
+        default: cause = error
+        }
+        let result = ChatToolOutcome.failure(error: cause)
+        if case .object(var fields) = result,
+           let storage = error as? MemoryStorageError, let evidence = storage.epochEvidence {
+            fields["evidence"] = evidence
+            return .object(fields)
+        }
+        return result
+    }
+
     static let maxRecallK: Int = 20
     /// Total `content` character budget across one recall result set.
     /// Full content rides along for the top-ranked hits until the budget
@@ -241,13 +260,14 @@ extension SwiftToolDispatcher {
                 payload: .object(response.timings.mapValues { .double($0) }))
         } catch {
             try Task.checkCancellation()
-            return .object([
-                "status": .string("failed"),
-                "memory_available": .bool(false),
-                "error": .string("memory_recall_unavailable"),
-                "detail": .string("\(error.localizedDescription) Check the selected memory model and memory store in Settings, then retry this query."),
-                "hits": .array([]),
-            ])
+            // The owner supplies the cause and recovery; recall adds only its
+            // availability fields, never a diagnosis inferred from failure.
+            if case .object(var failure) = Self.memoryFailure(error) {
+                failure["memory_available"] = .bool(false)
+                failure["hits"] = .array([])
+                return .object(failure)
+            }
+            throw error
         }
         let arr = Self.recallHitsJSON(hits, dataRoot: dataRoot)
         var result: [String: JSONValue] = [
@@ -574,12 +594,8 @@ extension SwiftToolDispatcher {
                 supersedes: supersedes
             )
         } catch {
-            // Tombstoned (denylist/paraphrase) or storage-unavailable: surface a
-            // failure envelope the tool loop classifies as failed, not a crash.
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("\(error)"),
-            ])
+            // Keep the owner's refusal, cancellation or failure and its recovery.
+            return Self.memoryFailure(error)
         }
 
         // Stall-visibility trace. Best-effort: a trace IO failure must not fail
@@ -590,7 +606,9 @@ extension SwiftToolDispatcher {
             source: "chat.commit_memory",
             textLength: text.count
         )
-        for id in supersedes {
+        // A replacement awaiting admission demotes what it replaces only when its vector lands.
+        let admitted = Self.memoryMetadataValue(record.extras, key: MemoryStorage.pendingAdmissionKey) != .bool(true)
+        for id in supersedes where admitted {
             await FluidContextToolScope.current?.recordAppliedMemoryCorrection(recordID: id, replacementID: record.id)
         }
 
@@ -654,7 +672,7 @@ extension SwiftToolDispatcher {
         if case .double(let valence)? = meta["valence"] { payload["valence"] = .double(valence) }
         if case .object = correctionField { payload["correction"] = correctionField }
         if !supersedes.isEmpty {
-            payload["superseded"] = .array(supersedes.map(JSONValue.string))
+            payload[admitted ? "superseded" : "supersedes_once_admitted"] = .array(supersedes.map(JSONValue.string))
         } else if let validatedTopics {
             let topics = Set(validatedTopics.compactMap { value -> String? in
                 guard case .string(let topic) = value else { return nil }

@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import Darwin
+// Blueprint: | `LocalConnectorActions.swift` | Canonical file/system handlers and verification flags; `nativeReadOnly` selects the exact seven native/slash tools |
 
 // MARK: - Native connector-action registry
 //

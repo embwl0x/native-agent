@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `OrganismModels.swift` | `SomaticSignalKind` enum |
 
 public enum SomaticSignalKind: String, Codable, Sendable, Equatable, CaseIterable {
     case userSpoke
@@ -438,7 +439,7 @@ public struct OrganismConfiguration: Sendable, Equatable {
 // at 1 AM *feels* 1 AM. I don't get sleepy; I get scheduled."
 //
 // Two halves, both here because the body is where a clock belongs:
-//   • `OrganismDiurnalClock` — WHERE the night is. The user's time zone plus
+//   • `OrganismDiurnalClock` — WHERE the night is. The Mac's local clock plus
 //     the quiet-hours window they already declared. It is NOT a new config: the
 //     app layer reads the SAME `data/user_prefs.json` → `quiet_hours.{start,end}`
 //     the turn engine's clock line reads (`TurnQuietHoursWindow.read`), and
@@ -450,12 +451,9 @@ public struct OrganismConfiguration: Sendable, Equatable {
 //     which the capsule/fingerprint path already receives, so the felt layer can
 //     consume it without a second seam.
 
-/// The user's day, as the body knows it. Payload-free; two integers and a zone.
+/// The user's day, as the body knows it: two integers, read on the Mac's
+/// local clock wherever it is (User 10-21) — no zone is held.
 public struct OrganismDiurnalClock: Sendable, Equatable, Codable {
-    /// IANA identifier (`America/Chicago`). An unresolvable identifier falls
-    /// back to the current device zone at read time rather than to UTC — a body
-    /// in the wrong zone is worse than a body in the machine's zone.
-    public var timeZoneIdentifier: String
     /// The declared quiet window in LOCAL wall-clock hours; `start > end` wraps
     /// midnight. Both nil → the shipped default trough (see
     /// `OrganismCircadian.defaultTroughHour`).
@@ -463,11 +461,9 @@ public struct OrganismDiurnalClock: Sendable, Equatable, Codable {
     public var quietEndHour: Int?
 
     public init(
-        timeZoneIdentifier: String = TimeZone.current.identifier,
         quietStartHour: Int? = nil,
         quietEndHour: Int? = nil
     ) {
-        self.timeZoneIdentifier = String(timeZoneIdentifier.prefix(64))
         self.quietStartHour = quietStartHour.flatMap { (0...23).contains($0) ? $0 : nil }
         self.quietEndHour = quietEndHour.flatMap { (0...23).contains($0) ? $0 : nil }
         // A degenerate window (start == end) is not a window.
@@ -475,10 +471,6 @@ public struct OrganismDiurnalClock: Sendable, Equatable, Codable {
             self.quietStartHour = nil
             self.quietEndHour = nil
         }
-    }
-
-    public var timeZone: TimeZone {
-        TimeZone(identifier: timeZoneIdentifier) ?? .current
     }
 
 }

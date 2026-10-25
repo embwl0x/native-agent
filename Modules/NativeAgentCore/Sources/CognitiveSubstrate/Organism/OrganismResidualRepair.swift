@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+// Blueprint: | `OrganismResidualRepair.swift` | `OrganismResidualRepair` enum; `combinedPressure`, `opportunity` |
 
 public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
     public var generatedAt: Date
@@ -82,15 +83,6 @@ public enum OrganismResidualRepair {
     public static let minimumPressure = 0.30
     public static let quietInterval: TimeInterval = 2 * 60
     public static let predictionHalfLife: TimeInterval = 6 * 60 * 60
-    /// F4-M1 (2026-07-23): bounded re-check cadence used ONLY when resource
-    /// inhibition (thermal / low-power) suppressed an otherwise-eligible wake.
-    /// Without it, `localNext` and the aggregate `nextWake` both go nil under
-    /// inhibition, the deadline runner arms no timer, and re-arm rides only
-    /// somatic/system-wake events — so a Mac that cools while idle leaves
-    /// residual repair disarmed indefinitely. The fallback wake only re-derives
-    /// the opportunity (cheap; no provider), letting the loop self-recover once
-    /// pressure clears.
-    public static let resourceRecheckInterval: TimeInterval = 5 * 60
 
     public static func combinedPressure(
         _ components: OrganismSleepPressureComponents
@@ -108,8 +100,7 @@ public enum OrganismResidualRepair {
         field: OrganismField,
         repairState: OrganismDreamRepairState,
         lastSignalAt: Date?,
-        at now: Date,
-        resourcePressure: OrganismResourcePressure = .nominal
+        at now: Date
     ) -> OrganismResidualRepairOpportunity {
         let lastRepairAt = repairState.lastReceipt?.generatedAt
         let acknowledgedFieldGeneration = repairState.lastReceipt?.sourceFieldGeneration ?? 0
@@ -280,12 +271,11 @@ public enum OrganismResidualRepair {
         let latestEvidenceAt = [trustedIngestionAt, trustedRepairAt].compactMap { $0 }.max()
             ?? fallbackEvidenceAt
         let localQuietUntil = latestEvidenceAt?.addingTimeInterval(quietInterval) ?? now
-        let resourceInhibited = resourcePressure != .nominal
         let localEligible = localRepairPressure >= minimumPressure
             && evidenceCount > 0
             && repairableFieldEvidenceCount > 0
-        let localReady = localEligible && !resourceInhibited && now >= localQuietUntil
-        let localNext = localEligible && !resourceInhibited ? max(now, localQuietUntil) : nil
+        let localReady = localEligible && now >= localQuietUntil
+        let localNext = localEligible ? max(now, localQuietUntil) : nil
 
         let lanes = [
             OrganismSleepLaneOpportunity(
@@ -293,7 +283,7 @@ public enum OrganismResidualRepair {
                 threshold: minimumPressure,
                 quietInterval: quietInterval,
                 disposition: localEligible
-                    ? (resourceInhibited ? .resourceInhibited : (localReady ? .ready : .waitingForQuiet))
+                    ? (localReady ? .ready : .waitingForQuiet)
                     : .inactive,
                 nextEligibleAt: localNext
             ),
@@ -309,33 +299,8 @@ public enum OrganismResidualRepair {
         // Below threshold, monotonic residual decay cannot create a crossing;
         // only exact pending prediction expiries are worth scheduling.
         //
-        // F4-M1 (2026-07-23): under resource inhibition BOTH localNext (above)
-        // and this aggregate wake were nil'd, so the deadline runner armed no
-        // timer and residual repair re-armed only on somatic/system-wake events.
-        // A Mac cooling while idle would leave repair disarmed indefinitely.
-        // When — and ONLY when — inhibition is the sole reason an otherwise
-        // eligible opportunity produced no wake, surface a bounded fallback
-        // re-check so the loop re-samples pressure and self-recovers. Never
-        // arm LATER than a real exact deadline the uninhibited pass would have.
-        // Behavior when NOT inhibited is unchanged.
-        let nextWake: Date?
-        if resourceInhibited {
-            let uninhibitedLocalNext = localEligible ? max(now, localQuietUntil) : nil
-            let uninhibitedCandidateDeadlines =
-                [uninhibitedLocalNext, pendingPredictionDue]
-                    .compactMap { $0 }
-                    .filter { $0 > now }
-            let wouldWakeAbsentInhibition = localEligible
-                || !uninhibitedCandidateDeadlines.isEmpty
-            if wouldWakeAbsentInhibition {
-                let fallback = now.addingTimeInterval(resourceRecheckInterval)
-                nextWake = ([fallback] + uninhibitedCandidateDeadlines).min()
-            } else {
-                nextWake = nil
-            }
-        } else {
-            nextWake = candidateDeadlines.min()
-        }
+        // She is always on (User 10-24): heat never disarms her repair.
+        let nextWake = candidateDeadlines.min()
         return OrganismResidualRepairOpportunity(
             generatedAt: now,
             pressure: pressure,
@@ -355,7 +320,6 @@ public enum OrganismResidualRepair {
             nextRepairAt: localNext,
             nextWakeAt: nextWake,
             ready: localReady,
-            resourceInhibited: resourceInhibited,
             lanes: lanes
         )
     }

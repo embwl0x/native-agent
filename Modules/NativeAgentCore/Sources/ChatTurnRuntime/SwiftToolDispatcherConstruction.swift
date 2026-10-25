@@ -5,13 +5,9 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import ToolRegistry
 import TrustCenter
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
@@ -19,6 +15,7 @@ import MacIntegration
 import ChatToolRuntime
 import AgentConversations
 import ChatTurnContracts
+// Blueprint: | `SwiftToolDispatcherConstruction.swift` | `SwiftToolDispatcher`: extension |
 
 // Preserve direct construction through the ordinary orchestration factory.
 extension SwiftToolDispatcher {

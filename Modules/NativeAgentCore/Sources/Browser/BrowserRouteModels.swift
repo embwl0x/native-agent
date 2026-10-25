@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `BrowserRouteModels.swift` | `BrowserRun`, `NativeActionReceipt`; failed navigation receipts expose the retained openError as detail |
 
 public struct BrowserRun: Identifiable, Codable, Hashable {
     public var id: String

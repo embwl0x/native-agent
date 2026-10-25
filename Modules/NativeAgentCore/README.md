@@ -34,18 +34,21 @@ are retired and are not products or dependencies in the current manifests.
 NativeAgentCore is the live Swift runtime for `NativeAgent.app`. There is no
 general-purpose agent daemon or runtime-selection attachment in the app
 lifecycle. The app's authenticated loopback bridge is a live adapter for local
-clients, not a fallback runtime; external coding CLI/MCP child processes remain
-distinct from the Mac-owned agent.
+clients; external coding CLIs and programs held by resident abilities run in
+separate processes. NativeAgent's own MCP door serves other agents.
 
 Key ownership boundaries:
 
 - **PersistenceCore** owns atomic JSON / JSONL file IO and file-lock helpers.
-- **ChatOrchestration**, **ProviderRouting**, **MemoryV2**, **Context**, **TrustCenter**, and
+- **ChatTurnRuntime**, **ProviderRouting**, **MemoryV2**, **Context**, **TrustCenter**, and
   **ToolExecution** own chat turns, model routing, recall/writeback, policy, and
   tool dispatch in process.
 - **BackgroundLoops**, **TriggerScheduler**, **DreamREMCycle**, and
-  **SelfImprovement** own unattended work from the Swift app.
-- **MCPDispatcher**, **ToolRegistry**, **Skills**, **WorkflowOrchestration**,
+  **BackgroundWork** own unattended work from the Swift app. **EngineRuntime**
+  owns the evaluation artifact reads and manual diagnostic support projections.
+- **PersonaEngine** owns built-in skill guidance and its display inventory;
+  **TrustCenter** owns capability-pack admission and the part-installation port.
+- **ToolRegistry**, **WorkflowOrchestration**,
   **WorkshopExecution**, **Research**, **Connectors**, and **MacControl** serve their
   runtime surfaces directly from Swift modules and the shared data root.
 - **DoctorChecks** and release verification are guardrails that specifically

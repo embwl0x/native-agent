@@ -1,4 +1,5 @@
 @_exported import ChatSessionWork
+// Blueprint: | `ChatSessionWork.swift` | Re-exports `ChatSessionWork` |
 
 extension SwiftNativeChatOrchestrationClient {
     func scheduleTranscriptAgingIfNeeded(

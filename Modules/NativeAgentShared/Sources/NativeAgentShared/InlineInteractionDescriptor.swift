@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `InlineInteractionDescriptor.swift` | `InlineInteractionDescriptor`: registry-supplied existing control/location bindings; renderers switch on interaction kind, not connector name |
+
 /// What the card needs to know about the thing being asked for, and WHICH
 /// existing control resolves it.
 ///
@@ -16,10 +18,8 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
     /// Which existing control opens. Closed by construction: the model cannot
     /// invent one, and a build that does not know a value decodes `.unknown`.
     public enum Control: String, Codable, Sendable, Equatable {
-        /// Connectors' own setup: a manual token paste (GitHub, Slack, Notion).
+        /// Connectors' own setup: a manual token paste (Slack, Telegram).
         case connectorManualToken = "connector_manual_token"
-        /// Connectors' native OAuth flow.
-        case connectorOAuth = "connector_oauth"
         case internetAccounts = "internet_accounts"
         /// Trust's Chrome switch, the extension folder and Chrome's extensions
         /// page, settled when the extension connects.
@@ -37,6 +37,8 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
         case providerGroupModel = "provider_group_model"
         /// Providers' API-key sheet.
         case providerAPIKey = "provider_api_key"
+        /// The keyring: a pasted secret, or a sign-in NativeAgent runs.
+        case keyring
         /// A capability flag write through Trust's own writer.
         case capabilityFlag = "capability_flag"
         /// An answer picked in the card itself; nothing outside opens.

@@ -1,7 +1,10 @@
 import Foundation
 import Darwin
 import Network
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import AgentConversations
+import ChatToolParsing
 import Cognition
 import ContextFlow
 import GrokLink
@@ -10,6 +13,8 @@ import CognitiveSubstrate
 import NativeAgentCore
 import PersistenceCore
 import Privacy
+import MacControl
+// Blueprint: | `ClaudeBridgeRuntime.swift` | Authenticated HTTP/contact routes and generation-ordered contact lifecycle; stop closes admission before passive cleanup, preserving accepted turns/tools; the 64-request ceiling inherited from connection admission now holds workers/actual tool dispatches until exit, beyond response deadlines; the shared human-pausable tool ceiling returns unknown on timeout without prematurely settling the tool receipt; one recovery per listener generation owns concurrent Codex/OMP children through exit, including SystemProcessAdapter-owned helper reaping; live payload publication, retained clients and event transport |
 
 /// Factories and app observations bound at launch; ingress and retained delivery
 /// stay with the agent runtime.
@@ -26,8 +31,6 @@ public protocol ClaudeBridgeRuntimePort: ClaudeBridgeMessagePort {
     func completionSender(dataRoot: URL) -> any AgentBridgeCompletionSending
     func receiveGrok(_ reply: GrokReplyInput, principal: AgentBridgePrincipal, dataRoot: URL) async throws
     func publishChatTurnCompleted(sessionID: String?) async
-    func handleCodexCompletion(messageIds: [String], codexStatus: String, summary: String,
-                               threadId: String?, turnId: String?, errorMessage: String?, noWorkObserved: Bool?) async
 }
 
 public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, ClaudeBridgeStatePort {
@@ -101,6 +104,22 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     private var _token: String = ""
     private var _activePort: UInt16 = 0
     private var replyRecoveryTask: Task<Void, Never>?
+    private var replyRecoveryToken: String?
+    private var contactLifecycleRevision: UInt64 = 0
+    private var contactLifecycleWorkers: [UInt64: Task<Void, Never>] = [:]
+    private struct RequestWorker {
+        let connection: ObjectIdentifier
+        let token: String
+        let latch: WorkLatch
+        let accepted: Bool
+        var worker: Task<Void, Never>?
+        var operation: Task<JSONValue, Error>?
+        var operationAdmitted = false
+        var operationClosed = false
+    }
+    // A response timeout does not release a slot while its operation lives.
+    // Use the same 64-request ceiling as connection admission.
+    private var requestWorkers: [UUID: RequestWorker] = [:]
     public private(set) var startedAt: Date = Date()
     // Each accepted connection owns one exact cancellable request-read deadline,
     // UUID-gated via `BridgeReadDeadlineState` so a late deadline fire can never
@@ -113,6 +132,86 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         let deadlineWork: DispatchWorkItem
     }
     private var connections: [ObjectIdentifier: ConnectionEntry] = [:]
+
+    private func updateContactLifecycleLocked(active: Bool) {
+        contactLifecycleRevision += 1
+        let revision = contactLifecycleRevision
+        tasks.setBridgeAdmission(active, revision: revision)
+        contactLifecycleWorkers[revision] = Task { [self] in
+            await tasks.setBridgeActive(active, revision: revision)
+            _ = stateLock.withLock { contactLifecycleWorkers.removeValue(forKey: revision) }
+        }
+    }
+
+    /// Retain each request through actual exit, including a tool operation
+    /// whose HTTP deadline has already answered. Accepted tool work survives
+    /// disconnect/stop; reads are canceled with their connection.
+    func startRequest(conn: NWConnection, latch: WorkLatch, priority: TaskPriority,
+                      accepted: Bool = false,
+                      operation: @escaping @Sendable (UUID) async -> Void) -> Task<Void, Never>? {
+        stateLock.withLock {
+            guard !_token.isEmpty, requestWorkers.count < 64,
+                  connections[ObjectIdentifier(conn)] != nil else { return nil }
+            let id = UUID()
+            requestWorkers[id] = RequestWorker(connection: ObjectIdentifier(conn), token: _token, latch: latch, accepted: accepted)
+            let worker = Task.detached(priority: priority) { [self] in
+                defer { finishRequest(id, operation: false) }
+                guard !Task.isCancelled else { return }
+                await operation(id)
+            }
+            requestWorkers[id]?.worker = worker
+            return worker
+        }
+    }
+
+    private func finishRequest(_ id: UUID, operation: Bool) {
+        stateLock.withLock {
+            if operation { requestWorkers[id]?.operation = nil }
+            else { requestWorkers[id]?.worker = nil }
+            if let entry = requestWorkers[id], entry.worker == nil, entry.operation == nil {
+                requestWorkers.removeValue(forKey: id)
+            }
+        }
+    }
+
+    private func runToolOperation(_ id: UUID, operation: @escaping @Sendable () async throws -> JSONValue) async throws -> JSONValue {
+        // Created inside TurnDeadline's scope so human waits still pause the
+        // existing active-work ceiling. Retain the actual dispatch, not just
+        // the wrapper that returns as soon as that ceiling fires.
+        let worker = try stateLock.withLock {
+            guard requestWorkers[id]?.operationClosed == false, !Task.isCancelled else { throw CancellationError() }
+            requestWorkers[id]?.operationAdmitted = true
+            let worker = Task { [self] in
+                defer { finishRequest(id, operation: true) }
+                return try await operation()
+            }
+            requestWorkers[id]?.operation = worker
+            return worker
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: { worker.cancel() }
+    }
+
+    private func closeUnstartedTool(_ id: UUID) -> Bool {
+        stateLock.withLock {
+            guard requestWorkers[id]?.operationAdmitted == false else { return false }
+            requestWorkers[id]?.operationClosed = true
+            return true
+        }
+    }
+
+    private func retireRequests(connection: ObjectIdentifier? = nil, token: String? = nil) {
+        let entries = stateLock.withLock {
+            requestWorkers.values.filter {
+                (connection == nil || $0.connection == connection) && (token == nil || $0.token == token)
+            }
+        }
+        for entry in entries {
+            _ = entry.latch.claim()
+            if !entry.accepted { entry.worker?.cancel(); entry.operation?.cancel() }
+        }
+    }
 
     // MARK: - Activity ring buffer + SSE subscribers
     //
@@ -203,7 +302,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     public var token: String { stateLock.lock(); defer { stateLock.unlock() }; return _token }
     public var activePort: UInt16 { stateLock.lock(); defer { stateLock.unlock() }; return _activePort }
 
-    // Lazily-built ChatOrchestration client + dispatcher. Built off-MainActor on
+    // Lazily-built ChatTurnRuntime client + dispatcher. Built off-MainActor on
     // first need. Both are Sendable.
     private let clientLock = NSLock()
     private var cachedToolClient: (any ToolDispatchClient)?
@@ -286,20 +385,24 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     /// Cancel the listener, all live connections + their deadline timers,
     /// clear the in-memory endpoint, and remove discovery files. Idempotent.
     public func stop() {
-        bridgeListener.stop()
         stateLock.lock()
         let entries = Array(connections.values)
+        let retiringToken = _token
         connections.removeAll()
         _token = ""
         _activePort = 0
-        replyRecoveryTask?.cancel()
-        replyRecoveryTask = nil
+        updateContactLifecycleLocked(active: false)
+        let recovery = replyRecoveryTask
+        eventSubscribers.removeAll()
+        bridgeListener.stop()
+        removeDiscoveryFiles()
         stateLock.unlock()
+        recovery?.cancel()
+        retireRequests(token: retiringToken)
         for entry in entries {
             entry.deadlineWork.cancel()
             entry.conn.cancel()
         }
-        removeDiscoveryFiles()
     }
 
     private func startSync() {
@@ -330,7 +433,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         }
         _token = tk
         _activePort = 0
-        stateLock.unlock()
+        updateContactLifecycleLocked(active: true)
         removeDiscoveryFiles()
         let started = bridgeListener.start(
             onReady: { [weak self] port in
@@ -347,6 +450,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 self?.handleListenerTerminated(token: tk)
             }
         )
+        stateLock.unlock()
         if !started {
             handleListenerTerminated(token: tk)
         }
@@ -363,21 +467,39 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         // Hold the lifecycle lock over the tiny atomic publications so stop()
         // cannot remove them and then lose a race to a stale ready callback.
         writeDiscoveryFiles(token: token, port: port)
-        replyRecoveryTask?.cancel()
-        replyRecoveryTask = Task.detached(priority: .utility) {
-            guard !Task.isCancelled else { return }
-            Self.startCodexReplyJobRecovery()
-            await AgentBridgeRuntime.startOMPReplyJobRecovery()
-        }
+        startReplyRecoveryLocked(token: token)
         stateLock.unlock()
 
         nativeLog("[ClaudeBridge] listening on 127.0.0.1:%d", Int(port))
     }
 
+    private func startReplyRecoveryLocked(token: String) {
+        guard replyRecoveryTask == nil, replyRecoveryToken != token else { return }
+        replyRecoveryToken = token
+        replyRecoveryTask = Task.detached(priority: .utility) { [self] in
+            defer {
+                stateLock.withLock {
+                    replyRecoveryTask = nil
+                    // A new listener may have become ready while the old
+                    // helper drained. Its state change admits one recovery.
+                    if !_token.isEmpty, _activePort != 0, _token != token {
+                        startReplyRecoveryLocked(token: _token)
+                    }
+                }
+            }
+            guard !Task.isCancelled, self.token == token else { return }
+            // Each organ recovers independently; the retained parent owns both
+            // children until exit, including cancellation and helper reaping.
+            async let codex: Void = startCodexReplyJobRecovery(token: token)
+            async let omp: Void = AgentBridgeRuntime.startOMPReplyJobRecovery()
+            _ = await (codex, omp)
+        }
+    }
+
     /// Relaunch repair for durable Codex reply jobs. The Node helper performs a
     /// single locked scan and gives every job its own delivery lock; it does not
     /// install a poller or another scheduler.
-    private static func startCodexReplyJobRecovery() {
+    private func startCodexReplyJobRecovery(token: String) async {
         let environment = ProcessInfo.processInfo.environment
         if ["1", "true", "yes"].contains(
             environment["NATIVE_AGENT_CODEX_REPLY_RECOVERY_DISABLED"]?.lowercased() ?? ""
@@ -398,34 +520,26 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: processEnvironment) else {
             return
         }
-        let process = Process()
-        process.executableURL = node
-        process.arguments = [helper.path, "--recover-reply-jobs"]
-        process.currentDirectoryURL = repoRoot
         var childEnvironment = processEnvironment
+        childEnvironment["NATIVE_AGENT_DATA_ROOT"] = dataRoot.path
         if childEnvironment["CODEX_BIN"] == nil,
            let codex = AgentBridgeRuntime.executableURL(named: "codex", environment: processEnvironment) {
             childEnvironment["CODEX_BIN"] = codex.path
         }
-        process.environment = childEnvironment
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        process.terminationHandler = { process in
-            if process.terminationStatus != 0 {
-                nativeLog(
-                    "[ClaudeBridge] Codex reply-job recovery exited %d",
-                    Int(process.terminationStatus)
-                )
-            }
-        }
+        guard !Task.isCancelled, self.token == token else { return }
         do {
-            try process.run()
+            // The existing process owner retains/reaps the helper and its
+            // descendants on cancellation; this recovery task awaits exit.
+            let result = try await SystemProcessAdapter().run(executable: node.path,
+                arguments: [helper.path, "--recover-reply-jobs"], currentDirectory: repoRoot,
+                environment: childEnvironment, standardInput: nil, timeoutSeconds: nil, outputByteLimit: 0)
+            if result.exitCode != 0, !Task.isCancelled {
+                nativeLog("[ClaudeBridge] Codex reply-job recovery exited %d", Int(result.exitCode))
+            }
         } catch {
-            nativeLog(
-                "[ClaudeBridge] could not start Codex reply-job recovery: %@",
-                String(describing: error)
-            )
+            if !Task.isCancelled {
+                nativeLog("[ClaudeBridge] could not start Codex reply-job recovery: %@", String(describing: error))
+            }
         }
     }
 
@@ -442,16 +556,19 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         }
         _token = ""
         _activePort = 0
-        replyRecoveryTask?.cancel()
-        replyRecoveryTask = nil
+        updateContactLifecycleLocked(active: false)
+        let recovery = replyRecoveryTask
+        eventSubscribers.removeAll()
         let entries = Array(connections.values)
         connections.removeAll()
+        removeDiscoveryFiles()
         stateLock.unlock()
+        recovery?.cancel()
+        retireRequests(token: token)
         for entry in entries {
             entry.deadlineWork.cancel()
             entry.conn.cancel()
         }
-        removeDiscoveryFiles()
     }
 
     private func accept(_ conn: NWConnection) {
@@ -492,6 +609,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 let removed = self?.connections.removeValue(forKey: key)
                 self?.stateLock.unlock()
                 removed?.deadlineWork.cancel()
+                self?.retireRequests(connection: key)
             default: break
             }
         }
@@ -680,7 +798,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
 
         // Same WorkLatch + asyncAfter bound as handleMessage/handleTool.
         let workLatch = WorkLatch()
-        let workTask = Task.detached(priority: .utility) { [weak self] in
+        let workTask = startRequest(conn: conn, latch: workLatch, priority: .utility) { [weak self] _ in
             guard let self else { return }
             // Every response path below goes through respond(...), so the work
             // Task and the deadline timer can never both write the response.
@@ -691,6 +809,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             let runtime = host.cognition
             if action == "reset" || action == "reset_continuity" {
                 let outcome = await runtime.resetOrganismContinuityChecked()
+                guard !Task.isCancelled else { return }
                 guard outcome.applied else {
                     respond(409, ["status": outcome.status.rawValue, "error": outcome.error ?? outcome.status.rawValue,
                                   "organism": ClaudeBridgeStateProjection.organismSnapshotJSON(outcome.snapshot)])
@@ -706,6 +825,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             }
             if action == "settle" || action == "settle_continuity" {
                 let outcome = await runtime.settleOrganismContinuityChecked()
+                guard !Task.isCancelled else { return }
                 guard outcome.applied else {
                     respond(409, ["status": outcome.status.rawValue, "error": outcome.error ?? outcome.status.rawValue,
                                   "organism": ClaudeBridgeStateProjection.organismSnapshotJSON(outcome.snapshot)])
@@ -721,6 +841,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             }
             if shouldClear {
                 let snapshot = await runtime.clearOrganismDebugBodyOverride()
+                guard !Task.isCancelled else { return }
                 self.publishOrganismDebugEvent(status: "cleared")
                 respond(200, [
                     "status": "cleared",
@@ -743,7 +864,9 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                     scenario: rawScenario,
                     ttlSeconds: ttlSeconds
                 )
+                guard !Task.isCancelled else { return }
                 let debug = await runtime.organismDebugBodyOverrideStatus()
+                guard !Task.isCancelled else { return }
                 self.publishOrganismDebugEvent(
                     status: "active",
                     scenario: rawScenario,
@@ -762,6 +885,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 ])
             }
         }
+        guard let workTask else { writeJSON(conn, status: 503, obj: ["error": "server_stopping_or_busy"]); return }
         workLatch.arm(afterSeconds: Self.readWorkDeadlineSeconds) { [weak self] in
             guard let self, workLatch.claim() else { return }
             workTask.cancel()
@@ -769,6 +893,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 "error": "work_timeout",
                 "path": path,
                 "seconds": Self.readWorkDeadlineSeconds,
+                "outcome": "unknown",
             ])
         }
     }
@@ -867,7 +992,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         let requestDigest = AgentPeerReplayClaimStore.digest(body)
         let started = Date()
         let workLatch = WorkLatch()
-        Task.detached(priority: .userInitiated) { [weak self] in
+        let workTask = startRequest(conn: conn, latch: workLatch, priority: .userInitiated, accepted: true) { [weak self] id in
             guard let self else { return }
             var admitted = false
             do {
@@ -884,11 +1009,26 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                     admitted = true
                 }
                 let result = try await TurnDeadline.withThrowingDeadline(seconds: Double(Self.toolWorkDeadlineSeconds)) {
-                    try await turn.bind {
-                        try await tools.dispatch(tool: name, input: inputJV, surface: turn.surface)
+                    try await self.runToolOperation(id) {
+                        do {
+                            let result = try await turn.bind {
+                                try await tools.dispatch(tool: name, input: inputJV, surface: turn.surface)
+                            }
+                            if let taskID { try await tasks.finishTool(taskID, owner: principal.id, result: result) }
+                            return result
+                        } catch {
+                            // Settle only at dispatch exit. The HTTP timeout
+                            // cannot claim a still-running tool has failed.
+                            if let taskID {
+                                let status = Task.isCancelled || error is CancellationError || error is TurnDeadline.DeadlineExceeded
+                                    ? "outcome_unknown" : "failed"
+                                try? await tasks.finishTool(taskID, owner: principal.id,
+                                    result: .object(["status": .string(status), "detail": .string(String(describing: error))]))
+                            }
+                            throw error
+                        }
                     }
                 }
-                if let taskID { try await tasks.finishTool(taskID, owner: principal.id, result: result) }
                 let resultAny = jsonValueToAny(result)
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 self.publishToolResultEvent(name: name, surface: surface, result: result, durationMs: durationMs)
@@ -899,9 +1039,9 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                     "durationMs": durationMs,
                 ])
             } catch {
-                if admitted, let taskID {
+                if admitted, let taskID, self.closeUnstartedTool(id) {
                     try? await tasks.finishTool(taskID, owner: principal.id,
-                                               result: .object(["status": .string("failed"), "detail": .string(String(describing: error))]))
+                        result: .object(["status": .string("failed"), "detail": .string(String(describing: error))]))
                 }
                 if error is TurnDeadline.DeadlineExceeded {
                     guard workLatch.claim() else { return }
@@ -910,6 +1050,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                     ])
                     self.writeJSON(conn, status: 504, obj: [
                         "error": "work_timeout", "name": name, "seconds": Self.toolWorkDeadlineSeconds,
+                        "outcome": "unknown",
                     ])
                     return
                 }
@@ -927,6 +1068,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 ])
             }
         }
+        guard workTask != nil else { writeJSON(conn, status: 503, obj: ["error": "server_stopping_or_busy"]); return }
     }
 
     // MARK: - Activity event publisher
@@ -974,6 +1116,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 self?.eventSubscribers.removeValue(forKey: key)
                 self?.stateLock.unlock()
                 removed?.deadlineWork.cancel()
+                self?.retireRequests(connection: key)
             default: break
             }
         }
@@ -1097,15 +1240,17 @@ extension ClaudeBridgeRuntime {
         let workLatch = WorkLatch()
         // 2026-09-23: .userInitiated; at .utility the first /codex/state reply
         // nearly missed the installer's 2s liveness check.
-        let workTask = Task.detached(priority: .userInitiated) { [weak self] in
+        let workTask = startRequest(conn: conn, latch: workLatch, priority: .userInitiated) { [weak self] _ in
             guard let self else { return }
             let payload = await ClaudeBridgeStateProjection.statePayload(
                 dataRoot: self.host.dataRoot,
                 port: self
             )
+            guard !Task.isCancelled else { return }
             guard workLatch.claim() else { return }
             self.writeJSON(conn, status: 200, obj: payload)
         }
+        guard let workTask else { writeJSON(conn, status: 503, obj: ["error": "server_stopping_or_busy"]); return }
         workLatch.arm(afterSeconds: Self.readWorkDeadlineSeconds) { [weak self] in
             guard let self, workLatch.claim() else { return }
             workTask.cancel()
@@ -1113,6 +1258,7 @@ extension ClaudeBridgeRuntime {
                 "error": "work_timeout",
                 "path": path,
                 "seconds": Self.readWorkDeadlineSeconds,
+                "outcome": "unknown",
             ])
         }
     }

@@ -16,9 +16,9 @@ Only an explicit `tab.close` request closes an owned tab.
 | --- | --- | --- |
 | `attach` | Optional `clientName`, `clientVersion` | Returns `connected: true`, host/protocol/extension identity, `capabilities`, `lastExtensionError`, and `tabs` with `tabId`, `windowId`, `groupId`, `title`, `url`, `userSequence`. Reinstalls the existing readers in grouped tabs. |
 | `extension.reload` | `reloadId` | Acknowledges `reloadId`, `beforeVersion`, `status: "acknowledged"`, then reloads. A progressing request refuses reload with `extension_busy`; failure emits `extension.reload_failed`. No tab changes. |
-| `navigate` | `url`; optional `tabId`, `expectedUserSequence` | Reuses the owned tab, or creates an inactive grouped tab if missing or no longer owned. HTTP(S) URLs only; `back` and `forward` require an owned tab and walk its history. |
+| `navigate` | `url`; optional `tabId`, `expectedUserSequence` | Reuses the owned tab, or creates an inactive grouped tab if missing or no longer owned. HTTP(S) URLs only; `back` and `forward` require an owned tab and walk its history. Waits for Chrome to finish loading the tab (`status: "complete"`); if the 25 s deadline passes after the new page committed, it returns that page with `status: "loading"` and a `loading` sentence. |
 | `tab.close` | `tabId`; optional `expectedUserSequence` | Explicitly closes an owned tab. |
-| `page.snapshot.read` | `tabId`; optional `expectedUserSequence`, `readCursor`, `maxNodes`, `maxTextChars`, `scope` | Reads structured rendered DOM material without scrolling. |
+| `page.snapshot.read` | `tabId`; optional `expectedUserSequence`, `readCursor`, `maxNodes`, `maxTextChars`, `scope` | Waits for Chrome to finish loading the tab, then reads structured rendered DOM material without scrolling. If the 25 s deadline passes first, it reads what is there with `rendering.loaded: false`. |
 | `page.element.click` | `tabId`, `expectedUserSequence`, `snapshotId`, `nodeId`; optional `button` | Clicks the exact observed node. |
 | `page.element.fill` | Same observed-node identity plus `value` | Replaces the editable value. |
 | `page.element.type` | Same observed-node identity plus `text`; optional `delayMs` | Appends bounded sequential text, with readback. |

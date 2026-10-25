@@ -8,13 +8,11 @@ import CommonCrypto
 import CryptoKit
 import AppKit
 import Foundation
-import TurnTrace
 import DeviceSyncState
 import NativeAgentShared
 import NativeAgentCore
-import ChatOrchestration
+import ChatSessionWork
 import CognitiveSubstrate
-import KnowledgeGraph
 import MemoryV2
 import MacIntegration
 import ApprovalInbox
@@ -23,17 +21,23 @@ import PersistenceCore
 import Desk
 import Transcripts
 import ProviderRouting
+// Blueprint: | `MacSyncEngine+Snapshots.swift` | Revisioned snapshots retain exact payload/wire digests; phone Inspector reads its host; chat snapshots carry HerScreen's read-only other-room exchanges as an additive field |
 
 /// Reconciles the persisted snapshot-digest cache against the files the iPhone
 /// actually reads.  The digest cache is an optimization, never evidence that
 /// a file remains intact: a same-name file can be truncated or replaced by an
 /// out-of-process iCloud/crash-window event while its old digest still sits in
-/// memory.  This bounded check runs only in MacSync's slow integrity fallback.
+/// memory. Exact file observation and a slow missed-event fallback share this check.
+struct SnapshotFileDigest: Codable, Equatable, Sendable {
+    let payload: String
+    let wire: String
+}
+
 enum MacSyncSnapshotIntegrity {
     static let maximumSnapshotBytes = 8 * 1024 * 1024
 
     struct Report: Equatable {
-        let retainedDigests: [String: String]
+        let retainedDigests: [String: SnapshotFileDigest]
         let missingManagedFiles: [String]
         let mismatchedManagedFiles: [String]
         let unreadableManagedFiles: [String]
@@ -57,12 +61,12 @@ enum MacSyncSnapshotIntegrity {
     /// A missing digest for a retired file is pruned without manufacturing a
     /// costly rebuild for a contract the phone no longer consumes.
     static func reconcile(
-        digests: [String: String],
+        digests: [String: SnapshotFileDigest],
         in directory: URL,
         managedFilenames: Set<String> = Set(NAMobileSnapshotGroup.allCases.flatMap(\.filenames))
     ) -> Report {
         let fileManager = FileManager.default
-        var retained: [String: String] = [:]
+        var retained: [String: SnapshotFileDigest] = [:]
         var missing: [String] = []
         var mismatched: [String] = []
         var unreadable: [String] = []
@@ -92,7 +96,7 @@ enum MacSyncSnapshotIntegrity {
                     continue
                 }
                 let actualDigest = digest(try Data(contentsOf: url))
-                guard actualDigest == expectedDigest else {
+                guard actualDigest == expectedDigest.wire else {
                     mismatched.append(filename)
                     continue
                 }
@@ -413,9 +417,9 @@ extension MacSyncEngine {
     }
 
     // MARK: - Snapshot writer
-    // 2026-05-09 / 2026-05-31: trust_policy.json is the raw checked policy's
-    // bytes (engine.trust.snapshotData()), not a re-encode of the typed model,
-    // so keys the Mac model does not name still reach the phone. iOS decodes
+    // trust_policy.json retains every raw checked policy field and adds the
+    // engine-resolved preset and effective permission level, so keys the typed
+    // Mac model does not name still reach the phone. iOS decodes
     // the raw JSON with lenient, fully-optional structs so the failure mode
     // is "field missing in UI", not "snapshot file disappears".
 
@@ -443,6 +447,7 @@ extension MacSyncEngine {
         snapshotWriteInFlight = true
         defer {
             snapshotWriteInFlight = false
+            if snapshotIntegrityReconcileQueued, isActive { requestSnapshotIntegrityPass() }
             if isActive, snapshotWriteQueued {
                 snapshotWriteQueued = false
                 let queuedForceHeavy = snapshotWriteQueuedNeedsHeavy
@@ -512,6 +517,7 @@ extension MacSyncEngine {
         }
 
         let api = sync.host
+        let readRevision = Date().timeIntervalSince1970
 
         do {
             // Fire lightweight freshness fetches. Full inventory/readout
@@ -644,7 +650,8 @@ extension MacSyncEngine {
                     data,
                     to: filename,
                     in: snapshotDir,
-                    lifecycleGeneration: lifecycleGeneration
+                    lifecycleGeneration: lifecycleGeneration,
+                    readRevision: readRevision
                 ) {
                 case .changed:
                     changedSnapshotFilenames.insert(filename)
@@ -753,20 +760,11 @@ extension MacSyncEngine {
                 recordGroupSkip("trust_policy", "native trust snapshot unavailable")
             }
             do {
-                let permissions = try await MacIntegrationPermissionStore.shared.currentChecked()
-                var projection: [String: [String: Bool]] = [:]
-                for id in MacIntegrationID.all {
-                    guard let permission = permissions[id] else { continue }
-                    var axes: [String: Bool] = [:]
-                    if MacIntegrationID.supportsRead(id) { axes["read"] = permission.read }
-                    if MacIntegrationID.supportsWrite(id) { axes["write"] = permission.write }
-                    projection[id] = axes
-                }
-                await write(projection, to: "mac_integration_permissions.json")
+                await write(try await api.macIntegrationPermissionsSnapshot(), to: "mac_integration_permissions.json")
             } catch {
                 recordFetchFailure("mac_integration_permissions", error)
             }
-            await write(SurfaceLayoutStore.layout(dataRoot: sync.dataRoot), to: "ui_layout.json")
+            await write(sync.host.surfaceLayout(), to: "ui_layout.json")
             if let personalityProfile {
                 await write(personalityProfile, to: "personality.json")
             } else {
@@ -775,10 +773,8 @@ extension MacSyncEngine {
             await publish(approvalsRaw, as: "approvals", to: "approvals.json")
             await publish(inboxRaw, as: "inbox", to: "inbox.json")
             if includeHeavySnapshots {
-                // Turn Inspector W4: per-turn summaries for the iOS read-only
-                // inspector (content-free; size-budgeted). Off-main read of the
-                // persisted day file — not a bus subscriber, no hot-path cost.
-                async let turnSummariesData: Data? = self.turnSummariesSnapshotData()
+                // The phone summarizes the same persisted projection as Mac Inspector.
+                async let turnSummariesData: Data? = sync.host.turnSummariesSnapshotData()
                 // E8 (upgrade-sweep 2026-08): command_palette.json was fetched
                 // and published on every heavy pass with ZERO readers in the
                 // iOS target. Choice made: stop writing it rather than build a
@@ -805,9 +801,7 @@ extension MacSyncEngine {
                     knowledgeGraphData,
                     runsFetch
                 )
-                if let turnSummariesRaw {
-                    await writeData(turnSummariesRaw, to: Self.turnSummariesSnapshotFilename)
-                }
+                await publish(turnSummariesRaw.map(SnapshotGroupBuild.built) ?? .skipped("turn traces unreadable or incomplete"), as: "turn_summaries", to: Self.turnSummariesSnapshotFilename)
                 await publish(knowledgeGraphRaw, as: "knowledge_graph", to: "knowledge_graph.json")
                 if let runsAll {
                     // Byte-budget the snapshot copy (review MED #2): prompt/
@@ -868,7 +862,6 @@ extension MacSyncEngine {
                 ] {
                     try? FileManager.default.removeItem(at: snapshotDir.appendingPathComponent(retired))
                 }
-                lastHeavySnapshotAt = Date()
             }
             if let connectors { await write(connectors, to: "connectors.json") }
             // fix-2026-06-10 sync-audit #1: pinned/transcript snapshots derive
@@ -876,13 +869,10 @@ extension MacSyncEngine {
             // transient error can't blank the phone's pinned chats/transcripts.
             if let sessions {
                 await write(sessions, to: "sessions.json")
-                let pinnedSessions = pinnedChatSessions(from: sessions)
-                await write(pinnedSessions, to: "pinned_chat_sessions.json")
-                if let anchor = chatAnchorSnapshot() {
-                    await write(anchor, to: "chat_anchor.json")
-                }
+                let navigation = sync.host.sessionNavigation(for: sessions)
+                await write(navigation, to: "pinned_chat_sessions.json")
                 if includeTranscriptSnapshots {
-                    let transcriptSessions = transcriptSnapshotSessions(from: sessions, pinnedSessions: pinnedSessions)
+                    let transcriptSessions = transcriptSnapshotSessions(from: sessions, navigation: navigation)
                     let transcripts: [ChatTranscriptSnapshot] = transcriptSessions.isEmpty
                         ? []
                         : await chatTranscriptSnapshots(for: transcriptSessions, api: api)
@@ -894,7 +884,6 @@ extension MacSyncEngine {
             await write(organismLivingStatus, to: Self.organismLivingStatusSnapshotFilename)
             if let memProposals { await write(memProposals, to: "memory_proposals.json") }
             await write([JSONValue](), to: "training_proposals.json")
-            await write([JSONValue](), to: "promotion_candidates.json")
             if let providers { await write(providers, to: "providers.json") }
             await write(api.providerSignInStates(), to: "provider_sign_ins.json")
 
@@ -903,8 +892,7 @@ extension MacSyncEngine {
             // SAME model the Mac picker shows, and so the iOS chat-box can
             // hydrate from the Mac's surfaces.json instead of carrying its
             // own stale @AppStorage cache. Shape: { surface: { model,
-            // reasoningEffort } } — flat-string variants are tolerated by
-            // the iOS reader for back-compat.
+            // reasoningEffort } }, inside the checked routing revision envelope.
             if includeHeavySnapshots {
                 await publish(
                     await self.modelPreferencesSnapshotData(),
@@ -994,6 +982,7 @@ extension MacSyncEngine {
         snapshotDir: URL,
         lifecycleGeneration: UInt64
     ) async {
+        let readRevision = Date().timeIntervalSince1970
         let api = sync.host
         let sessions: [ChatSession]
         do {
@@ -1006,7 +995,7 @@ extension MacSyncEngine {
         }
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
 
-        let pinnedSessions = pinnedChatSessions(from: sessions)
+        let navigation = sync.host.sessionNavigation(for: sessions)
         var changedFilenames = Set<String>()
         var writeFailures: [String] = []
 
@@ -1018,7 +1007,8 @@ extension MacSyncEngine {
                 data,
                 to: filename,
                 in: snapshotDir,
-                lifecycleGeneration: lifecycleGeneration
+                lifecycleGeneration: lifecycleGeneration,
+                readRevision: readRevision
             ) {
             case .changed:
                 changedFilenames.insert(filename)
@@ -1030,14 +1020,11 @@ extension MacSyncEngine {
         }
 
         await write(sessions, filename: "sessions.json")
-        await write(pinnedSessions, filename: "pinned_chat_sessions.json")
-        if let anchor = chatAnchorSnapshot() {
-            await write(anchor, filename: "chat_anchor.json")
-        }
+        await write(navigation, filename: "pinned_chat_sessions.json")
         if includeTranscripts {
             let selected = transcriptSnapshotSessions(
                 from: sessions,
-                pinnedSessions: pinnedSessions
+                navigation: navigation
             )
             let transcripts = await chatTranscriptSnapshots(for: selected, api: api)
             await write(transcripts, filename: "chat_transcripts.json")
@@ -1136,29 +1123,7 @@ extension MacSyncEngine {
         }
     }
 
-    /// Only real pins belong in the phone's closable pinned tabs. Main has its
-    /// own identity and other conversations remain available through history.
-    private func pinnedChatSessionIds() -> [String] {
-        sync.host.pinnedChatSessionIDs()
-    }
-
-    /// The phone's main chat follows the conversation User is in — the anchor
-    /// every door publishes when he sends — not the Mac window.
-    private func chatAnchorSnapshot() -> ConversationAnchorPin? {
-        ConversationAnchor.current(dataRoot: sync.dataRoot)
-    }
-
-    private func pinnedChatSessions(from sessions: [ChatSession]) -> [ChatSession] {
-        let liveById = Dictionary(
-            sessions
-                .filter { $0.archived != true }
-                .map { ($0.id, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        return pinnedChatSessionIds().compactMap { liveById[$0] }
-    }
-
-    private func transcriptSnapshotSessions(from sessions: [ChatSession], pinnedSessions: [ChatSession]) -> [ChatSession] {
+    private func transcriptSnapshotSessions(from sessions: [ChatSession], navigation: ChatSessionNavigation) -> [ChatSession] {
         var seen = Set<String>()
         var out: [ChatSession] = []
         func append(_ session: ChatSession?) {
@@ -1168,7 +1133,7 @@ extension MacSyncEngine {
             out.append(session)
         }
         // The conversation User is in always rides first, whatever its source.
-        let currentID = chatAnchorSnapshot()?.sessionId
+        let currentID = navigation.anchor?.sessionId
         append(sessions.first { $0.id == currentID })
         // Retain one Mac main and one phone main. `isMainAppSourceKey` includes
         // both, so selecting only its first match made whichever device sorted
@@ -1188,7 +1153,7 @@ extension MacSyncEngine {
         // chat that could never fill. Every pin the phone can select is
         // published now. Past the ceiling the NEWEST pins win, and an older
         // one reads as "history not synced" on the phone instead of as empty.
-        let remainingPins = pinnedSessions.filter { !seen.contains($0.id) && $0.archived != true }
+        let remainingPins = navigation.rows.filter(\.isPinned).map(\.session).filter { !seen.contains($0.id) && $0.archived != true }
         let room = max(0, Self.transcriptSnapshotSessionCeiling - out.count)
         // 2026-09-06: newest-first ALWAYS, not only when the count ceiling
         // bites. `chatTranscriptSnapshots` also drops the tail of this list
@@ -1249,11 +1214,13 @@ extension MacSyncEngine {
     /// This raw-byte bound also limits compilation work. The completed
     /// candidate is checked against the actual status codec below because
     /// compression ratios cannot guarantee the 800 KiB transport limit.
-    static let chatTranscriptGroupByteBudget = 2 * 1024 * 1024
+    nonisolated static let chatTranscriptGroupByteBudget = 2 * 1024 * 1024
 
     private func chatTranscriptSnapshots(for sessions: [ChatSession], api: any DeviceSyncHost) async -> [ChatTranscriptSnapshot] {
         var out: [ChatTranscriptSnapshot] = []
-        var retained: [String: ChatTranscriptBlock] = [:]
+        let exchanges: Result<[OtherRoomExchange], Error>
+        do { exchanges = .success(try await api.getOtherRoomExchanges()) }
+        catch { exchanges = .failure(error) }
         // The array framing the blocks ride in: "[" + "]".
         var used = 2
         // 2026-09-06: the selection above is already bounded by
@@ -1261,46 +1228,41 @@ extension MacSyncEngine {
         // which are pins. The flat `prefix(8)` that used to live here did not,
         // so it dropped pinned sessions the phone could still select.
         for session in sessions {
-            let block: ChatTranscriptBlock
-            // 2026-09-06: a transcript only changes when its generation moves,
-            // so reuse the block published for that generation instead of
-            // re-reading history. Without this every completion edge cost up to
-            // sixteen sequential history reads to republish fifteen unchanged
-            // transcripts.
-            if let generation = session.transcriptGeneration,
-               let cached = chatTranscriptBlockCache[session.id],
-               cached.generation == generation {
-                block = cached
-            } else {
-                guard let messages = try? await api.getChatMessages(sessionId: session.id) else { continue }
-                let snapshot = ChatTranscriptSnapshot(
+            var snapshot = ChatTranscriptSnapshot(sessionId: session.id, messages: [],
+                transcriptGeneration: session.transcriptGeneration)
+            do {
+                let messages = try await api.getChatMessages(sessionId: session.id)
+                snapshot = ChatTranscriptSnapshot(
                     sessionId: session.id,
                     messages: await MobileSnapshotBuilder.shared.build { Self.compactTranscriptMessages(messages) },
                     transcriptGeneration: session.transcriptGeneration,
                     hasOlder: messages.lazy.filter(\.isPersonVisible).count > Self.transcriptSnapshotRowLimit
                 )
-                // An unencodable block is treated as unaffordable rather than
-                // free, so it can never be the one that breaches the contract.
-                let encodedBytes = (try? await MobileSnapshotBuilder.shared.encode(snapshot))?.count
-                    ?? Self.chatTranscriptGroupByteBudget
-                block = ChatTranscriptBlock(
-                    generation: session.transcriptGeneration,
-                    snapshot: snapshot,
-                    encodedBytes: encodedBytes
-                )
+                let since = snapshot.messages.first.flatMap { UserDisplayFormatters.parseISOTimestamp($0.message.createdAt) }
+                snapshot.otherRooms = try exchanges.get().filter { event in
+                    event.sessionID != session.id && since.map { event.at >= $0 } == true
+                }
+            } catch {
+                snapshot.readError = error.localizedDescription
             }
+            let encodedBytes = (try? await MobileSnapshotBuilder.shared.encode(snapshot))?.count
+                ?? Self.chatTranscriptGroupByteBudget
             // Each block after the first also carries its separating comma.
-            let cost = block.encodedBytes + (out.isEmpty ? 0 : 1)
-            guard used + cost <= Self.chatTranscriptGroupByteBudget else { break }
-            used += cost
-            out.append(block.snapshot)
-            if block.generation != nil {
-                retained[session.id] = block
+            var candidates = out + [snapshot]
+            var size = used + encodedBytes + (out.isEmpty ? 0 : 1)
+            if size > Self.chatTranscriptGroupByteBudget {
+                // Spend the group on conversation rows before optional images,
+                // including previews in sessions already selected this pass.
+                candidates = await MobileSnapshotBuilder.shared.build { [candidates] in
+                    candidates.map { $0.omittingAttachmentPreviews() }
+                }
+                size = (try? await MobileSnapshotBuilder.shared.encode(candidates))?.count
+                    ?? (Self.chatTranscriptGroupByteBudget + 1)
             }
+            guard size <= Self.chatTranscriptGroupByteBudget else { break }
+            used = size
+            out = candidates
         }
-        // Only what was published this pass stays cached, so the cache is bound
-        // by the same budget the file is.
-        chatTranscriptBlockCache = retained
         // 2026-09-06: the version above came from the session list read BEFORE
         // these transcripts. A write landing in between shipped newer bytes
         // under an older counter, and the phone orders published transcripts by
@@ -1330,6 +1292,17 @@ extension MacSyncEngine {
         return await MobileSnapshotBuilder.shared.build {
             let encoder = MobileSnapshotBuilder.encoder()
             var out = candidates
+            // The compressed transport envelope has its own budget. Apply the
+            // same optional-preview reduction before dropping any session.
+            do {
+                _ = try NAMobileSnapshotStatusCodec.encode(
+                    group: .chat, files: ["chat_transcripts.json": try encoder.encode(out)])
+                return out
+            } catch DeviceSyncError.payloadTooLarge {
+                out = out.map { $0.omittingAttachmentPreviews() }
+            } catch {
+                return out
+            }
             while !out.isEmpty {
                 do {
                     _ = try NAMobileSnapshotStatusCodec.encode(
@@ -1390,11 +1363,21 @@ extension MacSyncEngine {
         return String(content.prefix(maxCharacters)) + "\n[truncated for iPhone snapshot]"
     }
 
+    private nonisolated static let revisionedSnapshotFiles: Set<String> = [
+        "approvals.json", "inbox.json", "memories.json", "memory_proposals.json"
+    ]
+
+    nonisolated static func revisionedSnapshotData(_ data: Data, revision: Double) throws -> Data {
+        try JSONSerialization.data(withJSONObject: ["revision": revision,
+            "value": JSONSerialization.jsonObject(with: data)], options: [.sortedKeys])
+    }
+
     func writeSnapshotData(
         _ data: Data,
         to filename: String,
         in snapshotDir: URL,
-        lifecycleGeneration expectedLifecycleGeneration: UInt64
+        lifecycleGeneration expectedLifecycleGeneration: UInt64,
+        readRevision: Double
     ) async -> SnapshotFileWriteResult {
         var data = data
         if let cap = Self.rowFileByteCaps[filename] {
@@ -1411,10 +1394,15 @@ extension MacSyncEngine {
         // file actually exists on disk. Digests persist across restarts, so a
         // matching digest with a missing/deleted file would otherwise suppress
         // recreating the snapshot forever, leaving iOS with no (or stale) data.
-        if snapshotFileDigests[filename] == digest,
+        if snapshotFileDigests[filename]?.payload == digest,
            FileManager.default.fileExists(atPath: url.path) {
             return .unchanged
         }
+        if Self.revisionedSnapshotFiles.contains(filename) {
+            do { data = try Self.revisionedSnapshotData(data, revision: readRevision) }
+            catch { return .failed(error.localizedDescription) }
+        }
+        let wireDigest = MacSyncSnapshotIntegrity.digest(data)
         // Off-main coordinated write, AWAITED so the write completes before this
         // returns. That keeps the original semantics exactly: digest is recorded
         // (and `true` returned) only on a confirmed write, the snapshotWriteInFlight
@@ -1437,7 +1425,7 @@ extension MacSyncEngine {
             syncError = "Snapshot write failed for \(filename): \(writeError)"
             return .failed(writeError)
         }
-        snapshotFileDigests[filename] = digest
+        snapshotFileDigests[filename] = SnapshotFileDigest(payload: digest, wire: wireDigest)
         return .changed
     }
 
@@ -1477,7 +1465,7 @@ extension MacSyncEngine {
     /// Digest keys whose snapshot file is present in `dir`. Pure, so the
     /// retire-a-snapshot lifecycle (file removed, digest must go too) is pinned
     /// without driving the engine.
-    nonisolated static func digestsPrunedToExistingFiles(_ digests: [String: String], in dir: URL) -> [String: String] {
+    nonisolated static func digestsPrunedToExistingFiles(_ digests: [String: SnapshotFileDigest], in dir: URL) -> [String: SnapshotFileDigest] {
         digests.filter { FileManager.default.fileExists(atPath: dir.appendingPathComponent($0.key).path) }
     }
 
@@ -1643,29 +1631,6 @@ extension MacSyncEngine {
         return unavailable
     }
 
-    /// Turn Inspector W4: compute the per-turn SUMMARY snapshot for the iOS
-    /// read-only inspector. Reads TODAY's (+ yesterday's) persisted turn-trace
-    /// day file off the live root, groups via the existing
-    /// `TurnInspectorGrouping`, projects to content-free `TurnSummaryRecord`s,
-    /// and applies the count + byte budget (truncation marker on drop).
-    ///
-    /// Runs entirely on a detached utility task — disk read + decode + grouping
-    /// are off the main actor and off the chat hot path (this is a 30s-poll read
-    /// of the persisted day file, NOT a TurnTraceBus subscriber). Returns nil
-    /// only on encode failure so a transient miss keeps the last good snapshot.
-    func turnSummariesSnapshotData(
-        sourceRoot: URL? = nil,
-        now: Date = Date()
-    ) async -> Data? {
-        let root = sourceRoot ?? TurnSummarySource.liveRoot()
-        return await Task.detached(priority: .utility) { () -> Data? in
-            let events = TurnSummarySource.loadEvents(root: root, now: now)
-            let encoder = TurnSummaryComputer.makeEncoder()
-            let file = TurnSummaryComputer.compute(from: events, encoder: encoder)
-            return try? encoder.encode(file)
-        }.value
-    }
-
     /// 2026-06-05 picker-sync: encode the picker's resolved per-surface
     /// model preferences as JSON for iOS to pull. Shape:
     /// Each surface includes model, providerId, and optional reasoningEffort/serviceTier.
@@ -1695,7 +1660,7 @@ extension MacSyncEngine {
             }
             let enc = JSONEncoder()
             enc.outputFormatting = .sortedKeys
-            do { return .built(try enc.encode(out)) } catch {
+            do { return .built(try Self.revisionedSnapshotData(enc.encode(out), revision: routing.revision)) } catch {
                 return .skipped("model preferences could not be encoded: \(error.localizedDescription)")
             }
         }
@@ -1833,7 +1798,7 @@ enum SnapshotGroupBuild: Sendable {
     }
 }
 
-private extension MemoryRecord {
+extension MemoryRecord {
     /// The phone's memories.json row, in the shape the Mac browsing list
     /// has always sent: importance 0, pinned spelled out, no tags.
     init(phoneRow r: MemoryV2.MemoryRecord) {

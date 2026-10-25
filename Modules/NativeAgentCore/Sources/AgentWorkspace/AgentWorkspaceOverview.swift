@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceOverview.swift` | `AgentWorkspaceNavigation`: `windowTitle`, `windowAction`, `window` |
 
 extension AgentWorkspaceNavigation {
     static func windowReference(_ place: AgentWorkspaceLocation) -> String? {

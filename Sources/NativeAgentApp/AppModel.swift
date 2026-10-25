@@ -15,20 +15,17 @@ import PersistenceCore
 import NativeAgentCore
 import MemoryV2
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
 import ToolExecution
 import PersonaEngine
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatToolRuntime
+import ChatSessionWork
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
 import Research
 import MultimodalTTS
 import TriggerScheduler
@@ -40,14 +37,14 @@ import TelegramBot
 import Dispatcher
 import MacControl
 import Onboarding
-import MacAssistantStatus
+import MacIntegration
 import WorkflowOrchestration
-import Skills
 import Connectors
 import Browser
 import DeviceSync
 import SchedulerExecution
 import TrustPersistence
+// Blueprint: | `AppModel.swift` | `AppModel`: app composition, UI/editor state and engine access; provider, persona, configuration and run state derive from engine owners; connector rows derive from `engine.connectors.accounts`; inbox actions receive `engine.inbox`; shared chat draft/session and surface command coordination |
 
 @MainActor
 extension AppModel: FirstRunWelcomePort {
@@ -115,19 +112,6 @@ extension AppModel: FirstRunWelcomePort {
 }
 
 @MainActor
-extension AppModel {
-    /// Preserve the last committed endpoint when refreshed configuration is invalid.
-    func applyRefreshedSearXNGBaseURL(_ value: String?) {
-        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        do {
-            searxngBaseURL = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(value)
-        } catch {
-            statusText = "SearXNG configuration unavailable: \(error.localizedDescription)"
-        }
-    }
-}
-
-@MainActor
 @Observable
 final class AppModel: Sendable {
     // Unfinished edits belong to their subject, across every presentation.
@@ -136,6 +120,10 @@ final class AppModel: Sendable {
 
     func editDraft<Value>(_ subject: String, seed: @autoclosure () -> Value) -> Value {
         (editDrafts[subject]?.value as? Value) ?? seed()
+    }
+
+    func editDraftBaseline<Value>(_ subject: String, seed: Value) -> Value {
+        (editDrafts[subject]?.baseline as? Value) ?? seed
     }
 
     func setEditDraft<Value>(_ value: Value, for subject: String, baseline: Value? = nil) {
@@ -150,8 +138,19 @@ final class AppModel: Sendable {
         else { editDrafts[subject] = (held.value, saved) }
     }
 
-    func mergingEditDraft<Value: Codable>(_ subject: String, edited: Value, into current: Value) throws -> Value {
-        guard let original = editDrafts[subject]?.baseline as? Value else { return current }
+    /// Keep only edits made while this save was in flight, based on the saved
+    /// generation. Carrying the whole old draft would resurrect unrelated fields.
+    func acceptEditDraft<Value: Codable & Equatable>(_ subject: String, submitted: Value, rebasingOn saved: Value) throws {
+        guard let pending = editDrafts[subject]?.value as? Value else { return }
+        if pending == submitted { editDrafts[subject] = nil }
+        else {
+            let rebased = try mergingEditDraft(subject, edited: pending, into: saved, baseline: submitted)
+            editDrafts[subject] = (rebased, saved)
+        }
+    }
+
+    func mergingEditDraft<Value: Codable>(_ subject: String, edited: Value, into current: Value, baseline originalBaseline: Value? = nil) throws -> Value {
+        guard let original = originalBaseline ?? (editDrafts[subject]?.baseline as? Value) else { return current }
         let encoder = JSONEncoder(), decoder = JSONDecoder()
         func fields(_ value: Value) throws -> [String: JSONValue] {
             try decoder.decode([String: JSONValue].self, from: encoder.encode(value))
@@ -207,10 +206,8 @@ final class AppModel: Sendable {
     // computed properties — `@Observable` only tracks STORED properties so
     // SwiftUI bindings never propagated and onChange never fired. Converted
     // to stored with `didSet` UserDefaults persistence so settings panels
-    // (Telegram and SearXNG) actually save when toggled.
-    var searxngBaseURL: String = UserDefaults.standard.string(forKey: "searxngBaseURL") ?? "" {
-        didSet { UserDefaults.standard.set(searxngBaseURL, forKey: "searxngBaseURL") }
-    }
+    // Telegram settings actually save when toggled. Research reads engine configuration.
+    var searxngBaseURL: String { engine.configuration.searxngBaseURL }
 
     /// A credential draft belongs only in the secure field until the user
     /// explicitly saves it through `telegram/config.json`.  In particular,
@@ -229,88 +226,46 @@ final class AppModel: Sendable {
         didSet { UserDefaults.standard.set(telegramRequireMention, forKey: "telegramRequireMention") }
     }
 
-    // PATCH-2026-05-07: chat-binding-fix These are real stored properties
-    // (with UserDefaults persistence as a side-effect) so @Observable can
-    // actually track changes. The earlier UserDefaults-only computed
-    // pattern wasn't observed, so picker selections never propagated and
-    // onChange handlers never fired.
-    /// Empty means "no pick of my own": the turn resolves through the Providers
-    /// group like every other surface (`resolveRequestedModel` falls through on
-    /// an empty id). 2026-09-13: this used to default to a literal primary model,
-    /// which is a choice made in code rather than at the picker.
-    var chatModel: String = {
-        ProvidersFacade.clearRetiredModelSelection("chatModel")
-        return UserDefaults.standard.string(forKey: "chatModel") ?? ""
-    }() {
-        didSet { UserDefaults.standard.set(chatModel, forKey: "chatModel") }
+    /// Only an unsaved picker edit is local; saved choices belong to providers.
+    var pendingChatBrainSelection: ProvidersFacade.ChatBrainSelection?
+    var chatModel: String {
+        get { pendingChatBrainSelection?.model ?? engine.providers.selection(for: "chat").model }
+        set { var draft = currentChatBrainSelection; draft.model = newValue; pendingChatBrainSelection = draft }
     }
-
-    var chatReasoningEffort: String = UserDefaults.standard.string(forKey: "chatReasoningEffort") ?? "high" {
-        didSet { UserDefaults.standard.set(chatReasoningEffort, forKey: "chatReasoningEffort") }
+    var chatReasoningEffort: String {
+        get { pendingChatBrainSelection?.reasoningEffort ?? engine.providers.selection(for: "chat").reasoningEffort }
+        set { var draft = currentChatBrainSelection; draft.reasoningEffort = newValue; pendingChatBrainSelection = draft }
     }
-
-    var chatFastMode: Bool = UserDefaults.standard.bool(forKey: "chatFastMode") {
-        didSet { UserDefaults.standard.set(chatFastMode, forKey: "chatFastMode") }
+    var chatFastMode: Bool {
+        get { pendingChatBrainSelection?.fastMode ?? engine.providers.selection(for: "chat").fastMode }
+        set { var draft = currentChatBrainSelection; draft.fastMode = newValue; pendingChatBrainSelection = draft }
     }
 
     var chatFileAccess: String = UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto" {
         didSet { UserDefaults.standard.set(chatFileAccess, forKey: "chatFileAccess") }
     }
 
-    /// Empty means "no pick of my own" — see `chatModel`.
-    var telegramModel: String = {
-        ProvidersFacade.clearRetiredModelSelection("telegramModel")
-        return UserDefaults.standard.string(forKey: "telegramModel") ?? ""
-    }() {
-        didSet { UserDefaults.standard.set(telegramModel, forKey: "telegramModel") }
+    var pendingTelegramModel: String?
+    var pendingTelegramReasoningEffort: String?
+    var telegramModel: String {
+        get { pendingTelegramModel ?? engine.providers.selection(for: "telegram").model }
+        set { pendingTelegramModel = newValue }
+    }
+    var telegramReasoningEffort: String {
+        get { pendingTelegramReasoningEffort ?? engine.providers.selection(for: "telegram").reasoningEffort }
+        set { pendingTelegramReasoningEffort = newValue }
     }
 
-    var telegramReasoningEffort: String = UserDefaults.standard.string(forKey: "telegramReasoningEffort") ?? "high" {
-        didSet { UserDefaults.standard.set(telegramReasoningEffort, forKey: "telegramReasoningEffort") }
-    }
-
-    /// The bars cache the same checked selection every other door reads.
     @MainActor
-    func refreshSurfacePickerCache() async {
-        let saveGeneration = engine.providers.chatBrainSaveGeneration
-        let chatWasSaving = isSavingChatBrain
-        do {
-            let snapshot = try await engine.providers.routing.checkedRoutingSnapshot()
-            applySurfacePickerSnapshot(snapshot, applyChat: !chatWasSaving
-                && !isSavingChatBrain && saveGeneration == engine.providers.chatBrainSaveGeneration)
-        } catch {
-            if !chatWasSaving && !isSavingChatBrain && saveGeneration == engine.providers.chatBrainSaveGeneration {
-                chatModel = ""
-                chatReasoningEffort = ""
-                chatFastMode = false
-                engine.providers.chatBrainCanonicalSelection = nil
-            }
-            telegramModel = ""
-            telegramReasoningEffort = ""
-            setFailureStatus(error, action: "read the model choices")
+    func refreshProviderPresentation() async {
+        if case .failed(let detail) = await engine.providers.refreshSettings(refreshCatalog: false, cause: UserFacingError.cause) {
+            setFailureStatus(detail, cause: ProviderRoutingError.underlying(detail))
         }
     }
 
-    func applySurfacePickerSnapshot(_ snapshot: ProviderRoutingSnapshot, applyChat: Bool = true) {
-        if applyChat, let chat = snapshot.preferences["chat"] {
-            chatModel = chat.model
-            chatReasoningEffort = chat.reasoningEffort
-            chatFastMode = chat.serviceTier == "priority"
-            chatProvider = snapshot.activeProviders["chat"] ?? ""
-            engine.providers.chatBrainCanonicalSelection = ProvidersFacade.ChatBrainSelection(
-                model: chat.model, reasoningEffort: chat.reasoningEffort, fastMode: chatFastMode
-            )
-        }
-        if let telegram = snapshot.preferences["telegram"] {
-            telegramModel = telegram.model
-            telegramReasoningEffort = telegram.reasoningEffort
-        }
-    }
-
-    var telegramTokenConfigured = false
     /// Last checked form values, used only to preserve unsaved UI edits.
     var telegramSettingsDraftBaseline: TelegramSettingsDraftSnapshot?
-    var telegramSettingsReadID: UUID?
+    @ObservationIgnored let telegramSettingsRead = LatestRead()
     /// The one "needs you" count (WorkOverviewRead's Needs you): Today's header
     /// and rail dot, the Simple card and the widget read it. Nil while part of
     /// the overview could not be read.
@@ -406,16 +361,12 @@ final class AppModel: Sendable {
         chatSessionIndexRefreshFailed = false
     }
 
-    var compiledPersonality: CompiledPersonalityWire?
-    var privacyMap: PrivacyMap?
     var supportDiagnostics: SupportDiagnostics?
     /// Support Snapshot has its own bounded read pass. Keep its progress
     /// separate from Doctor so its button can be honest about a snapshot that
     /// is loading, unavailable, or failed.
     var supportDiagnosticsLoading = false
     var capabilityCatalogSourceSaveInFlight = false
-    var activityEvents: [ActivityEvent] = []
-    var runs: [RunRecord] = []
     /// App integration tests use the same native files behind a temporary
     /// root; production leaves this nil and resolves the ordinary data root.
     var dataRootOverride: URL?
@@ -428,26 +379,17 @@ final class AppModel: Sendable {
     /// memory, routing, TrustCenter and tool owners while preserving their
     /// per-turn reads and effect-time checks.
     @ObservationIgnored lazy var macChatClient = engine.chatClient(profile: .mac)
-    var personality: PersonalityProfile? {
-        didSet {
-            if oldValue?.name != personality?.name {
-                NativeAgentShortcuts.updateAppShortcutParameters()
-            }
-        }
-    }
-
     /// Memory hygiene learns the name she goes by, so a fact "about Agent" is
     /// kept out of the user's profile whatever the persona is called. Called
-    /// wherever the profile is assigned; a `didSet` on an @Observable stored
+    /// after Mac profile loads and saves; a `didSet` on an @Observable stored
     /// property took the chat room down (2026-09-02), so it is explicit.
-    func teachMemoryHygieneName() {
-        engine.memory.teachAssistantName(personality)
+    func teachMemoryHygieneName(previousName: String?) {
+        engine.memory.teachAssistantName(engine.persona.profile)
+        if previousName != engine.persona.profile?.name { NativeAgentShortcuts.updateAppShortcutParameters() }
         // Every sentence about the agent, wherever it is built, speaks in
         // the persona's name and the chosen pronoun.
         AgentVoice.live = AgentVoice.current(name: agentDisplayName)
     }
-    var personalityDocs: [PersonaDocSpec] = []
-    var skills: [SkillRecord] = []
     /// Toolbar-specific single-flight state. Navigation may still perform its
     /// own scoped load, but repeated user taps cannot launch concurrent Tools
     /// refreshes that race to overwrite the visible receipt.
@@ -455,32 +397,13 @@ final class AppModel: Sendable {
     var toolsRefreshState: ToolsRefreshPresentation.State = .idle
     var routePlan: IntentRoutePlan?
     var routePresentation: IntentRoutePresentation = .idle
-    var workflows: [WorkflowRecord] = []
     /// Shared by every mounted approval surface. This is UI coordination only;
     /// the ApprovalInbox actor remains the durable terminal-decision authority.
     var approvalResolutionInFlightIDs: Set<String> = []
-    var mcpServers: [MCPServer] = []
-    var mcpTools: [MCPTool] = []
-    var mcpToolReadState: MCPHubToolReadState = .notLoaded
-    var mcpResources: [MCPResource] = []
-    var mcpResourceReadState: MCPHubResourceReadState = .notLoaded
-    var latestMCPCall: MCPCallResult?
-    var mcpRecentCallState: MCPHubRecentCallState = .notLoaded
-    var selectedMCPServerId: String?
-    var traces: [RuntimeTrace] = []
-    var capabilityTraceTimeline: CapabilityTraceFeed.State = .sourceAbsent
-    var agentGraph: AgentGraph?
-    var graphEntities: [GraphEntity] = []
-    var graphStatus: GraphIndexStatus?
-    /// Nil means no failed graph read has been observed. The Capability graph
-    /// panel keeps this separate from a legitimately empty, checked graph.
-    var graphLoadError: String?
     var graphSearchResults: [GraphSearchResult] = []
-    var autonomyKernel: AutonomyKernelSummary?
-    var personalOS: PersonalOSSummary?
-    var capabilityCatalog: [CapabilityCatalogItem] = []
-    var capabilityCatalogSources: [CapabilityCatalogSource] = []
-    var capabilityPackInstalls: [CapabilityPackInstall] = []
+    @ObservationIgnored let graphSearchRead = LatestRead()
+    @ObservationIgnored let capabilityUpdatesRead = LatestRead()
+    @ObservationIgnored let capabilityEvaluationRead = LatestRead()
     var capabilityCatalogInstallOutcome: CapabilityCatalogInstallOutcome?
     /// The signed demo action performs a multi-store durable install. Keep the
     /// mounted control single-flight so a second click cannot race the
@@ -488,18 +411,7 @@ final class AppModel: Sendable {
     var isInstallingDemoCapabilityPack = false
     var latestCapabilityTrustEvaluation: CapabilityTrustEvaluation?
     var latestCapabilityUpdateCheck: CapabilityUpdateCheck?
-    var nextGenSummary: NextGenSummary?
-    var nextGenPhases: [NextGenPhase] = []
-    var nextGenReceipts: [NextGenReceipt] = []
-    var latestNextGenReceipt: NextGenReceipt?
     var isRunningNextGenAction = false
-    var personalityGrowth: PersonalityGrowthSummary?
-    var nativeActions: [NativeActionRecord] = []
-    var nativeActionReceipts: [NativeActionReceipt] = []
-    var notificationStatus: NotificationRuntimeStatus?
-    var browserRuntimeStatus: BrowserRuntimeStatus?
-    var memoryVectorStatus: MemoryVectorStatus?
-    var memoryV2Status: MemoryV2Status?
     var latestMemoryHygiene: MemoryHygieneReport?
     /// F2: when a memory feature throws/returns a `not_implemented` /
     /// `panelDisabled` envelope, the UI surfaces this badge instead of a
@@ -507,7 +419,7 @@ final class AppModel: Sendable {
     var memoryFeatureDisabledMessage: String?
     /// W3 (eval5): generalised version of `memoryFeatureDisabledMessage` for
     /// non-memory panels (workflow run, eval run, capability pack install,
-    /// MCP warm/refresh, etc.). When a Swift-native implementation is
+    /// etc.). When a Swift-native implementation is
     /// deliberately unavailable, the underlying call throws
     /// `NativeActionRouteSupport.notImplemented(...)` with a
     /// `panelDisabled` userInfo flag; AppModel converts that into this
@@ -515,32 +427,14 @@ final class AppModel: Sendable {
     /// instead of a fake success toast or a red error. Cleared by the next
     /// successful action on the affected panel.
     var disabledFeature: String?
-    var connectorActionRegistry: ConnectorActionRegistry?
-    var latestConnectorActionReceipt: ConnectorActionReceipt?
-    var improvementGauntletStatus: ImprovementGauntletStatus?
-    var latestBrowserRun: BrowserRun?
-    var latestGauntletRun: ImprovementGauntletRun?
-    var productionHardening: ProductionHardeningSummary?
-    var productionExports: [ProductionExport] = []
     /// The last action initiated on the Trust surface. Unlike `statusText`, it
     /// cannot be overwritten by refreshes or work from another surface.
     var trustCenterActionOutcome: TrustCenterActionOutcome?
-    var connectors: [ConnectorRecord] = []
-    var workspaces: [WorkspaceRecord] = []
-    var evals: [EvalRun] = []
     var isSavingChatBrain: Bool {
         get { engine.providers.isSavingChatBrain }
         set { engine.providers.isSavingChatBrain = newValue }
     }
-    // PATCH-2026-05-07: chat-provider-picker Cache the active chat provider
-    // so the chat screen can render a Provider→Model dual picker without
-    // re-fetching every render (the list is `engine.providers.connections`).
-    // PATCH-2026-05-07: chat-binding-fix Stored property (not computed)
-    // so @Observable actually tracks changes. UserDefaults persistence is
-    // a side effect of didSet.
-    var chatProvider: String = UserDefaults.standard.string(forKey: "chatProvider") ?? "openai_oauth_direct" {
-        didSet { UserDefaults.standard.set(chatProvider, forKey: "chatProvider") }
-    }
+    var chatProvider: String { engine.providers.selection(for: "chat").provider }
     var statusText: String = "Not checked" {
         didSet { statusCause = nil }
     }
@@ -588,10 +482,6 @@ final class AppModel: Sendable {
     @ObservationIgnored var firstRunGreetingPublicReleaseOverride: Bool?
     @ObservationIgnored var firstRunGreetingProviderReadyOverride: (@MainActor @Sendable () async -> Bool)?
     @ObservationIgnored var firstRunGreetingSendOverride: (@MainActor @Sendable (String, String, Bool) async -> ChatTurnAcceptance)?
-    var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading {
-        get { engine.turns.runtime.chatTurnTranscriptProofReader }
-        set { engine.turns.runtime.chatTurnTranscriptProofReader = newValue }
-    }
     var chatTurnLifecycleRepairCompleted: Bool {
         get { engine.turns.runtime.chatTurnLifecycleRepairCompleted }
         set { engine.turns.runtime.chatTurnLifecycleRepairCompleted = newValue }
@@ -621,7 +511,7 @@ final class AppModel: Sendable {
         }
     }
     var agentDisplayName: String {
-        let profileName = (personality?.name ?? engine.memory.cachedAgentDisplayName)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let profileName = (engine.persona.profile?.name ?? engine.memory.cachedAgentDisplayName)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !profileName.isEmpty { return profileName }
         return NativeAgentIdentity.displayName(chatPersona)
     }
@@ -637,10 +527,9 @@ final class AppModel: Sendable {
     /// `agentDisplayName` is left alone because its callers want the raw
     /// profile name.
     var agentAddressName: String {
-        NativeAgentIdentity.displayName(personality?.name ?? engine.memory.cachedAgentDisplayName ?? chatPersona, fallback: "The agent")
+        NativeAgentIdentity.displayName(engine.persona.profile?.name ?? engine.memory.cachedAgentDisplayName ?? chatPersona, fallback: "The agent")
     }
     // PATCH-2026-05-06: skill-ui AppModel state — skill lifecycle registry
-    var skillManifests: [SkillInfo] = []
     var isLoadingSkillManifests = false
     var skillManifestError: String?
     /// Event-identified feedback for the mounted Skill Lifecycle banner/toast.
@@ -648,40 +537,16 @@ final class AppModel: Sendable {
 
     /// The miss ledger, this week and last: the Self-Improvement page's first section.
     var missLessons: [MemoryMissLesson] = []
+    @ObservationIgnored let missLessonsRead = LatestRead()
     var dreamError: String?
     var pendingMemoryProposalsCount: Int {
         engine.memory.proposals.filter { $0.status == "pending" }.count
     }
 
     // PATCH-2026-05-08: wave3 Feature A/B state
-    @ObservationIgnored var healthCardRefreshGate = LatestSnapshotRefreshGate()
 
-    @MainActor
-    var chatDrafts: [String: String] = [:]
+    @ObservationIgnored var chatComposerDrafts: [String: ChatComposerDraft] = [:]
     var chatPendingAttachments: [String: [MultimodalAttachment]] = [:]
-    // S.1: LRU tracking so we can cap chatDrafts at 50 entries
-    var chatDraftLastTouched: [String: Date] = [:]
-    /// 2026-09-06: when the text currently stored for a session was last
-    /// TYPED, as opposed to when it was written through. `flushLiveChatDrafts`
-    /// asks every live composer to commit inside one notification and observer
-    /// order is arbitrary, so without this an older detached-panel edit could
-    /// land on top of newer main-window typing. Nothing renders from it.
-    @ObservationIgnored var chatDraftLastEdited: [String: Date] = [:]
-
-    // H5 (2026-07-09): the composer no longer writes `chatDrafts` on every
-    // keystroke — it keeps the in-progress text in view-local @State and
-    // commits to `chatDrafts` only on send / session-switch / disappear.
-    // Prefills that originate OUTSIDE the composer (skill-build starter,
-    // suggestion chip, slash-command completion) bump this counter so the
-    // composer can pull the new text without observing `chatDrafts` on the
-    // keystroke path. See `injectChatDraft(_:sessionId:)`.
-    private(set) var chatDraftInjectionGeneration: Int = 0
-
-    /// Internal setter for the injection counter. `injectChatDraft` is the
-    /// only intended caller.
-    func bumpChatDraftInjectionGeneration() {
-        chatDraftInjectionGeneration &+= 1
-    }
 
     /// PATCH-2026-06-06: activity-flatten — when Cmd+Shift+A / Cmd+Shift+I
     /// fires from another page, Today is not yet mounted and its
@@ -730,7 +595,7 @@ final class AppModel: Sendable {
             }
         )
         guard startBackgroundTasks else { return }
-        Task { @MainActor in await self.refreshSurfacePickerCache() }
+        Task { @MainActor in await self.refreshProviderPresentation() }
         // Every Desk write in this process re-reads the overview, so a new
         // owner wait counts and pushes whether or not phone sync is on.
         Task { [weak self] in
@@ -748,14 +613,6 @@ final class AppModel: Sendable {
 
     func publishChatSnapshot() {
         chatSnapshotPublisher()
-    }
-
-    var selectedMCPServer: MCPServer? {
-        if let selectedMCPServerId,
-           let server = mcpServers.first(where: { $0.id == selectedMCPServerId }) {
-            return server
-        }
-        return mcpServers.first
     }
 
     var refreshAllInFlight = false
@@ -811,7 +668,7 @@ final class AppModel: Sendable {
     }
 
     @MainActor
-    private func recordRefreshFailure(_ label: String, error: Error) {
+    func recordRefreshFailure(_ label: String, error: Error) {
         let detail = "\(label): \(error.localizedDescription)"
         print("[NativeAgent] refreshAll/\(detail)")
         guard isRecordingRefreshAllFailures else {
@@ -859,60 +716,14 @@ extension NightlyReflectionJobOutcome {
     }
 }
 
-/// The scheduler read result belongs to the scheduler surface. Its detail is
-/// carried with the read rather than recovered later from AppModel.statusText,
-/// which any unrelated operation may replace before SchedulerView renders.
-enum SchedulerJobsRefreshResult: Equatable {
-    case current
-    case partial(detail: String)
-    case unavailable(detail: String)
-
-    var failureDetail: String? {
-        switch self {
-        case .current:
-            nil
-        case .partial(let detail), .unavailable(let detail):
-            detail
-        }
-    }
-
-    static func make(from feed: SchedulerJobsFeedState) -> Self {
-        switch feed {
-        case .current:
-            return .current
-        case .partial(let rows, let rejectedRows):
-            return .partial(detail: SchedulerJobsFeedState.partial(rows, rejectedRows: rejectedRows).failureDetail
-                ?? "Schedule is partially unavailable.")
-        case .sourceAbsent:
-            return .unavailable(detail: SchedulerJobsFeedState.sourceAbsent.failureDetail
-                ?? "Schedule source is absent.")
-        case .unavailable(let detail):
-            return .unavailable(detail: SchedulerJobsFeedState.unavailable(detail).failureDetail
-                ?? "Schedule source is unavailable.")
-        }
-    }
-}
-
 @MainActor
 extension AppModel {
     @MainActor
     @discardableResult
-    func refreshSchedulerJobs() async -> SchedulerJobsRefreshResult {
+    func refreshSchedulerJobs() async -> SchedulerJobsFeedState? {
         let feed = await engine.desk.refreshJobs()
-        let result = SchedulerJobsRefreshResult.make(from: feed)
-        switch feed {
-        case .current:
-            return result
-        case .partial:
-            statusText = result.failureDetail ?? "Schedule is partially unavailable."
-            return result
-        case .sourceAbsent:
-            statusText = result.failureDetail ?? "Schedule source is absent."
-            return result
-        case .unavailable:
-            statusText = result.failureDetail ?? "Schedule source is unavailable."
-            return result
-        }
+        if let detail = feed?.failureDetail { statusText = detail }
+        return feed
     }
 
     /// Pause / resume one scheduled job from the Scheduler screen (item 36).
@@ -1004,7 +815,7 @@ extension AppModel {
             // A failed canonical write can mean the underlying policy bytes
             // became unreadable between the UI read and this mutation. Do not
             // leave a stale OpenAI-voice grant available to playback.
-            engine.trust.policy = nil
+            engine.trust.publishPolicy(nil)
             recordTrustActionFailure(UserFacingError.message(error, action: "save the multimodal policy"), cause: error)
             return false
         }
@@ -1068,24 +879,8 @@ extension AppModel {
     }
 
     @MainActor
-    @discardableResult
-    func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil) async -> Bool {
-        do {
-            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot)
-                .saveAgentAccessMode(mode, currentPolicy: engine.trust.policy, developerMode: developerMode)
-            let status = "Agent access saved: \(Self.agentAccessLabel(mode))"
-            applySavedTrustPolicy(savedPolicy, status: status)
-            chatFileAccess = TrustAccessModeCapabilityCatalog.normalizedMode(mode)
-            return true
-        } catch {
-            recordTrustActionFailure(UserFacingError.message(error, action: "save agent access"), cause: error)
-            return false
-        }
-    }
-
-    @MainActor
     func applySavedTrustPolicy(_ policy: TrustPolicy, status: String? = nil) {
-        engine.trust.policy = policy
+        engine.trust.publishPolicy(policy)
         if let status {
             statusText = status
             trustCenterActionOutcome = .saved(status)
@@ -1096,15 +891,6 @@ extension AppModel {
         statusText = message
         statusCause = cause?.localizedDescription
         trustCenterActionOutcome = .failed(message)
-    }
-
-    nonisolated static func agentAccessLabel(_ mode: String) -> String {
-        switch TrustAccessModeCapabilityCatalog.normalizedMode(mode) {
-        case "read_only": return "Read"
-        case "workspace": return "Workspace"
-        case "full": return "Full Mac"
-        default: return "Auto"
-        }
     }
 
     /// The backup, or nil; either way `statusText` carries the receipt.
@@ -1131,13 +917,15 @@ extension AppModel {
     @MainActor
     func restoreBackup(_ backup: BackupRecord) async {
         let receipt: String
+        let outcome: TrustCenterActionOutcome
         var cause: String?
         do {
             let result = try await TrustBackupPersistence.restoreBackup(
                 id: backup.id, dataRoot: firstRunDataRoot, host: .app
             )
             if result.requiresRestart {
-                statusText = "Restore validated and staged with safety backup \(result.safetyBackupId ?? "created"). NativeAgent is restarting to restore before any live state owner opens."
+                statusText = "Restore validated and staged. NativeAgent is restarting to install the backup and carry only readable current requests and consumption evidence. A turn in progress when the backup was taken is restored as stopped; nothing from the backup runs on its own."
+                trustCenterActionOutcome = .saved(statusText)
                 AppRestartCoordinator.relaunchApp(terminate: {
                     RunLoop.main.perform(inModes: [.common]) {
                         MainActor.assumeIsolated { NSApplication.shared.terminate(nil) }
@@ -1150,12 +938,15 @@ extension AppModel {
             let scopes = TrustBackupPersistence.scopeNames(for: result.restored)
             let restoredDescription = scopes.isEmpty ? "no matching data scopes" : scopes.joined(separator: ", ")
             receipt = "Restore completed at \(result.restoredAt): \"\(backup.reason)\" from \(backup.createdAt). Safety backup created first. Restored: \(restoredDescription)."
+            outcome = .saved(receipt)
         } catch {
             receipt = "Restore failed for \"\(backup.reason)\" from \(backup.createdAt). "
                 + UserFacingError.cause(error, action: "restore that backup")
             cause = error.localizedDescription
+            outcome = .failed(receipt)
         }
         await refreshBackupList(preserving: receipt, cause: cause)
+        trustCenterActionOutcome = outcome
     }
 
     @MainActor
@@ -1177,7 +968,7 @@ extension AppModel {
     /// Guidance text to show in chat when no AI provider is usable at all;
     /// `nil` when at least one provider looks connected.
     func missingProviderChatGuidance() -> String? {
-        guard !SwiftNativeProviderRouting(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).hasUsableCredentials() else { return nil }
+        guard engine.providers.settings != nil, !engine.providers.hasReadyConnection else { return nil }
         return """
         No AI provider is connected yet, so I can't reply.
 
@@ -1216,14 +1007,15 @@ extension AppModel {
             completion: { [weak self] result, error in
                 guard let self else { return }
                 switch result {
-                case .saved(let selection):
-                    self.applyCanonicalChatBrainSelection(selection)
+                case .saved:
+                    self.pendingChatBrainSelection = nil
                     self.statusText = result.userMessage
                     self.publishProviderCatalogStatusAfterBrainSave()
                 case .unchanged:
+                    self.pendingChatBrainSelection = nil
                     self.statusText = result.userMessage
-                case .failed(_, let canonical, _):
-                    if let canonical { self.applyCanonicalChatBrainSelection(canonical) }
+                case .failed:
+                    self.pendingChatBrainSelection = nil
                     if let error { self.setFailureStatus(result.userMessage, cause: error) }
                     else { self.statusText = result.userMessage }
                 }
@@ -1237,20 +1029,12 @@ extension AppModel {
             return .unchanged(currentChatBrainSelection)
         }
         let result = await engine.providers.awaitChatBrainSave(generation: generation)
-        if case .failed(_, _, nil) = result { statusText = result.userMessage }
+        if case .failed(_, nil) = result { statusText = result.userMessage }
         return result
     }
 
     private var currentChatBrainSelection: ProvidersFacade.ChatBrainSelection {
         .init(model: chatModel, reasoningEffort: chatReasoningEffort, fastMode: chatFastMode)
-    }
-
-    private func applyCanonicalChatBrainSelection(_ selection: ProvidersFacade.ChatBrainSelection) {
-        if chatModel != selection.model { chatModel = selection.model }
-        if chatReasoningEffort != selection.reasoningEffort {
-            chatReasoningEffort = selection.reasoningEffort
-        }
-        if chatFastMode != selection.fastMode { chatFastMode = selection.fastMode }
     }
 
     private func publishProviderCatalogStatusAfterBrainSave() {
@@ -1259,32 +1043,16 @@ extension AppModel {
         }
     }
 
-    /// PATCH-2026-05-07: chat-provider-picker Load + cache the providers
-    /// list so the chat screen's Provider dropdown stays populated. Also
-    /// reads the canonical providers/active.json owner for `chatProvider`.
-    /// M12 (gpt-5.5 review, 2026-07-09): returns whether the provider list
-    /// actually refreshed, so the chat panel's staleness tracking can record
-    /// a carried-over dropdown instead of silently impersonating a live one.
+    /// Refresh the engine's checked provider presentation for every door.
     @MainActor
     @discardableResult
     func loadProvidersForChat() async -> Bool {
-        defer { engine.providers.refreshAccountModelsInBackground() }
-        let saveGeneration = engine.providers.chatBrainSaveGeneration
-        let chatWasSaving = isSavingChatBrain
-        var providersFresh = true
-        do {
-            let snapshot = try await engine.providers.routing.checkedProviderSnapshot()
-            engine.providers.connections = try ProvidersFacade.connections(from: snapshot)
-            applySurfacePickerSnapshot(snapshot.routing, applyChat: !chatWasSaving
-                && !isSavingChatBrain && saveGeneration == engine.providers.chatBrainSaveGeneration)
-            Task {
-                _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus()
-            }
-        } catch {
-            // keep prior list on screen, but say so
-            providersFresh = false
+        switch await engine.providers.refreshSettings(refreshCatalog: false, cause: UserFacingError.cause) {
+        case .loaded:
+            Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
+            return true
+        case .failed: return false
         }
-        return providersFresh
     }
 
     @MainActor
@@ -1304,14 +1072,14 @@ extension ProvidersFacade.ChatBrainSaveResult {
         switch self {
         case .unchanged(let selection), .saved(let selection):
             return "Chat brain saved: \(selection.model) / \(selection.reasoningEffort)\(selection.fastMode ? " / Fast" : "")"
-        case .failed(let message, _, _):
+        case .failed(let message, _):
             return "Couldn't save the model choice. \(message)"
         }
     }
 
     /// What the agent's tool result says: the same line plus the raw cause.
     var agentMessage: String {
-        if case .failed(_, _, let cause) = self { return UserFacingError.forAgent(userMessage, cause: cause) }
+        if case .failed(_, let cause) = self { return UserFacingError.forAgent(userMessage, cause: cause) }
         return userMessage
     }
 }
@@ -1334,11 +1102,6 @@ extension AppModel {
     }
 
     // MARK: Chat context / tools
-    func getSessionContext(sessionId: String, model: String? = nil) async throws -> SessionContextStatus {
-        try await RuntimeReadProjection.getSessionContext(
-            sessionId: sessionId, model: model, dataRoot: engine.dataRoot, configuredThresholdTokens: nil)
-    }
-
     /// ChatOrchestration's canonical transcript compactor, so automatic and
     /// manual requests share validation, verified backup, durable
     /// replacement, traces, and optional distillation.
@@ -1351,21 +1114,6 @@ extension AppModel {
         try await engine.compactSession(
             sessionId: sessionId, model: model, providerID: providerID, force: force, client: macChatClient
         )
-    }
-
-    /// A slash command's tool run. The caller serializes its input on the
-    /// main actor so only Sendable data crosses into the dispatcher.
-    func dispatchToolData(tool: String, inputData: Data, sessionId: String?) async throws -> DispatchResult {
-        try await engine.dispatchToolData(tool: tool, inputData: inputData, sessionId: sessionId)
-    }
-
-    // MARK: Connectors
-    func getConnectorRegistrationStatus(provider: String) async throws -> ConnectorRegistrationStatus {
-        try await ConnectorWizardActions.getConnectorRegistrationStatus(provider: provider)
-    }
-
-    func registerConnectorApp(provider: String) async throws -> ConnectorRegisterAppResponse {
-        try await ConnectorWizardActions.registerConnectorApp(provider: provider)
     }
 
     // MARK: Onboarding
@@ -1400,12 +1148,6 @@ extension AppModel {
     }
 
     // MARK: Mac assistant / Mac control
-    func getMacAssistantStatus() async throws -> MacAssistantStatusResult {
-        // UI consumes the full access/template lists — request non-lightweight.
-        try await AppConnectorActionPlatform(dataRoot: engine.dataRoot).macAssistantStatusClient()
-            .macAssistantStatus(lightweight: false)
-    }
-
     func saveMacIntegrationPreset(_ preset: String, currentPolicy: TrustPolicy? = nil) async throws -> TrustPolicy {
         try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMacIntegrationPreset(preset, currentPolicy: currentPolicy)
     }
@@ -1413,20 +1155,17 @@ extension AppModel {
     /// Overload of the existing `runConnectorAction(_:)` for the id/dryRun/input
     /// call shape used by the Mac-data probe.
     func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue] = [:]) async throws -> ConnectorActionReceipt {
-        try await ConnectorActions(platform: AppConnectorActionPlatform(dataRoot: engine.dataRoot))
-            .runConnectorAction(id: id, dryRun: dryRun, input: input)
-    }
-
-    func fullMacYoloAuthorityAdmitted(tool: String, surface: String) async -> Bool {
-        await ConnectorActions.fullMacYoloAdmitted(tool: tool, surface: surface, dataRoot: engine.dataRoot)
+        try await engine.runConnectorAction(id: id, dryRun: dryRun, input: input,
+            origin: "mac_ui:connector_action:" + id, platform: AppConnectorActionPlatform(engine: engine))
     }
 
     func saveMacControlPolicy(
         _ policy: TrustMacControlPolicy,
+        comparedTo baseline: TrustMacControlPolicy,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
     ) async throws -> TrustPolicy {
         try await TrustPolicyActions(dataRoot: engine.dataRoot)
-            .saveMacControlPolicy(policy, guardedByLockedPolicy: guardedByLockedPolicy)
+            .saveMacControlPolicy(policy, comparedTo: baseline, guardedByLockedPolicy: guardedByLockedPolicy)
     }
 
     func macControlNotify(title: String, message: String) async throws -> Bool {
@@ -1443,12 +1182,7 @@ extension AppModel {
 
     // MARK: Providers
     func clearSurfaceOverride(surface: String) async throws {
-        try await engine.clearSurfaceOverride(surface: surface) { preference in
-            applySurfacePickerSelection(
-                surface: surface, model: preference.model,
-                reasoningEffort: preference.reasoningEffort, serviceTier: preference.serviceTier
-            )
-        }
+        try await engine.clearSurfaceOverride(surface: surface)
     }
 
     func saveProviderGroupSelection(
@@ -1457,8 +1191,7 @@ extension AppModel {
     ) async throws -> ProviderGroupWriteResult {
         try await engine.saveProviderGroupSelection(
             group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
-            serviceTier: serviceTier, clearOverride: clearOverride,
-            applySnapshot: { applySurfacePickerSnapshot($0) }
+            serviceTier: serviceTier, clearOverride: clearOverride
         )
     }
 
@@ -1468,38 +1201,7 @@ extension AppModel {
         try await engine.configureSurfaceSelection(
             surface: surface, providerID: providerID, model: model,
             reasoningEffort: reasoningEffort, serviceTier: serviceTier
-        ) { response in
-            applySurfacePickerSelection(
-                surface: surface, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier
-            )
-            if surface == "chat" {
-                chatProvider = providerID
-                let canonical = response.current.chat
-                engine.providers.chatBrainCanonicalSelection = ProvidersFacade.ChatBrainSelection(
-                    model: canonical.model, reasoningEffort: canonical.reasoningEffort,
-                    fastMode: canonical.serviceTier == "priority"
-                )
-            }
-        }
-    }
-
-    private func applySurfacePickerSelection(
-        surface: String,
-        model: String,
-        reasoningEffort: String,
-        serviceTier: String?
-    ) {
-        switch surface {
-        case "chat":
-            chatModel = model
-            chatReasoningEffort = reasoningEffort
-            chatFastMode = serviceTier == "priority"
-        case "telegram":
-            telegramModel = model
-            telegramReasoningEffort = reasoningEffort
-        default:
-            break
-        }
+        )
     }
 
     func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String? = nil) async throws {
@@ -1537,7 +1239,7 @@ extension AppModel {
         if let inboxActionOverride {
             return try await inboxActionOverride(id, action)
         }
-        try await InboxCardActions.perform(id, action: action, dataRootOverride: dataRootOverride, effects: AppInboxCardActionEffects())
+        try await InboxCardActions.perform(id, action: action, dataRootOverride: dataRootOverride, effects: AppInboxCardActionEffects(inbox: engine.inbox))
     }
 }
 

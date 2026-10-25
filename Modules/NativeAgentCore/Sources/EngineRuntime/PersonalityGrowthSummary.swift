@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `PersonalityGrowthSummary.swift` | `PersonalityGrowthSummary` struct |
 
 public struct PersonalityGrowthSummary: Codable, Hashable {
     public var engineVersion: String

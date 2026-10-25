@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import MacControl
+// Blueprint: | `ResearchTransports.swift` | `URLSessionResearchHTTPClient.getBounded`; Docker discovery/start retains daemon readiness polling at 3-second intervals within its 90-second window, with no confirmed push replacement; subprocesses delegate to `MacControl.SystemProcessAdapter` with full output capture |
 
 // MARK: - URLSession-backed HTTP client (production)
 
@@ -199,7 +200,7 @@ public final class SystemDockerPSExecutor: Sendable {
 }
 
 /// Run a subprocess under a deadline with stdin closed; nil when it cannot
-/// start. Shared by the docker probes (8s) and Codex web search (60s).
+/// start. Used by the docker probes (8s).
 func runResearchSubprocess(
     executable: String, arguments: [String], environment: [String: String]? = nil,
     cwd: URL? = nil, timeout: TimeInterval

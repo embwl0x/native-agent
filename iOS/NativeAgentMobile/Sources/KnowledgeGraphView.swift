@@ -4,16 +4,10 @@
 // available on iPhone.
 // Phone-friendly: list + tap-to-detail sheet and pull-to-refresh.
 //
-// F3 (fix3) — iOS source choice: KEEP the existing iCloud snapshot fallback
-// (`iCloudSyncEngine.shared.loadSnapshotObjectAsync(named: "knowledge_graph.json")`).
-// Rationale: iCloud snapshots already round-trip from the Mac Swift runtime to the
-// phone with no additional plumbing; adding a `kg_snapshot` BridgeMessage kind
-// for this surface would duplicate transport with no functional gain. The Mac
-// app's KG storage cutover to SQLite (when it happens) will still emit the same
-// JSON envelope into the iCloud snapshot folder, so this code path stays valid
-// across that transition.
+// List, detail headers and neighbors all read the sync engine's typed graph.
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `KnowledgeGraphView.swift` | Graph presentation and ID-resolved entity details/neighbors from the shared typed graph; local search/loading state |
 
 enum KnowledgeGraphPresentation {
     enum ContentState: Equatable {
@@ -53,25 +47,13 @@ enum KnowledgeGraphEmptyStatePresentation {
 /// iCloud delivery failure.
 enum KnowledgeGraphDetailNeighborsPresentation {
     enum UnavailableReason: Equatable {
-        case snapshotStillDownloading
         case entityNoLongerPublished
     }
 
     static func message(for reason: UnavailableReason) -> String {
         switch reason {
-        case .snapshotStillDownloading:
-            return "Knowledge graph snapshot is still downloading from iCloud."
         case .entityNoLongerPublished:
             return "This entity is no longer in the published Knowledge Graph."
-        }
-    }
-
-    static func recoveryDetail(for reason: UnavailableReason) -> String? {
-        switch reason {
-        case .snapshotStillDownloading:
-            return nil
-        case .entityNoLongerPublished:
-            return "The list and detail snapshots disagree. Refresh the Knowledge Graph on the Mac to publish a consistent view."
         }
     }
 
@@ -204,7 +186,6 @@ struct KGEntity: Decodable, Identifiable, Equatable, Sendable {
 }
 
 private struct KGNeighborsResponse: Sendable {
-    var entity: KGEntity?
     var edges: [KGEdge]
     var neighbors: [String: KGEntity]
 }
@@ -229,7 +210,7 @@ struct KGEdge: Decodable, Identifiable, Equatable, Sendable {
 
 @MainActor
 private final class KGStore: ObservableObject {
-    @Published private(set) var snapshot: KGEntityResponse?
+    var snapshot: KGEntityResponse? { iCloudSyncEngine.shared.knowledgeGraph }
     var entities: [KGEntity] { snapshot?.entities ?? [] }
     var total: Int { snapshot?.total ?? 0 }
     @Published var isLoading = false
@@ -242,12 +223,8 @@ private final class KGStore: ObservableObject {
     func refresh() async {
         isLoading = true
         defer { isLoading = false }
-        if let resp: KGEntityResponse = await iCloudSyncEngine.shared.loadSnapshotObjectAsync(named: "knowledge_graph.json") {
-            if snapshot != resp {
-                withAnimation(AppMotion.snappy) {
-                    snapshot = resp
-                }
-            }
+        await iCloudSyncEngine.shared.refreshKnowledgeGraphSnapshot()
+        if snapshot != nil {
             bannerError = nil
         } else {
             bannerError = "Knowledge graph snapshot is still downloading from iCloud. Try again in a moment."
@@ -259,12 +236,11 @@ private final class KGStore: ObservableObject {
 // MARK: - KnowledgeGraphView
 
 struct KnowledgeGraphView: View {
-    private let syncEngine = iCloudSyncEngine.shared
     @StateObject private var store = KGStore()
     @State private var searchText = ""
     @State private var searchIndex = MobileSearchIndex<KGEntity>()
     @State private var searchResults: [KGEntity] = []
-    @State private var selectedEntity: KGEntity?
+    @State private var selectedEntityID: String?
 
     private var displayEntities: [KGEntity] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -318,7 +294,7 @@ struct KnowledgeGraphView: View {
                     Section {
                         ForEach(displayEntities) { entity in
                             Button {
-                                selectedEntity = entity
+                                selectedEntityID = entity.id
                             } label: {
                                 KGEntityRowCell(entity: entity)
                             }
@@ -358,9 +334,6 @@ struct KnowledgeGraphView: View {
             }
             .refreshable { await store.refresh() }
             .task { await store.refresh() }
-            .onChange(of: syncEngine.pageSnapshotVersions["knowledge_graph.json"]) { _, _ in
-                Task { await store.refresh() }
-            }
 
         }
         .animation(AppMotion.snappy, value: store.bannerError)
@@ -377,8 +350,12 @@ struct KnowledgeGraphView: View {
             }
         }
         .macSyncErrorBanner()
-        .sheet(item: $selectedEntity) { entity in
-            KGEntityDetailSheet(entity: entity, store: store)
+        .sheet(isPresented: Binding(get: { selectedEntityID != nil }, set: { if !$0 { selectedEntityID = nil } })) {
+            if let entity = MobileDesignSamples.rows(store.entities).first(where: { $0.id == selectedEntityID }) {
+                KGEntityDetailSheet(entity: entity, store: store)
+            } else {
+                AliveCalmState(title: "Entity unavailable", line: KnowledgeGraphDetailNeighborsPresentation.message(for: .entityNoLongerPublished))
+            }
         }
     }
 }
@@ -424,11 +401,15 @@ private struct KGEntityRowCell: View {
 private struct KGEntityDetailSheet: View {
     let entity: KGEntity
     @ObservedObject var store: KGStore
-    @State private var neighbors: KGNeighborsResponse?
-    @State private var isLoading = false
-    @State private var loadError: String?
-    @State private var loadUnavailableReason: KnowledgeGraphDetailNeighborsPresentation.UnavailableReason?
     @Environment(\.dismiss) private var dismiss
+
+    private var neighbors: KGNeighborsResponse? {
+        guard let snapshot = store.snapshot else { return nil }
+        let edges = snapshot.edges.filter { $0.from == entity.id || $0.to == entity.id }
+        let ids = Set(edges.flatMap { [$0.from, $0.to] }).subtracting([entity.id])
+        return KGNeighborsResponse(edges: edges,
+            neighbors: Dictionary(snapshot.entities.filter { ids.contains($0.id) }.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }))
+    }
 
     var body: some View {
         let meta = KGEntityMeta.presentation(for: entity.type)
@@ -474,24 +455,7 @@ private struct KGEntityDetailSheet: View {
                     }
 
                     // Edges / neighbors
-                    if isLoading {
-                        MobileAdaptiveRow { Spacer(); ProgressView("Loading edges…"); Spacer() }
-                            .padding()
-                    } else if let err = loadError {
-                        MobileReadingSurface {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Label(err, systemImage: "exclamationmark.triangle")
-                                    .font(.callout)
-                                    .foregroundStyle(.red)
-                                if let reason = loadUnavailableReason,
-                                   let detail = KnowledgeGraphDetailNeighborsPresentation.recoveryDetail(for: reason) {
-                                    Text(detail)
-                                        .font(.callout)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    } else if let nbr = neighbors {
+                    if let nbr = neighbors {
                         if nbr.edges.isEmpty {
                             AliveCalmState(title: "No relationships", line: "No edges recorded yet for this entity.")
                             .frame(minHeight: 200)
@@ -521,42 +485,9 @@ private struct KGEntityDetailSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .task(id: store.snapshot) { await loadNeighbors() }
         }
     }
 
-    private func loadNeighbors() async {
-        isLoading = true
-        defer { if !Task.isCancelled { isLoading = false } }
-        loadError = nil
-        loadUnavailableReason = nil
-        guard let snapshot = store.snapshot else {
-            let reason: KnowledgeGraphDetailNeighborsPresentation.UnavailableReason = .snapshotStillDownloading
-            loadUnavailableReason = reason
-            loadError = KnowledgeGraphDetailNeighborsPresentation.message(for: reason)
-            return
-        }
-        let entityID = entity.id
-        let projected = await Task.detached(priority: .userInitiated) {
-            guard let match = snapshot.entities.first(where: { $0.id == entityID }) else { return nil as KGNeighborsResponse? }
-            let incidentEdges = snapshot.edges.filter { $0.from == entityID || $0.to == entityID }
-            let neighborIDs = Set(incidentEdges.flatMap { [$0.from, $0.to] }).subtracting([entityID])
-            let neighborMap = Dictionary(snapshot.entities
-                .filter { neighborIDs.contains($0.id) }
-                .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-            return KGNeighborsResponse(entity: match, edges: incidentEdges, neighbors: neighborMap)
-        }.value
-        guard !Task.isCancelled, store.snapshot == snapshot else { return }
-        guard let projected else {
-            let reason: KnowledgeGraphDetailNeighborsPresentation.UnavailableReason = .entityNoLongerPublished
-            loadUnavailableReason = reason
-            loadError = KnowledgeGraphDetailNeighborsPresentation.message(for: reason)
-            return
-        }
-
-        neighbors = projected
-        loadError = nil
-    }
 }
 
 // MARK: - Edge row

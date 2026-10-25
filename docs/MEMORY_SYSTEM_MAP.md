@@ -39,7 +39,7 @@ Read the page for the current arguments and applicable action warnings.
 | `MemoryV2/MemoryStorage+Recall.swift`, `MemoryRecallScoring.swift` | Cached recall candidates, vector and lexical scoring. |
 | `MemoryV2/MemoryV2+AdaptivePromoter.swift` | Applies `AfterTurnNoveltyGate.swift` before the shared interpretation, screens candidates and stages fact/moment proposals. |
 | `ChatTurnRuntime/MindMemoryManager.swift` | At most one shared model interpretation after the novelty gate, returning memories, a possible moment, affect and a caring judgment. |
-| `KnowledgeGraph/KnowledgeGraph+MemoryIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: ordered per-memory entity, edge and support projection into the shared SQLite database. |
+| `MemoryV2/KnowledgeGraph+MemoryIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: ordered per-memory entity, edge and support projection into the shared SQLite database. |
 | `ContextFlow/NativeMemoryContextProjection.swift` | Compiles eligible memory records into selectable context atoms. |
 | `MemoryV2/MemoryV2+ConsolidationGate.swift` | Builds and stages a candidate, then reconciles approved application and derived projections. |
 
@@ -107,11 +107,14 @@ for review. Rejection/forgetting use tombstones to prevent unwanted content
 from returning.
 
 For explicit `memory.commit`, `corrects` names an existing record; the result
-reports whether that correction applied. `context_topics` narrows a correction's
-context scope. Other kinds ignore that field; valid correction topic strings
-are bounded, and empty input supplies no scope. If no valid scope is supplied,
-`CorrectionScopeAtIntake` may derive topics from tools actually dispatched in
-that turn. With no derivable scope, the correction remains global.
+reports whether that correction applied. `context_topics` narrows automatic
+context injection for `correction`, `instruction`, `preference` and `note`;
+other kinds ignore it. Intake keeps up to eight non-empty, trimmed topic
+strings of at most 120 characters each. Empty or invalid input supplies no
+scope; no scope is inferred from dispatched tools. Omitted scope stays global.
+Explicit recall is not restricted by these topics. A save returns existing
+agreements with the same declared scope for judgment; scope alone never
+retires them or grants authority.
 
 Owners: `MemoryV2+Proposals.swift`, `MemoryStorage+Proposals.swift`,
 `ChatToolRuntime/SwiftToolDispatcher+MemoryTools.swift`.
@@ -132,6 +135,13 @@ core (`userPromptCore`, 3,500 B) carry facts about the owner only: user_fact,
 user_preference, preference, relationship, identity and attribute. Moments
 and experiences are theirs; they reach a turn through recall, and `memory.pin`
 refuses any kind outside that list.
+
+The generator retains its trailing deadline through regeneration. Engine
+termination closes projection admission, drains the storage-owned USER.md,
+Spotlight and graph tails, and flushes accepted USER.md requests after cancelling
+any sleeping debounce deadline. Already accepted promoter observations and
+canonical writes are allowed to finish without blanket cancellation. Canonical
+writes that finish after projection admission closes are reconciled at next launch.
 
 ## Embeddings
 
@@ -161,6 +171,13 @@ The model must accept `input_ids` and `attention_mask` as int32 tensors shaped
 shaped `[1, N]` or `[N]`, where `N` matches `dimensions`. The runtime mean-pools
 token vectors using the attention mask and L2-normalizes the resulting vector
 or the supplied pooled vector.
+
+A search query (a turn's message and its other voice, explicit recall, the
+consolidation probes) is embedded through `embedQueriesWithEpoch`. A bge model
+is trained asymmetric, so `ManagedEmbeddingProvider` gives its queries the
+instruction "Represent this sentence for searching relevant passages: "; stored
+text never carries it, so corpus vectors and the epoch are the same either way.
+MiniLM and the mock embed a query like any text.
 
 Vectors carry a `MemoryEmbeddingEpoch`. `MemoryStorage+EmbeddingEpoch.swift`
 owns corpus activation, and recall checks compatibility before comparing
@@ -221,7 +238,7 @@ Keys live under `memoryPolicy` in `<dataRoot>/trust/policy.json`.
 | `adaptive_promotion` | Fact proposal lane; moments have their own switch. |
 | `knowledge_graph_enabled` | Graph indexing/read/rebuild admission. |
 | `consolidation_enabled` | Gated consolidation. |
-| `auto_promote_consolidated` | Removed 10-10 with its switch: consolidation never accepts a proposal (they reviews with `memory_moment_review` or on the Memories page). A saved key is ignored on read. |
+| `auto_promote_consolidated` | Removed 10-10 with its switch: consolidation never accepts a proposal (they reviews with `memory.review` or on the Memories page). A saved key is ignored on read. |
 | `hygiene_enabled` | Memory hygiene. |
 
 Disabling cross-session recall excludes every MemoryV2 source from ContextFlow,

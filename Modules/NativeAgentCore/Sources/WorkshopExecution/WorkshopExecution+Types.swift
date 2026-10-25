@@ -5,6 +5,8 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 
+// Blueprint: | `WorkshopExecution+Types.swift` | Workshop execution value contracts: specs/steps, verification/records, enqueue outcomes, argument validation and planner interface |
+
 // MARK: - Errors
 
 public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
@@ -219,6 +221,7 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
     }
 
     public var id: String
+    public var lifeID: String? = nil
     /// Authoritative Workshop/Desk identity. The execution id remains an
     /// internal compatibility key until the legacy queue is retired.
     public var deskHandle: String? = nil
@@ -226,7 +229,7 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
     public var title: String
     public var objective: String
     public var createdAt: String         // "created_at" in JSON
-    public var status: String            // "queued"|"running"|"blocked_on_approval"|"blocked_on_reconciliation"|"completed"|"failed"|"cancelled"
+    public var status: String            // "queued"|"running"|"blocked_on_approval"|"blocked_on_reconciliation"|"completed"|"failed"|"cancelled"|"stopped"
     public var plan: [WorkshopExecutionStep]
     public var stepsCompleted: [JSONValue]   // "steps_completed" — opaque from Swift's POV
     public var receiptsDir: String       // "receipts_dir" — absolute path to receipts/
@@ -282,6 +285,7 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
             object["last_movement_at"] = .string(lastMovementAt)
         }
         if let compiledOperationBinding { object["compiled_operation_binding"] = compiledOperationBinding }
+        if let lifeID { object["lifeID"] = .string(lifeID) }
         if let terminalReason { object["terminal_reason"] = .string(terminalReason) }
         if let planningProviderCallCount {
             object["planning_provider_call_count"] = .int(Int64(planningProviderCallCount))
@@ -333,25 +337,17 @@ public enum WorkshopArgumentValidation {
     }
 }
 
-/// Pluggable LLM call for the planner. The default HTTP-backed impl asks
-/// the daemon to run codex; tests pass a deterministic stub. The protocol
-/// also exposes the connector-action list so the planner can build
-/// tools_summary; the daemon answers that one too.
+/// Planner provider seam; production uses `SwiftNativeWorkshopPlannerLLM`.
 public protocol WorkshopPlannerLLM: Sendable {
     /// Exact direct provider calls issued by one `runCodex` invocation. A
     /// custom/test adapter that cannot prove this leaves it nil; callers must
     /// not infer provider usage merely because the method was invoked.
     var directProviderCallCountPerInvocation: Int? { get }
-    /// Live connector_actions list. Each element is the daemon's
-    /// connector_actions_registry().actions[i] dict (id/description/...).
-    /// Returning [] is allowed and matches Python's silent-except fallback.
+    /// Available connector action descriptors; an empty list is supported.
     func availableConnectorActions() async -> [JSONValue]
 
-    /// Run codex with the assembled prompt; return (model, raw output).
-    /// `surface` is "workshop" (P2-3; "missions" before 0.3.8 and still
-    /// accepted) so the per-surface provider routing
-    /// applies. Any error → caller treats it as a planner failure and falls
-    /// back to the stub.
+    /// Run the planner on the routed surface and return (model, raw output).
+    /// Planning errors propagate to the caller.
     func runCodex(prompt: String, surface: String, timeoutSeconds: Int) async throws -> (model: String, output: String)
 }
 
@@ -359,54 +355,12 @@ public extension WorkshopPlannerLLM {
     var directProviderCallCountPerInvocation: Int? { nil }
 }
 
-/// Default deny-LLM impl — returns no connector actions and refuses to run
-/// codex. Wired by the SwiftNative factory when no real planner is
-/// available, so the runner ALWAYS falls back to the deterministic stub.
-/// Used by tests and by callers that don't want the daemon round-trip.
+/// Deny-LLM implementation: no connector actions; planning throws.
 public struct StubWorkshopPlannerLLM: WorkshopPlannerLLM {
     public init() {}
     public var directProviderCallCountPerInvocation: Int? { 0 }
     public func availableConnectorActions() async -> [JSONValue] { [] }
     public func runCodex(prompt: String, surface: String, timeoutSeconds: Int) async throws -> (model: String, output: String) {
         throw WorkshopExecutionError.plannerFailure("stub planner does not run codex")
-    }
-}
-
-/// Field patch for the queue-bridge half of POST /v1/missions/update.
-/// `nil` means "field absent in the request body" → leave unchanged, exactly
-/// like Python's `if "title" in body:` presence checks (L5385-L5398). An
-/// EMPTY string for title/objective is treated by Python as "fall back to the
-/// existing value" (`str(body.get("title") or qm.title)`), so we model that
-/// distinction faithfully: a present-but-empty title/objective keeps the old
-/// value, while `status`/`result` overwrite verbatim (Python lets them go
-/// empty). `summary` is the alias Python accepts for `result`.
-public struct WorkshopExecutionUpdate: Sendable, Equatable {
-    public var id: String
-    public var title: String?
-    public var objective: String?
-    public var status: String?
-    public var result: String?
-
-    public init(id: String, title: String? = nil, objective: String? = nil, status: String? = nil, result: String? = nil) {
-        self.id = id
-        self.title = title
-        self.objective = objective
-        self.status = status
-        self.result = result
-    }
-
-    /// Retired truthiness for a JSON value (matches `bool(x)` for the scalar
-    /// types `body.get(...)` can return): absent/null/false/0/0.0/""/[]/{}
-    /// are falsy; everything else is truthy.
-    static func pyTruthy(_ v: JSONValue?) -> Bool {
-        switch v {
-        case .none, .some(.null): return false
-        case .some(.bool(let b)): return b
-        case .some(.int(let i)): return i != 0
-        case .some(.double(let d)): return d != 0
-        case .some(.string(let s)): return !s.isEmpty
-        case .some(.array(let a)): return !a.isEmpty
-        case .some(.object(let o)): return !o.isEmpty
-        }
     }
 }

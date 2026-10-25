@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceHumanProjection.swift` | `AgentWorkspaceHumanProjection` enum; `read`, `project` |
 
 enum AgentWorkspaceHumanProjection {
     /// A selected conversation reads through its explicit owner; the list is the index's own rows.

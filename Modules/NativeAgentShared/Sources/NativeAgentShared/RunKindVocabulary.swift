@@ -1,3 +1,5 @@
+// Blueprint: | `RunKindVocabulary.swift` | `RunKindVocabulary.displayName`: shared safe display names for extensible run-kind wire values |
+
 /// Human-facing vocabulary for the durable `RunRecord.kind` wire field.
 ///
 /// The field remains forward-compatible rather than a closed enum, so readers

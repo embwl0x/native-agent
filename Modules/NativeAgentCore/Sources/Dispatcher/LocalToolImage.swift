@@ -4,6 +4,8 @@ import PersistenceCore
 import ImageIO
 import UniformTypeIdentifiers
 
+// Blueprint: | `LocalToolImage.swift` | `LocalToolImage`: turn-local admitted image continuation and bounded thumbnails; pixels never enter durable JSON/transcript receipts |
+
 /// Pixels live only in the admitted tool call's model continuation, never in
 /// JSON tool results, transcript receipts, result paging, or tool notices.
 public enum LocalToolImage {
@@ -138,6 +140,7 @@ public enum LocalToolImage {
     /// per round. Images the model has not answered yet are never released.
     public static func boundConversation(_ messages: inout [LLMMessage],
                                          maxImages: Int = roundImages, maxBytes: Int = roundBytes) {
+        supersede(&messages)
         func size(_ block: LLMContentBlock) -> Int? {
             guard case .image(_, let base64, _, let byteSize) = block else { return nil }
             return max(byteSize, base64.utf8.count * 3 / 4)
@@ -156,11 +159,60 @@ public enum LocalToolImage {
                 if count < maxImages / 2, size <= maxBytes / 2 - bytes {
                     count += 1; bytes += size
                 } else {
-                    content[blockIndex] = .text("[Earlier image \(name ?? "attachment") released from visual context to bound this turn. Its pixels are no longer visible; reread the original file if needed.]")
+                    content[blockIndex] = .text("[Earlier image \(name.map(shown) ?? "attachment") released from visual context to bound this turn. Its pixels are no longer visible; reread the original file if needed.]")
                     changed = true
                 }
             }
             if changed {
+                messages[index] = LLMMessage(role: message.role, content: content,
+                    turnScopedClearAtNextUserMessage: message.turnScopedClearAtNextUserMessage,
+                    toolChanges: message.toolChanges)
+            }
+        }
+    }
+
+    /// A screenshot's name: what it shows and when, for her to read, then a tag
+    /// of its exact source (the capture's own window and region key), so only a
+    /// newer shot of that same source stands in for it (`supersede`).
+    public static func screenshotName(of display: String, source: String, at date: Date = Date()) -> String {
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm"
+        let tag = source.utf8.reduce(UInt64(14_695_981_039_346_656_037)) { ($0 ^ UInt64($1)) &* 1_099_511_628_211 }
+        return "screenshot of " + display + " at " + clock.string(from: date) + sourceMark + String(tag, radix: 16)
+    }
+    private static let sourceMark = " · source "
+
+    /// A name as she reads it: a screenshot's without its source tag.
+    public static func shown(_ name: String) -> String {
+        name.range(of: sourceMark, options: .backwards).map { String(name[..<$0.lowerBound]) } ?? name
+    }
+
+    /// The names of the images whose pixels are still in `messages`.
+    public static func imageNames(_ messages: [LLMMessage]) -> Set<String> {
+        Set(messages.flatMap(\.content).compactMap { if case .image(_, _, let name?, _) = $0 { name } else { nil } })
+    }
+
+    /// Only the newest screenshot of each source keeps its pixels: an earlier
+    /// one becomes a line naming it. The line never changes, so after the
+    /// first replacement the cached prefix stays the same; each later one
+    /// rewrites only from the shot it replaces, about one round back.
+    static func supersede(_ messages: inout [LLMMessage]) {
+        func source(_ block: LLMContentBlock) -> (name: String, source: String)? {
+            guard case .image(_, _, let name?, _) = block, name.hasPrefix("screenshot of "),
+                  let mark = name.range(of: sourceMark, options: .backwards) else { return nil }
+            return (name, String(name[mark.upperBound...]))
+        }
+        var newest: Set<String> = []
+        for index in messages.indices.reversed() {
+            var content = messages[index].content, changed = false
+            for blockIndex in content.indices.reversed() {
+                guard let shot = source(content[blockIndex]) else { continue }
+                if newest.insert(shot.source).inserted { continue }
+                content[blockIndex] = .text("[" + shown(shot.name) + " replaced by a newer one]")
+                changed = true
+            }
+            if changed {
+                let message = messages[index]
                 messages[index] = LLMMessage(role: message.role, content: content,
                     turnScopedClearAtNextUserMessage: message.turnScopedClearAtNextUserMessage,
                     toolChanges: message.toolChanges)

@@ -12,6 +12,8 @@ import SwiftUI
 import Observation
 import CognitiveSubstrate
 
+// Blueprint: | `CognitionProposalsView.swift` | `CognitionProposalsView`: live standing-view review controls and read-only schema lineage from canonical Dream/REM approvals |
+
 // MARK: - Feed loader (Today's standing-views count)
 
 // MARK: - Full destination view (Today ▸ Standing views)

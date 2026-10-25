@@ -1,14 +1,17 @@
 import TrustCenter
 import Desk
 import MultimodalTTS
-import ChatOrchestration
+import ChatToolRuntime
 import EngineRuntime
 import AppToolRuntime
+import NativeAgentCore
 import SwiftUI
 import PersistenceCore
 import NativeAgentShared
 import MacControl
 import ProviderRouting
+
+// Blueprint: | `ChatComposerSettings.swift` | Composer shell state/readers/layout and settings cards: shared main/detached composer presentation and quiet command port bindings |
 
 /// The composer's three settings, each rendered as the word that names it.
 ///
@@ -73,15 +76,13 @@ extension QuietComposerCommands {
     @MainActor
     fileprivate struct Routing: ChatComposerRoutingReading {
         let appModel: AppModel
-        var botContract: BotChatContract? { nil }
+        var sessionID: String { appModel.activeChatSessionId }
         var cardState: ComposerShellState? { QuietSelfAdmin.shared.composerCards }
     }
 
     @MainActor
     fileprivate static func draft(_ sessionID: String, appModel: AppModel) -> String {
-        (sessionID == appModel.activeChatSessionId ? QuietSelfAdmin.shared.composerDraft?.text : nil)
-            ?? appModel.chatDrafts[sessionID]
-            ?? ""
+        appModel.chatDraft(for: sessionID)
     }
 
     fileprivate static func cardName(_ card: ChatComposerCard?) -> String? {
@@ -216,9 +217,8 @@ extension QuietComposerCommands {
             guard shown == .desk else {
                 return .refuse("Desk item", "item_needs_desk", "choice opens a Desk item, so pass value desk with it.")
             }
-            let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             do {
-                guard try await SwiftNativeDeskStore(dataRoot: root).liveState().items.contains(where: { $0.handle == handle }) else {
+                guard try await appModel.engine.desk.store.liveState().items.contains(where: { $0.handle == handle }) else {
                     return .refuse("Desk item", "unknown_desk_item", "No Desk item has the handle \(handle). app desk.read lists the handles.")
                 }
             } catch {
@@ -258,24 +258,15 @@ extension AppModel: QuietComposerCommandPort {
     func quietComposerDraft(_ sessionID: String) -> String {
         QuietComposerCommands.draft(sessionID, appModel: self)
     }
+    func quietComposerDraftRevision(_ sessionID: String) -> (Date, Int) {
+        let draft = composerDraft(for: sessionID)
+        return (draft.editedAt, Int(clamping: draft.manualEditRevision))
+    }
     func setQuietComposerDraft(_ after: String, sessionID: String) {
-        if sessionID != activeChatSessionId {
-            if after != quietComposerDraft(sessionID) { injectChatDraft(after, sessionId: sessionID) }
-        } else {
-            if let live = QuietSelfAdmin.shared.composerDraft, live.sessionId == sessionID || live.sessionId.isEmpty {
-                live.edit(after)
-                live.sessionId = sessionID
-            }
-            if after.isEmpty { chatDrafts.removeValue(forKey: sessionID) } else { chatDrafts[sessionID] = after }
-            touchChatDraft(sessionId: sessionID)
-        }
+        composerDraft(for: sessionID).edit(after)
     }
     func clearQuietAcceptedDraft(_ message: String, sessionID: String, editedAt: Date) {
-        if let live = QuietSelfAdmin.shared.composerDraft, live.sessionId == sessionID, live.text == message {
-            live.edit("")
-        }
         clearChatDraftAfterSend(message, sessionId: sessionID, editedAt: editedAt)
-        bumpChatDraftInjectionGeneration()
     }
     func quietComposerPaneClosed(turnID: String?) -> Bool { WorkPaneState.shared.userClosed(turnID: turnID) }
     func quietComposerPresentation(verb: String, value: String, choice: String) async -> QuietComposerOutcome {
@@ -318,15 +309,16 @@ extension AppModel: QuietComposerCommandPort {
         return (result.succeeded, result.agentMessage)
     }
     func quietComposerPresentationState(sessionID: String) async -> [String: JSONValue] {
-        let routing = QuietComposerCommands.Routing(appModel: self)
+        let projection = await engine.providers.refreshSession(sessionID)
+        let routing = ComposerSessionReader(appModel: self, sessionID: sessionID)
         var body: [String: JSONValue] = [
-            "provider": .string(chatProvider), "model": .string(chatModel), "model_word": .string(routing.modelWord),
-            "think": .string(chatReasoningEffort), "think_word": .string(routing.effortWord),
+            "provider": .string(projection.choice?.provider ?? ""), "model": .string(projection.choice?.model ?? ""), "model_word": .string(routing.modelWord),
+            "think": .string(projection.choice?.reasoningEffort ?? ""), "think_word": .string(routing.effortWord),
             "think_choices": .array(routing.efforts.map { .string($0.id) }), "fast": .bool(routing.fastIsOn),
             "trust_word": .string(routing.trustWord), "persona": .string(chatPersona),
             "open_card": .string(QuietComposerCommands.cardName(QuietSelfAdmin.shared.composerCards?.activePane.word) ?? "none"),
         ]
-        if !sessionID.isEmpty, let status = try? await getSessionContext(sessionId: sessionID, model: chatModel) {
+        if !sessionID.isEmpty, let status = projection.context {
             let usage = ContextFillPresentation.usage(status)
             body["ring_fraction"] = .double(usage.fillFraction)
             body["ring_percent"] = .int(Int64(usage.percent.rounded()))
@@ -617,6 +609,7 @@ final class ComposerShellState {
     /// without starting a second, asynchronous read of the trace ledger — the
     /// pane said "Context pane is open" and then listed nothing.
     var contextReceipt: ComposerContextReceiptState = .loading
+    @ObservationIgnored let contextReceiptRead = LatestRead()
 
     /// Which provider's models are showing, derived from the pane so there is
     /// one source of truth.
@@ -760,47 +753,22 @@ final class ComposerShellState {
 @MainActor
 protocol ChatComposerRoutingReading {
     var appModel: AppModel { get }
-    var botContract: BotChatContract? { get }
+    var sessionID: String { get }
     var cardState: ComposerShellState? { get }
 }
 
-private struct ComposerBotContractRefresh: ViewModifier {
+struct ComposerSessionRefresh: ViewModifier {
     @Environment(AppModel.self) private var appModel
-    @Environment(\.chatPageIsVisible) private var isVisible
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    @Binding var contract: BotChatContract?
-
-    private struct Identity: Equatable {
-        let sessionID: String
-        let root: URL
-        let live: Bool
-    }
+    let sessionID: String
+    var live = true
+    @AppStorage("nativeagent.contextWindowMode") private var windowMode = ""
+    @AppStorage("nativeagent.compactionThresholdTokens") private var windowSize = 0
 
     func body(content: Content) -> some View {
-        let identity = Identity(
-            sessionID: appModel.activeChatSessionId,
-            root: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-            live: isVisible && !quietOffscreenRead
-        )
-        content.task(id: identity) {
-            contract = nil
-            guard identity.sessionID.hasPrefix("bot-"),
-                  let id = UUID(uuidString: String(identity.sessionID.dropFirst(4))) else { return }
-            guard identity.live else {
-                let checked = await BotChatContract.checked(identity.sessionID, dataRoot: identity.root)
-                guard !Task.isCancelled else { return }
-                contract = checked
-                return
-            }
-            let path = identity.root.appendingPathComponent("bots/definitions/\(id.uuidString).json")
-            let events = FileChangeEvents(paths: [path], emitInitial: true)
-            await withTaskCancellationHandler {
-                for await _ in events.stream {
-                    let checked = await BotChatContract.checked(identity.sessionID, dataRoot: identity.root)
-                    guard !Task.isCancelled else { break }
-                    contract = checked
-                }
-            } onCancel: { events.cancel() }
+        content.quietReadTask(id: "\(sessionID):\(windowMode):\(windowSize):\(live)") {
+            if quietOffscreenRead { await appModel.engine.providers.refreshSession(sessionID) }
+            else if live { await appModel.engine.providers.observeSession(sessionID) }
         }
     }
 }
@@ -810,16 +778,26 @@ private struct ComposerBotContractRefresh: ViewModifier {
 @MainActor
 struct ComposerShellReader: ChatComposerRoutingReading {
     let appModel: AppModel
-    var botContract: BotChatContract? { nil }
+    var sessionID: String { appModel.activeChatSessionId }
     let cardState: ComposerShellState?
 }
 
+@MainActor
+private struct ComposerSessionReader: ChatComposerRoutingReading {
+    let appModel: AppModel
+    let sessionID: String
+    var cardState: ComposerShellState? { QuietSelfAdmin.shared.composerCards }
+}
+
 extension ChatComposerRoutingReading {
+    var sessionID: String { appModel.activeChatSessionId }
+    var routeChoice: ProviderTurnChoice? { appModel.engine.providers.sessions[sessionID]?.choice }
+    var botContract: BotChatContract? { appModel.engine.providers.sessions[sessionID]?.contract }
 
     // MARK: - Data (provider-blind: the catalog is data, nothing branches on a name)
 
     var isBotConversation: Bool {
-        appModel.activeChatSessionId.hasPrefix("bot-")
+        sessionID.hasPrefix("bot-")
     }
 
     /// Every provider a person can pick from today, each carrying its own
@@ -827,15 +805,15 @@ extension ChatComposerRoutingReading {
     var providerGroups: [ChatComposerModelGroup] {
         ChatComposerModelGroup.groups(
             connections: appModel.engine.providers.connections,
-            catalog: appModel.engine.providers.catalog, providerID: appModel.chatProvider
+            catalog: appModel.engine.providers.catalog, providerID: (routeChoice?.provider ?? "")
         )
     }
 
 
     /// Which row of a provider's flyout is the live one.
     func flyoutSelectedIndex(for group: ChatComposerModelGroup, provider: String? = nil) -> Int {
-        guard (provider ?? group.id) == appModel.chatProvider,
-              let index = group.models.firstIndex(where: { $0.id == appModel.chatModel })
+        guard (provider ?? group.id) == (routeChoice?.provider ?? ""),
+              let index = group.models.firstIndex(where: { $0.id == (routeChoice?.model ?? "") })
         else { return 0 }
         return index
     }
@@ -853,8 +831,8 @@ extension ChatComposerRoutingReading {
 
     var selectedModel: ModelCatalogItem? {
         providerGroups
-            .first { $0.id == appModel.chatProvider }?
-            .models.first { $0.id == appModel.chatModel }
+            .first { $0.id == (routeChoice?.provider ?? "") }?
+            .models.first { $0.id == (routeChoice?.model ?? "") }
     }
 
     var efforts: [ReasoningEffortOption] {
@@ -864,7 +842,7 @@ extension ChatComposerRoutingReading {
     }
 
     var effortIndex: Int {
-        efforts.firstIndex { $0.id == appModel.chatReasoningEffort } ?? 0
+        efforts.firstIndex { $0.id == (routeChoice?.reasoningEffort ?? "") } ?? 0
     }
 
     var selectedModelSupportsFast: Bool {
@@ -877,8 +855,8 @@ extension ChatComposerRoutingReading {
         if isBotConversation { return botContract?.model ?? "Bot model" }
         // Never "Saving…": the word flipping on every slider step felt
         // clunky (User, 2026-09-15). The save still gates Send quietly.
-        guard !appModel.chatModel.isEmpty else { return "Choose model" }
-        return selectedModel?.displayName ?? appModel.chatModel
+        guard !(routeChoice?.model ?? "").isEmpty else { return "Choose model" }
+        return selectedModel?.displayName ?? (routeChoice?.model ?? "")
     }
 
     func effortLabel(_ effort: String) -> String {
@@ -891,7 +869,7 @@ extension ChatComposerRoutingReading {
             guard let effort = botContract?.reasoningEffort else { return "Bot thinking" }
             return effortLabel(effort)
         }
-        return effortLabel(appModel.chatReasoningEffort)
+        return effortLabel((routeChoice?.reasoningEffort ?? ""))
     }
 
     /// The resting chip says Fast is really on for what will send: the bot's
@@ -900,7 +878,7 @@ extension ChatComposerRoutingReading {
     /// a model that has no Fast (Sol, 2026-09-15).
     var fastIsOn: Bool {
         if isBotConversation { return botContract?.choice?.fast == true }
-        return appModel.chatFastMode && selectedModelSupportsFast
+        return (routeChoice?.fast == true) && selectedModelSupportsFast
     }
 
     var trustWord: String {
@@ -951,18 +929,13 @@ extension ChatComposerRoutingReading {
         return Task { @MainActor in
             defer { appModel.isSavingChatBrain = false }
             do {
-                let response = try await appModel.configureSurfaceSelection(
+                _ = try await appModel.configureSurfaceSelection(
                     surface: "chat",
                     providerID: provider,
                     model: model.id,
                     reasoningEffort: choice.reasoningEffort,
                     serviceTier: choice.fast ? "priority" : "default"
                 )
-                // What actually landed on disk, not what was asked for.
-                let canonical = response.current.chat
-                appModel.chatModel = canonical.model
-                appModel.chatReasoningEffort = canonical.reasoningEffort
-                appModel.chatFastMode = canonical.serviceTier == "priority"
                 return nil
             } catch {
                 appModel.setFailureStatus(error, action: "change the model")
@@ -990,7 +963,6 @@ extension ChatComposerRoutingReading {
 struct ChatComposerSettings: View, ChatComposerRoutingReading {
     @Environment(AppModel.self) var appModel
     @Environment(\.chatPageIsVisible) private var chatPageIsVisible
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(ComposerShellState.self) var cardState: ComposerShellState?
 
     /// Bumped by the draft when Tab should move into the words.
@@ -1000,10 +972,6 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
     @State private var handoffWouldChange = false
     @AppStorage(ShotgunController.enabledKey) private var shotgunEnabled = true
 
-    /// Sol, 2026-09-15: a bot conversation sends on its OWN model, effort and
-    /// Fast, so the words must read the bot's contract — showing (and editing)
-    /// the global Chat tuple there was three lies on one row.
-    @State var botContract: BotChatContract?
     @FocusState private var focusedWord: ChatComposerCard?
 
     init(focusWordToken: Int = 0) {
@@ -1180,7 +1148,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                 handoffWouldChange = await MacAttentionSessionStore.shared.handoffWouldChange()
             }
         }
-        .modifier(ComposerBotContractRefresh(contract: $botContract))
+        .modifier(ComposerSessionRefresh(sessionID: appModel.activeChatSessionId, live: chatPageIsVisible))
         .onChange(of: focusWordToken) { _, _ in focusedWord = .model }
     }
 
@@ -1225,8 +1193,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
         Button {
             toggleContextPopover()
         } label: {
-            ComposerContextRing(sessionId: appModel.activeChatSessionId,
-                                model: isBotConversation ? botContract?.model : nil)
+            ComposerContextRing(sessionId: appModel.activeChatSessionId)
                 .padding(.horizontal, 5)
                 .padding(.vertical, 4)
                 .background {
@@ -1589,7 +1556,6 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
     let anchors: [ChatComposerCard: Anchor<CGRect>]
 
     var cardState: ComposerShellState? { state }
-    @State var botContract: BotChatContract?
     /// The pane's first control. Tab off a word lands here, so the shell's own
     /// controls are keyboard-reachable; exactly one pane is mounted at a time,
     /// so exactly one view carries this binding.
@@ -1623,7 +1589,6 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
             // PORTED-DORMANT-PARTIAL), which nothing has written since, so it
             // only ever said "incomplete"; this one reads the turn traces the
             // engine writes on every turn, and shows only what they record.
-            .modifier(ComposerBotContractRefresh(contract: $botContract))
             // The routing the panes read, and what a driver answers from.
             // Registering the live shell for the verbs is ChatView's job —
             // `liveOnAppear`, so the offscreen copy a quiet page read mounts

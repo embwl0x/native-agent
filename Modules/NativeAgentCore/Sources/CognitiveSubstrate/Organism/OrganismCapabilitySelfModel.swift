@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `OrganismCapabilitySelfModel.swift` | `OrganismCapabilitySelfModel` enum; `beliefs` |
 
 public struct OrganismCapabilityBelief: Sendable, Equatable, Identifiable {
     public enum EvidenceBasis: String, Sendable, Equatable {

@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `QuietTrustPolicyPreset.swift` | `TrustPolicyPreset` enum; `save`, effective-policy preset matching |
 
 public enum TrustPolicyPreset: CaseIterable, Equatable, Sendable {
     case safe

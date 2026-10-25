@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+// Blueprint: | `DreamRunReservation.swift` | `DreamRunReservation` struct; `acquire`, `release` |
 
 /// Exclusive, crash-safe reservation for a dream run (2026-09-06). Same
 /// `<target>.lock` + nonblocking `flock` shape the rest of the tree uses; the

@@ -2,8 +2,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
-import MCPDispatcher
-import KnowledgeGraph
 import PersonaEngine
 import ProviderRouting
 import ToolRegistry
@@ -13,6 +11,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
+// Blueprint: | `SwiftToolDispatcher+SwarmTools.swift` | `SwiftToolDispatcher`: `impl_agent_swarm` |
 
 // MARK: - Agent swarm tools
 
@@ -30,10 +29,7 @@ public struct SwarmProviderAssembly: Sendable {
 
     init(dataRoot: URL, environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.dataRoot = dataRoot
-        self.codexEnvironment = environment.merging([
-            "CODEX_HOME": OpenAIOAuthDirectAdapter.codexChildHome(dataRoot: dataRoot).path,
-            "NATIVE_AGENT_DATA_ROOT": dataRoot.path,
-        ]) { _, bound in bound }
+        self.codexEnvironment = environment
         self.anthropicDataRoot = dataRoot
         self.openAIDataRoot = dataRoot
         self.anthropicOAuthPath = dataRoot.appendingPathComponent("providers", isDirectory: true)
@@ -118,7 +114,10 @@ extension SwiftToolDispatcher {
         let providerAssembly = SwarmProviderAssembly(dataRoot: dataRoot)
         let llm = SwiftNativeLLMClient(
             router: router,
-            codex: CodexAdapter(processEnvironmentOverride: providerAssembly.codexEnvironment),
+            codex: CodexAdapter(
+                processEnvironmentOverride: providerAssembly.codexEnvironment,
+                dataRootOverride: providerAssembly.dataRoot
+            ),
             anthropic: AnthropicAdapter(dataRootOverride: providerAssembly.anthropicDataRoot, telemetryDataRootOverride: providerAssembly.dataRoot),
             openAI: OpenAIAdapter(dataRootOverride: providerAssembly.openAIDataRoot, telemetryDataRootOverride: providerAssembly.dataRoot),
             openAIOAuthDirect: OpenAIOAuthDirectAdapter(

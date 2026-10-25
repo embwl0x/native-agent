@@ -7,6 +7,8 @@ import ToolRegistry
 import PersistenceCore
 import MacControl
 
+// Blueprint: | `ChatTurnFailure.swift` | `ChatTurnFailure`: failure metadata and retry-confirmation classification from the turn's own dispatch/effect evidence |
+
 public protocol ChatTurnFailureMetadata {
     var providerRefusal: Bool? { get }
     var providerRefusalDraft: Bool? { get }

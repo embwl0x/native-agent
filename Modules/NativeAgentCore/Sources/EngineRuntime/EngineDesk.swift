@@ -1,14 +1,16 @@
 import Cognition
+import NativeAgentCore
 import StandingBots
 import BackgroundWork
 import BackgroundLoops
 import TrustCenter
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatToolRuntime
 import ProviderRouting
 import ApprovalTransactions
 import AppToolRuntime
 import Desk
-import GitHubConnector
+import WorkflowOrchestration
 import Foundation
 import OSLog
 import Observation
@@ -21,26 +23,92 @@ import ApprovalInbox
 import NativeAgentShared
 import NotificationInbox
 import Experiences
+// Blueprint: | `EngineDesk.swift` | DeskFacade retains one complete board/overview/page snapshot for Mac and DeviceSync, including prepared attention rows and deadlines; engine inbox/approvals/bots supply its lanes. LatestRead orders board, workflow, research and scheduler publication; committed research receipts use write, scheduler repairs fence older reads before checked feed readback. Job observation and refresh coalescing share the retained feed. DeskToolDispatchRouter retains checked routing and the local-click approval filer while dispatching through the canonical part door, including Make's Try again. |
 
-/// `NativeAgentEngine.desk` (S10): the Desk for one data root, in core types —
-/// the board (desk items, executions, GitHub), the schedule, and research lab
-/// runs. The Desk pages, the Schedule and Capabilities render `jobs` and
-/// `researchRuns`; the reads are nonisolated so the phone snapshot and the
-/// phone's desk actions use the same owner. Writes (new tasks, job pause and
-/// cancel, research runs) run through the Workshop submitter, the scheduler
-/// job writer and the research client.
+/// Scheduler refreshes come from Desk invalidations, the mounted jobs watcher
+/// and explicit Retry. Keep those refreshes single-flight,
+/// while preserving one edge that arrives during the active read so a mutation
+/// is not lost merely because the first snapshot was still being decoded.
+private struct SchedulerJobsRefreshCoalescer: Equatable {
+    private(set) var isRefreshing = false
+    private(set) var trailingRefreshQueued = false
+
+    mutating func requestRefresh() -> Bool {
+        guard !isRefreshing else {
+            trailingRefreshQueued = true
+            return false
+        }
+        isRefreshing = true
+        trailingRefreshQueued = false
+        return true
+    }
+
+    mutating func completeRefresh() -> Bool {
+        guard isRefreshing else { return false }
+        if trailingRefreshQueued {
+            trailingRefreshQueued = false
+            return true
+        }
+        cancel()
+        return false
+    }
+
+    mutating func cancel() {
+        isRefreshing = false
+        trailingRefreshQueued = false
+    }
+}
+
+/// One root's retained Desk revision: board, overview and page lanes. Mac,
+/// diagnostics, status publication and DeviceSync all render this owner.
 @MainActor
 @Observable
 public final class DeskFacade {
     public nonisolated let dataRoot: URL
+    private nonisolated let inbox: InboxFacade
+    private nonisolated let approvals: ApprovalsFacade
+    private nonisolated let bots: BotRunnerScheduler
+
+    public private(set) var workflows: [WorkflowRecord] = []
+    public private(set) var workflowsReadError: String?
 
     /// Every scheduled job, as of the last read that returned rows.
-    public var jobs: [ScheduledJob] = []
-    /// Research lab runs, newest first, as of the last read.
-    public var researchRuns: [ResearchLabRun] = []
+    public private(set) var jobs: [ScheduledJob] = []
+    public private(set) var jobsFeedState: SchedulerJobsFeedState?
+    @ObservationIgnored private lazy var jobsRead = LatestRead()
+    private var jobsRefresh = SchedulerJobsRefreshCoalescer()
+    public var isRefreshingJobs: Bool { jobsRefresh.isRefreshing }
 
-    public nonisolated init(dataRoot: URL) {
+    public func watchJobs() async {
+        await EventDeadlinePhysiology.refreshOnChanges(paths: [jobsPath], debounceDelay: .milliseconds(100)) {
+            _ = await self.refreshJobs()
+        }
+    }
+    /// Research lab runs, newest first, as of the last read.
+    public private(set) var researchRuns: [ResearchLabRun] = []
+    @ObservationIgnored private lazy var researchRead = LatestRead()
+    public private(set) var researchRunsLoaded = false
+    public private(set) var researchRunsError: String?
+    @ObservationIgnored private let workflowsRead = LatestRead()
+
+    public func refreshWorkflows() async throws {
+        let result: Result<[WorkflowRecord], Error> = await workflowsRead.read({
+            do { return .success(try await SwiftNativeWorkflowOrchestrationClient(root: dataRoot).listWorkflowRecords()) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            switch result {
+            case .success(let rows): workflows = rows; workflowsReadError = nil
+            case .failure(let error): workflowsReadError = error.localizedDescription
+            }
+        })
+        _ = try result.get()
+    }
+
+    public nonisolated init(dataRoot: URL, inbox: InboxFacade, approvals: ApprovalsFacade, bots: BotRunnerScheduler) {
         self.dataRoot = dataRoot
+        self.inbox = inbox
+        self.approvals = approvals
+        self.bots = bots
     }
 
     /// The desk-item store for this root.
@@ -50,54 +118,62 @@ public final class DeskFacade {
 
     // MARK: board
 
-    /// One read of every Desk store (see `DeskBoardRead`), taken off the main
-    /// actor by the caller.
-    ///
-    /// - Parameter includeSequencing: build the classic page's sequencing plan
-    ///   and alias map as well. Off by default: a page that does not render
-    ///   them should not pay for them.
-    public nonisolated func loadBoard(includeSequencing: Bool = false, includeOverview: Bool = false) async -> DeskBoardRead {
+    public var board: DeskBoardRead { page.board ?? DeskBoardRead() }
+    public private(set) var page = DeskPageSnapshot.empty
+    public private(set) var readCount = 0
+    public private(set) var liveUpdateError: String?
+    @ObservationIgnored private lazy var boardRead = LatestRead()
+    @ObservationIgnored private var refreshTask: Task<DeskPageSnapshot, Never>?
+    @ObservationIgnored private var watcher: FileChangeWatcher?
+    @ObservationIgnored private var busTask: Task<Void, Never>?
+    @ObservationIgnored private var experienceTask: Task<Void, Never>?
+    @ObservationIgnored private var deadlineTask: Task<Void, Never>?
+    @ObservationIgnored private var watchedPaths: Set<URL> = []
+    @ObservationIgnored private lazy var debouncer = StoreReloadDebouncer { [weak self] in
+        _ = await self?.refresh()
+    }
+
+    /// Readers receive the retained revision. Explicit refresh and source edges
+    /// replace it once for every surface, including pages that are offscreen.
+    public func loadBoard() async -> DeskBoardRead {
+        await loadPage().board!
+    }
+
+    public func loadPage() async -> DeskPageSnapshot {
+        if page.loaded { return page }
+        if let refreshTask { return await refreshTask.value }
+        return await refreshPage()
+    }
+
+    private nonisolated func readBoard() async -> DeskBoardRead {
         var read = DeskBoardRead()
         let runner = SwiftNativeWorkshopRunner(root: dataRoot)
         async let deskState = store.liveState()
         async let records = runner.listAll()
-        async let githubState = GitHubCommandStore(dataRoot: dataRoot).liveState()
         do {
             read.deskState = try await deskState
+            read.debugProjection = read.deskState.map { DeskProjection.render($0) } ?? ""
         } catch {
             read.deskError = Self.loadFailure(error)
         }
-        // Execution and GitHub reads stay independent: one broken lane never
-        // blanks the other live Workshop projections. But "lenient" used to
-        // mean "silent" — a corrupt store returned [] and the surface said
-        // "Quiet right now". Each lane now reports rows OR a reason.
+        // "Lenient" used to mean "silent": a corrupt store returned [] and the
+        // surface said "Quiet right now". Each lane reports rows OR a reason.
         read.executions = DeskLaneState.classify(rows: await records, root: runner.executionRecordsRoot)
-        do {
-            read.github = .rows(try await githubState.items)
-        } catch {
-            read.github = .failed(error)
-        }
-        if includeSequencing {
-            read.plan = read.deskState.map { DeskSequencing.compute($0, now: Date()) }
-                ?? DeskSequencing.Plan()
-            var aliases: [String: String] = [:]
-            for item in read.items { aliases[item.handle] = item.alias }
-            read.aliasByHandle = aliases
-        }
-        if includeOverview {
-            read.overview = await loadOverview(read).overview
-        }
+        let overview = await loadOverview(read)
+        read.overview = overview.overview
+        read.approvals = overview.approvals
+        read.inbox = overview.inbox
         return read
     }
 
     /// The overview and its checked authority lanes share one read with phone snapshots.
-    public nonisolated func loadOverview(_ board: DeskBoardRead) async -> (
+    private nonisolated func loadOverview(_ board: DeskBoardRead) async -> (
         overview: WorkOverview,
         approvals: Result<[ApprovalRecord], Error>,
         inbox: Result<[NotificationInbox.InboxItemRecord], Error>
     ) {
-        async let approvalsRead = SwiftNativeApprovalInbox(root: dataRoot).list(filter: .init())
-        async let inboxRead = InboxFacade(dataRoot: dataRoot).list()
+        async let approvalsRead = self.approvals.list()
+        async let inboxRead = self.inbox.list()
         var unavailable: [String] = []
         if let reason = board.deskError { unavailable.append("Desk: \(reason)") }
         if let reason = board.executions.unavailableReason { unavailable.append("Executions: \(reason)") }
@@ -131,7 +207,7 @@ public final class DeskFacade {
     /// that is not an execution is skipped, but a feed where no row reads is
     /// corruption, never an empty bench, and throws.
     public nonisolated func taskRows() async throws -> [WorkshopTaskRow] {
-        let rows = try await SwiftNativeWorkshopRunner(root: dataRoot).listWorkshopExecutionsMerged()
+        let rows = try await SwiftNativeWorkshopRunner(root: dataRoot).listWorkshopExecutions()
         let tasks = rows.compactMap(WorkshopTaskRow.init(row:))
         if tasks.count < rows.count {
             nativeLog("[DeskFacade] taskRows dropped \(rows.count - tasks.count) of \(rows.count) malformed execution row(s)")
@@ -143,6 +219,14 @@ public final class DeskFacade {
             ])
         }
         return tasks
+    }
+
+    deinit {
+        watcher?.cancel()
+        busTask?.cancel()
+        experienceTask?.cancel()
+        deadlineTask?.cancel()
+        refreshTask?.cancel()
     }
 
     // MARK: schedule
@@ -157,7 +241,17 @@ public final class DeskFacade {
     /// partially readable durable state as an empty schedule. The final row
     /// projection comes from `SchedulerJobWriter.listJobs()` so callers retain
     /// the same next-run decoration as the production list route.
-    public nonisolated func jobsFeed() async -> SchedulerJobsFeedState {
+    public func jobsFeed() async -> SchedulerJobsFeedState {
+        await jobsRead.read({ await self.readJobsFeed() }) { feed in
+            jobsFeedState = feed
+            switch feed {
+            case .current(let rows), .partial(let rows, _): jobs = rows
+            case .sourceAbsent, .unavailable: break
+            }
+        }
+    }
+
+    private nonisolated func readJobsFeed() async -> SchedulerJobsFeedState {
         let path = jobsPath
         let manager = FileManager.default
         var isDirectory: ObjCBool = false
@@ -203,7 +297,7 @@ public final class DeskFacade {
     }
 
     /// The whole schedule, or why it cannot be shown whole.
-    public nonisolated func listJobs() async throws -> [ScheduledJob] {
+    public func listJobs() async throws -> [ScheduledJob] {
         switch await jobsFeed() {
         case .current(let jobs):
             return jobs
@@ -216,45 +310,78 @@ public final class DeskFacade {
         }
     }
 
-    public func refreshJobs() async -> SchedulerJobsFeedState {
-        let feed = await jobsFeed()
-        switch feed {
-        case .current(let rows), .partial(let rows, _): jobs = rows
-        case .sourceAbsent, .unavailable: break
+    @discardableResult
+    public func refreshJobs() async -> SchedulerJobsFeedState? {
+        if jobsRefresh.requestRefresh() {
+            repeat {
+                _ = await jobsFeed()
+                if Task.isCancelled { jobsRefresh.cancel(); break }
+            } while jobsRefresh.completeRefresh()
         }
-        return feed
+        return jobsFeedState
     }
 
     public func setJobEnabled(id: String, enabled: Bool) async throws -> ScheduledJob {
         let writer = makeSchedulerJobWriter(
             connectorActionIDs: Set(connectorActionDescriptors().map(\.id)), dataRoot: dataRoot)
         let result = try await writer.setJobEnabled(jobId: id, enabled: enabled)
+        // Readback follows the commit; pre-commit reads may no longer publish.
+        jobsRead.write {}
         guard case .object(let object) = result, let row = object["job"] else {
             throw SchedulerJobsFeedError.unavailable("scheduler pause/resume returned no job")
         }
-        return try ScheduledJob(row: row)
+        let saved = try ScheduledJob(row: row)
+        jobsRead.write {
+            if let index = jobs.firstIndex(where: { $0.id == saved.id }) { jobs[index] = saved }
+        }
+        return saved
     }
 
     public func ensureNightlyReflection(scheduler: SchedulerDueJobRunner) async throws -> NightlyReflectionJobOutcome {
-        let before: ScheduledJob?
+        let prior: [ScheduledJob]
         do {
-            before = try await listJobs().first { $0.id == "nativeagent-nightly-dream" }
+            prior = try await listJobs()
         } catch SchedulerJobsFeedError.sourceAbsent {
             // Only explicit creation may repair an absent feed; damage stays unavailable.
-            before = nil
+            prior = []
         }
         // Explicit re-enable clears cancellation, unlike passive bootstrap.
-        _ = try await scheduler.ensureDefaultCycleJobs(now: Date(), reactivateCancelled: true)
+        let resolved = try await scheduler.ensureDefaultCycleJobs(now: Date(), reactivateCancelled: true).nightlyDream
+        // Keep the retained feed until readback, without admitting older reads.
+        jobsRead.write {}
+        let id = try ScheduledJob(row: resolved).id
         let refreshed = try await listJobs()
-        jobs = refreshed
-        guard let after = refreshed.first(where: { $0.id == "nativeagent-nightly-dream" }) else {
+        guard let after = refreshed.first(where: { $0.id == id }) else {
             return .failed("the canonical scheduler job was not persisted")
         }
-        if let before { return before == after ? .alreadyPresent : .repaired }
+        if let before = prior.first(where: { $0.id == id }) { return before == after ? .alreadyPresent : .repaired }
         return .added
     }
 
     // MARK: research
+
+    /// Publish one receipt history and read outcome for every research surface.
+    public func refreshResearchRuns() async {
+        let _: Result<[ResearchLabRun], Error> = await researchRead.read({
+            do { return .success(try await self.listResearchRuns()) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            researchRunsLoaded = true
+            switch result {
+            case .success(let rows): researchRuns = rows; researchRunsError = nil
+            case .failure(let error):
+                let detail = UserFacingError.cause(error, action: "list research runs")
+                researchRunsError = detail.count > 240 ? String(detail.prefix(240)) + "…" : detail
+            }
+        })
+    }
+
+    public func recordResearchRun(_ run: ResearchLabRun) {
+        researchRead.write {
+            researchRuns.removeAll { $0.id == run.id }
+            researchRuns.insert(run, at: 0)
+        }
+    }
 
     /// Research lab runs from `research/lab/runs.json`, newest first. A run
     /// that does not read is skipped.
@@ -281,12 +408,10 @@ extension DeskFacade {
         var paths = [
             SwiftNativeDeskStore(dataRoot: dataRoot).opsPath,
             SwiftNativeDeskStore(dataRoot: dataRoot).basePath,
-            await SwiftNativeApprovalInbox(root: dataRoot).approvalsPath,
+            await approvals.requestsPath(),
             LiveNotificationInbox.livePath(dataRoot: dataRoot),
-            GitHubCommandStore(dataRoot: dataRoot).opsPath,
-            GitHubCommandStore(dataRoot: dataRoot).basePath,
             executions,
-            DeskFacade(dataRoot: dataRoot).jobsPath,
+            jobsPath,
             dataRoot.appendingPathComponent("bots/definitions", isDirectory: true),
             dataRoot.appendingPathComponent("bots/runner-jobs.json"),
             DeskNagConfigStore(dataRoot: dataRoot).configPath,
@@ -305,39 +430,121 @@ extension DeskFacade {
         }
         for directory in directories where try directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
             paths.append(ExecutionRecordFile.canonicalPath(in: directory))
-            paths.append(ExecutionRecordFile.legacyPath(in: directory))
         }
         return paths
     }
 
-    public func loadPage() async -> (DeskPageSnapshot, [DeskMissedBot], [DeskTimedBot], Date,
-                                      DeskNagConfig, StudioWanderLane.TraceEntry?, Bool) {
-        let dataRoot = self.dataRoot
-        let loaded = await Task.detached(priority: .userInitiated) {
-            await DeskPageSnapshot.load(desk: self)
-        }.value
-        let missed = await Task.detached(priority: .userInitiated) {
-            DeskMissedBot.load(root: dataRoot)
-        }.value
-        var timed: [DeskTimedBot] = []
-        if await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot) {
-            timed = await Task.detached(priority: .userInitiated) {
-                DeskTimedBot.load(root: dataRoot)
-            }.value
-        }
-        let now = Date()
-        let nags = await DeskNagConfigStore(dataRoot: dataRoot).load()
-        let hour: StudioWanderLane.TraceEntry?
-        let hourUnavailable: Bool
-        do {
-            hour = try await Self.residentHour(dataRoot: dataRoot)
-            hourUnavailable = false
-        } catch {
-            hour = nil
-            hourUnavailable = true
-        }
-        return (loaded, missed, timed, now, nags, hour, hourUnavailable)
+    @discardableResult
+    public func refresh() async -> Bool {
+        let read = await refreshPage()
+        return !Task.isCancelled && page.id == read.id
     }
+
+    public func refreshPage() async -> DeskPageSnapshot {
+        readCount += 1
+        defer { readCount -= 1 }
+        let preceding = refreshTask
+        // A source edge arriving during a read must run after that read. Joining
+        // it would consume the edge against bytes captured before the change.
+        let task = Task {
+            _ = await preceding?.value
+            return await readRevision()
+        }
+        refreshTask = task
+        let read = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        if readCount == 1 { refreshTask = nil }
+        return read
+    }
+
+    /// The complete bundle returns to its reader and publishes once for every
+    /// mount. No presentation field is stored beside this retained revision.
+    private func readRevision() async -> DeskPageSnapshot {
+        await boardRead.read {
+            await bindLiveUpdates()
+            var snapshot = await Task.detached(priority: .userInitiated) {
+                DeskPageSnapshot(read: await self.readBoard())
+            }.value
+            // The armed parent catches later membership changes; rescan for any
+            // execution directory created between the first enumeration and arm.
+            await bindLiveUpdates()
+            _ = await refreshJobs()
+            let dataRoot = self.dataRoot
+            let timing = try? await bots.effectiveSchedule()
+            snapshot.missedBots = await Task.detached(priority: .userInitiated) {
+                timing.map { DeskMissedBot.load(root: dataRoot, timing: $0) } ?? []
+            }.value
+            if let timing, timing.unattended {
+                snapshot.timedBots = await Task.detached(priority: .userInitiated) {
+                    DeskTimedBot.load(root: dataRoot, timing: timing)
+                }.value
+            }
+            snapshot.now = Date()
+            snapshot.nagConfig = await DeskNagConfigStore(dataRoot: dataRoot).load()
+            let hour: StudioWanderLane.TraceEntry?
+            do {
+                hour = try await Self.residentHour(dataRoot: dataRoot)
+                snapshot.herHour = DeskHerHourPresentation.state(installed: true, entry: hour, now: snapshot.now)
+            } catch {
+                hour = nil
+                snapshot.herHour = .line(text: "Her hour’s saved state is unavailable.", symbol: "exclamationmark.triangle")
+            }
+            let hourExpiry = hour.flatMap { UserDisplayFormatters.parseISOTimestamp($0.at) }
+                .map { DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: snapshot.now) }
+            snapshot.jobs = jobs
+            snapshot.rows = await Task.detached(priority: .userInitiated) { [snapshot] in
+                DeskPageContent.project(snapshot: snapshot, now: snapshot.now, nags: snapshot.nagConfig,
+                    timedBots: snapshot.timedBots, jobStamps: snapshot.jobs.compactMap(\.nextRunAt), hourExpiry: hourExpiry)
+            }.value
+            return snapshot
+        } publish: { snapshot in
+            page = snapshot
+            deadlineTask?.cancel()
+            deadlineTask = snapshot.rows.deadline.map { deadline in
+                Task { [weak self] in
+                    do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
+                    catch { return }
+                    await self?.signalRefresh()
+                }
+            }
+        }
+    }
+
+    public func signalRefresh() async { await debouncer.signal() }
+
+    private func bindLiveUpdates() async {
+        if experienceTask == nil {
+            let changes = await ExperienceStore.at(dataRoot).changes()
+            experienceTask = Task { [weak self] in
+                for await _ in changes {
+                    guard !Task.isCancelled else { return }
+                    await self?.signalRefresh()
+                }
+            }
+        }
+        do {
+            let paths = try await liveUpdatePaths()
+            let normalized = Set(paths.map(\.standardizedFileURL))
+            liveUpdateError = nil
+            guard normalized != watchedPaths else { return }
+            watcher?.cancel()
+            busTask?.cancel()
+            watchedPaths = normalized
+            let changes = StoreChangeBus.shared.changes()
+            busTask = Task { [weak self] in
+                for await change in changes where normalized.contains(change.path.standardizedFileURL) {
+                    guard !Task.isCancelled else { return }
+                    await self?.signalRefresh()
+                }
+            }
+            watcher = await FileChangeWatcher.armed(paths: paths) { [weak self] _ in
+                Task { await self?.signalRefresh() }
+            }
+            await debouncer.setVisible(true)
+        } catch {
+            liveUpdateError = UserFacingError.message(error, action: "turn on Desk live updates")
+        }
+    }
+
 }
 // MARK: - The schedule feed
 
@@ -377,65 +584,6 @@ public enum SchedulerJobsFeedError: LocalizedError, Sendable {
     }
 }
 
-/// Bounded health projection for the canonical scheduler feed. It does not
-/// mutate schedules or infer a zero count from missing state; callers can use
-/// it for a live read to distinguish dormant disabled rows from enabled jobs
-/// whose advancement has stalled.
-public struct SchedulerJobsFeedHealth: Equatable, Sendable {
-    public let rowCountByKind: [String: Int]
-    public let enabledMissingNextRunIDs: [String]
-    public let enabledOverdueNextRunIDs: [String]
-    public let enabledStaleLastRunIDs: [String]
-
-    public static func assess(_ jobs: [ScheduledJob], now: Date = Date()) -> SchedulerJobsFeedHealth {
-        var rowCountByKind: [String: Int] = [:]
-        var missingNextRun: [String] = []
-        var overdueNextRun: [String] = []
-        var staleLastRun: [String] = []
-        let nowEpoch = now.timeIntervalSince1970
-
-        for job in jobs {
-            rowCountByKind[job.kind, default: 0] += 1
-            guard job.enabled else { continue }
-            let cadence = Double(min(max(job.intervalSeconds ?? 3_600, 60), 365 * 24 * 60 * 60))
-            if let next = epoch(job.nextRunAt) {
-                if nowEpoch - next > cadence {
-                    overdueNextRun.append(job.id)
-                }
-            } else {
-                missingNextRun.append(job.id)
-            }
-            if let last = epoch(job.lastRunAt), nowEpoch - last > cadence * 2 {
-                staleLastRun.append(job.id)
-            }
-        }
-        return SchedulerJobsFeedHealth(
-            rowCountByKind: rowCountByKind,
-            enabledMissingNextRunIDs: missingNextRun,
-            enabledOverdueNextRunIDs: overdueNextRun,
-            enabledStaleLastRunIDs: staleLastRun
-        )
-    }
-
-    private static func epoch(_ raw: String?) -> TimeInterval? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
-        if let numeric = TimeInterval(raw), numeric.isFinite { return numeric }
-        return ISO8601DateFormatter().date(from: raw)?.timeIntervalSince1970
-    }
-    public init(
-        rowCountByKind: [String: Int],
-        enabledMissingNextRunIDs: [String],
-        enabledOverdueNextRunIDs: [String],
-        enabledStaleLastRunIDs: [String]
-    ) {
-        self.rowCountByKind = rowCountByKind
-        self.enabledMissingNextRunIDs = enabledMissingNextRunIDs
-        self.enabledOverdueNextRunIDs = enabledOverdueNextRunIDs
-        self.enabledStaleLastRunIDs = enabledStaleLastRunIDs
-    }
-
-}
-
 // MARK: - The phone's execution row
 
 /// One Desk execution as workshop_tasks.json has always carried it, read from
@@ -459,6 +607,8 @@ public struct WorkshopTaskRow: Encodable, Hashable, Sendable {
     public var lastMovementAt: String?
     public var completedAt: String?
     public var receiptCount: Int?
+    public var currentStepId: String?
+    public var requiresApproval: Bool { WorkOverviewRead.requiresApproval(status: status) }
 
     public init?(row: JSONValue) {
         guard case .object(let obj) = row else { return nil }
@@ -505,13 +655,14 @@ public struct WorkshopTaskRow: Encodable, Hashable, Sendable {
         lastMovementAt = text("lastMovementAt", "last_movement_at")
         completedAt = text("completedAt", "completed_at")
         receiptCount = count("receiptCount", "receipt_count")
+        currentStepId = text("currentStepId", "current_step_id")
         guard !malformed else { return nil }
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, deskHandle, projectSpaceId, title, objective, status, phase, priority
         case autonomyLevel, permissionProfile, summary
-        case createdAt, updatedAt, lastMovementAt, completedAt, receiptCount
+        case createdAt, updatedAt, lastMovementAt, completedAt, receiptCount, currentStepId, requiresApproval
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -532,6 +683,8 @@ public struct WorkshopTaskRow: Encodable, Hashable, Sendable {
         try c.encodeIfPresent(lastMovementAt, forKey: .lastMovementAt)
         try c.encodeIfPresent(completedAt, forKey: .completedAt)
         try c.encodeIfPresent(receiptCount, forKey: .receiptCount)
+        try c.encodeIfPresent(currentStepId, forKey: .currentStepId)
+        try c.encode(requiresApproval, forKey: .requiresApproval)
     }
 }
 
@@ -565,17 +718,14 @@ public struct DeskToolDispatchRouter: Sendable {
         // required approval (gpt-5.5 review 2026-08-06, blocking #1). The
         // gated chain resolves Trust Center policy identically. Only this local
         // action boundary supplies the click approval filer.
-        let gated = makeGatedToolDispatchClient(
-            tools: SwiftToolDispatcher(
-                dataRoot: dataRoot,
-                agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
-            ),
-            fileAccess: "auto",
-            approvalFiler: DeskClickApprovalFiler(dataRoot: dataRoot),
-            dataRoot: dataRoot
-        )
-        return try await gated.dispatch(
-            tool: tool, input: input, surface: surface)
+        return try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(
+            envelope: .native("mac_ui:desk:" + tool, surface: surface),
+            approvalFiler: DeskClickApprovalFiler(dataRoot: dataRoot)) {
+            guard let dispatch = AppDoorReentry.perform else {
+                throw PartCallError(code: "door_unavailable", message: "The local Desk click has no originating app door.")
+            }
+            return try await dispatch(tool, input)
+        }
     }
 }
 

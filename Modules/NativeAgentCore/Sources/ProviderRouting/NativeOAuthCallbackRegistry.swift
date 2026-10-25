@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `NativeOAuthCallbackRegistry.swift` | `PendingCallbacks` class; `register`, `forget` |
 
 public final class PendingCallbacks: @unchecked Sendable {
     public static let shared = PendingCallbacks()

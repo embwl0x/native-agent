@@ -1,6 +1,9 @@
 import Foundation
 import SwiftUI
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatSessionWork
+
+// Blueprint: | `ChatTurnFailure.swift` | `FailedTurnRetryConfirmation` and continuation binding: shared confirmation after effects/unknown outcomes and session-local continue action |
 
 extension AppModel {
     /// Continue from here: a new turn in the failed message's session that

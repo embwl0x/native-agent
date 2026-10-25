@@ -6,7 +6,6 @@ import PersistenceCore
 import TurnTrace
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
 import ToolRegistry
@@ -29,41 +28,11 @@ public func makeResidentProviderLLMClient(
     if usesCanonicalBody {
         let telemetryRoot: URL? = credentialRoot == nil ? nil : dataRoot
         let stallSession = streamGuard.wallTimeout == 0 ? ProviderStreamGuard.stallOnlySession : nil
-        // User, 2026-09-06: readiness ("codex is signed in") is decided from the
-        // app's OWN credential resolution
-        // (`OpenAIOAuthDirectAdapter.preferredAuthPath`), but the child got no
-        // CODEX_HOME unless a `credentialRoot` was injected — so on the default
-        // root the CLI went and used whatever `~/.codex` or ambient CODEX_HOME
-        // it found, which is a different account from the one the badge
-        // validated (and the one the app deliberately gates behind CLI-adoption
-        // consent). Whenever the app has resolved a usable credential, the
-        // child is pointed at exactly that location.
-        // The merge sits on `augmentedProcessEnvironment` because an injected
-        // environment REPLACES the adapter's PATH repair, and a GUI-launched
-        // app's PATH cannot find `codex`.
-        // The child runs on the app credential's access-only copy
-        // (`codexChildHome`), never the app's own file; an adopted ~/.codex is
-        // the CLI's own and stays as it is.
-        let codexEnvironment: [String: String]? = {
-            if let root = credentialRoot {
-                return CodexAdapter.augmentedProcessEnvironment().merging([
-                    "CODEX_HOME": OpenAIOAuthDirectAdapter.codexChildHome(dataRoot: root).path,
-                    "NATIVE_AGENT_DATA_ROOT": root.path,
-                ]) { _, bound in bound }
-            }
-            let resolved = OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot)
-            guard OpenAIOAuthDirectAdapter.hasUsableTokens(at: resolved) else { return nil }
-            return CodexAdapter.augmentedProcessEnvironment().merging([
-                "CODEX_HOME": (OpenAIOAuthDirectAdapter.codexChildHome(mirroring: resolved)
-                    ?? resolved.deletingLastPathComponent()).path,
-            ]) { _, bound in bound }
-        }()
+        // Both account-backed adapters resolve the same root as readiness.
+        // CodexAdapter owns binding its child home to that selected credential.
         llm = SwiftNativeLLMClient(
             router: router,
-            // Codex child processes read CODEX_HOME / NATIVE_AGENT_DATA_ROOT; bind
-            // both to the credential root so a secondary runtime never reads (or
-            // refreshes) the operator's personal ~/.codex. (gpt-5.5 BLOCKING.)
-            codex: CodexAdapter(processEnvironmentOverride: codexEnvironment),
+            codex: CodexAdapter(dataRootOverride: credentialRoot ?? dataRoot),
             anthropic: AnthropicAdapter(
                 session: stallSession ?? .shared,
                 dataRootOverride: credentialRoot,
@@ -76,7 +45,7 @@ public func makeResidentProviderLLMClient(
             ),
             openAIOAuthDirect: OpenAIOAuthDirectAdapter(
                 session: stallSession ?? OpenAIOAuthDirectAdapter.productionSession,
-                dataRootOverride: credentialRoot,
+                dataRootOverride: credentialRoot ?? dataRoot,
                 telemetryDataRootOverride: telemetryRoot
             ),
             anthropicOAuthDirect: AnthropicOAuthDirectAdapter(
@@ -134,50 +103,15 @@ private struct AlternateRootUnavailableChatLLMClient: LLMClient {
         throw unavailable()
     }
 }
-import KnowledgeGraph
-import XConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
 import Context
+// Blueprint: | `ChatOrchestrationClient+Factories.swift` | `complete`, `makeChatOrchestrationClient`, `makeGatedToolDispatchClient`, canonical `makeResidentProviderLLMClient` shared by turns and background body work; stall-only calls share a transport without a resource wall; `SwiftNativeMemoryV2RecallingAdapter`: disclosure-aware recall and served-hit credit |
 
 // MARK: - Factory
-
-/// Injection-style factory: when the caller has assembled a SwiftNativeTurnEngine
-/// + llm + tools, build the SwiftNative impl directly. The prebuilt engine owns
-/// its TurnTraceBus; this factory deliberately reuses that exact instance rather than pretending `dataRoot` can rewrite an
-/// already-assembled engine. Missing deps → fall through to the no-arg form
-/// which constructs sensible defaults.
-public func makeChatOrchestrationClient(
-    engine: SwiftNativeTurnEngine?,
-    llm: (any LLMClient)?,
-    tools: (any ToolDispatchClient)?,
-    dataRoot: URL = PersistenceCore.defaultDataRoot(),
-    approvalFiler: (any ApprovalFiler)? = nil,
-    cognitiveObserver: (any CognitiveEventObserving)? = nil,
-    cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
-    contextFlow: (any ContextTurnPreparing)? = nil
-) -> any ChatOrchestrationClient {
-    if let engine, let llm, let tools {
-        return SwiftNativeChatOrchestrationClient(
-            engine: engine, tools: tools, llm: llm,
-            history: SessionHistoryReader(dataRoot: dataRoot),
-            dataRoot: dataRoot,
-            trust: SwiftNativeTrustCenter(dataRoot: dataRoot),
-            approvalFiler: approvalFiler,
-            cognitiveObserver: cognitiveObserver,
-            cognitiveContextProvider: cognitiveContextProvider
-        )
-    }
-    return makeChatOrchestrationClient(
-        dataRoot: dataRoot,
-        cognitiveObserver: cognitiveObserver,
-        cognitiveContextProvider: cognitiveContextProvider,
-        contextFlow: contextFlow
-    )
-}
 
 /// Convenience overload for app shells that need to add app-owned tools while
 /// reusing the production persona/router/trust/LLM/memory wiring.
@@ -255,9 +189,9 @@ public func makeChatOrchestrationClient(
 /// write-guards.
 ///
 /// - `fileAccess`: same values as `ChatOrchestrationClient.chat(..., fileAccess:)`
-///   — `"workspace"|"auto"|"full"` = allow, `"read_only"` = block writes,
-///   `"none"|"off"|"disabled"` = block all FS/shell tools by name prefix.
-///   2026-07-21: empty/unknown values FAIL CLOSED (no longer permissive).
+///   — invalid modes are refused; `none` refuses pathful `read` and prevents
+///   downstream screen reads from opening inferred files. The mode travels
+///   downstream; this wrapper does not impose a general read-only write block.
 /// - `approvalFiler`: pass nil to make CONFIRM-tier tools fail closed (no
 ///   human-in-the-loop). Pass a wired filer to allow async approvals.
 /// - `dataRoot`: exact root used when this factory constructs its default
@@ -298,14 +232,6 @@ public func makeGatedToolDispatchClient(
         // exactly one dispatch.
         approvedReplayVerifier: approvedReplayVerifier
             ?? ApprovalInboxApprovedReplayVerifier(dataRoot: dataRoot, canonicalTool: CanonicalToolNameDispatcher.canonical),
-        // Peer turns expose the external MCP namespace like any other tool
-        // (User, 2026-09-15: whole Agent), so the gate needs to know which of
-        // those tools ACT. The registry already stamps a per-tool risk class
-        // and `riskRequiresApproval` is exactly the read/effect split — a
-        // server that ships no metadata resolves to
-        // `approval_gated_missing_tool_risk`, which requires approval. So an
-        // unclassified external tool asks rather than runs.
-        externalToolIsEffect: peerExternalToolEffectResolver(dataRoot: dataRoot),
         // The ONLY chain offered the first-conversation exemption: this is
         // the Mac chat turn the opener runs on. The token itself is bound
         // to a session id and spent on first use, so later turns on this
@@ -318,27 +244,12 @@ public func makeGatedToolDispatchClient(
     // Provenance policy also binds approved replays and carried work, even
     // when those dispatch chains do not record a chat trace.
     dispatcher = PeerDataTaintDispatcher(
-        inner: dispatcher, peerStore: AgentPeerStore(dataRoot: dataRoot), dataRoot: dataRoot
+        inner: dispatcher, peerStore: AgentPeerStore(dataRoot: dataRoot)
     )
     if tracePeerTurn { dispatcher = ChatToolDispatchTracer(inner: dispatcher, dataRoot: dataRoot) }
     // 2026-09-18: every surface resolves saved peer names from this same root.
     return CanonicalToolNameDispatcher(inner: dispatcher, peerDataRoot: dataRoot,
         builtInLanes: tools as? any BuiltInAgentLaneProviding, conversationScope: verifiedSessionId)
-}
-
-/// The same registry evidence must reach peer effect gates on every turn chain.
-func peerExternalToolEffectResolver(dataRoot: URL) -> @Sendable (String) -> Bool {
-    { name in
-        let lowered = name.lowercased()
-        if !lowered.hasPrefix("mcp__") {
-            guard !SwiftToolDispatcher.reservedBuiltInNames.contains(name) else { return false }
-            return AppActionBinding.action(input: ["action": .string(ToolNameAliases.authoredAction(lowered))])?.read != true
-        }
-        guard let descriptor = MCPToolBridge.listMCPTools(dataRoot: dataRoot)
-            .first(where: { $0.bridgedName.lowercased() == lowered })
-        else { return true }
-        return MCPToolBridge.riskRequiresApproval(descriptor.effectiveRiskClass)
-    }
 }
 
 private func makeDefaultChatOrchestrationClient(
@@ -405,20 +316,8 @@ private func makeDefaultChatOrchestrationClient(
             .appendingPathComponent("active.json")
     )
     let trust = SwiftNativeTrustCenter(dataRoot: dataRoot)
-    // Wave 27 OpenAIOAuthDirectAdapter must be wired here too — without it,
-    // gpt-* models in OAuth mode (the user's production setup: no OPENAI_API_KEY,
-    // ChatGPT JWT in data/codex_home/auth.json::tokens.access_token) silently
-    // throw .notConfigured(provider: "openai") and the Mac UI shows nothing.
-    // SwiftNativeLLMClient routes gpt-* to OAuth-direct when the adapter is
-    // installed and SURFACES its errors (no silent api-key swap, per 9358710c
-    // strict routing); the api-key path is used only when the adapter is nil.
-    //
-    // Wave 28 AnthropicOAuthDirectAdapter (2026-06-01): same shape for the
-    // claude-* / anthropic/* prefix. the user's environment has NO
-    // ANTHROPIC_API_KEY — only the OAuth setup_token in
-    // data/providers/anthropic_oauth_direct.json. Without this wire, every
-    // chat turn against a claude model fails .notConfigured(provider:
-    // "anthropic") and the Mac UI shows a silent no-reply.
+    // The resident assembly installs the OAuth adapters; the checked explicit
+    // provider route selects the transport, never the model-name prefix.
     // A non-nil telemetry override flips LLMCallTraceRecorder to SYNCHRONOUS
     // test-mode writes — never hand it to production (gpt-5.5 review catch).
     // Only a non-default root (hermetic tests) gets the override.

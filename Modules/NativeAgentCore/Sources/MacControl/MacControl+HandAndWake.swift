@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 #if canImport(CoreGraphics)
 import CoreGraphics
+// Blueprint: | `MacControl+HandAndWake.swift` | `SwiftNativeMacControl`: `waitForTextInput`, `handleHand`, `watchedWindowMiss` (a watch's events land on its window, read at each event), `handleNudge`; text input verifies focus, selection and value with cancellable 25ms polling bounded to 750ms; hand text mismatch excerpts are always redacted because its readback lacks canonical caption/group redaction context |
 #endif
 
 extension SwiftNativeMacControl {
@@ -308,8 +309,16 @@ extension SwiftNativeMacControl {
         // A front:true act: every event is posted only while that app is in
         // front — User switching mid-act stops the hand before it reaches his app.
         let requiredFront = Self.intValue(body, "require_front_pid").map { Int32(clamping: $0) }
+        let surfacePid = ["click", "double_click", "key"].contains(gesture)
+            ? requiredFront ?? accessibilitySource.frontmostApp()?.processIdentifier : nil
+        let surfaceWindowBefore = surfacePid.flatMap { accessibilityActSource.focusedWindow(pid: $0) }
         // A watch's hand: every event lands on that exact window, read at the event.
         let requiredWindow = Self.intValue(body, "require_front_window")
+        let chords = gesture == "key" ? body.stringValue("keys").flatMap { try? MacKeySyntax.parseChords($0) } : nil
+        let selectsAll = chords?.count == 1 && chords?.first?.keyCode == 0x00 && chords?.first?.modifiers == .command
+        let selectionTarget = selectsAll ? accessibilitySource.frontmostApp().flatMap {
+            accessibilityActSource.focusedElement(pid: $0.processIdentifier)
+        } : nil
         // Every point is checked before the first event too, so a drag that
         // would end on another window never presses the button.
         if let requiredFront, let requiredWindow, let missed = executionPlan.lazy.compactMap({ step -> String? in
@@ -442,13 +451,14 @@ extension SwiftNativeMacControl {
 
         if Task.isCancelled { return interruptedResult() }
 
-        var textVerified = false
+        var textAfter: MacAXTextInput?
         if let input = textInput, let text = body.stringValue("text"),
            let pid = requiredFront ?? accessibilitySource.frontmostApp()?.processIdentifier {
-            // An already matching value proves delivery only if the selection moved.
-            textVerified = await waitForTextInput(
+            // Existing bounded acknowledgement, followed by the complete read
+            // the declared-effect judge consumes.
+            _ = await waitForTextInput(
                 pid: pid, target: input.target, value: input.inserting(text), changedFrom: input
-            ) != nil
+            )
         }
         let afterView = defersVisualVerification ? nil : visibleEvidence(await handleView([
             "max_marks": .int(60),
@@ -456,6 +466,18 @@ extension SwiftNativeMacControl {
         ]))
         if Task.isCancelled { return interruptedResult() }
         let visibleChanged = beforeView != nil && afterView != nil && beforeView != afterView
+        let declaration: MacActClosedLoop.DeclaredEffect = selectsAll ? .selectAll : .text(textInput.flatMap { input in
+            body.stringValue("text").map { input.inserting($0) }
+        })
+        if let target = selectionTarget ?? textInput?.target { textAfter = accessibilityActSource.textInput(target) }
+        // This readback has no canonical caption/group redaction context.
+        // Compare complete values, but never publish their text excerpts.
+        let verdict = MacActClosedLoop.verify(declaration,
+            value: (selectionTarget ?? textInput?.target).flatMap { accessibilityActSource.reread($0)?.value },
+            selection: textAfter?.selection, redactingText: true)
+        let surfaceVerdict = MacActClosedLoop.verify(.surface(nil),
+            dismissed: surfaceWindowBefore.flatMap { accessibilityActSource.windowPresence($0) }.map { !$0 },
+            processGone: surfacePid.map { accessibilitySource.appInfo(pid: $0) == nil } ?? false)
 
         return MacControlResult(
             ok: true,
@@ -464,18 +486,15 @@ extension SwiftNativeMacControl {
                 "status": .string(visibleChanged ? "emitted_observed" : "emitted_unobserved"),
                 "gesture": .string(gesture),
                 "steps": .int(Int64(plan.count)),
+                "requested_events_emitted": .int(Int64(emittedEvents)),
                 "visible_changed": .bool(visibleChanged),
-                "verified": .bool(checkedTextInput ? textVerified : visibleChanged),
-                "text_value_verified": checkedTextInput ? .bool(textVerified) : .null,
+                "text_value_verified": checkedTextInput ? .bool(verdict.status == "acted") : .null,
                 "visual_verification_deferred": .bool(defersVisualVerification),
                 "drag_travel_ms": dragTravelMs.map { .int(Int64($0)) } ?? .null,
                 "holding": body["holding"] ?? .null,
                 "button": body["button"] ?? .null,
                 "hand_neutral": .bool(heldKeys.isEmpty && heldButtons.isEmpty),
-                "verification_evidence": textVerified ? .string("focused_text_value_match") : visibleChanged && !checkedTextInput
-                    ? .string("fresh_fused_view_change")
-                    : .null,
-            ]),
+            ].merging(checkedTextInput || selectsAll ? verdict.receipt : surfaceVerdict.receipt) { _, new in new }),
             error: nil,
             durationMs: Int(now().timeIntervalSince(started) * 1000)
         )

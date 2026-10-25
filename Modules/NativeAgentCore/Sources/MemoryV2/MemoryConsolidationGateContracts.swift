@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryConsolidationGateContracts.swift` | `MemoryConsolidationDiff` struct |
 
 // MARK: - Outcome shapes
 
@@ -40,7 +41,7 @@ public enum GatedConsolidationOutcome: Sendable {
     case noChanges(plan: ConsolidationReport)
     /// Candidate scored below live on the probe set — refused to stage.
     case refusedRegression(scores: MemoryProbeComparison, plan: ConsolidationReport)
-    /// Candidate staged for approval; live store untouched.
+    /// New candidate staged for approval; prior approved swaps may have applied.
     case staged(
         approvalId: String,
         scores: MemoryProbeComparison,
@@ -88,22 +89,38 @@ struct MemoryConsolidationProjectionEnvironment: Sendable {
     }
 }
 
-public enum MemoryConsolidationGateError: Error, CustomStringConvertible {
+public enum MemoryConsolidationGateError: Error, CustomStringConvertible, LocalizedError {
     case probeGateUnavailable(String)
     case candidateBuildFailed(String)
     case stagingFailed(String)
     case reconcileFailed(String)
 
-    public var description: String {
+    public var failure: ToolFailureError {
+        let code: String
+        let detail: String
+        let instruction: String
         switch self {
         case .probeGateUnavailable(let why):
-            return "probe gate unavailable — consolidation refused (fail closed): \(why)"
+            code = "memory_consolidation_probe_unavailable"
+            detail = "Memory consolidation verification is unavailable: \(why)"
+            instruction = "Repair the reported verification input or memory search model before consolidating."
         case .candidateBuildFailed(let why):
-            return "candidate store build failed: \(why)"
+            code = "memory_consolidation_candidate_failed"
+            detail = "Candidate memory store build failed: \(why)"
+            instruction = "Repair the reported candidate memory store error before consolidating."
         case .stagingFailed(let why):
-            return "approval staging failed (live store untouched): \(why)"
+            code = "memory_consolidation_staging_failed"
+            detail = "Consolidation approval staging failed; the new candidate was not applied: \(why)"
+            instruction = "Inspect approvals and repair the reported staging error before creating another candidate."
         case .reconcileFailed(let why):
-            return "pre-stage reconcile failed — staging refused (fail closed): \(why)"
+            code = "memory_consolidation_reconcile_failed"
+            detail = "Prior consolidation reconciliation failed; new staging stopped: \(why)"
+            instruction = "Inspect prior approvals and memory state; repair the reported reconciliation error before staging."
         }
+        return ToolFailureError(detail, effects: .unknown, owner: "memory consolidation",
+            nextCall: ToolFailureError.call("app", ["page": .string("memories")]), code: code, instruction: instruction)
     }
+
+    public var description: String { MemoryV2Error.describe(failure) }
+    public var errorDescription: String? { description }
 }

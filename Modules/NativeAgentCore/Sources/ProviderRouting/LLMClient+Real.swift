@@ -4,11 +4,11 @@ import os
 import PersistenceCore
 import TurnTrace
 import Experiences
+// Blueprint: | `LLMClient+Real.swift` | `SwiftNativeLLMClient` shared routing and non-streaming execution envelope, stream guard admission before adapter creation, and failed-call telemetry before error normalization |
 
 // MARK: - LLMAdapter
 
-/// One backend (Anthropic / OpenAI / Codex CLI). The real client multiplexes
-/// over these by model-id prefix.
+/// One provider transport, selected by the call's checked explicit provider route.
 public protocol LLMAdapter: Sendable {
     /// How this transport carries tools; required, so a new adapter has to say.
     static var toolWire: ProviderToolWire { get }
@@ -205,9 +205,8 @@ public final class SwiftNativeLLMClient: LLMClient {
     /// If absent, that route fails as not configured; it never borrows the
     /// API-key route.
     private let anthropicOAuthDirect: (any LLMAdapter)?
-    /// NativeAgent-owned xAI OAuth provider for first-party Grok models. This
-    /// is separate from the X/Twitter connector; it calls api.x.ai as a model
-    /// provider after an xAI OAuth login.
+    /// NativeAgent-owned xAI OAuth provider for first-party Grok models: it
+    /// calls api.x.ai as a model provider after an xAI OAuth login.
     private let xaiOAuthDirect: (any LLMAdapter)?
     /// Moonshot API-key adapter for Kimi models. Kept separate from the
     /// generic OpenAI adapter so provider identity, credentials, endpoint,
@@ -346,7 +345,8 @@ public final class SwiftNativeLLMClient: LLMClient {
         var noReply = false
         if case .noReply? = error.flatMap(ProviderFailure.classify) { noReply = true }
         await lifecycleObserver?.observeProviderCall(started.terminal(
-            phase, firstOutputMs: receipt?.withLock(\.ttftMs), streamKind: streamKind?.rawValue, noReply: noReply))
+            phase, firstOutputMs: receipt?.withLock(\.ttftMs), streamKind: streamKind?.rawValue, noReply: noReply,
+            requestBytes: receipt?.withLock(\.requestBytes)))
         if phase == .succeeded {
             RepairOwed.settle(moonshotCatalogDataRoot, operation: "model.call:" + started.providerId + ":" + started.model,
                              evidence: .init(source: "provider", id: started.id))
@@ -378,7 +378,8 @@ public final class SwiftNativeLLMClient: LLMClient {
             dataRoot: moonshotCatalogDataRoot, id: "provider-repair:" + started.id, evidence: [.init(source: "provider", id: started.id)])
         let normalized = ProviderFailure.normalize(error) as? ProviderFailure.Diagnostic
         return ProviderFailure.Diagnostic(cause: ProviderFailure.classify(error) ?? .malformedResponse, detail: detail,
-            deadlineExpired: normalized?.deadlineExpired ?? false, admitted: normalized?.admitted ?? false, repair: repair)
+            deadlineExpired: normalized?.deadlineExpired ?? false, admitted: normalized?.admitted ?? false, repair: repair,
+            tries: normalized?.tries ?? 1)
     }
 
     /// Adapter choice produced by `resolveAdapterAndModel`. Used by
@@ -778,7 +779,9 @@ public final class SwiftNativeLLMClient: LLMClient {
                 var lifecycle: LLMCallLifecycleEvent?
                 var streamKind: LLMMessagesStreamKind?
                 let attemptStartedAt = ProcessInfo.processInfo.systemUptime
+                let requestBytes = LLMMessage.inputBytes(messages, system: system, tools: tools ?? [])
                 let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
+                recorded.withLock { $0.requestBytes = requestBytes }
                 do {
                     let routingSnapshot = try await self.checkedRoutingSnapshot()
                     let resolvedModel = try self.resolveRequestedModel(
@@ -856,7 +859,7 @@ public final class SwiftNativeLLMClient: LLMClient {
                     let kind = adapter.messagesStreamKind(tools: tools)
                     streamKind = kind
                     if let deadline = await self.lifecycleObserver?.firstOutputDeadline(
-                        provider: resolution.providerId, model: effectiveModel, streamKind: kind.rawValue) {
+                        provider: resolution.providerId, model: effectiveModel, streamKind: kind.rawValue, requestBytes: requestBytes) {
                         streamGuardConfig.firstOutput = deadline
                     }
                     try await ProviderStreamContext.$stallOnly.withValue(streamGuardConfig.wallTimeout == 0) {
@@ -938,6 +941,8 @@ public final class SwiftNativeLLMClient: LLMClient {
                 var lifecycle: LLMCallLifecycleEvent?
                 let attemptStartedAt = ProcessInfo.processInfo.systemUptime
                 let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
+                let requestBytes = LLMMessage.inputBytes([.user(prompt)], system: system)
+                recorded.withLock { $0.requestBytes = requestBytes }
                 let routingSnapshot: ProviderRoutingSnapshot
                 let resolvedModel: String
                 do {
@@ -991,7 +996,8 @@ public final class SwiftNativeLLMClient: LLMClient {
                 }
                 var guardConfig = streamGuardConfig
                 if let deadline = await self.lifecycleObserver?.firstOutputDeadline(
-                    provider: resolution.providerId, model: effectiveModel, streamKind: nil) {
+                    provider: resolution.providerId, model: effectiveModel, streamKind: nil,
+                    requestBytes: requestBytes) {
                     guardConfig.firstOutput = deadline
                 }
                 let guardedStream = ProviderStreamGuard.wrap(

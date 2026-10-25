@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `RuntimeSummaryModels.swift` | `KernelGuardrail` struct |
 
 public struct KernelGuardrail: Identifiable, Codable, Hashable {
     public var id: String
@@ -43,28 +44,6 @@ public struct AutonomyKernelSummary: Codable, Hashable {
         self.guardrails = guardrails
         self.approvalClasses = approvalClasses
         self.runningImprovements = runningImprovements
-        self.createdAt = createdAt
-    }
-}
-
-public struct PersonalOSSpace: Identifiable, Codable, Hashable {
-    public var id: String
-    public var name: String
-    public var count: Int
-    public var kind: String?
-    public init(id: String, name: String, count: Int, kind: String? = nil) {
-        self.id = id
-        self.name = name
-        self.count = count
-        self.kind = kind
-    }
-}
-
-public struct PersonalOSSummary: Codable, Hashable {
-    public var spaces: [PersonalOSSpace]
-    public var createdAt: String?
-    public init(spaces: [PersonalOSSpace], createdAt: String? = nil) {
-        self.spaces = spaces
         self.createdAt = createdAt
     }
 }

@@ -1,12 +1,17 @@
 import Foundation
+import NativeAgentCore
 import Observation
 import BackgroundLoops
+import BackgroundWork
 import DoctorChecks
 import NativeAgentShared
 import TrustCenter
 import PersistenceCore
 import AppToolRuntime
 import ToolRegistry
+import SystemOps
+import Cognition
+// Blueprint: | `EngineDoctor.swift` | DoctorFacade owns report evidence, loop verdicts and DoctorPlainCopy summary/issue rows; rooted weekly digest/error, activity, hardening/exports, gauntlet, health card, liveness, watchdog and live report refresh publish through LatestRead; completed reports and committed exports use write. RuntimeHealth is liveness metadata; lifecycle facts remain manager-owned; run history belongs to engine.runs. |
 
 /// `NativeAgentEngine.doctor` (S10): Doctor, this runtime's health and the
 /// background-loop watchdog for one data root, in core types. Diagnostics,
@@ -38,10 +43,8 @@ public final class DoctorFacade {
             return false
         }
 
-        /// Failing rows outside the `live.*` namespace, which covers optional
-        /// user-configured subsystems (Telegram token, SearXNG URL). Those are
-        /// real Doctor findings but they are NOT the app-owned scaffold, and
-        /// blocking onboarding on them would strand a user who skipped setup.
+        /// Onboarding's offline subset: every `live.*` row is excluded,
+        /// including app-owned memory/cognition and optional integrations.
         public var failingScaffoldChecks: [CheckResult] {
             guard case .completed(_, let failing) = self else { return [] }
             return failing.filter { !$0.checkID.hasPrefix("live.") }
@@ -62,8 +65,18 @@ public final class DoctorFacade {
 
     public nonisolated let dataRoot: URL
 
+    public private(set) var activityEvents: [ActivityEvent] = []
+    public private(set) var activityRefresh: PanelRefreshStatus?
+    public private(set) var productionHardening: ProductionHardeningSummary?
+    public private(set) var productionExports: [ProductionExport] = []
+    public private(set) var improvementGauntletStatus: ImprovementGauntletStatus?
+    public private(set) var hardeningRefresh: PanelRefreshStatus?
+    @ObservationIgnored private let activityRead = LatestRead()
+    @ObservationIgnored private let hardeningRead = LatestRead()
+
     /// The last Doctor report, as of the last run or live-row refresh.
     public var report: DoctorReport?
+    @ObservationIgnored public let reportRead = LatestRead()
     /// A run is in flight: the Run button, the pill and Support Snapshot wait.
     public var isRunning = false
     public var runStartedAt: Date?
@@ -71,12 +84,106 @@ public final class DoctorFacade {
     /// next run, so a page read mid-run names the report it shows (Support
     /// Snapshot is refused while `isRunning`), and clears if that run fails.
     public var reportCompletedAt: Date?
-    /// This runtime's health, as of the last probe.
+    /// Runtime liveness metadata, as of the last probe.
     public var health: RuntimeHealth?
+    @ObservationIgnored private let healthRead = LatestRead()
+
+    @discardableResult
+    public func refreshHealth() async -> RuntimeHealth {
+        await healthRead.read({ readHealth() }, publish: { health = $0 })
+    }
     /// The background-loop watchdog, as of the last read.
     public var watchdog: WatchdogStatus?
     /// The health pill's card, as of the last read.
     public var healthCard: HealthCard?
+    @ObservationIgnored public let healthCardRead = LatestRead()
+    @ObservationIgnored private let watchdogRead = LatestRead()
+
+    @discardableResult
+    public func refreshWatchdog(manager: BackgroundLoopsManager = .shared) async -> WatchdogStatus {
+        await watchdogRead.read({ await readWatchdog(manager: manager) }, publish: { watchdog = $0 })
+    }
+    /// The verdicts from the same evidence as the report's background-loop row.
+    public var loopVerdicts: [LoopHealthVerdict] = []
+
+    public func refreshActivity() async throws {
+        let result: Result<[ActivityEvent], Error> = await activityRead.read({
+            do { return .success(try await RuntimeReadProjection.getActivity(root: dataRoot)) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            switch result {
+            case .success(let events):
+                activityEvents = events
+                activityRefresh = PanelRefreshStatus(lastAttemptAt: Date(), lastSuccessAt: Date(), failedEndpoints: [])
+            case .failure:
+                activityRefresh = PanelRefreshStatus(lastAttemptAt: Date(), lastSuccessAt: activityRefresh?.lastSuccessAt, failedEndpoints: ["activity"])
+            }
+        })
+        _ = try result.get()
+    }
+
+    public func recordProductionExports(_ verified: [ProductionExport]) {
+        hardeningRead.write { productionExports = verified }
+    }
+
+    public func refreshHardening() async -> [(endpoint: String, label: String, error: Error)] {
+        let read = await hardeningRead.read({
+            var hardening: ProductionHardeningSummary?
+            var exports: [ProductionExport]?
+            var gauntlet: ImprovementGauntletStatus?
+            var failures: [(endpoint: String, label: String, error: Error)] = []
+            do { hardening = try await DoctorStatusProjection.getProductionHardening(dataRoot: dataRoot) }
+            catch { failures.append(("production hardening", "getProductionHardening", error)) }
+            do { exports = try await ProductionExport.list(dataRoot: dataRoot) }
+            catch { failures.append(("production exports", "getProductionExports", error)) }
+            do { gauntlet = try await RuntimeReadProjection.swiftImprovementGauntlet(dataRoot: dataRoot) }
+            catch { failures.append(("improvement gauntlet", "getImprovementGauntlet", error)) }
+            return (hardening, exports, gauntlet, failures)
+        }, publish: { read in
+            if let value = read.0 { productionHardening = value }
+            if let value = read.1 { productionExports = value }
+            if let value = read.2 { improvementGauntletStatus = value }
+            hardeningRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
+                lastSuccessAt: read.3.isEmpty ? Date() : hardeningRefresh?.lastSuccessAt, failedEndpoints: read.3.map { $0.endpoint })
+        })
+        return read.3
+    }
+
+    public private(set) var weeklyDigest: (text: String, date: String)?
+    public private(set) var weeklyDigestError: String?
+    @ObservationIgnored private let weeklyDigestRead = LatestRead()
+
+    public func observeWeeklyDigest() async {
+        await EventDeadlinePhysiology.refreshOnChanges(paths: [
+            dataRoot.appendingPathComponent("self_improvement/digests", isDirectory: true)
+        ]) {
+            _ = await self.weeklyDigestRead.read { () async -> Result<(text: String, date: String)?, Error> in
+            do {
+                let dir = self.dataRoot.appendingPathComponent("self_improvement/digests", isDirectory: true)
+                let digest = try await Task.detached(priority: .utility) { () throws -> (text: String, date: String)? in
+                    let files: [URL]
+                    do { files = try FileManager.default.contentsOfDirectory(
+                        at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) }
+                    catch CocoaError.fileReadNoSuchFile { return nil }
+                    let dated = try files.filter { $0.pathExtension == "md" }.map { url in
+                        (url: url, modified: try url.resourceValues(forKeys: [.contentModificationDateKey])
+                            .contentModificationDate ?? .distantPast)
+                    }
+                    guard let latest = dated.max(by: { $0.modified < $1.modified })?.url else { return nil }
+                    return (try String(contentsOf: latest, encoding: .utf8), latest.deletingPathExtension().lastPathComponent)
+                }.value
+                return Result<(text: String, date: String)?, Error>.success(digest)
+            } catch {
+                return .failure(error)
+            }
+            } publish: { result in
+                switch result {
+                case .success(let digest): self.weeklyDigest = digest; self.weeklyDigestError = nil
+                case .failure(let error): self.weeklyDigestError = UserFacingError.message(error, action: "read latest digest")
+                }
+            }
+        }
+    }
 
     public nonisolated init(dataRoot: URL) {
         self.dataRoot = dataRoot
@@ -97,8 +204,10 @@ public final class DoctorFacade {
     /// clears its stamp, so nothing (Support Snapshot's reuse) takes that
     /// rollup as current after a newer run failed to confirm it.
     public func finishRun(_ finished: DoctorReport?) {
+        reportRead.write {
         if let finished { report = finished }
         reportCompletedAt = finished == nil ? nil : Date()
+        }
         isRunning = false
         runStartedAt = nil
     }
@@ -118,20 +227,18 @@ public final class DoctorFacade {
         }
     }
 
-    /// When THIS runtime started. `ProcessInfo.systemUptime` measures the
-    /// machine, which made Status report days of "uptime" for an app launched
-    /// a minute ago.
-    public nonisolated static let processStartedAt = Date()
+    /// Lazily initialized by the first health read, not stamped at process launch.
+    private nonisolated static let firstHealthReadAt = Date()
 
-    /// This runtime's health. The Mac process IS the runtime, so this is its
-    /// own state: version, data root and how long it has been up.
+    /// `ok` means this in-process read answered, not that Doctor passed.
+    /// `uptimeSeconds` measures elapsed time since the first health read.
     public nonisolated func readHealth() -> RuntimeHealth {
         RuntimeHealth(
             ok: true,
             app: "NativeAgent",
             version: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev",
             dataDir: dataRoot.path,
-            uptimeSeconds: Date().timeIntervalSince(Self.processStartedAt)
+            uptimeSeconds: Date().timeIntervalSince(Self.firstHealthReadAt)
         )
     }
 
@@ -139,8 +246,13 @@ public final class DoctorFacade {
         let loopStatuses = await backgroundLoopsManager.status()
         let running = await backgroundLoopsManager.isRunning()
         let uptime = await backgroundLoopsManager.uptimeSeconds()
-        let failedLoops = loopStatuses.filter { $0.lastError != nil }
-        let lifecycleStatus = running ? (failedLoops.isEmpty ? "ok" : "degraded") : "stopped"
+        let loopHealth = DoctorLoopHealth.doctorCheck(
+            observations: loopStatuses,
+            recentFailureDates: DoctorLoopHealth.recentFailureDates(
+                receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl")),
+            now: Date())
+        let adverse = DoctorSafeRepairPolicy.isAdverse(loopHealth.status)
+        let lifecycleStatus = running ? (adverse ? "degraded" : loopHealth.status) : "stopped"
         let newestRun = loopStatuses.compactMap(\.lastRun).max()
         let lastActivity: JSONValue? = newestRun.map { lastRun in
             .object([
@@ -167,14 +279,12 @@ public final class DoctorFacade {
             uptimeSeconds: uptime,
             runtimeLifecycleStatus: lifecycleStatus,
             runtimeLifecycleDetail: running
-                ? (failedLoops.isEmpty
-                    ? "Swift background loops are running in NativeAgent.app."
-                    : "Swift background loops are running with \(failedLoops.count) loop failure(s): \(failedLoops.map(\.name).sorted().joined(separator: ", ")).")
+                ? (loopHealth.status == "ok" ? "Swift background loops are running in NativeAgent.app." : loopHealth.detail)
                 : "Swift background loops are not running.",
             runningImprovements: loopStatuses.filter { $0.executing && $0.name == "self_improvement_sweep" }.count,
             runningExecutions: loopStatuses.filter { $0.executing && ["mission_executor", "workshop_pump"].contains($0.name) }.count,
             lastActivity: lastActivity,
-            repairAvailable: !failedLoops.isEmpty,
+            repairAvailable: loopStatuses.contains { $0.lastError != nil },
             extras: .object([
                 "backend": .string("swift"),
                 "source": .string("app_background_loops_manager"),
@@ -205,7 +315,38 @@ extension WatchdogStatus {
         switch runtimeLifecycleStatus {
         case "ok": return "ok"
         case "stopped", "degraded": return "warn"
+        case "off", "not needed": return runtimeLifecycleStatus
+        case "unmeasured": return "info"
         default: return "error"
+        }
+    }
+}
+
+extension DoctorFacade {
+    public struct RuntimeStatus: Equatable, Sendable {
+        public enum Tone: Sendable { case neutral, success, warning, failure }
+        public let text: String
+        public let detail: String?
+        public let tone: Tone
+        public let systemImage: String
+    }
+
+    /// Runtime liveness is independent of the most recent operation's feedback.
+    public func runtimeStatus(lastRefreshError: String?) -> RuntimeStatus {
+        let hasError = !(lastRefreshError?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let detail = hasError ? "Some sections didn't refresh. The details are in the log." : nil
+        switch health?.ok {
+        case true:
+            return RuntimeStatus(text: hasError ? "App is online; some app data is unavailable" : "App is online",
+                detail: detail, tone: hasError ? .warning : .success,
+                systemImage: hasError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+        case false:
+            return RuntimeStatus(text: "App reported a problem", detail: detail,
+                tone: .failure, systemImage: "xmark.octagon.fill")
+        case nil:
+            return RuntimeStatus(text: hasError ? "App status is unavailable" : "App status has not been checked",
+                detail: detail, tone: hasError ? .failure : .neutral,
+                systemImage: hasError ? "xmark.octagon.fill" : "questionmark.circle")
         }
     }
 }
@@ -218,7 +359,8 @@ public enum SystemHealthSummary: Sendable, Equatable {
 }
 
 extension DoctorFacade {
-    public var systemHealthSummary: SystemHealthSummary {
+    public var systemHealth: (summary: SystemHealthSummary,
+        issues: [(id: String, title: String, detail: String, repairAvailable: Bool)]) {
         // Prefer an explicit Doctor run. Otherwise reuse the health card that
         // Chat already keeps current instead of launching a second full Doctor
         // pass from this always-mounted toolbar control.
@@ -231,11 +373,11 @@ extension DoctorFacade {
             if buckets.isEmpty || buckets.contains("unclear") { return .unknown }
             return .ok
         }
-        if let checks = report?.checks {
-            return summarize(checks.map(\.status))
-        }
-        guard let subsystems = healthCard?.subsystems else { return .unknown }
-        return summarize(subsystems.map(\.status))
+        let rows = report.map { $0.checks.map { ($0.id, $0.title, $0.status, $0.repairFace, $0.repair_available == true) } }
+            ?? (healthCard?.subsystems ?? []).map { ($0.id, $0.label, $0.status, $0.detail, false) }
+        return (summarize(rows.map(\.2)), rows.filter {
+            ["warning", "failing"].contains(DoctorPlainCopy.bucket(for: $0.2))
+        }.map { ($0.0, $0.1, $0.3, $0.4) })
     }
 }
 

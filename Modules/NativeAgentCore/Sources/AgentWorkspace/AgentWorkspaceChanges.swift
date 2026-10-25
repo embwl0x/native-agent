@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceChanges.swift` | `AgentWorkspaceChanges` enum; `evaluate`, `evaluateHumanListing`, conversation change observations through the bound owner port |
 
 /// Small comparison receipts, never another content store or unread-message
 /// owner. The caller records a stamp only after presenting a successful read.
@@ -180,7 +181,7 @@ enum AgentWorkspaceChanges {
                 }), "state": row["state"] ?? row["status"] ?? .null])
             }
             guard row["reply"] != nil || row["state"] != nil else { return nil }
-            return selected(row, ["agent", "conversation", "state", "status", "reply", "completed", "terminal", "needs_input", "needs_authentication", "artifacts", "parts"])
+            return selected(row, ["agent", "conversation", "state", "status", "reply", "last_send_completed", "last_send_terminal", "last_send_needs_input", "last_send_needs_authentication", "completed", "terminal", "needs_input", "needs_authentication", "artifacts", "parts"])
         case "chat_conversations":
             guard row["conversation_session_id"] != nil, case .array(let messages)? = row["messages"],
                   messages.allSatisfy({ object($0).map(successful) == true }),

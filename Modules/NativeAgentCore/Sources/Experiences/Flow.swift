@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import os
+// Blueprint: | `Flow.swift` | `Flow`: scope-ordered open, stopped, finished and dropped helpers over ExperienceStore; unfinished runs owe finish, with position-prefixed landed digests and references to their owners' raw records |
 
 /// Landed work belongs to one unfinished experience, not to a second ledger.
 /// Each stop appends the whole list of what has landed, newest last, so a

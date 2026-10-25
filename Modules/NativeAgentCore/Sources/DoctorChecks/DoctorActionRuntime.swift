@@ -3,6 +3,7 @@ import NativeAgentCore
 import MemoryV2
 import PersistenceCore
 import Synchronization
+// Blueprint: | `DoctorActionRuntime.swift` | `DoctorActionRuntime` struct; `safeDetail`, `mergeReport` |
 
 public typealias DoctorTelegramSnapshot = (enabled: Bool, tokenConfigured: Bool, isTransientPollInterruption: Bool, actionableError: String?, pollerEnabled: Bool, hasFreshSuccessfulPoll: Bool, isStarting: Bool)
 public typealias DoctorAutonomySnapshot = (enabled: Bool?, disabledReason: String?, status: String, mode: String?, runningImprovements: Int?)
@@ -59,9 +60,6 @@ public protocol DoctorActionPort: Sendable {
     func doctorTelegramSnapshot() async throws -> DoctorTelegramSnapshot
     func doctorSearchURL() async throws -> String?
     func doctorProbeSearch(base: String) async -> Bool
-    func doctorSearchSetupReading() async -> String?
-    /// Codex web search, the route that answers first: is its login live?
-    func doctorProbeCodexSearch() async -> Bool
     /// Doctor state: Docker was checked for this search URL and holds no SearXNG.
     func doctorSearchBackendAbsent(base: String) -> Bool
     func doctorLiveRepair(for check: CheckResult, scope: DoctorRepairScope) async -> DoctorExecutableRepair?
@@ -84,7 +82,7 @@ public protocol DoctorActionPort: Sendable {
 private let liveMemoryQuickCheck = Mutex<(at: Date, rows: [String])?>(nil)
 private let liveMemoryQuickCheckMaxAge: TimeInterval = 600
 private let doctorRepairInFlight = Mutex(false)
-private let liveSearchReading = Mutex<(base: String, healthy: Bool, codex: Bool, at: Date)?>(nil)
+private let liveSearchReading = Mutex<(base: String, healthy: Bool, at: Date)?>(nil)
 
 public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
     private let port: Port
@@ -146,6 +144,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                         receipt = attempt.detail
                         actionCompleted = attempt.completed
                     } else if let result = try await impl.runCheck(id: id, repair: true, scope: repairScope) {
+                        actionCompleted = result.repairApplied == true
                         receipt = result.receipt ?? (id == "oauth_token_expiry"
                             ? result.detail : result.repair ?? "Repair attempted; no completion receipt returned.")
                         // The OAuth result carries the exchange verdict. A
@@ -172,8 +171,8 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                         let row = checks[index]
                         checks[index] = CheckResult(source: row.source, nextCall: row.nextCall, id: row.id, title: row.title, status: "unmeasured",
                                                     detail: row.detail, harm: row.harm, repair: row.repair,
-                                                    receipt: row.receipt, human_action: row.human_action,
-                                                    repair_available: row.repair_available, ask: row.ask, owner: row.owner)
+                                                    receipt: row.receipt, repairApplied: row.repairApplied, human_action: row.human_action,
+                                                    repair_available: row.repair_available, automaticRepairEligible: row.automaticRepairEligible, ask: row.ask, owner: row.owner)
                     }
                 }
                 let verified = checks[index]
@@ -187,13 +186,13 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                     text += " " + failure
                 }
                 repairReceipts.append(CheckResult(source: verified.source, nextCall: verified.nextCall, id: id, title: before.title,
-                    status: verified.status, detail: text, harm: verified.harm, receipt: text, human_action: verified.human_action,
-                    repair_available: verified.repair_available, ask: verified.ask, owner: verified.owner))
+                    status: verified.status, detail: text, harm: verified.harm, receipt: text, repairApplied: actionCompleted, human_action: verified.human_action,
+                    repair_available: verified.repair_available, automaticRepairEligible: verified.automaticRepairEligible, ask: verified.ask, owner: verified.owner))
                 checks[index] = CheckResult(source: verified.source, nextCall: verified.nextCall,
                     id: id, title: verified.title, status: verified.status,
                     detail: verified.detail, harm: verified.harm,
-                    repair: verified.repair, receipt: text, human_action: verified.human_action,
-                    repair_available: verified.repair_available, ask: verified.ask, owner: verified.owner
+                    repair: verified.repair, receipt: text, repairApplied: actionCompleted, human_action: verified.human_action,
+                    repair_available: verified.repair_available, automaticRepairEligible: verified.automaticRepairEligible, ask: verified.ask, owner: verified.owner
                 )
             }
         }
@@ -244,7 +243,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
             let available = await port.doctorLiveRepair(for: row, scope: .button)?.checkID == row.id
             checks[index] = CheckResult(source: row.source, nextCall: row.nextCall,
                 id: row.id, title: row.title, status: row.status, detail: row.detail, harm: row.harm,
-                repair: available ? "Run Repair Safe Issues to retry this live service." : nil,
+                repair: available ? "Press Repair in Diagnostics → Health checks to retry this live service." : nil,
                 receipt: row.receipt, human_action: row.recoveryAction(repairAvailable: available), repair_available: available,
                 ask: row.ask, owner: DoctorOwner.of(row, repairAvailable: available)
             )
@@ -284,7 +283,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                 id: "live.memory", title: title, status: "fail",
                 detail: "The canonical memory store is not attached: \(safeDoctorDetail(SwiftNativeMemoryV2.sharedOpenFailure ?? "attachment unavailable"))",
                 harm: "Her memories cannot be saved or recalled.",
-                repair: "Run Repair Safe Issues to retry canonical memory attachment."
+                repair: "Press Repair in Diagnostics → Health checks to retry canonical memory attachment."
             )
         }
         let storage = await bridge.underlyingStorage()
@@ -297,7 +296,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                     id: "live.memory", title: title, status: "fail",
                     detail: "The memory knowledge graph is waiting for canonical reconciliation: \(safeDoctorDetail(failure))",
                     harm: "She cannot recall connections between her saved memories.",
-                    repair: "Run Repair Safe Issues to reconcile the canonical memory graph."
+                    repair: "Press Repair in Diagnostics → Health checks to reconcile the canonical memory graph."
                 )
             }
             let cached = liveMemoryQuickCheck.withLock { $0 }
@@ -317,7 +316,8 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                     id: "live.memory", title: title, status: "fail",
                     detail: "quick_check on \(path) reported: \(safeDoctorDetail(rows.joined(separator: "; ")))",
                     harm: "Her saved memories may be damaged and further writes could lose them.",
-                    human_action: "Restore memory.sqlite from a backup (Trust Center) before it is written further."
+                    human_action: "Open Trust → Advanced → Backups, select a verified backup containing memory/memory.sqlite, then choose Restore → Restore backup before further writes.",
+                    ask: .permission
                 )
             }
             return CheckResult(source: "memory/memory.sqlite",
@@ -348,9 +348,9 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                 failures.append("\(name) is not listening: \(failure)")
                 if let range = failure.range(of: " is held by ") {
                     let holder = String(failure[range.upperBound...])
-                    nextSteps.append("Quit \(holder) to free port \(health.port) for \(name), then run Doctor again.")
+                    nextSteps.append("quit \(holder.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))) to free port \(health.port) for \(name), then run Health checks again")
                 } else {
-                    nextSteps.append("\(name) could not bind port \(health.port): \(failure).")
+                    nextSteps.append("press Repair in Diagnostics → Health checks to retry \(name) on port \(health.port)")
                 }
             } else if let bound = health.boundPort {
                 healthy.append("\(name) on \(bound)")
@@ -358,6 +358,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                 warnings.append("\(name) is still starting on \(health.port)")
             } else if expected {
                 failures.append("\(name) is not listening: its startup stopped before binding port \(health.port) (see Console for [\(name)])")
+                nextSteps.append("press Repair in Diagnostics → Health checks to restart \(name)")
             } else {
                 healthy.append("\(name) off")
             }
@@ -366,9 +367,9 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
             return CheckResult(source: "Local bridge listeners",
                 id: "live.bridges", title: "Local bridges",
                 status: failures.isEmpty ? "unmeasured" : "fail",
-                detail: safeDoctorDetail((failures + warnings + healthy).joined(separator: ". ") + "."),
+                detail: safeDoctorDetail((failures + warnings + healthy).joined(separator: "; ") + "."),
                 harm: failures.isEmpty ? nil : "Other apps and helpers cannot reach her through the affected local bridges.",
-                human_action: nextSteps.isEmpty ? nil : nextSteps.joined(separator: " ")
+                human_action: nextSteps.isEmpty ? nil : "For the affected bridges, " + nextSteps.joined(separator: "; ") + "."
             )
         }
         return CheckResult(source: "Local bridge listeners",
@@ -388,17 +389,24 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
             case .healthy:
                 break
             case .unhealthy(let detail):
-                return CheckResult(source: "Providers > Chat",
+                let check = CheckResult(source: "Providers > Chat",
                     id: "live.providers",
                     title: "Providers and OAuth",
                     status: "warn",
-                    detail: "\(registryCheck.detail) \(safeDoctorDetail(detail))",
+                    detail: registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; active path: " + safeDoctorDetail(detail),
                     harm: "She cannot reliably answer through the active provider.",
                     human_action: detail.hasPrefix("No usable provider")
-                        ? "Open Providers and activate an authenticated provider for Chat."
-                        : "Open Providers and run Test Connection for the active provider. If it fails, use its reported authentication or connectivity step.",
+                        ? "Open Providers → Chat and choose an authenticated Provider and Model."
+                        : detail.contains("isn't offered") || detail.contains("is no longer offered")
+                            ? "Open Providers → Chat → Model and choose a model offered by the selected Provider."
+                            : "Open Providers → active account → Manage → Test the connection and follow its authentication or connectivity step.",
                     ask: detail.hasPrefix("No usable provider") ? .signIn : nil
                 )
+                // Preserve the pending-transaction repair when it exists; only
+                // a path without a handler needs the person's provider control.
+                guard check.ask == nil, await port.doctorLiveRepair(for: check, scope: .button) == nil else { return check }
+                return CheckResult(source: check.source, id: check.id, title: check.title, status: check.status,
+                    detail: check.detail, harm: check.harm, human_action: check.human_action, ask: .permission)
             case .unavailable, .configurationIssue:
                 break
             }
@@ -410,7 +418,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                     id: registryCheck.id,
                     title: registryCheck.title,
                     status: "ok",
-                    detail: "\(registryCheck.detail) Active provider path is ready.",
+                    detail: registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; active provider path is ready.",
                     repair: nil
                 )
             case .stale(let providerID):
@@ -418,21 +426,24 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                     id: "live.providers",
                     title: "Providers and OAuth",
                     status: DoctorSafeRepairPolicy.isAdverse(registryCheck.status) ? registryCheck.status : "unmeasured",
-                    detail: "\(registryCheck.detail) Last native provider check for \(providerID ?? "an unknown provider") is stale.",
+                    detail: registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; last native provider check for \(providerID ?? "an unknown provider") is stale.",
                     harm: registryCheck.harm, repair: registryCheck.repair, receipt: registryCheck.receipt,
-                    human_action: registryCheck.human_action ?? "Open Providers and run Test Connection.",
+                    human_action: registryCheck.human_action ?? "Open Providers → active account → Manage → Test the connection.",
                     repair_available: registryCheck.repair_available, ask: registryCheck.ask, owner: registryCheck.owner
                 )
-            case .unavailable:
+            case .unavailable(let detail):
                 // No native connection test exists for this route; ready
                 // authentication is the whole verdict, not a fault.
-                return registryCheck
+                return CheckResult(source: registryCheck.source, id: registryCheck.id, title: registryCheck.title, status: registryCheck.status,
+                    detail: registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; " + safeDoctorDetail(detail),
+                    harm: registryCheck.harm, repair: registryCheck.repair, human_action: registryCheck.human_action, ask: registryCheck.ask)
             case .failed(let detail):
                 return CheckResult(source: "Providers > Chat",
                     id: "live.providers",
                     title: "Providers and OAuth",
-                    status: "unmeasured",
-                    detail: "The last native provider check failed: \(safeDoctorDetail(detail))"
+                    status: "fail",
+                    detail: "The last native provider check failed: \(safeDoctorDetail(detail))",
+                    human_action: "Open Providers → active account → Manage → Test the connection and follow its reported recovery step."
                 )
             }
         } catch {
@@ -443,13 +454,11 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                     && ["active.json", "surfaces.json", "pending-surface-configuration.json"].contains(url.lastPathComponent) ? url : nil
             }
             return CheckResult(source: file?.path ?? "Providers > saved configuration",
-                nextCall: file.map { ToolFailureError.fileRepairCall($0, dataRoot: port.dataRoot,
-                    shape: "This JSON object holds the saved provider routing selection or its pending transaction. Preserve all surface, provider, model, effort and transaction fields; never choose a replacement provider or alter credentials.") },
                 id: "live.providers", title: "Providers and OAuth", status: "fail",
                 detail: "Provider registry could not be read: \(safeDoctorDetail(error.localizedDescription))",
                 harm: "She cannot choose an authenticated provider to answer.", repair: nil,
-                human_action: "Open Providers and check its saved provider configuration; restore the provider registry from a valid backup if it cannot be read."
-            )
+                human_action: [file.map { ToolFailureError.fileRepairInstruction($0,
+                    shape: "This JSON object holds the saved provider routing selection or its pending transaction. Preserve all surface, provider, model, effort and transaction fields; never choose a replacement provider or alter credentials.") }, "Open Providers and check its saved provider configuration; restore the provider registry from a valid backup if it cannot be read."].compactMap { $0 }.joined(separator: " "))
         }
     }
 
@@ -464,12 +473,11 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                     human_action: "Telegram → Bot token → Bot token: enter the current token from @BotFather, then Save.", ask: .signIn)
             }
             return CheckResult(source: "telegram/config.json",
-                nextCall: ToolFailureError.fileRepairCall(port.dataRoot.appendingPathComponent("telegram/config.json"), dataRoot: port.dataRoot,
-                    shape: "This JSON object holds Telegram's saved enabled flag, sender allowlists and configuration. Preserve all credential references and admission choices exactly."),
                 id: "live.telegram", title: "Telegram", status: "fail",
                 detail: "Telegram status could not be read: \(safeDoctorDetail(error.localizedDescription))",
-                harm: "Telegram messages may not be read or answered.", repair: nil
-            )
+                harm: "Telegram messages may not be read or answered.", repair: nil,
+                human_action: ToolFailureError.fileRepairInstruction(port.dataRoot.appendingPathComponent("telegram/config.json"),
+                    shape: "This JSON object holds Telegram's saved enabled flag, sender allowlists and configuration. Preserve all credential references and admission choices exactly."))
         }
     }
 
@@ -479,9 +487,10 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return await searchDoctorCoverageCheck(raw, probe: probe)
         } catch {
-            return CheckResult(source: "providers/active.json and providers/surfaces.json",
-                id: "live.search", title: "Search", status: "unmeasured",
-                detail: "Search configuration could not be read: \(safeDoctorDetail(error.localizedDescription))"
+            let source = (error as? ToolFailureError)?.owner ?? port.dataRoot.appendingPathComponent("research/config.json").path
+            return CheckResult(source: source,
+                id: "live.search", title: "Search", status: "fail",
+                detail: "Search configuration is unreadable or malformed at \(safeDoctorDetail(source))."
             )
         }
     }
@@ -495,7 +504,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                 id: "live.tools", title: "Tool Registry", status: "fail",
                 detail: "Tool registry could not be read: \(safeDoctorDetail(error.localizedDescription))",
                 harm: "She cannot use her self-built tools.",
-                human_action: "Trust → Backups → select a verified backup → Restore → Restore backup.", ask: .permission
+                human_action: "Open Trust → Advanced → Backups, select a verified backup, then choose Restore → Restore backup.", ask: .permission
             )
         }
     }
@@ -509,7 +518,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                 id: "live.autonomy", title: "Autonomy", status: "fail",
                 detail: "Autonomy state could not be read: \(safeDoctorDetail(error.localizedDescription))",
                 harm: "She cannot safely continue work on her own.",
-                human_action: "Trust → Backups → select a verified backup → Restore → Restore backup.", ask: .permission
+                human_action: "Open Trust → Advanced → Backups, select a verified backup, then choose Restore → Restore backup.", ask: .permission
             )
         }
     }
@@ -570,9 +579,9 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         if let lastError = status.actionableError {
             let rejected = lastError.contains("401") || lastError.localizedCaseInsensitiveContains("unauthorized")
             return CheckResult(source: rejected ? "Telegram > Bot token" : "telegram/state.json > lastError",
-                id: "live.telegram", title: "Telegram", status: rejected ? "warn" : "unmeasured",
+                id: "live.telegram", title: "Telegram", status: rejected ? "warn" : "fail",
                 detail: "Telegram's last recorded error is: \(safeDoctorDetail(lastError))",
-                harm: rejected ? "Telegram messages may not be read or answered." : nil,
+                harm: "Telegram messages may not be read or answered.",
                 human_action: rejected
                     ? "Telegram → Bot token → Bot token: enter the current token from @BotFather, then Save."
                     : nil,
@@ -601,66 +610,49 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
     }
 
     private func searchDoctorCoverageCheck(_ raw: String, probe: Bool) async -> CheckResult {
-        if raw.isEmpty, let detail = await port.doctorSearchSetupReading() {
-            return CheckResult(source: "Providers > ChatGPT", id: "live.search", title: "Search", status: "unmeasured", detail: detail)
+        let source = "research/config.json > searxng_base_url"
+        if raw.isEmpty {
+            return CheckResult(source: source, id: "live.search", title: "Search", status: "ok",
+                               detail: "SearXNG is not set up, so her web searches go through the browser (Chrome when its extension is connected, else her own browser).")
         }
-        let validCategoryURL = URL(string: raw).map {
+        let validURL = URL(string: raw).map {
             ["http", "https"].contains($0.scheme?.lowercased() ?? "")
                 && $0.host?.isEmpty == false && $0.query == nil && $0.fragment == nil
         } ?? false
+        guard validURL else {
+            return CheckResult(source: source, id: "live.search", title: "Search", status: "fail",
+                               detail: "The configured SearXNG URL is invalid, so her web searches fail.",
+                               harm: "She cannot search the web.",
+                               human_action: "Open Research → Search service, enter a complete HTTP(S) URL in SearXNG URL without a query or fragment, then click Save.")
+        }
         // Only a Doctor run probes (launch, auto run, Run/Repair); the health
         // pill reads this reading and spawns nothing.
         if probe {
-            async let healthy = validCategoryURL ? port.doctorProbeSearch(base: raw) : false
-            async let codex = port.doctorProbeCodexSearch()
-            let reading = (raw, await healthy, await codex, Date())
+            let reading = (raw, await port.doctorProbeSearch(base: raw), Date())
             liveSearchReading.withLock { $0 = reading }
         }
         guard let reading = liveSearchReading.withLock({ $0 }), reading.base == raw,
               Date().timeIntervalSince(reading.at) < 600 else {
-            return CheckResult(source: "research/config.json > searxng_base_url", id: "live.search", title: "Search", status: "unmeasured",
-                               detail: "Web search has no recent probe result. Run Doctor to check it.")
-        }
-        let codexLine = reading.codex
-            ? "Codex web search, which handles general searches, is signed in."
-            : "General search is unavailable: the bundled Codex executable or NativeAgent's ChatGPT sign-in needs attention. Check ChatGPT in Providers, then run Doctor."
-        if raw.isEmpty {
-            return CheckResult(source: "Providers > ChatGPT", id: "live.search", title: "Search", status: reading.codex ? "ok" : "warn",
-                               detail: codexLine + " Optional SearXNG category search is not configured.",
-                               harm: reading.codex ? nil : "She cannot search the web for current information.",
-                               human_action: reading.codex ? nil : "Providers → Sign in, reconnect or add an account → ChatGPT → Sign in with ChatGPT.",
-                               ask: reading.codex ? nil : .signIn)
-        }
-        if !validCategoryURL {
-            return CheckResult(source: "research/config.json > searxng_base_url", id: "live.search", title: "Search", status: "fail",
-                               detail: codexLine + " The configured SearXNG URL is invalid.",
-                               harm: "She cannot search the configured news, IT and science categories.",
-                               human_action: "Open Research → Search service, enter a complete HTTP(S) URL in SearXNG URL without a query or fragment, then click Save.")
+            return CheckResult(source: source, id: "live.search", title: "Search", status: "unmeasured",
+                               detail: "Web search has no recent probe result; run Diagnostics → Health checks to check it.")
         }
         if reading.healthy {
-            return CheckResult(source: reading.codex ? "research/config.json > searxng_base_url" : "Providers > ChatGPT", id: "live.search", title: "Search", status: reading.codex ? "ok" : "warn",
-                               detail: codexLine + " SearXNG answered the bounded search probe.",
-                               harm: reading.codex ? nil : "She cannot run general web searches.",
-                               human_action: reading.codex ? nil : "Providers → Sign in, reconnect or add an account → ChatGPT → Sign in with ChatGPT.",
-                               ask: reading.codex ? nil : .signIn)
+            return CheckResult(source: source, id: "live.search", title: "Search", status: "ok",
+                               detail: "SearXNG answered the bounded search probe.")
         }
         let absent = port.doctorSearchBackendAbsent(base: raw)
-        return CheckResult(source: reading.codex ? "research/config.json > searxng_base_url" : "Providers > ChatGPT",
-            id: "live.search", title: "Search", status: "warn",
-            detail: codexLine + " " + (absent
-                ? "No SearXNG backend: nothing answers at \(safeDoctorDetail(raw)) and Docker holds no SearXNG container for it, so category searches (news, it, science) are off."
-                : "SearXNG at \(safeDoctorDetail(raw)) did not answer the bounded search probe, so category searches (news, it, science) are down."),
-            harm: reading.codex ? "She cannot search the configured news, IT and science categories." : "She cannot search the web for current information.",
-            human_action: reading.codex ? nil : "Providers → Sign in, reconnect or add an account → ChatGPT → Sign in with ChatGPT.",
-            ask: reading.codex ? nil : .signIn
-        )
+        return CheckResult(source: source, id: "live.search", title: "Search", status: "warn",
+            detail: (absent
+                ? "No SearXNG backend: nothing answers at \(safeDoctorDetail(raw)) and Docker holds no SearXNG container for it, so "
+                : "SearXNG at \(safeDoctorDetail(raw)) did not answer the bounded search probe, so ") + "her web searches fail until it does.",
+            harm: "She cannot search the web.")
     }
 
     /// Saved admission states are facts; a quarantine is not damage to undo.
     private func toolsDoctorCoverageCheck(_ tools: [DoctorToolSnapshot]) -> CheckResult {
         let quarantined = tools.filter { $0.status.lowercased() == "quarantined" }
         let active = tools.filter { $0.status.lowercased() == "active" }.count
-        let scope = " Registry read only: Doctor invoked no tool, so this says nothing about whether one runs."
+        let scope = "; registry read only, with no tool invoked, so execution is unmeasured."
         // Taste pass 2026-07-24: this registry holds SELF-BUILT (promoted)
         // tools only — built-in chat tools never appear here, so an empty
         // registry is the normal state and "0 active, 0 total" read like the
@@ -668,18 +660,17 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         if tools.isEmpty {
             return CheckResult(source: "abilities/",
                 id: "live.tools", title: "Tool Registry", status: "ok",
-                detail: "Self-built tool registry is readable; no promoted tools yet."
-                    + " Built-in tools don't live here." + scope,
+                detail: "Self-built tool registry is readable with no promoted tools yet; built-in tools are outside this registry" + scope,
                 repair: nil
             )
         }
-        let census = "Self-built tool registry is readable (\(active) active, \(tools.count) total)."
+        let census = "Self-built tool registry is readable (\(active) active, \(tools.count) total)"
         if !quarantined.isEmpty {
             let named = quarantined.prefix(3).map(\.name).joined(separator: ", ")
             let more = quarantined.count > 3 ? ", …" : ""
             return CheckResult(source: "abilities/",
                 id: "live.tools", title: "Tool Registry", status: "ok",
-                detail: census + " \(quarantined.count) quarantined: \(named)\(more)." + scope
+                detail: census + "; \(quarantined.count) quarantined: \(named)\(more)" + scope
             )
         }
         return CheckResult(source: "abilities/",
@@ -698,15 +689,15 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         }
         guard autonomy.enabled == true else {
             return CheckResult(source: "Trust > Autonomy",
-                id: "live.autonomy", title: "Autonomy", status: "ok",
+                id: "live.autonomy", title: "Autonomy", status: "off",
                 detail: autonomy.disabledReason ?? "Autonomy is disabled by policy.", repair: nil
             )
         }
         let state = autonomy.status.lowercased()
         return CheckResult(source: "Trust > Autonomy",
             id: "live.autonomy", title: "Autonomy",
-            status: ["fail", "error", "degraded"].contains(state) ? "unmeasured" : "ok",
-            detail: "Autonomy is enabled in \(autonomy.mode ?? "supervised") mode; \(autonomy.runningImprovements ?? 0) improvements are active. Reported state: \(autonomy.status).",
+            status: ["fail", "error"].contains(state) ? "fail" : state == "degraded" ? "warn" : "ok",
+            detail: "Autonomy is enabled in \(autonomy.mode ?? "supervised") mode; \(autonomy.runningImprovements ?? 0) improvements are active; reported state: \(autonomy.status).",
             repair: nil
         )
     }

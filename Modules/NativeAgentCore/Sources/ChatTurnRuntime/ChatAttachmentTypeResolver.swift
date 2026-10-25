@@ -3,6 +3,8 @@ import AppKit
 import UniformTypeIdentifiers
 import NativeAgentShared
 
+// Blueprint: | `ChatAttachmentTypeResolver.swift` | `ChatAttachmentTypeResolver`: type/size admission, bounded off-main file reads and voice draft attachments |
+
 public typealias ChatAttachmentTypeResolver = NativeAgentShared.ChatAttachmentTypeResolver
 
 public extension ChatAttachmentTypeResolver {

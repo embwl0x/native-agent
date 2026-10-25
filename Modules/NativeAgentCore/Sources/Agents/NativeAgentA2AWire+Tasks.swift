@@ -1,5 +1,8 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
+import AgentWorkspace
+import ChatToolParsing
+import AgentLinkTransport
 import NativeAgentCore
 import PersistenceCore
 import AgentConversations
@@ -9,13 +12,15 @@ import CoreFoundation
 import ProviderRouting
 import CryptoKit
 import SQLite3
+// Blueprint: | `NativeAgentA2AWire+Tasks.swift` | Canonical contact task projection and record-owned accepted workers; failed settlement preserves streamed prose and offsets; transmitted reply acknowledgements route outbound evidence through AgentPeerStore.recordProof for MCP-host reply health; synchronous bridge admission closure precedes generation-ordered passive cleanup; approval/receipt observations, reply waiters/streams and push tails retire on stop, with canceled handles retained through exit; activation restores persisted owed callbacks, including terminal tasks outside live records; coalesced approval-refresh requests retain a pending pass so worker settlement and observation rearming cannot lose their wake; accepted workers and durable recovery finish independently of the listener, and explicit task cancellation remains separate; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
 
 public enum AgentContactTaskState: String, Codable, Sendable {
-    case submitted, working, inputRequired = "input-required", completed, failed, canceled
-    public var terminal: Bool { self == .completed || self == .failed || self == .canceled }
+    case submitted, working, inputRequired = "input-required", completed, failed, canceled, stopped
+    public var terminal: Bool { self == .completed || self == .failed || self == .canceled || self == .stopped }
 }
 
 public struct AgentContactTask: Codable, Sendable {
+    public var lifeID: String?
     public let id: String
     public let context: String
     public let owner: String
@@ -35,6 +40,10 @@ public struct AgentContactTask: Codable, Sendable {
     public var delegatedCompletionDigests: [String: String]?
     /// Its registered callbacks, by config id: durable before acceptance.
     public var callbacks: [String: AgentContactCallback]?
+
+    var owesCallbacks: Bool {
+        callbacks?.values.contains { $0.delivered != state.rawValue } == true
+    }
 
     var needsReplyRecovery: Bool {
         // Older receipts conflated file recovery with the canonical turn outcome.
@@ -99,11 +108,18 @@ public actor AgentContactTasks {
     private var records: [String: Record] = [:]
     private var order: [String] = []
     private var pushConfigs: [String: [String: AgentContactPushConfig]] = [:]
-    private var pushDeliveries: [String: Task<Void, Never>] = [:]
+    private var pushDeliveries: [String: (generation: UUID, worker: Task<Void, Never>)] = [:]
     private let capacity: Int
     private let inbox: SwiftNativeApprovalInbox
     private var approvalObservation: Task<Void, Never>?
     private var receiptObservation: AgentContactReceiptObservation?
+    private var approvalRefresh: Task<Void, Never>?
+    private var approvalRefreshPending = false
+    private var lifecycle = UUID()
+    private var bridgeRevision: UInt64 = 0
+    private var accepting = true
+    private nonisolated let bridgeAdmission = AgentContactBridgeAdmission()
+    private var bridgeIsActive: Bool { accepting && bridgeAdmission.isActive }
     private var terminalPayloadWrites = 32
     /// Set once the launch recovery has read every conversation's saved input.
     private var launchRecovered = false
@@ -121,30 +137,115 @@ public actor AgentContactTasks {
         self.inbox = SwiftNativeApprovalInbox(root: dataRoot)
     }
 
-    deinit { approvalObservation?.cancel() }
+    deinit {
+        approvalObservation?.cancel()
+        approvalRefresh?.cancel()
+        receiptObservation?.cancel()
+        for delivery in pushDeliveries.values { delivery.worker.cancel() }
+    }
 
-    private func observeApprovals() async {
-        guard approvalObservation == nil else { return }
-        let events = await ApprovalLifecycleBus.shared.events()
-        guard approvalObservation == nil else { return }
-        receiptObservation = AgentContactReceiptObservation { [weak self] in
-            Task { await self?.refreshApprovals() }
-        }
-        approvalObservation = Task { [weak self] in
-            for await event in events where event.phase == .resolved {
-                guard !Task.isCancelled else { return }
-                await self?.refreshApprovals()
+    /// Listener transitions are ordered even when their actor hops arrive out
+    /// of order. Stop retires passive resources; accepted turns keep their
+    /// record-owned worker and settle normally. Explicit cancel is separate.
+    public nonisolated func setBridgeAdmission(_ active: Bool, revision: UInt64) {
+        bridgeAdmission.set(active, revision: revision)
+    }
+
+    public func setBridgeActive(_ active: Bool, revision: UInt64) {
+        guard revision > bridgeRevision else { return }
+        bridgeRevision = revision
+        accepting = active
+        lifecycle = UUID()
+        approvalRefreshPending = false
+        approvalObservation?.cancel()
+        approvalRefresh?.cancel()
+        receiptObservation?.cancel(); receiptObservation = nil
+        for delivery in pushDeliveries.values { delivery.worker.cancel() }
+        pushConfigs.removeAll()
+        if active {
+            scheduleApprovalRefresh()
+            for record in records.values { restoreCallbacks(record.task) }
+            if let saved = try? retainedTasksAwaitingRecovery() {
+                for task in saved where task.owesCallbacks && records[task.id] == nil {
+                    restoreCallbacks(task)
+                }
+            }
+        } else {
+            for id in Array(records.keys) {
+                records[id]?.subscribers.values.forEach { $0.finish() }
+                records[id]?.waiters.values.forEach { $0.resume(throwing: CancellationError()) }
+                records[id]?.subscribers.removeAll()
+                records[id]?.waiters.removeAll()
             }
         }
     }
 
-    private func refreshApprovals() async {
+    private func scheduleApprovalRefresh() {
+        guard bridgeIsActive,
+              records.values.contains(where: { !$0.task.state.terminal }) else { return }
+        if approvalRefresh != nil {
+            approvalRefreshPending = true
+            return
+        }
+        approvalRefreshPending = false
+        let generation = lifecycle
+        approvalRefresh = Task {
+            defer {
+                approvalRefresh = nil
+                // An inbox read can suspend after a running worker was skipped.
+                // Keep its settlement wake, as well as a retiring observer's wake.
+                if bridgeIsActive, approvalRefreshPending || lifecycle != generation || approvalObservation == nil {
+                    scheduleApprovalRefresh()
+                }
+            }
+            await observeApprovals()
+            guard lifecycle == generation, !Task.isCancelled else { return }
+            await refreshApprovals()
+        }
+    }
+
+    private func observeApprovals() async {
+        guard bridgeIsActive, approvalObservation == nil else { return }
+        let generation = lifecycle
+        let receipts = AgentContactReceiptObservation()
+        receiptObservation = receipts
+        approvalObservation = Task { [weak self] in
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { [weak self] in
+                    let events = await ApprovalLifecycleBus.shared.events()
+                    guard !Task.isCancelled else { return }
+                    await self?.refreshApprovals(generation: generation)
+                    for await event in events where event.phase == .resolved {
+                        guard !Task.isCancelled else { return }
+                        await self?.refreshApprovals(generation: generation)
+                    }
+                }
+                group.addTask { [weak self] in
+                    for await _ in receipts.events {
+                        guard !Task.isCancelled else { return }
+                        await self?.refreshApprovals(generation: generation)
+                    }
+                }
+            }
+            await self?.approvalObservationFinished()
+        }
+    }
+
+    private func approvalObservationFinished() {
+        approvalObservation = nil
+        if bridgeIsActive { scheduleApprovalRefresh() }
+    }
+
+    private func refreshApprovals(generation: UUID? = nil) async {
+        let generation = generation ?? lifecycle
+        guard bridgeIsActive, lifecycle == generation, !Task.isCancelled else { return }
         for id in Array(records.keys) {
             guard let record = records[id], !record.task.state.terminal,
                   record.worker == nil, !record.approvals.isEmpty else { continue }
             var approvals: [ApprovalRecord] = []
             for approvalID in record.approvals {
                 guard let approval = try? await inbox.get(approvalID) else { break }
+                guard bridgeIsActive, lifecycle == generation, !Task.isCancelled else { return }
                 approvals.append(approval)
             }
             guard approvals.count == record.approvals.count,
@@ -172,6 +273,8 @@ public actor AgentContactTasks {
         if let value = send.pushConfig { pushConfig = try await AgentContactPushConfig.parse(value, taskID: send.taskID) }
         else { pushConfig = nil }
         await observeApprovals()
+        try Task.checkCancellation()
+        guard bridgeIsActive else { throw CancellationError() }
         let key = AgentPeerReplayClaimStore.key(principal: principal.id, protocolName: protocolName, messageID: send.clientMessageID)
         let claimed = try claims.claim(key: key, digest: digest)
         switch claimed {
@@ -182,6 +285,7 @@ public actor AgentContactTasks {
             return try get(id, owner: principal.id)
         case .conflict: throw AgentContactFailure(code: -32602, message: "That message ID was already used for different content")
         case .inFlight: throw AgentContactFailure(code: -32004, message: "That message is already being accepted")
+        case .stopped: throw AgentContactFailure(code: -32004, message: "That message is stopped (restored). Start a new task in the conversation.")
         case .claimed: break
         }
         let task: AgentContactTask
@@ -200,6 +304,7 @@ public actor AgentContactTasks {
                 }
                 var created = AgentContactTask(id: send.taskID, context: send.context, owner: principal.id,
                                                acceptedOutputModes: send.acceptedOutputModes)
+                created.lifeID = try DataRootLife.current(in: dataRoot)
                 if let pushConfig {
                     try pushConfig.keep()
                     created.callbacks = [pushConfig.id: pushConfig.callback]
@@ -289,6 +394,7 @@ public actor AgentContactTasks {
     /// A repeated transport request reads the original receipt, never reruns it.
     public func beginTool(context: String, request: String, principal: AgentBridgePrincipal,
                           digest: String) throws -> (task: AgentContactTask, execute: Bool) {
+        guard bridgeIsActive else { throw CancellationError() }
         let id = "na3.\(context).\(request)"
         guard NativeAgentA2AWire.locator(id) != nil else { throw AgentContactFailure.missing }
         let key = AgentPeerReplayClaimStore.key(principal: principal.id, protocolName: "tool", messageID: id)
@@ -313,6 +419,7 @@ public actor AgentContactTasks {
                 pushConfigs.removeValue(forKey: oldest)
             }
             var task = AgentContactTask(id: id, context: context, owner: principal.id)
+            task.lifeID = try DataRootLife.current(in: dataRoot)
             task.state = .working
             task.canonicalSession = principal.storedConversation(context)
             try retain(task)
@@ -405,6 +512,10 @@ public actor AgentContactTasks {
               let data = try handle.read(upToCount: limit + 1), data.count <= limit,
               var task = try? JSONDecoder().decode(AgentContactTask.self, from: data),
               task.id == id, task.owner == owner else { throw AgentContactFailure.missing }
+        if try !DataRootLife.isCurrent(task.lifeID, in: dataRoot), task.needsReplyRecovery {
+            task.state = .stopped
+            task.detail = DataRootLife.stoppedReason
+        }
         if task.needsReplyRecovery {
             // Settlement can retire the checkpoint, so read it before the reply.
             var checkpointed = false
@@ -451,7 +562,7 @@ public actor AgentContactTasks {
                 records[id] = Record(task: task, approvals: task.approvalIDs ?? [],
                                      acceptedOutputModes: task.acceptedOutputModes ?? ["*/*"])
                 order.append(id)
-                Task { await self.observeApprovals(); await self.refreshApprovals() }
+                scheduleApprovalRefresh()
                 // Its place in the conversation is held by the restored backlog
                 // (TurnAdmission.restore), so it runs in the order it was said.
                 if let queued {
@@ -469,6 +580,7 @@ public actor AgentContactTasks {
         for (artifactID, part) in task.delegatedCompletions ?? [:] {
             guard case .text(let text) = part else { continue }
             var completion = AgentContactTask(id: "na3.\(task.context).\(artifactID)", context: task.context, owner: task.owner)
+            completion.lifeID = task.lifeID
             var existing = stat()
             guard Darwin.lstat(retainedURL(id: completion.id, owner: completion.owner).path, &existing) != 0 else { continue }
             guard errno == ENOENT else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
@@ -484,6 +596,7 @@ public actor AgentContactTasks {
 
     /// Called only after a reply-reading door successfully transmitted the reply.
     public func recordReplyFetch(_ task: AgentContactTask) {
+        AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: task.owner, outbound: true)
         guard task.state == .completed, let session = task.canonicalSession, let run = task.canonicalRunID else { return }
         ContactReplyReads.record(dataRoot: dataRoot, session: session, request: task.id, run: run)
     }
@@ -506,8 +619,9 @@ public actor AgentContactTasks {
             accepted: EnqueuedUserMessage(sessionId: session, runId: input.runId))
     }
 
-    public func recordReplyFetch(session: String, request: String, run: String) {
+    public func recordReplyFetch(session: String, request: String, run: String, owner: String) {
         ContactReplyReads.record(dataRoot: dataRoot, session: session, request: request, run: run)
+        AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: owner, outbound: true)
     }
 
     private func bindRun(_ id: String, session: String, run: String) throws {
@@ -537,6 +651,7 @@ public actor AgentContactTasks {
         }
         var replies: [AgentContactOutcome] = []
         var approvals = task.approvalIDs ?? []
+        var waitingOnPerson = false
         for line in data.split(separator: 10) {
             guard let row = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
             guard row["sessionId"] as? String == session, row["runId"] as? String == run,
@@ -544,6 +659,7 @@ public actor AgentContactTasks {
             if row["role"] as? String == "tool", let approval = metadata["approvalId"] as? String {
                 approvals.insert(approval)
             }
+            if row["role"] as? String == "tool", metadata["resultStatus"] as? String == "needs_input" { waitingOnPerson = true }
             guard row["role"] as? String == "assistant",
                   let outcome = metadata["outcomeObservation"] as? [String: Any],
                   let content = row["content"] as? String else { continue }
@@ -553,9 +669,15 @@ public actor AgentContactTasks {
             } else if persistence == "failed" {
                 replies.append(.init(state: .failed, parts: [.text(content)]))
             } else if persistence == "persisted", metadata["partial"] as? Bool != true {
-                let state: AgentContactTaskState = metadata["completionState"] as? String == "completed" ? .completed : .failed
+                // A turn that stopped at a card waits on the person; it did not fail.
+                let state: AgentContactTaskState = metadata["completionState"] as? String == "completed" ? .completed
+                    : waitingOnPerson ? .inputRequired : .failed
                 var parts: [AgentContactPart] = content.isEmpty ? [] : [.text(content)]
-                var detail = state == .failed ? "The saved reply does not confirm that the work finished" : nil
+                var detail: String? = switch state {
+                case .failed: "The saved reply does not confirm that the work finished"
+                case .inputRequired: "Waiting on the person: a card is up in NativeAgent. Send the next message once they answer."
+                default: nil
+                }
                 do {
                     for key in ["attachments", "outputFiles"] {
                         guard let raw = metadata[key] else { continue }
@@ -606,7 +728,8 @@ public actor AgentContactTasks {
     }
 
     private func retain(_ task: AgentContactTask) throws {
-        if task.state.terminal, task.replyPayloadExpired == true || !task.hasReplyPayload {
+        // Launch recovery scans these files; keep an owed callback discoverable.
+        if task.state.terminal, !task.owesCallbacks, task.replyPayloadExpired == true || !task.hasReplyPayload {
             var receipt = task
             receipt.replyPayloadExpired = true
             try archiveTasks([receipt])
@@ -640,7 +763,7 @@ public actor AgentContactTasks {
                   info.st_size <= AgentContactPart.maximumOutputBytes * 2,
                   let task = try? JSONDecoder().decode(AgentContactTask.self, from: Data(contentsOf: url)),
                   retainedURL(id: task.id, owner: task.owner) == url,
-                  task.state.terminal else { continue }
+                  task.state.terminal, !task.owesCallbacks else { continue }
             if task.replyPayloadExpired == true {
                 expired.append((url, task))
                 continue
@@ -783,6 +906,7 @@ public actor AgentContactTasks {
     }
 
     public func subscribe(_ id: String, owner: String) throws -> AsyncStream<AgentContactEvent> {
+        guard bridgeIsActive else { throw CancellationError() }
         let task = try get(id, owner: owner)
         let subscriberID = UUID()
         let pair = AsyncStream<AgentContactEvent>.makeStream(bufferingPolicy: .bufferingOldest(128))
@@ -903,13 +1027,14 @@ public actor AgentContactTasks {
             return try config.value
         case "DeleteTaskPushNotificationConfig":
             guard let id = params["id"] as? String, !id.isEmpty else { throw AgentContactPushConfig.invalid }
-            if let config = pushConfigs[taskID]?.removeValue(forKey: id) { try? AgentPeerCredentials.deleteSecret(account: config.account) }
+            // Keep the live config through the retained read so it cannot be restored by deletion.
             try updateCallbacks(taskID, owner: owner) { $0[id] = nil }
+            if let config = pushConfigs[taskID]?.removeValue(forKey: id) { try? AgentPeerCredentials.deleteSecret(account: config.account) }
             let key = taskID + ":" + id
             if let delivery = pushDeliveries.removeValue(forKey: key) {
-                delivery.cancel()
+                delivery.worker.cancel()
                 // Join an already-started bounded POST before acknowledging deletion.
-                await delivery.value
+                await delivery.worker.value
             }
             return .object([:])
         case "ListTaskPushNotificationConfigs":
@@ -935,6 +1060,7 @@ public actor AgentContactTasks {
     }
 
     private func notifyPush(_ task: AgentContactTask, only owed: Set<String>? = nil) {
+        guard bridgeIsActive, (try? DataRootLife.isCurrent(task.lifeID, in: dataRoot)) == true else { return }
         guard let configs = pushConfigs[task.id]?.filter({ owed?.contains($0.key) ?? true }), !configs.isEmpty else { return }
         // A status event contains only the protocol locator and state. Peers fetch
         // artifacts through their authenticated task API instead of webhook copies.
@@ -945,13 +1071,22 @@ public actor AgentContactTasks {
         for config in configs.values {
             let key = task.id + ":" + config.id
             let previous = pushDeliveries[key]
-            pushDeliveries[key] = Task {
-                await previous?.value
-                guard !Task.isCancelled, self.pushConfigs[task.id]?[config.id]?.generation == config.generation else { return }
+            let generation = UUID()
+            pushDeliveries[key] = (generation, Task {
+                defer {
+                    if self.pushDeliveries[key]?.generation == generation {
+                        self.pushDeliveries.removeValue(forKey: key)
+                    }
+                }
+                await withTaskCancellationHandler {
+                    await previous?.worker.value
+                } onCancel: { previous?.worker.cancel() }
+                guard self.bridgeIsActive, !Task.isCancelled, self.pushConfigs[task.id]?[config.id]?.generation == config.generation else { return }
                 let accepted = await config.deliver(payload)
+                // Deletion or replacement while the POST was pending owns the outcome now.
+                guard self.bridgeIsActive, !Task.isCancelled, self.pushConfigs[task.id]?[config.id]?.generation == config.generation else { return }
                 self.recordCallback(task, config: config, accepted: accepted)
-                if task.state.terminal { self.pushDeliveries.removeValue(forKey: key) }
-            }
+            })
         }
     }
 
@@ -959,14 +1094,20 @@ public actor AgentContactTasks {
     /// owed failure with its cause that a relaunch delivers again. Once a
     /// terminal update is accepted the callback's secret is no longer needed.
     private func recordCallback(_ sent: AgentContactTask, config: AgentContactPushConfig, accepted: Bool) {
-        var task = records[sent.id]?.task ?? sent
-        guard var callback = task.callbacks?[config.id] else { return }
-        if accepted { callback.delivered = sent.state.rawValue }
-        callback.failure = accepted ? nil : "The callback did not accept the \(sent.state.rawValue) update after three attempts."
-        task.callbacks?[config.id] = callback
-        do { try retain(task); records[sent.id]?.task = task }
+        do {
+            // Eviction does not make the sent snapshot current again. Patch the
+            // retained task under this actor, preserving its reply and outcome.
+            // The live record first; a reread (which can recover and push again) only once evicted.
+            var task = try records[sent.id]?.task ?? get(sent.id, owner: sent.owner)
+            guard var callback = task.callbacks?[config.id], callback.account == config.account else { return }
+            if accepted { callback.delivered = sent.state.rawValue }
+            callback.failure = accepted ? nil : "The callback did not accept the \(sent.state.rawValue) update after three attempts."
+            task.callbacks?[config.id] = callback
+            try retain(task)
+            records[sent.id]?.task = task
+            if accepted, sent.state.terminal { try? AgentPeerCredentials.deleteSecret(account: config.account) }
+        }
         catch { nativeLog("[a2a] callback outcome could not be saved for %@: %@", sent.id, error.localizedDescription) }
-        if accepted, sent.state.terminal { try? AgentPeerCredentials.deleteSecret(account: config.account) }
     }
 
     private func updateCallbacks(_ taskID: String, owner: String, _ change: (inout [String: AgentContactCallback]) -> Void) throws {
@@ -982,12 +1123,26 @@ public actor AgentContactTasks {
     /// accepted update is not the task's state is owed it again.
     private func restoreCallbacks(_ task: AgentContactTask) {
         var owed: Set<String> = []
+        guard bridgeIsActive, (try? DataRootLife.isCurrent(task.lifeID, in: dataRoot)) == true else { return }
         for (id, callback) in task.callbacks ?? [:] where pushConfigs[task.id]?[id] == nil {
             guard let config = try? AgentContactPushConfig.restored(callback, id: id, taskId: task.id) else { continue }
             pushConfigs[task.id, default: [:]][id] = config
             if callback.delivered != task.state.rawValue { owed.insert(id) }
         }
         if !owed.isEmpty { notifyPush(task, only: owed) }
+    }
+
+    /// Owed terminal callbacks remain here even when no live record holds them.
+    /// Activation and launch recovery read the same persisted task set.
+    private func retainedTasksAwaitingRecovery() throws -> [AgentContactTask] {
+        let directory = dataRoot.appendingPathComponent("agents/a2a-replies")
+        let urls = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        return try urls.filter { $0.pathExtension == "json" }.compactMap { url -> AgentContactTask? in
+            guard let task = try? JSONDecoder().decode(AgentContactTask.self, from: Data(contentsOf: url)),
+                  try DataRootLife.isCurrent(task.lifeID, in: dataRoot),
+                  !task.state.terminal || task.owesCallbacks else { return nil }
+            return task
+        }
     }
 
     /// At launch: every retained task whose callback is still owed an update
@@ -997,16 +1152,10 @@ public actor AgentContactTasks {
     /// said there, before anything new is admitted; a queued one runs from its
     /// saved input. One strict read of each conversation supplies both.
     public func redeliverOwedCallbacks() async {
-        let directory = dataRoot.appendingPathComponent("agents/a2a-replies")
-        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
+        guard let open = try? retainedTasksAwaitingRecovery() else {
             launchRecovered = true
             await TurnAdmission.shared.restorationComplete()
             return
-        }
-        let open = urls.filter { $0.pathExtension == "json" }.compactMap { url -> AgentContactTask? in
-            guard let task = try? JSONDecoder().decode(AgentContactTask.self, from: Data(contentsOf: url)),
-                  !task.state.terminal || task.callbacks?.values.contains(where: { $0.delivered != task.state.rawValue }) == true else { return nil }
-            return task
         }
         var backlog: [AgentContactTask] = []
         for (session, tasks) in Dictionary(grouping: open.filter { !$0.state.terminal && $0.canonicalRunID != nil }, by: { $0.canonicalSession ?? "" })
@@ -1044,6 +1193,8 @@ public actor AgentContactTasks {
     private func unsubscribe(_ task: String, _ subscriber: UUID) { records[task]?.subscribers.removeValue(forKey: subscriber) }
 
     func settled(_ id: String, owner: String) async throws -> AgentContactTask {
+        try Task.checkCancellation()
+        guard bridgeIsActive else { throw CancellationError() }
         let task = try get(id, owner: owner)
         if records[id]?.worker == nil { return task }
         let waiter = UUID()
@@ -1122,13 +1273,15 @@ public actor AgentContactTasks {
     private func finish(_ id: String, outcome: AgentContactOutcome) {
         guard var record = records[id], record.task.needsReplyRecovery else { return }
         var parts = outcome.parts.compactMap { $0.accepted(in: record.acceptedOutputModes) }
-        if outcome.state == .failed, parts.isEmpty, !record.cancelling {
-            if let recovered = try? canonicalReply(record.task) {
+        if outcome.state == .failed, !record.cancelling {
+            if parts.isEmpty, let recovered = try? canonicalReply(record.task) {
                 parts = recovered.outcome.parts.compactMap { $0.accepted(in: record.acceptedOutputModes) }
             }
-            if parts.isEmpty, !record.task.text.isEmpty,
+            // A failed turn keeps the prose already read by its peer at the same offsets.
+            if !record.task.text.isEmpty,
                let draft = AgentContactPart.text(record.task.text).accepted(in: record.acceptedOutputModes) {
-                parts = [draft]
+                parts.removeAll { if case .text = $0 { return true }; return false }
+                parts.insert(draft, at: 0)
             }
         }
         record.task.state = record.cancelling ? .canceled : outcome.state
@@ -1168,7 +1321,7 @@ public actor AgentContactTasks {
         subscribers.forEach { $0.finish() }
         waiters.forEach { $0.resume(returning: record.task) }
         if record.task.state == .inputRequired {
-            Task { await self.refreshApprovals() }
+            scheduleApprovalRefresh()
         }
     }
 
@@ -1184,13 +1337,33 @@ public actor AgentContactTasks {
     }
 }
 
+private final class AgentContactBridgeAdmission: @unchecked Sendable {
+    private let lock = NSLock()
+    private var revision: UInt64 = 0
+    private var active = true
+    var isActive: Bool { lock.withLock { active } }
+    func set(_ active: Bool, revision: UInt64) {
+        lock.withLock {
+            guard revision > self.revision else { return }
+            self.revision = revision
+            self.active = active
+        }
+    }
+}
+
 /// Canonical replay writes its receipt before emitting chatTurnCompleted.
 private final class AgentContactReceiptObservation: @unchecked Sendable {
     private let token: NSObjectProtocol
-    init(onReceipt: @escaping @Sendable () -> Void) {
-        token = NotificationCenter.default.addObserver(forName: .chatTurnCompleted, object: nil, queue: nil) { _ in onReceipt() }
+    let events: AsyncStream<Void>
+    private let feed: AsyncStream<Void>.Continuation
+    init() {
+        let pair = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
+        events = pair.stream
+        feed = pair.continuation
+        token = NotificationCenter.default.addObserver(forName: .chatTurnCompleted, object: nil, queue: nil) { _ in pair.continuation.yield(()) }
     }
-    deinit { NotificationCenter.default.removeObserver(token) }
+    func cancel() { NotificationCenter.default.removeObserver(token); feed.finish() }
+    deinit { cancel() }
 }
 
 extension NativeAgentA2AWire {

@@ -3,8 +3,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
-import MCPDispatcher
-import KnowledgeGraph
 import PersonaEngine
 import ProviderRouting
 import ToolRegistry
@@ -14,6 +12,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
+// Blueprint: | `SwiftToolDispatcher+ToolManifest.swift` | `SwiftToolDispatcher`: `toolManifest` |
 
 // MARK: - The Tools page's manifest
 
@@ -26,9 +25,8 @@ extension SwiftToolDispatcher {
     public func toolManifest(detail: String? = nil, surface: String = "chat") async throws -> JSONValue {
         let fullDetail = detail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "full"
         let access = await fullMacToolAccess(surface: surface)
-        if fullDetail { MCPToolCatalogWarmer.shared.kickDetached(dataRoot: dataRoot) }
         let catalog = await catalogSnapshot(includeSchemas: false)
-        let names = catalog.names.filter { !catalog.hiddenMCPNames.contains($0) && !Self.isModelHidden($0) }.sorted()
+        let names = catalog.names.filter { !Self.isModelHidden($0) }.sorted()
         let trustedRoots = await trustedWorkspaceRoots()
         let modelNameSet = Self.modelVisibleCatalogToolNames(Set(names))
         let schemas = fullDetail ? try await listAvailableToolSchemas(named: modelNameSet).sorted { $0.name < $1.name } : []
@@ -43,16 +41,12 @@ extension SwiftToolDispatcher {
                     ? "nativeagent_app_tool_dispatcher" : "swift_tool_dispatcher"),
                 "load_state": .string(loadedSet.contains(schema.name) ? "loaded" : "hidden"),
             ]
-            if Self.skillReaderToolNames.contains(schema.name) {
-                row["tags"] = .array([.string("skill_reader")])
-            }
             // A registry-owned bucket makes the rendered catalog reflect the
             // dispatch table rather than a second UI-only name list. An
             // unreviewed runtime name is never fabricated as a safe category;
             // the mounted Tools UI renders that adverse condition explicitly.
             row["catalog_bucket"] = .string(
-                (schema.name.hasPrefix("mcp__") ? ChatToolCatalogBucket.mcp
-                    : Self.catalogBucket(forRegisteredToolNamed: schema.name) ?? contributedBuckets[schema.name])?.rawValue
+                (Self.catalogBucket(forRegisteredToolNamed: schema.name) ?? contributedBuckets[schema.name])?.rawValue
                     ?? ChatToolCatalogBucket.unclassified.rawValue
             )
             if let parameters = try? JSONValue.parse(schema.parametersJSON) {

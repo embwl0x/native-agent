@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ProviderRecoveryPolicy.swift` | Shared failure classification and helper-start backoff; surfaces never replay a provider call (delivery redials live in ProviderStreamGuard's `ProviderWire`) |
 
 /// Shared provider failure classification and helper-start backoff.
 public enum ProviderRecoveryPolicy {

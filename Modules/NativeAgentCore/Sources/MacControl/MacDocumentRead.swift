@@ -60,6 +60,8 @@ import PersistenceCore
 import PDFKit
 #endif
 
+// Blueprint: | `MacDocumentRead.swift` | `MacDocumentRead`: bounded document extraction and scrolling accumulation; admitted file access, deadlines and redacted read frames |
+
 /// User, 2026-09-06: THE TURN'S FILE-ACCESS MODE, carried to the one organ that
 /// can name a file the caller never did.
 ///

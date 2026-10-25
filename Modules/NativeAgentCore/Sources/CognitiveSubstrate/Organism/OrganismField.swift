@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `OrganismField.swift` | `OrganismField` struct; `summary`, `edge` |
 
 public enum OrganismNodeKind: String, Codable, Sendable, Equatable, CaseIterable {
     case organ
@@ -428,7 +429,7 @@ public enum OrganismPlasticity {
             }
             if normalized == "normal" || normalized == "low" { return .nominal }
             if normalized == "medium" { return .elevated }
-            if normalized == "thermal" || normalized == "low_power" || normalized == "low-power" {
+            if normalized == "thermal" {
                 return .critical
             }
         }

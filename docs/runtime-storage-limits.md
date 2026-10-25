@@ -1,16 +1,16 @@
 # Runtime diagnostic storage limits
 
-`FeedPolicy/FeedPolicy.swift` defines shared feed limits;
+`PersistenceCore/FeedPolicy.swift` defines shared feed limits;
 `PersistenceCore/JSONLRetention.swift` enforces them under the append lock.
 
 | Feed | Row rotation | Byte rotation |
 |---|---|---|
 | `traces/events.jsonl` | 5,000 → 4,000 | 8 MiB → 4 MiB |
 | `activity/events.jsonl` | 5,000 → 4,000, preserving rare event kinds | No hard byte cap in this policy |
-| `telegram/receipts.jsonl`, `memory/moment_receipts.jsonl` | 5,000 → 4,000 | No hard byte cap in this policy |
+| `telegram/receipts.jsonl` | 5,000 → 4,000 | No hard byte cap in this policy |
 | `turn_traces/<day>.jsonl` | 20,000 retained; checked on first append and every 4,096 appends | 12 MiB → 8 MiB |
 
-Trace/activity and Telegram/moment receipt row checks run on the first append and then every 128 appends,
+Trace/activity and Telegram receipt row checks run on the first append and then every 128 appends,
 so their row triggers can overshoot by 127. The shared trace byte ceiling is
 checked on every append. An oversized incoming diagnostic row is refused;
 inherited unreadable diagnostic bytes are preserved and appends that would
@@ -19,7 +19,7 @@ cross the ceiling are refused.
 `TurnTraceRetention.swift` removes date-named turn ledgers older than its
 14-day window. Each persisted turn-trace row is bounded to 12 KiB by
 `TurnTrace.swift`, except `llm.call` rows, which keep the 8 MiB allowance
-`FeedPolicy` grants a model exchange.
+`PersistenceCore` grants a model exchange.
 
 `Browser/BrowserCaptureCache.swift` owns temporary page text, links and
 screenshots. Captures share 128 MiB, 256 groups and seven days, enforced on
@@ -35,5 +35,20 @@ These are replaceable diagnostics, separate from authored images.
 The daily `DataRootDiskHygieneCheck` reports oversized state; it does not
 automatically delete it or enforce a global quota. Chat recovery backups have
 their own five-per-session policy; see [Data bounds](data-bounds.md).
+
+## Recovery and cutoff artifacts
+
+| Path | Owner and content | Retention |
+|---|---|---|
+| `turn_traces/<day>.jsonl.doctor-preserved-<UUID>.bak` | `TurnTracePersistLane.salvageValidRows`: original bytes before an explicit Doctor repair | No automatic expiry; date-named ledger retention does not select these copies |
+| `diagnostics/cutoffs/<turn-or-time>[-UUID].txt` | `RunawayOutputDetector.writeDiagnostic`: reason, character count and raw output; returns and logs its path | Existing writer keeps the newest 100 text files on write |
+
+Neither path is selected for local backup, production export or a raw phone
+snapshot; PrivacyMap inventories their parent folders. They are recovery and
+diagnostic review candidates, not proven orphans merely because no dedicated
+in-app content reader exists. The sweep lists existing candidates for User
+without deleting, moving or rewriting them, and adds no launch cleanup or
+migration. `traces/events.jsonl` and `user_prefs.json` retain live readers and
+are not orphan stores.
 
 Source paths above are under `Modules/NativeAgentCore/Sources/`.

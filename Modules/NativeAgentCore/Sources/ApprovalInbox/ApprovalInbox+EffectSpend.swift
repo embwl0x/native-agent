@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `ApprovalInbox+EffectSpend.swift` | `SwiftNativeApprovalInbox` effect spends: durable consumption immediately before execution; a spend is not an outcome or permission to replay |
+
 /// Result of durably consuming a generic approval immediately before its
 /// effect boundary. A spend is intentionally not an outcome: it records that
 /// execution may have started, so a restart must not blindly repeat it.
@@ -12,6 +14,8 @@ public enum ApprovalEffectSpendOutcome: String, Sendable, Equatable {
 }
 
 extension SwiftNativeApprovalInbox {
+    // This versioned spend object is included in local backup and export,
+    // excluded from phone sync, and listed under PrivacyMap's Approvals.
     public static let effectSpendSchema = "approval-effect-spend.v1"
     static let effectSpendCap = 2000
 

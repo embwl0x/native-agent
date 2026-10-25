@@ -37,13 +37,14 @@ and [CHANGELOG.md](../CHANGELOG.md).
 | [Project Direction](PROJECT_DIRECTION.md) | Durable product and safety rules |
 | [App tool contract](TOOL_LOADING.md) | One always-on `app`: home, pages, items, actions, scripts and discovery |
 | [Turn resilience](TURN_RESILIENCE.md) | Why a turn dies, what keeps it alive |
+| [Stop](STOP.md) | The Stop law: Stop cancels the work, never its settlement |
 | [Memory system map](MEMORY_SYSTEM_MAP.md), [What a good memory is](memory-quality.md) | Every memory piece and its standard |
 | [Canonical data paths](canonical_data_paths.md), [Runtime storage limits](runtime-storage-limits.md) | Where state lives and how it is bounded |
 | [Automated systems](AUTOMATED_SYSTEMS.md) | Background loops and their health probes |
 | [Subconscious](SUBCONSCIOUS.md), [Cognition wiring](COGNITION_WIRING.md), [Organism](ORGANISM.md) | The inner-life layers, as built |
 | [Continuous cognitive substrate](CONTINUOUS_COGNITIVE_SUBSTRATE.md), [its traceability ledger](COGNITIVE_SUBSTRATE_TRACEABILITY.md) | The substrate design and per-item status |
 | [Jev (retired)](JEV.md) | Retirement and legacy-data guidance |
-| [Codex bridge](CODEX_BRIDGE_DIAGNOSTICS.md), [Image generation](IMAGE_GENERATION.md), [GitHub project tracking](GITHUB_PROJECT_TRACKING.md) | Specific integrations |
+| [Codex bridge](CODEX_BRIDGE_DIAGNOSTICS.md), [Image generation](IMAGE_GENERATION.md) | Specific integrations |
 | [Skill manifest spec](skill_manifest_spec.md), [example manifests](example_manifests/), [Approval schema](approval-schema.md) | Formats |
 
 ## Building and releasing
@@ -59,8 +60,8 @@ and [CHANGELOG.md](../CHANGELOG.md).
 
 Do not move or rename these without updating their readers:
 
-- `data-bounds.md` and `release-notes/*.md` — copied into the app bundle by
-  `script/install_app.sh`, read by Settings and the update note.
+- `data-bounds.md` and `release-notes/*.md` — bundled by `project.yml` resource
+  declarations and its release-build stamp phase; read by Settings and the update note.
 - `eval_acknowledgments.json` — read at runtime by the heartbeat.
 - `licenses/A2A-gRPC-NOTICES.txt` — a Mac app resource in `project.yml`.
 - `ARCHITECTURE_BLUEPRINT.md`, `COGNITIVE_SUBSTRATE_TRACEABILITY.md` and the

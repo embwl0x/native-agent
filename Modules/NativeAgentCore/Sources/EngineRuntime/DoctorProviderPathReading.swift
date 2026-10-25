@@ -1,7 +1,8 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnContracts
 import DoctorChecks
 import ProviderRouting
+// Blueprint: | `DoctorProviderPathReading.swift` | `DoctorProviderPathReading` enum; checked active-provider route and injected platform probe |
 
 public enum DoctorProviderPathReading {
     public static func read(dataRoot: URL) async -> DoctorProviderRuntimeReading {
@@ -11,7 +12,7 @@ public enum DoctorProviderPathReading {
             routing = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedRoutingSnapshotReadOnly()
         } catch {
             // A pending selection or unreadable routing state is itself the fault.
-            return .unhealthy("Provider routing can't be read (\(error.localizedDescription)). Open Settings → Providers and choose the active model again.")
+            return .unhealthy("Provider routing can't be read (\(error.localizedDescription)); the saved provider selection is unavailable.")
         }
         guard let providers = try? await ProvidersFacade(dataRoot: dataRoot).list() else {
             return .unavailable

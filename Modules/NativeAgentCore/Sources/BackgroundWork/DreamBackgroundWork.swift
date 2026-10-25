@@ -10,6 +10,7 @@ import Cognition
 import TrustCenter
 import NotificationInbox
 import AgentWorkspace
+// Blueprint: | `DreamBackgroundWork.swift` | `DreamBackgroundWork` enum; `runREM` routes typed decode failures and healthy settlement to the shared finding sink; `stagePendingREMProposalsAtLaunch`, `makeREMProposalStager` |
 
 /// The app's notification delivery, after the Core-owned REM card is durable.
 public typealias REMProposalNotificationPort = BackgroundWorkNotificationPort
@@ -25,6 +26,7 @@ public enum DreamBackgroundWork {
         trigger: DreamTrigger
     ) async throws -> [String: Any] {
         let result = try await cycle.runDream(force: force, trigger: trigger)
+        await raisePendingMoments(dataRoot: dataRoot)
         let response = try foundationDictionary(result.rawResponse)
         guard var metadata = dreamCompletionMetadataIfCommitted(response, force: force) else {
             return response
@@ -44,6 +46,23 @@ public enum DreamBackgroundWork {
             reflectionMaterial: result.reflectionMaterial
         )
         return response
+    }
+
+    /// Lived moments wait for her review and are never accepted for her. Her
+    /// turns show the count, but only a wake gives her time of her own: each
+    /// new batch (keyed by its newest moment) is one arrival after the night.
+    static func raisePendingMoments(dataRoot: URL) async {
+        do {
+            let moments = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+                .listProposals(status: "pending").filter { MemoryMoments.isMoment($0.metadata) }
+            guard let newest = moments.first else { return }
+            let line = moments.count == 1 ? "1 lived moment waits for your review: app memory.moments"
+                : "\(moments.count) lived moments wait for your review: app memory.moments"
+            ResidentWake.shared.request(dataRoot: dataRoot, reason: "what your night left",
+                                        items: [.init(id: "moments.pending:" + newest.id, line: line, key: "moments.pending")])
+        } catch {
+            nativeLog("[dream] pending moments not counted; her turns still show them: %@", error.localizedDescription)
+        }
     }
 
     public static func runREM(
@@ -120,7 +139,7 @@ public enum DreamBackgroundWork {
     // RETIRED 2026-08-31: `makeREMCycleLoop` / the `rem_cycle` background lane.
     //
     // Weekly REM has exactly one owner — the `nativeagent-weekly-rem`
-    // TriggerScheduler job (Sun 04:30 America/Chicago) →
+    // TriggerScheduler job (Sun 04:30 Mac-local) →
     // SchedulerDueJobRunner.executeREM → BackgroundLoopsAssembly.runRem →
     // SwiftNativeDreamREMCycle. That path resolves the persona root through
     // PersistenceCore.defaultPersonaRoot (DreamREMCycle.swift:486), so the
@@ -388,7 +407,7 @@ public enum DreamBackgroundWork {
             dataRoot: dataRoot,
             alternateRootEmbedder: MockEmbeddingProvider()
         )
-        return { @Sendable in
+        return { @Sendable cutoff in
             // The daemon-era design fed `layer="persona_feedback"` deltas.
             // The current Swift chat path doesn't write that tag, AND the
             // MemoryV2 SQLite bridge hardcodes every read-back row to
@@ -396,7 +415,7 @@ public enum DreamBackgroundWork {
             // L134). A strict layer/tag filter would therefore reject every
             // production record. Until the bridge preserves layer + tags
             // through `extras`, the practical Self-half is "every memory
-            // record created within the dream recency window," prefer
+            // record created since the dream's own cutoff," prefer
             // persona-feedback-tagged rows when they actually appear, and
             // let DreamCycleRunner's char/count budgets bound the volume.
             //
@@ -404,50 +423,43 @@ public enum DreamBackgroundWork {
             // stub `MemoryV2` class in scope, so we can't name either type
             // directly. Field access via inference; every field used here
             // is documented on the real MemoryV2.MemoryRecord shape.
-            let recencyWindow: TimeInterval = 24 * 60 * 60
-            let cutoff = Date().addingTimeInterval(-recencyWindow)
             // Reuse the runner's parser instead of inlining a copy — the
             // earlier inline regex `[+-Z]` was a character RANGE (a typo
             // for a character class) and mis-parsed every microsecond
             // timestamp, which would let stale tagged rows survive and
             // drop fresh general rows. One source of truth now.
 
-            do {
-                let records = try await memory.listMemory(kind: nil)
-                // Newest-first.
-                let sorted = records.sorted { $0.createdAt > $1.createdAt }
+            let records = try await memory.listMemory(kind: nil)
+            // Newest-first.
+            let sorted = records.sorted { $0.createdAt > $1.createdAt }
 
-                var tagged: [String] = []
-                var general: [String] = []
-                for rec in sorted {
-                    let text = rec.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if text.isEmpty { continue }
-                    // Recency cutoff — only material absorbed within the
-                    // dream window counts as "new since the last dream."
-                    if let parsed = DreamCycleRunner.parseDaemonISO(rec.createdAt),
-                       parsed < cutoff {
-                        continue
-                    }
-                    // Honor an explicit status field when present.
-                    if let status = rec.status?.lowercased(),
-                       status == "rejected" || status == "deleted" {
-                        continue
-                    }
-                    let tags = rec.tags ?? []
-                    let layer = (rec.layer ?? "").lowercased()
-                    let line = "\(rec.createdAt) — \(text)"
-                    if tags.contains("persona-feedback")
-                        || layer == "persona_feedback"
-                        || layer == "persona-feedback" {
-                        tagged.append(line)
-                    } else {
-                        general.append(line)
-                    }
+            var tagged: [String] = []
+            var general: [String] = []
+            for rec in sorted {
+                let text = rec.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if text.isEmpty { continue }
+                // The run's cutoff — only material absorbed since the
+                // last dream's high-water mark counts as new.
+                if let parsed = DreamCycleRunner.parseDaemonISO(rec.createdAt),
+                   parsed < cutoff {
+                    continue
                 }
-                return tagged.isEmpty ? general : tagged
-            } catch {
-                return []
+                // Only what recall could speak: active, recall-eligible, admitted.
+                guard rec.status == "active", MemoryLifecycle.isRecallEligible(rec.lifecycle),
+                      !MemoryStorage.metadataFlag(rec.extras, MemoryStorage.pendingAdmissionKey)
+                else { continue }
+                let tags = rec.tags ?? []
+                let layer = (rec.layer ?? "").lowercased()
+                let line = "\(rec.createdAt) — \(text)"
+                if tags.contains("persona-feedback")
+                    || layer == "persona_feedback"
+                    || layer == "persona-feedback" {
+                    tagged.append(line)
+                } else {
+                    general.append(line)
+                }
             }
+            return tagged.isEmpty ? general : tagged
         }
     }
 

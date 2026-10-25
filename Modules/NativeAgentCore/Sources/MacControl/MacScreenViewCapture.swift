@@ -21,6 +21,7 @@ import CoreGraphics
 #endif
 #if canImport(ScreenCaptureKit) && os(macOS)
 import ScreenCaptureKit
+// Blueprint: | `MacScreenViewCapture.swift` | Window/display capture selection, `SystemMacVisualObstructionProbe` (other apps' windows over a frame, for sight and a watch's hands) and `SystemMacScreenCaptureSource`; exactly-once callback cancellation invalidates results and resumes immediately, with no cancellation-ignoring join on an unabortable ScreenCaptureKit callback |
 #endif
 
 // MARK: - Production capture source (ScreenCaptureKit)
@@ -94,8 +95,23 @@ public struct SystemMacVisualObstructionProbe: Sendable {
     }
 
     /// A window that takes what lands on it: visible, not below the desktop, not system chrome.
+    /// A window at or above the Dock's level that spans a whole display is a
+    /// system overlay (the Dock's, Notification Center's) and covers nothing;
+    /// a system dialog above that level is display-sized only if it is one.
     private static func covers(_ window: MacVisualWindowRecord) -> Bool {
         window.alpha > 0.05 && window.layer >= 0 && !["Window Server", "Dock", "Control Center"].contains(window.ownerName)
+            && !(window.layer >= Int(CGWindowLevelForKey(.dockWindow)) && spansDisplay(window.frame))
+    }
+
+    private static func spansDisplay(_ frame: MacAXFrame) -> Bool {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return false }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &displays, &count) == .success else { return false }
+        return displays.prefix(Int(count)).contains { display in
+            let bounds = CGDisplayBounds(display)
+            return bounds.minX == frame.x && bounds.minY == frame.y && bounds.width == frame.w && bounds.height == frame.h
+        }
     }
 
     /// On-screen windows, front to back.

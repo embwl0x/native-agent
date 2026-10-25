@@ -2,6 +2,8 @@ import Privacy
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `JSONValueBounding.swift` | `JSONValueBounding`: shared recursive metadata bounds, depth limits and secret redaction for substrate, continuity and somatic persistence |
+
 /// Single recursive bounder for persisted `JSONValue` metadata.
 ///
 /// Three copies used to live here — `CognitiveSubstrate.boundMetadataValue`,

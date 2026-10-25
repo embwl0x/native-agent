@@ -1,8 +1,8 @@
 import AgentWorkspace
-import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SwiftToolDispatcher+OMPBridgeTools.swift` | `SwiftToolDispatcher`: `runOMPMessage`, `ompSessionSaved` |
 
 extension SwiftToolDispatcher {
     // MARK: - OMP asynchronous bridge
@@ -64,11 +64,10 @@ extension SwiftToolDispatcher {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_dir_create_failed"),
-                "detail": .string(String(describing: error)),
-            ])
+            return .object(Self.builderFailureFields(error,
+                tool: "omp_message", reason: "inbox_dir_create_failed", effects: .none,
+                owner: directory.path,
+                instruction: "Repair the OMP inbox directory's reported storage error. No message was queued."))
         }
 
         let messageId = Self.builderMessageId(input: input)
@@ -149,11 +148,13 @@ extension SwiftToolDispatcher {
                 persistence: persistence, quarantine: quarantineNote
             )
         } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_write_failed"),
-                "detail": .string(String(describing: error)),
-            ])
+            var fields = Self.builderFailureFields(error,
+                tool: "omp_message", reason: "inbox_write_failed", effects: .unknown,
+                owner: inboxURL.path,
+                instruction: "Repair the reported inbox storage error from retained rows and message identities. Reconcile this message_id before another send; this wake did not launch.")
+            fields["messageId"] = .string(messageId)
+            Self.stampBuilderInboxQuarantine(quarantineNote, on: &fields)
+            return .object(fields)
         }
         guard appendResult.status != "conflict" else {
             return .object([
@@ -294,6 +295,7 @@ extension SwiftToolDispatcher {
                store: .omp,
                jobsDirectory: WakeupReplayGuard.jobsDirectory(
                    for: .omp, configRoot: agentBridgeConfigRoot),
+               dataRoot: dataRoot,
                topic: topic,
                text: text,
                now: Date()
@@ -319,18 +321,17 @@ extension SwiftToolDispatcher {
                     named: "omp_thread_wakeup.js",
                     dataRoot: dataRoot
                 ).path),
-                "fix": .string("Rebuild or reinstall NativeAgent so omp_thread_wakeup.js is at the expected path."),
+                "remedy": Self.builderFailureRemedy(owner: "NativeAgent app bundle / omp_thread_wakeup.js", instruction: "The bundled OMP wake helper is missing."),
             ])
         }
         let inputData: Data
         do {
             inputData = try JSONValue.object(payload).serializedData(pretty: false)
         } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("wakeup_payload_encode_failed"),
-                "error": .string(String(describing: error)),
-            ])
+            return .object(Self.builderFailureFields(error,
+                tool: "omp_message", reason: "wakeup_payload_encode_failed", effects: .none,
+                owner: "OMP wake payload encoding",
+                instruction: "Repair the reported payload encoding error. The inbox message is saved; this wake did not launch."))
         }
         let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
             ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)

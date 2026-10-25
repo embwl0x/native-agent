@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import DeviceSync
+// Blueprint: | `AppToolNotificationInput.swift` | `NativeAgentNotificationDefaults`: `parseInput` |
 
 extension NativeAgentNotificationDefaults {
     /// The one parser every notify entry point (chat shim, core bridge,

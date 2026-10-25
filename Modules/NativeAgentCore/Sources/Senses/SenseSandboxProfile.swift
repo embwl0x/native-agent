@@ -1,24 +1,28 @@
 import Darwin
 import Foundation
 import PersistenceCore
+// Blueprint: | `Modules/NativeAgentCore/Sources/Senses/SenseSandboxProfile.swift` | Deny-default Seatbelt reach, shared private-root policy (workspace allowed only through app delivery), and exact-IP network fence |
 
 /// P2 launches the helper with /usr/bin/sandbox-exec -p <profile>. The app
 /// supplies source and material over the plug; source arrives over the supervised plug.
 public enum SenseSandboxProfile {
-    /// The app's byte delivery obeys the same exclusions as helper reach.
+    private static func exclusions(dataRoot: URL, personaRoot: URL) -> (roots: [URL], deliveryWorkspace: URL) {
+        ([dataRoot, personaRoot] + [".ssh", ".aws", ".gnupg", ".codex", "Library/Keychains"]
+            .map { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent($0) }, NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot))
+    }
+
+    /// Delivery excludes private roots, except the workspace; the helper's
+    /// direct filesystem reach excludes those roots including the workspace.
     public static func requirePublicPath(_ path: String, dataRoot: URL, personaRoot: URL) throws {
         let candidate = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
             .standardizedFileURL.resolvingSymlinksInPath().path
-        let home = FileManager.default.homeDirectoryForCurrentUser
         func under(_ root: URL) -> Bool {
             let root = root.standardizedFileURL.resolvingSymlinksInPath().path
             return candidate == root || candidate.hasPrefix(root + "/")
         }
-        // The person's workspace is their own files, even though a public
-        // install keeps it inside the data root (NativeAgentWorkspaceRoot).
-        if under(NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)) { return }
-        let roots = [dataRoot, personaRoot] + [".ssh", ".aws", ".gnupg", ".codex", "Library/Keychains"].map { home.appendingPathComponent($0) }
-        guard !roots.contains(where: under) else {
+        let policy = exclusions(dataRoot: dataRoot, personaRoot: personaRoot)
+        if under(policy.deliveryWorkspace) { return }
+        guard !policy.roots.contains(where: under) else {
             throw SenseFailure(code: "source_denied", message: "Sense material cannot come from private app stores, persona or credentials.")
         }
     }
@@ -96,15 +100,10 @@ public enum SenseSandboxProfile {
         if !reach.hosts.isEmpty {
             rules.append("(allow mach-lookup (global-name \"com.apple.mDNSResponder\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\"))")
         }
-        // These denies win even over a declared '/' read grant. The resolved
-        // persona root may live outside dataRoot in development installations.
-        // Deny the whole app store, including the notebook:
-        // all legitimate access to it is app-side through the plug.
-        rules.append("(deny file-read* file-write* (subpath \(path(dataRoot))))")
-        rules.append("(deny file-read* file-write* (subpath \(path(personaRoot))))")
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        for store in [".ssh", ".aws", ".gnupg", ".codex", "Library/Keychains"] {
-            rules.append("(deny file-read* file-write* (subpath \(path(home.appendingPathComponent(store)))))")
+        // These denies win over '/' reach, including the in-data-root workspace;
+        // its legitimate access is app-side delivery, never helper file access.
+        for root in exclusions(dataRoot: dataRoot, personaRoot: personaRoot).roots {
+            rules.append("(deny file-read* file-write* (subpath \(path(root))))")
         }
         return rules.joined(separator: "\n")
     }

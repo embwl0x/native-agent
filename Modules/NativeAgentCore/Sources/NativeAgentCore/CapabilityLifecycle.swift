@@ -1,9 +1,11 @@
 import Foundation
 
-/// One lifecycle for every capability she has, her senses, skills and the tools she
+// Blueprint: | `CapabilityLifecycle.swift` | `CapabilityLifecycle`: common ability store paths, lifecycle actions, version rules and current peer/owner keep authority |
+
+/// One lifecycle for every capability she has, her senses and the parts she
 /// wrote. One folder holds current, previous and proposed files.
-/// - Use: a skill's run or `skill.read` (a recall pointer's one act is that
-///   read), a tool's call. Turning one on restarts the clock.
+/// - Use: a part's run or `ability.read` (a recall pointer's one act is that
+///   read). Turning one on restarts the clock.
 /// - Drop removes an ability; rollback swaps current and previous.
 public enum CapabilityLifecycle {
     public enum Action: Sendable { case change, enable, restore, rollback, drop }
@@ -41,8 +43,8 @@ public enum CapabilityLifecycle {
     public static var writeRefusal: String? { turnWriteCheck()()?.message }
 
     public static func peerRefusal(_ who: String, tap: String?) -> ToolFailureError {
-        ToolFailureError("This turn was steered by \(who), so it cannot change senses, tools or skills or capture material for growth. "
-            + (tap.map { "Only the person can elevate this source at \($0); the pending work keeps its provenance." }
+        ToolFailureError("\(who) is an untrusted source, so it cannot change senses, tools or skills on this run. "
+            + (tap.map { "The owner can trust this source at \($0) to authorize future runs." }
                ?? "The saved steer has no authenticated contact binding. It cannot be elevated by renaming it; obtain a new request through an authenticated connected agent, or let the work go."),
             effects: .none, owner: "peer \(who) (not elevated)", tap: tap, personDecides: true)
     }
@@ -55,14 +57,19 @@ public enum CapabilityLifecycle {
     public static func requireKeep(ownerAuthorized: Bool) throws {
         guard ownerAuthorized else {
             throw NSError(domain: "CapabilityLifecycle", code: 403, userInfo: [NSLocalizedDescriptionKey:
-                "Below Full Mac, keeping a part is the owner's"])
+                "Below Full Mac, keeping an ability is the owner's"])
         }
     }
 
+    /// Who switched something off: the owner (the person, on his own
+    /// surface), hers (her turn or her own ability, a trusted agent's turn
+    /// included), or an untrusted peer. "agent" is hers, as older records say it.
+    public static let offActors: Set<String> = ["owner", "hers", "peer", "agent"]
+
     public static func requiresOwnerToEnable(isOff: Bool, disabledBy: String?) -> Bool {
-        // Off with no affirmative "agent" attribution is the owner's off (older
-        // records carry none): failing closed keeps his switch his.
-        disabledBy != "agent" && (isOff || disabledBy != nil)
+        // Off with no attribution is the owner's off (older records carry
+        // none): failing closed keeps his switch his. Only his is his to lift.
+        !["hers", "peer", "agent"].contains(disabledBy ?? "") && (isOff || disabledBy != nil)
     }
 
     public static func nextVersion(_ versions: [Int], requested: Int = 1) throws -> Int {

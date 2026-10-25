@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MobileTrustAction.swift` | `MobileTrustAction` enum |
 
 /// Closed, non-secret requests accepted only from a verified paired phone.
 public enum MobileTrustAction: Sendable {

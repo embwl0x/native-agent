@@ -117,6 +117,7 @@ class Follower {
     for (const entry of this.pending.values()) entry.reject(error);
     this.pending.clear();
     this.snapshotReject?.(error);
+    this.changeReject?.(error);
     this.socket.destroy();
     this.end(this.error);
   }
@@ -222,8 +223,27 @@ class Follower {
       this.owner = message.sourceClientId;
       this.revision = change.revision;
       this.snapshotResolve?.();
+      this.changeResolve?.();
       this.onChange?.();
     }
+  }
+
+  // The send operation registers before checking revision, so a confirmation
+  // arriving with the busy response cannot be missed. One waiter, one deadline.
+  async changedAfter(revision, deadline) {
+    let timer;
+    try {
+      const changed = new Promise((resolve, reject) => {
+        this.changeResolve = resolve;
+        this.changeReject = reject;
+      });
+      if (this.error) throw this.error;
+      if (this.revision !== revision) return;
+      await Promise.race([changed, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error("ChatGPT is still confirming an earlier message to Dot; try again in a moment. Nothing was sent."),
+          { reason: "chatgpt_busy" })), Math.max(0, deadline - performance.now()));
+      })]);
+    } finally { clearTimeout(timer); this.changeResolve = null; this.changeReject = null; }
   }
 
   async connect() {
@@ -267,7 +287,9 @@ class Follower {
 
   close() {
     if (this.identity && this.client !== "initializing-client" && !this.socket.destroyed && !this.error) this.following(false);
-    this.socket.end();
+    // Operation completion retires the connection even if the peer never
+    // closes its half. Disconnection also retires this client as a follower.
+    this.socket.destroy();
   }
 }
 
@@ -319,14 +341,23 @@ async function main(input) {
     checkApp();
     if (!sameIdentity(selection(), identity) || follower.error) fail("dot_identity_changed", "Dot's conversation in ChatGPT changed during the request; nothing was sent.");
     const clientUserMessageId = randomUUID();
-    dispatched = true;
-    const response = await follower.request("thread-follower-start-turn", 3, { conversationId: identity.root,
-      turnStart: { request: { threadId: identity.root, clientUserMessageId,
-        input: [{ type: "text", text: input.text, text_elements: [] }] },
-      context: { inheritThreadSettings: true, messageThreadId: randomUUID() } } }, true);
+    const deadline = performance.now() + 120000;
+    let response;
+    while (true) {
+      if (!sameIdentity(selection(), identity) || follower.error) fail("dot_identity_changed", "Dot's conversation in ChatGPT changed during the request; nothing was sent.");
+      const revision = follower.revision;
+      dispatched = true;
+      response = await follower.request("thread-follower-start-turn", 3, { conversationId: identity.root,
+        turnStart: { request: { threadId: identity.root, clientUserMessageId,
+          input: [{ type: "text", text: input.text, text_elements: [] }] },
+        context: { inheritThreadSettings: true, messageThreadId: randomUUID() } } }, true);
+      if (!(response.resultType === "error" && /not yet confirmed/i.test(String(response.error ?? "")))) break;
+      dispatched = false; // ChatGPT explicitly refused admission; nothing was sent.
+      if (performance.now() >= deadline) fail("chatgpt_busy", "ChatGPT is still confirming an earlier message to Dot; try again in a moment. Nothing was sent.");
+      await follower.changedAfter(revision, deadline);
+      if (performance.now() >= deadline) fail("chatgpt_busy", "ChatGPT is still confirming an earlier message to Dot; try again in a moment. Nothing was sent.");
+    }
     const result = response.result?.result;
-    if (response.resultType === "error" && /not yet confirmed/i.test(String(response.error ?? "")))
-      fail("chatgpt_busy", "ChatGPT is still confirming an earlier message to Dot; try again in a moment. Nothing was sent.");
     // ChatGPT's selection file can name a conversation ChatGPT no longer has
     // (deleted, or moved by an app update): its own answer says so, and that is
     // not a protocol change. Nothing was accepted, so nothing is unknown.

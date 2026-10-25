@@ -1,10 +1,12 @@
 import ApprovalInbox
-import ChatOrchestration
+import ChatTurnContracts
+import AgentWorkspace
 import Desk
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `AppToolExecutor+MyQueue.swift` | `AppToolExecutor`: `runMyQueue`, `runHouseFile`; filing receipts report the stored owner and explicitly say when a requested reassignment was not made |
 
 extension AppToolExecutor {
     @MainActor
@@ -47,7 +49,9 @@ extension AppToolExecutor {
             return .object(["status": .string("ok"), "id": .string("desk." + item.alias),
                             "owner": filedOwner.map(JSONValue.string) ?? .null,
                             "confirmation": .string("Filed: " + item.title + ownership)])
-        } catch { return Self.failure("house_file_failed", error.localizedDescription, extra: ["effects": .string("unknown")]) }
+        } catch { return Self.ownedFailure(error, code: "house_file_failed", owner: "Desk",
+            instruction: "Read the Desk to reconcile this filing and resolve the reported storage error before filing again.",
+            next: ["page": .string("desk")], effects: .unknown) }
     }
 
     /// MY QUEUE's actions (Wave 2 #7): queue a step, or mark one done or
@@ -108,11 +112,13 @@ extension AppToolExecutor {
             try await MyQueue.finish(entry, dropped: dropped, why: text("reason") ?? (dropped ? "dropped" : "done"), store: store)
             // A stopped skill run's step, closed: the run is closed too, and lets go of what it held.
             if let run = MyQueue.skillRun(in: entry.step.words) {
-                try? FileManager.default.removeItem(at: SkillRunStore.file(run, root: store.dataRoot))
+                PartRunStore.discard(run, root: store.dataRoot)
             }
             return receipt(entry, dropped ? "dropped" : "done")
         } catch {
-            return Self.failure("queue_failed", error.localizedDescription + " Home's MY QUEUE shows what is there now.", extra: ["effects": .string("unknown")])
+            return Self.ownedFailure(error, code: "queue_failed", owner: "MY QUEUE",
+                instruction: "Read home to reconcile the queue and resolve the reported cause before another change.",
+                next: ["page": .string("home")], effects: .unknown)
         }
     }
 }

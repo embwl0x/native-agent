@@ -1,5 +1,7 @@
 import EngineRuntime
 import AppToolRuntime
+
+// Blueprint: | `SetupRestRows.swift` | `SetupRestRows`: remaining settings controls in shared page rows, build identity and bundled data-limit reference handoff |
 // The rest of Settings, on the Settings page.
 //
 // SetupView used to end in a door ("All settings") that pushed the old grouped
@@ -22,8 +24,7 @@ import AppToolRuntime
 //                                                  (SlimSettingsView.swift:362-385)
 //   About             → NativeAgentBuildIdentity + buildIdentityLine
 //                                                  (SlimSettingsView.swift:388-403)
-//   App status        → AppModel.health + lastRefreshError through
-//                       SlimSettingsStatusLinePresentation
+//   App status        → DoctorFacade.runtimeStatus (also used by Status)
 //
 // Devices and Integrations are deliberately absent: Telegram and iPhone already
 // have their own cards on this page (SetupView.swift:549-567) and the rail
@@ -289,13 +290,9 @@ struct SetupRestRows: View {
 
     // MARK: App status
 
-    /// Whether the runtime answered, and — when a refresh failed — the last
-    /// refresh error itself, whole and selectable, under the row.
+    /// The same runtime liveness and read-failure presentation as Status.
     private var appStatusRow: some View {
-        let state = SlimSettingsStatusLinePresentation.runtimeState(
-            runtimeOK: appModel.engine.doctor.health?.ok,
-            lastRefreshError: appModel.lastRefreshError
-        )
+        let state = appModel.engine.doctor.runtimeStatus(lastRefreshError: appModel.lastRefreshError)
         return VStack(alignment: .leading, spacing: 6) {
             SetupRestCard(
                 title: "App status",
@@ -413,7 +410,7 @@ enum SlimSettingsDataLimitsOpenOutcome: Equatable {
         case .opened:
             return nil
         case .resourceUnavailable:
-            return "The data-limits reference is missing from this copy of NativeAgent. Reinstall or update the app, then try again."
+            return "Tell the person: the data-limits reference is missing from this copy of NativeAgent."
         case .openFailed:
             return "NativeAgent found the data-limits reference but macOS could not open it. Try again or open the document from the installed app bundle."
         }

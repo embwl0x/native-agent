@@ -333,7 +333,7 @@ final class PairingStore: ObservableObject {
         // is unavailable. Start the existing bridge during the unpaired screen
         // so it can receive the Mac's canonical secret; KVS personal mode
         // remains unchanged.
-        if DeviceSyncTransportResolver.resolvedKind() == .cloudkit {
+        if iCloudBridge.runsCloudKit {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 iCloudBridge.shared.pairingStore = self
@@ -372,9 +372,12 @@ final class PairingStore: ObservableObject {
     /// Reads the HMAC secret from iCloud KVS and, if it differs from (or is newer than)
     /// the value currently in Keychain, writes it to Keychain for signed transport.
     /// Safe to call repeatedly — no-ops when everything is already current.
+    /// On the CloudKit transport KVS is never a key source: the public Mac never
+    /// writes it, so any value there is stale and would replace the record's key.
     @discardableResult
     func applyKVSPairingMaterialIfNeeded(allowDuringRepair: Bool = false) -> Bool {
-        guard !isRepairingConnection,
+        guard !iCloudBridge.runsCloudKit,
+              !isRepairingConnection,
               !connectionRepairPending || allowDuringRepair else { return false }
         let kvs = NSUbiquitousKeyValueStore.default
         guard let secretData = Self.validatedKVSPairingSecret(
@@ -411,16 +414,14 @@ final class PairingStore: ObservableObject {
 
     /// Receives pairing material from the CloudKit transport. Exact length is
     /// validated before the existing PairingStore transaction writes Keychain;
-    /// no bridge or transport may become a second persistence owner.
+    /// no bridge or transport may become a second persistence owner. True only
+    /// when a different key was installed.
     @discardableResult
     func applyCloudKitPairingSecret(
         _ data: Data,
         persist: ((Data) -> OSStatus)? = nil
     ) -> Bool {
-        guard !isRepairingConnection, data.count == 32 else { return false }
-        if iCloudPairingSecret == data {
-            return true
-        }
+        guard !isRepairingConnection, data.count == 32, iCloudPairingSecret != data else { return false }
         return installPairingSecret(data, source: "CloudKit", persist: persist)
     }
 
@@ -451,9 +452,11 @@ final class PairingStore: ObservableObject {
     }
 
     /// Re-read HMAC material from KVS. Returns true only when a different
-    /// secret is durably installed in Keychain.
+    /// secret is durably installed in Keychain. Nothing on the CloudKit
+    /// transport, where every drain re-reads the Mac's pairing record instead.
     @discardableResult
     func refreshFromKVS(allowDuringRepair: Bool = false) async -> Bool {
+        guard !iCloudBridge.runsCloudKit else { return false }
         // Synchronize first so we get the freshest KVS state — but under the
         // same timeout wrapper the launch path uses: this self-heal fires
         // precisely when KVS/cloudd is misbehaving (signature resync), and a

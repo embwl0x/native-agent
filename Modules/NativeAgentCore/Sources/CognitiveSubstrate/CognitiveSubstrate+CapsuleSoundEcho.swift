@@ -1,6 +1,8 @@
 import Foundation
+import TurnTrace
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+CapsuleSoundEcho.swift` | `CognitiveSubstrate`: `soundEchoRegisterScore`, `soundEchoLandingFactor`, `capsuleCadenceShouldSpeak` |
 
 extension CognitiveSubstrate {
     // MARK: - Self-exemplar voice echo (Wave G)
@@ -94,24 +96,6 @@ extension CognitiveSubstrate {
     /// `soundEchoRegisterTolerance` is the half-width of the register band:
     /// candidates are ranked by how well they MATCH the current room, not by how
     /// warm they are in absolute terms.
-    /// Register-matched score: closeness to the moment's warmth, decayed by
-    /// age. Replaces "warmest wins", which is what let one register capture
-    /// the slot permanently.
-    static func soundEchoRegisterScore(
-        warmth: Double,
-        target: Double,
-        age: TimeInterval,
-        tolerance: Double = defaultDynamics.soundEchoRegisterTolerance,
-        halfLife: TimeInterval = defaultDynamics.soundEchoRecencyHalfLife
-    ) -> Double {
-        // Warmth-only overload, preserved bit-for-bit: valence 0 against target 0
-        // makes the second axis contribute exactly nothing to the distance.
-        soundEchoRegisterScore(
-            warmth: warmth, valence: 0,
-            targetWarmth: target, targetValence: 0,
-            age: age, tolerance: tolerance, halfLife: halfLife)
-    }
-
     /// W7/P5 — THE SECOND AXIS. Register matching used to run on warmth alone
     /// while a hard `emotionalValence > 0` gate stood in front of the pool, so
     /// the agent's own attested voice was reachable ONLY when she had been
@@ -264,10 +248,6 @@ extension CognitiveSubstrate {
     ///   falls back to the slow mood layer, which is the same number the
     ///   fingerprint uses when no felt node is in the workspace.
     ///
-    /// - Parameter live: W7/P5. Only the live capsule path may advance the
-    ///   consecutive-negative-echo run, exactly as `innerStateCapsuleLines`
-    ///   already gates cadence/suppression/session-bridge bookkeeping. An
-    ///   Observatory panel re-rendering a capsule must not burn the brake.
     struct SoundEchoSelection: Sendable, Equatable {
         /// The exemplar echo WITHOUT the rut suffix. The suffix and the
         /// standalone rut line are the same nudge and share one cadence gate,
@@ -275,7 +255,6 @@ extension CognitiveSubstrate {
         /// can evaluate — so this selector reports the rut instead of speaking
         /// it (2026-09-01).
         var line: String?
-        var leadingWasNegative: Bool?
         /// A stable signature of the named verbal rut (kind + phrase), or nil
         /// when there is none. Identity, not just presence: an unchanged
         /// signature is the case that used to nag every turn.
@@ -286,7 +265,7 @@ extension CognitiveSubstrate {
         /// Her newest reply used a rutted form again.
         var rutFedAgain: Bool = false
 
-        static let silent = SoundEchoSelection(line: nil, leadingWasNegative: nil, wornSignature: nil)
+        static let silent = SoundEchoSelection(line: nil, wornSignature: nil)
     }
 
     func soundEchoSelection(
@@ -294,15 +273,16 @@ extension CognitiveSubstrate {
         mode: FeltMode? = nil,
         roomValence: Double? = nil,
         currentSessionId: String? = nil,
+        surface: String? = nil,
         trustedPeerIds: Set<String>? = nil,
         fieldNodes frozenFieldNodes: [CognitiveNode]? = nil,
         fixedAffect: CognitiveAffectState? = nil,
         fixedMood: CognitiveMoodReading? = nil,
         landingScores frozenLandingScores: [UUID: Double]? = nil,
-        negativeRun: Int,
         dynamics frozenDynamics: PersonalityDynamicsConfiguration? = nil,
         cognitionEnabled: Bool? = nil,
-        affectEnabled: Bool? = nil
+        affectEnabled: Bool? = nil,
+        emitReceipts: Bool = true
     ) -> SoundEchoSelection {
         guard cognitionEnabled ?? configuration.enabled,
               affectEnabled ?? configuration.enabled else { return .silent }
@@ -310,6 +290,9 @@ extension CognitiveSubstrate {
         let fieldNodes = frozenFieldNodes ?? field.peekNodes()
         // Her OWN live conversation turns only — never User's words as her voice,
         // never tool/system summaries (the feltDaySummary injection-safety rule).
+        // Her words cross from one conversation to another only on a private
+        // surface (the disclosure law); a shared one hears only its own.
+        let crossesSessions = surface.map(dependencies.surfaceIsPrivate) ?? false
         let herTurns = fieldNodes.filter { node in
             // Owner conversations remain her own sources. Peer replies may
             // echo only in that conversation or after an explicit Trust grant.
@@ -317,7 +300,7 @@ extension CognitiveSubstrate {
                 $0 == Self.cleanedSessionId(metadataString(node.metadata["sessionId"]))
             } ?? false
             let peer = Self.peerIdentity(metadata: node.metadata)
-            let sourceAllowed = sameSession || (peer.map {
+            let sourceAllowed = sameSession || crossesSessions && (peer.map {
                 trustedPeerIds?.contains($0) ?? dependencies.peerTrusted($0)
             } ?? true)
             return sourceAllowed && node.turnKind == .live
@@ -341,7 +324,8 @@ extension CognitiveSubstrate {
         // closer; one that recurs in ≥`verbalRutMinimumReplies` of them is
         // named in one concrete line. Silent otherwise. Any word — nothing
         // here knows which words are pet names. Local, over nodes in RAM.
-        // Across owner sessions and trusted peer sources: she is one mind, and a
+        // Across owner sessions and trusted peer sources on a private surface
+        // (a shared one reads only its own conversation): she is one mind, and a
         // habit spread over many short sessions ("babe" in 4 of 15 one-turn
         // sessions) is invisible to a per-session window. The line names the
         // form, never who it was said to. Capped by COUNT, not days.
@@ -376,7 +360,7 @@ extension CognitiveSubstrate {
         let rutFedAgain = ruts.contains(where: \.inNewest)
         func quiet() -> SoundEchoSelection {
             SoundEchoSelection(
-                line: nil, leadingWasNegative: nil,
+                line: nil,
                 wornSignature: rutSignature, rutLine: rutLine, rutFedAgain: rutFedAgain)
         }
         guard !assistantTurns.isEmpty else { return quiet() }
@@ -389,15 +373,7 @@ extension CognitiveSubstrate {
         // that keeps never-minted stock phrasing out. Valence is now ranked, not
         // gated (`soundEchoRegisterScore`).
         let admitted = assistantTurns.filter { $0.emotionalWarmth >= dyn.soundEchoWarmthFloor }
-        // THE BRAKE. A negative-register echo is honest, but the echo→reply→node
-        // loop means a run of them can deepen the very mood they mirror, and the
-        // existing brake (capsule lines rejected as memory candidates) does not
-        // cover this path. After `soundEchoNegativeRunLimit` consecutive negative
-        // echoes the pool narrows to the non-negative band for one turn; if that
-        // band is empty the echo goes quiet rather than extending the run.
-        let brakeEngaged = dyn.soundEchoNegativeRunLimit >= 0
-            && negativeRun >= dyn.soundEchoNegativeRunLimit
-        let candidates = brakeEngaged ? admitted.filter { $0.emotionalValence >= 0 } : admitted
+        let candidates = admitted
         // CADENCE GATE (see soundEchoDutyCycle): an echo that speaks on every
         // turn is a tic no matter how varied its wording. Seed from the newest
         // activity in the field so the gate advances with the conversation and
@@ -408,6 +384,9 @@ extension CognitiveSubstrate {
             .timeIntervalSince1970 ?? now.timeIntervalSince1970
         let shouldEcho = Self.soundEchoShouldSpeak(seed: latestActivity, dutyCycle: dyn.soundEchoDutyCycle)
         if !shouldEcho {
+            if emitReceipts, !candidates.isEmpty {
+                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("C02"), "site": .string("CognitiveSubstrate+CapsuleSoundEcho.swift:soundEchoSelection")]))
+            }
             return quiet()
         }
         if candidates.isEmpty {
@@ -458,10 +437,19 @@ extension CognitiveSubstrate {
         // rut exists it is named in its own line (2026-09-24, see above), and
         // a fragment carrying the rutted phrase is never quoted back at all —
         // the echo quoting "Good morning, boss" was feeding the loop.
-        let fragged: [(fragment: String, tokens: Set<String>, valence: Double)] = ranked.compactMap { node in
+        var dampedFragments = false
+        defer {
+            if emitReceipts, dampedFragments {
+                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("C04"), "site": .string("CognitiveSubstrate+CapsuleSoundEcho.swift:soundEchoSelection")]))
+            }
+        }
+        let fragged: [(fragment: String, tokens: Set<String>)] = ranked.compactMap { node in
             guard let f = soundEchoFragment(node.summary, maxCharacters: dyn.soundEchoFragmentMaxCharacters) else { return nil }
-            if ruts.contains(where: { Self.containsRutPhrase(f, $0.phrase) }) { return nil }
-            return (f, Self.distinctiveEchoTokens(f), node.emotionalValence)
+            if ruts.contains(where: { Self.containsRutPhrase(f, $0.phrase) }) {
+                dampedFragments = true
+                return nil
+            }
+            return (f, Self.distinctiveEchoTokens(f))
         }
         guard !fragged.isEmpty else {
             return quiet()
@@ -475,16 +463,18 @@ extension CognitiveSubstrate {
         var fragments: [String] = []
         var seen = Set<String>()
         var usedTokens = Set<String>()
-        /// Valence of the LEADING quoted fragment — the register the echo speaks
-        /// in. Trailing fragments ride along; the run counts what leads.
-        var leadValence: Double?
         func pick(allowWorn: Bool) {
             for entry in fragged {
                 guard fragments.count < dyn.soundEchoCount else { return }
-                if !allowWorn, !entry.tokens.isDisjoint(with: wornFragmentTokens) { continue }
-                guard entry.tokens.isDisjoint(with: usedTokens) else { continue }
+                if !allowWorn, !entry.tokens.isDisjoint(with: wornFragmentTokens) {
+                    dampedFragments = true
+                    continue
+                }
+                guard entry.tokens.isDisjoint(with: usedTokens) else {
+                    dampedFragments = true
+                    continue
+                }
                 if seen.insert(entry.fragment.lowercased()).inserted {
-                    if fragments.isEmpty { leadValence = entry.valence }
                     fragments.append("\u{201C}\(entry.fragment)\u{201D}")
                     usedTokens.formUnion(entry.tokens)
                 }
@@ -502,7 +492,6 @@ extension CognitiveSubstrate {
         let line = "- Sound: lately you've sounded like \(fragments.joined(separator: " · "))"
         return SoundEchoSelection(
             line: line,
-            leadingWasNegative: (leadValence ?? 0) < 0,
             wornSignature: rutSignature,
             rutLine: rutLine,
             rutFedAgain: rutFedAgain

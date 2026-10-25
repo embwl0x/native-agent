@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Senses
+// Blueprint: | `MacFourVerbs+Observation.swift` | `MacFourVerbs`: `screen`, `observedReply`, `sight`; self-window looks hand off to the mounted `visible` presentation without claiming a completed read; call-local complete AX read shared with pixel capture under window identity and frame-generation validation; observed and blind replies preserve failed declared-effect verdicts and confirmed window/process removal even when the next screen belongs to another app |
 
 /// Call-local proof supplied by the canonical view capture, never
 /// by app-name matching. Pixels that cannot bind to this look are discarded.
@@ -94,13 +95,6 @@ extension MacFourVerbs {
         }
         switch await sight(part: part, app: app) {
         case .blind(let reply):
-            if reply.detail["status"] == .string("in_process_route"), case .array? = reply.detail["running_apps"] {
-                let front = Self.string(Self.object(reply.detail["frontmost_app"])["name"]) ?? "unknown app"
-                return MacFourVerbsReply(ok: true,
-                    text: "MAC · \(front) in front\n" + Self.runningAppsLine(reply.detail)
-                        + "NativeAgent's window is read in process; no accessibility capture was made.",
-                    detail: reply.detail)
-            }
             return reply
         case .seen(let sighting):
             let contentRoute = ["com.apple.mail": "mail.*", "com.apple.MobileSMS": "messages.*",
@@ -116,9 +110,10 @@ extension MacFourVerbs {
                 ok: true,
                 text: (sighting.detail["native_page"] != nil ? sighting.render : lead + "\n" + sighting.render)
                     + (contentRoute.map { "\nUse \($0) for content; this is only the on-screen view." } ?? ""),
-                detail: structured
+                detail: (structured
                     ? sighting.detail.merging(["controls": sighting.controls]) { _, new in new }
                     : sighting.detail.filter { $0.key != "native_page" }
+                ).merging(MacPersonInput.idleDetail) { _, new in new }
             )
         }
     }
@@ -128,7 +123,6 @@ extension MacFourVerbs {
         description: String,
         unverifiedDescription: String? = nil,
         before: Sighting?,
-        allowGenericScreenChangeVerification: Bool = true,
         afterPart: String? = nil,
         pointerTarget: String? = nil,
         /// A pointer press: judged by `MacActClosedLoop.pressEvidence`.
@@ -136,140 +130,67 @@ extension MacFourVerbs {
     ) async -> MacFourVerbsReply {
         switch await sight(part: afterPart) {
         case .blind(let reply):
+            let output = Self.object(result.output)
             return MacFourVerbsReply(
-                ok: true,
-                text: (unverifiedDescription ?? description)
-                    + " The input went out, but I couldn't take the confirming look. " + reply.text,
+                ok: output["status"] != .string("acted_mismatch"),
+                text: (output["verified"] == .bool(true) ? description : unverifiedDescription ?? description)
+                    + " " + (Self.string(output["status_note"])
+                        ?? "The input went out, but the declared effect could not be read back.")
+                    + " I couldn't take the fresh screen look. " + reply.text,
                 detail: Self.operationDetail(result).merging(["observed_after": .bool(false)]) { current, _ in current }
             )
         case .seen(let after):
-            // In a batch, the text the step before typed is that step's change,
-            // not this one's: a return that only "changed" that text did nothing.
-            // Too short a text ("a") would match unrelated words: ignored then.
-            let typedRaw = Self.typedJustBefore.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).count >= 3 ? $0 : nil }
-            let typedBefore = typedRaw.map(Self.normalize)
-            let withoutTyped: (String) -> String = { render in
-                typedRaw.map { render.replacingOccurrences(of: $0, with: "") } ?? render
-            }
-            // A scoped post-action render is intentionally shaped differently
-            // from the full pre-action screen. That difference is presentation,
-            // not effect evidence; visible values and handler evidence remain
-            // independently comparable.
-            let structuralChanged = afterPart == nil
-                ? before.map { withoutTyped($0.effectRender) != withoutTyped(after.effectRender) }
-                : nil
-            let textValueVerified = Self.bool(Self.object(result.output)["text_value_verified"])
-            let handlerEvidence = Self.bool(Self.object(result.output)["verified"]) == true
-            let changed = structuralChanged.map { $0 || handlerEvidence }
-            let differingValues: Set<String> = {
-                guard let before,
-                      let beforeValues = Self.visionValueTexts(before.detail),
-                      let afterValues = Self.visionValueTexts(after.detail) else { return [] }
-                return beforeValues.symmetricDifference(afterValues)
-            }()
-            let onlyTypedChanged = typedBefore.map { typed in
-                !differingValues.isEmpty && differingValues.map(Self.normalize).allSatisfy { $0.contains(typed) || ($0.count >= 3 && typed.contains($0)) }
-            } ?? false
-            let visibleValueChanged = !differingValues.isEmpty && !onlyTypedChanged
-            let pointerOnTarget: Bool? = {
-                guard let pointerTarget, let before,
-                      before.bundleIdentifier == after.bundleIdentifier,
-                      before.appName == after.appName,
-                      let pointer = after.pointer,
-                      case .hit(let target) = Self.resolve(pointerTarget, among: after.targets),
-                      let frame = target.observedFrame else { return nil }
-                return pointer.isInside(frame) && !target.excludedFrames.contains { pointer.isInside($0) }
-            }()
-            let press = Self.pressVerdict(pressed, before: before, after: after)
-            let observation: String
-            if press?.own == true, press?.consequence == false, let pressed {
-                observation = " Only \(Self.name(pressed)) itself changed; nothing it should open or switch did."
-            }
-            else if pointerOnTarget == true { observation = " The system pointer is inside the target's freshly observed bounds." }
-            else if pointerOnTarget == false { observation = " The system pointer is outside the target's freshly observed bounds." }
-            else if visibleValueChanged { observation = " A value the fresh screen says changed after it." }
-            else if structuralChanged == true { observation = " The fresh screen changed after it." }
-            else if onlyTypedChanged, !handlerEvidence {
-                observation = " Nothing visibly happened after it: the only change on the fresh screen is the text typed just before."
-            }
-            else if handlerEvidence && allowGenericScreenChangeVerification {
-                observation = " The fresh fused view changed after it, although the structural words stayed the same."
-            }
-            else if changed == false { observation = " The fresh screen did not visibly change." }
-            else { observation = " This is the fresh screen afterward." }
-            var detail = Self.operationDetail(result)
             let mechanism = Self.object(result.output)
-            if let neutral = Self.bool(mechanism["hand_neutral"]) {
-                detail["hand_neutral"] = .bool(neutral)
-            }
+            var detail = Self.operationDetail(result)
             detail["observed_after"] = .bool(true)
-            detail["screen_changed"] = changed.map(JSONValue.bool) ?? .null
-            // Physical input starts unverified because emitting HID is not
-            // evidence. An immediate fresh fused screen delta is independent
-            // evidence that the visible computer reacted, so settle THAT claim
-            // (not the caller's larger goal). An unchanged screen remains
-            // explicitly unverified.
-            if let textValueVerified {
-                detail["verification"] = .string(textValueVerified
-                    ? MotorVerificationState.satisfied.rawValue : MotorVerificationState.unverified.rawValue)
-                detail["text_value_verified"] = .bool(textValueVerified)
-                detail.removeValue(forKey: "verification_evidence")
-                if textValueVerified { detail["verification_evidence"] = .string("focused_text_value_match") }
-            } else if pointerTarget != nil {
-                detail["pointer_on_target"] = pointerOnTarget.map(JSONValue.bool) ?? .null
-                detail["verification"] = .string(pointerOnTarget == true
-                    ? MotorVerificationState.satisfied.rawValue : MotorVerificationState.unverified.rawValue)
-                detail.removeValue(forKey: "verification_evidence")
-                if pointerOnTarget == true {
-                    detail["verification_evidence"] = .string("fresh_system_pointer_in_observed_target")
-                    detail["verification_scope"] = .string("pointer_position_only")
-                }
-            } else if let press {
-                detail["verification"] = .string(press.consequence
-                    ? MotorVerificationState.satisfied.rawValue : MotorVerificationState.unverified.rawValue)
-                detail.removeValue(forKey: "verification_evidence")
-                if press.consequence { detail["verification_evidence"] = .string("press_consequence") }
-            } else if visibleValueChanged {
-                detail["verification"] = .string(MotorVerificationState.satisfied.rawValue)
-                detail["verification_evidence"] = .string("fresh_visible_value_change")
-            } else if changed == true, allowGenericScreenChangeVerification {
-                detail["verification"] = .string(MotorVerificationState.satisfied.rawValue)
-                detail["verification_evidence"] = .string("fresh_visible_screen_change")
-            } else if !allowGenericScreenChangeVerification {
-                detail["verification"] = .string(MotorVerificationState.unverified.rawValue)
-                detail.removeValue(forKey: "verification_evidence")
+            // The fresh screen is a witness only. Verification comes from
+            // the declared effect's AX readback, never a render or pixel delta.
+            detail["screen_changed"] = before.map { .bool($0.effectRender != after.effectRender) } ?? .null
+            var verdict: MacActClosedLoop.ActClassification?
+            if let pointerTarget, let before {
+                let inside = before.pid != nil && before.pid == after.pid
+                    ? after.pointer.flatMap { pointer -> Bool? in
+                        guard case .hit(let target) = Self.resolve(pointerTarget, among: after.targets),
+                              let frame = target.observedFrame else { return nil }
+                        return pointer.isInside(frame) && !target.excludedFrames.contains { pointer.isInside($0) }
+                    } : nil
+                verdict = MacActClosedLoop.verify(.pointer, pointerOnTarget: inside)
+                detail["pointer_on_target"] = inside.map(JSONValue.bool) ?? .null
+            } else if let pressed, let before, mechanism["verified"] != .bool(true) {
+                verdict = Self.pressVerdict(pressed, before: before, after: after)
             }
-            let truthfulDescription = visibleValueChanged
-                    || (changed == true && allowGenericScreenChangeVerification)
-                ? description
-                : (unverifiedDescription ?? description)
-            let neutralObservation = mechanism["holding"] != nil
-                && mechanism["holding"] != .null
-                && Self.bool(mechanism["hand_neutral"]) == true
-                ? " The held keys were released and the hand returned neutral."
-                : ""
+            if let verdict { detail.merge(verdict.receipt) { _, new in new } }
+            let verified = detail["verified"] == .bool(true)
+            detail["verification"] = .string(verified ? MotorVerificationState.satisfied.rawValue
+                : detail["status"] == .string("acted_mismatch") ? MotorVerificationState.failed.rawValue
+                : MotorVerificationState.unverified.rawValue)
+            let note = Self.string(detail["status_note"])
+                ?? "The input went out, but the declared effect could not be read back."
+            let neutral = mechanism["holding"] != nil && mechanism["holding"] != .null
+                && mechanism["hand_neutral"] == .bool(true)
+                ? " The held keys were released and the hand returned neutral." : ""
             return MacFourVerbsReply(
-                ok: true,
-                text: truthfulDescription + observation + neutralObservation + "\n" + after.render,
-                detail: detail
-            )
+                ok: detail["status"] != .string("acted_mismatch"),
+                text: (verified ? description : unverifiedDescription ?? description)
+                    + " " + note + neutral + "\n" + after.render, detail: detail)
         }
     }
 
-    /// A pointer press judged by the one judge, `MacActClosedLoop.pressEvidence`,
-    /// over the look before and the look after, each with its own bounds: a
-    /// capped or cut read makes turnover no evidence.
-    static func pressVerdict(_ pressed: ActTarget?, before: Sighting?, after: Sighting) -> (own: Bool, consequence: Bool)? {
-        guard let pressed, let beforePercept = before?.percept, let afterPercept = after.percept else { return nil }
+    /// Pointer and AX presses declare the same surface effect, judged from AX.
+    static func pressVerdict(_ pressed: ActTarget, before: Sighting, after: Sighting) -> MacActClosedLoop.ActClassification {
+        guard before.pid != nil, before.pid == after.pid,
+              let beforePercept = before.percept, let afterPercept = after.percept else {
+            return MacActClosedLoop.verify(.surface(nil))
+        }
         func caps(_ percept: MacLookPercept) -> MacLookCompileCaps {
             MacLookCompileCaps(truncated: percept.truncated || percept.affordancesOmitted > 0)
         }
-        let frame = MacLookFrame.from(percept: beforePercept, frameId: before?.frameId ?? "", capturedAt: Date(),
+        let frame = MacLookFrame.from(percept: beforePercept, frameId: before.frameId, capturedAt: Date(),
                                       windowTitle: beforePercept.windowTitle, caps: caps(beforePercept))
-        guard let entry = frame.entries[pressed.handle] else { return nil }
+        guard let entry = frame.entries[pressed.handle] else { return MacActClosedLoop.verify(.surface(nil)) }
         let diff = MacActClosedLoop.diff(before: frame, after: afterPercept,
                                          afterWindowTitle: afterPercept.windowTitle, afterCaps: caps(afterPercept))
-        return MacActClosedLoop.pressEvidence(diff, before: frame, pressed: entry, clicked: true)
+        return MacActClosedLoop.verify(.surface(nil), diff: diff, press: (frame, entry))
     }
 
     // MARK: - One sighting
@@ -958,7 +879,7 @@ extension MacFourVerbs {
     }
 
     static func ownAppRoute(verb: String? = nil, target: String = "", text: String? = nil) -> MacFourVerbsReply {
-        var input: [String: JSONValue] = ["page": .string("current")]
+        var input: [String: JSONValue] = ["page": .string("visible")]
         let verb = verb?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let target = target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         var executable = verb == nil

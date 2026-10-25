@@ -1,6 +1,7 @@
 // Diagnostic optional-result API and iOS timeout wording; Shared owns the race.
 import Foundation
 import NativeAgentShared
+// Blueprint: | `CKLandmine.swift` | `withCKTimeout` |
 
 // 2026-09-07: the timeout latch lives in NativeAgentShared (CloudKitTimeoutResultLatch)
 // so the cancellation-before-registration fix is one implementation for Mac, device

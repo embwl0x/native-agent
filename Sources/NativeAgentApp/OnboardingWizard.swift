@@ -2,9 +2,11 @@ import ProviderRouting
 import AppToolRuntime
 import Onboarding
 import EngineRuntime
+import NativeAgentCore
 // PATCH-2026-05-07: onboarding-2 Generic onboarding wizard — name + persona type
 import SwiftUI
 import AppKit
+// Blueprint: | `OnboardingWizard.swift` | `OnboardingWizard` struct; provider rows, connection and Chat readiness derive from ProvidersFacade settings; only setup progress and drafts are local |
 
 // MARK: - Models
 
@@ -56,54 +58,51 @@ final class OnboardingWizardState {
     /// a female/male/ai choice (User, 2026-07-04: "just give it a name and tell
     /// it your name"). Fixed to "ai"; the backend still accepts it.
     var personaType: String = "ai"
-    /// Provider connection captured during the `.provider` step. Skippable
-    /// (User, 2026-07-04: "strongly suggest, allow skip"), so `connected`
-    /// stays false when the user moves past without connecting — the chat
-    /// surface then shows an honest "connect a provider" prompt.
-    var providerConnected: Bool = false
-    var connectedProviderLabel: String?
-    var providers: [ProviderInfo] = []
+    var providers: [ProviderInfo] { draftOwner?.engine.providers.connections ?? [] }
     var providersLoading = false
     var savingModel = false
-    var chatModelReady = false
-    var providerLoadError: String?
+    var providerLoadError: String? {
+        draftOwner?.engine.providers.settingsError == nil ? nil : "Couldn't check your connected accounts"
+    }
+    var providerConnected: Bool {
+        !providersLoading && providerLoadError == nil && providers.contains { $0.auth_status.eligible }
+    }
+    var connectedProviderLabel: String? {
+        let ready = providers.filter { $0.auth_status.eligible }
+        let providerID = draftOwner?.engine.providers.settings?.activeProviders["chat"]
+        return (ready.first { $0.provider_id == providerID } ?? ready.first)?.display_name
+    }
+    var chatModelReady: Bool {
+        guard let settings = draftOwner?.engine.providers.settings else { return false }
+        return ProvidersFacade.chatModelIsReady(
+            providers: settings.providers, providerID: settings.activeProviders["chat"] ?? "",
+            model: settings.preferences["chat"]?.model ?? ""
+        )
+    }
     private var pendingConnectedProviderID: String?
-    private var providerLoadGeneration = 0
+    @ObservationIgnored private let providerRead = LatestRead()
+    private var pendingProviderReads = 0
 
     /// A retry retains the explicit sign-in choice without treating cached rows as proof.
     func reloadProviders(
         connectedId: String? = nil,
-        list: () async throws -> [ProviderInfo],
+        refresh: () async -> Bool,
         adopt: (String) async -> Void
     ) async {
         if let connectedId { pendingConnectedProviderID = connectedId }
-        providerLoadGeneration += 1
-        let generation = providerLoadGeneration
+        pendingProviderReads += 1
+        defer { pendingProviderReads -= 1; providersLoading = pendingProviderReads > 0 }
         providersLoading = true
-        chatModelReady = false
-        providerConnected = false
-        do {
-            let refreshed = try await list()
-            guard generation == providerLoadGeneration else { return }
-            providers = refreshed
-            providerLoadError = nil
-            let ready = refreshed.filter { $0.auth_status.eligible }
-            if let pendingConnectedProviderID,
-               let connected = ready.first(where: { $0.provider_id == pendingConnectedProviderID }) {
-                self.pendingConnectedProviderID = nil
-                await adopt(connected.provider_id)
-                guard generation == providerLoadGeneration else { return }
-                connectedProviderLabel = connected.display_name
-            } else if !ready.contains(where: { $0.display_name == connectedProviderLabel }) {
-                connectedProviderLabel = ready.first?.display_name
-            }
-            providerConnected = !ready.isEmpty
-        } catch {
-            guard generation == providerLoadGeneration else { return }
-            providerLoadError = "Couldn't check your connected accounts"
-            connectedProviderLabel = nil
+        var connected: String?
+        _ = await providerRead.read({ await refresh() }, publish: { refreshed in
+        if refreshed,
+           let pendingConnectedProviderID,
+           providers.contains(where: { $0.provider_id == pendingConnectedProviderID && $0.auth_status.eligible }) {
+            self.pendingConnectedProviderID = nil
+            connected = pendingConnectedProviderID
         }
-        providersLoading = false
+        })
+        if let connected { await adopt(connected) }
     }
     // Blank by default — never pre-fill from the macOS account name
     // (NSFullUserName): a public user's Mac account isn't their answer to
@@ -564,9 +563,8 @@ struct OnboardingWizard: View {
     /// done. Reached from BOTH completion paths: submit-success and the
     /// payload-free pending-recovery resume.
     ///
-    /// Fresh-install scaffold (2026-07-04, User: "it starts with a bunch of red
-    /// warnings"): create the app-owned runtime JSON stores + bridge dirs now,
-    /// so first launch lands clean.
+    /// The remaining scaffold repairs run through their registered owners.
+    /// Runtime stores begin through canonical owners, never Doctor defaults.
     ///
     /// gpt-5.5 review BLOCKING 2 (2026-08-02): the repair result was DISCARDED,
     /// so a repair that threw — or that reported failing scaffold checks over a
@@ -754,7 +752,7 @@ private struct ProviderConnectStep: View {
     @Bindable var state: OnboardingWizardState
     @Environment(AppModel.self) private var appModel
 
-    @State private var configureSheet: ProviderInfo? = nil
+    @State private var configureSheet: String? = nil
     @State private var showsAPIKeys = false
     @State private var modelSaveError: String?
 
@@ -816,7 +814,7 @@ private struct ProviderConnectStep: View {
                         // 2026-09-22: sign-in rows repeat the buttons above;
                         // onboarding lists API-key rows only (Providers keeps all).
                         ForEach(state.providers.filter { !Self.signInProviderIDs.contains($0.provider_id) }) { provider in
-                            ProviderRowView(provider: provider) { configureSheet = provider }
+                            ProviderRowView(provider: provider) { configureSheet = provider.provider_id }
                         }
                     }
                     .padding(.top, 12)
@@ -874,19 +872,19 @@ private struct ProviderConnectStep: View {
             }
             .padding(.vertical, 4)
         }
-        .sheet(item: $configureSheet) { provider in
+        .sheet(isPresented: Binding(get: { configureSheet != nil }, set: { if !$0 { configureSheet = nil } })) {
+            if let provider = appModel.engine.providers.connections.first(where: { $0.provider_id == configureSheet }) {
             ProviderConfigSheet(provider: provider) {
                 let configuredId = provider.provider_id
                 configureSheet = nil
                 Task { await reload(connectedId: configuredId) }
             }
             .environment(appModel)
+            }
         }
         .task {
             await reload()
         }
-        // The chat model can be set from anywhere, not only this sheet's picker.
-        .onChange(of: [appModel.chatProvider, appModel.chatModel]) { updateModelReadiness() }
     }
 
     /// Reload the provider list and reflect whether ANY provider is ready.
@@ -900,19 +898,8 @@ private struct ProviderConnectStep: View {
     private func reload(connectedId: String? = nil) async {
         await state.reloadProviders(
             connectedId: connectedId,
-            list: {
-                let snapshot = try await appModel.engine.providers.routing.checkedProviderSnapshot()
-                appModel.applySurfacePickerSnapshot(snapshot.routing)
-                return try await appModel.engine.providers.list()
-            },
+            refresh: { await appModel.loadProvidersForChat() },
             adopt: { await appModel.adoptProviderForBlankSurfaces($0) }
-        )
-        updateModelReadiness()
-    }
-
-    private func updateModelReadiness() {
-        state.chatModelReady = ProvidersFacade.chatModelIsReady(
-            providers: state.providers, providerID: appModel.chatProvider, model: appModel.chatModel
         )
     }
 }

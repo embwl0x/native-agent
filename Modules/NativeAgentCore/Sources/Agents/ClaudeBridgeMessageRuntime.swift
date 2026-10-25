@@ -2,7 +2,8 @@ import Foundation
 import ChatTurnContracts
 import Darwin
 import CryptoKit
-import ChatOrchestration
+import ChatTurnRuntime
+import AgentConversations
 import AgentWorkspace
 import NativeAgentCore
 import NativeAgentShared
@@ -10,6 +11,7 @@ import PersistenceCore
 import Privacy
 import TurnTrace
 import Transcripts
+// Blueprint: | `ClaudeBridgeMessageRuntime.swift` | Bridge message admission/delivery and the retained chat client; event publication is a weak callback to the HTTP runtime |
 
 /// App selection, transport publication and existing delivery adapters used by
 /// the Core conversation owner. Authentication happens before this boundary.
@@ -19,9 +21,6 @@ public protocol ClaudeBridgeMessagePort: Sendable {
     func chatClient() -> any ChatOrchestrationClient
     func completionSender(dataRoot: URL) -> any AgentBridgeCompletionSending
     func publishChatTurnCompleted(sessionID: String?) async
-    func handleCodexCompletion(messageIds: [String], codexStatus: String, summary: String,
-                               threadId: String?, turnId: String?, errorMessage: String?,
-                               noWorkObserved: Bool?) async
 }
 
 /// Admission, enqueue, completion and durable return receipts for the existing
@@ -124,6 +123,13 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         }
         let isCodexCompletion = json["completion"] is [String: Any]
         let dataRoot = PersistenceCore.defaultDataRoot()
+        if isCodexCompletion {
+            do {
+                guard try DataRootLife.isCurrent(json["lifeID"] as? String, in: dataRoot) else {
+                    response(409, ["status": "stopped", "reason": DataRootLife.stoppedReason]); return
+                }
+            } catch { response(503, ["error": "life_id_unavailable", "detail": error.localizedDescription]); return }
+        }
         let owner = AgentContactIdentity(dataRoot: dataRoot).canonical("peer:" + principal.id)
         let threadOwner = owner.hasPrefix("peer:") ? String(owner.dropFirst(5)) : owner
         let requestedSessionId = json["sessionId"] as? String
@@ -184,21 +190,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             response(400, ["error": "codex_completion_digest_failed"])
             return
         }
-        let githubCommandCompletion: (messageIds: [String], status: String, threadId: String?, turnId: String?, errorMessage: String?, noWorkObserved: Bool?)? = {
-            guard let completion = json["completion"] as? [String: Any] else { return nil }
-            let messageIds = (completion["messageIds"] as? [Any])?.compactMap { $0 as? String } ?? []
-            guard !messageIds.isEmpty else { return nil }
-            return (
-                messageIds,
-                completion["codexStatus"] as? String ?? "unknown",
-                completion["threadId"] as? String,
-                completion["turnId"] as? String,
-                // JSON null decodes as NSNull, which fails both casts to nil —
-                // exactly the "unknown" reading the three-state field wants.
-                completion["errorMessage"] as? String,
-                completion["noWorkObserved"] as? Bool
-            )
-        }()
         let completionRoute: AgentBridgeCompletionRoute? = {
             guard isCodexCompletion else { return nil }
             return AgentBridgeCompletionRoute(
@@ -269,7 +260,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 } else {
                     callerResultIsTool = false
                 }
-                let resp: ChatOrchestration.ChatResponse
+                let resp: ChatTurnRuntime.ChatResponse
                 var wasCached = false
                 if let deliveryId, let completionRequestDigest {
                     let responseRunID = CausalTransitionEvidence.opaqueIdentity(deliveryId)
@@ -300,17 +291,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                         return
                     case .start:
                         lifecycleClaimed = true
-                        if let completion = githubCommandCompletion {
-                            await self.port.handleCodexCompletion(
-                                messageIds: completion.messageIds,
-                                codexStatus: completion.status,
-                                summary: rawText,
-                                threadId: completion.threadId,
-                                turnId: completion.turnId,
-                                errorMessage: completion.errorMessage,
-                                noWorkObserved: completion.noWorkObserved
-                            )
-                        }
                         var request = baseRequest
                         request.replyRoute = completionRoute?.chatToolReplyRoute
                         request.pinnedRunID = responseRunID
@@ -322,7 +302,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                                 model: "",
                                 reasoningEffort: nil
                         )
-                        let generated: ChatOrchestration.ChatResponse
+                        let generated: ChatTurnRuntime.ChatResponse
                         if callerResultIsTool {
                             generated = .init(runId: responseRunID, model: "", output: rawText,
                                               sessionId: sessionId, attachments: attachments, providerCallCount: 0)
@@ -366,17 +346,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                         return
                     }
                 } else {
-                    if let completion = githubCommandCompletion {
-                        await self.port.handleCodexCompletion(
-                            messageIds: completion.messageIds,
-                            codexStatus: completion.status,
-                            summary: rawText,
-                            threadId: completion.threadId,
-                            turnId: completion.turnId,
-                            errorMessage: completion.errorMessage,
-                            noWorkObserved: completion.noWorkObserved
-                        )
-                    }
                     var request = baseRequest
                     request.pinnedRunID = requestID
                     request.codexCompletion = CodexCompletionTranscriptBinding(
@@ -1035,15 +1004,15 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         return text + "\n\n[\(skips.count) \(noun) not attached: " + skips.joined(separator: "; ") + ". The sender can resend the file\(skips.count == 1 ? "" : "s").]"
     }
 
-    static func bridgeImageAttachments(_ paths: [String]) -> [ChatOrchestration.MultimodalAttachment] {
+    static func bridgeImageAttachments(_ paths: [String]) -> [ChatTurnRuntime.MultimodalAttachment] {
         let mimes = ["png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"]
-        var out: [ChatOrchestration.MultimodalAttachment] = []
+        var out: [ChatTurnRuntime.MultimodalAttachment] = []
         for raw in paths.prefix(4) {
             let url = URL(fileURLWithPath: raw.trimmingCharacters(in: .whitespacesAndNewlines))
             guard let mime = mimes[url.pathExtension.lowercased()],
                   let data = try? Data(contentsOf: url),
                   !data.isEmpty, data.count <= 8 * 1024 * 1024 else { continue }
-            out.append(ChatOrchestration.MultimodalAttachment(
+            out.append(ChatTurnRuntime.MultimodalAttachment(
                 type: "image", base64: data.base64EncodedString(), mime: mime,
                 name: url.lastPathComponent, byteSize: data.count, path: url.path
             ))
@@ -1052,7 +1021,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     }
 
     static func bridgeAttachmentPayload(
-        _ attachments: [ChatOrchestration.MultimodalAttachment]?
+        _ attachments: [ChatTurnRuntime.MultimodalAttachment]?
     ) -> [[String: Any]] {
         (attachments ?? []).map { attachment in
             [
@@ -1066,7 +1035,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         }
     }
 
-    static func codexCompletionRequestDigest(_ json: [String: Any], attachments: [ChatOrchestration.MultimodalAttachment]) -> String? {
+    static func codexCompletionRequestDigest(_ json: [String: Any], attachments: [ChatTurnRuntime.MultimodalAttachment]) -> String? {
         var canonical: [String: Any] = [:]
         for key in ["text", "sessionId", "origin", "completion", "image_paths"] {
             if let value = json[key] { canonical[key] = value }
@@ -1161,7 +1130,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     }
 
     /// The answer goes back to the chat that asked, from this who's own conversation.
-    func answerAskingChat(replyTo messageID: String, response: ChatOrchestration.ChatResponse, turnSession: String?, owner: String) async {
+    func answerAskingChat(replyTo messageID: String, response: ChatTurnRuntime.ChatResponse, turnSession: String?, owner: String) async {
         let dataRoot = PersistenceCore.defaultDataRoot()
         let identity = AgentContactIdentity(dataRoot: dataRoot)
         let threadOwner = owner.hasPrefix("peer:") ? String(owner.dropFirst(5)) : owner

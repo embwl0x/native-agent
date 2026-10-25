@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ContextFeedback.swift` | `ContextFeedbackReducer`: deterministic rebuildable utility projection from explicit-bucket feedback and canonical seeds |
+
 // FC7 feedback is deliberately a pure, rebuildable projection. This file has
 // no persistence or owning-system dependencies: authority/privacy arrive from
 // canonical sources, and durable learning can leave Context only as a proposal.

@@ -44,12 +44,16 @@
 	<string>26.0</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>NativeAgent uses Apple Events to coordinate with system applications.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>NativeAgent uses Bluetooth when you ask it to work with a Bluetooth device.</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>NativeAgent uses full calendar access to read upcoming events for assistant briefings and user-approved watch jobs.</string>
 	<key>NSCalendarsUsageDescription</key>
 	<string>NativeAgent uses calendar access for assistant briefings and user-approved watch jobs.</string>
 	<key>NSCalendarsWriteOnlyAccessUsageDescription</key>
 	<string>NativeAgent uses write-only calendar access to create events only when the user enables Calendar write access.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>NativeAgent uses the camera when you ask it to.</string>
 	<key>NSContactsUsageDescription</key>
 	<string>NativeAgent uses Contacts so the assistant can look up people you ask about and (with the Contacts write toggle on) create or update contacts on your behalf.</string>
 	<key>NSDesktopFolderUsageDescription</key>

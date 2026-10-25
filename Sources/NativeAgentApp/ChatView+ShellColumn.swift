@@ -1,9 +1,10 @@
 import EngineRuntime
 import AppToolRuntime
-import ChatOrchestration
+import ChatSessionWork
 import SwiftUI
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `ChatView+ShellColumn.swift` | `ChatView`: `shellSessionHasUnsentWork`, `shellSessionIsPinned`, `shellSessionRow` |
 
 // ui-simplify 2026-09-02 (Lane A): the conversations column.
 //
@@ -89,7 +90,7 @@ extension ChatView {
                     Task {
                         await appModel.newChatSession()
                         await MainActor.run {
-                            renameTitle = activeSession?.title ?? ""
+                            renameTitle = activeSession?.displayTitle ?? ""
                         }
                     }
                 } label: {
@@ -138,7 +139,7 @@ extension ChatView {
                     guard let id, id != appModel.activeChatSessionId, renamingSessionId == nil,
                           let session = (sections.rows + sections.briefs + sections.working)
                             .first(where: { $0.id == id }) else { return }
-                    renameTitle = session.title
+                    renameTitle = session.displayTitle
                     Task { await appModel.selectChatSession(session) }
                 }
             )) {
@@ -212,14 +213,13 @@ extension ChatView {
     /// The conversations column's blocks as this chat's view shows them;
     /// none shown, no column (Simple's profile, as seeded).
     var shellColumnBlocks: [String] {
-        SurfaceLayoutLive.shared.layout.shown("chat", profile: layoutProfile).map(\.name)
+        appModel.engine.layout.layout.shown("chat", profile: layoutProfile).map(\.name)
     }
 
     /// A fold the person opens or closes: the layout's, written as theirs.
     func shellFold(_ block: String) -> Binding<Bool> {
-        let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        return Binding(get: { SurfaceLayoutLive.shared.layout.expanded("chat", block) },
-                       set: { open in Task.detached { SurfaceLayoutStore.setExpanded(open, surface: "chat", block: block, dataRoot: root) } })
+        Binding(get: { appModel.engine.layout.layout.expanded("chat", block) },
+                set: { open in Task { await appModel.engine.setSurfaceExpanded(open, surface: "chat", block: block) } })
     }
 
     /// One row. While a rename is in flight the classic `SessionRow` renders
@@ -230,13 +230,10 @@ extension ChatView {
     func shellSessionRow(_ session: ChatSession) -> some View {
         let renaming = renamingSessionId == session.id
         let isPinned = shellSessionIsPinned(session)
-        let _ = ChatShellNaming.settle(session, transcripts: appModel.engine.transcripts) { id, title in
-            await appModel.renameChatSession(id: id, title: title)
-        }
         let selectSession: () -> Void = {
             guard !renaming else { return }
             if renamingSessionId != nil { renamingSessionId = nil }
-            renameTitle = session.title
+            renameTitle = session.displayTitle
             Task { await appModel.selectChatSession(session) }
         }
         Group {
@@ -277,7 +274,7 @@ extension ChatView {
         }
         .overlay {
             if !renaming {
-                SessionDragSource(sessionId: session.id, sessionTitle: session.title)
+                SessionDragSource(sessionId: session.id, sessionTitle: session.displayTitle)
             }
         }
         .contextMenu {
@@ -305,12 +302,9 @@ extension ChatView {
 
     // MARK: - The room's felt state
 
-    /// True while an approval is waiting on a decision. This is the ONE thing
-    /// that spends the teal.
+    /// Only approvals waiting on the owner's decision spend the teal.
     var shellHasPendingApproval: Bool {
-        appModel.engine.approvals.records.contains {
-            $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "pending"
-        }
+        !WorkOverviewRead.waitingApprovals(appModel.engine.approvals.records).isEmpty
     }
 
     /// True when her last turn came apart. Derived from the transcript that is
@@ -368,12 +362,13 @@ extension ChatView {
             latestRequest: transcriptLatestRequest,
             onPagedBackChange: { [scrollCoordinator] in scrollCoordinator.transcriptPagedBack = $0 }
         )
-        // The join. The transcript asks for the cards belonging to a row; the
-        // binding answers from the persisted interactions of this session, and
-        // a tap goes to the resolver, which opens the control that already
-        // exists and then asks THAT control's owner what happened.
-        .environment(\.inlineCardSource) { [inlineCards] rowID in
-            inlineCards.cards(forRow: rowID)
+        .safeAreaInset(edge: .top) {
+            if case .unavailable(let reason) = appModel.engine.transcripts.transcriptReadStatus(for: appModel.activeChatSessionId) {
+                Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            }
+        }
+        .environment(\.inlineCardSource) { [appModel] rowID in
+            appModel.engine.transcripts.cards(forRow: rowID, in: appModel.activeChatSessionId)
         }
         .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
             inlineCards.handle(card: card, action: action, appModel: appModel)

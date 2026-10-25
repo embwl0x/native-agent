@@ -4,6 +4,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import ToolExecution
+// Blueprint: | `AppQuietToolHost+Mind.swift` | `AppQuietToolHost`: `runMind`, `managePart` |
 
 extension AppQuietToolHost {
     // MARK: - mind_run
@@ -44,13 +45,11 @@ extension AppQuietToolHost {
             })
     }
 
-    // MARK: - skill_manage
+    // MARK: - ability_manage
 
-    func manageSkill(verb: String, input: [String: JSONValue], steer: [String]) async -> QuietMindOutcome {
-        let outcome = await CapabilityLifecycleCommands(dataRootOverride: appModel.dataRootOverride,
-            tools: appModel.engine.tools, formatFailure: { error, action in
-                UserFacingError.message(error, action: action)
-            }).manageSkill(verb: verb, input: input, steer: steer)
+    func managePart(verb: String, input: [String: JSONValue], steer: [String]) async -> QuietMindOutcome {
+        let outcome = await CapabilityLifecycleCommands(dataRootOverride: appModel.dataRootOverride)
+            .managePart(verb: verb, input: input, steer: steer)
         if outcome.refreshSkills { await appModel.loadSkillManifests() }
         // The Tools page's own refresh, its catalog too, so a dropped tool leaves
         // both lists; before the verb's status, which the refresh must not overwrite.

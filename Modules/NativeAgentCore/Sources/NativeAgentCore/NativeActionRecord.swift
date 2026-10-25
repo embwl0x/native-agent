@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `NativeActionRecord.swift` | `NativeActionRecord` struct |
 
 public struct NativeActionRecord: Identifiable, Codable, Hashable, Sendable {
     public var id: String

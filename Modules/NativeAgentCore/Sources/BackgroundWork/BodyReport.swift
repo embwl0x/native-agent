@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+// Blueprint: | `BodyReport.swift` | Crash breadcrumb paths and fatal-signal/process-exit logging |
 
 /// The crash breadcrumbs: a launch row opens each run, the exit row closes
 /// a clean one, a fatal-signal row names a crash; nothing after the launch

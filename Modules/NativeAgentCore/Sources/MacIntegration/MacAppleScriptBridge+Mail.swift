@@ -3,6 +3,7 @@ import Foundation
 import AppKit
 import SQLite3
 import PersistenceCore
+// Blueprint: | `MacAppleScriptBridge+Mail.swift` | `MacAppleScriptBridge`: `mailListRecent`, `mailSearch`, `mailSend`, `mailDraft` |
 
 extension MacAppleScriptBridge {
     // MARK: MAIL

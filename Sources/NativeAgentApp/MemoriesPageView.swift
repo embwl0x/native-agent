@@ -60,6 +60,7 @@ import NativeAgentShared
 import NativeAgentCore
 import MemoryV2
 import PersistenceCore
+// Blueprint: | `MemoriesPageView.swift` | `MemoriesPageView` struct |
 
 // MARK: - Metrics
 
@@ -198,9 +199,9 @@ enum MemoriesPageContent {
     /// and the proposals named for what they are, memories to look at, never
     /// "waiting on you" (Today and the Desk own that count). Nil until the
     /// memories have been read: a page that has not looked says nothing.
-    static func headerLine(loaded: Bool, failed: Bool, kept: Int, toLookAt: Int) -> String? {
+    static func headerLine(loaded: Bool, failed: Bool, kept: Int?, toLookAt: Int) -> String? {
         guard loaded else { return nil }
-        if failed { return "I couldn't refresh all my memories just now." }
+        guard !failed, let kept else { return "I couldn't refresh all my memories just now." }
         let keep: String
         switch kept {
         case 0: keep = "No memories loaded."
@@ -217,7 +218,7 @@ enum MemoriesPageContent {
         return headerLine(
             loaded: status != nil,
             failed: status?.failedEndpoints.contains("memories") == true,
-            kept: appModel.engine.memory.memories.count,
+            kept: appModel.engine.memory.totalCount,
             toLookAt: appModel.engine.memory.proposals.filter { $0.status == "pending" }.count)
     }
 
@@ -281,7 +282,6 @@ struct MemoriesPageView: View {
     @State private var query = ""
     @State private var loaded = false
     @State private var readCount = 0
-    @State private var rejectedProposals: [ProposalRecord] = []
     @State private var rejectedShown = MemoriesPageMetrics.foldRowCap
     @State private var now = Date()
     @State private var searchTask: Task<Void, Never>?
@@ -441,7 +441,7 @@ struct MemoriesPageView: View {
                 loaded: loaded,
                 failed: memory.proposalsReadFailed
                     || appModel.panelRefreshStatus[.memories]?.failedEndpoints.contains("memories") == true,
-                kept: memories.count,
+                kept: memory.totalCount,
                 toLookAt: pendingProposals.count),
             lineID: "memories.kept-line")
     }
@@ -582,8 +582,8 @@ struct MemoriesPageView: View {
 
     @ViewBuilder
     private var deletedFold: some View {
-        if !rejectedProposals.isEmpty {
-            let count = rejectedProposals.count
+        if !memory.rejectedProposals.isEmpty {
+            let count = memory.rejectedProposals.count
             MemoriesFold(
                 title: "\(count) \(DeskPageWords.plural(count, "thing I let go", "things I let go"))",
                 isOpen: binding(Fold.deleted)
@@ -592,7 +592,7 @@ struct MemoriesPageView: View {
                 // restore, and MemoryV2 has no un-reject. A "Bring it back"
                 // button here would be a button that cannot do anything.
                 AliveGroupCard {
-                    MemoriesRejectedHistory(proposals: rejectedProposals, shown: $rejectedShown) { proposal in
+                    MemoriesRejectedHistory(proposals: memory.rejectedProposals, shown: $rejectedShown) { proposal in
                         fullText = MemoriesFullText(
                             id: proposal.id, text: proposal.content)
                     }
@@ -670,13 +670,8 @@ struct MemoriesPageView: View {
         // The same five-queue read the classic page's Refresh performs, so the
         // memories, the proposals and the status all move together.
         await appModel.refreshForSidebarItem(.memories)
-        do {
-            let rejected = try await memory.proposals(status: "rejected")
-            guard !Task.isCancelled else { return }
-            rejectedProposals = rejected
-        } catch {
-            notice = "Could not reload rejected memory history."
-        }
+        await memory.refreshRejectedHistory()
+        if let error = memory.rejectedHistoryError { notice = error }
         guard !Task.isCancelled else { return }
         now = Date()
         loaded = true
@@ -713,7 +708,6 @@ struct MemoriesFold<Content: View>: View {
     let title: String
     @Binding var isOpen: Bool
     @ViewBuilder let content: () -> Content
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         // The Mac's own disclosure (User 09-27: all controls native).

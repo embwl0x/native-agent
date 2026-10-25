@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceWork.swift` | `AgentWorkspaceWork` enum; `desk`, `continuation` |
 
 /// Work navigation binds only canonical handles and typed owner continuations.
 /// Free text, archived claims and nested recipes never become executable work.

@@ -3,6 +3,8 @@ import Foundation
 import Darwin
 #endif
 
+// Blueprint: | `ProcessTreeReaper.swift` | `ProcessTreeReaper`: process-start-identity snapshots and leaf-first subprocess termination; reused PIDs never receive stale signals |
+
 /// PID plus immutable process-start identity. A retained PID is signaled only
 /// while its current BSD identity still matches this value, preventing a PID
 /// reused during the escalation grace window from receiving a stale kill.

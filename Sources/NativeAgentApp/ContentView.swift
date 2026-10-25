@@ -10,7 +10,6 @@ import Speech
 import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
-import ChatOrchestration
 import MemoryV2
 import Onboarding
 import PersistenceCore
@@ -22,6 +21,8 @@ import CloudKit
 import DeviceSync
 #endif
 
+// Blueprint: | `ContentView.swift` | `ContentView`: Simple/Advanced/Agent shell assembly, navigation destinations, first-run presentation and iCloud action refresh routing |
+
 struct ContentView: View {
     // Liquid Feel W4: page-switch transition respects Reduce Motion.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -31,10 +32,16 @@ struct ContentView: View {
     @State private var hasMountedBots = false
     @SceneStorage("skillsToolsSection") private var skillsToolsSectionRaw = SkillsToolsSection.skills.rawValue
     @AppStorage("nativeagent.showTour") private var showTour = false
-    /// Simple | Advanced (SimpleViewMode.swift).
+    /// The visible Simple, Advanced or Agent shell.
     @AppStorage(SimpleViewMode.key) private var viewModeRaw = ""
     /// ⌘0 hides the rail (and Chat's conversations column) so chat fills the window.
     @AppStorage(WorkPaneState.sidebarsHiddenKey) private var sidebarsHidden = false
+    @AppStorage(WorkPaneState.openKey) private var workPaneOpen = false
+    @AppStorage(ShellRailTab.storageKey(.capabilities)) private var capabilitiesTab = "capabilities"
+    private var sensesVisible: Bool {
+        !showsSimpleView && !showsAgentView && ((isShowingChat && workPaneOpen)
+            || (activeContentItem == .capabilities && capabilitiesTab == "senses"))
+    }
     private var showsSimpleView: Bool { SimpleViewMode.resolved(viewModeRaw) == SimpleViewMode.simple }
     private var showsAgentView: Bool { SimpleViewMode.resolved(viewModeRaw) == SimpleViewMode.agent }
     @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
@@ -59,6 +66,7 @@ struct ContentView: View {
     // .newWorkshopTaskRequest and the sheet lives on this attachment point.
     @State private var showNewWorkshopTask = false
     @State private var navigationMountID: UUID?
+    @State private var agentRoom = "home"
 
     private var selection: Binding<SidebarItem> {
         Binding {
@@ -69,7 +77,7 @@ struct ContentView: View {
             // (gpt-5.5 review MED, 2026-07-03 dead-weight sweep).
             let item = (SidebarItem(rawValue: selectionRaw) ?? .chat).normalized
             // User, 2026-09-04: a saved selection naming a page that is a tab
-            // now (Knowledge graph, MCP, Dreams, Telegram, Mac integration)
+            // now (Knowledge graph, Dreams, Telegram, Mac integration)
             // reads as its rail page, so the rail shows a row and the page
             // has its frame.
             if let home = SidebarItem.shellHome(for: item) { return home.parent }
@@ -118,7 +126,7 @@ struct ContentView: View {
             if showsSimpleView {
                 SimpleShellView()
             } else if showsAgentView {
-                AgentScreenView()
+                AgentScreenView(room: $agentRoom)
             } else {
             ShellFrame {
                 // ui-simplify 2026-09-02 (Lane A): the rail. Five places with
@@ -134,7 +142,7 @@ struct ContentView: View {
                 ShellSidebarRail(
                     selection: selection,
                     needsYou: Set(
-                        SidebarItem.rail(SurfaceLayoutLive.shared.layout).compactMap { $0 }
+                        SidebarItem.rail(appModel.engine.layout.layout).compactMap { $0 }
                             // Agent, 2026-09-02: a rail dot is a promise about the
                             // page under it. Today's dot reads what Today's header
                             // reads: the one Needs you count.
@@ -239,7 +247,7 @@ struct ContentView: View {
                     case .connectors: ConnectorsRailPage()
                     case .trust: TrustRailPage()
                     case .providers:
-                        ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, alive: true) { ProviderSettingsView() }
+                        ShellRailPage(title: "Providers", subtitlePage: .providers, alive: true) { ProviderSettingsView() }
                     case .macIntegration: MacIntegrationView()
                     case .settings:
                         // A route to Settings is a route to its ROOT, and
@@ -268,7 +276,6 @@ struct ContentView: View {
                     case .telegram: TelegramView()
                     case .inboxPolicy:
                         ShellRailPage(title: "Notifications", alive: true) { InboxSettingsView() }
-                    case .mcp: MCPHubView()
                     // ── Legacy aliases (unreachable post-normalize, kept exhaustive) ───
                     // .autoImprovement → .activity and .panels → .diagnostics
                     // joined this list in the 2026-07-03 dead-weight sweep.
@@ -333,24 +340,8 @@ struct ContentView: View {
             // keeps the approvals the turn card and Work pane read current.
             .task(id: scenePhase) {
                 guard scenePhase == .active else { return }
-                let root = PersistenceCore.defaultDataRoot()
-                let memoryDatabase = root
-                    .appendingPathComponent("memory", isDirectory: true)
-                    .appendingPathComponent("memory.sqlite")
-                var statusPaths = [
-                    root.appendingPathComponent("workflows/approvals/requests.json"),
-                    root.appendingPathComponent("notifications/inbox.jsonl"),
-                    memoryDatabase,
-                    URL(fileURLWithPath: memoryDatabase.path + "-wal"),
-                ]
-                if #available(macOS 27, *) {
-                    statusPaths += [
-                        root.appendingPathComponent("desk/desk_ops.jsonl"),
-                        root.appendingPathComponent("desk/desk_ops_base.json"),
-                    ]
-                }
-                await EventDeadlinePhysiology.refreshOnChanges(paths: statusPaths) {
-                    await appModel.refreshSidebarActivityBadge()
+                await appModel.engine.watchActivityChanges {
+                    _ = await appModel.refreshSidebarActivityBadge()
                 }
             }
             }
@@ -361,6 +352,7 @@ struct ContentView: View {
             // PATCH-2026-05-10: startup-tour-gate — only show when explicitly replayed from About.
             if showTour {
                 OnboardingTourOverlay(
+                    layout: appModel.engine.layout.layout,
                     onComplete: {
                         showTour = false
                     },
@@ -407,8 +399,12 @@ struct ContentView: View {
                 selectionRaw = home.parent.rawValue
             }
             guard navigationMountID == nil else { return }
-            navigationMountID = NativeAgentAppCoordinator.shared.mountMainScene(currentPage: {
-                QuietPages.all.first { $0.item == activeContentItem }
+            navigationMountID = NativeAgentAppCoordinator.shared.mountMainScene(visiblePageInput: {
+                switch SimpleViewMode.current {
+                case SimpleViewMode.simple: return ["page": .string("chat")]
+                case SimpleViewMode.agent: return ["page": .string("agent_view"), "item": .string(agentRoom)]
+                default: return QuietPages.all.first { $0.item == activeContentItem }.map { ["page": .string($0.id)] }
+                }
             }) { destination in
                 applyNavigationDestination(destination)
             }
@@ -422,9 +418,9 @@ struct ContentView: View {
             await appModel.reloadPersonality()
             await checkFirstRunOnboardingIfNeeded()
         }
-        // Every surface's order, visibility and folds (ui/layout.json),
-        // re-drawn the moment a write or a hand edit lands.
-        .task { await SurfaceLayoutLive.shared.watch() }
+        .liveTask(id: sensesVisible) {
+            if sensesVisible { await appModel.engine.senses.observe() }
+        }
         // All Mac projections of chat sessions share AppModel's one canonical
         // list: Chat, detached-window titles, Status, command search, and the
         // optional project/session lineage page. Keep it current from the
@@ -433,13 +429,7 @@ struct ContentView: View {
         // lightweight refresh also suppresses equal observed writes.
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
-            let sessionIndexPath = PersistenceCore.defaultDataRoot()
-                .appendingPathComponent("chat", isDirectory: true)
-                .appendingPathComponent("sessions.json")
-            await EventDeadlinePhysiology.refreshOnChanges(
-                paths: [sessionIndexPath],
-                debounceDelay: .milliseconds(150)
-            ) {
+            await appModel.engine.transcripts.watchIndexChanges {
                 await appModel.refreshChatSessionIndex()
             }
         }
@@ -499,7 +489,7 @@ struct ContentView: View {
             selectionRaw = SidebarItem.chat.rawValue
             guard let draft = note.object as? String, !draft.isEmpty else { return }
             if appModel.activeChatSessionId.isEmpty { return }
-            if appModel.chatDrafts[appModel.activeChatSessionId]?.isEmpty != false {
+            if appModel.chatDraft(for: appModel.activeChatSessionId).isEmpty {
                 appModel.injectChatDraft(draft, sessionId: appModel.activeChatSessionId)
             }
         }

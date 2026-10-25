@@ -2,6 +2,8 @@ import Foundation
 import Darwin
 import PersistenceCore
 import NativeAgentShared
+import TurnTrace
+// Blueprint: | `ChatSessionIndexFile.swift` | Canonical durable index writer and checked index schema and message-index, projection-generation, transcript-rewrite and retention-removal transactions; count/acknowledgment reads under index → transcript locks, retention on every message within the index transaction; `recordContinuityParticipant`, `recordConversationChange`; backup/export/sync/privacy decisions live here |
 
 public enum ChatSessionIndexFileError: Error, LocalizedError, Sendable, Equatable {
     case unreadable(path: String, reason: String)
@@ -35,13 +37,41 @@ public enum ChatSessionIndexFileError: Error, LocalizedError, Sendable, Equatabl
     }
 }
 
-/// Strict decoder for mutating `chat/sessions.json`.
+/// Checked mutation and durable commit owner for `chat/sessions.json`.
 ///
 /// A missing file is the only state treated as a new index. Existing files
 /// must be readable, non-empty JSON arrays containing only object rows. This
 /// prevents read failures and malformed rows from being collapsed into an
 /// empty index and overwritten by the next surface that creates a session.
+/// Callers hold its shared lock across read, row edits and write.
+/// Storage: local/off-disk backup and PrivacyMap/chat include it; data export
+/// excludes it. DeviceSync publishes selected session rows, not this raw file.
 public enum ChatSessionIndexFile {
+    public static func mutate<T: Sendable>(
+        at path: URL, using persistence: PersistenceCoreProtocol = SwiftNativePersistenceCore(),
+        _ mutation: @Sendable (inout [[String: JSONValue]]) async throws -> T
+    ) async throws -> T {
+        try await persistence.withFileLock(path) {
+            var rows = try loadObjectRowsForMutation(at: path)
+            let original = rows
+            let result = try await mutation(&rows)
+            if rows != original { try write(rows, to: path) }
+            return result
+        }
+    }
+
+    /// Compound transactions may commit before their next effect (retention,
+    /// binding publication). The existing lock scope remains held across both.
+    public static func write(_ rows: [[String: JSONValue]], to path: URL, removeWhenEmpty: Bool = false) throws {
+        try CredentialFileLock.withLock(path) {
+            if removeWhenEmpty && rows.isEmpty { try FileManager.default.removeItem(at: path) }
+            else {
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                    JSONValue.array(rows.map(JSONValue.object)).serializedData(pretty: true), to: path)
+            }
+        }
+    }
+
     private static let pendingSyncLock = NSLock()
     nonisolated(unsafe) private static var pendingSyncs: [String: Int] = [:]
 
@@ -148,6 +178,174 @@ public enum ChatSessionIndexFile {
             rows.append(row)
         }
         return rows
+    }
+
+    /// Canonical sessions.json message-index transaction. The JSON object-array
+    /// schema is locally backed up, excluded from production export, projected
+    /// to phone sessions/pins and inventoried under PrivacyMap's chat category.
+    /// Count and filesystem acknowledgment are read inside index → transcript
+    /// locks; retention remains inside the same index transaction on every message.
+    package static func recordMessage(
+        sessionId: String, role normalizedRole: String, source: String, sourceKey: String?,
+        timestamp: String, syncedAt: String, preview: String, stamp: TranscriptRowStamp,
+        title: String?, continuityParticipant: String?, continuityScope: String?,
+        dataRoot: URL, messagesPath: URL, persistence: any PersistenceCoreProtocol,
+        countMessages: @escaping @Sendable (URL) -> Int,
+        clock retentionClock: @escaping @Sendable () -> Date
+    ) async throws {
+        let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
+        try await persistence.withFileLock(sessionsPath) {
+            let snapshot = try await persistence.withFileLock(messagesPath) {
+                (count: countMessages(messagesPath),
+                 version: ChatSessionIndexFile.transcriptVersion(at: messagesPath))
+            }
+            let messageCount = snapshot.count
+            let parent = sessionsPath.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+
+            var updated: [String: JSONValue]? = nil
+            var remaining: [[String: JSONValue]] = []
+            for var row in rows {
+                guard case .string(let id)? = row["id"], id == sessionId else {
+                    remaining.append(row)
+                    continue
+                }
+                row["updatedAt"] = .string(syncedAt)
+                ChatSessionIndexFile.bumpTranscriptGeneration(in: &row)
+                row["messageCount"] = .int(Int64(messageCount))
+                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview); row[TranscriptRowStamp.previewKey] = stamp.json }
+                if let title,
+                   shouldReplaceSessionTitle(row["title"]) {
+                    row["title"] = .string(title)
+                }
+                if row["source"] == nil {
+                    row["source"] = .string(source)
+                }
+                if row["sourceKey"] == nil, let sourceKey {
+                    row["sourceKey"] = .string(sourceKey)
+                }
+                if normalizedRole == "user" {
+                    ChatSessionIndexFile.recordContinuityParticipant(
+                        in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount)
+                }
+                if row["threadKind"] == nil {
+                    let existingSource: String = {
+                        if case .string(let value)? = row["source"] { return value }
+                        return source
+                    }()
+                    row["threadKind"] = .string(
+                        ChatThreadKind.inferred(fromSource: existingSource).rawValue
+                    )
+                }
+                updated = row
+            }
+
+            if updated == nil {
+                var row: [String: JSONValue] = [
+                    "id": .string(sessionId),
+                    "title": .string(title ?? "New Chat"),
+                    "source": .string(source),
+                    "threadKind": .string(ChatThreadKind.inferred(fromSource: source).rawValue),
+                    "createdAt": .string(timestamp),
+                    "updatedAt": .string(syncedAt),
+                    "archived": .bool(false),
+                    "messageCount": .int(Int64(messageCount)),
+                    "summary": .string(""),
+                    ChatSessionIndexFile.transcriptGenerationKey: .int(1),
+                ]
+                if let sourceKey { row["sourceKey"] = .string(sourceKey) }
+                if normalizedRole == "user" {
+                    ChatSessionIndexFile.recordContinuityParticipant(
+                        in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount)
+                }
+                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview); row[TranscriptRowStamp.previewKey] = stamp.json }
+                updated = row
+            }
+
+            if var updated {
+                if messageCount == 1 || updated["createdAt"] == .string(timestamp) {
+                    updated["firstMessageAt"] = .string(timestamp)
+                }
+                let previous = updated["lastMessageAt"].flatMap { value -> Date? in
+                    if case .string(let stamp) = value { return dateFromISO8601(stamp) }
+                    return nil
+                } ?? .distantPast
+                if (dateFromISO8601(timestamp) ?? .distantPast) >= previous {
+                    updated["lastMessageAt"] = .string(timestamp)
+                }
+                updated[ChatSessionIndexFile.acknowledgedTranscriptKey] = snapshot.version
+                ChatSessionIndexFile.recordConversationChange(in: &updated, role: normalizedRole)
+                remaining.insert(updated, at: 0)
+            }
+            try write(remaining, to: sessionsPath)
+            ChatSessionRetention.enforceBestEffort(
+                dataRoot: dataRoot,
+                now: retentionClock(),
+                context: "ChatOrchestrationClient.syncSessionIndex"
+            )
+        }
+    }
+
+    /// Projection-only changes preserve every other index field.
+    package static func recordProjectionChanges(
+        sessionIDs: Set<String>, dataRoot: URL,
+        persistence: any PersistenceCoreProtocol
+    ) async throws {
+        let path = dataRoot.appendingPathComponent("chat/sessions.json")
+        try await persistence.withFileLock(path) {
+            var rows = try loadObjectRowsForMutation(at: path)
+            var changed = false
+            for index in rows.indices {
+                guard case .string(let id)? = rows[index]["id"], sessionIDs.contains(id) else { continue }
+                changed = bumpTranscriptGeneration(in: &rows[index]) || changed
+            }
+            guard changed else { return }
+            try write(rows, to: path)
+        }
+    }
+
+    /// A rewritten transcript acknowledges its exact filesystem version and count.
+    package static func recordTranscriptRewrite(
+        sessionID: String, dataRoot: URL, persistence: any PersistenceCoreProtocol,
+        countMessages: @escaping @Sendable (URL) -> Int
+    ) async throws {
+        let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
+        try await persistence.withFileLock(sessionsPath) {
+            var rows = try loadObjectRowsForMutation(at: sessionsPath)
+            guard let index = rows.firstIndex(where: { $0["id"] == .string(sessionID) }) else { return }
+            bumpTranscriptGeneration(in: &rows[index])
+            let messagesPath = dataRoot.appendingPathComponent("chat/messages/\(sessionID).jsonl")
+            let snapshot = try await persistence.withFileLock(messagesPath) {
+                (count: countMessages(messagesPath), version: transcriptVersion(at: messagesPath))
+            }
+            rows[index]["messageCount"] = .int(Int64(snapshot.count))
+            rows[index][acknowledgedTranscriptKey] = snapshot.version
+            try write(rows, to: sessionsPath)
+        }
+    }
+
+    /// Retention calls this while holding index and archived transcript locks.
+    static func removeArchivedRow(
+        _ row: [String: JSONValue], from rows: inout [[String: JSONValue]], at path: URL
+    ) throws {
+        guard let index = rows.firstIndex(of: row) else { return }
+        var next = rows
+        next.remove(at: index)
+        try write(next, to: path)
+        rows = next
+    }
+
+    private static func shouldReplaceSessionTitle(_ value: JSONValue?) -> Bool {
+        guard case .string(let raw)? = value else { return true }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || trimmed == "New Chat"
+    }
+
+    private static func dateFromISO8601(_ raw: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
     }
 
     public static func serializedData(

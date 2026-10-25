@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+// Blueprint: | `LLMClient+AnthropicOAuthRequestBody.swift` | `AnthropicOAuthDirectAdapter`: `ephemeralCacheControl`, `currentTurnUserIndex`, `currentBoundaryIndex` |
 
 /// Anthropic OAuth wire layout and cache placement. Transport and token
 /// ownership remain in the adapter; these helpers preserve model-visible bytes.
@@ -359,6 +360,7 @@ extension AnthropicOAuthDirectAdapter {
     static func applyTextLaneStops(to body: inout [String: Any], system: String?) {
         if system?.contains(textToolProtocolHeader) == true {
             body["stop_sequences"] = ["</function_calls>", "<function_results>", "\n<tool_result", "\nNativeAgent tool result #"]
+            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L01"), "site": .string("LLMClient+AnthropicOAuthRequestBody.swift:applyTextLaneStops")]))
         }
     }
 

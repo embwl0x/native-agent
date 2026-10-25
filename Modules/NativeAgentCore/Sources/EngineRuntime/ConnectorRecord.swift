@@ -1,5 +1,6 @@
 import Foundation
 import TrustCenter
+// Blueprint: | `ConnectorRecord.swift` | `ConnectorRecord`, `ConnectorActionRecord` and descriptor readiness projection |
 
 public struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -69,7 +70,6 @@ extension ConnectorActionRecord {
         let nativeConnectors: Set<String> = [
             "mobile", "scheduler", "mac", "mac_assistant",
             "local_files", "codex_work", "codex_handoff",
-            "markets",
         ]
         return connectorActionDescriptors().map { descriptor in
             let key = ConnectorStatusProjection.normalizedConnectorID(descriptor.connectorId)

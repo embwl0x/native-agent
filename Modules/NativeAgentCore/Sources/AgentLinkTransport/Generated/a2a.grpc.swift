@@ -13,6 +13,7 @@
 import GRPCCore
 import GRPCProtobuf
 import SwiftProtobuf
+// Blueprint: | `a2a.grpc.swift` | `GRPCCore`: `Lf_A2a_V1_A2AService`, `Method`, `SendMessage` |
 
 // MARK: - lf.a2a.v1.A2AService
 

@@ -3,6 +3,7 @@ import MacControl
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `SwiftToolDispatcher+MacControlNeed.swift` | `SwiftToolDispatcher`: `macControlCategoryNeedEnvelope`, `builderFullMacRequired`, `fileOpsNeedEnvelope` |
 
 extension SwiftToolDispatcher {
     /// Trust category refusals share one card path, preserving the requested

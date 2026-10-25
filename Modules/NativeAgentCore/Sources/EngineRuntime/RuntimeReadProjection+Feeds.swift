@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -7,10 +8,31 @@ import TrustCenter
 import Browser
 import NotificationInbox
 import ApprovalInbox
-import Skills
+import PersonaEngine
 import Desk
 import StandingBots
 import DreamREMCycle
+import Observation
+// Blueprint: | `RuntimeReadProjection+Feeds.swift` | Notification pending counts read only ApprovalInbox; the unwritten notification receipt input and inferred authorization are retired. Browser reads, checked skills with opt-in source/revision from the inventory body epoch, JSON decoding and JSONL tails; engine.runs retains rows and availability through LatestRead and returns its own read for DeviceSync, preserving rows on failure. Saved-things reads delegate to existing Desk, bot, memory and diary owners. |
+
+extension RuntimeReadProjection {
+    @MainActor @Observable
+    public final class Runs {
+        public private(set) var rows: [RunRecord] = []
+        public private(set) var readSucceeded: Bool?
+        @ObservationIgnored private let latest = LatestRead()
+        public nonisolated init() {}
+        @discardableResult
+        public func refresh(dataRoot: URL) async throws -> [RunRecord] {
+            let read = await latest.read({ await RuntimeReadProjection.runs(dataRoot: dataRoot) }, publish: { next in
+                readSucceeded = next != nil
+                if let next { rows = next }
+            })
+            guard let read else { throw RuntimeReadError.unreadableFeed("The run history could not be read. Refresh to try again.") }
+            return read
+        }
+    }
+}
 
 private enum NextGenStatusFeedAvailability: Equatable {
     case absent
@@ -19,75 +41,31 @@ private enum NextGenStatusFeedAvailability: Equatable {
 }
 
 extension RuntimeReadProjection {
-    public static func savedThings(dataRoot: URL) async -> (
-        desk: [DeskItem], botReplies: [(BotsShelfRecord, ShelfEntry)], dreams: [DreamEntry]
-    ) {
-        let desk = ((try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items) ?? [])
-            .sorted { $0.updatedAt > $1.updatedAt }.prefix(40)
-        let records = await Task.detached(priority: .utility) {
-            (try? BotsShelfRecord.read(root: dataRoot)) ?? []
-        }.value
-        var replies: [(BotsShelfRecord, ShelfEntry)] = []
-        for record in records {
-            for entry in record.sortedEntries where !entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                replies.append((record, entry))
-            }
-        }
-        let botReplies = replies.sorted { $0.1.runAt > $1.1.runAt }.prefix(40)
-        let dreams = await Task.detached(priority: .utility) {
-            FileBackedDreamDiary(dataRoot: dataRoot).listEntries(limit: 40)
-        }.value
-        return (Array(desk), Array(botReplies), dreams)
-    }
-
     public static func getNotificationStatus(dataRoot: URL) async throws -> NotificationRuntimeStatus {
-        // Neither authoritative feed means unmeasured; damaged authority is
-        // unavailable rather than a ready zero-count runtime.
-        let root = dataRoot
-        let receiptsPath = root
-            .appendingPathComponent("native_power", isDirectory: true)
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("receipts.jsonl")
-        let approvalsPath = root
+        // The approval owner supplies the panel's pending count. The retired
+        // notification receipt path has no producer and cannot measure it.
+        let approvalsPath = dataRoot
             .appendingPathComponent("workflows", isDirectory: true)
             .appendingPathComponent("approvals", isDirectory: true)
             .appendingPathComponent("requests.json")
-        let availability = Self.statusFeedAvailability([receiptsPath, approvalsPath])
+        let availability = Self.statusFeedAvailability([approvalsPath])
         guard availability == .measured else {
             return NotificationRuntimeStatus(
                 status: availability == .absent ? "unmeasured" : "unavailable",
-                authorization: nil,
                 pendingApprovals: nil,
-                receiptCount: nil,
-                latestReceipt: nil,
                 createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
             )
         }
         do {
-            let receiptRead = try await SwiftNativePersistenceCore()
-                .tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
-            guard receiptRead.malformedJSONRowCount == 0,
-                  receiptRead.rows.allSatisfy({ if case .object = $0 { return true }; return false }),
-                  receiptRead.physicalRowsScanned > 0 || receiptRead.bytesRead == 0 else {
-                throw PersistenceCoreError.ioFailure("The notification receipt feed is malformed.")
-            }
-            let approvals = try SwiftNativeApprovalInbox.loadApprovalRowsChecked(at: approvalsPath)
-            let pendingApprovals = approvals.filter {
-                guard case .object(let row) = $0 else { return false }
-                return row["status"] == .string("pending")
-            }.count
-            let latestReceipt = try receiptRead.rows.last.map {
-                try Self.decodeJSONValue($0, as: NativeActionReceipt.self, context: "getNotificationStatus(swiftNative)")
-            }
+            let pendingApprovals = try SwiftNativeApprovalInbox(root: dataRoot)
+                .recordsUnlocked().filter { $0.status == "pending" }.count
             return NotificationRuntimeStatus(
-                status: "ready", authorization: "app_requested", pendingApprovals: pendingApprovals,
-                receiptCount: receiptRead.rows.count, latestReceipt: latestReceipt,
+                status: "ready", pendingApprovals: pendingApprovals,
                 createdAt: NativeTimestampFormat.sixDigitUTCOffset(Date())
             )
         } catch {
             return NotificationRuntimeStatus(
-                status: "unavailable", authorization: nil, pendingApprovals: nil,
-                receiptCount: nil, latestReceipt: nil,
+                status: "unavailable", pendingApprovals: nil,
                 createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
             )
         }
@@ -112,7 +90,6 @@ extension RuntimeReadProjection {
         guard availability == .measured else {
             return BrowserRuntimeStatus(
                 status: availability == .absent ? "unmeasured" : "unavailable",
-                profilePath: nil,
                 sourcePath: nil,
                 screenshotPath: nil,
                 approvedDomains: nil,
@@ -129,7 +106,7 @@ extension RuntimeReadProjection {
             return try Self.decodeJSONValue(envelope, as: BrowserRuntimeStatus.self, context: "getBrowserStatus(swiftNative)")
         } catch {
             return BrowserRuntimeStatus(
-                status: "unavailable", profilePath: nil, sourcePath: nil,
+                status: "unavailable", sourcePath: nil,
                 screenshotPath: nil, approvedDomains: nil, domainPolicy: nil,
                 activeRuns: nil, receiptCount: nil, latestReceipt: nil,
                 createdAt: ISO8601DateFormatter().string(from: Date())
@@ -156,20 +133,26 @@ extension RuntimeReadProjection {
         return try JSONDecoder.nativeAgent.decode(T.self, from: data)
     }
 
-    /// The learned-skills registry, newest first. One malformed row drops
-    /// that row instead of blanking the list; a list where every row is
-    /// malformed throws, so it never reads as an empty registry.
-    public static func skills(dataRoot: URL) async throws -> [SkillRecord] {
-        let rows = try await makeSkillsClient(root: dataRoot).listSkills()
-        var firstDropError: Error?
-        let survivors = rows.compactMap { row -> SkillRecord? in
-            do { return try SkillRecord(row: row) } catch {
+    /// Checked built-in guidance; source is loaded only for source review.
+    public static func skills(dataRoot: URL, includingSource: Bool = false) async throws -> [SkillRecord] {
+        let entries = try InstalledSkillInventory.entries(dataRoot: dataRoot)
+        var survivors: [SkillRecord] = [], firstDropError: Error?
+        for entry in entries {
+            var skill: SkillRecord
+            do { skill = try SkillRecord(row: .object(entry.row)) }
+            catch {
                 if firstDropError == nil { firstDropError = error }
                 print("[NativeAgent] getSkills(swiftNative) dropped a malformed element: \(error)")
-                return nil
+                continue
             }
+            if includingSource {
+                let body = entry.readme
+                skill.body = body
+                skill.bodyRevision = SHA256.hash(data: Data(body.utf8)).map { String(format: "%02x", $0) }.joined()
+            }
+            survivors.append(skill)
         }
-        if !rows.isEmpty, survivors.isEmpty, let firstDropError { throw firstDropError }
+        if !entries.isEmpty, survivors.isEmpty, let firstDropError { throw firstDropError }
         return survivors
     }
 
@@ -222,15 +205,5 @@ extension RuntimeReadProjection {
             }
         }
         return out
-    }
-
-    public static func readLocalJSON<T: Decodable>(_ url: URL, fallbackJSON: String) throws -> T {
-        let data: Data
-        do {
-            data = try Data(contentsOf: url)
-        } catch CocoaError.fileReadNoSuchFile {
-            data = Data(fallbackJSON.utf8)
-        }
-        return try JSONDecoder.nativeAgent.decode(T.self, from: data)
     }
 }

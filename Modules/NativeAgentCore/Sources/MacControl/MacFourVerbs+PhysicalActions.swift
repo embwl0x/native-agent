@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MacFourVerbs+PhysicalActions.swift` | `MacFourVerbs`: `performPhysical` |
 
 extension MacFourVerbs {
     enum PhysicalVerb: String, CaseIterable {
@@ -266,7 +267,6 @@ extension MacFourVerbs {
             description: description,
             attention: attention,
             before: confirm ? before : nil,
-            allowGenericScreenChangeVerification: !physicalOnly,
             afterPart: physicalOnly ? "visual surface" : nil,
             pointerTarget: pointerTarget,
             pressed: pressed,

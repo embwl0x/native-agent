@@ -7,6 +7,7 @@ import ApprovalInbox
 import TrustCenter
 import MacIntegration
 import ToolRegistry
+// Blueprint: | `WorkshopExecution+Executor.swift` | `WorkshopExecutorLoop` dispatches execution-record transitions and blocked-step approval-claim clears with its own root through ExecutionRecordFile; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
 
 // MISSIONS EXECUTOR PORT (2026-06-10) — docs/build_plans/missions-executor-port.md
 //
@@ -18,7 +19,7 @@ import ToolRegistry
 // tests against archived daemon-era timelines from the pre-Workshop queue):
 //   claim (queued→running, re-checked INSIDE the cross-process flock — closes
 //   the W6 check-then-act race) → `started` timeline event → iterate plan
-//   steps (current_step_id tracking + per-step receipts into receiptsDir +
+//   steps (current_step_id tracking + per-step output receipts +
 //   `step_completed` events) → terminal status (completed/failed/
 //   blocked_on_approval/cancelled) + result summary extracted from the last
 //   step output.
@@ -40,7 +41,7 @@ import ToolRegistry
 // CONCURRENCY / CANCELLATION (W2 lesson: no orphaned children):
 //   - cooperative Task.checkCancellation between steps;
 //   - each step dispatch runs inside a throwing task group racing a
-//     cancellation observer over mission.json — when cancel() (this process or
+//     cancellation observer over execution.json — when cancel() (this process or
 //     any other) flips status to "cancelled", the kqueue/vnode edge wakes the
 //     observer and the in-flight step
 //     Task is cancelled via group.cancelAll(). Structured concurrency
@@ -211,13 +212,14 @@ public actor WorkshopExecutorLoop {
     }
     /// Resolved record path — see `SwiftNativeWorkshopRunner.executionRecordPath`.
     nonisolated func executionRecordPath(_ id: String) -> URL {
-        ExecutionRecordFile.resolve(in: workshopExecutionDir(id))
+        ExecutionRecordFile.canonicalPath(in: workshopExecutionDir(id))
     }
     nonisolated func timelinePath(_ id: String) -> URL {
-        workshopExecutionDir(id).appendingPathComponent("timeline.jsonl")
+        ExecutionRecordFile.timelinePath(in: workshopExecutionDir(id))
     }
+
     nonisolated func receiptsDir(_ id: String) -> URL {
-        workshopExecutionDir(id).appendingPathComponent("receipts", isDirectory: true)
+        ExecutionRecordFile.receiptsPath(in: workshopExecutionDir(id))
     }
 
     // MARK: drain
@@ -412,10 +414,10 @@ public actor WorkshopExecutorLoop {
     /// "Blocked since" = the stable `executed_at` of the latest
     /// blocked_on_approval STEP record (set ONCE when the step blocked;
     /// runSteps appends it via outcome.toJSON). NOT the execution's `updatedAt`:
-    /// `updateWorkshopExecution` bumps updatedAt on unrelated title/objective patches,
-    /// which would silently EXTEND the wait every time (gpt-5.5 review). Fall
+    /// unrelated title/objective patches can bump updatedAt, which would
+    /// silently EXTEND the wait every time (gpt-5.5 review). Fall
     /// back to updatedAt only when no such record/timestamp exists. Both are
-    /// persisted in mission.json, so the clock survives restarts.
+    /// persisted in execution.json, so the clock survives restarts.
     ///
     /// CONCURRENCY: the CAS requires `blocked_on_approval` and resume now
     /// CAS-claims `blocked_on_approval → running` BEFORE it executes the step
@@ -493,10 +495,8 @@ public actor WorkshopExecutorLoop {
         return nil
     }
 
-    /// Explicit single-execution start — the executor-backed replacement for
-    /// the daemon's start() on the QUEUED path. v1 does NOT port the
-    /// failed/cancelled re-run branch (rerun_count++) — re-runs stay
-    /// unsupported until a caller needs them.
+    /// Explicit start claims queued work; a stopped life starts a fresh request
+    /// through the ordinary planner, never the restored plan or completed steps.
     @discardableResult
     public func start(executionId: String) async throws -> WorkshopExecutionRecord {
         let trimmed = executionId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -510,6 +510,15 @@ public actor WorkshopExecutorLoop {
         // started here (before the first background drain) would be seen as a
         // "running" orphan by that drain and wrongly failed (gpt-5.5 review).
         try await ensureOrphansReconciled()
+        if let stopped = try await getRecord(trimmed), stopped.status == "stopped" {
+            let runner = SwiftNativeWorkshopRunner(root: root, persistence: persistence,
+                planner: SwiftNativeWorkshopPlannerLLM(dataRoot: root))
+            let fresh = try await runner.submit(spec: WorkshopExecutionSpec(title: stopped.title,
+                objective: stopped.objective, triggerSource: "manual", trustRequired: stopped.trustRequired,
+                deskHandle: stopped.deskHandle, projectSpaceId: stopped.projectSpaceId,
+                expectedOutputs: stopped.expectedOutputs.compactMap { if case .string(let value) = $0 { value } else { nil } }))
+            return try await start(executionId: fresh.executionId)
+        }
         guard let claimed = try await claim(trimmed) else {
             // Mirror the daemon's typed refusal.
             let current = try await getRecord(trimmed)
@@ -539,7 +548,7 @@ public actor WorkshopExecutorLoop {
     /// read runningCount == 0 and both claim, bursting past maxActive. The
     /// WHOLE scan+claim now runs inside ONE queue-level cross-process flock
     /// (`queueClaimLockTarget`); the per-execution RMW stays nested inside it.
-    /// Lock order is always queue-claim-lock → mission.json-lock; nothing
+    /// Lock order is always queue-claim-lock → execution.json-lock; nothing
     /// takes them in the other order (cancel()/mutators take only the
     /// execution lock and never the claim lock), so there is no ordering cycle.
     ///
@@ -575,43 +584,22 @@ public actor WorkshopExecutorLoop {
         guard await executionAllowed() else {
             throw WorkshopExecutionError.forbidden("Workshop execution is disabled by trust policy")
         }
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         let executionRecordJSON = executionRecordPath(executionId)
         let nowStr = SwiftNativeWorkshopRunner.isoTimestamp(now())
-        let work: @Sendable () async throws -> WorkshopExecutionRecord? = { [persistence, self] in
-            let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
-            // The claimed slot and the execution we dispatch must have the
-            // same identity. A mismatched payload must not redirect the run
-            // while leaving this directory stuck in running.
-            guard case .object(let obj) = raw,
-                  case .string(let gotId)? = obj["id"], gotId == executionId else {
-                return nil
-            }
-            var record = SwiftNativeWorkshopRunner.recordFromJSON(obj)
-            guard record.status == status else { return nil }
-            if let stepId, record.currentStepId != stepId { return nil }
-            // Slot-cap re-check INSIDE the claim critical section. The
-            // enclosing queue-level flock serializes claimers across
-            // Workshop executions (blocker #4), so this count cannot be concurrently
-            // stale-read by another claimer.
+        let update = try await ExecutionRecordFile.update(at: executionRecordJSON, id: executionId, using: persistence) { [self] record in
+            guard record.status == status else { return false }
+            if let stepId, record.currentStepId != stepId { return false }
+            // The enclosing queue lock serializes claimers; count under the record lock.
             let queue = try await self.scanQueue()
-            let runningCount = queue
-                .filter { $0.status == "running" && $0.id != executionId }
-                .count
-            guard runningCount < self.maxActive else { return nil }
+            let runningCount = queue.filter { $0.status == "running" && $0.id != executionId }.count
+            guard runningCount < self.maxActive else { return false }
             record.status = "running"
             if let stepId { record.currentStepId = stepId }
             record.updatedAt = nowStr
             record.lastMovementAt = nowStr
-            try await persistence.writeJSON(record.toJSON(), to: executionRecordJSON)
-            return record
+            return true
         }
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
-        return try await persistence.withFileLock(executionRecordJSON, work)
+        return update.applied ? update.record : nil
     }
 
     // MARK: execution run loop (port of _run_mission_locked, the retired daemon)
@@ -640,7 +628,7 @@ public actor WorkshopExecutorLoop {
             // teardown). Release only this still-running claim so the next
             // drain in the SAME process can reclaim it. A concurrent explicit
             // user cancel wins the CAS and remains terminal.
-            await releaseClaimAfterParentCancellation(executionId)
+            await releaseClaimAfterInterruption(executionId)
             return
         } catch {
             // Mirror the daemon's broad-except tail (L872-L880): mark failed
@@ -668,26 +656,42 @@ public actor WorkshopExecutorLoop {
         }
     }
 
-    private func releaseClaimAfterParentCancellation(_ executionId: String) async {
-        let released = try? await casMutateWorkshopExecution(executionId, require: ["running"]) { record in
-            if record.currentStepId.isEmpty {
-                record.status = "queued"
-            } else {
-                record.status = "blocked_on_reconciliation"
-                record.result = .object(["error": .string("interrupted_step_outcome_unknown")])
+    private func releaseClaimAfterInterruption(
+        _ executionId: String,
+        reason: String = "parent_task_cancelled",
+        outcome: WorkshopStepOutcome? = nil
+    ) async {
+        // Await one uncancelled cleanup task: the caller's cancellation must
+        // not abort a contended file-lock acquisition and strand the claim.
+        await Task {
+            let released = try? await casMutateWorkshopExecution(executionId, require: ["running"]) { record in
+                if record.currentStepId.isEmpty {
+                    record.status = "queued"
+                } else {
+                    record.status = "blocked_on_reconciliation"
+                    var evidence: [String: JSONValue] = ["error": .string("interrupted_step_outcome_unknown")]
+                    if let outcome, record.currentStepId == outcome.stepId {
+                        evidence["step_outcome"] = outcome.toJSON()
+                    }
+                    record.result = .object(evidence)
+                }
             }
-        }
-        guard released?.applied == true else { return }
-        try? await appendTimelineLocked(
-            .object([
-                "event": .string("execution_interrupted"),
-                "reason": .string("parent_task_cancelled"),
-                "status": .string(released?.record?.status ?? "blocked_on_reconciliation"),
-                "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
-            ]),
-            executionId: executionId
-        )
-        Self.logger.notice("interrupted execution claim for \(executionId, privacy: .public): \(released?.record?.status ?? "unknown", privacy: .public)")
+            guard let released else {
+                Self.logger.error("execution claim reconciliation failed for \(executionId, privacy: .public)")
+                return
+            }
+            guard released.applied else { return }
+            try? await appendTimelineLocked(
+                .object([
+                    "event": .string("execution_interrupted"),
+                    "reason": .string(reason),
+                    "status": .string(released.record?.status ?? "blocked_on_reconciliation"),
+                    "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
+                ]),
+                executionId: executionId
+            )
+            Self.logger.notice("interrupted execution claim for \(executionId, privacy: .public): \(released.record?.status ?? "unknown", privacy: .public)")
+        }.value
     }
 
     /// Execute plan steps in order. `afterStepId == nil` runs the whole plan
@@ -817,7 +821,7 @@ public actor WorkshopExecutorLoop {
             default:
                 // The outcome, receipt, and timeline are now durable. Honor a
                 // parent/pass cancellation before another step (or terminal
-                // completion) so releaseClaimAfterParentCancellation requeues
+                // completion) so releaseClaimAfterInterruption requeues
                 // the Workshop execution. The next drain skips this durable step.
                 _ = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
                     rec.currentStepId = ""
@@ -887,7 +891,6 @@ public actor WorkshopExecutorLoop {
         await emitTerminalEvent(completedWrite.record, reason: nil)
     }
 
-
     // MARK: step execution (port of execute_step + _dispatch_step)
 
     /// Step kinds that are a model turn, not a tool call; their own tool calls
@@ -921,7 +924,7 @@ public actor WorkshopExecutorLoop {
         }
         if ["blocked", "deny"].contains(law) {
             return WorkshopStepOutcome(stepId: step.id, status: "failed",
-                error: "Trust refuses \(step.toolOrAction) in User's current posture; nothing ran.", executedAt: nowStr)
+                error: "Trust refuses \(step.toolOrAction) in the owner's current posture; nothing ran.", executedAt: nowStr)
         }
         let needsApproval = !bypassApproval
             && (law != "auto" || enforceStepAutonomy && (execution.trustRequired != "none" || step.autonomy == "needs_approval"))
@@ -1178,7 +1181,7 @@ public actor WorkshopExecutorLoop {
         guard failed || cancelled else {
             return (WorkshopStepOutcome.successStatus, "")
         }
-        let detail = ["error", "reason", "message", "detail"].compactMap { key -> String? in
+        let detail = ["detail", "error", "reason", "message"].compactMap { key -> String? in
             guard case .string(let value)? = object[key], !value.isEmpty else { return nil }
             return value
         }.first ?? (rawStatus.isEmpty ? "tool reported failure" : "tool returned status=\(rawStatus)")
@@ -1209,7 +1212,7 @@ public actor WorkshopExecutorLoop {
     }
 
     /// Marker error the cancellation watcher throws when cancel() flipped
-    /// mission.json to "cancelled" while a step was in flight.
+    /// execution.json to "cancelled" while a step was in flight.
     private struct WorkshopExecutionCancelledDuringStep: Error {}
 
     /// Thrown by the step-deadline task in raceWithCancellationWatch when a
@@ -1228,7 +1231,7 @@ public actor WorkshopExecutorLoop {
         case observerCancelled
     }
 
-    /// Race the step dispatch against a kqueue/vnode observer over mission.json.
+    /// Race the step dispatch against a kqueue/vnode observer over execution.json.
     /// It performs one initial canonical read to close the registration race,
     /// then sleeps without timers until the file changes. When cancel() lands
     /// (any process), the observer reports it and the
@@ -1242,7 +1245,7 @@ public actor WorkshopExecutorLoop {
     /// swallows CancellationError) keeps running, and structured concurrency
     /// AWAITS it — the group cannot return until that child does. So PROMPT
     /// preemption depends on the closure's cooperativeness. STATE
-    /// correctness does NOT: every post-step mission.json write is a
+    /// correctness does NOT: every post-step execution.json write is a
     /// compare-and-swap (casMutateMission) that re-reads the status in-lock
     /// and only transitions from "running"/"blocked_on_approval", so a
     /// late-finishing step can never overwrite a cancelled execution —
@@ -1253,17 +1256,6 @@ public actor WorkshopExecutorLoop {
         executionId: String,
         _ op: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        // RESOLVED ONCE, AT ARM TIME (P2-1). The kqueue target is the record
-        // name that exists NOW — canonical, or a legacy `mission.json` the
-        // rename pass hasn't reached. It cannot be renamed out from under the
-        // watcher mid-run: WorkshopStorageMigrator runs synchronously in
-        // applicationDidFinishLaunching, before any executor exists, so no
-        // rename ever races a live step. Watching BOTH names instead would
-        // double the fd cost per in-flight step to defend against a window
-        // that cannot open; and it would not even help, since a rename of the
-        // watched file is itself a vnode event that FileChangeWatcher re-arms
-        // on. If the file is absent entirely, FileChangeWatcher falls back to
-        // the parent directory, so first-creation still wakes the observer.
         let executionRecordJSON = executionRecordPath(executionId)
         let deadlineNanos = stepTimeoutNanos
         let persistence = self.persistence
@@ -1281,7 +1273,7 @@ public actor WorkshopExecutorLoop {
                 do {
                     for await _ in changes.stream {
                         try Task.checkCancellation()
-                        let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
+                        let raw = try await ExecutionRecordFile.readJSON(at: executionRecordJSON, using: persistence)
                         if case .object(let obj) = raw,
                            case .string(let status)? = obj["status"],
                            status == "cancelled" {
@@ -1412,7 +1404,7 @@ public actor WorkshopExecutorLoop {
         // blocked_on_approval step record, and its approval card stays
         // clickable. Approving that stale card must NOT execute the step or
         // flip the execution back to running. Require the EXECUTION status be
-        // blocked_on_approval, read under the mission.json flock so the
+        // blocked_on_approval, read under the execution.json flock so the
         // check cannot interleave with an in-flight cancel()'s RMW. (The
         // step executes AFTER the lock is released — holding a flock across
         // a minutes-long step would block cancel(); a cancel that lands
@@ -1505,109 +1497,126 @@ public actor WorkshopExecutorLoop {
             }
             throw WorkshopExecutionError.approvalDeferred
         }
-        // A capacity deferral must not write timeline events and wake its own drain.
-        try await appendTimelineLocked(
-            .object([
-                "event": .string("approval_decision"),
-                "step_id": .string(stepId),
-                "approved": .bool(true),
-                "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
-            ]),
-            executionId: executionId
-        )
-        let result = await dispatchStep(execution: resumed, step: approvedStep, approvalId: approvalId)
-        if Task.isCancelled && result.status == "cancelled" {
-            await releaseClaimAfterParentCancellation(executionId)
-            return try await getRecord(executionId) ?? execution
-        }
-        // Update (or append) the step record with the replay result —
-        // daemon updates the existing dict in place (L1545-L1551). CAS from
-        // running (blocker #2, post-claim): a cancel that landed while the
-        // resumed step ran flips running→cancelled and wins this CAS — skip the
-        // record update, the receipt, and every status write below.
-        let updateWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
-            if let index = rec.plan.firstIndex(where: { $0.id == stepId }) {
-                rec.plan[index].args = approvedStep.args
-            }
-            var replaced = false
-            rec.stepsCompleted = rec.stepsCompleted.map { sr in
-                guard !replaced, case .object(var o) = sr, case .string(let sid)? = o["step_id"], sid == stepId else { return sr }
-                replaced = true
-                if case .object(let new) = result.toJSON() {
-                    for (k, v) in new { o[k] = v }
-                }
-                return .object(o)
-            }
-            if !replaced {
-                rec.stepsCompleted.append(result.toJSON())
-            }
-        }
-        guard updateWrite.applied else {
-            return updateWrite.record ?? execution
-        }
-        await writeReceipt(executionId: executionId, outcome: result)
-        // NOTE: the daemon does NOT emit step_completed for the resumed step
-        // itself (fixture 3e718ce5: approval_decision → step_completed for
-        // step-2/3 only). Match it.
-        if result.status == "failed" || result.status == "blocked_on_approval" || result.status == "cancelled" {
-            let terminal = (result.status == "blocked_on_approval") ? "blocked_on_approval"
-                : (result.status == "cancelled" ? "cancelled" : "failed")
-            let terminalWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
-                rec.status = terminal
-                if terminal == "failed" || terminal == "cancelled" {
-                    rec.terminalReason = result.error.isEmpty ? nil : result.error
-                    rec.currentStepId = ""   // terminal — clear the step pointer
-                }
-            }
-            if result.status == "failed", terminalWrite.applied {
-                try await appendTimelineLocked(
-                    .object([
-                        "event": .string("failed"),
-                        "step_id": .string(stepId),
-                        "error": .string(result.error),
-                        "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
-                    ]),
-                    executionId: executionId
-                )
-            }
-            if terminalWrite.applied && (terminal == "failed" || terminal == "cancelled") {
-                await emitTerminalEvent(terminalWrite.record, reason: result.error.isEmpty ? nil : result.error)
-            }
-            await annotateApprovedStep(terminalWrite.record ?? execution, stepId: stepId, approvalId: approvalId)
-            return terminalWrite.record ?? execution
-        }
-
-        // Continue the remaining steps. The Workshop execution is already "running" (the
-        // claim above); this CAS is now a GUARD, not the blocked→running flip:
-        // require "running" so a cancel that landed during the resumed step
-        // (running→cancelled) wins and runSteps does not proceed. The status
-        // write is idempotent (running→running). (Was the blocked→running flip
-        // pre-claim; the claim moved that earlier — blocker #2/#3 preserved.)
-        let runWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
-            rec.status = "running"
-            rec.currentStepId = ""
-        }
-        guard runWrite.applied else {
-            await annotateApprovedStep(runWrite.record ?? execution, stepId: stepId, approvalId: approvalId)
-            return runWrite.record ?? execution
-        }
+        // Every exceptional exit after the claim must release capacity. Keep
+        // a returned step outcome even if its execution.json write was interrupted.
+        var approvedOutcome: WorkshopStepOutcome?
         do {
+            // A capacity deferral must not write timeline events and wake its own drain.
+            try await appendTimelineLocked(
+                .object([
+                    "event": .string("approval_decision"),
+                    "step_id": .string(stepId),
+                    "approved": .bool(true),
+                    "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
+                ]),
+                executionId: executionId
+            )
+            let result = await dispatchStep(execution: resumed, step: approvedStep, approvalId: approvalId)
+            approvedOutcome = result
+            if Task.isCancelled && result.status == "cancelled" {
+                await releaseClaimAfterInterruption(executionId, outcome: result)
+                return try await getRecord(executionId) ?? execution
+            }
+            // Update (or append) the step record with the replay result —
+            // daemon updates the existing dict in place (L1545-L1551). CAS from
+            // running (blocker #2, post-claim): a cancel that landed while the
+            // resumed step ran flips running→cancelled and wins this CAS — skip the
+            // record update, the receipt, and every status write below.
+            let updateWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
+                if let index = rec.plan.firstIndex(where: { $0.id == stepId }) {
+                    rec.plan[index].args = approvedStep.args
+                }
+                var replaced = false
+                rec.stepsCompleted = rec.stepsCompleted.map { sr in
+                    guard !replaced, case .object(var o) = sr, case .string(let sid)? = o["step_id"], sid == stepId else { return sr }
+                    replaced = true
+                    if case .object(let new) = result.toJSON() {
+                        for (k, v) in new { o[k] = v }
+                    }
+                    return .object(o)
+                }
+                if !replaced {
+                    rec.stepsCompleted.append(result.toJSON())
+                }
+            }
+            guard updateWrite.applied else {
+                return updateWrite.record ?? execution
+            }
+            await writeReceipt(executionId: executionId, outcome: result)
+            // NOTE: the daemon does NOT emit step_completed for the resumed step
+            // itself (fixture 3e718ce5: approval_decision → step_completed for
+            // step-2/3 only). Match it.
+            if result.status == "failed" || result.status == "blocked_on_approval" || result.status == "cancelled" {
+                let terminal = (result.status == "blocked_on_approval") ? "blocked_on_approval"
+                    : (result.status == "cancelled" ? "cancelled" : "failed")
+                let terminalWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
+                    rec.status = terminal
+                    if terminal == "failed" || terminal == "cancelled" {
+                        rec.terminalReason = result.error.isEmpty ? nil : result.error
+                        rec.currentStepId = ""   // terminal — clear the step pointer
+                    }
+                }
+                if result.status == "failed", terminalWrite.applied {
+                    try await appendTimelineLocked(
+                        .object([
+                            "event": .string("failed"),
+                            "step_id": .string(stepId),
+                            "error": .string(result.error),
+                            "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
+                        ]),
+                        executionId: executionId
+                    )
+                }
+                if terminalWrite.applied && (terminal == "failed" || terminal == "cancelled") {
+                    await emitTerminalEvent(terminalWrite.record, reason: result.error.isEmpty ? nil : result.error)
+                }
+                await annotateApprovedStep(terminalWrite.record ?? execution, stepId: stepId, approvalId: approvalId)
+                return terminalWrite.record ?? execution
+            }
+
+            // Continue the remaining steps. The Workshop execution is already "running" (the
+            // claim above); this CAS is now a GUARD, not the blocked→running flip:
+            // require "running" so a cancel that landed during the resumed step
+            // (running→cancelled) wins and runSteps does not proceed. The status
+            // write is idempotent (running→running). (Was the blocked→running flip
+            // pre-claim; the claim moved that earlier — blocker #2/#3 preserved.)
+            let runWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
+                rec.status = "running"
+                rec.currentStepId = ""
+            }
+            guard runWrite.applied else {
+                await annotateApprovedStep(runWrite.record ?? execution, stepId: stepId, approvalId: approvalId)
+                return runWrite.record ?? execution
+            }
             try await runSteps(executionId: executionId, afterStepId: stepId)
-        } catch is CancellationError {
-            // The approved step is already durably recorded above. Match the
-            // ordinary drain's continuation recovery: free the live claim so
-            // a later pass can continue, while its durable-step set prevents
-            // the approved side effect from replaying or asking again.
-            await releaseClaimAfterParentCancellation(executionId)
-            await annotateApprovedStep((try? await getRecord(executionId)) ?? execution, stepId: stepId, approvalId: approvalId)
-            throw CancellationError()
+            let final = try await getRecord(executionId) ?? execution
+            await annotateApprovedStep(final, stepId: stepId, approvalId: approvalId)
+            return final
+        } catch {
+            let reason = Task.isCancelled || error is CancellationError
+                ? "parent_task_cancelled" : "approval_resume_failed"
+            await releaseClaimAfterInterruption(executionId, reason: reason, outcome: approvedOutcome)
+            if approvedOutcome != nil {
+                await annotateApprovedStep((try? await getRecord(executionId)) ?? execution,
+                    stepId: stepId, approvalId: approvalId)
+            }
+            throw error
         }
-        let final = try await getRecord(executionId) ?? execution
-        await annotateApprovedStep(final, stepId: stepId, approvalId: approvalId)
-        return final
     }
 
     // MARK: helpers
+
+    /// The execution owner clears a blocked step's claim under its record lock.
+    /// Retain every other JSON field and timestamp; this is not a state transition.
+    package func clearStepApprovalClaim(executionId: String, stepId: String) async {
+        do {
+            try await ExecutionRecordFile.clearStepApprovalClaim(
+                executionId: executionId, stepId: stepId, dataRoot: root,
+                persistence: persistence)
+        } catch {
+            nativeLog("[workshopStep] claim clear failed for \(executionId)/\(stepId): \(error)")
+        }
+    }
 
     private func annotateApprovedStep(_ record: WorkshopExecutionRecord, stepId: String, approvalId: String?) async {
         guard let approvalId, !approvalId.isEmpty else { return }
@@ -1623,9 +1632,8 @@ public actor WorkshopExecutorLoop {
     }
 
     private func getRecord(_ executionId: String) async throws -> WorkshopExecutionRecord? {
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         guard SwiftNativeWorkshopRunner.isSafeExecutionID(executionId) else { return nil }
-        let raw = try await persistence.readJSON(executionRecordPath(executionId), ifMissing: .null)
+        let raw = try await ExecutionRecordFile.readJSON(at: executionRecordPath(executionId), using: persistence)
         guard case .object(let obj) = raw,
               case .string(let gotId)? = obj["id"], gotId == executionId else { return nil }
         return SwiftNativeWorkshopRunner.recordFromJSON(obj)
@@ -1649,9 +1657,9 @@ public actor WorkshopExecutorLoop {
         }
     }
 
-    /// Compare-and-swap mission.json mutation (gpt-5.5 executor-port
+    /// Compare-and-swap execution.json mutation (gpt-5.5 executor-port
     /// blocker #2, 2026-06-10). The WHOLE read-check-mutate-write runs
-    /// inside ONE cross-process withFileLock(mission.json) critical section,
+    /// inside ONE cross-process withFileLock(execution.json) critical section,
     /// and the mutation only applies when the IN-LOCK status is in
     /// `require`. A cancel() — or any other transition — that landed since
     /// the caller's last (unlocked) read therefore WINS: the stale write is
@@ -1663,7 +1671,7 @@ public actor WorkshopExecutorLoop {
     ///
     /// Returns (post-write record, true) when the swap applied;
     /// (latest on-disk record, false) when the status precondition failed;
-    /// (nil, false) when mission.json is absent/malformed.
+    /// (nil, false) when execution.json is absent/malformed.
     @discardableResult
     private func casMutateWorkshopExecution(
         _ executionId: String,
@@ -1671,79 +1679,38 @@ public actor WorkshopExecutorLoop {
         matching predicate: (@Sendable (WorkshopExecutionRecord) -> Bool)? = nil,
         _ mutate: @escaping @Sendable (inout WorkshopExecutionRecord) -> Void
     ) async throws -> (record: WorkshopExecutionRecord?, applied: Bool) {
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         guard SwiftNativeWorkshopRunner.isSafeExecutionID(executionId) else {
             return (nil, false)
         }
         let executionRecordJSON = executionRecordPath(executionId)
         let nowStr = SwiftNativeWorkshopRunner.isoTimestamp(now())
-        let work: @Sendable () async throws -> (WorkshopExecutionRecord?, Bool) = { [persistence] in
-            let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
-            guard case .object(let obj) = raw,
-                  case .string(let gotId)? = obj["id"], gotId == executionId else {
-                return (nil, false)
-            }
-            var record = SwiftNativeWorkshopRunner.recordFromJSON(obj)
-            guard allowedStatuses.contains(record.status), predicate?(record) != false else {
-                return (record, false)   // CAS lost — concurrent transition wins
-            }
-            mutate(&record)
-            record.updatedAt = nowStr
-            record.lastMovementAt = nowStr
-            try await persistence.writeJSON(record.toJSON(), to: executionRecordJSON)
-            return (record, true)
-        }
         do {
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            return try await persistence.withFileLock(executionRecordJSON, work)
+            return try await ExecutionRecordFile.update(at: executionRecordJSON, id: executionId, using: persistence) { record in
+                guard allowedStatuses.contains(record.status), predicate?(record) != false else { return false }
+                mutate(&record)
+                record.updatedAt = nowStr
+                record.lastMovementAt = nowStr
+                return true
+            }
         } catch let e as WorkshopExecutionError {
             throw e
         } catch {
-            throw WorkshopExecutionError.persistenceFailure("executor mission.json write failed: \(error)")
+            throw WorkshopExecutionError.persistenceFailure("executor execution.json write failed: \(error)")
         }
     }
 
-    /// Read mission.json under its cross-process flock — a quiesced-point
+    /// Read execution.json under its cross-process flock — a quiesced-point
     /// read for in-lock status preconditions (cannot interleave with a
     /// concurrent RMW's read→write window). Used by resumeAfterApproval's
     /// blocked_on_approval precondition (blocker #3).
     private func readRecordLocked(_ executionId: String) async throws -> WorkshopExecutionRecord? {
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         guard SwiftNativeWorkshopRunner.isSafeExecutionID(executionId) else { return nil }
         let executionRecordJSON = executionRecordPath(executionId)
-        let work: @Sendable () async throws -> WorkshopExecutionRecord? = { [persistence] in
-            let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
-            guard case .object(let obj) = raw,
-                  case .string(let gotId)? = obj["id"], gotId == executionId else {
-                return nil
-            }
-            return SwiftNativeWorkshopRunner.recordFromJSON(obj)
-        }
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
-        return try await persistence.withFileLock(executionRecordJSON, work)
+        return try await ExecutionRecordFile.readLocked(at: executionRecordJSON, id: executionId, using: persistence)
     }
 
-    /// Same cross-process `<timeline>.lock` flock the runner + daemon take
-    /// on every timeline append (SwiftNativeWorkshopRunner.appendTimelineLocked).
     private func appendTimelineLocked(_ event: JSONValue, executionId: String) async throws {
-        let timeline = timelinePath(executionId)
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
-        let core = persistence
-        try await core.withFileLock(timeline) {
-            try await core.appendJSONL(event, to: timeline)
-        }
+        try await ExecutionRecordFile.appendTimeline(event, to: timelinePath(executionId), using: persistence)
     }
 
     /// Sanitize a PLANNER-DERIVED string for use as a single filename
@@ -1764,13 +1731,11 @@ public actor WorkshopExecutorLoop {
         return String(mapped.prefix(180))
     }
 
-    /// Per-step receipt: <receiptsDir>/<sanitized step_id>.json with the
-    /// full outcome. The daemon-era executor created receipts/ but never
-    /// populated it; the build plan makes the receipt write explicit in the
-    /// Swift port. Best-effort: a receipt IO failure must not fail the step
-    /// (the durable record is steps_completed in mission.json).
-    /// SECURITY (blocker #5): stepId is planner-derived — sanitize before it
-    /// becomes a path component so "../execution" cannot escape receiptsDir.
+    /// WorkshopStepOutcome JSON output artifacts, exposed by the overview's
+    /// receipt-directory location; steps_completed remains durable truth.
+    /// Local backup/export include workshop/; no raw phone sync; PrivacyMap
+    /// lists Workshop. Writes are best effort, with planner-derived step IDs
+    /// sanitized to a single filename inside the receipt directory.
     private func writeReceipt(executionId: String, outcome: WorkshopStepOutcome) async {
         guard outcome.status != "blocked_on_approval" else { return }  // not executed
         guard let safeStepId = Self.sanitizedPathComponent(outcome.stepId) else {
@@ -1855,15 +1820,8 @@ public actor WorkshopExecutorLoop {
         guard case .object(let last)? = execution.stepsCompleted.last else { return .null }
         let output = last["output"] ?? .null
         switch output {
-        case .object(let o):
-            if case .string(let text)? = o["text"] { return .string(text) }
-            if case .object(let inner)? = o["output"] {
-                if case .string(let text)? = inner["text"] { return .string(text) }
-                return .string((try? JSONValue.object(inner).serialize(pretty: false)) ?? "")
-            }
-            return .string((try? JSONValue.object(o).serialize(pretty: false)) ?? "")
-        case .string(let s):
-            return .string(s)
+        case .object, .string:
+            return .string(fullStepOutputText(output))
         default:
             return .null
         }
@@ -1981,11 +1939,8 @@ public actor WorkshopExecutorLoop {
         return resolve(args)
     }
 
-    /// Full (untruncated) text of a step output, for `{{step:id}}` substitution.
-    /// Mirrors summarizeStepOutput's extraction but returns the raw text with no
-    /// 500-char cap and no "returned no results" sentinel — an empty/absent
-    /// output substitutes as the empty string (so an empty prior step yields an
-    /// empty insert, not the literal words "returned no results").
+    /// Untruncated step handoff, retaining structured receipts when no text
+    /// projection exists. Textual outcome verification reads only result content.
     static func fullStepOutputText(_ output: JSONValue) -> String {
         switch output {
         case .null:
@@ -2005,39 +1960,15 @@ public actor WorkshopExecutorLoop {
         }
     }
 
-    /// Port of _summarize_step_output.
-    static func summarizeStepOutput(_ output: JSONValue, maxChars: Int = 500) -> String {
-        let text: String
-        switch output {
-        case .null:
-            return "returned no results"
-        case .string(let s):
-            text = s
-        case .object(let o):
-            if case .string(let t)? = o["text"] {
-                text = t
-            } else if case .object(let inner)? = o["output"] {
-                if case .string(let t)? = inner["text"] {
-                    text = t
-                } else if inner.isEmpty {
-                    return "returned no results"
-                } else {
-                    text = (try? JSONValue.object(inner).serialize(pretty: false)) ?? ""
-                }
-            } else if o.isEmpty {
-                return "returned no results"
-            } else {
-                text = (try? JSONValue.object(o).serialize(pretty: false)) ?? ""
-            }
-        default:
-            text = (try? output.serialize(pretty: false)) ?? ""
-        }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return "returned no results" }
-        if trimmed.count > maxChars {
-            return String(trimmed.prefix(maxChars)) + "…"
-        }
-        return trimmed
+    /// Only model context is bounded; receipts and tool references stay whole.
+    static func summarizeStepOutput(_ output: JSONValue, maxChars: Int = 32_768) -> String {
+        let text = fullStepOutputText(output)
+        if text.isEmpty { return "returned no results" }
+        if text.count <= maxChars { return text }
+        let head = maxChars / 4, tail = maxChars - head
+        return String(text.prefix(head))
+            + "\n… [\(text.count - maxChars) characters elided from middle] …\n"
+            + String(text.suffix(tail))
     }
 
     /// Last steps_completed record for a step id (daemon _step_record,

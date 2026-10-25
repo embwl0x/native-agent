@@ -1,6 +1,9 @@
 import NativeAgentShared
+
+// Blueprint: | `InboxSettingsView.swift` | `InboxSettingsView`: master/trigger controls, independent writer outcomes and history navigation over canonical inbox policy |
 // PATCH-2026-05-07: proactive-inbox-1 InboxSettingsView — trigger config + master enable
 import SwiftUI
+import NativeAgentCore
 import NotificationInbox
 import Observation
 import TrustCenter
@@ -91,9 +94,6 @@ struct InboxPolicyStatusSlot: Equatable {
         bySource[source] = status
     }
 
-    mutating func clear(source: Source) {
-        bySource.removeValue(forKey: source)
-    }
 }
 
 /// Owns the policy surface's Inbox History route without becoming a second
@@ -102,46 +102,11 @@ struct InboxPolicyStatusSlot: Equatable {
 /// rest of the app already observes.
 @MainActor @Observable
 final class InboxHistoryRoute {
-    enum RefreshResult: Equatable {
-        case loaded
-        case failed
-        case alreadyLoading
-    }
-
     private(set) var isPresented = false
-    private(set) var isLoading = false
-    private(set) var errorText: String?
 
-    func open(
-        read: @escaping @MainActor () async throws -> [InboxItemRecord],
-        retainedItemCount: @escaping @MainActor () -> Int,
-        adopt: @escaping @MainActor ([InboxItemRecord]) -> Void
-    ) async {
+    func open(inbox: InboxFacade) async {
         isPresented = true
-        _ = await refresh(read: read, retainedItemCount: retainedItemCount, adopt: adopt)
-    }
-
-    @discardableResult
-    func refresh(
-        read: @escaping @MainActor () async throws -> [InboxItemRecord],
-        retainedItemCount: @escaping @MainActor () -> Int,
-        adopt: @escaping @MainActor ([InboxItemRecord]) -> Void
-    ) async -> RefreshResult {
-        guard !isLoading else { return .alreadyLoading }
-        isLoading = true
-        errorText = nil
-        defer { isLoading = false }
-
-        do {
-            adopt(try await read())
-            return .loaded
-        } catch {
-            errorText = InboxLoadFailurePresentation.banner(
-                error: error,
-                retainedItemCount: retainedItemCount()
-            )
-            return .failed
-        }
+        await inbox.refresh()
     }
 
     func close() {
@@ -150,7 +115,7 @@ final class InboxHistoryRoute {
 }
 
 /// Rendered truth for the policy's history sheet. This deliberately has no
-/// collection state: cards come directly from the app-wide inbox mirror.
+/// collection state: cards come directly from the engine's inbox revision.
 enum InboxHistoryPresentation {
     enum Content: Equatable {
         case empty
@@ -200,18 +165,35 @@ enum InboxPolicyTriggersPanelGate: Equatable {
 
 struct InboxSettingsView: View {
     @Environment(AppModel.self) private var appModel
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    @State private var masterEnabled: Bool = false
-    @State private var suppressMasterSave = false
-    @State private var triggers: [TriggerConfig] = []
-    @State private var isLoading = false
     @State private var isSaving = false
     @State private var statusSlot = InboxPolicyStatusSlot()
-    @State private var trustReadState: InboxPolicyTrustReadState = .loading
     @State private var inboxHistoryRoute = InboxHistoryRoute()
-    /// The trigger read has come back once, either way: the header may speak.
-    @State private var triggersRead = false
+    private var triggers: [TriggerConfig] { appModel.engine.inbox.triggerRows }
+    private var triggersRead: Bool { appModel.engine.inbox.triggersRead }
+    private var isLoading: Bool { appModel.engine.inbox.isLoadingTriggers }
+    private var trustReadState: InboxPolicyTrustReadState {
+        let trust = appModel.engine.trust
+        if let error = trust.inboxPolicyError {
+            return .unavailable(UserFacingError.cause(error, action: "read the notification setting"))
+        }
+        return trust.hasReadInboxPolicy ? .loaded(enabled: trust.inboxPolicyEnabled) : .loading
+    }
+    private var masterEnabled: Binding<Bool> {
+        Binding(
+            get: { appModel.engine.trust.inboxPolicyEnabled },
+            set: { enabled in Task { await saveMaster(enabled: enabled) } })
+    }
+    private var statuses: [InboxPolicyStatusSlot.Entry] {
+        var displayed = statusSlot
+        if let error = appModel.engine.trust.inboxPolicyError {
+            displayed.record(InboxPolicyStatus(.settingsLoadFailed(UserFacingError.message(error, action: "load inbox settings"))), from: .settingsRead)
+        }
+        if let error = appModel.engine.inbox.triggerError {
+            displayed.record(InboxPolicyStatus(.triggersLoadFailed(error)), from: .triggersRead)
+        }
+        return displayed.entries
+    }
 
     private var triggersPanelGate: InboxPolicyTriggersPanelGate {
         InboxPolicyTriggersPanelGate.resolve(trustRead: trustReadState)
@@ -223,31 +205,24 @@ struct InboxSettingsView: View {
         case .loading, .unavailable: return true
         }
     }
-    private var agentDisplayName: String {
-        let profileName = appModel.personality?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let chatName = appModel.chatPersona.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !profileName.isEmpty && profileName != "NativeAgent" { return profileName }
-        if !chatName.isEmpty { return NativeAgentIdentity.displayName(chatName, fallback: "the agent") }
-        return "the agent"
-    }
-
     var body: some View {
         ScrollView {
             aliveContent
         }
-        // One save path for the switch: a user flip writes, a programmatic
-        // load does not.
-        .onChange(of: masterEnabled) { _, val in
-            if suppressMasterSave {
-                suppressMasterSave = false
-                return
-            }
-            Task { await saveMaster(enabled: val) }
-        }
         .alivePageLine(headerLine)
         // ui-taste-sweep 2026-06-07: was falling back to the bundle name.
         .navigationTitle("Notifications")
-        .quietReadTask { await load() }
+        .quietReadTask(live: false) {
+            do { _ = try await appModel.engine.trust.inboxEnabled() }
+            catch { ModuleLog.app("%@", "[inbox settings] \(error.localizedDescription)") }
+            do { _ = try await appModel.engine.inbox.triggers() }
+            catch { ModuleLog.app("%@", "[inbox triggers] \(error.localizedDescription)") }
+        }
+        .liveTask {
+            async let policy: Void = appModel.engine.trust.observeInboxPolicy()
+            async let triggers: Void = appModel.engine.inbox.observeTriggers()
+            _ = await (policy, triggers)
+        }
         .sheet(isPresented: Binding(
             get: { inboxHistoryRoute.isPresented },
             set: { presented in
@@ -255,7 +230,6 @@ struct InboxSettingsView: View {
             }
         )) {
             InboxHistoryView(
-                route: inboxHistoryRoute,
                 onRefresh: { await refreshInboxHistory() },
                 onClose: { inboxHistoryRoute.close() }
             )
@@ -290,9 +264,9 @@ struct InboxSettingsView: View {
             VStack(alignment: .leading, spacing: 12) {
                 AliveGroupCard {
                     InboxAliveSwitchRow(
-                        title: "Let \(agentDisplayName) raise things unasked",
-                        detail: "When this is on, \(agentDisplayName) can share observations, file changes, finished Desk tasks and check-ins without being asked.",
-                        isOn: $masterEnabled,
+                        title: "Let \(appModel.agentDisplayName) raise things unasked",
+                        detail: "When this is on, \(appModel.agentDisplayName) can share observations, file changes, finished Desk tasks and check-ins without being asked.",
+                        isOn: masterEnabled,
                         isSaving: isSaving
                     )
                     .disabled(masterToggleDisabled)
@@ -323,7 +297,7 @@ struct InboxSettingsView: View {
                     case .disabled:
                         EmptyView()
                     case .loading:
-                        Text("Checking whether notifications from \(agentDisplayName) are on…")
+                        Text("Checking whether notifications from \(appModel.agentDisplayName) are on…")
                             .font(.system(size: 13))
                             .foregroundStyle(NativeAgentShell.secondary)
                     case .unavailable(let detail):
@@ -340,9 +314,9 @@ struct InboxSettingsView: View {
                     }
                 }
 
-                if !statusSlot.entries.isEmpty {
+                if !statuses.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
-                        ForEach(statusSlot.entries, id: \.source) { entry in
+                        ForEach(statuses, id: \.source) { entry in
                             Text(entry.status.text)
                                 .font(ShellType.label)
                                 .foregroundStyle(statusColor(entry.status.tone))
@@ -364,7 +338,7 @@ struct InboxSettingsView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(inboxHistoryRoute.isLoading)
+                .disabled(appModel.engine.inbox.isLoading)
             }
         }
         .padding(.bottom, 32)
@@ -374,70 +348,18 @@ struct InboxSettingsView: View {
     // ── Data loading ──────────────────────────────────────────────────────
 
     private var triggersReadFailed: Bool {
-        statusSlot.entries.contains { $0.source == .triggersRead && $0.status.tone == .failure }
-    }
-
-    private var foldAnimation: Animation? {
-        NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)
-    }
-
-    func load() async {
-        isLoading = true
-        defer { isLoading = false }
-        // Load the raw trust policy to pick up inboxPolicy (not in the typed TrustPolicy)
-        // PATCH-2026-05-29: surface-load-errors Do not swallow the /v1/trust fetch
-        // with try?; a failed fetch left masterEnabled stale/false with no status.
-        do {
-            let loaded = try await appModel.engine.trust.inboxEnabled()
-            withAnimation(triggersRead ? foldAnimation : nil) {
-                trustReadState = .loaded(enabled: loaded)
-            }
-            statusSlot.clear(source: .settingsRead)
-            // Suppress the master toggle's onChange save only when the value
-            // actually changes: this is a programmatic load, not a user toggle,
-            // so it must not trigger a write-back. Guarding on the delta avoids
-            // arming the flag when onChange won't fire (which would otherwise
-            // swallow the next genuine user toggle).
-            if masterEnabled != loaded {
-                suppressMasterSave = true
-                masterEnabled = loaded
-            }
-        } catch {
-            trustReadState = .unavailable(UserFacingError.cause(error, action: "read the notification setting"))
-            statusSlot.record(InboxPolicyStatus(.settingsLoadFailed(UserFacingError.message(error, action: "load inbox settings"))), from: .settingsRead)
-        }
-        // Load triggers
-        // U5 W-A item 1 (:151): the trigger read was swallowed into [] —
-        // a failed read rendered as "no triggers configured" with no
-        // signal. Keep last-known rows and surface the real error in the
-        // panel's status line instead.
-        do {
-            let loadedTriggers = try await appModel.engine.inbox.triggers()
-            withAnimation(foldAnimation) { triggers = loadedTriggers }
-            statusSlot.clear(source: .triggersRead)
-        } catch {
-            statusSlot.record(InboxPolicyStatus(.triggersLoadFailed(UserFacingError.message(error, action: "load triggers"))), from: .triggersRead)
-        }
-        triggersRead = true
+        appModel.engine.inbox.triggerError != nil
     }
 
     func saveMaster(enabled: Bool) async {
         guard !isSaving else { return }
         isSaving = true
         defer { isSaving = false }
-        let previousEnabled: Bool = {
-            if case .loaded(let enabled) = trustReadState { return enabled }
-            return !enabled
-        }()
         do {
             try await appModel.engine.trust.setInboxEnabled(enabled)
-            withAnimation(foldAnimation) { trustReadState = .loaded(enabled: enabled) }
             statusSlot.record(InboxPolicyStatus(.masterSaved(enabled: enabled)), from: .masterToggle)
         } catch {
             statusSlot.record(InboxPolicyStatus(.masterSaveFailed(UserFacingError.message(error, action: "turn the inbox on or off"))), from: .masterToggle)
-            suppressMasterSave = true
-            masterEnabled = previousEnabled
-            trustReadState = .loaded(enabled: previousEnabled)
         }
     }
 
@@ -451,7 +373,6 @@ struct InboxSettingsView: View {
         do {
             try await appModel.engine.inbox.setTrigger(name, enabled: enabled)
             statusSlot.record(InboxPolicyStatus(.triggerSaved(name: name, enabled: enabled)), from: .triggerToggle(name))
-            await load()
             return true
         } catch {
             statusSlot.record(InboxPolicyStatus(.triggerSaveFailed(UserFacingError.message(error, action: "change that trigger"))), from: .triggerToggle(name))
@@ -460,19 +381,11 @@ struct InboxSettingsView: View {
     }
 
     private func openInboxHistory() async {
-        await inboxHistoryRoute.open(
-            read: { try await appModel.engine.inbox.list() },
-            retainedItemCount: { appModel.engine.inbox.items.count },
-            adopt: { appModel.engine.inbox.items = $0 }
-        )
+        await inboxHistoryRoute.open(inbox: appModel.engine.inbox)
     }
 
     private func refreshInboxHistory() async {
-        _ = await inboxHistoryRoute.refresh(
-            read: { try await appModel.engine.inbox.list() },
-            retainedItemCount: { appModel.engine.inbox.items.count },
-            adopt: { appModel.engine.inbox.items = $0 }
-        )
+        await appModel.engine.inbox.refresh()
     }
 
     private func statusColor(_ tone: InboxPolicyStatus.Tone) -> Color {
@@ -487,18 +400,17 @@ struct InboxSettingsView: View {
 
 /// Read-only history projection used only by Inbox Policy. It intentionally
 /// does not mount `InboxView`: there is one source of inbox rows, the shared
-/// AppModel mirror, and this sheet merely renders it.
+/// InboxFacade revision, and this sheet merely renders it.
 struct InboxHistoryView: View {
     @Environment(AppModel.self) private var appModel
 
-    let route: InboxHistoryRoute
     let onRefresh: @MainActor () async -> Void
     let onClose: () -> Void
 
     var body: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 0) {
-                if let errorText = route.errorText {
+                if let errorText = appModel.engine.inbox.refreshErrorText {
                     Text(errorText)
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.trouble)
@@ -507,12 +419,12 @@ struct InboxHistoryView: View {
                 }
 
                 switch InboxHistoryPresentation.content(items: appModel.engine.inbox.items) {
-                case .empty where route.isLoading:
+                case .empty where appModel.engine.inbox.isLoading:
                     ProgressView("Loading notification history…")
                         .font(ShellType.label)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .empty:
-                    Text(route.errorText == nil
+                    Text(appModel.engine.inbox.refreshErrorText == nil
                          ? "No notification history yet. Cards appear here after the agent records an observation, a file change or a finished Desk task."
                          : "Notification history is unavailable. Try refreshing.")
                         .font(ShellType.label)
@@ -538,7 +450,7 @@ struct InboxHistoryView: View {
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
-                    .disabled(route.isLoading)
+                    .disabled(appModel.engine.inbox.isLoading)
                     .accessibilityLabel("Refresh notification history")
                 }
                 ToolbarItem(placement: .confirmationAction) {

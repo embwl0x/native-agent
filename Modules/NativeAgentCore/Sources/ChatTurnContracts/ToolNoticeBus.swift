@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ToolNoticeBus.swift` | `ToolNoticeBus` enum |
 
 /// Task-local bridge that lets a deep tool implementation (e.g. the
 /// invoke_claude subprocess handler) push user-visible progress notices into

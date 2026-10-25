@@ -1,5 +1,7 @@
 import ApprovalTransactions
-import ChatOrchestration
+import ChatTurnContracts
+import ChatToolRuntime
+import ChatToolParsing
 import Dispatcher
 import Foundation
 import MacIntegration
@@ -8,6 +10,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `AppToolExecutor+InteractionAct.swift` | `AppToolExecutor`: `cardRefusal`, `runCardAction`, `applyMacControlCategoryGrant` |
 
 /// Answering an inline card without a hand on the trackpad.
 ///
@@ -16,8 +19,7 @@ import TrustCenter
 /// that tap into three steps: mark the row running, OPEN THE CONTROL that
 /// already owns the thing, then ask that control's owner whether it is now
 /// done. The door's card actions are the same three steps with the middle one taken through
-/// the control's non-UI path — Connectors' own token write, the receipted
-/// permission store, `saveMultimodalPolicy`, the model override binding —
+/// the control's non-UI path — the receipted permission store, `saveMultimodalPolicy`, the model override binding —
 /// instead of through a sheet.
 ///
 /// What it deliberately does NOT do:
@@ -28,8 +30,8 @@ import TrustCenter
 ///    path, so the answer is `needs_glass` with the reason — never a silent
 ///    half-grant.
 ///  * **It never becomes the authority.** `complete` re-reads the owner, the
-///    same as a tap does, so a bad token FAILS the card in the connector's own
-///    words and leaves the retry intact.
+///    same as a tap does, so a rejected write FAILS the card in the owner's
+///    own words and leaves the retry intact.
 ///  * **It never answers for someone else.** A card raised in a conversation
 ///    that came from the phone or Telegram belongs to that person; the tool
 ///    refuses it rather than settling a question it was not asked.
@@ -37,7 +39,6 @@ extension AppToolExecutor {
 
     /// Which controls can be worked without a window, and how.
     private enum InteractionControlRoute {
-        case connectorToken(connector: String)
         case permissionGrant
         case capabilityFlag
         case providerKey
@@ -68,7 +69,6 @@ extension AppToolExecutor {
     /// route changes nothing about what the agent is allowed to do.
     private static func authorityMutation(_ route: InteractionControlRoute) -> String? {
         switch route {
-        case .connectorToken: return "Writing a connector's token"
         case .permissionGrant: return "Granting Mac access"
         case .capabilityFlag: return "Turning on a Trust capability"
         case .providerKey: return "Writing a provider key"
@@ -386,13 +386,6 @@ extension AppToolExecutor {
         var setupError: String?
         var note: String?
         switch route {
-        case .connectorToken(let connector):
-            // The connector's own writer, which validates with the service
-            // before it saves. A rejected token writes nothing, so the
-            // resolver's re-read fails the card in the connector's own words.
-            setupError = await interactions.saveConnectorToken(value, connector: connector, dataRoot: dataRoot)
-            selection = connector
-
         case .permissionGrant:
             // Below Full Mac `cardGate` refused the card by its kind.
             await grantInteractionPermissions(current, appModel: appModel, dataRoot: dataRoot)
@@ -479,32 +472,11 @@ extension AppToolExecutor {
             return .needsGlass("Pairing needs the person's iPhone and the Pair button on the Mac.")
         case .connectorManualToken:
             let connector = InlineInteractionRegistry.canonicalConnectorID(interaction.target)
-            // Slack's setup is a token PLUS its channel/user allowlists; there
-            // is no one-value write that means the same thing.
-            guard ["notion", "github"].contains(connector) else {
-                return .needsGlass(
-                    "\(connector)'s setup takes more than one token — it has to be done in "
-                    + "Connectors on the glass."
-                )
-            }
-            // Decided BEFORE the card is marked running: a missing token has
-            // to leave it pending, not stranded mid-flight.
-            guard !value.isEmpty else {
-                if connector == "github" {
-                    return .needsGlass(
-                        "GitHub signs in in the browser: the person taps Connect with GitHub on the "
-                        + "card and approves the code. Or pass a GitHub token as `value`."
-                    )
-                }
-                return .needsGlass(
-                    "Pass the \(descriptor.displayName) token as `value`, or the person pastes "
-                    + "it in Connectors."
-                )
-            }
-            return .connectorToken(connector: connector)
-        case .connectorOAuth:
+            // Slack's and Telegram's setup is a token PLUS their allowlists;
+            // there is no one-value write that means the same thing.
             return .needsGlass(
-                "Signing in to \(interaction.target) happens in a browser, with the person there."
+                "\(connector)'s setup takes more than one token — it has to be done in "
+                + "Connectors on the glass."
             )
         case .macPermissionGrant:
             if interaction.allTargets.contains(where: { InlineInteractionRegistry.isMacControlCategory($0) || SystemPermissionPreflight.cardSettingsCapability($0) != nil }) {
@@ -517,6 +489,8 @@ extension AppToolExecutor {
             )
         case .capabilityFlag:
             return .capabilityFlag
+        case .keyring:
+            return .needsGlass("A secret goes from the person's card into the keyring, never through you: they paste it or sign in on the Mac.")
         case .providerAPIKey:
             guard !value.isEmpty else {
                 return .needsGlass(
@@ -800,7 +774,7 @@ extension AppToolExecutor {
         }
         var attachments: [URL] = []
         for raw in Self.attachmentPaths(input["attachments"]) {
-            switch await Self.fencedAttachment(raw, fullMac: posture?.name == Self.fullMacModeName, dataRoot: dataRoot) {
+            switch await SwiftNativeSecurityCenter.fencedAttachment(raw, dataRoot: dataRoot) {
             case .success(let file): attachments.append(file)
             case .failure(let refusal):
                 return .failure(GateRefusal(answer: Self.interactionFailure(
@@ -821,12 +795,11 @@ extension AppToolExecutor {
                     "verb": .string(verb),
                     "element": .string(outcome.element),
                     "effects": .string(refusal.effects.rawValue),
+                    "remedy": outcome.remedy ?? .null,
                 ]
             )
         }
     }
-
-    struct AttachmentRefusal: Error { let reason: String; let detail: String }
 
     private static func attachmentPaths(_ value: JSONValue?) -> [String] {
         switch value {
@@ -834,35 +807,6 @@ extension AppToolExecutor {
         case .array(let many)?: return many.map(interactionText).filter { !$0.isEmpty }
         default: return []
         }
-    }
-
-    /// The fence `read_file` keeps, for a file the agent attaches: it must sit
-    /// in a Trust workspace root unless this Mac is in Full Mac. A relative
-    /// path is read against her workspace, as `read_file` reads it. make.add keeps it too.
-    static func fencedAttachment(
-        _ raw: String, fullMac: Bool, dataRoot: URL
-    ) async -> Result<URL, AttachmentRefusal> {
-        let expanded = HomePath.expand(raw)
-        let file = (expanded.hasPrefix("/")
-            ? URL(fileURLWithPath: expanded)
-            : NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot).appendingPathComponent(expanded))
-            .standardizedFileURL.resolvingSymlinksInPath()
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: file.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
-            return .failure(.init(reason: "attachment_missing",
-                detail: "No file is at \(file.path). Check the path with app files.list, then try again."))
-        }
-        if fullMac { return .success(file) }
-        guard let policy = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked() else {
-            return .failure(.init(reason: "trust_mode_unreadable",
-                detail: "The saved Trust policy could not be read, so no file was attached. The person can check Trust."))
-        }
-        guard SwiftNativeSecurityCenter.isInsideTrustedWorkspace(file, policy: policy, dataRoot: dataRoot) else {
-            return .failure(.init(reason: "attachment_outside_workspace",
-                detail: "\(file.path) is outside your Trust workspace folders, the same fence app files.read keeps. "
-                + "Ask the owner to attach it themselves, or to add its folder to the workspace roots in Trust."))
-        }
-        return .success(file)
     }
 
     // MARK: - Answers

@@ -7,17 +7,14 @@ import PersistenceCore
 import Desk
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
 import ToolRegistry
+// Blueprint: | `SwiftToolDispatcher+AgentBridgeTools.swift` | `SwiftToolDispatcher`: `drivenAgentLaunch`, `drivenAgentContact`, `stampDelegationProducer` |
 
 /// One finished launch of an agent NativeAgent drives: SecurityCenter's
 /// decision for this turn's real origin and the exact program
@@ -100,7 +97,8 @@ extension SwiftToolDispatcher {
     /// historical uncertainty separate from evidence produced by this build.
     static func stampDelegationProducer(on payload: inout [String: JSONValue]) {
         payload["producerSchemaVersion"] = .int(1)
-        // 2026-09-22: a peer's words shaped this turn; the woken agent must know the ask is not the person's.
+        // A turn an untrusted agent started delegates under that steer: the
+        // woken agent is told the ask is not the person's.
         if let taint = PeerDataTaint.current, taint.isTainted { payload["peerTainted"] = .string(taint.sourceDescription) }
         guard let raw = Bundle.main.object(forInfoDictionaryKey: "NativeAgentSourceRevision") as? String else {
             return
@@ -443,43 +441,6 @@ extension SwiftToolDispatcher {
             ])))
         }
         return .success(requested)
-    }
-
-    // MARK: - time_now handler
-
-    /// Return current date/time in multiple representations. Zero-input,
-    /// zero-side-effect, always safe. Caught by Agent 2026-06-08: she
-    /// called time_now mid-test and got "not in the dispatch table" —
-    /// the name is sensible, the tool just was never built. Now it is.
-    static func impl_time_now() -> JSONValue {
-        let now = Date()
-        let isoUTC = ISO8601DateFormatter().string(from: now)
-        let isoLocalFormatter = ISO8601DateFormatter()
-        isoLocalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        isoLocalFormatter.timeZone = TimeZone.current
-        let isoLocal = isoLocalFormatter.string(from: now)
-        let epoch = Int64(now.timeIntervalSince1970)
-        let cal = Calendar.current
-        let weekday = cal.component(.weekday, from: now)
-        let weekdayNames = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
-        let weekdayName = weekdayNames[max(1, min(7, weekday)) - 1]
-        let dayOfYear = cal.ordinality(of: .day, in: .year, for: now) ?? 0
-        let humanFormatter = DateFormatter()
-        humanFormatter.dateStyle = .full
-        humanFormatter.timeStyle = .medium
-        humanFormatter.timeZone = TimeZone.current
-        let human = humanFormatter.string(from: now)
-        return .object([
-            "status": .string("ok"),
-            "iso_utc": .string(isoUTC),
-            "iso_local": .string(isoLocal),
-            "epoch_seconds": .int(epoch),
-            "weekday": .string(weekdayName),
-            "day_of_year": .int(Int64(dayOfYear)),
-            "human": .string(human),
-            "timezone": .string(TimeZone.current.identifier),
-            "timezone_offset_seconds": .int(Int64(TimeZone.current.secondsFromGMT(for: now))),
-        ])
     }
 
     /// Keep deduplication and the capped append under the same inbox lock.
@@ -856,6 +817,7 @@ extension SwiftToolDispatcher {
                               launch: DrivenAgentLaunch? = nil, launchArguments: [String] = [],
                               launchEnvironment: [String: String] = [:]) async -> JSONValue {
         var environment = AgentBridgeRuntime.processEnvironment()
+        environment["NATIVE_AGENT_DATA_ROOT"] = dataRoot.path
         environment.merge(InstallPaths.current.bridgeEnvironment(configRoot: builderWorktreeConfigRoot)) { _, path in path }
         guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
             var failure: [String: JSONValue] = [
@@ -1039,6 +1001,7 @@ enum WakeupReplayGuard {
     static func terminalDuplicate(
         store: Store,
         jobsDirectory: URL,
+        dataRoot: URL,
         topic: String?,
         text: String,
         conversationId: String? = nil,
@@ -1054,7 +1017,8 @@ enum WakeupReplayGuard {
             let url = jobsDirectory.appendingPathComponent(name)
             guard let data = try? Data(contentsOf: url),
                   let parsed = try? JSONValue.parse(data),
-                  case .object(let record) = parsed else { continue }
+                  case .object(let record) = parsed,
+                  (try? DataRootLife.isCurrent(string(record, "lifeID"), in: dataRoot)) == true else { continue }
             records.append(record)
             guard let candidate = match(
                 store: store, record: record, url: url,

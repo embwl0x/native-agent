@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `TurnTraceW2.swift` | `TurnTraceRedactor` and `InspectorThinkingLane`: shared trace redaction and per-surface summarized-thinking visibility gate |
+
 // MARK: - Turn Inspector W2 (turn-inspector build plan, ledger d6143561)
 //
 // W2 adds richer per-turn EMISSION points on top of the W1 spine

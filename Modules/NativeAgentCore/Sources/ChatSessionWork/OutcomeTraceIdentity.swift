@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `OutcomeTraceIdentity.swift` | `OutcomeTraceIdentity` enum; `normalized` |
 
 /// Closed validation for the opaque correlation token stored on canonical
 /// assistant completions. It intentionally rejects whitespace, paths, prose,

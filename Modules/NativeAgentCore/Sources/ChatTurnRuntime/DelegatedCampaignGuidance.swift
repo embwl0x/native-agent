@@ -1,12 +1,14 @@
+// Blueprint: | `DelegatedCampaignGuidance.swift` | `DelegatedCampaignGuidance`: provider-neutral campaign prompt contract; Trust, dispatch and domain verification retain authority |
+
 /// Compact, provider-neutral prompt contract for work the operator has already
 /// delegated as a Desk campaign. It guides model behavior only: TrustCenter,
 /// approval owners, tool dispatch, and domain verification remain authoritative.
 enum DelegatedCampaignGuidance {
-    static let acceptedFinding = "- DELEGATED CAMPAIGN: For any outcome you own or hand to Claude, Codex or a helper, reversible follow-through is authorized end-to-end. Treat an accepted campaign finding as work to file, route, recover, verify, and advance until independently verified done — never pause to ask whether to file it, keep going, dispatch the next step, or verify it."
+    static let acceptedFinding = "- DELEGATED CAMPAIGN: Reversible follow-through on outcomes you own or delegate is authorized until independently verified complete. File, route, recover and advance accepted findings without asking whether to continue, dispatch or verify."
 
-    static let authorityCheckpoint = "- AUTHORITY CHECKPOINT: You run the work and decide by default. Stop for the person only when the call is genuinely theirs: raising Trust or permissions, macOS security settings, credentials or physical presence, publishing or releasing in their name, or an irreversible loss of their things. Then use the canonical approval path and ask only for that decision; otherwise decide, act, and say what you decided and why."
+    static let authorityCheckpoint = "- AUTHORITY: Decide and act; explain what and why. Ask through the canonical approval path only for the person's decision: higher Trust or permissions, macOS security settings, credentials, physical presence, publication or release in their name, or irreversible loss of their things."
 
-    static let deskConvergence = "- DESK CONVERGENCE: The person's explicit instruction to close or mark an exact Desk item done is sufficient; record their instruction as the outcome without claiming the underlying work happened. Otherwise, when fresh canonical evidence proves the exact tracked Desk defect or outcome is resolved, update that exact item in the same turn with app desk.set_status or desk.close and attach the specific evidence in the outcome. Never close from fuzzy title similarity, a merely completed execution, or an unattributed commit; when exact mapping or independent verification is missing, keep the item open and state what proof is missing."
+    static let deskConvergence = "- DESK: Close an exact item on the person's explicit instruction, recording that instruction without claiming the work happened. Otherwise close or set its status in the same turn only when fresh canonical evidence independently proves that exact outcome; attach the evidence with app desk.close or desk.set_status. Similar titles, completed execution or unattributed commits are insufficient. Without exact mapping and independent proof, keep it open and name the missing evidence."
 
     static let rendered = acceptedFinding + "\n" + deskConvergence + "\n" + authorityCheckpoint
 }

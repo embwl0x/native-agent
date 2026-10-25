@@ -9,6 +9,8 @@ import MemoryV2
 import NativeAgentShared
 import NativeAgentCore
 
+// Blueprint: | `SlimSettingsView.swift` | Operational settings presentation: canonical control homes, status wording and updater availability shared by settings page rows |
+
 /// One canonical owner for each live operational control. Views consume these
 /// labels rather than repeating storage-oriented wording, which keeps a
 /// control from quietly acquiring a second settings home.
@@ -53,79 +55,6 @@ enum OperationalSettingsControlPresentation {
         case .off: "Off"
         }
     }
-}
-
-/// The About panel must distinguish a live runtime read from the unrelated
-/// most-recent UI action. `AppModel.statusText` is intentionally a broad
-/// activity feed, so showing it as "Status" could claim an old save result
-/// describes the runtime now.
-enum SlimSettingsStatusLinePresentation {
-    enum Tone: Equatable {
-        case neutral
-        case success
-        case warning
-        case failure
-    }
-
-    struct State: Equatable {
-        let text: String
-        let detail: String?
-        let tone: Tone
-        let systemImage: String
-    }
-
-    static func runtimeState(runtimeOK: Bool?, lastRefreshError: String?) -> State {
-        let error = normalized(lastRefreshError)
-
-        switch runtimeOK {
-        case true:
-            if error != nil {
-                return State(
-                    text: "App is online; some app data is unavailable",
-                    detail: refreshDetail,
-                    tone: .warning,
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-            }
-            return State(
-                text: "App is online",
-                detail: nil,
-                tone: .success,
-                systemImage: "checkmark.circle.fill"
-            )
-        case false:
-            return State(
-                text: "App reported a problem",
-                detail: error == nil ? nil : refreshDetail,
-                tone: .failure,
-                systemImage: "xmark.octagon.fill"
-            )
-        case nil:
-            if error != nil {
-                return State(
-                    text: "App status is unavailable",
-                    detail: refreshDetail,
-                    tone: .failure,
-                    systemImage: "xmark.octagon.fill"
-                )
-            }
-            return State(
-                text: "App status has not been checked",
-                detail: nil,
-                tone: .neutral,
-                systemImage: "questionmark.circle"
-            )
-        }
-    }
-
-    private static func normalized(_ raw: String?) -> String? {
-        guard let raw else { return nil }
-        let text = raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
-        return text.isEmpty ? nil : text
-    }
-
-    /// The failed reads are named in the log (refreshAll), not here.
-    private static let refreshDetail = "Some sections didn't refresh. The details are in the log."
 }
 
 /// Feed availability, automatic-check preference and manual-check readiness

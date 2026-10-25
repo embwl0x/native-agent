@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `InlineInteractionModelOverride.swift` | `InlineInteractionModelOverride` enum; `binding` |
 
 /// A model choice bound to ONE resumed request, and nothing else.
 ///

@@ -2,6 +2,7 @@ import Foundation
 import PersistenceCore
 import Experiences
 import NativeAgentCore
+// Blueprint: | `ShelfStore.swift` | `ShelfStore` struct; `append`, `settleApproval` |
 
 public struct ShelfStore: Sendable {
     public static let maximumPageSize = 100

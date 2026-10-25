@@ -2,6 +2,7 @@ import Foundation
 import PersonaEngine
 import MemoryV2
 import Cognition
+// Blueprint: | `RuntimeReadProjection+Personality.swift` | RuntimeReadProjection.swiftPersonalityGrowth; saved profile/document reads, failures and committed writes belong to PersonaFacade. |
 
 extension RuntimeReadProjection {
     public static func swiftPersonalityGrowth(

@@ -2,6 +2,7 @@ import Context
 import Foundation
 import MemoryV2
 import Senses
+// Blueprint: | `SensesContextProjection.swift` | `SensesContextProjection`: four bounded unread `news` atoms from `SenseNewsBoard`, selected from the published generation, verified for expiry/seen state before delivery, separately rendered and acknowledged only on provider output; expiry/seen exclusion also protects retained generations |
 
 /// A bounded unread-news slot, separate from topic-selected memories.
 public struct SensesContextProjection: ContextCompiledProjectionProvider, Sendable {
@@ -22,9 +23,11 @@ public struct SensesContextProjection: ContextCompiledProjectionProvider, Sendab
 
     public func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
                        surface: ContextSurface) async -> ContextTurnExclusion {
+        let news = chosen.filter { $0.draft.kind == .news }
+        guard !news.isEmpty else { return ContextTurnExclusion() }
         let unread = Set(await SenseNewsBoard.shared.latest(limit: SenseNewsBoard.capacity).map(Self.atomID))
-        return ContextTurnExclusion(atomIDs: Set(chosen.filter {
-            $0.draft.kind == .news && !unread.contains($0.draft.id)
+        return ContextTurnExclusion(atomIDs: Set(news.filter {
+            !unread.contains($0.draft.id)
         }.map(\.draft.id)))
     }
 

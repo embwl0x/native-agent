@@ -6,7 +6,8 @@
 // prompt never carries any of it. Reject and undo are her own verbs over her
 // own mind; the substrate owns both lists and their caps.
 
-import ChatOrchestration
+import ChatTurnContracts
+import AgentConversations
 import CognitiveSubstrate
 import Foundation
 import MemoryV2
@@ -16,16 +17,24 @@ import Privacy
 import Studio
 import TurnTrace
 
+// Blueprint: | `NativeCognitionRuntime+MindLedger.swift` | `NativeCognitionRuntime` mind ledger: trace-backed why, association rejection, opinion revision and undo through substrate owners |
+
 extension NativeCognitionRuntime {
-    /// Why and terminal rows of today and yesterday, newest first.
-    private static func whyEvents(dataRoot: URL) async -> [TurnTraceEvent] {
+    /// Why and terminal rows of today and yesterday (calendar days), newest
+    /// first, and each day's trace that could not be read: never "no record".
+    private static func whyEvents(dataRoot: URL) async -> (events: [TurnTraceEvent], unreadable: [String]) {
         let reader = TurnTraceRecentReader(dataRootOverride: dataRoot)
+        let now = Date()
         var events: [TurnTraceEvent] = []
-        for day in [Date(), Date().addingTimeInterval(-86_400)] {
-            guard let snapshot = try? await reader.read(now: day) else { continue }
-            events += snapshot.events.filter { $0.kind == "mind.why" || $0.kind == "turn.terminal" }
+        var unreadable: [String] = []
+        for (name, day) in [("today", now), ("yesterday", Calendar.current.date(byAdding: .day, value: -1, to: now) ?? now)] {
+            do {
+                events += try await reader.read(now: day).events.filter { $0.kind == "mind.why" || $0.kind == "turn.terminal" }
+            } catch {
+                unreadable.append("\(name)'s turn trace (\(error.localizedDescription))")
+            }
         }
-        return events.sorted { $0.ts > $1.ts }
+        return (events.sorted { $0.ts > $1.ts }, unreadable)
     }
 
     private static func lane(_ event: TurnTraceEvent) -> String {
@@ -47,10 +56,13 @@ extension NativeCognitionRuntime {
             envelope.agent == nil ? envelope.replyRoute.surface : "bridge")
         let destination = TurnTraceContext.destinationId
         let thread = TurnTraceContext.threadId
-        let events = await Self.whyEvents(dataRoot: dataRoot).filter {
+        let (traced, unreadable) = await Self.whyEvents(dataRoot: dataRoot)
+        let events = traced.filter {
             $0.sessionId == session && $0.surface == caller.surface
                 && $0.destinationId == destination && $0.threadId == thread
         }
+        let unread = unreadable.isEmpty ? nil
+            : "Could not read " + unreadable.joined(separator: " or ") + ", so a record there may be missing."
         let wanted = turn?.trimmingCharacters(in: .whitespacesAndNewlines)
         var recent: [String] = []
         for event in events where event.kind == "mind.why" && !recent.contains(event.turnId) {
@@ -64,7 +76,7 @@ extension NativeCognitionRuntime {
         }
         guard let target = (wanted?.isEmpty == false ? wanted : nil) ?? completed?.turnId else {
             return .object(["status": .string("unavailable"),
-                            "detail": .string("No completed turn is recorded in this conversation. Pass turn explicitly to read its record."),
+                            "detail": .string(unread ?? "No completed turn is recorded in this conversation. Pass turn explicitly to read its record."),
                             "recent_turns": .array(recent.map { .string($0) })])
         }
         var rows: [(event: TurnTraceEvent, payload: JSONValue)] = []
@@ -73,11 +85,14 @@ extension NativeCognitionRuntime {
                 rows.append((event, payload))
             }
         }
-        var out: [String: JSONValue] = ["status": .string(rows.isEmpty ? "empty" : "ok"), "turn": .string(target)]
+        var out: [String: JSONValue] = [
+            "status": .string(!rows.isEmpty ? "ok" : unread == nil ? "empty" : "unavailable"), "turn": .string(target)]
         if rows.isEmpty {
-            out["detail"] = .string(target == TurnTraceContext.turnId
+            out["detail"] = .string(unread ?? (target == TurnTraceContext.turnId
                 ? "No why record is available for this turn yet. Its cue record lands at delivery; pass this turn explicitly after it finishes."
-                : "No why record is available for the requested turn in this conversation.")
+                : "No why record is available for the requested turn in this conversation."))
+        } else if let unread {
+            out["unreadable"] = .string(unread)
         }
         for row in rows where out[Self.lane(row.event)] == nil {
             out[Self.lane(row.event)] = row.payload

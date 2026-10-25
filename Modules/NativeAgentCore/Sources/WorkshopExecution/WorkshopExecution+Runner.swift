@@ -7,11 +7,13 @@ import PersistenceCore
 import ProviderRouting
 import TrustCenter
 
+// Blueprint: | `WorkshopExecution+Runner.swift` | `SwiftNativeWorkshopRunner`: canonical execution.json ownership, safe execution IDs, queue admission, planning/cancel transitions and timeline receipts |
+
 // MARK: - SwiftNative impl
 
 public actor SwiftNativeWorkshopRunner {
     private let root: URL
-    private let persistence: any PersistenceCoreProtocol
+    let persistence: any PersistenceCoreProtocol
     private let planner: any WorkshopPlannerLLM
     private let now: @Sendable () -> Date
     private let uuid: @Sendable () -> String
@@ -41,20 +43,17 @@ public actor SwiftNativeWorkshopRunner {
         executionRecordsRoot.appendingPathComponent(id, isDirectory: true)
     }
 
-    /// Resolved record path: `execution.json`, falling back to a legacy
-    /// `mission.json` for a directory the P2-1 rename pass hasn't reached
-    /// (crash mid-migration, iCloud straggler). A directory with neither
-    /// resolves to the canonical name, so submit() writes `execution.json`.
+    /// The sole live record: execution.json. Legacy files stay untouched.
     public nonisolated func executionRecordPath(_ id: String) -> URL {
-        ExecutionRecordFile.resolve(in: workshopExecutionDir(id))
+        ExecutionRecordFile.canonicalPath(in: workshopExecutionDir(id))
     }
 
     public nonisolated func timelinePath(_ id: String) -> URL {
-        workshopExecutionDir(id).appendingPathComponent("timeline.jsonl")
+        ExecutionRecordFile.timelinePath(in: workshopExecutionDir(id))
     }
 
     public nonisolated func receiptsDir(_ id: String) -> URL {
-        workshopExecutionDir(id).appendingPathComponent("receipts", isDirectory: true)
+        ExecutionRecordFile.receiptsPath(in: workshopExecutionDir(id))
     }
 
     /// Execution ids are persisted as directory names. Keep every public
@@ -89,24 +88,11 @@ public actor SwiftNativeWorkshopRunner {
     /// `Runtime.activity_path`:
     /// `<root>/activity/events.jsonl`.
     nonisolated var activityPath: URL {
-        root
-            .appendingPathComponent("activity", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
+        SwiftNativePersistenceCore.activityEventsPath(dataRoot: root)
     }
 
-    /// Mirror of `Runtime._missions_allowed`:
-    ///   `bool(policy.get("developerMode")) or
-    ///    bool(policy.get("missionPolicy", {}).get("enabled", False))`
-    /// against the MERGED trust policy. We only need these two keys, so rather
-    /// than port the whole `trust_policy()` merge+normalize, read the saved
-    /// `trust/policy.json` and apply the SAME default the daemon's
-    /// `default_trust_policy()` ships:
-    /// `missionPolicy.enabled` defaults to TRUE. So a fresh root with no saved
-    /// policy is ALLOWED — matching the daemon and keeping the default-OFF
-    /// `.missionsWrites` seam's behavior identical to the daemon route it
-    /// falls through to. The gate only ever REFUSES when a saved policy
-    /// explicitly sets `missionPolicy.enabled = false` (and developerMode is
-    /// not set) — exactly the daemon's 403 condition.
+    /// Read checked Trust authority before submission; damaged saved policy
+    /// refuses work. A missing store receives the owner's bootstrap defaults.
     private func workshopExecutionsAllowed() async throws -> Bool {
         // Reuse the authority owner's checked read: only a missing file may
         // bootstrap. A damaged saved policy is unavailable, not permission to
@@ -122,16 +108,7 @@ public actor SwiftNativeWorkshopRunner {
         }
     }
 
-    /// SINGLE SOURCE OF TRUTH for the missionPolicy half of
-    /// `Runtime._missions_allowed`:
-    ///   `bool(policy.get("developerMode")) or
-    ///    bool(policy.get("missionPolicy", {}).get("enabled", False))`
-    /// evaluated with merged-default semantics. Public + static so the
-    /// app-layer EXECUTOR gate (BackgroundLoopsAssembly.workshopExecutorGate)
-    /// evaluates the EXACT same rules as this submit-side gate — gpt-5.5
-    /// executor-port blocker #7 flagged the two gates diverging (the
-    /// executor gate treated a present-but-malformed missionPolicy as ALLOW
-    /// while submit denies it).
+    /// Shared Workshop policy projection for submission and background execution.
     ///
     /// Rules:
     ///   - developerMode truthy (retired truthiness) -> allow. Swift-native
@@ -147,7 +124,7 @@ public actor SwiftNativeWorkshopRunner {
     ///   - `enabled` key absent → allow (merged default enabled=true).
     ///   - otherwise -> retired truthiness of `enabled`.
     public static func workshopPolicyAllows(_ policy: [String: JSONValue]) -> Bool {
-        if WorkshopExecutionUpdate.pyTruthy(policy["developerMode"]) { return true }
+        if pyTruthy(policy["developerMode"]) { return true }
         // Wave 4 read-both (phase A): accept the FUTURE `workshopPolicy`
         // spelling, falling back to the on-wire `missionPolicy`. Every writer
         // still emits the old key, so on a real policy this resolves to exactly
@@ -163,7 +140,22 @@ public actor SwiftNativeWorkshopRunner {
         guard let enabled = mp["enabled"] else {
             return true   // enabled key absent → merged default enabled=true
         }
-        return WorkshopExecutionUpdate.pyTruthy(enabled)
+        return pyTruthy(enabled)
+    }
+
+    /// Retired truthiness for a JSON value (matches `bool(x)` for the scalar
+    /// types `body.get(...)` can return): absent/null/false/0/0.0/""/[]/{}
+    /// are falsy; everything else is truthy.
+    private static func pyTruthy(_ v: JSONValue?) -> Bool {
+        switch v {
+        case .none, .some(.null): return false
+        case .some(.bool(let b)): return b
+        case .some(.int(let i)): return i != 0
+        case .some(.double(let d)): return d != 0
+        case .some(.string(let s)): return !s.isEmpty
+        case .some(.array(let a)): return !a.isEmpty
+        case .some(.object(let o)): return !o.isEmpty
+        }
     }
 
     /// Mirror of the `_mission_slots` capacity:
@@ -206,7 +198,7 @@ public actor SwiftNativeWorkshopRunner {
     }
 
     /// In-flight submit reservations: queue subdirs holding `.reserved` with
-    /// no mission.json yet. Each occupies a slot so concurrent submitters
+    /// no execution.json yet. Each occupies a slot so concurrent submitters
     /// can't overshoot the cap between admission and the durable write.
     /// Age-out: a reservation older than 10 minutes is a crashed submit
     /// (planning happens BEFORE reservation; only file IO remains) — ignore
@@ -219,9 +211,6 @@ public actor SwiftNativeWorkshopRunner {
         var count = 0
         for dir in subdirs {
             let marker = dir.appendingPathComponent(".reserved")
-            // EITHER record name counts as "the durable write landed" — a
-            // canonical-only probe would read an unmigrated dir as a live
-            // reservation and leak an admission slot for 10 minutes.
             guard fm.fileExists(atPath: marker.path),
                   !ExecutionRecordFile.exists(in: dir, fileManager: fm) else {
                 continue
@@ -235,7 +224,7 @@ public actor SwiftNativeWorkshopRunner {
 
     /// Append one Activity event mirroring `Runtime.record_activity`
     ///: the daemon writes
-    ///   {id, kind, title, detail, status, missionId, payload, createdAt}
+    ///   {id, kind, title, detail, status, executionId, payload, createdAt}
     /// to `activity/events.jsonl` (sorted-keys JSON line). The legacy
     /// create_mission (L5432) and update_mission (L5490) handlers emit these
     /// rows; the QUEUE path the native writer mirrors emits NONE (neither
@@ -264,26 +253,18 @@ public actor SwiftNativeWorkshopRunner {
         executionId: String?,
         payload: JSONValue
     ) async {
-        let event: JSONValue = .object([
-            "id": .string(uuid()),
-            "kind": .string(kind),
-            "title": .string(NativeAgentSecretRedactor.redactText(title)),
-            "detail": .string(NativeAgentSecretRedactor.redactText(detail)),
-            "status": .string(status),
-            "executionId": executionId.map { JSONValue.string($0) } ?? .null,
-            "payload": NativeAgentSecretRedactor.redactValue(payload),
-            "createdAt": .string(Self.isoTimestamp(now())),
-        ])
+        let event = SwiftNativePersistenceCore.activityEvent(
+            id: uuid(),
+            kind: kind,
+            title: NativeAgentSecretRedactor.redactText(title),
+            detail: NativeAgentSecretRedactor.redactText(detail),
+            status: status,
+            executionId: executionId,
+            payload: NativeAgentSecretRedactor.redactValue(payload),
+            createdAt: Self.isoTimestamp(now())
+        )
         do {
-            try? FileManager.default.createDirectory(
-                at: activityPath.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            // U5 fix-round (2026-06-11, gpt-5.5 review): routed through the
-            // shared capped append (PersistenceCore.appendJSONLCapped) — same
-            // flock-when-SwiftNative behavior as before, plus the shared
-            // activity-feed line cap with rotation logging.
-            try await appendJSONLCapped(
+            try await SwiftNativePersistenceCore.appendActivityEvent(
                 event, to: activityPath, using: persistence,
                 logLabel: "Workshop"
             )
@@ -299,6 +280,7 @@ public actor SwiftNativeWorkshopRunner {
 
     private func planWorkshopExecution(spec: WorkshopExecutionSpec) async throws -> [WorkshopExecutionStep] {
         try Task.checkCancellation()
+        let workspaceDirectory = NativeAgentWorkspaceRoot.resolve(dataRoot: root).path
 
         // Build tools_summary. Always include chat.synthesize.
         let connectorActions = await planner.availableConnectorActions()
@@ -361,6 +343,7 @@ public actor SwiftNativeWorkshopRunner {
 
             Workshop task title: \(spec.title)
             Workshop task objective: \(spec.objective)
+            Workspace folder: \(workspaceDirectory)
             Required output phrases: \((spec.expectedOutputs ?? []).joined(separator: "\n"))
 
             Available tools:
@@ -369,13 +352,15 @@ public actor SwiftNativeWorkshopRunner {
             Rules:
             - Each step's tool_or_action must be one of the available tool IDs above, OR chat.synthesize.
             - autonomy_hint must be one of: auto, needs_approval
-            - Maximum 8 steps. Prefer fewer, focused steps.
+            - Maximum 8 steps.
+            - Set working_directory to the first path named in the objective if it denotes a directory, or to its parent if it denotes a file (including a file to create). Use the Workspace folder only when no path is named; a named directory stays the working_directory even if it does not exist.
+            - Working-folder arguments (cwd or package_path) use the directory required by that step; use working_directory when the objective does not specify another directory for that step.
             - args must be a JSON object preserving each tool schema's declared types, including booleans, numbers, arrays, and objects. Never quote booleans or numbers.
-            - args must be FINAL literal values, never placeholders. Do NOT write things like "<today's date>", "<result>", or "<the summary>". For the date, use the Current date/time above directly in the arg.
+            - working_directory and args must be FINAL literal values, never placeholders. Do NOT write things like "<today's date>", "<result>", or "<the summary>". For the date, use the Current date/time above directly in the arg.
             - If a step's arg must contain the OUTPUT of an EARLIER step (e.g. write a file whose body is what a prior step produced), put the token {{step:<that earlier step's id>}} in the arg — it is replaced at run time with that step's actual output. This works in tool args only; chat.synthesize steps automatically see all prior step outputs, so to turn raw data into prose first add a chat.synthesize step, then reference ITS id with {{step:<id>}} in the write step.
 
             Return ONLY valid JSON, no commentary, no markdown fences:
-            {"steps": [{"id": "step-1", "description": "...", "tool_or_action": "...", "args": {}, "autonomy_hint": "auto"}]}
+            {"working_directory": "...", "steps": [{"id": "step-1", "description": "...", "tool_or_action": "...", "args": {}, "autonomy_hint": "auto"}]}
             """
 
         // Call codex.
@@ -399,11 +384,25 @@ public actor SwiftNativeWorkshopRunner {
         let raw = Self.stripMarkdownFences(rawOutput).trimmingCharacters(in: .whitespacesAndNewlines)
 
         do {
+            let directory = try JSONRow(JSONValue.parse(Data(raw.utf8))).string("working_directory")
+            if directory.isEmpty { throw JSONRow.Malformed.field("working_directory") }
+            let workingDirectory = NativeAgentWorkspaceRoot.resolveFileMutationPath(directory, dataRoot: root).path
             let steps = try Self.parsePlanJSON(raw, validTools: Set(availableTools.map(\.id)), schemas: schemas)
             guard !steps.isEmpty else {
                 throw WorkshopExecutionError.plannerFailure("planner returned no steps")
             }
-            return steps
+            return steps.map { step in
+                var step = step
+                if case .object(let schema)? = schemas[step.toolOrAction],
+                   case .object(let properties)? = schema["properties"],
+                   case .object(var args) = step.args {
+                    for key in ["cwd", "package_path"] where properties[key] != nil && args[key] == nil {
+                        args[key] = .string(workingDirectory)
+                    }
+                    step.args = .object(args)
+                }
+                return step
+            }
         } catch {
             throw planningFailure(error, spec: spec)
         }
@@ -425,6 +424,7 @@ public actor SwiftNativeWorkshopRunner {
 
     public func submit(spec: WorkshopExecutionSpec) async throws -> WorkshopExecutionEnqueueResult {
         try Task.checkCancellation()
+        let lifeID = try DataRootLife.current(in: root)
 
         // WAVE 41 W01 (a) missionPolicy gate — FIRST, matching the daemon's
         // POST /v1/missions route ORDER: the route checks `_missions_allowed()`
@@ -437,7 +437,6 @@ public actor SwiftNativeWorkshopRunner {
         guard try await workshopExecutionsAllowed() else {
             throw WorkshopExecutionError.forbidden("Workshop execution is disabled by trust policy")
         }
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
 
         // Validation mirror — the route's empty-objective check
         //, which runs AFTER the policy gate and
@@ -486,7 +485,7 @@ public actor SwiftNativeWorkshopRunner {
 
         // Check cancellation AFTER planning, BEFORE file IO. Without this gate
         // a cancel that lands between the planner returning and the directory
-        // create would still write mission.json and fire the detached
+        // create would still write execution.json and fire the detached
         // auto-start — silent landing of a cancelled Workshop execution.
         try Task.checkCancellation()
 
@@ -506,7 +505,7 @@ public actor SwiftNativeWorkshopRunner {
         // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4),
         // so the downcast was gratuitous; admission now always runs, locked.
         let existing = try await persistence.withFileLock(admissionLock) { [self] () async throws -> WorkshopExecutionRecord? in
-            let raw = try await persistence.readJSON(executionRecordPath(id), ifMissing: .null)
+            let raw = try await ExecutionRecordFile.readJSON(at: executionRecordPath(id), using: persistence)
             if case .object(let object) = raw {
                 guard object["id"] == .string(id) else {
                     throw WorkshopExecutionError.persistenceFailure("execution identity mismatch")
@@ -520,7 +519,7 @@ public actor SwiftNativeWorkshopRunner {
             // COUNTED reservation (delta review: an empty dir is invisible
             // to the slot count, so racers serializing through this lock
             // each saw the same count). `.reserved` occupies a slot until
-            // mission.json lands; removed on success, dir deleted on
+            // execution.json lands; removed on success, dir deleted on
             // failure, age-out guards a crash between the two.
             try FileManager.default.createDirectory(
                 at: workshopExecutionDir(id), withIntermediateDirectories: true)
@@ -537,16 +536,13 @@ public actor SwiftNativeWorkshopRunner {
             return WorkshopExecutionEnqueueResult(status: existing.status, executionId: id, record: existing)
         }
 
-        // Ensure execution dir + receipts/ exist (daemon does this in
-        // TaskQueue.enqueue at L350-L352). receipts_dir is the absolute
-        // path string the Python side writes.
         let dir = workshopExecutionDir(id)
         let receipts = receiptsDir(id)
         let timeline = timelinePath(id)
         let executionRecordJSON = executionRecordPath(id)
         // Delta review: ONE cleanup scope for every throw between the counted
-        // reservation and the durable mission.json write (receipts create,
-        // both timeline appends, cancellation, mission.json itself) — any
+        // reservation and the durable execution.json write (receipt directory,
+        // both timeline appends, cancellation, execution.json itself) — any
         // failure frees the reservation by deleting the dir, instead of
         // falsely occupying a slot until the 600s age-out.
         func freeReservationAndRethrow(_ error: Error) throws -> Never {
@@ -555,6 +551,7 @@ public actor SwiftNativeWorkshopRunner {
         }
         var record = WorkshopExecutionRecord(
             id: id,
+            lifeID: lifeID,
             deskHandle: spec.deskHandle,
             projectSpaceId: spec.projectSpaceId,
             title: titleTrunc,
@@ -596,27 +593,16 @@ public actor SwiftNativeWorkshopRunner {
         } catch {
             throw WorkshopExecutionError.persistenceFailure("timeline append failed: \(error)")
         }
-        // cancel between timeline append and mission.json write should NOT
-        // land mission.json — and must free the admission reservation.
+        // cancel between timeline append and execution.json write should NOT
+        // land execution.json — and must free the admission reservation.
         if Task.isCancelled { throw CancellationError() }
 
-        // Then mission.json under the cross-process flock so the daemon
-        // can't tear our write. The Python side already wraps _write_json
-        // in file_lock per wave-4 + wave-21 daemon symmetry.
-        let work: @Sendable () async throws -> Void = { [persistence, record, executionRecordJSON] in
-            try await persistence.writeJSON(record.toJSON(), to: executionRecordJSON)
-        }
         do {
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            try await persistence.withFileLock(executionRecordJSON, work)
+            try await ExecutionRecordFile.write(record, to: executionRecordJSON, using: persistence)
         } catch {
-            throw WorkshopExecutionError.persistenceFailure("mission.json write failed: \(error)")
+            throw WorkshopExecutionError.persistenceFailure("execution.json write failed: \(error)")
         }
-        // Reservation fulfilled — mission.json is the counted artifact now.
+        // Reservation fulfilled — execution.json is the counted artifact now.
         try? FileManager.default.removeItem(at: dir.appendingPathComponent(".reserved"))
         } catch {
             try freeReservationAndRethrow(error)
@@ -625,12 +611,12 @@ public actor SwiftNativeWorkshopRunner {
         // WAVE 41 W01 (c) Activity row — mirror the daemon legacy create_mission's
         // record_activity:
         //   record_activity("mission", "Workshop task created", title, "ok",
-        //                   execution["id"], {"missionId": execution["id"]})
+        //                   execution["id"], {"executionId": execution["id"]})
         // emitted right after the durable write (the daemon records once the
         // execution is persisted, with NO cancellation point between).
         //
         // gpt-5.5 review #5: this MUST sit BEFORE the post-write
-        // checkCancellation() below. A landed mission.json write is durable; if a
+        // checkCancellation() below. A landed execution.json write is durable; if a
         // cancel were checked first, the execution would exist on disk with NO
         // Activity row — the exact gap the reopen flags. Emitting here guarantees
         // every durably-created execution gets its row. recordActivity is
@@ -655,21 +641,9 @@ public actor SwiftNativeWorkshopRunner {
 
     // MARK: cancel (WAVE 33 W07 — execution-lifecycle WRITE)
     //
-    // Port of MissionRunner.cancel. The WHOLE
-    // read-mutate-write runs inside one withFileLock(mission.json) critical
-    // section. This is intentionally STRONGER than the Python side: Python's
-    // TaskQueue.get reads mission.json OUTSIDE file_lock (only the subsequent
-    // _write_json is locked), so the daemon executor could in principle mutate
-    // the file between Python's read and write. With `.executions` ON in
-    // production the Swift daemon-bridge and the Python executor BOTH touch
-    // this file, so we hold the cross-process flock across the full
-    // read→mutate→write to make the cancel atomic against the executor and
-    // against a concurrent updateWorkshopExecution(). The flock is the SAME advisory
-    // lock the Python file_lock(path) uses (the retired daemon <->
-    // PersistenceCore+FileLock.swift), so mutual exclusion holds across both
-    // processes.
+    // Hold the execution-file lock across read, mutation and write so cancel
+    // cannot race another execution mutation.
     public func cancel(executionId: String) async throws -> WorkshopExecutionRecord {
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         let trimmed = executionId.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             throw WorkshopExecutionError.invalidRequest("empty missionId")
@@ -692,84 +666,33 @@ public actor SwiftNativeWorkshopRunner {
             throw WorkshopExecutionError.invalidRequest("Workshop execution not found: \(trimmed)")
         }
 
-        // Mutate-under-flock. Returns the post-cancel record AND whether a
-        // timeline event needs appending. A stale cancellation must not
-        // rewrite an outcome that settled before this lock was acquired.
-        let work: @Sendable () async throws -> (record: WorkshopExecutionRecord, didCancel: Bool) = { [persistence] in
-            let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
-            guard case .object(let obj) = raw,
-                  case .string(let gotId)? = obj["id"], gotId == trimmed else {
-                // Mirror Python's `if execution is None: raise ValueError(...)`.
+        let record: WorkshopExecutionRecord
+        let didCancel: Bool
+        do {
+            let update = try await ExecutionRecordFile.update(at: executionRecordJSON, id: trimmed, using: persistence) { record in
+                guard !["completed", "failed", "cancelled", "stopped"].contains(record.status) else { return false }
+                record.status = "cancelled"
+                record.updatedAt = nowStr
+                return true
+            }
+            guard let saved = update.record else {
                 throw WorkshopExecutionError.invalidRequest("Workshop execution not found: \(trimmed)")
             }
-            var record = SwiftNativeWorkshopRunner.recordFromJSON(obj)
-            // Cancellation cannot undo completed effects or replace a failed
-            // outcome. Return settled truth without another write or event.
-            if ["completed", "failed", "cancelled"].contains(record.status) {
-                return (record, false)
-            }
-            record.status = "cancelled"
-            // TaskQueue.save_mission bumps updated_at — match.
-            record.updatedAt = nowStr
-            try await persistence.writeJSON(record.toJSON(), to: executionRecordJSON)
-            return (record, true)
-        }
-
-        let (record, didCancel): (WorkshopExecutionRecord, Bool)
-        do {
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            (record, didCancel) = try await persistence.withFileLock(executionRecordJSON, work)
+            record = saved
+            didCancel = update.applied
         } catch let e as WorkshopExecutionError {
             throw e
         } catch {
-            throw WorkshopExecutionError.persistenceFailure("cancel mission.json write failed: \(error)")
+            throw WorkshopExecutionError.persistenceFailure("cancel execution.json write failed: \(error)")
         }
 
-        // Append the `cancelled` timeline event AFTER the mission.json write
-        // (Python order: save_mission then append_timeline, L1569-L1570). Only
-        // on a real transition — never on the idempotent no-op.
-        //
-        // The append takes withFileLock(timeline) — its OWN lock, NOT the
-        // mission.json lock (already released above). WAVE 34 W03 correction:
-        // the daemon's TaskQueue.append_timeline -> _append_jsonl now wraps the
-        // write in file_lock(timeline); the prior comment here
-        // mis-cited the retired daemon (that is _write_json's lock — _append_jsonl
-        // historically took NONE). Holding the mission.json lock across the
-        // timeline write would buy nothing and widen the window, but the
-        // timeline DOES need its own cross-process lock so the appendBytes
-        // short-write loop can't tear a concurrent daemon/scheduler append.
-        // WAVE 34 W07 (CUTOVER §6.96 round-2 #3): the append now runs inside
-        // withFileLock(timeline) — its OWN lock on timeline.jsonl, NOT the
-        // mission.json lock. The mission.json withFileLock BODY (the `work`
-        // closure) has fully completed by here; its unlock is scheduled in a
-        // detached Task (PersistenceCore+FileLock.swift defer), so the actual
-        // flock release may lag a beat — but that is a DIFFERENT path's lock, so
-        // there is no deadlock and no lock-ordering hazard with the timeline
-        // lock acquired below. The Python side now wraps _append_jsonl in
-        // file_lock(path), taking the SAME advisory lock on
-        // `<timeline>.lock`. Without this, a `.executions`-ON Swift cancel and a
-        // concurrent Python executor timeline append (e.g. a `failed`/`step`
-        // event mid-cancel) could interleave into a torn JSONL line and break
-        // the strict reader. timeline.jsonl's lock is distinct from
-        // mission.json's lock, so there is no nesting/contention with the
-        // read-mutate-write critical section that just completed.
+        // Append the event only after the durable transition and lock release.
         if didCancel {
             let event: JSONValue = .object([
                 "event": .string("cancelled"),
                 "ts": .string(nowStr),
             ])
             do {
-                // WAVE 35 W10 (CUTOVER §6.117): single flock-wrapped append via
-                // the shared appendTimelineLocked helper. The wave-34 W03/W07
-                // merge had left BOTH the W03 inline withFileLock(timeline) block
-                // AND the W07 appendTimelineLocked call live here, double-writing
-                // the `cancelled` event to timeline.jsonl. appendTimelineLocked is
-                // the canonical single-source-of-truth append (same `<timeline>.lock`
-                // flock, identical to the daemon's _append_jsonl→file_lock).
                 try await appendTimelineLocked(event, to: timeline)
             } catch {
                 // The durable state transition already landed; a failed
@@ -782,208 +705,22 @@ public actor SwiftNativeWorkshopRunner {
         return record
     }
 
-    // MARK: updateWorkshopExecution (WAVE 33 W07 — queue-bridge field patch)
-    //
-    // Port of the `_missions_allowed()` queue-bridge branch of
-    // Runtime.update_mission. Applies the
-    // field patches to the queue execution's mission.json under flock and
-    // returns the post-patch record. Returns nil when the id is NOT a queue
-    // execution. Historical missions.jsonl rows are a different file shape and
-    // are not handled by this queue bridge. Whole read-mutate-write held under
-    // the flock, same rationale as cancel().
-    public func updateWorkshopExecution(_ patch: WorkshopExecutionUpdate) async throws -> WorkshopExecutionRecord? {
-        let id = patch.id.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !Self.isSafeExecutionID(id) {
-            // Unsafe ids never match a queue execution; return nil so callers
-            // surface Unknown/unsupported through the Swift path.
-            return nil
-        }
-        // WAVE 41 W01 (a) missionPolicy gate: when missionPolicy is off, skip
-        // the queue bridge so the native writer never runs against a disabled
-        // policy. Default-safe (fresh root -> allowed).
-        guard try await workshopExecutionsAllowed() else {
-            return nil
-        }
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
-        let executionRecordJSON = executionRecordPath(id)
-        let nowStr = Self.isoTimestamp(now())
-
-        // Terminal statuses that clear current_step_id.
-        // NOTE: Python's queue-bridge terminal set INCLUDES "canceled" AND
-        // "cancelled" (L5393) — broader than the legacy-path set at L5415.
-        let terminalStatuses: Set<String> = [
-            "done", "completed", "succeeded", "canceled", "cancelled", "failed",
-        ]
-
-        // The work closure returns (record?, changed) so the caller can emit the
-        // Activity row only when a real patch landed (matching the daemon's
-        // `if changed:` save gate). nil record == not a queue execution.
-        let work: @Sendable () async throws -> (record: WorkshopExecutionRecord, changed: Bool)? = { [persistence] in
-            let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
-            guard case .object(let obj) = raw,
-                  case .string(let gotId)? = obj["id"], gotId == id else {
-                // Not a queue execution → nil, daemon falls through to legacy.
-                return nil
-            }
-            var record = SwiftNativeWorkshopRunner.recordFromJSON(obj)
-            var changed = false
-            // Presence-gated patches, mirroring L5385-L5398. Empty title/objective
-            // falls back to the existing value (Python `str(... or qm.title)`).
-            if let t = patch.title {
-                record.title = String((t.isEmpty ? record.title : t).prefix(160))
-                changed = true
-            }
-            if let o = patch.objective {
-                record.objective = String((o.isEmpty ? record.objective : o).prefix(2000))
-                changed = true
-            }
-            if let s = patch.status {
-                // Python `str(body.get("status") or qm.status)` — empty falls
-                // back to existing.
-                record.status = s.isEmpty ? record.status : s
-                if terminalStatuses.contains(record.status) {
-                    record.currentStepId = ""
-                }
-                changed = true
-            }
-            if let r = patch.result {
-                // Python: `str(body.get("summary") or body.get("result") or qm.result or "")`.
-                // Preserve the existing result when the patch is empty:
-                //   - non-empty body result  → use it verbatim.
-                //   - empty body result + TRUTHY existing result → KEEP existing
-                //     (gpt-5.5 finding #2: do NOT clobber an existing
-                //     .object/.array/non-empty-.string result to ""). The Python
-                //     `qm.result` here is the queue dataclass's `str|None`, but
-                //     the reads port widened `record.result` to JSONValue, so we
-                //     preserve any truthy value rather than lossily str()-ing it.
-                //   - empty body result + falsy existing result → "".
-                if !r.isEmpty {
-                    record.result = .string(r)
-                } else if WorkshopExecutionUpdate.pyTruthy(record.result) {
-                    // keep existing truthy result unchanged
-                } else {
-                    record.result = .string("")
-                }
-                changed = true
-            }
-            // Only persist + bump updated_at when something actually changed
-            // (Python: `if changed ... qm.updated_at = now_iso(); save_mission`).
-            if changed {
-                record.updatedAt = nowStr
-                try await persistence.writeJSON(record.toJSON(), to: executionRecordJSON)
-            }
-            return (record, changed)
-        }
-
-        let outcome: (record: WorkshopExecutionRecord, changed: Bool)?
-        do {
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            outcome = try await persistence.withFileLock(executionRecordJSON, work)
-        } catch let e as WorkshopExecutionError {
-            throw e
-        } catch {
-            throw WorkshopExecutionError.persistenceFailure("updateWorkshopExecution mission.json write failed: \(error)")
-        }
-
-        // Not a queue execution → nil; daemon falls through to its legacy path.
-        guard let outcome else { return nil }
-
-        // WAVE 41 W01 (c) Activity row — mirror the daemon legacy update_mission's
-        // record_activity:
-        //   record_activity("mission", "Workshop task updated", title,
-        //                   "ok" if status not in {failed, blocked} else "warn",
-        //                   mission_id, {"status": ..., "phase": ...})
-        // Emit ONLY when a real change landed (the daemon writes — and so emits —
-        // only inside `if changed`). The queue Execution has no `phase` field
-        // (documented §6.220), so payload.phase mirrors that as null, exactly
-        // like the daemon's queue-bridge would if it recorded.
-        //
-        // DELIBERATE DAEMON-QUEUE-PATH DIVERGENCE (documented §6.240): the daemon's
-        // queue-bridge update branch (L5448-L5468) returns BEFORE record_activity —
-        // only its LEGACY path (L5490) emits the row. This native bridge emits the
-        // SAME-shape row so the Mac Activity feed shows queue-execution updates the
-        // legacy path would show; a daemon queue-bridge update emits none. This is
-        // the intent of the reopen ("native writes emit no record_activity rows")
-        // and is gated behind default-OFF .missionsWrites.
-        if outcome.changed {
-            let status = outcome.record.status
-            await recordActivity(
-                kind: "mission",
-                title: "Workshop task updated",
-                detail: outcome.record.title.isEmpty ? id : outcome.record.title,
-                status: (status == "failed" || status == "blocked") ? "warn" : "ok",
-                executionId: id,
-                payload: .object(["status": .string(status), "phase": .null])
-            )
-        }
-        return outcome.record
-    }
-
-    // MARK: appendTimelineLocked (WAVE 34 W07 — cross-process timeline flock)
-    //
-    // Appends one event to <id>/timeline.jsonl while holding the advisory flock
-    // for that timeline file.
-    //
-    // WHY: a Swift submit()/cancel() and Workshop execution can both append to
-    // the SAME timeline.jsonl
-    // concurrently. O_APPEND moves to EOF atomically per write(), but a single
-    // logical JSONL row can span MULTIPLE underlying write()s. Holding the
-    // shared `<timeline>.lock` serializes the whole append.
-    //
-    // The lock is on timeline.jsonl's OWN `.lock` sibling — distinct from
-    // mission.json's lock — so it never nests inside or contends with the
-    // read-mutate-write critical section that submit()/cancel()/updateWorkshopExecution()
-    // hold on mission.json. Uniform locking (2026-08-01): EVERY persistence
-    // conformer takes this lock — mock persistence included — pinned by
-    // UniformFileLockTests; do not restore an unlocked mock path.
     private func appendTimelineLocked(_ event: JSONValue, to timeline: URL) async throws {
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
-        let core = persistence
-        try await core.withFileLock(timeline) {
-            try await core.appendJSONL(event, to: timeline)
-        }
+        try await ExecutionRecordFile.appendTimeline(event, to: timeline, using: persistence)
     }
 
-    // MARK: reads (WAVE 32 W07 — execution listing / detail / timeline)
-    //
-    // Read-side port of the daemon's GET /v1/missions, GET /v1/missions/<id>,
-    // and GET /v1/missions/<id>/timeline handlers (the retired daemon
-    // L51353-L51437) plus their TaskQueue backers.
-    // All three are PURE file reads against the same on-disk layout the
-    // SwiftNative submit() already writes:
-    //     <root>/workshop/executions/<id>/mission.json
+    // Reads use the same on-disk layout submit() writes:
+    //     <root>/workshop/executions/<id>/execution.json
     //     <root>/workshop/executions/<id>/timeline.jsonl
     // The compatibility record shape is preserved under Workshop ownership.
     // Reads remain lock-free, matching the prior behavior.
 
-    /// Path to the LEGACY flat execution store (the retired daemon:
-    /// `self.missions_path = root / "missions" / "missions.json"`). This is a
-    /// SEPARATE store from the queue dir — a flat JSON list of camelCase
-    /// execution dicts created by `create_mission`. GET /v1/missions MERGES
-    /// queue + legacy (L51363-L51365: `new_missions + old_missions`), so the
-    /// SwiftNative list-read must read BOTH or it silently drops every legacy
-    /// execution.
-    public nonisolated var legacyWorkshopExecutionsPath: URL {
-        root
-            .appendingPathComponent("workshop", isDirectory: true)
-            .appendingPathComponent("legacy_executions.json")
-    }
-
     /// `TaskQueue.get`. Reads
-    /// <queue>/<id>/mission.json, returns nil when absent, malformed, or
+    /// <queue>/<id>/execution.json, returns nil when absent, malformed, or
     /// carrying an id that does not match its containing directory.
     public func getWorkshopExecution(_ executionId: String) async throws -> WorkshopExecutionRecord? {
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         guard Self.isSafeExecutionID(executionId) else { return nil }
-        let raw = try await persistence.readJSON(executionRecordPath(executionId), ifMissing: .null)
+        let raw = try await ExecutionRecordFile.readJSON(at: executionRecordPath(executionId), using: persistence)
         guard case .object(let obj) = raw,
               case .string(let gotId)? = obj["id"], gotId == executionId else {
             return nil
@@ -997,9 +734,8 @@ public actor SwiftNativeWorkshopRunner {
     /// gpt-5.5 finding #1: use this (not getMission(...)?.toJSON()) so `plan`
     /// is emitted verbatim.
     public func getWorkshopExecutionWireJSON(_ executionId: String) async throws -> JSONValue? {
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         guard Self.isSafeExecutionID(executionId) else { return nil }
-        let raw = try await persistence.readJSON(executionRecordPath(executionId), ifMissing: .null)
+        let raw = try await ExecutionRecordFile.readJSON(at: executionRecordPath(executionId), using: persistence)
         guard case .object(let obj) = raw,
               case .string(let gotId)? = obj["id"], gotId == executionId else {
             return nil
@@ -1016,12 +752,11 @@ public actor SwiftNativeWorkshopRunner {
                 "executionId must be a single path component"
             )
         }
-        return try await persistence.readJSONL(timelinePath(executionId))
+        return try await ExecutionRecordFile.readTimeline(at: timelinePath(executionId), using: persistence)
     }
 
-    /// `TaskQueue._scan_all`: every <queue>/<id>/
-    /// subdir with a parseable mission.json whose `id` matches the directory.
-    /// Failed reads and invalid records remain visible as corrupt and block queue admission.
+    /// Queue members have execution.json; retired-only directories are excluded.
+    /// Failed reads and invalid canonical records remain visible as corrupt and block admission.
     private func scanAllQueueWorkshopExecutions() async -> [(record: WorkshopExecutionRecord, raw: [String: JSONValue])] {
         do {
             return try await scanAllQueueWorkshopExecutionsChecked()
@@ -1036,7 +771,7 @@ public actor SwiftNativeWorkshopRunner {
         }
     }
 
-    /// Only an absent execution root is empty; failed reads cannot prove inactivity.
+    /// Absent canonical records are not queue members; failed reads cannot prove inactivity.
     private func scanAllQueueWorkshopExecutionsChecked() async throws -> [(record: WorkshopExecutionRecord, raw: [String: JSONValue])] {
         try await Self.readQueueRecords(dataRoot: root, persistence: persistence).compactMap { id, raw in
             guard case .object(let obj) = raw,
@@ -1046,7 +781,6 @@ public actor SwiftNativeWorkshopRunner {
     }
 
     static func readQueueRecords(dataRoot: URL, persistence: any PersistenceCoreProtocol) async throws -> [(id: String, raw: JSONValue)] {
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: dataRoot)
         let fm = FileManager.default
         let queueRoot = dataRoot.appendingPathComponent("workshop/executions", isDirectory: true)
         let entries: [URL]
@@ -1061,9 +795,9 @@ public actor SwiftNativeWorkshopRunner {
         for sub in entries {
             let isDir = try sub.resourceValues(forKeys: [.isDirectoryKey]).isDirectory ?? false
             guard isDir else { continue }
-            let mp = ExecutionRecordFile.resolve(in: sub, fileManager: fm)
+            let mp = ExecutionRecordFile.canonicalPath(in: sub)
             let raw = await Self.readQueueRecord(mp, id: sub.lastPathComponent, persistence: persistence)
-            out.append((sub.lastPathComponent, raw))
+            if raw != .null { out.append((sub.lastPathComponent, raw)) }
         }
         return out
     }
@@ -1073,7 +807,7 @@ public actor SwiftNativeWorkshopRunner {
         _ path: URL, id: String, persistence: any PersistenceCoreProtocol
     ) async -> JSONValue {
         do {
-            let raw = try await persistence.readJSON(path, ifMissing: .null)
+            let raw = try await ExecutionRecordFile.readJSON(at: path, using: persistence)
             if raw == .null, !FileManager.default.fileExists(atPath: path.path) { return raw }
             guard case .object(let obj) = raw else {
                 throw WorkshopExecutionError.persistenceFailure("Execution record must be an object")
@@ -1113,56 +847,21 @@ public actor SwiftNativeWorkshopRunner {
     }
 
     private nonisolated static func recentRecords(_ records: [WorkshopExecutionRecord]) -> [WorkshopExecutionRecord] {
-        let done: Set<String> = ["completed", "failed", "cancelled"]
+        let done: Set<String> = ["completed", "failed", "cancelled", "stopped"]
         let filtered = records.filter { done.contains($0.status) }
         return Array(filtered.sorted { $0.updatedAt > $1.updatedAt }.prefix(20))
     }
 
-    /// Legacy flat store: the
-    /// raw camelCase dict list, sorted by updatedAt|createdAt DESC. Returned as
-    /// opaque JSONValue dicts (NOT WorkshopExecutionRecord — the legacy schema has
-    /// `phase`/`priority`/`receiptCount` and camelCase keys the queue record
-    /// type doesn't model). The Mac decode models accept either casing, so
-    /// passing these through verbatim is byte-faithful.
-    public func listLegacyWorkshopExecutions() async throws -> [JSONValue] {
-        let raw = try await persistence.readJSON(legacyWorkshopExecutionsPath, ifMissing: .array([]))
-        guard case .array(let items) = raw else {
-            throw WorkshopExecutionError.persistenceFailure("Legacy execution store must be an array")
-        }
-        guard items.allSatisfy({ if case .object = $0 { return true }; return false }) else {
-            throw WorkshopExecutionError.persistenceFailure("Legacy execution rows must be objects")
-        }
-        let dicts = items.compactMap { item -> [String: JSONValue]? in
-            if case .object(let o) = item { return o }
-            return nil
-        }
-        // Sort key mirrors L5329: updatedAt or createdAt, missing -> "".
-        let sortKey: ([String: JSONValue]) -> String = { o in
-            if case .string(let u)? = o["updatedAt"], !u.isEmpty { return u }
-            if case .string(let c)? = o["createdAt"] { return c }
-            return ""
-        }
-        return dicts.sorted { sortKey($0) > sortKey($1) }.map { .object($0) }
-    }
-
-    /// Merged GET /v1/missions list (default branch, no `active` param —
-    /// the retired daemon): queue `list_all()` records FIRST, then
-    /// the legacy flat list, preserving the daemon's `new_missions +
-    /// old_missions` order. Returns a JSONValue array so the NativeClient seam
-    /// can decode it into whichever Mac model the caller asked for.
-    public func listWorkshopExecutionsMerged() async throws -> [JSONValue] {
-        // Queue first (created_at DESC), faithful asdict bytes; then legacy
-        // verbatim. Matches the retired daemon `new_missions +
-        // old_missions`. gpt-5.5 finding #1: emit via readJSONForWorkshopExecution so the
-        // raw `plan` survives instead of being normalized by WorkshopExecutionRecord.
+    /// Canonical queue records, sorted by creation time; retired flat history is untouched.
+    public func listWorkshopExecutions() async throws -> [JSONValue] {
+        // Preserve raw plan bytes from the sole canonical execution store.
         let queue = try await scanAllQueueWorkshopExecutionsChecked()
             .sorted { $0.record.createdAt > $1.record.createdAt }
             .map { Self.readJSONForWorkshopExecution($0.raw) }
-        let legacy = try await listLegacyWorkshopExecutions()
-        return queue + legacy
+        return queue
     }
 
-    /// Build a WorkshopExecutionRecord from a persisted mission.json object, mirroring
+    /// Build a WorkshopExecutionRecord from a persisted execution.json object, mirroring
     /// Byte-faithful read serialization mirroring the daemon's HTTP wire output
     /// for a single execution: `asdict(TaskQueue._from_dict(data))` (missions.py
     /// L432-L450 + dataclasses.asdict). gpt-5.5 review (wave 32 W07) finding #1:
@@ -1171,7 +870,7 @@ public actor SwiftNativeWorkshopRunner {
     /// only `str()`-coerces the scalar string fields. Round-tripping `plan`
     /// through `WorkshopExecutionRecord`/`WorkshopExecutionStep` would NORMALIZE it (default a
     /// missing tool_or_action, drop unknown keys), altering the wire bytes vs
-    /// the daemon. So the wire paths (listWorkshopExecutionsMerged, getWorkshopExecutionWireJSON) use
+    /// the daemon. So the wire paths (listWorkshopExecutions, getWorkshopExecutionWireJSON) use
     /// THIS, not `recordFromJSON(...).toJSON()`. Defaults match _from_dict:
     /// status->"queued", trigger_source->"manual", trust_required->"none",
     /// rerun_count->0 (graceful coerce; the daemon never writes a non-int).
@@ -1201,8 +900,8 @@ public actor SwiftNativeWorkshopRunner {
             "created_at": .string(s("created_at", "")),
             "status": .string(s("status", "queued")),
             "plan": rawArr("plan"),
-            "steps_completed": rawArr("steps_completed"),
             "receipts_dir": .string(s("receipts_dir", "")),
+            "steps_completed": rawArr("steps_completed"),
             "trigger_source": .string(s("trigger_source", "manual")),
             "trust_required": .string(s("trust_required", "none")),
             "expected_outputs": rawArr("expected_outputs"),
@@ -1211,6 +910,8 @@ public actor SwiftNativeWorkshopRunner {
             "result": obj["result"] ?? .null,
             "rerun_count": rerun(),
         ]
+        normalized["lifeID"] = obj["lifeID"]
+        normalized["terminal_reason"] = obj["terminal_reason"]
         if let deskHandle = obj["desk_handle"], case .string = deskHandle {
             normalized["desk_handle"] = deskHandle
         }
@@ -1238,7 +939,7 @@ public actor SwiftNativeWorkshopRunner {
     }
 
     /// `TaskQueue._from_dict` field-for-field
-    /// (defaults included) so a partial / older-schema mission.json decodes the
+    /// (defaults included) so a partial / older-schema execution.json decodes the
     /// same way Python would.
     static func recordFromJSON(_ obj: [String: JSONValue]) -> WorkshopExecutionRecord {
         func s(_ key: String, _ dflt: String) -> String {
@@ -1263,6 +964,7 @@ public actor SwiftNativeWorkshopRunner {
         }
         return WorkshopExecutionRecord(
             id: s("id", ""),
+            lifeID: { if case .string(let id)? = obj["lifeID"] { id } else { nil } }(),
             deskHandle: {
                 let value = s("desk_handle", "").trimmingCharacters(in: .whitespacesAndNewlines)
                 return value.isEmpty ? nil : value
@@ -1301,7 +1003,7 @@ public actor SwiftNativeWorkshopRunner {
         )
     }
 
-    /// Plan-array parser for persisted mission.json `plan` fields.
+    /// Plan-array parser for persisted execution.json `plan` fields.
     static func parsePlanSteps(_ v: JSONValue?) -> [WorkshopExecutionStep] {
         guard let v, case .array(let arr) = v else { return [] }
         var out: [WorkshopExecutionStep] = []
@@ -1402,7 +1104,7 @@ public actor SwiftNativeWorkshopRunner {
         }
     }
 
-    /// Same shape as MCPDispatcher.isoTimestamp and TriggerScheduler.isoTimestamp.
+    /// Same shape as TriggerScheduler.isoTimestamp.
     public static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }

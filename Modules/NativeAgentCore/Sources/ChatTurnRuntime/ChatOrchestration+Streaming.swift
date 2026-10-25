@@ -6,6 +6,8 @@ import MemoryV2
 import ProviderRouting
 import TrustCenter
 
+// Blueprint: | `ChatOrchestration+Streaming.swift` | `TurnStreamEvent`: reversible streaming display and transient tool notices; never durable reply or terminal evidence |
+
 // MARK: - TurnStreamEvent
 
 public enum TurnStreamEvent: Sendable {

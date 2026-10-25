@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import Procedures
 
+// Blueprint: | `WorkshopCanonicalProcedureExecutor.swift` | `WorkshopCompiledProcedureInvocationExecutor`: provider-free invocation with canonical queue admission inside the procedure ledger boundary |
+
 /// Provider-free invocation adapter for a compiled Workshop plan that has not
 /// yet been admitted to the canonical queue. Queue admission happens *inside*
 /// `ProcedureArtifactStore.invokeManual`. This closes the crash/race gap where

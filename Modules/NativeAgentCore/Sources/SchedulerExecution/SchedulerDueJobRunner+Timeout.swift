@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SchedulerDueJobRunner+Timeout.swift` | `SchedulerDueJobRunner`: `jobTimeoutSeconds`, `executeWithTimeout` |
 
 // MARK: - Per-job timeouts
 //
@@ -16,10 +17,8 @@ import PersistenceCore
 // or swallowed.
 
 extension SchedulerDueJobRunner {
-    /// SINGLE SOURCE of every due-job deadline. Default is 300s; the long-running
-    /// consolidation / benchmark kinds (which legitimately call multi-minute
-    /// LLM + I/O passes) get 1800s. Add a kind here to change its budget — no
-    /// deadline lives anywhere else.
+    /// Per-job budget: 300s, or 1800s for long-running kinds. The enclosing
+    /// trigger-loop tick independently has a 1800s ceiling.
     static let defaultJobTimeoutSeconds: Double = 300
     static let longJobTimeoutSeconds: Double = 1800
 
@@ -65,8 +64,8 @@ extension SchedulerDueJobRunner {
                 output: .object(output)
             )
         case .timedOut:
-            let detail = "job kind '\(job.kind)' exceeded \(Int(seconds))s timeout; "
-                + "cancellation requested; later jobs wait for this job to exit"
+            let detail = "job_timeout: Scheduled Desk task '\(job.kind)' exceeded \(Int(seconds))s; "
+                + "cancellation requested, exit unconfirmed. Effects are unknown; later tasks wait for its exit. Inspect its delivery receipts before resuming it."
             FileHandle.standardError.write(Data(
                 "[SchedulerDueJobRunner] TIMEOUT \(job.id) (\(job.kind)): \(detail)\n".utf8
             ))
@@ -76,12 +75,13 @@ extension SchedulerDueJobRunner {
                 output: .object([
                     "error": .string(detail),
                     "failureKind": .string("job_timeout"),
+                    "effects": .string("unknown"),
                     "timeoutSeconds": .int(Int64(seconds)),
                 ])
             )
         case .cancelled:
-            let detail = "job kind '\(job.kind)' cancelled; "
-                + "later jobs wait for this job to exit"
+            let detail = "job_cancelled: Cancellation requested for scheduled Desk task '\(job.kind)'; "
+                + "exit unconfirmed. Effects are unknown; later tasks wait for its exit. Inspect its delivery receipts before resuming it."
             FileHandle.standardError.write(Data(
                 "[SchedulerDueJobRunner] CANCELLED \(job.id) (\(job.kind)): \(detail)\n".utf8
             ))
@@ -91,6 +91,7 @@ extension SchedulerDueJobRunner {
                 output: .object([
                     "error": .string(detail),
                     "failureKind": .string("job_cancelled"),
+                    "effects": .string("unknown"),
                 ])
             )
         }

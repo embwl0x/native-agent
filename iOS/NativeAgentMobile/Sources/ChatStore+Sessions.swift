@@ -33,10 +33,10 @@ extension ChatStore {
         return !availablePinnedSessionIDs.contains(selected)
     }
 
-    func switchSession(to sessionID: String, using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {
+    func switchSession(to sessionID: String, using client: MacBridgeClient) {
         guard !isSwitchingSession, let clean = Self.cleanSessionID(sessionID) else { return }
         guard clean != selectedSessionID else {
-            forceSessionRefresh(using: client, fallbackMessages: fallbackMessages)
+            forceSessionRefresh(using: client)
             return
         }
         setSelectedSessionID(clean)
@@ -49,25 +49,23 @@ extension ChatStore {
                 let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: sessionID)
                 if page.hasOlder { self?.pagedSessionsWithOlder.insert(sessionID) }
                 return .published(page.messages, generation: nil)
-            },
-            fallbackMessages: fallbackMessages
+            }
         )
     }
 
-    func switchToMainSession(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {
+    func switchToMainSession(using client: MacBridgeClient) {
         guard !isSwitchingSession else { return }
         if let mainSessionID {
-            switchSession(to: mainSessionID, using: client, fallbackMessages: fallbackMessages)
+            switchSession(to: mainSessionID, using: client)
             return
         }
         guard selectedSessionID != nil || !messages.isEmpty else {
-            forceSessionRefresh(using: client, fallbackMessages: fallbackMessages)
+            forceSessionRefresh(using: client)
             return
         }
         setSelectedSessionID(nil)
         loadSelectedSession(
-            loadTranscript: { sessionID in await client.readChatTranscript(sessionID: sessionID) },
-            fallbackMessages: fallbackMessages
+            loadTranscript: { sessionID in await client.readChatTranscript(sessionID: sessionID) }
         )
     }
 
@@ -114,8 +112,6 @@ extension ChatStore {
         streamingHintsByMessageId.removeAll()
         maxDeltaSeqByCorrelation.removeAll()
         // 2026-09-06: both sets name rows of the session being left.
-        macPublishedMessageIDs.removeAll()
-        regeneratedAwayAssistantIDs.removeAll()
         isPollingFallback = false
         errorBanner = nil
         // The in-flight turn (if any) was just cancelled above; a brand-new
@@ -129,9 +125,7 @@ extension ChatStore {
         markLocallyCreatedSession(freshSessionID)
         MobileChatSelectionIntent.noteNotifiedSelection(freshSessionID)
         setSelectedSessionID(freshSessionID)
-        suppressMessagePersistence = true
         messages = []
-        suppressMessagePersistence = false
         lastRefreshAt = .distantPast
     }
 
@@ -139,14 +133,11 @@ extension ChatStore {
         sessionSwitchGeneration &+= 1
         sessionSwitchTask?.cancel()
         sessionSwitchTask = nil
-        sessionCacheLoadTask?.cancel()
-        sessionCacheLoadTask = nil
         isSwitchingSession = false
     }
 
     private func loadSelectedSession(
-        loadTranscript: @escaping SessionTranscriptLoader,
-        fallbackMessages: [ChatMessage]?
+        loadTranscript: @escaping SessionTranscriptLoader
     ) {
         // 2026-09-06: every switch that actually changes conversation lands
         // here (switchSession, switchToMainSession, the evaluation variant);
@@ -175,8 +166,6 @@ extension ChatStore {
         // PATCH-2026-05-30: session switch — clear text_delta seq tracking too.
         maxDeltaSeqByCorrelation.removeAll()
         // 2026-09-06: both sets name rows of the session being left.
-        macPublishedMessageIDs.removeAll()
-        regeneratedAwayAssistantIDs.removeAll()
         isPollingFallback = false
         isSwitchingSession = true
         sessionSwitchGeneration &+= 1
@@ -190,72 +179,24 @@ extension ChatStore {
         isLoading = false
         errorBanner = nil
         let loadingSessionID = selectedSessionID
-        let cacheLoad = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { if self.sessionSwitchGeneration == switchGeneration { self.sessionCacheLoadTask = nil } }
-            await self.restorationTask?.value
-            let cachedMessages = await loadCachedMessages(for: loadingSessionID, fallback: fallbackMessages)
-            guard !Task.isCancelled, self.selectedSessionID == loadingSessionID,
-                  self.sessionSwitchGeneration == switchGeneration else { return }
-            suppressMessagePersistence = true
-            messages = cachedMessages
-            suppressMessagePersistence = false
-            // Cache-loaded rows are NOT recent arrivals: without this, switching
-            // back to a session could resurrect rows the Mac removed/aged out for
-            // a full preserve window. Live in-session arrivals keep real stamps.
-            for id in cachedMessages.map(\.id) { localArrivalDates[id] = .distantPast }
-            // 2026-09-13: opening another conversation never erased the durable
-            // record of this one's unfinished exchange — so coming back re-attaches
-            // it: the same bubble, the same partial answer, still being observed.
-            restorePendingExchanges(for: loadingSessionID)
-            lastRefreshAt = .distantPast
-        }
-        sessionCacheLoadTask = cacheLoad
         sessionSwitchTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.finishSessionSwitch(generation: switchGeneration) }
-            await cacheLoad.value
+            await self.restorationTask?.value
             guard !Task.isCancelled, self.selectedSessionID == loadingSessionID,
                   self.sessionSwitchGeneration == switchGeneration else { return }
             do {
                 let read = try await loadTranscript(loadingSessionID)
                 guard !Task.isCancelled, self.selectedSessionID == loadingSessionID else { return }
-                let macMessages = read.messages
-                if case .published(_, let generation) = read, !macMessages.isEmpty {
-                    if let generation, let loadingSessionID,
-                       let applied = self.appliedTranscriptGenerations[loadingSessionID],
-                       generation < applied {
-                        return
-                    }
-                    self.noteAppliedTranscriptGeneration(
-                        generation, for: Self.cleanSessionID(loadingSessionID))
-                    self.noteMacPublishedMessageIDs(macMessages)
-                    // Prefer the exact session cache and preserve complete local
-                    // replies when the Mac publishes a truncated snapshot.
-                    if !self.resolvePendingReplyFromMac(macMessages) {
-                        self.messages = self.mergedMacMessagesPreservingPending(macMessages)
-                    }
-                    self.persistMessages()
-                } else if case .published(_, let generation) = read,
-                          macMessages.isEmpty,
-                          self.applyAuthoritativeEmptyTranscript(
-                              generation: generation,
-                              sessionID: Self.cleanSessionID(loadingSessionID)) {
-                    // 2026-09-06: the Mac published an empty transcript for this
-                    // chat and proved it newer than anything shown — the cached
-                    // rows loaded above are the ones that were cleared. Falling
-                    // through to the cache here is what kept a cleared chat
-                    // alive on the phone across every reopen.
-                } else if !self.messages.isEmpty {
-                    self.persistMessages()
-                }
+                self.applyMacTranscriptRead(read, sessionID: loadingSessionID)
+                self.restorePendingExchanges(for: loadingSessionID)
                 self.lastRefreshAt = Date()
             } catch is CancellationError {
                 // The explicit cancellation owner clears the gate immediately;
                 // defer remains as a backstop for a cooperative loader.
             } catch {
                 guard !Task.isCancelled, self.selectedSessionID == loadingSessionID else { return }
-                errorBanner = "Could not load this chat. Showing the cached transcript."
+                errorBanner = "Could not load this chat."
             }
         }
     }
@@ -266,8 +207,8 @@ extension ChatStore {
         isSwitchingSession = false
     }
 
-    private func forceSessionRefresh(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {
+    private func forceSessionRefresh(using client: MacBridgeClient) {
         lastRefreshAt = .distantPast
-        refresh(using: client, fallbackMessages: fallbackMessages)
+        refresh(using: client)
     }
 }

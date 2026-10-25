@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import Senses
+// Blueprint: | `MacScreenPageCompiler.swift` | `MacScreenPageCompiler` enum; complete nested AX reading order, structural/activation alias folding, adjacent checkbox captions in structured and aggregate documents, document title ownership, sentence-first links including aggregate document text, AX landmark and card sections, live-region text with duplicate container folding, display cleanup after full-context redaction, composite rows with status details and exact related-action bindings |
 
 /// The complete AX window in native form. The source walk and look frame own
 /// identity; this compiler owns reading order and representation, never input.

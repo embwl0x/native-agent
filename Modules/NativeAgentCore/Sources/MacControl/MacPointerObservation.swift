@@ -5,6 +5,8 @@ import PersistenceCore
 import CoreGraphics
 #endif
 
+// Blueprint: | `MacPointerObservation.swift` | `MacPointerPosition` and `MacRegionAim`: actual cursor observation and clear-region aiming; unavailable position never becomes an invented origin |
+
 /// A read from the system cursor, never the point the hand intended to reach.
 /// Nil is unavailable; the origin must not be fabricated as a fallback.
 public struct MacPointerPosition: Sendable, Equatable {

@@ -1,6 +1,7 @@
 import ChatSessionWork
 import Foundation
 import PersistenceCore
+// Blueprint: | `CompactActionReceipt.swift` | `CompactActionReceipt` struct; `toJSONValue`, `toolDispatch` |
 
 struct CompactActionReceipt: Equatable, Sendable {
     var action: String

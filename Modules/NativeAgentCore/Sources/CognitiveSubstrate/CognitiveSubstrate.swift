@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate.swift` | `CognitiveSubstrate` actor; `waitForMaintenanceTransition`, `beginMaintenanceTransition` |
 
 public actor CognitiveSubstrate {
     var configuration: CognitiveConfiguration
@@ -21,9 +22,9 @@ public actor CognitiveSubstrate {
     /// stores from a sibling file in the same module. Still no external writer.
     var episodes: [UUID: CognitiveEpisodeReference] = [:]
     var schemaProposals: [UUID: CognitiveSchemaProposal] = [:]
-    /// Wave E: proposal-shaped standing views. Every view enters `.proposed`; only
-    /// `resolveStandingViewChecked(approved:)` (User) activates one. Persisted one artifact per view
-    /// (kind "standing_view"), restored on boot. See CognitiveSubstrate+StandingViews.swift.
+    /// Standing views persist one artifact each. Approval activates proposed
+    /// views; interests and recurring opinions enter their own statuses
+    /// directly and do not become `.active`/`.held` through that path.
     var standingViews: [UUID: CognitiveStandingView] = [:]
     /// 2026-09-06: the cap repair's artifact deletes used to be swallowed, so a
     /// store that cannot accept deletes re-demoted the same views on every
@@ -83,6 +84,7 @@ public actor CognitiveSubstrate {
     /// the SAME artifact write as the value it describes, so a retry of a
     /// partially failed dream integration cannot nudge her twice for one night.
     var dreamDispositionNight: String?
+    var dreamIntegrations: [String: Task<Bool, Never>] = [:]
     /// 2026-09-13 — HOW the undertone got where it is, not just where it is.
     /// Every disposition write records before / after-decay / after-contribution
     /// with the source that contributed, which is the only way the readout can
@@ -101,14 +103,8 @@ public actor CognitiveSubstrate {
     var ablations: [String: Bool] = [:]
 
     // MARK: - Personality depth wave, items 6 and 7 (2026-09-02)
-    // Four in-memory ledgers. NONE of them persists, on purpose:
-    //   • a released nag re-derives from the seed's own age after a restart, and
-    //     the seed is gone, so there is nothing to re-derive;
-    //   • a re-feel budget that survives a restart would be a second clock to
-    //     keep honest for no gain — the worst case is one extra small nudge;
-    //   • the night's residue is by definition about the turns right after
-    //     waking, and a restart is a different waking.
-    // Each is bounded by its own owner (see `+Rumination`, `+Affect`, `+Mood`).
+    // Release/re-feel ledgers are transient. Dream residue and its claim key
+    // persist together; their field comments below name that owner.
 
     /// Item 6 — seeds whose weight has been cleared, and when. Pruned past
     /// `ruminationReleaseMemory`.
@@ -162,6 +158,7 @@ public actor CognitiveSubstrate {
     /// path is never blocked by a microcycle commit; a maintenance skipped here
     /// simply re-arms and runs once the microcycle finishes.
     var maintenanceCommitInFlight = false
+    var microcycleWaiters: [CheckedContinuation<Void, Never>] = []
 
     private var maintenanceTransitionWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -239,7 +236,7 @@ public actor CognitiveSubstrate {
         /// Session the completion and its reaction share.
         var sessionID: String
         /// The completion turn this reaction answers — `PendingCompletion.nodeKey`,
-        /// which ChatOrchestration mints per turn. An opaque `type:id` key; no
+        /// which ChatTurnRuntime mints per turn. An opaque `type:id` key; no
         /// content.
         var turnID: String
         /// `pushback` / `confirmed` / `neutral`.
@@ -265,9 +262,6 @@ public actor CognitiveSubstrate {
     private var landingScores: [UUID: (score: Double, at: Date)] = [:]
     static let landingScoreCapacity = 256
 
-    /// W7/P5 — consecutive negative-register echoes. See
-    /// `soundEchoNegativeRunLimit`. Memory-only and live-path only.
-    var negativeSoundEchoRun = 0
     var settlingRun = 0
 
     /// 2026-09-01 — the rut nudge's change-driven cadence, and the inner line's
@@ -324,7 +318,6 @@ public actor CognitiveSubstrate {
             fingerprintLastSurfacedAt: fingerprintFamilyRun?.lastSurfacedAt,
             owedSinceGap: owedSinceGap,
             lastSessionBridgeAt: lastSessionBridgeAt,
-            negativeSoundEchoRun: negativeSoundEchoRun,
             settlingRun: settlingRun,
             soundRutSignature: soundRutSignature,
             soundRutLastSurfacedAt: soundRutLastSurfacedAt,
@@ -529,7 +522,6 @@ public actor CognitiveSubstrate {
         lastSemanticReaction = nil
         // Landing and presentation ledgers describe the field being cleared.
         landingScores.removeAll(keepingCapacity: false)
-        negativeSoundEchoRun = 0
         settlingRun = 0
         fingerprintFamilyRun = nil
         owedSinceGap = nil

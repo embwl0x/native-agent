@@ -1,5 +1,7 @@
 import SwiftUI
 import EngineRuntime
+import NativeAgentCore
+// Blueprint: | `ComposerContextReceipt.swift` | `ComposerContextReceiptBody`, `ComposerContextReceiptCard` views; `LatestRead` on the shell (or standalone card) orders receipt publication |
 
 // MARK: - The receipt body, shared by the composer card and the classic panel
 
@@ -144,6 +146,7 @@ struct ComposerContextReceiptCard: View {
     var model: String? = nil
     @Environment(AppModel.self) private var appModel
     @State private var state: ComposerContextReceiptState = .loading
+    @State private var receiptRead = LatestRead()
     private var windowModel: String { model ?? appModel.chatModel }
     // Settings › Context window: a change re-sizes the window at once.
     @AppStorage("nativeagent.contextWindowMode") private var windowMode = ""
@@ -153,7 +156,7 @@ struct ComposerContextReceiptCard: View {
     @State private var refreshToken = 0
 
     var body: some View {
-        ComposerContextReceiptBody(state: state)
+        ComposerContextReceiptBody(state: shell?.contextReceipt ?? state)
             // `quietReadTask`, not `.task`: this only fetches and assigns, and
             // the offscreen copy a quiet page read mounts must WAIT for it —
             // otherwise the screenshot of an open context pane is a picture of
@@ -166,12 +169,12 @@ struct ComposerContextReceiptCard: View {
                 // card empties FIRST; what replaces it belongs to this id.
                 state = .loading
                 shell?.contextReceipt = .loading
-                let loaded = await ContextReceiptProjection.read(
-                    sessionId: sessionId, selectedModel: windowModel
-                )
-                guard !Task.isCancelled else { return }
+                _ = await (shell?.contextReceiptRead ?? receiptRead).read({ await ContextReceiptProjection.read(
+                    sessionId: sessionId, selectedModel: windowModel, dataRoot: appModel.engine.dataRoot
+                ) }, publish: { loaded in
                 state = loaded
                 shell?.contextReceipt = loaded
+                })
             }
             .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
                 if let completed = note.object as? String, completed != sessionId { return }

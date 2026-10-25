@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `AgentHostACP.swift` | `AgentHostACP`: documented stdio launch contracts, protocol pins, explicit ask permissions and verification/version blockers |
+
 /// Documented stdio entry points, not prompt templates. ACP wire version 1.
 /// https://agentclientprotocol.com/protocol/v1/transports
 public struct AgentHostACP: Sendable, Equatable, Codable {

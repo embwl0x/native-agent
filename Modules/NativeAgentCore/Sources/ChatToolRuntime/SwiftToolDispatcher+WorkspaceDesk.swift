@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import PersistenceCore
 import Desk
+// Blueprint: | `SwiftToolDispatcher+WorkspaceDesk.swift` | `SwiftToolDispatcher`: `workspaceDesk` |
 
 extension SwiftToolDispatcher {
     /// Disposable typed projection of the same Desk owner, never reconstructed
@@ -19,7 +20,6 @@ extension SwiftToolDispatcher {
                 return .object(["status": .string("record_changed"), "handle": .string(selected.handle),
                     "message": .string("The recorded work changed; reopen its complete record to read the current version.")])
             }
-            latchDeskRecordPeers(selected, in: state)
             let characters = Array(text), end = min(characters.count, start + 12_000)
             let safeStart = min(start, characters.count)
             var result: [String: JSONValue] = [
@@ -46,8 +46,6 @@ extension SwiftToolDispatcher {
             return $0.handle < $1.handle
         }
         let shown = Array(sorted.dropFirst(rowOffset).prefix(pageSize))
-        latchDeskPeers(shown + shown.flatMap { Array(state.children(of: $0.handle).prefix(5)) })
-        if let selected { latchDeskPeers([selected]) }
         var base: [String: JSONValue] = ["structured": .bool(true)]
         base["updated_on"] = input["updated_on"]
         if let selected { base["handle"] = .string(selected.handle) }

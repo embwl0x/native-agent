@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryV2+Proposals.swift` | `SwiftNativeMemoryV2`: `propose`, `acceptProposal`, `supersedingAcceptance` |
 
 extension SwiftNativeMemoryV2 {
 
@@ -30,7 +31,7 @@ extension SwiftNativeMemoryV2 {
         let content = MemoryTextClip.memoryDisplayText(content, kind: kind)
         guard !content.isEmpty else { throw MemoryV2Error.invalidQuery }
         if let reason = MemoryCandidateQuality.rejectionReason(text: content, source: source, kind: kind) {
-            throw MemoryV2Error.underlying("not durable memory: \(reason)")
+            throw MemoryV2Error.rejectedCandidate(reason)
         }
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
@@ -57,12 +58,7 @@ extension SwiftNativeMemoryV2 {
         // and no folded hash is ever stored, so stored contentHash uses
         // (KG memory index, kind backfill) are untouched.
         let dedupKey: @Sendable (String) -> String = { s in
-            let folded = s.replacingOccurrences(
-                of: #"(?i)\b(?:a|an|the)\s+"#,
-                with: "",
-                options: .regularExpression
-            )
-            return MemoryStorage.contentHash(folded)
+            MemoryStorage.contentHash(MemoryStorage.comparisonKey(s, mode: .proposal))
         }
         // The evidence merge, lifted out of the old inline branch so BOTH the
         // atomic staging path and the legacy fallback below apply exactly the
@@ -197,7 +193,7 @@ extension SwiftNativeMemoryV2 {
         if let reason = MemoryCandidateQuality.rejectionReason(
             text: proposal.content,
             source: proposal.source,
-            kind: Self.metadataKind(proposal.metadata)
+            kind: MemoryRecallScoring.kind(of: proposal.metadata)
         ) {
             let rejection = "quality gate at acceptance: \(reason)"
             try await storage.updateProposalStatus(
@@ -205,14 +201,14 @@ extension SwiftNativeMemoryV2 {
                 status: "rejected",
                 rejectionReason: rejection
             )
-            throw MemoryV2Error.underlying("not durable memory: \(reason)")
+            throw MemoryV2Error.rejectedCandidate("\(reason); the proposal was marked rejected.", effects: .occurred)
         }
         // The tombstone gate runs at acceptance too, not just at proposal time —
         // a proposal that was queued before the denylist entry landed must still
         // be rejected when it tries to promote.
         if try await storage.isTombstoned(content: proposal.content) {
             try await storage.updateProposalStatus(id: id, status: "rejected", rejectionReason: "tombstoned at acceptance")
-            throw MemoryV2Error.underlying("tombstoned: proposal content matches a rejection denylist entry")
+            throw MemoryV2Error.forgottenContent("Proposal content matches a forgotten or rejected memory; the proposal was marked rejected.", effects: .occurred)
         }
         // An `update` from the memory manager carries the id of the memory it
         // replaces, plus that row's fingerprint at staging time. Keep is then ONE
@@ -227,9 +223,10 @@ extension SwiftNativeMemoryV2 {
                 // is nothing to check the target against, so applying it would be
                 // an unverified demotion of whatever now holds that id. Left
                 // pending for re-review rather than silently demoting.
-                throw MemoryV2Error.underlying(
-                    "needs re-review: target fingerprint missing for the memory this update replaces (\(targetId)); left pending"
-                )
+                throw ToolFailureError("The replacement target has no recorded fingerprint (\(targetId)); the proposal remains pending.",
+                    effects: .none, nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
+                    code: "memory_supersession_review_required", status: .refused,
+                    instruction: "Read the current target and stage a newly reviewed replacement; do not resubmit this unverified proposal.", recovery: .inspect)
             }
             let accepted = try await acceptSuperseding(id: id, superseding: superseding)
             return accepted
@@ -282,8 +279,8 @@ extension SwiftNativeMemoryV2 {
             throw MemoryV2Error.recordNotFound
         }
         if let reason = MemoryCandidateQuality.rejectionReason(
-            text: content, source: proposal.source, kind: Self.metadataKind(proposal.metadata)
-        ) { throw MemoryV2Error.underlying("not durable memory: \(reason)") }
+            text: content, source: proposal.source, kind: MemoryRecallScoring.kind(of: proposal.metadata)
+        ) { throw MemoryV2Error.rejectedCandidate(reason) }
         let embedded = try await embedOneWithEpoch(content)
         let accepted = try await storage.acceptReviewedMoment(id: id, review: ReviewedMomentAcceptance(
             expectedContent: proposal.content, content: content,
@@ -366,13 +363,13 @@ extension SwiftNativeMemoryV2 {
     public func rejectProposal(id: String, reason: String? = nil) async throws -> Bool {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        guard let proposal = try await storage.getProposal(id: id) else {
+        guard try await storage.getProposal(id: id) != nil else {
             throw MemoryV2Error.recordNotFound
         }
+        // Rejection writes its tombstone (with the proposal's vector) in the
+        // same transaction as the status, so the same fact can't re-enter via
+        // a future proposal.
         try await storage.updateProposalStatus(id: id, status: "rejected", rejectionReason: reason)
-        // Rejection writes a tombstone so the same fact can't re-enter via a future
-        // proposal — matches the Python promoter's denylist semantics.
-        try await storage.recordTombstone(content: proposal.content, reason: reason)
         return true
     }
 

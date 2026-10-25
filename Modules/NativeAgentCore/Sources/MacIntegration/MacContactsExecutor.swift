@@ -2,6 +2,7 @@ import AuthoredCapabilities
 import Foundation
 import Contacts
 import PersistenceCore
+// Blueprint: | `MacContactsExecutor.swift` | concrete `CNContactStore` ownership, authorization, selection, mutation validation, name cache and projection |
 
 public enum MacContactsExecutor {
     // MARK: - TCC status (for Mac Integration permission wizard)

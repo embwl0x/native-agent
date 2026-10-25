@@ -11,6 +11,7 @@ import CryptoKit
 import SwiftUI
 import UIKit
 import NativeAgentShared
+// Blueprint: | `iCloudBridge.swift` | `iCloudBridge` class; `recordMacConfirmation`, `clearMacConfirmationForConnectionRepair`; pairing-scoped record-identity nudges until authenticated Mac acceptance or the existing chat/action/place owner retires delivery; place acceptance is checkpointed by `PhonePlaces` before nudges stop; restored owners loaded before pruning |
 
 // BridgeMessage, BridgeError, and all HMAC helpers are now in NativeAgentShared.
 private typealias KVSKey = NativeAgentICloudBridgeConstants.KVSKey
@@ -247,11 +248,18 @@ final class iCloudBridge: ObservableObject {
     private var driveURL: URL?
     private var metadataQuery: NSMetadataQuery?
     // CK-3b: the device-sync transport SEAM. Non-nil ⇒ CloudKit is the active
-    // transport (resolver selected `.cloudkit` AND the entitlement is present —
-    // makeCloudKitTransport enforces the crash-guard). nil ⇒ the legacy
+    // transport (`runsCloudKit`: resolver selected `.cloudkit` AND the
+    // entitlement is present — the crash-guard). nil ⇒ the legacy
     // KVS/ubiquity path runs unchanged.
     private var deviceTransport: DeviceSyncTransport?
     var usesCloudKitDeviceTransport: Bool { deviceTransport != nil }
+    /// The effective transport, decided once per process before either side
+    /// needs it: the bridge builds CloudKit only when this is true, and
+    /// PairingStore reads it to choose the pairing key's source (the record on
+    /// CloudKit, KVS on the legacy path) — so a phone always has exactly one.
+    nonisolated static let runsCloudKit = DeviceSyncTransportResolver.runsCloudKit(
+        containerIdentifier: NativeAgentICloudBridgeConstants.containerID
+    )
     var onTransportSucceeded: (() -> Void)?
     // CK-3c: single-flight guard for the transport drain (APNs push + observe
     // re-drains coalesce; per-message delivery is already atomic in the transport).
@@ -571,13 +579,12 @@ final class iCloudBridge: ObservableObject {
     private func configureDeviceTransportIfAvailable() {
         let resolvedProductionTransport: Bool
         if deviceTransport == nil {
-            guard let transport = DeviceSyncTransportResolver.makeCloudKitTransport(
+            guard Self.runsCloudKit else { return }
+            deviceTransport = CloudKitDeviceTransport(
                 role: .ios,
-                containerIdentifier: NativeAgentICloudBridgeConstants.containerID
-            ) else {
-                return
-            }
-            deviceTransport = transport
+                containerIdentifier: NativeAgentICloudBridgeConstants.containerID,
+                configured: true
+            )
             resolvedProductionTransport = true
         } else {
             resolvedProductionTransport = false
@@ -1209,7 +1216,6 @@ final class iCloudBridge: ObservableObject {
             lastSyncAt = Date()
             syncStatus = "Received notification from Mac (CloudKit)"
         } else {
-            PhoneTurnActivity.shared.receive(msg)
             guard !messageHandlers.isEmpty else { return false }
             recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
             lastSyncAt = Date()
@@ -1239,7 +1245,7 @@ final class iCloudBridge: ObservableObject {
         return await Task.detached(priority: .userInitiated) { message.verifySignature(secret: refreshed) }.value
     }
 
-    /// CK-3c: drain the CloudKit transport (incoming + pairing + status) if it is
+    /// CK-3c: drain the CloudKit transport (pairing + incoming + status) if it is
     /// active; no-op when nil (flag-off). Called from the APNs silent-push
     /// handler. Single-flight — overlapping pushes/re-drains coalesce into at
     /// most one queued re-run (per-message delivery is already atomic in the
@@ -1264,6 +1270,10 @@ final class iCloudBridge: ObservableObject {
             }
         }
         let accountGeneration = accountFailureGeneration
+        // Pairing first: a reply signed with a key the Mac just published
+        // verifies in this same drain instead of waiting for the next one.
+        await ck.drainPairing()
+        guard generation == setupGeneration, NADeviceSyncRecoveryBudget.hasTime else { return false }
         let result = await ck.drainIncoming()
         guard generation == setupGeneration else { return false }
         if case .failure(.account(let failure), _) = result {
@@ -1272,8 +1282,6 @@ final class iCloudBridge: ObservableObject {
         if case .success = result { onTransportSucceeded?() }
         let dispatched = result.dispatchedCount
         if dispatched > 0 { NADeviceSyncRecoveryBudget.didApplyData?() }
-        guard NADeviceSyncRecoveryBudget.hasTime else { return dispatched > 0 }
-        await ck.drainPairing()
         guard generation == setupGeneration, NADeviceSyncRecoveryBudget.hasTime else { return dispatched > 0 }
         await ck.drainStatus()
         guard generation == setupGeneration else { return false }
@@ -1400,7 +1408,6 @@ final class iCloudBridge: ObservableObject {
         guard !seenKVSProgressMessageIDs.contains(msg.id) else { return }
         guard !messageHandlers.isEmpty else { return }
         recordSeenKVSProgressMessageID(msg.id)
-        PhoneTurnActivity.shared.receive(msg)
         lastSyncAt = Date()
         syncStatus = "Received Mac progress"
         for handler in messageHandlers.values {

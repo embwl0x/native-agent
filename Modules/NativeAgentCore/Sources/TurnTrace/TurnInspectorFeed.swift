@@ -1,91 +1,117 @@
 import Foundation
+import NativeAgentCore
 import Observation
+import PersistenceCore
+// Blueprint: | `TurnInspectorFeed.swift` | Engine-owned persisted today/yesterday evidence, exact file observation, `LatestRead` publication with checked read failures, grouped Mac cards, bounded phone summaries and immutable selected-date replay reads |
 
-public enum TurnInspectorLiveDropState: Equatable, Sendable {
-    case measured(Int)
-    case unavailable
-}
-
-/// Owns a bounded Inspector subscription and generation-bound replay reads.
+/// The engine's persisted trace projection. Mac details and phone summaries
+/// share today's and yesterday's rows, grouped once after source changes.
 @MainActor
 @Observable
 public final class TurnInspectorFeed {
-    public private(set) var liveEvents: [TurnTraceEvent] = []
-    public private(set) var replayEvents: [TurnTraceEvent] = []
-    public private(set) var liveDropCountState: TurnInspectorLiveDropState = .measured(0)
-    public private(set) var liveSinkActive = false
-    public var onEventsChanged: (() -> Void)?
+    private var groups: [TurnTraceGroup] = []
+    public private(set) var readIssue: String?
+    @ObservationIgnored private lazy var latestRead = LatestRead()
+    public var cards: [InspectorTurnCard] { TurnInspectorGrouping.cards(groups) }
+    public var observationActive: Bool { watcher?.isArmed == true }
 
     private let lane: TurnTracePersistLane
-    private let bus: TurnTraceBus
-    private var consumeTask: Task<Void, Never>?
-    private var liveGeneration = 0
-    private var replayGeneration = 0
+    @ObservationIgnored private var watcher: FileChangeWatcher?
+    @ObservationIgnored private var watchedDay: URL?
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var refreshRequested = false
 
-    public init(dataRootOverride: URL? = nil, bus: TurnTraceBus = .shared) {
+    public nonisolated init(dataRootOverride: URL? = nil) {
         lane = TurnTracePersistLane(dataRootOverride: dataRootOverride)
-        self.bus = bus
     }
 
-    @discardableResult
-    public func start() -> Bool {
-        guard consumeTask == nil else { return false }
-        liveGeneration += 1
-        liveDropCountState = .measured(0)
-        let generation = liveGeneration
-        consumeTask = Task { [weak self, bus] in
-            let sub = await bus.subscribe(capacity: TurnTraceBus.defaultBufferCapacity)
-            defer { Task { await bus.unsubscribe(sub.id) } }
-            // Cancellation cannot abort the actor call above; a stale start
-            // must still release the subscription it just received.
-            guard !Task.isCancelled, self?.liveGeneration == generation else { return }
-            self?.liveSinkActive = true
-            let dropMonitor = Task { [weak self] in
-                for await count in sub.dropCounts {
-                    guard !Task.isCancelled, self?.liveGeneration == generation else { break }
-                    self?.liveDropCountState = .measured(max(0, count))
-                }
-            }
-            defer { dropMonitor.cancel() }
-            for await event in sub.stream {
-                guard !Task.isCancelled, let self, self.liveGeneration == generation else { break }
-                self.liveEvents.append(event)
-                if self.liveEvents.count > 4000 {
-                    self.liveEvents.removeFirst(self.liveEvents.count - 4000)
-                }
-                self.onEventsChanged?()
-            }
-            if !Task.isCancelled, self?.liveGeneration == generation {
-                self?.liveSinkActive = false
-                self?.liveDropCountState = .unavailable
-            }
-        }
-        return true
+    deinit {
+        watcher?.cancel()
+        refreshTask?.cancel()
+    }
+
+    public func start() {
+        observeCurrentDays()
     }
 
     public func stop() {
-        liveSinkActive = false
-        liveGeneration += 1
-        consumeTask?.cancel()
-        consumeTask = nil
+        watcher?.cancel()
+        watcher = nil
+        watchedDay = nil
+        refreshTask?.cancel()
+        refreshTask = nil
     }
 
-    public func clearLive() {
-        liveEvents.removeAll()
+    /// Clear is a window's display filter; it never changes shared evidence.
+    public func cards(after cutoff: Date?) -> [InspectorTurnCard] {
+        guard let cutoff else { return cards }
+        return TurnInspectorGrouping.group(groups.flatMap(\.events).filter { $0.ts > cutoff })
     }
 
-    /// A superseded read cannot relabel the displayed evidence as another day.
-    public func loadReplay(for date: Date) async -> (exists: Bool, skipped: Int)? {
-        replayGeneration += 1
-        let generation = replayGeneration
+    private func observeCurrentDays() {
+        let today = lane.path(for: Date())
+        guard watchedDay != today else { return }
+        watcher?.cancel()
+        watchedDay = today
+        let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: Date()) ?? Date()
+        watcher = FileChangeWatcher(paths: [
+            today, lane.path(for: yesterday), today.deletingLastPathComponent(),
+        ]) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.observeCurrentDays()
+                self?.scheduleRefresh()
+            }
+        }
+        scheduleRefresh()
+    }
+
+    /// Replay returns an immutable read result; each window keeps its selection.
+    public func loadReplay(for date: Date) async throws -> (exists: Bool, report: JSONLReadReport, cards: [InspectorTurnCard]) {
         let url = lane.path(for: date)
-        let result = await Task.detached(priority: .userInitiated) {
+        return try await Task.detached(priority: .userInitiated) {
             let exists = FileManager.default.fileExists(atPath: url.path)
-            let parsed = TurnTraceReplayReader.read(url)
-            return (exists: exists, events: parsed.events, skipped: parsed.skipped)
+            let parsed = try await TurnTraceReplayReader.read(url)
+            return (exists: exists, report: parsed.report, cards: TurnInspectorGrouping.group(parsed.events))
         }.value
-        guard generation == replayGeneration else { return nil }
-        replayEvents = result.events
-        return (result.exists, result.skipped)
+    }
+
+    public func summaryData() async -> Data? {
+        start()
+        let result = await readGroups()
+        guard case .success(let groups) = result else { return nil }
+        let encoder = TurnSummaryComputer.makeEncoder()
+        return try? encoder.encode(TurnSummaryComputer.compute(from: TurnInspectorGrouping.cards(groups), encoder: encoder))
+    }
+
+    private func readGroups() async -> Result<[TurnTraceGroup], Error> {
+        await latestRead.read {
+            let root = lane.resolvedDataRoot()
+            return await Task.detached(priority: .userInitiated) {
+                do { return Result<[TurnTraceGroup], Error>.success(TurnTraceGrouping.group(try await TurnSummarySource.loadEvents(root: root))) }
+                catch { return .failure(error) }
+            }.value
+        } publish: { result in
+            switch result {
+            case .success(let groups): self.groups = groups; readIssue = nil
+            case .failure(let error): readIssue = error.localizedDescription
+            }
+        }
+    }
+
+    /// Existing 0.1s presentation coalescing now follows persisted writes,
+    /// rather than racing the bus's detached persistence.
+    private func scheduleRefresh() {
+        refreshRequested = true
+        guard refreshTask == nil else { return }
+        refreshTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard let self, !Task.isCancelled else { return }
+            while self.refreshRequested {
+                self.refreshRequested = false
+                _ = await self.readGroups()
+                guard !Task.isCancelled else { return }
+            }
+            self.refreshTask = nil
+        }
     }
 }

@@ -1,5 +1,6 @@
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `WorkshopExecutorContracts.swift` | `WorkshopStepApprovalRequest` struct |
 
 // MARK: - Injected closure types
 
@@ -72,7 +73,7 @@ public typealias WorkshopTerminalEventSink = @Sendable (_ record: WorkshopExecut
 // MARK: - Step outcome
 
 /// Mirror of the daemon @dataclass StepResult.
-/// Serialized into mission.json `steps_completed` with the same snake_case
+/// Serialized into execution.json `steps_completed` with the same snake_case
 /// keys as Python's asdict(StepResult).
 public struct WorkshopStepOutcome: Sendable, Equatable {
     public static let successStatus = "succeeded"

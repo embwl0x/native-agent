@@ -1,5 +1,6 @@
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `InboxModels.swift` | `InboxItemRecord` transport shape and presentation; status is supplied by the Mac |
 
 // MARK: - Model
 
@@ -39,8 +40,7 @@ struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
 }
 
 // The decoder lives in an extension on purpose: declaring `init(from:)` in the
-// struct body would suppress the synthesized memberwise init that the view
-// (InboxView.swift:151) and InboxStoreTests both construct records with.
+// struct body would suppress the synthesized memberwise init.
 extension InboxItemRecord {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -81,8 +81,7 @@ extension InboxItemRecord {
     /// producer cannot become a tappable iOS control until the signed Mac
     /// action router accepts it.
     var presentableActions: [InboxActionRecord] {
-        actions.filter { InboxActionPresentation.presentableActionIDs.contains($0.id)
-            || (source == "interaction" && $0.id.hasPrefix("interaction_choice_")) }
+        actions.filter { $0.id == "view" || InboxActionVocabulary.supports($0.id, itemID: id) }
     }
 
     var severityColor: Color {
@@ -116,26 +115,6 @@ extension InboxItemRecord {
         return date.formatted(.dateTime.month(.abbreviated).day())
     }
 
-    func replacingStatus(_ nextStatus: String, readAt: String? = nil) -> InboxItemRecord {
-        InboxItemRecord(
-            id: id,
-            created_at: created_at,
-            source: source,
-            severity: severity,
-            title: title,
-            summary: summary,
-            detail: detail,
-            relatedWorkshopExecutionId: relatedWorkshopExecutionId,
-            related_approval_id: related_approval_id,
-            related_paths: related_paths,
-            related_groups: related_groups,
-            actions: actions,
-            status: nextStatus,
-            read_at: readAt ?? read_at,
-            chat_session_id: chat_session_id,
-            presentation: presentation
-        )
-    }
 }
 
 /// The Mac's `InboxSourcePresentation`, as the snapshot carries it.
@@ -154,18 +133,6 @@ extension InboxRelatedGroup {
     func matches(_ item: InboxItemRecord) -> Bool {
         matches(itemID: item.id, title: item.title)
     }
-}
-
-/// The complete inbox-card vocabulary this iOS build can present. `view` is
-/// local-only; every other id is sent through `iCloudSyncEngine.inboxAction`.
-enum InboxActionPresentation {
-    static let localOnlyActionIDs: Set<String> = ["view"]
-    static let forwardedActionIDs: Set<String> = [
-        "read", "act", "approve", "reject", "deny",
-        "archive", "dismiss", "repair", "open_approvals",
-    ]
-
-    static let presentableActionIDs = localOnlyActionIDs.union(forwardedActionIDs)
 }
 
 /// A bounded notification plan for one inbox snapshot. Large arrivals still

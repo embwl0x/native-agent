@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import TelegramBot
 import ProviderRouting
 import MemoryV2
@@ -8,6 +9,7 @@ import DeviceSync
 import NotificationInbox
 import PersistenceCore
 import ToolRegistry
+// Blueprint: | `ChatSurfaceBackgroundWork.swift` | `ChatSurfaceBackgroundWork` enum; `makeTelegramChatHandler`; `fileSystemPermissionNotice` passes native Speech Recognition facts to maintenance-assistance, retaining permission checks, retirement, sticky-status publication and delivery |
 
 public enum ChatSurfaceBackgroundWork {
     private static func withChatTranscriptCompletionSignal<T>(
@@ -89,7 +91,7 @@ public enum ChatSurfaceBackgroundWork {
             let chatAttachments: [MultimodalAttachment] = mediaAttachments.compactMap { media in
                 guard let bytes = media.bytes, !bytes.isEmpty else { return nil }
                 guard let resolved = media.chatTypeAndMime else { return nil }
-                return ChatOrchestration.MultimodalAttachment(
+                return ChatTurnRuntime.MultimodalAttachment(
                     type: resolved.type,
                     base64: bytes.base64EncodedString(),
                     mime: resolved.mime,
@@ -158,7 +160,7 @@ public enum ChatSurfaceBackgroundWork {
             }
             // The streamed draft showed her working; the settled message is the
             // answer, with the images she chose.
-            return (ChatOrchestration.ChatResponse.answerOnly(
+            return (ChatTurnRuntime.ChatResponse.answerOnly(
                 response.output,
                 workingCommentaryCharacters: response.workingCommentaryCharacters
             ), TelegramPollLoop.replyImagePaths(response))
@@ -187,6 +189,7 @@ public enum ChatSurfaceBackgroundWork {
         capability: String,
         dataRoot: URL,
         permissionStatus: @escaping @Sendable () -> SpeechPermissionSnapshot,
+        assistanceCard: @escaping @Sendable (JSONValue) async throws -> AssistanceCardContent,
         notify: @escaping @Sendable (URL, String, String, String, String, String) async -> Void
     ) async {
         guard capability == "speechRecognition" else {
@@ -210,33 +213,27 @@ public enum ChatSurfaceBackgroundWork {
             )
             return
         }
-        let summary = liveStatus.warningSummary
         let settingsLink = liveStatus.settingsLink
         let now = ISO8601DateFormatter().string(from: Date())
-        let detail = """
-        A Telegram voice note could not be transcribed because macOS \
-        Speech Recognition is not approved for NativeAgent (current state: \
-        \(liveStatus.rawValue)).
-
-        \(summary)
-
-        Two ways to fix it:
-        • In NativeAgent: Mac Integration → System Permissions → Speech Recognition → Grant.
-        • In macOS: open System Settings → Privacy & Security → Speech Recognition \
-        and switch NativeAgent on.\
-        \(settingsLink.map { "\n\nDirect link: \($0)" } ?? "")
-
-        Until then, inbound voice notes will keep replying with the permission notice \
-        instead of a transcript.
-        """
+        let content: AssistanceCardContent
+        do {
+            content = try await assistanceCard(.object([
+                "kind": .string("speech"), "permission": .string(liveStatus.rawValue),
+                "warningSummary": .string(liveStatus.warningSummary),
+                "settingsLink": settingsLink.map(JSONValue.string) ?? .null
+            ]))
+        } catch {
+            FileHandle.standardError.write(Data("SystemPermissionNotice: assistance part unavailable: \(error)\n".utf8))
+            return
+        }
         let card: JSONValue = .object([
             "id": .string(systemPermissionsSpeechCardId),
             "created_at": .string(now),
             "source": .string("system_permissions"),
             "severity": .string("actionable"),
-            "title": .string("Speech Recognition is not approved"),
-            "summary": .string(String(summary.prefix(500))),
-            "detail": .string(detail),
+            "title": .string(content.title),
+            "summary": .string(String(content.summary.prefix(500))),
+            "detail": .string(content.detail),
             "related_mission_id": .null,
             "related_approval_id": .null,
             "related_paths": .array(settingsLink.map { [.string($0)] } ?? []),
@@ -273,11 +270,7 @@ public enum ChatSurfaceBackgroundWork {
         let persistence = SwiftNativePersistenceCore()
         do {
             let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-                let lines = try InboxRewriteGuard.readLines(inboxPath)
-                guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
-                    InboxRewriteGuard.refuse("SystemPermissionNotice", path: inboxPath)
-                    return false
-                }
+                let lines = try LiveNotificationInbox.readLines(inboxPath)
                 var mutated: [Data] = []
                 mutated.reserveCapacity(lines.count + 1)
                 var found = false
@@ -302,15 +295,15 @@ public enum ChatSurfaceBackgroundWork {
                     found = true
                 }
                 if !found { mutated.append(Data(try card.serialize(pretty: false).utf8)) }
-                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
+                try LiveNotificationInbox.write(mutated, to: inboxPath)
                 return !found
             }
             if inserted {
                 await notify(
                     dataRoot,
                     systemPermissionsSpeechCardId,
-                    "Speech Recognition is not approved",
-                    String(summary.prefix(500)),
+                    content.title,
+                    String(content.summary.prefix(500)),
                     "system_permissions",
                     "actionable"
                 )
@@ -341,12 +334,8 @@ public enum ChatSurfaceBackgroundWork {
         let now = ISO8601DateFormatter().string(from: Date())
         do {
             try await persistence.withFileLock(inboxPath) { () async throws -> Void in
-                let lines = try InboxRewriteGuard.readLines(inboxPath)
+                let lines = try LiveNotificationInbox.readLines(inboxPath)
                 guard !lines.isEmpty else { return }
-                guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
-                    InboxRewriteGuard.refuse("SystemPermissionNotice", path: inboxPath)
-                    return
-                }
                 var changed = false
                 var mutated: [Data] = []
                 mutated.reserveCapacity(lines.count)
@@ -372,7 +361,7 @@ public enum ChatSurfaceBackgroundWork {
                     mutated.append(Data(try JSONValue.object(obj).serialize(pretty: false).utf8))
                     changed = true
                 }
-                if changed { try InboxRewriteGuard.writeLines(mutated, to: inboxPath) }
+                if changed { try LiveNotificationInbox.write(mutated, to: inboxPath) }
             }
         } catch {
             FileHandle.standardError.write(Data(

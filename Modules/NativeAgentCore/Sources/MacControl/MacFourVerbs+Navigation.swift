@@ -1,20 +1,25 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MacFourVerbs+Navigation.swift` | `MacFourVerbs`: `go`, `webURL`; landing targets the recipient returned by Launch Services |
 
 extension MacFourVerbs {
     // MARK: 3 — LEGS
 
     /// Get her THERE. A running app is raised through the existing focus organ,
     /// an installed one is launched, a path or a URL is opened. The reply is
-    /// where she landed, as `screen()`. Without `front` nothing is activated:
-    /// the app is launched or opened behind, and the reply reads its window.
+    /// where she landed, as `screen()`. Without `front` it opens behind unless
+    /// the person-only window has handed her the screen.
     /// A launch is awaited to its real completion (a cold start can take
     /// longer than a read); each landing read carries its own AX deadline.
     public func go(_ name: String, front: Bool = false) async -> MacFourVerbsReply {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            return MacFourVerbsReply(ok: false, text: "Where to? Give me an app, a folder, a file or a link.")
+            return MacFourVerbsReply(ok: false, text: "No destination was supplied. Set name to an app, folder, file or link in mac.go.",
+                detail: ["error": .string("missing_destination"), "effects": .string("none"),
+                    "remedy": .object(["kind": .string("correct_arguments"),
+                        "instruction": .string("Supply the intended destination in mac.go args.name."),
+                        "next_call": .object(["tool": .string("app"), "input": .object(["find": .string("mac.go")])])])])
         }
         // AppKit cannot raise an app over loginwindow. In User's ordinary setup
         // that is the screensaver layer, and the existing wake organ is the
@@ -43,7 +48,7 @@ extension MacFourVerbs {
             do {
                 result = try await host.dispatch(action: "open_target", body: opening(url))
             } catch {
-                return await landingFailure("I couldn't ask the Mac to open that link.")
+                return Self.unknownActionReply(error, operation: "opening \(trimmed)", app: landingApp)
             }
             moved = "The Mac accepted the request to open \(trimmed)."
             settlesAsynchronously = true
@@ -53,7 +58,7 @@ extension MacFourVerbs {
             do {
                 result = try await host.dispatch(action: "open_target", body: opening(path))
             } catch {
-                return await landingFailure("I couldn't ask the Mac to open that path.")
+                return Self.unknownActionReply(error, operation: "opening \(path.path)", app: landingApp)
             }
             moved = "The Mac accepted the request to open \(path.path)."
             verificationDestination = path.path
@@ -107,10 +112,19 @@ extension MacFourVerbs {
                     }
                 }
             } catch {
-                return await landingFailure("I couldn't switch to \(trimmed).")
+                return Self.unknownActionReply(error, operation: "opening \(trimmed)", app: trimmed)
             }
         }
-        guard !Task.isCancelled else { return MacFourVerbsReply(ok: false, text: "I stopped waiting for the app.") }
+        guard !Task.isCancelled else {
+            var detail = Self.operationDetail(result)
+            detail["status"] = .string("cancelled")
+            detail["error"] = .string("cancelled")
+            detail["effects"] = detail["effects"] ?? .string("unknown")
+            detail["remedy"] = Self.inspectAppRemedy(landingApp,
+                instruction: "Waiting was cancelled after the open or focus request; inspect the receiving app before another action.")
+            return MacFourVerbsReply(ok: false,
+                text: "Waiting for the app was cancelled. The open or focus request may already have taken effect; inspect the receiving app before continuing.", detail: detail)
+        }
         if let refusal = covered(result) { return refusal }
         if result.action == "open_target" {
             let output = Self.object(result.output)

@@ -1,11 +1,12 @@
 import AppToolRuntime
-import ChatOrchestration
 // PATCH-2026-05-08: polish-wave — primary sidebar coach-mark onboarding tour
 import SwiftUI
+import NativeAgentShared
+// Blueprint: | `OnboardingTourOverlay.swift` | Tour progress uses stable stop identity and reconciles rail changes from the engine layout passed by ContentView; only in-overlay progress is local |
 
 // MARK: - Tour Step Model
 
-struct OnboardingTourStep: Identifiable, Sendable {
+struct OnboardingTourStep: Identifiable, Equatable, Sendable {
     let id: Int
     let item: SidebarItem
     let title: String
@@ -110,14 +111,6 @@ private let onboardingTourStops: [OnboardingTourStep] = [
     ),
 ]
 
-/// The stops the rail actually has words for: a page the layout hides from
-/// the rail (`SidebarItem.rail`) drops its stop. Stop ids stay fixed, so a
-/// stop keeps its identity whether or not its page is showing.
-@MainActor var onboardingTourSteps: [OnboardingTourStep] {
-    let rail = SidebarItem.rail(SurfaceLayoutLive.shared.layout)
-    return onboardingTourStops.filter { rail.contains($0.item) }
-}
-
 // MARK: - Tour interaction state
 
 /// The view-free tour state machine. It owns only in-overlay progress and the
@@ -137,11 +130,20 @@ enum OnboardingTourEffect: Equatable, Sendable {
 }
 
 @MainActor struct OnboardingTourState: Equatable, Sendable {
-    private(set) var stepIndex = 0
+    private(set) var steps: [OnboardingTourStep]
+    private(set) var currentStopID: Int?
+    init(layout: SurfaceLayout) {
+        steps = Self.steps(in: layout)
+        currentStopID = steps.first?.id
+    }
+    private static func steps(in layout: SurfaceLayout) -> [OnboardingTourStep] {
+        SidebarItem.rail(layout).compactMap { item in onboardingTourStops.first { $0.item == item } }
+    }
+    var stepIndex: Int { steps.firstIndex { $0.id == currentStopID } ?? 0 }
     private(set) var didComplete = false
 
-    var step: OnboardingTourStep { onboardingTourSteps[stepIndex] }
-    var isLast: Bool { stepIndex == onboardingTourSteps.count - 1 }
+    var step: OnboardingTourStep { steps[stepIndex] }
+    var isLast: Bool { stepIndex == steps.count - 1 }
     var route: SidebarItem { step.item }
 
     /// Applies one visible control action. Completion is idempotent so a
@@ -155,22 +157,29 @@ enum OnboardingTourEffect: Equatable, Sendable {
                 didComplete = true
                 return .complete
             }
-            stepIndex += 1
+            currentStopID = steps[stepIndex + 1].id
             return .route(route)
         case .retreat:
             guard stepIndex > 0 else { return .none }
-            stepIndex -= 1
+            currentStopID = steps[stepIndex - 1].id
             return .route(route)
         case let .select(stepID):
-            guard let index = onboardingTourSteps.firstIndex(where: { $0.id == stepID }) else {
+            guard let index = steps.firstIndex(where: { $0.id == stepID }) else {
                 return .none
             }
-            stepIndex = index
+            currentStopID = steps[index].id
             return .route(route)
         case .skip:
             didComplete = true
             return .complete
         }
+    }
+
+    mutating func reconcile(layout: SurfaceLayout) -> OnboardingTourEffect {
+        steps = Self.steps(in: layout)
+        if steps.isEmpty { return apply(.skip) }
+        currentStopID = step.id
+        return .route(route)
     }
 }
 
@@ -185,7 +194,7 @@ enum OnboardingTourEffect: Equatable, Sendable {
     let backEnabled: Bool
 
     init(state: OnboardingTourState) {
-        progressText = "Step \(state.stepIndex + 1) of \(onboardingTourSteps.count)"
+        progressText = "Step \(state.stepIndex + 1) of \(state.steps.count)"
         title = state.step.title
         sidebarItem = state.step.item
         advanceLabel = state.step.buttonLabel
@@ -196,10 +205,17 @@ enum OnboardingTourEffect: Equatable, Sendable {
 // MARK: - Tour Overlay
 
 struct OnboardingTourOverlay: View {
+    let layout: SurfaceLayout
     let onComplete: () -> Void
     let onSelectTab: (SidebarItem) -> Void
 
-    @State private var tour = OnboardingTourState()
+    @State private var tour: OnboardingTourState
+    init(layout: SurfaceLayout, onComplete: @escaping () -> Void, onSelectTab: @escaping (SidebarItem) -> Void) {
+        self.layout = layout
+        _tour = State(initialValue: OnboardingTourState(layout: layout))
+        self.onComplete = onComplete
+        self.onSelectTab = onSelectTab
+    }
     @AppStorage(SimpleViewMode.key) private var viewMode = ""
     @State private var previousViewMode: String?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -207,7 +223,23 @@ struct OnboardingTourOverlay: View {
     private var step: OnboardingTourStep { tour.step }
     private var presentation: OnboardingTourPresentation { .init(state: tour) }
 
+    /// A rail the layout left empty has no stop to show: the tour ends.
     var body: some View {
+        if tour.steps.isEmpty {
+            Color.clear.onAppear(perform: onComplete)
+        } else {
+            tourBody
+                .onChange(of: layout) { _, _ in
+                    switch tour.reconcile(layout: layout) {
+                    case .route(let item): onSelectTab(item)
+                    case .complete: onComplete()
+                    case .none: break
+                    }
+                }
+        }
+    }
+
+    private var tourBody: some View {
         ZStack {
             // Dimmed background
             Color.black.opacity(0.55)
@@ -295,7 +327,7 @@ struct OnboardingTourOverlay: View {
     /// 2pt bar beside the one you are on.
     private var tabRail: some View {
         VStack(alignment: .leading, spacing: 2) {
-            ForEach(onboardingTourSteps) { tabStep in
+            ForEach(tour.steps) { tabStep in
                 let isSelected = tabStep.id == step.id
                 Button {
                     apply(.select(stepID: tabStep.id))

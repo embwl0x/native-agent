@@ -1,12 +1,15 @@
 import Foundation
 import NativeAgentCore
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatToolRuntime
 import PersistenceCore
 import ApprovalInbox
 import Cognition
 import WorkshopExecution
 import TrustCenter
 import NotificationInbox
+// Blueprint: | `WorkshopBackgroundWork.swift` | `WorkshopBackgroundWork` enum; `makeWorkshopExecutor`, `unattendedWorkAllowed`, Full Mac unattended override |
 
 public typealias WorkshopInboxNotification = @Sendable (URL, String, String, String, String, String) async -> Void
 
@@ -124,6 +127,7 @@ public enum WorkshopBackgroundWork {
             // hard blocks and effect-time validation.
             stepApprovalEnforced: { await !isWideOpenTrust(dataRoot: dataRoot) },
             terminalEventSink: { record, reason in
+                NotificationCenter.default.post(name: DeskContinuationScheduler.ownerReceiptChanged, object: dataRoot)
                 await WorkshopDeskReceiptBridge.recordTerminal(
                     record,
                     reason: reason,
@@ -157,12 +161,6 @@ public enum WorkshopBackgroundWork {
         if case .bool(true) = policy["enableAutonomy"] ?? .null { return true }
         if isFullMacPolicy(policy) { return true }
         return await isWideOpenTrust(dataRoot: dataRoot)
-    }
-
-    public static func unattendedWorkForced(policy: TrustPolicy?, dataRoot: URL) async -> Bool {
-        let fullMac = policy.map(TrustAccessModeCapabilityCatalog.fullMacGrantIsActive) ?? false
-        let yolo = await isWideOpenTrust(dataRoot: dataRoot)
-        return fullMac || yolo
     }
 
     /// The isFullMac rule from `SwiftNativeTrustCenter.normalizedTrustPolicy`,
@@ -333,7 +331,7 @@ public enum WorkshopBackgroundWork {
             "related_mission_id": .string(req.executionId),
             "related_approval_id": .string(approvalId),
             "related_paths": .array([
-                .string(ExecutionRecordFile.resolve(
+                .string(ExecutionRecordFile.canonicalPath(
                     in: dataRoot.appendingPathComponent(
                         "workshop/executions/\(req.executionId)", isDirectory: true)).path),
             ]),

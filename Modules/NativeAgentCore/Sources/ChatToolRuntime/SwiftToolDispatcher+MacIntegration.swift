@@ -4,17 +4,14 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
 import MapKit
+// Blueprint: | `SwiftToolDispatcher+MacIntegration.swift` | `SwiftToolDispatcher`: `dispatchMacIntegrationTool`, read-only MapKit directions, distance-fraction place lookup and radius-bounded nearby place search via `impl_maps_route` / `impl_maps_search`, sharing `place` / `describe` |
 
 extension SwiftToolDispatcher {
     @MainActor
@@ -181,7 +178,10 @@ extension SwiftToolDispatcher {
                                       store: MacIntegrationPermissionStore) async throws -> JSONValue? {
         guard let refusal = try await store.readinessChecked().refusal(integration: integration, mode: mode) else { return nil }
         return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("denied"), "reason": .string("operator_permission_off"),
-            "integration": .string(integration), "mode": .string(mode.rawValue), "message": .string(refusal)]))
+            "integration": .string(integration), "mode": .string(mode.rawValue), "message": .string(refusal),
+            "remedy": Repair.why(owner: "security/mac_integration_permissions.json \(integration).\(mode.rawValue)",
+                tap: "Trust > Mac > Apps and features > \(MacIntegrationID.displayName(for: integration)) > \(mode.rawValue.capitalized)",
+                instruction: "Only the owner can enable this switch.")]))
     }
 
     func dispatchMacIntegrationTool(
@@ -234,6 +234,9 @@ extension SwiftToolDispatcher {
                 "integration": .string(integration),
                 "mode": .string(mode.rawValue),
                 "fix": .string(fixHint),
+                "remedy": Repair.why(owner: "security/mac_integration_permissions.json \(integration).\(mode.rawValue)",
+                    tap: "Trust > Mac > Apps and features > \(MacIntegrationID.displayName(for: integration)) > \(mode.rawValue.capitalized)",
+                    instruction: "Ask the owner to enable this integration's \(mode.rawValue.capitalized) switch."),
             ]))
         }
         guard let bridge = macIntegrationBridge else {

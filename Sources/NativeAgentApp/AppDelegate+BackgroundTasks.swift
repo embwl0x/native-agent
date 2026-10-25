@@ -9,6 +9,7 @@ import DoctorChecks
 import DeviceSync
 import NativeAgentCore
 import NativeAgentShared
+// Blueprint: | `AppDelegate+BackgroundTasks.swift` | `AppDelegate`: `registerBackgroundTaskHandlers` |
 
 extension AppDelegate {
     static func registerBackgroundTaskHandlers() {

@@ -5,6 +5,7 @@ import PersistenceCore
 import Desk
 import Dispatcher
 import ToolRegistry
+// Blueprint: | `SwiftToolDispatcher+ArtifactContext.swift` | `SwiftToolDispatcher`: `impl_artifact_find` |
 
 // A lazy projection over existing evidence, not another artifact registry.
 // Paths and versions below describe what a record said at the time; opening
@@ -201,12 +202,9 @@ enum ArtifactContextProjection {
 
     private static func evidence(_ message: ChatMessage, sessionID: String, dataRoot: URL) -> JSONValue {
         let row = object(message.extras)
-        let meta = metadata(message)
-        let display = ChatTranscriptEvidenceRendering.displayContent(
+        let display = SwiftToolDispatcher.chatHistoryDisplayEvidence(
             message.role == "tool" ? "Retained tool receipt; open source for details." : safeText(message.content),
-            originLabel: message.role == "user" ? ChatTranscriptEvidenceRendering.recordedOriginLabel(meta["origin"]) : nil,
-            incompleteReplyLabel: message.role == "assistant"
-                ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: row, metadata: meta) : nil)
+            role: message.role, row: row)
         var value: [String: JSONValue] = [
             "session_id": .string(sessionID), "role": .string(message.role),
             "timestamp": .string(message.timestamp), "excerpt": .string(safeText(display)),

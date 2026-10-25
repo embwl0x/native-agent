@@ -4,15 +4,13 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
+// Blueprint: | `ChatOrchestrationClient+ToolDispatching.swift` | `SwiftNativeChatOrchestrationClient`: `makeTracedGatedDispatcher` |
 
 extension SwiftNativeChatOrchestrationClient {
     /// CHOKE POINT for chat tool dispatch. Every chat turn must build its

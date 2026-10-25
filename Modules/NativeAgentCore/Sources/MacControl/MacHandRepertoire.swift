@@ -1,6 +1,8 @@
 import CoreGraphics
 import Foundation
 
+// Blueprint: | `MacHandRepertoire.swift` | `MacHandRepertoire`: pure bounded keyboard/pointer plans with held-key/button balance and residual-release accounting |
+
 // MARK: - MacHandRepertoire
 //
 // THE FULL HAND. Everything a human hand and keyboard can do, expressed as a
@@ -89,11 +91,6 @@ public enum MacHandLimit: String, Sendable, Equatable {
     /// `MacMouseButton` has no `.middle`, and `CGEventSink.post(mouse:)` has no
     /// `.otherMouseDown/.otherMouseUp/.otherMouseDragged` mapping.
     case middleButtonNotAtSeam = "mac_hand_middle_button_not_at_event_seam"
-    /// Magnification is a `CGEventType.gesture` / NSEvent-family event; the
-    /// sink posts only key, mouse and scroll events.
-    case pinchNotAtSeam = "mac_hand_pinch_not_at_event_seam"
-    /// Rotation is the same family as pinch, and equally absent from the sink.
-    case rotateNotAtSeam = "mac_hand_rotate_not_at_event_seam"
 }
 
 /// Thrown when a described gesture has no honest event representation.
@@ -337,27 +334,6 @@ public enum MacHandRepertoire {
     /// (notched wheel) or pixel (trackpad-grade) granularity.
     public static func scroll(dx: Int32, dy: Int32, unit: MacScrollUnit = .line) -> [MacHandStep] {
         [.scroll(MacScrollEvent(deltaX: dx, deltaY: dy, unit: unit))]
-    }
-
-    /// Pinch to zoom. DESCRIBABLE, not plannable: magnification is a
-    /// gesture-family event and `MacEventSink` posts key, mouse and scroll
-    /// only. Throwing here — rather than emitting, say, a control-scroll and
-    /// calling it a pinch — keeps the caller's model of her own hands true.
-    public static func pinch(scale: Double) throws -> [MacHandStep] {
-        _ = scale
-        throw MacHandUnsupported(
-            limit: .pinchNotAtSeam,
-            needed: "MacEventSink needs a magnification event (CGEventType.gesture / NSEvent magnify) before pinch can be planned."
-        )
-    }
-
-    /// Rotate. Same family, same honest refusal, as `pinch`.
-    public static func rotate(degrees: Double) throws -> [MacHandStep] {
-        _ = degrees
-        throw MacHandUnsupported(
-            limit: .rotateNotAtSeam,
-            needed: "MacEventSink needs a rotation event (CGEventType.gesture / NSEvent rotate) before rotate can be planned."
-        )
     }
 
     // MARK: - Keyboard

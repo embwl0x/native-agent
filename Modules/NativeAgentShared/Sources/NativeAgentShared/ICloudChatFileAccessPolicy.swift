@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ICloudChatFileAccessPolicy.swift` | `ICloudChatFileAccessPolicy.normalized`: canonical signed phone file-access modes; malformed metadata never becomes permissive |
+
 /// Canonical file-access IDs carried by signed iPhone chat envelopes and
 /// admitted by the Mac iCloud chat route. Keeping this at the transport
 /// boundary prevents the control pill from advertising a mode the router does

@@ -1,5 +1,6 @@
 import SwiftUI
-import KnowledgeGraph
+import MemoryV2
+// Blueprint: | `KGGraphCanvas.swift` | `KGGraphCanvas` struct |
 
 // ---------------------------------------------------------------------------
 // MARK: - KGGraphCanvas — node-link force-directed graph (F3)

@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ICloudDeliveryNudgeQueue.swift` | `ICloudDeliveryNudgeQueue`: one bounded single-flight KVS wake worker; a nudge never proves transport delivery |
+
 /// The KVS wake-up is not delivery confirmation: it merely gives the paired
 /// device a prompt to drain its real transport. Keep the retry plan bounded,
 /// observable, and single-flight so a chat burst cannot create an unbounded

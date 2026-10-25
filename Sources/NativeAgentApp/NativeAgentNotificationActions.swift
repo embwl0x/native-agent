@@ -5,6 +5,7 @@ import Foundation
 import AttentionRouting
 import UserNotifications
 import AppKit
+// Blueprint: | `NativeAgentNotificationActions.swift` | Native response mapping, notification categories and mounted window/conversation dispatch; effects stay in EngineNotificationActions |
 
 extension NativeAgentNotificationActions.Response {
     init(_ response: UNNotificationResponse) {
@@ -115,9 +116,7 @@ extension NativeAgentNotificationActions {
 @MainActor
 enum NativeAgentApprovalNotifications {
     static func observe() async {
-        async let approvals: Void = observeApprovals()
-        async let interactions: Void = InlineInteractionDelivery.observe()
-        _ = await (approvals, interactions)
+        await observeApprovals()
     }
 
     private static func observeApprovals() async {

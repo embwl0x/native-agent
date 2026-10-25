@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `LLMClient+OpenRouterAdapter.swift` | `OpenRouterAdapter`: namespaced model routing, reasoning controls and authenticated OpenRouter completion/stream transport |
+
 /// OpenRouter chat-completions adapter. OpenRouter speaks the OpenAI
 /// chat-completions wire format at `https://openrouter.ai/api/v1/chat/completions`
 /// and uses the Bearer api key saved in
@@ -197,9 +199,7 @@ public final class OpenRouterAdapter: LLMAdapter {
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
                     do {
-                        if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-                        (bytes, response) = try await session.bytes(for: req)
-                        if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
+                        (bytes, response) = try await ProviderWire.open(session, req)
                     } catch {
                         throw mapTransportError(error, fallback: .underlying(
                             message: "connection refused: \(endpoint.host ?? "openrouter")"

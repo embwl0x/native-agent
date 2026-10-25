@@ -7,6 +7,8 @@ const USER_NAME = process.env.NATIVE_AGENT_USER_NAME || "the user";
 
 const {
   jsonOut, nowISO, redactDiagnosticText, processStartIdentity,
+  dataRootLife,
+  lifeOf,
   createProcessStartIdentityReader, safeFilePart: sharedSafeFilePart,
   postWakeCompletion, unicodePrefix, dirLockOwnerAlive, fsyncDirectorySync, writeSyncedAndClose,
   copyWakeProducerIdentity, copyWakeCompletionOrigin, readWakeJSON,
@@ -838,6 +840,24 @@ function appendReplyDeliveryReceiptUnlocked(receipt) {
   if (held.dev !== atPath.dev || held.ino !== atPath.ino) {
     throw new Error("Reply receipt lock sidecar replaced while waiting; retry the delivery");
   }
+  // Swift supplies settlement candidates, never writes this ledger. Compare
+  // under the same lock as producer appends and rotation, then append once.
+  if (Array.isArray(receipt)) {
+    const raw = fs.existsSync(REPLY_DELIVERIES_PATH)
+      ? new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(REPLY_DELIVERIES_PATH)) : "";
+    if (raw && !raw.endsWith("\n")) throw new Error("Reply receipt ledger has an incomplete line");
+    const latest = new Map();
+    for (const line of raw.split("\n").filter((line) => line.trim())) {
+      const row = JSON.parse(line);
+      if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("Reply receipt ledger has a non-object row");
+      if (typeof row.jobId === "string") latest.set(row.jobId, row);
+    }
+    const lines = receipt
+      .filter(({ expected, record }) => !latest.has(record.jobId) || require("node:util").isDeepStrictEqual(latest.get(record.jobId), expected))
+      .map(({ record }) => `${JSON.stringify(record)}\n`).join("");
+    if (lines) appendSyncedWakeLine(REPLY_DELIVERIES_PATH, () => lines);
+    return;
+  }
   appendJSONL(REPLY_DELIVERIES_PATH, receipt);
   const maxBytes = 16 * 1024 * 1024;
   if (fs.statSync(REPLY_DELIVERIES_PATH).size <= maxBytes) return;
@@ -969,6 +989,7 @@ function replyAdmissionJob(config, threadId, entries, priorTurnIds = [], options
     status: "reserved",
     jobPath,
     job: {
+      lifeID: entries[0] && entries[0].lifeID,
       schemaVersion: 2,
       id,
       phase: "turn_start_reserved",
@@ -979,6 +1000,7 @@ function replyAdmissionJob(config, threadId, entries, priorTurnIds = [], options
       hangRetryCount,
       priorTurnIds: [...new Set(priorTurnIds.filter(Boolean))],
       entries: entries.map((entry) => ({
+        lifeID: entry.lifeID,
         id: entry.id || null,
         key: entry.key || null,
         hangRetryCount: Number(entry.hangRetryCount || 0),
@@ -1023,6 +1045,7 @@ async function startTurnWithDurableReplyAdmission(
       }
       writeJSONAtomic(reservation.jobPath, job);
     }
+    if (lifeOf(job.lifeID) !== dataRootLife()) return { status: "stopped", reason: "restored", jobPath: reservation.jobPath };
     if (job.id !== reservation.job.id || job.threadId !== threadId
         || job.clientUserMessageId !== reservation.job.clientUserMessageId) {
       return { status: "failed", reason: "reply_admission_identity_conflict" };
@@ -1101,6 +1124,7 @@ function startReplyWatcher(config, threadId, turnId, entries) {
     ensureBridgeDir();
     fs.mkdirSync(REPLY_JOBS_DIR, { recursive: true, mode: 0o700 });
     const job = {
+      lifeID: entries[0] && entries[0].lifeID,
       id: stableUUID(`codex-reply:${threadId}:${turnId}`),
       createdAt: nowISO(),
       threadId,
@@ -1108,6 +1132,7 @@ function startReplyWatcher(config, threadId, turnId, entries) {
       hangRetryCount: Math.max(0, ...entries.map((entry) => Number(entry && entry.hangRetryCount || 0))),
       appServer: captureAppServerIdentity(),
       entries: entries.map((entry) => ({
+        lifeID: entry.lifeID,
         id: entry.id || null,
         key: entry.key || null,
         hangRetryCount: Number(entry.hangRetryCount || 0),
@@ -1345,6 +1370,10 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     }
     return quarantineReplyJob(jobPath, error);
   }
+  if (lifeOf(job.lifeID) !== dataRootLife()) {
+    writeJSONAtomic(jobPath, { ...job, phase: "stopped", status: "stopped", reason: "restored" });
+    return { status: "stopped", reason: "restored", jobPath };
+  }
   if (!job.turnId) {
     if ((job.entries || []).some((entry) => entry.hungTurnId || Number(entry.hangRetryCount || 0) > 0)) {
       return { status: "failed", reason: "hang_effect_reconciliation_required", jobPath };
@@ -1470,6 +1499,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     attemptCount: execution.attempts.length,
   }, turnResult);
   const completionMetadata = {
+    lifeID: job.lifeID,
     deliveryId: job.id,
     origin,
     completion: {
@@ -1646,6 +1676,10 @@ function pendingBusyResult(entry, state, reason, extra = {}) {
 }
 
 async function consumePendingEntry(entry, config, options = {}) {
+  if (lifeOf(entry.lifeID) !== dataRootLife()) {
+    await deadLetterPendingEntry(entry, null, "restored");
+    return { status: "stopped", reason: "restored" };
+  }
   const laneKey = entryLaneKey(entry);
   const runInLane = options.withWakeExecutionLane || withWakeExecutionLane;
   const readHead = options.pendingHeadForLane || pendingHeadForLane;
@@ -1823,6 +1857,7 @@ async function requestTurnStart(payload, threadId, config, launch) {
 async function requestFreshThreadTurnStart(payload, config, launch) {
   const prompt = formatPrompt(payload);
   const entries = [{
+    lifeID: dataRootLife(),
     id: crypto.randomUUID(),
     threadId: null,
     payload: sanitizePayload(payload),
@@ -1928,6 +1963,7 @@ async function drainPending(config, options = {}) {
           continue;
         }
         const result = item.result;
+        if (result.status === "stopped") { madeProgress = true; continue; }
         if (result.status === "busy") {
           lastBusy = result;
           busyStates.push(result);
@@ -2016,6 +2052,16 @@ function launchFromArgv(argv) {
 }
 
 async function main() {
+  if (process.argv.includes("--settle-reply-deliveries")) {
+    await appendReplyDeliveryReceipt(JSON.parse(readStdin()));
+    jsonOut({ status: "ok" });
+    return;
+  }
+  if (process.argv.includes("--append-inbox")) {
+    try { jsonOut(await appendInbox(JSON.parse(readStdin()))); }
+    catch (error) { jsonOut({ status: "failed", reason: "inbox_write_failed", detail: String(error.message || error) }); }
+    return;
+  }
   const config = loadJSON(CONFIG_PATH);
   const readThreadIndex = process.argv.indexOf("--read-thread");
   if (readThreadIndex >= 0) {
@@ -2184,7 +2230,7 @@ async function main() {
 }
 
 // Assemble lane owners before any command dispatch; durable state stays in the existing stores.
-const { markInboxConsumed, markInboxTerminal, messageIdForPayload } =
+const { appendInbox, markInboxConsumed, markInboxTerminal, messageIdForPayload } =
   require("./codex_wake_inbox_projection.js").createCodexWakeInboxProjection({
     BRIDGE_DIR,
     inboxLockDir,

@@ -1,8 +1,10 @@
-import ChatOrchestration
+import ChatTurnRuntime
 import Foundation
 import NativeAgentShared
 import os
 import Transcripts
+import Privacy
+// Blueprint: | `MacSyncEngine+LiveTurns.swift` | `MacSyncEngine`: `startLiveTurnRelay`, `stopLiveTurnRelay` |
 
 /// A turn another door started in the anchored conversation reaches the phone
 /// as it streams, the way the phone's own turns do (ICloudIncomingTurnForwarder):
@@ -66,7 +68,9 @@ extension MacSyncEngine {
                     }
                     var metadata = ["live": "true", "transport": "icloud", "source": "mac"]
                     metadata["kind"] = kind
-                    if case .failed(let failure) = event.kind { metadata["errorDetail"] = failure }
+                    if case .failed(let failure) = event.kind {
+                        metadata["errorDetail"] = NativeAppSecretRedactor.redactedRemoteErrorDetail(failure)
+                    }
                     if case .incomplete(_, let status) = event.kind {
                         metadata["status"] = status.prefix(1).uppercased() + status.dropFirst()
                     }

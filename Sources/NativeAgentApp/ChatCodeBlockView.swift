@@ -1,5 +1,7 @@
 import SwiftUI
 
+// Blueprint: | `ChatCodeBlockView.swift` | `ChatCodeBlockView`: selectable fenced code, language label and idempotent copy; no renderer state or clock |
+
 /// A fenced code block in the transcript: monospaced, newline-preserving,
 /// selectable, with the fence's language label and a copy button.
 ///

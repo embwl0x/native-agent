@@ -1,6 +1,10 @@
 import AppKit
+import AppToolRuntime
 import Foundation
 import Observation
+import PersistenceCore
+
+// Blueprint: | `NativeAgentAppCoordinator.swift` | `NativeAgentAppCoordinator`: process bootstrap and queued scene navigation; delivery receipts prove scene acceptance, not finished rendering or work |
 
 enum NativeAgentNavigationDestination: Equatable, Sendable {
     case sidebar(SidebarItem)
@@ -64,8 +68,6 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
             return .sidebar(.diagnostics)
         case "tools":
             return .skillsTools(.tools)
-        case "mcp", "mcps", "mcp_servers":
-            return .sidebar(.mcp)
         case "inspector", "turn_inspector", "readout":
             return .sidebar(.inspector)
         case "macintegration", "mac_integration":
@@ -134,7 +136,7 @@ final class NativeAgentAppCoordinator {
     private var pendingDestinations: [NativeAgentNavigationDestination] = []
     private var mountedScene: (
         id: UUID,
-        currentPage: () -> QuietPage?,
+        visiblePageInput: () -> [String: JSONValue]?,
         deliver: (NativeAgentNavigationDestination) -> Void
     )?
 
@@ -170,11 +172,11 @@ final class NativeAgentAppCoordinator {
 
     @discardableResult
     func mountMainScene(
-        currentPage: @escaping () -> QuietPage? = { nil },
+        visiblePageInput: @escaping () -> [String: JSONValue]? = { nil },
         deliver: @escaping (NativeAgentNavigationDestination) -> Void
     ) -> UUID {
         let id = UUID()
-        mountedScene = (id, currentPage, deliver)
+        mountedScene = (id, visiblePageInput, deliver)
         _ = drainPendingDestinations()
         return id
     }
@@ -184,7 +186,12 @@ final class NativeAgentAppCoordinator {
         mountedScene = nil
     }
 
-    var currentPage: QuietPage? { mountedScene?.currentPage() }
+    var visiblePageInput: [String: JSONValue]? { mountedScene?.visiblePageInput() }
+    var currentPage: QuietPage? {
+        guard SimpleViewMode.current == SimpleViewMode.advanced,
+              case .string(let page)? = visiblePageInput?["page"] else { return nil }
+        return QuietPages.page(named: page)
+    }
 
     @discardableResult
     func request(_ destination: NativeAgentNavigationDestination) -> NativeAgentNavigationRequestReceipt {

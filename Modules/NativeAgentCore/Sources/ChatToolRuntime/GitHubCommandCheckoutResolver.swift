@@ -1,8 +1,9 @@
 import Foundation
 import Dispatcher
+// Blueprint: | `GitHubCommandCheckoutResolver.swift` | `GitHubCommandCheckoutResolver` enum; `resolve` |
 
 // Trusted repository-checkout resolution for explicit codex_message repository
-// selection. The GitHub watcher never invokes this resolver.
+// selection.
 //
 // The trust anchor is the remote, not the name. A caller names an owner/name
 // GitHub repository -- never a filesystem path -- and this resolver only
@@ -14,9 +15,7 @@ import Dispatcher
 enum GitHubCommandCheckoutResolver {
     static func resolve(
         repository: String,
-        headSHA: String?,
-        dataRoot: URL,
-        searchRoots: [URL]? = nil
+        dataRoot: URL
     ) -> URL? {
         let parts = repository.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         guard parts.count == 2, parts.allSatisfy({
@@ -24,7 +23,7 @@ enum GitHubCommandCheckoutResolver {
                 && $0.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || "-_.".contains($0)) }
         }) else { return nil }
         let repoName = parts[1]
-        let roots = searchRoots ?? defaultSearchRoots(dataRoot: dataRoot)
+        let roots = defaultSearchRoots(dataRoot: dataRoot)
         let candidates = checkoutCandidates(repoName: repoName, roots: roots)
         return candidates.compactMap { candidate -> (URL, Int)? in
             guard remoteOutput(candidate).split(separator: "\n").contains(where: {
@@ -34,11 +33,6 @@ enum GitHubCommandCheckoutResolver {
             let name = candidate.lastPathComponent.lowercased()
             if name == repoName.lowercased() { score += 20 }
             if name.contains("contrib") { score += 10 }
-            if let headSHA, git(["rev-parse", "HEAD"], at: candidate)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .caseInsensitiveCompare(headSHA) == .orderedSame {
-                score += 100
-            }
             return (candidate, score)
         }
         .sorted { lhs, rhs in

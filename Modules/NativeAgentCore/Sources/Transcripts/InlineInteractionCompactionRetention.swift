@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 
+// Blueprint: | `InlineInteractionCompactionRetention.swift` | `InlineInteractionCompactionRetention`: preserves live/suspended card handles during destructive transcript compaction |
+
 /// WHICH inline-interaction rows a destructive transcript pass is allowed to
 /// fold away.
 ///

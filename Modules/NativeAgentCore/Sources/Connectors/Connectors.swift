@@ -1,8 +1,8 @@
-import FeedPolicy
 import Privacy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `Connectors.swift` | Canonical workspace-array read and tilde-expanded string paths for search and journal roots; empty search queries return nil for the action's empty envelope |
 
 // Connectors runs in the app process. Swift owners manage the registry,
 // credentials, provider actions and receipts. This client reads saved workspaces,
@@ -28,7 +28,7 @@ public final class SwiftNativeConnectorsClient: Sendable {
     /// Mirror `Daemon.activity_path`:
     /// <root>/activity/events.jsonl.
     private var activityPath: URL {
-        root.appendingPathComponent("activity/events.jsonl")
+        SwiftNativePersistenceCore.activityEventsPath(dataRoot: root)
     }
 
     public func listWorkspaces() async throws -> [JSONValue] {
@@ -40,9 +40,7 @@ public final class SwiftNativeConnectorsClient: Sendable {
     }
 
     public func searchWorkspaces(query rawQuery: String) async throws -> JSONValue? {
-        // Python: query = str(body.get("query")).strip().lower(); if not query: raise.
-        // We mirror strip().lower(); an empty result returns nil so the caller
-        // falls through to HTTP where the daemon raises the real ValueError.
+        // Empty queries return nil; ConnectorRegistryActions projects an empty result.
         let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if query.isEmpty { return nil }
 
@@ -53,36 +51,25 @@ public final class SwiftNativeConnectorsClient: Sendable {
         let workspaces = try await listWorkspaces()
 
         for workspace in workspaces {
-            guard case .object(let ws) = workspace, !Self.stringField(ws["path"]).isEmpty else {
+            guard case .object(let ws) = workspace, let wsRoot = Self.workspaceURL(ws["path"]) else {
                 unexamined.append(.string("a workspace entry has no path"))
                 continue
             }
-            let wsRoot = URL(fileURLWithPath: Self.stringField(ws["path"]))
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: wsRoot.path, isDirectory: &isDir), isDir.boolValue else {
                 unexamined.append(.string("\(wsRoot.path): workspace folder is missing or not a folder"))
                 continue
             }
 
-            // `scanned` RESETS per workspace (gpt-5.5 review #1, 2026-06-01):
-            // the daemon's `scanned>2000` only breaks the CURRENT workspace's
-            // os.walk, never the outer `for workspace` loop. Only the global
-            // `len(results)>=50` cap effectively halts everything.
+            // The scan cap is per workspace; the result cap spans all workspaces.
             var scanned = 0
-            // walkDir returns false when the WORKSPACE walk must stop (either
-            // cap hit). Whether to continue to the NEXT workspace is decided by
-            // the global results cap below, mirroring Python.
+            // A capped workspace does not prevent searching the next one.
             if !walkDirectory(wsRoot, root: wsRoot, ws: ws, query: query,
                               results: &results, scanned: &scanned, unexamined: &unexamined),
                results.count < maxResults {
                 unexamined.append(.string("\(wsRoot.path): stopped after \(maxScanned) files; the rest of this workspace was not searched"))
             }
 
-            // Python outer loop: `if len(results) >= 50 or scanned > 2000: break`.
-            // scanned>2000 here would NOT actually skip later workspaces in
-            // Python because scanned resets — but the outer break IS hit, then
-            // the next `for workspace` iteration resets scanned and proceeds.
-            // The only cross-workspace-terminating condition is results>=50.
             if results.count >= maxResults { break }
         }
 
@@ -90,7 +77,7 @@ public final class SwiftNativeConnectorsClient: Sendable {
         // activity row the daemon writes at the END of search_workspaces, AFTER
         // the result set is finalized. `query` is already strip().lower()'d
         // above (matches the daemon, which passes its lowercased `query`).
-        try await recordSearchActivity(query: query, resultCount: results.count)
+        try await recordSearchActivity(query: query, resultCount: results.count, unexamined: unexamined)
 
         var envelope: [String: JSONValue] = ["query": .string(query), "results": .array(results)]
         if !unexamined.isEmpty { envelope["unexamined"] = .array(unexamined) }
@@ -108,33 +95,30 @@ public final class SwiftNativeConnectorsClient: Sendable {
     /// byte-for-byte (append_jsonl uses json.dumps(sort_keys=True), which
     /// `appendJSONL`/`serialize(pretty:false)` reproduce) — EXCEPT the
     /// `createdAt` precision (Swift millis vs Python micros; see isoTimestamp):
-    ///   {id, kind, title, detail, status, missionId, payload, createdAt}.
+    ///   {id, kind, title, detail, status, executionId, payload, createdAt}.
     /// - title  = redact("Workspace search")  (no secrets → unchanged)
     /// - detail = redact(query)               (user free text → may be redacted)
     /// - payload = redact({"resultCount": <int>}) (int → unchanged)
-    /// - missionId = null (record_activity default mission_id=None)
-    /// - status = "ok"
-    private func recordSearchActivity(query: String, resultCount: Int) async throws {
-        let event: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string("connector"),
-            "title": .string(SecretRedactor.redactText("Workspace search")),
-            "detail": .string(SecretRedactor.redactText(query)),
-            "status": .string("ok"),
-            "executionId": .null,
-            "payload": SecretRedactor.redactValue(.object([
+    /// - executionId = null (record_activity default mission_id=None)
+    /// Unexamined scope remains part of the activity receipt.
+    private func recordSearchActivity(query: String, resultCount: Int, unexamined: [JSONValue]) async throws {
+        let event = SwiftNativePersistenceCore.activityEvent(
+            id: UUID().uuidString.lowercased(),
+            kind: "connector",
+            title: SecretRedactor.redactText("Workspace search"),
+            detail: SecretRedactor.redactText(query),
+            status: unexamined.isEmpty ? "ok" : "partial",
+            executionId: nil,
+            payload: SecretRedactor.redactValue(.object([
                 "resultCount": .int(Int64(resultCount)),
+                "unexamined": .array(unexamined),
             ])),
-            "createdAt": .string(Self.isoTimestamp(Date())),
-        ])
-        // The shared owner takes the one-sided Swift flock and amortizes the
-        // newest-5000 trim behind the activity feed's byte trigger. Do not
-        // reintroduce an exact full-file count on every workspace search.
-        try await appendJSONLCapped(
+            createdAt: Self.isoTimestamp(Date())
+        )
+        try await SwiftNativePersistenceCore.appendActivityEvent(
             event,
             to: activityPath,
             using: persistence,
-            maxLines: JSONLLineCaps.activityEvents,
             logLabel: "Connectors"
         )
     }
@@ -256,6 +240,11 @@ public final class SwiftNativeConnectorsClient: Sendable {
     }
 
     // MARK: - helpers
+
+    static func workspaceURL(_ value: JSONValue?) -> URL? {
+        let path = stringField(value)
+        return path.isEmpty ? nil : URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+    }
 
     private static func stringField(_ v: JSONValue?) -> String {
         guard let v else { return "" }

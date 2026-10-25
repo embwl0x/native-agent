@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentA2AStream.swift` | `AgentA2AStream` enum; `events`, `normalize`; shared stream accumulator |
 
 /// Bounded SSE evidence folded into the same result as send/get. No replay and
 /// no completion inferred from EOF, lastChunk, or the legacy `final` field.

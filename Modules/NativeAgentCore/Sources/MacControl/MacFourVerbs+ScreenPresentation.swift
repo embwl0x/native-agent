@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Senses
+// Blueprint: | `MacFourVerbs+ScreenPresentation.swift` | `MacFourVerbs`: supplemental AX native-page merge, `zoom`, `parseVerb`, `isRightClick` |
 
 extension MacFourVerbs {
     /// Merge every acquired pathless AX surface (notably open menus) into the
@@ -320,128 +321,70 @@ extension MacFourVerbs {
         let status: String
     }
 
-    /// What changed, said plainly. Everything here is read off the effect diff
-    /// the closed loop already computed and already redacted — no value is
-    /// re-derived and none is re-rendered from a raw string.
-    static func effectWords(
-        output: [String: JSONValue],
-        verb: MacActVerb,
-        typed: String?
-    ) -> EffectWords {
-        let status = string(output["status"]) ?? "acted"
-        let effect = object(output["effect"] ?? .null)
-        var parts: [String] = []
-
-        for row in array(effect["readouts_changed"]).prefix(3) {
-            let readout = object(row)
-            if let text = MacScreenText(string(readout["text"]) ?? "", redacted: readout["text"]).display {
-                parts.append("it now reads \"\(text)\"")
-            }
-        }
-        if parts.isEmpty {
-            for row in array(effect["readouts_added"]).prefix(2) {
-                let readout = object(row)
-                if let text = MacScreenText(string(readout["text"]) ?? "", redacted: readout["text"]).display {
-                    parts.append("\"\(text)\" appeared")
-                }
-            }
-        }
-        if case .bool(true)? = effect["window_changed"] {
-            let reasons = array(effect["change_reasons"]).compactMap { string($0) }
-            parts.append(reasons.isEmpty ? "the window changed" : "the window changed (\(reasons.joined(separator: ", ")))")
-        }
-        let added = int(effect["affordances_added_total"]) ?? 0
-        let removed = int(effect["affordances_removed_total"]) ?? 0
-        if added > 0 || removed > 0 {
-            parts.append("\(added) thing\(added == 1 ? "" : "s") appeared, \(removed) went away")
-        }
-        if verb == .type, let typed, !typed.isEmpty, status == "acted" {
-            parts.insert("the text went in", at: 0)
-        }
-
-        // The verdict from below is carried, not restated: `acted_unobserved`
-        // means the event went out and nothing was seen to happen, and calling
-        // that a success is the exact dishonesty the closed loop was built to
-        // stop.
-        var sentence: String
-        if status == "acted" {
-            sentence = parts.isEmpty ? "It landed; nothing else on screen moved." : parts.joined(separator: "; ") + "."
-        } else if status == "acted_unobserved" {
-            let why = string(output["status_reason"]).map { " (\($0))" } ?? ""
-            sentence = "The press went out but nothing was seen to change\(why)"
-                + (parts.isEmpty ? "." : " — " + parts.joined(separator: "; ") + ".")
-        } else {
-            sentence = (string(output["status_note"]) ?? "Status: \(status).")
-        }
-        return EffectWords(sentence: sentence, status: status)
+    /// Carry the one verifier's sentence without judging the screen again.
+    static func effectWords(output: [String: JSONValue]) -> EffectWords {
+        let status = string(output["status"]) ?? "acted_unobserved"
+        return EffectWords(
+            sentence: string(output["status_note"]) ?? string(output["guidance"])
+                ?? "The input went out, but the declared effect could not be read back.",
+            status: status)
     }
 
-    /// THE HOMEWORK STRIPPER.
-    ///
-    /// The layers below write real words, and their guidance is used verbatim —
-    /// except for the tail they were written with: "…call mac_look again",
-    /// "…re-look", "…now do X and call me again". native-screen.md: "A refusal
-    /// ending in '…now do X and call me again' is a BUG, not a safety feature."
-    /// Those clauses name a tool she does not have any more and ask her to
-    /// perform bookkeeping this file already performed — every refusal here is
-    /// followed by a fresh screen. So the mechanism survives, the homework does
-    /// not, and the reply says which of the two happened.
-    static func plainWords(_ guidance: String?) -> String? {
-        guard let guidance, !guidance.isEmpty else { return nil }
-        // Clause-wise, so the MECHANISM (which is the part she reasons with) is
-        // never truncated along with the instruction.
-        let clauses = guidance
-            .replacingOccurrences(of: " — ", with: "\u{1}")
-            .replacingOccurrences(of: "; ", with: "\u{1}")
-            .split(separator: "\u{1}", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        let homework = ["mac_look", "call me again", "look again", "re-look", "take another look"]
-        let kept = clauses.filter { clause in
-            let lowered = clause.lowercased()
-            return !homework.contains { lowered.contains($0) }
-        }
-        var mechanism = (kept.isEmpty ? clauses : kept).joined(separator: " — ")
-        // …and the FRAME vocabulary goes with it. Below this file a frame is a
-        // real object with a real name; in her hands it is the bookkeeping these
-        // verbs deleted, and a mechanism she cannot map onto anything she did is
-        // not a mechanism she can choose differently from.
-        for (jargon, plain) in [
-            ("the app this frame was captured from", "the app I was looking at"),
-            ("the window this frame was captured from", "the window I was looking at"),
-            ("this frame was captured from", "I was looking at"),
-            ("the old frame is discarded", "I've let go of what I had"),
-            ("this frame", "what I was looking at"),
-            ("the frame", "what I was looking at"),
-        ] {
-            mechanism = mechanism.replacingOccurrences(of: jargon, with: plain)
-        }
-        var trimmed = mechanism.trimmingCharacters(in: CharacterSet(charactersIn: " .")).appending(".")
-        if let first = trimmed.first, first.isLowercase {
-            trimmed = first.uppercased() + trimmed.dropFirst()
-        }
-        // The re-look is stated as DONE, because it is: the fresh screen is
-        // already attached below this line.
-        return kept.count == clauses.count ? trimmed : trimmed + " I looked again — this is what's there now."
-    }
-
-    /// A refusal code with no `guidance` of its own — rare, since the layers
-    /// below write their own words. Translated, never echoed bare.
+    /// Present the action owner's refusal code; a fresh screen follows the reply.
     static func refusalWords(_ code: String) -> String {
         switch code {
         case "window_not_key":
             return "another window has the keyboard right now, so the keystroke would have gone "
                 + "somewhere else — nothing was sent."
         case "handle_drifted", "window_drifted":
-            return "the screen moved while I was reaching for it — nothing was touched; look again."
+            return "the screen moved while I was reaching for it — nothing was touched."
         case "frame_window_gone", "frame_app_gone":
             return "what I was looking at isn't there any more — nothing was touched."
         case "verb_not_supported_on_element":
-            return "that thing doesn't do that."
+            return "that control does not support this action. Use mac.look for this app to inspect its controls and supported actions."
         case "observer_unavailable":
             return "I couldn't watch that app for the effect, so I didn't press anything blind."
         default:
             return "it refused: \(code)."
         }
+    }
+
+    static func inspectAppRemedy(_ app: String?, instruction: String) -> JSONValue {
+        let args: [String: JSONValue] = app.map { ["app": .string($0)] } ?? [:]
+        return Repair.reconcile(instruction: instruction, nextCall: .object([
+            "tool": .string("app"), "input": .object([
+                "action": .string("mac.look"), "args": .object(args),
+            ]),
+        ]))
+    }
+
+    static func unknownActionReply(_ error: any Error, operation: String = "the action", app: String?) -> MacFourVerbsReply {
+        let cause = error.localizedDescription
+        let evidence = error as? ToolFailureError
+        let effects = evidence?.effects ?? .unknown
+        let status = evidence?.status.rawValue ?? (error is CancellationError ? "cancelled" : "outcome_unknown")
+        let outcome = effects == .none ? "\(operation) stopped" : "The outcome of \(operation) is unknown"
+        let code = evidence?.code ?? (error is CancellationError ? "cancelled" : "mac_action_result_unavailable")
+        var remedy = inspectAppRemedy(app, instruction: "Inspect the affected app to establish what changed before another action.")
+        if let evidence, effects == .none {
+            if evidence.recovery == .terminal {
+                remedy = Repair.terminal(instruction: evidence.instruction ?? cause)
+            } else if evidence.personDecides, let tap = evidence.tap {
+                remedy = Repair.why(owner: evidence.owner ?? "Mac action", tap: tap, instruction: evidence.instruction)
+            } else if let next = evidence.nextCall, let call = try? JSONValue.parse(Data(next.utf8)), case .object = call {
+                remedy = .object(["kind": .string(evidence.recovery?.rawValue ?? "inspect"),
+                    "instruction": .string(evidence.instruction ?? cause), "next_call": call])
+            } else if let tap = evidence.tap {
+                remedy = Repair.why(owner: evidence.owner ?? "Mac action", tap: tap, instruction: evidence.instruction)
+            }
+        }
+        return MacFourVerbsReply(ok: false,
+            text: "\(outcome): \(cause)\nInspect \(app ?? "the affected app") before another action.",
+            detail: ["status": .string(status),
+                "reason": .string(code), "error": .string(code),
+                "detail": .string(cause), "message": .string(cause), "effects": .string(effects.rawValue),
+                "outcome_unknown": .bool(effects != .none),
+                "remedy": remedy])
     }
 
     static func lookRefusalWords(_ code: String) -> String {
@@ -495,12 +438,12 @@ extension MacFourVerbs {
         String(format: "%.1fs", max(0, value))
     }
 
-    static func operationDetail(_ result: MacControlResult) -> [String: JSONValue] {
+    static func operationDetail(_ result: MacControlResult, app: String? = nil) -> [String: JSONValue] {
         var detail: [String: JSONValue] = [:]
         if case .object(let output) = result.output {
             // Emission counts ride every receipt: whether input went out is
             // what tells a refusal from an act that was not observed.
-            for key in ["note", "guidance", "message", "remedy", "blocked_by", "block_reason", "matched_name", "bundle_identifier", "process_identifier",
+            for key in ["reason", "detail", "effects", "note", "guidance", "message", "remedy", "blocked_by", "block_reason", "matched_name", "bundle_identifier", "process_identifier",
                         "requested_events_emitted", "recovery_events_emitted", "effects_may_have_occurred"] { detail[key] = output[key] }
         }
         if let error = result.error { detail["error"] = .string(error) }
@@ -512,6 +455,21 @@ extension MacFourVerbs {
         if let operationId = result.operationId { detail["operationId"] = .string(operationId) }
         if let state = result.operationState { detail["operationState"] = .string(state.rawValue) }
         if let verification = result.verification { detail["verification"] = .string(verification.rawValue) }
+        detail["duration_ms"] = .int(Int64(result.durationMs))
+        let output = object(result.output)
+        for key in ["status", "verified", "status_reason", "status_note", "verification_evidence", "verification_scope",
+                    "hand_neutral", "text_value_verified"] {
+            detail[key] = output[key]
+        }
+        if detail["status"] == .string("outcome_unknown"), let app {
+            detail["remedy"] = inspectAppRemedy(app,
+                instruction: "Inspect the affected app to establish what changed before another action.")
+        }
+        if output["verified"] == .bool(true) {
+            detail["verification"] = .string(MotorVerificationState.satisfied.rawValue)
+        } else if output["status"] == .string("acted_mismatch") {
+            detail["verification"] = .string(MotorVerificationState.failed.rawValue)
+        }
         return detail
     }
 

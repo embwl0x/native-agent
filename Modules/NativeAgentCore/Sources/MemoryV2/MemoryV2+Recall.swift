@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryV2+Recall.swift` | `SwiftNativeMemoryV2`: `recordRecallHits`, `recall`, `readMemoryRecord`; invocation-local ranked voices reused for disclosure refill |
 
 extension SwiftNativeMemoryV2 {
 
@@ -9,7 +10,10 @@ extension SwiftNativeMemoryV2 {
     @discardableResult
     func reconcileMemoryEmbeddingEpoch() async throws -> MemoryEmbeddingEpochActivationReport? {
         try await ensureCanonicalAttachment()
-        guard let embedder else { throw MemoryV2Error.storageUnavailable }
+        guard let embedder else {
+            throw MemoryStorageError.searchFailure("No memory search model is attached.",
+                code: "memory_search_model_unavailable", instruction: "Inspect Doctor's memory search model findings before searching again.")
+        }
         try await warmUpEmbedder()
         while true {
             try Task.checkCancellation()
@@ -23,8 +27,10 @@ extension SwiftNativeMemoryV2 {
         }
     }
 
-    static let recallCorpusConverging = MemoryV2Error.underlying(
-        "Semantic recall is unavailable: saved memories are being re-embedded for the current memory-search model. MemoryV2 finishes this on its own; retry recall after it does."
+    static let recallCorpusConverging = ToolFailureError(
+        "Memory search is updating saved memories for the current memory search model.", effects: .none,
+        nextCall: ToolFailureError.call("app", ["page": .string("memories")]), code: "memory_search_index_updating",
+        instruction: "Check memory search progress before recalling again.", recovery: .inspect
     )
 
     /// Access-signal bump for records served OUTSIDE the recall lane (the
@@ -78,7 +84,8 @@ extension SwiftNativeMemoryV2 {
         guard let residentEpoch = residentEmbeddingEpoch() else {
             requestEmbeddingEpochReconcile()
             let failed = embeddingRuntimeSnapshot()?.lastLoadError.map { " Its last load failed: \($0)." } ?? ""
-            throw MemoryV2Error.underlying("Semantic recall is unavailable: the memory-search model is not loaded.\(failed) MemoryV2 loads it on its own; retry recall shortly.")
+            throw MemoryStorageError.searchFailure("The memory search model is not loaded.\(failed)",
+                code: "memory_search_model_not_loaded", instruction: "It loads on its own; recall again shortly. If it keeps failing, Doctor names the load error.")
         }
         guard try await memoryEmbeddingEpochState().activeEpoch == residentEpoch.rawValue else {
             requestEmbeddingEpochReconcile()
@@ -95,10 +102,14 @@ extension SwiftNativeMemoryV2 {
             query.text,
             names: MemoryRecallQueryExpansion.names(storeDirectory: storeDirectory)
         )
-        guard let embedder else { throw MemoryV2Error.storageUnavailable }
-        let embedded = try await embedder.embedWithEpoch([query.text] + (rewritten.map { [$0] } ?? []))
+        guard let embedder else {
+            throw MemoryStorageError.searchFailure("No memory search model is attached.",
+                code: "memory_search_model_unavailable", instruction: "Inspect Doctor's memory search model findings before searching again.")
+        }
+        let embedded = try await embedder.embedQueriesWithEpoch([query.text] + (rewritten.map { [$0] } ?? []))
         guard let qvec = embedded.vectors.first else {
-            throw MemoryV2Error.underlying("embedder returned no vectors")
+            throw MemoryStorageError.searchFailure("The memory search model returned no query vectors.",
+                code: "memory_search_vectors_missing", instruction: "Inspect Doctor's model findings; repair the missing query vectors before searching again.")
         }
         let queryEmbedding = (vector: qvec, epoch: embedded.epoch)
         try Task.checkCancellation()
@@ -149,7 +160,7 @@ extension SwiftNativeMemoryV2 {
                 guard classification.permits(surface: query.surface, personaID: query.persona) else {
                     return false
                 }
-                let key = MemoryStorage.normalizedRecallContent(scoredRecord.record.text)
+                let key = MemoryStorage.comparisonKey(scoredRecord.record.text, mode: .recall)
                 return key.isEmpty || seen.insert(key).inserted
             }
         }
@@ -165,7 +176,8 @@ extension SwiftNativeMemoryV2 {
         timings["generation_ms"] = milliseconds(since: generationStarted)
         var retrievalStarted = ProcessInfo.processInfo.systemUptime
         guard hasUsableVector else {
-            throw MemoryV2Error.underlying("Semantic recall is unavailable: the embedding query has no usable vector.")
+            throw MemoryStorageError.searchFailure("The memory search model returned no usable query vector.",
+                code: "memory_search_vector_unusable", instruction: "Inspect Doctor's model findings; repair the unusable query vector before searching again.")
         }
         // Keep each voice's full ranking; deduplication and record conversion
         // stop at its requested window, including when disclosure widens it.
@@ -333,7 +345,13 @@ extension SwiftNativeMemoryV2 {
     /// rank, enumerate records, or expose an admin/lineage bypass.
     public func readMemoryRecord(id: String, persona: String? = nil, surface: String) async throws -> MemoryRecord? {
         let id = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !id.isEmpty, id.utf8.count <= 512 else { throw MemoryV2Error.invalidQuery }
+        guard !id.isEmpty, id.utf8.count <= 512 else {
+            throw ToolFailureError("Memory id must contain 1–512 UTF-8 bytes.", argumentPath: "memory_id",
+                accepted: "an existing memory id, at most 512 UTF-8 bytes", effects: .none,
+                nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
+                code: "memory_id_invalid", status: .refused,
+                instruction: "Correct memory_id in the original call.", recovery: .correctArguments)
+        }
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         try Task.checkCancellation()
@@ -347,6 +365,11 @@ extension SwiftNativeMemoryV2 {
               ) else { return nil }
         let tombstoned = try await storage.isTombstoned(content: record.text)
         guard !tombstoned else { return nil }
+        guard !MemoryStorage.metadataFlag(record.extras, MemoryStorage.pendingAdmissionKey) else {
+            throw ToolFailureError("This memory is awaiting admission checks and cannot be recalled yet.", effects: .none,
+                nextCall: ToolFailureError.call("app", ["page": .string("memories")]), code: "memory_admission_pending",
+                instruction: "Check memory admission progress before recalling this record again.", recovery: .inspect)
+        }
         try Task.checkCancellation()
         return record
     }

@@ -3,28 +3,20 @@ import Darwin
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
-import Skills
+import WorkflowOrchestration
+// Blueprint: | `CapabilityCatalog.swift` | Capability sources, trust roots and pack installation receipts; catalog registry aggregation and mutation share `CapabilityCatalogStoreReader`'s checked object-array schema; workflow mutations delegate to WorkflowOrchestration. Installed items and receipts are authoritative, with no saved pack copy or `packPath`. Retained `catalog/packs` files are untouched orphans, excluded from local backup, export and phone sync; PrivacyMap lists their catalog folder. |
 
 // MARK: - Capability catalog persistence
 //
-// The retired daemon rewrote these stores while serving a read. That behavior
-// is deliberately NOT preserved: sources and trust roots are authoritative
-// operator state, so a read must be pure and an existing damaged store must be
-// unavailable rather than silently becoming the default list. Missing stores
-// are the one legitimate bootstrap case; callers receive in-memory defaults
-// without a read-side write.
-//
-//   1. catalog_sources()
-//      → <dataRoot>/catalog/sources/sources.json
-//   2. capability_trust_roots()
-//      → <dataRoot>/catalog/trust/roots.json
-//
-// Merge semantics remain compatible on valid input:
-//   defaults first; for each default record, overlay any saved record
-//   with the same id (saved fields win). Then append unmatched saved records.
-//
-// Timestamps use SwiftNativeManifestSigner.isoTimestamp (TrustCenter.swift:1334)
-// for Python-format-compatible UTC ISO strings.
+// Sources and trust roots are checked operator authority. Reads never rewrite
+// lists; missing lists receive in-memory defaults. Trust-root resolution may
+// create the missing signing key after validating the list.
+// Local backup includes sources, roots, registry and install receipts; export
+// selects sources, roots and registry only. The 64-hex-character, 0600
+// .pack_signing_key is deliberately excluded from local backup, export and
+// phone sync. No catalog file syncs to the phone. PrivacyMap lists Catalog
+// (hidden key bytes are omitted from its directory size tally).
+// Saved fields override defaults by ID; unmatched saved records append.
 
 // MARK: - File-private helpers
 
@@ -36,11 +28,36 @@ public enum CapabilityCatalogPersistenceError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .unreadable(let path, let detail):
-            return "capability catalog store unreadable at \(path): \(detail)"
+            return "capability_catalog_unreadable: Cannot read \(path): \(detail). Repair access to this file; preserve its bytes and saved authority."
         case .malformed(let path, let detail):
-            return "capability catalog store malformed at \(path): \(detail)"
+            return "capability_catalog_malformed: Invalid records in \(path): \(detail). Repair this file from its retained bytes, preserving every record and authority choice; never reset it to an empty catalog."
         case .signingKeyUnavailable(let path, let detail):
-            return "capability pack signing key unavailable at \(path): \(detail)"
+            return "capability_signing_key_unavailable: Cannot use \(path): \(detail). Ask the owner to repair or restore the original 64-hex-character key as a regular 0600 file at this path; never replace an existing signing identity."
+        }
+    }
+
+    fileprivate var failure: ToolFailureError {
+        switch self {
+        case .unreadable(let path, let detail):
+            let file = URL(fileURLWithPath: path)
+            return ToolFailureError("Capability catalog cannot be read at \(path): \(detail)",
+                effects: .none, owner: path,
+                tap: "Finder > Go > Go to Folder > \(file.deletingLastPathComponent().path) > \(file.lastPathComponent) > Get Info > Sharing & Permissions",
+                code: "capability_catalog_unreadable",
+                instruction: "Ask the owner to repair access to this file, preserving its original bytes and saved authority.")
+        case .malformed(let path, let detail):
+            let file = URL(fileURLWithPath: path)
+            return ToolFailureError("Capability catalog has invalid records at \(path): \(detail)",
+                effects: .none, owner: path,
+                code: "capability_catalog_malformed",
+                instruction: ToolFailureError.fileRepairInstruction(file,
+                    shape: "This catalog authority store must be a JSON array of records with unique nonblank string IDs. Preserve every record, field, trust root, source and authority choice. Recover required fields only from these retained bytes; never invent IDs, packIds, status or authority, or reset the catalog.") + " Repair only the named catalog file from its retained bytes, preserving saved authority.")
+        case .signingKeyUnavailable(let path, let detail):
+            return ToolFailureError("Capability signing key at \(path) is unavailable: \(detail)",
+                effects: .unknown, owner: path,
+                tap: "Finder > Go > Go to Folder > \(URL(fileURLWithPath: path).deletingLastPathComponent().path) > .pack_signing_key > Get Info",
+                code: "capability_signing_key_unavailable",
+                instruction: "Ask the owner to repair or restore the original 64-hex-character key as a regular 0600 file; never replace an existing signing identity.")
         }
     }
 }
@@ -54,7 +71,7 @@ private func loadObjectRowsChecked(
         guard errno == ENOENT else {
             throw CapabilityCatalogPersistenceError.unreadable(
                 path: path.path, detail: "store cannot be inspected"
-            )
+            ).failure
         }
         return []
     }
@@ -73,7 +90,7 @@ private func loadObjectRowsChecked(
         throw CapabilityCatalogPersistenceError.unreadable(
             path: path.path,
             detail: error.localizedDescription
-        )
+        ).failure
     }
 
     let raw: JSONValue
@@ -83,13 +100,13 @@ private func loadObjectRowsChecked(
         throw CapabilityCatalogPersistenceError.malformed(
             path: path.path,
             detail: "invalid JSON: \(error.localizedDescription)"
-        )
+        ).failure
     }
     guard case .array(let items) = raw else {
         throw CapabilityCatalogPersistenceError.malformed(
             path: path.path,
             detail: "expected a JSON array of \(recordKind) records"
-        )
+        ).failure
     }
 
     var rows: [[String: JSONValue]] = []
@@ -100,20 +117,20 @@ private func loadObjectRowsChecked(
             throw CapabilityCatalogPersistenceError.malformed(
                 path: path.path,
                 detail: "\(recordKind) row \(index) is not a JSON object"
-            )
+            ).failure
         }
         guard case .string(let id)? = row["id"],
               !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw CapabilityCatalogPersistenceError.malformed(
                 path: path.path,
                 detail: "\(recordKind) row \(index) has no non-empty string id"
-            )
+            ).failure
         }
         guard seenIDs.insert(id).inserted else {
             throw CapabilityCatalogPersistenceError.malformed(
                 path: path.path,
                 detail: "\(recordKind) row \(index) duplicates id \(id)"
-            )
+            ).failure
         }
         rows.append(row)
     }
@@ -124,6 +141,28 @@ private func loadObjectRowsChecked(
 /// other ingress paths should call these methods before installing bytes so the
 /// same missing-vs-damaged contract governs live reads and restore preflight.
 public enum CapabilityCatalogStoreReader {
+    /// The catalog registry's one object-array schema, shared by mutation and
+    /// read-only aggregation. Existing damaged rows never become defaults.
+    package static func loadRegistryChecked(_ path: URL, persistence: any PersistenceCoreProtocol) async throws -> [[String: JSONValue]] {
+        let raw = try await persistence.readJSON(path, ifMissing: .array([]))
+        guard case .array(let rows) = raw else {
+            throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
+                NSLocalizedDescriptionKey: "Capability pack registry must be an array: \(path.path)"
+            ])
+        }
+        var seenIDs: Set<String> = []
+        return try rows.map {
+            guard case .object(let obj) = $0, case .string(let id)? = obj["id"],
+                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  seenIDs.insert(id).inserted else {
+                throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
+                    NSLocalizedDescriptionKey: "Capability pack registry contains an invalid entry: \(path.path)"
+                ])
+            }
+            return obj
+        }
+    }
+
     public static func loadCatalogSourcesChecked(
         at path: URL
     ) throws -> [[String: JSONValue]] {
@@ -152,14 +191,14 @@ public enum CapabilityCatalogStoreReader {
                 throw CapabilityCatalogPersistenceError.malformed(
                     path: path.path,
                     detail: "capability pack install row \(index) has no non-empty string packId"
-                )
+                ).failure
             }
             guard case .string(let status)? = row["status"],
                   !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw CapabilityCatalogPersistenceError.malformed(
                     path: path.path,
                     detail: "capability pack install row \(index) has no non-empty string status"
-                )
+                ).failure
             }
         }
         return rows
@@ -235,7 +274,7 @@ private func validatedPackSigningKey(_ data: Data, at keyPath: URL) throws -> St
         throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
             path: keyPath.path,
             detail: "existing key must contain exactly 64 hexadecimal characters"
-        )
+        ).failure
     }
     return secret
 }
@@ -249,18 +288,19 @@ private func checkedExistingPackSigningKey(at keyPath: URL) throws -> String? {
 /// remain untouched and unavailable.
 private func resolvePackSigningKey(dataRoot: URL) throws -> String {
     let keyPath = dataRoot.appendingPathComponent("catalog/.pack_signing_key")
+    let data: Data
     do {
-        let data = try CheckedFixedSizeSecretFile.loadOrCreate(at: keyPath, byteCount: 64) {
+        data = try CheckedFixedSizeSecretFile.loadOrCreate(at: keyPath, byteCount: 64) {
             let secret = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
                 + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
             return Data(secret.utf8)
         }
-        return try validatedPackSigningKey(data, at: keyPath)
     } catch {
         throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
             path: keyPath.path, detail: error.localizedDescription
-        )
+        ).failure
     }
+    return try validatedPackSigningKey(data, at: keyPath)
 }
 
 /// SHA-256 hex of `s` (UTF-8 bytes), truncated to the first 32 chars —
@@ -323,9 +363,8 @@ public actor SwiftNativeCapabilityTrustRoots {
         self.clock = clock
     }
 
-    /// Pure, strict read of capability trust roots. A missing store returns the
-    /// local root in memory. Existing damaged state throws and is never healed
-    /// into a different trust set by a read.
+    /// Strict root-list read; never rewrites it. After validation, resolving
+    /// the local root creates its signing key if missing.
     public func capabilityTrustRoots() async throws -> [[String: JSONValue]] {
         let trustPath = dataRoot
             .appendingPathComponent("catalog", isDirectory: true)
@@ -632,17 +671,7 @@ public actor SwiftNativeCatalogWrites {
             .appendingPathComponent("installs.json")
     }
 
-    private var packsPath: String {
-        dataRoot
-            .appendingPathComponent("catalog", isDirectory: true)
-            .appendingPathComponent("packs", isDirectory: true)
-            .path
-    }
-
-    /// Daemon's trace/activity ledger — `<dataRoot>/traces/events.jsonl`
-    ///. Both the activity feed (/v1/activity) and the
-    /// trace ledger (/v1/traces) read this file, so emitting the same envelope
-    /// here keeps the audit feeds intact when the write flows through Swift.
+    /// Shared diagnostic ledger; appends belong to appendPathOwnedJSONL.
     private var tracesPath: URL {
         dataRoot
             .appendingPathComponent("traces", isDirectory: true)
@@ -700,7 +729,7 @@ public actor SwiftNativeCatalogWrites {
         ]
 
         let sourcesPathLocal = sourcesPath
-        let packsPathLocal = packsPath
+        let dataRootLocal = dataRoot
         let persistenceLocal = persistence
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(clock())
         try await withSourcesLock {
@@ -708,7 +737,7 @@ public actor SwiftNativeCatalogWrites {
             // once. Existing damaged state throws before any write.
             let merged = try Self.mergedSourcesChecked(
                 sourcesPath: sourcesPathLocal,
-                packsPath: packsPathLocal,
+                dataRoot: dataRootLocal,
                 nowISO: nowISO
             )
             var sources = merged.filter { row in
@@ -783,53 +812,19 @@ public actor SwiftNativeCatalogWrites {
     /// state throws before the caller's single commit.
     private static func mergedSourcesChecked(
         sourcesPath: URL,
-        packsPath: String,
+        dataRoot: URL,
         nowISO: String
     ) throws -> [[String: JSONValue]] {
         let saved = try CapabilityCatalogStoreReader.loadCatalogSourcesChecked(at: sourcesPath)
 
-        let defaults: [[String: JSONValue]] = [[
-            "id": .string("local-catalog"),
-            "name": .string("Local NativeAgent Catalog"),
-            "kind": .string("local"),
-            "url": .string(packsPath),
-            "status": .string("ready"),
-            "trustedRootId": .string("local-trusted"),
-            "lastCheckedAt": .null,
-            "createdAt": .string(nowISO),
-        ]]
-
-        return mergeRecords(defaults: defaults, saved: saved)
+        return mergeRecords(defaults: defaultCatalogSources(dataRoot: dataRoot, nowISO: nowISO), saved: saved)
     }
 
-    /// Append a trace event to `<dataRoot>/traces/events.jsonl` in the daemon's
-    /// `record_trace` envelope shape (`{id, kind, title, status, payload,
-    /// createdAt}`, the retired daemon). The envelope-level `status` mirrors
-    /// the daemon, which pulls `status` out of the payload defaulting to "ok"
-    /// (`str(_payload.get("status") or "ok")`, the retired daemon); for
-    /// catalog.source.save that resolves to the record's "ready"|"needs_setup".
-    /// `_normalize_trace_error` only mutates the payload when an `error` key is
-    /// present, which catalog.source.save never carries, so the payload passes
-    /// through verbatim.
-    ///
-    /// Wave 33 W01 (closes §6.95 #1+#2):
-    /// - ERROR PROPAGATION: this `async throws` and lets the append error
-    ///   surface. The daemon's `record_trace` calls the UNWRAPPED `append_jsonl`
-    ///, so a trace-write failure raises out of
-    ///   `upsert_catalog_source`; matching that means the Swift port must NOT
-    ///   swallow. Same convention as DispatchLedger.append /
-    ///   Research.appendResearchTrace, which already propagate.
-    /// - CROSS-PROCESS FLOCK: the `withFileLock` around the append is now
-    ///   SYMMETRIC with the daemon. Wave 33 W01 made Python's `record_trace`
-    ///   and the periodic/startup traces prune acquire `file_lock(traces_path)`
-    ///, which rendezvous on the same `<path>.lock` advisory
-    ///   lock (Python `str(path)+".lock"` == Swift `targetPath.path+".lock"`).
-    ///   The lock is required, not a cosmetic precaution: `traces/events.jsonl`
-    ///   is co-written by Python (`record_trace` + the read-modify-replace
-    ///   prune) and >=4 Swift emitters during the cutover, and trace payloads
-    ///   can exceed PIPE_BUF so O_APPEND atomicity alone does not prevent torn
-    ///   lines, nor does it protect the non-atomic prune `os.replace` against
-    ///   in-flight appenders.
+    /// Append the shared {id, kind, title, status, payload, createdAt} envelope.
+    /// The path-owned persistence writer holds its lock through append/retention;
+    /// no retired daemon writes this feed. Catalog payloads pass through verbatim
+    /// and their nonempty status becomes the envelope status (otherwise "ok").
+    /// Append failures propagate to the catalog mutation's caller.
     private func emitCatalogTrace(
         kind: String,
         title: String,
@@ -838,11 +833,7 @@ public actor SwiftNativeCatalogWrites {
         var statusStr = "ok"
         if case .string(let s)? = payload["status"], !s.isEmpty { statusStr = s }
         let event: JSONValue = .object([
-            // Lowercased to match Python's str(uuid.uuid4()) (the retired daemon
-            // record_trace) — Darwin's UUID().uuidString is UPPERCASE, which
-            // would drift the trace-envelope `id` case from the daemon's. This
-            // is the repo convention for Python-parity ids (see slugify fallback
-            // at line 390, etc.).
+            // Preserve the stored envelope's lowercase UUID convention.
             "id": .string(UUID().uuidString.lowercased()),
             "kind": .string(kind),
             "title": .string(title),
@@ -1009,23 +1000,15 @@ extension CapabilityPackInstall {
         let version = jsonString(pack, "version")
         let signature = jsonString(pack, "signature")
         let itemIDs = capabilityPackItemIDs(pack)
-        let skills = SwiftNativeSkillsClient(root: root, persistence: persistence)
         let skillItems = capabilityPackObjects(pack, category: "skills")
         let installs = try CapabilityCatalogStoreReader.loadCapabilityPackInstallsChecked(at: capabilityPackInstallsPath(root: root))
         let previousItemIDs = try installs.first(where: { jsonString($0, "id") == installID })
             .map { try installedItemIDs(from: $0) }
         try await preflightPackItems(capabilityPackObjects(pack, category: "catalog"),
             path: root.appendingPathComponent("catalog/registry.json"), installID: installID, persistence: persistence)
-        try await preflightPackItems(capabilityPackObjects(pack, category: "workflows"),
-            path: root.appendingPathComponent("workflows/registry.json"), installID: installID, persistence: persistence)
-        try skills.preflightPackSkills(skillItems, installID: installID, packID: packID)
-        let packPath = root
-            .appendingPathComponent("catalog", isDirectory: true)
-            .appendingPathComponent("packs", isDirectory: true)
-            .appendingPathComponent("\(packID).json")
-        try await persistence.withFileLock(packPath) {
-            try await persistence.writeJSON(.object(pack), to: packPath)
-        }
+        try SwiftNativeWorkflowOrchestrationClient(root: root, persistence: persistence)
+            .preflightPackItems(capabilityPackObjects(pack, category: "workflows"), installID: installID)
+        try CapabilityPackParts.preflight(skillItems, installID: installID, dataRoot: root)
         try await installCatalogItems(
             capabilityPackObjects(pack, category: "catalog"),
             root: root,
@@ -1034,19 +1017,13 @@ extension CapabilityPackInstall {
             packID: packID,
             nowISO: nowISO
         )
-        try await installWorkflowItems(
+        try await SwiftNativeWorkflowOrchestrationClient(root: root, persistence: persistence).installPackItems(
             capabilityPackObjects(pack, category: "workflows"),
-            root: root,
-            persistence: persistence,
             installID: installID,
             packID: packID,
             nowISO: nowISO
         )
-        try await SwiftNativeSkillsClient(root: root).installPackSkills(
-            skillItems,
-            installID: installID,
-            packID: packID
-        )
+        try await CapabilityPackParts.install(skillItems, installID: installID, pack: packID, dataRoot: root)
         if let previousItemIDs {
             let omittedCatalog = previousItemIDs.catalog.filter { !itemIDs.catalog.contains($0) }
             let omittedWorkflows = previousItemIDs.workflows.filter { !itemIDs.workflows.contains($0) }
@@ -1057,12 +1034,16 @@ extension CapabilityPackInstall {
                 try await removePackCatalogItems(omittedCatalog, installID: installID, packID: packID, root: root, persistence: persistence)
             }
             if !omittedWorkflows.isEmpty {
-                try await removePackWorkflowItems(omittedWorkflows, installID: installID, packID: packID, root: root, persistence: persistence)
+                try await SwiftNativeWorkflowOrchestrationClient(root: root, persistence: persistence)
+                    .removePackItems(omittedWorkflows, installID: installID, packID: packID)
             }
             if !omittedSkills.isEmpty {
-                try await skills.removePackSkills(omittedSkills, installID: installID, packID: packID)
+                try CapabilityPackParts.remove(omittedSkills, installID: installID, dataRoot: root)
             }
         }
+        // Receipts and installed items own the installation. No saved pack copy:
+        // retained catalog/packs files stay untouched, outside local backup,
+        // export and phone sync; PrivacyMap's catalog category lists the folder.
         let receipt: [String: JSONValue] = [
             "id": .string(installID),
             "packId": .string(packID),
@@ -1072,7 +1053,6 @@ extension CapabilityPackInstall {
             "signature": signature.isEmpty ? .null : .string(signature),
             "installedAt": .string(nowISO),
             "rolledBackAt": .null,
-            "packPath": .string(packPath.path),
             "itemIds": .object([
                 "catalog": .array(itemIDs.catalog.map { .string($0) }),
                 "workflows": .array(itemIDs.workflows.map { .string($0) }),
@@ -1112,8 +1092,9 @@ extension CapabilityPackInstall {
             let packID = jsonString(row, "packId")
             let itemIDs = try installedItemIDs(from: row)
             try await removePackCatalogItems(itemIDs.catalog, installID: id, packID: packID, root: root, persistence: persistence)
-            try await removePackWorkflowItems(itemIDs.workflows, installID: id, packID: packID, root: root, persistence: persistence)
-            try await SwiftNativeSkillsClient(root: root, persistence: persistence).removePackSkills(itemIDs.skills, installID: id, packID: packID)
+            try await SwiftNativeWorkflowOrchestrationClient(root: root, persistence: persistence)
+                .removePackItems(itemIDs.workflows, installID: id, packID: packID)
+            try CapabilityPackParts.remove(itemIDs.skills, installID: id, dataRoot: root)
             row["status"] = .string("rolled_back")
             row["rolledBackAt"] = .string(nowISO)
             rows[idx] = row
@@ -1148,7 +1129,7 @@ extension CapabilityPackInstall {
         (
             catalog: capabilityPackObjects(pack, category: "catalog").map { jsonString($0, "id") }.filter { !$0.isEmpty },
             workflows: capabilityPackObjects(pack, category: "workflows").map { jsonString($0, "id") }.filter { !$0.isEmpty },
-            skills: capabilityPackObjects(pack, category: "skills").map { SwiftNativeSkillsClient.packSkillID($0) }.filter { !$0.isEmpty }
+            skills: capabilityPackObjects(pack, category: "skills").map(CapabilityPackParts.id).filter { !$0.isEmpty }
         )
     }
 
@@ -1180,7 +1161,7 @@ extension CapabilityPackInstall {
     private static func preflightPackItems(
         _ items: [[String: JSONValue]], path: URL, installID: String, persistence: SwiftNativePersistenceCore
     ) async throws {
-        let rows = try await readObjectArray(path, persistence: persistence)
+        let rows = try await CapabilityCatalogStoreReader.loadRegistryChecked(path, persistence: persistence)
         let ids = Set(items.map { jsonString($0, "id") })
         guard items.allSatisfy({
                   if case .string(let id)? = $0["id"] {
@@ -1208,7 +1189,7 @@ extension CapabilityPackInstall {
         guard !items.isEmpty else { return }
         let path = root.appendingPathComponent("catalog/registry.json")
         try await persistence.withFileLock(path) {
-            var rows = try await readObjectArray(path, persistence: persistence)
+            var rows = try await CapabilityCatalogStoreReader.loadRegistryChecked(path, persistence: persistence)
             let ids = Set(items.map { jsonString($0, "id") }.filter { !$0.isEmpty })
             rows.removeAll { ids.contains(jsonString($0, "id")) }
             for item in items {
@@ -1218,33 +1199,6 @@ extension CapabilityPackInstall {
                 row["installedAt"] = .string(nowISO)
                 row["updatedAt"] = .string(nowISO)
                 if row["createdAt"] == nil { row["createdAt"] = .string(nowISO) }
-                row["installedByPack"] = .string(packID)
-                row["capabilityPackInstallId"] = .string(installID)
-                rows.append(row)
-            }
-            try await persistence.writeJSON(.array(rows.map { .object($0) }), to: path)
-        }
-    }
-
-    private static func installWorkflowItems(
-        _ items: [[String: JSONValue]],
-        root: URL,
-        persistence: SwiftNativePersistenceCore,
-        installID: String,
-        packID: String,
-        nowISO: String
-    ) async throws {
-        guard !items.isEmpty else { return }
-        let path = root.appendingPathComponent("workflows/registry.json")
-        try await persistence.withFileLock(path) {
-            var rows = try await readObjectArray(path, persistence: persistence)
-            let ids = Set(items.map { jsonString($0, "id") }.filter { !$0.isEmpty })
-            rows.removeAll { ids.contains(jsonString($0, "id")) }
-            for item in items {
-                var row = item
-                row["status"] = .string(jsonString(row, "status").isEmpty ? "active" : jsonString(row, "status"))
-                row["createdAt"] = row["createdAt"] ?? .string(nowISO)
-                row["updatedAt"] = .string(nowISO)
                 row["installedByPack"] = .string(packID)
                 row["capabilityPackInstallId"] = .string(installID)
                 rows.append(row)
@@ -1263,16 +1217,6 @@ extension CapabilityPackInstall {
         try await removeMarkedRows(path: root.appendingPathComponent("catalog/registry.json"), ids: ids, installID: installID, packID: packID, persistence: persistence)
     }
 
-    private static func removePackWorkflowItems(
-        _ ids: [String],
-        installID: String,
-        packID: String,
-        root: URL,
-        persistence: SwiftNativePersistenceCore
-    ) async throws {
-        try await removeMarkedRows(path: root.appendingPathComponent("workflows/registry.json"), ids: ids, installID: installID, packID: packID, persistence: persistence)
-    }
-
     private static func removeMarkedRows(
         path: URL,
         ids: [String],
@@ -1281,7 +1225,7 @@ extension CapabilityPackInstall {
         persistence: SwiftNativePersistenceCore
     ) async throws {
         try await persistence.withFileLock(path) {
-            var rows = try await readObjectArray(path, persistence: persistence)
+            var rows = try await CapabilityCatalogStoreReader.loadRegistryChecked(path, persistence: persistence)
             rows.removeAll { row in
                 let marked = jsonString(row, "capabilityPackInstallId") == installID || jsonString(row, "installedByPack") == packID
                 let matches = ids.isEmpty || ids.contains(jsonString(row, "id"))
@@ -1335,26 +1279,6 @@ extension CapabilityPackInstall {
     private static func capabilityPackInstallsPath(root: URL) -> URL {
         root.appendingPathComponent("catalog", isDirectory: true)
             .appendingPathComponent("installs.json")
-    }
-
-    private static func readObjectArray(_ path: URL, persistence: SwiftNativePersistenceCore) async throws -> [[String: JSONValue]] {
-        let raw = try await persistence.readJSON(path, ifMissing: .array([]))
-        guard case .array(let rows) = raw else {
-            throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
-                NSLocalizedDescriptionKey: "Capability pack registry must be an array: \(path.path)"
-            ])
-        }
-        var seenIDs: Set<String> = []
-        return try rows.map {
-            guard case .object(let obj) = $0, case .string(let id)? = obj["id"],
-                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  seenIDs.insert(id).inserted else {
-                throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
-                    NSLocalizedDescriptionKey: "Capability pack registry contains an invalid entry: \(path.path)"
-                ])
-            }
-            return obj
-        }
     }
 
     private static func jsonString(_ obj: [String: JSONValue], _ key: String) -> String {

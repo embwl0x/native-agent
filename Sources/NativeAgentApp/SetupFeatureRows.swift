@@ -1,4 +1,6 @@
 import MemoryV2
+
+// Blueprint: | `SetupFeatureRows.swift` | `SetupFeatureRows`: settings-page controls over existing cognition/context/dream/memory/embedding owners; no new settings store |
 // THE REST OF THE FOUR THINGS, ON THE SETUP PAGE.
 //
 // Every switch here writes exactly the storage its old control wrote — the
@@ -33,17 +35,14 @@ struct SetupFeatureRows<InnerLife: View>: View {
     @AppStorage("contextFlowMode") private var contextFlowMode = ContextFlowMode.active.rawValue
     @AppStorage("selfImprovementEnabled") private var selfImprovementEnabled = true
 
-    // Optimistic local mirrors for the writes that go over the trust policy or
-    // the memory runtime, so a switch does not snap back mid-round-trip.
-    // Reconciled from the source of truth after every save.
-    @State private var dreamCycleOn = false
+    // Pending edits reconcile from their owners after every save.
+    @State private var pendingDream: Bool?
     @State private var savingDream = false
     @State private var remCycleOn = true
     @State private var savingRem = false
     @State private var memoryDraft = TrustMemoryPolicy()
     @State private var savingMemory = false
-    @State private var embeddingsStatus: EmbeddingsStatus?
-    @State private var embeddingsOn = false
+    private var embeddingsStatus: EmbeddingsStatus? { appModel.engine.memory.embeddingsStatus }
     @State private var savingEmbeddings = false
     @State private var pendingEmbeddings: Bool?
     @State private var savingContextFlow = false
@@ -75,10 +74,7 @@ struct SetupFeatureRows<InnerLife: View>: View {
         // it, and these rows follow it rather than keeping their own copy.
         .onChange(of: appModel.engine.trust.policy) { _, _ in
             syncFromTrustPolicy()
-            // The dream gate is a composite the policy only half carries;
-            // re-read it the way the Dreams page does.
-            guard !savingDream else { return }
-            Task { @MainActor in dreamCycleOn = await appModel.engine.cognitionView.dreamEnabled() }
+            Task { await appModel.engine.cognitionView.refreshDiary() }
         }
     }
 
@@ -170,15 +166,15 @@ struct SetupFeatureRows<InnerLife: View>: View {
             detail: "At night I go back over the day and write down what I made of it.",
             key: "dream_cycle_enabled",
             isOn: Binding(
-                get: { dreamCycleOn },
+                get: { pendingDream ?? (appModel.engine.cognitionView.diaryGate?.dreamEnabled == true) },
                 set: { value in
                     guard !savingDream else { return }
-                    dreamCycleOn = value          // optimistic — no snap-back
+                    pendingDream = value
                     savingDream = true
                     Task { await setDreams(value) }
                 }
             ),
-            disabled: savingDream
+            disabled: savingDream || appModel.engine.cognitionView.diaryGate == nil
         )
     }
 
@@ -187,12 +183,9 @@ struct SetupFeatureRows<InnerLife: View>: View {
         // ONE call: the two gates move together, and this is the composite
         // write the Dreams page makes.
         let ok = await appModel.setDreamCycleEnabled(value)
-        if ok {
-            // The gate is a composite of two policy fields; read it back the
-            // way the Dreams page does rather than trusting the flip.
-            dreamCycleOn = await appModel.engine.cognitionView.dreamEnabled()
-        } else {
-            dreamCycleOn = !value
+        await appModel.engine.cognitionView.refreshDiary()
+        pendingDream = nil
+        if !ok {
             appModel.systemToasts.push(
                 error: appModel.dreamError ?? "The dream setting could not be saved."
             )
@@ -245,9 +238,9 @@ struct SetupFeatureRows<InnerLife: View>: View {
             detail: meaningMemoryDetail,
             key: "embeddings",
             isOn: Binding(
-                get: { pendingEmbeddings ?? embeddingsOn },
+                get: { pendingEmbeddings ?? embeddingsStatus?.requestedEnabled ?? false },
                 set: { value in
-                    guard !savingEmbeddings, value != embeddingsOn else { return }
+                    guard !savingEmbeddings, value != embeddingsStatus?.requestedEnabled else { return }
                     pendingEmbeddings = value
                 }
             ),
@@ -276,16 +269,9 @@ struct SetupFeatureRows<InnerLife: View>: View {
     @MainActor
     private func setEmbeddings(_ value: Bool) async {
         savingEmbeddings = true
-        embeddingsOn = value
         do {
-            let result = try await MemoryStatusProjection.toggleEmbeddingsBackend(enabled: value, dataRoot: appModel.engine.dataRoot)
-            embeddingsStatus = result.status
-            embeddingsOn = result.status.requestedEnabled
-            if let error = result.error {
-                appModel.systemToasts.push(error: error)
-            }
+            try await appModel.engine.memory.toggleEmbeddings(value)
         } catch {
-            embeddingsOn = !value
             appModel.systemToasts.push(
                 error: UserFacingError.message(error, action: "change how memory is searched")
             )
@@ -296,7 +282,7 @@ struct SetupFeatureRows<InnerLife: View>: View {
     /// The detail line says what is TRUE right now, not what was asked for.
     private var meaningMemoryDetail: String {
         guard let status = embeddingsStatus else {
-            return "Checking how I look things up right now."
+            return appModel.engine.memory.embeddingsError ?? "Checking how I look things up right now."
         }
         if savingEmbeddings {
             return "Re-indexing every memory. This can take a while."
@@ -369,7 +355,7 @@ struct SetupFeatureRows<InnerLife: View>: View {
 
     private var adaptivePromotionRow: some View {
         SetupFeatureSwitchRow(
-            title: "Memories that recur become facts",
+            title: "Recurring memories are proposed as facts",
             detail: "When something keeps coming back, I propose it as a durable fact for you to accept.",
             key: "adaptive_promotion",
             isOn: Binding(
@@ -423,13 +409,11 @@ struct SetupFeatureRows<InnerLife: View>: View {
         // loads it too; this only fills the gap when these rows are mounted
         // before that read lands.
         if appModel.engine.trust.policy == nil {
-            appModel.engine.trust.policy = try? await appModel.engine.trust.load()
+            _ = try? await appModel.engine.trust.load()
         }
         syncFromTrustPolicy()
-        // The dream gate is a COMPOSITE of two policy fields, so it is read
-        // through the one function that owns that math.
-        dreamCycleOn = await appModel.engine.cognitionView.dreamEnabled()
-        await refreshEmbeddings()
+        await appModel.engine.cognitionView.refreshDiary()
+        await appModel.engine.memory.loadEmbeddings()
     }
 
     @MainActor
@@ -439,15 +423,6 @@ struct SetupFeatureRows<InnerLife: View>: View {
         }
         if !savingRem {
             remCycleOn = remEnabledInPolicy
-        }
-    }
-
-    @MainActor
-    private func refreshEmbeddings() async {
-        guard let status = try? await MemoryStatusProjection.embeddingsStatus(dataRoot: appModel.engine.dataRoot) else { return }
-        embeddingsStatus = status
-        if !savingEmbeddings {
-            embeddingsOn = status.requestedEnabled
         }
     }
 

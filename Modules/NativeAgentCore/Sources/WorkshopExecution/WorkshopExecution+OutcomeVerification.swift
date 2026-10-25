@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `WorkshopExecution+OutcomeVerification.swift` | `WorkshopExecutorLoop`: `unmetSuccessCriterion`, `verifyCompletedOutcome` |
 
 extension WorkshopExecutorLoop {
     /// W3 success-criterion check, pure and testable. Returns a human detail
@@ -7,16 +8,15 @@ extension WorkshopExecutorLoop {
     /// when satisfied or when no criterion exists.
     ///
     /// Two criterion sources, both matched by CONTAINMENT against the joined
-    /// step outputs (exact equality would false-fail on quoting/wrapping):
+    /// result content, excluding receipt metadata (exact equality would
+    /// false-fail on quoting/wrapping):
     /// 1. Every non-empty string entry in `expected_outputs`.
     /// 2. An exact-output objective: "Return exactly: <phrase>" (case-
     ///    insensitive marker; phrase runs to the first sentence end).
     static func unmetSuccessCriterion(_ record: WorkshopExecutionRecord) -> String? {
         let combinedOutput = record.stepsCompleted.compactMap { step -> String? in
-            guard case .object(let obj) = step,
-                  case .object(let output)? = obj["output"],
-                  case .string(let text)? = output["text"] else { return nil }
-            return text
+            guard case .object(let obj) = step else { return nil }
+            return textualResultContent(obj["output"] ?? .null)
         }.joined(separator: "\n")
 
         for entry in record.expectedOutputs {
@@ -47,6 +47,20 @@ extension WorkshopExecutorLoop {
             }
         }
         return nil
+    }
+
+    /// Text criteria describe produced content, never paths, status, or other
+    /// receipt fields. An explicitly empty content field stays empty.
+    private static func textualResultContent(_ output: JSONValue) -> String {
+        switch output {
+        case .string(let text): return text
+        case .object(let fields):
+            for key in ["text", "content", "stdout", "reply"] {
+                if case .string(let text)? = fields[key] { return text }
+            }
+            return textualResultContent(fields["output"] ?? .null)
+        default: return ""
+        }
     }
 
     /// Verify only outcomes for which Workshop owns exact local evidence.

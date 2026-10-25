@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `MobileAppSettings.swift` | `MobileAppSetting`: phone projection of Mac settings registry controls and single-value update spellings |
+
 /// One row of the Mac's settings registry as the phone shows it. The Mac
 /// reads and writes every value through the row its own page control uses;
 /// the phone only renders it and sends back one new value at a time.

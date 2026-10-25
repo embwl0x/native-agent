@@ -16,6 +16,8 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+// Blueprint: | `SessionRow.swift` | `SessionRow` and `ChatRenameStateMachine`: session pin/source presentation and one terminal rename result across submit/cancel/focus loss |
+
 /// Shared state transitions for the conversation-row rename editor.
 /// A structural disappearance is always a cancel, and only one terminal event
 /// may escape even when Escape is immediately followed by focus loss.
@@ -250,7 +252,7 @@ struct SessionRow: View {
                 .font(.subheadline.weight(.semibold))
                 .lineLimit(1)
                 .focused($titleFocused)
-                .onSubmit { endRename(renameState.submit(currentTitle: session.title)) }
+                .onSubmit { endRename(renameState.submit(currentTitle: session.displayTitle)) }
                 // COMMIT only on deliberate signals: Enter, or genuine focus
                 // loss (clicking the search field / composer — real focus
                 // targets). Everything structural CANCELS: Esc, clicking
@@ -268,11 +270,11 @@ struct SessionRow: View {
                 .onChange(of: titleFocused) { _, focused in
                     endRename(renameState.focusChanged(
                         isFocused: focused,
-                        currentTitle: session.title
+                        currentTitle: session.displayTitle
                     ))
                 }
                 .onAppear {
-                    renameState.begin(title: session.title)
+                    renameState.begin(title: session.displayTitle)
                     DispatchQueue.main.async { titleFocused = true }
                 }
                 .onDisappear { endRename(renameState.cancel()) }

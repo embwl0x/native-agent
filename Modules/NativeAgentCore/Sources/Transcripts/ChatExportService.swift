@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `ChatExportService.swift` | Snapshot-based Markdown rendering and atomic export write outside the main actor; completion follows the file write |
 
 public protocol ChatExportAttachment {
     var id: String { get }

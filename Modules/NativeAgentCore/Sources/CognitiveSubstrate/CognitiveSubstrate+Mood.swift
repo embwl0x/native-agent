@@ -14,6 +14,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `CognitiveSubstrate+Mood.swift` | `CognitiveSubstrate` mood: read-time emotional-tag integration, disposition, congruence, felt-day summaries and dream-residue claims |
+
 /// The SLOW felt layer: a small persisted valence undertone that only considered
 /// outcomes (reflection; later dreams/settled views) can move, decaying over ~a day.
 /// User's design (2026-07-09): reflections give her feelings a slower-moving floor.
@@ -274,8 +276,10 @@ extension CognitiveSubstrate {
         source: String = "experience",
         // Phase 5 B0: only HER updates are undoable — her reflection and her
         // dream. A view User settled is his, and is never recorded.
-        undoable: Bool = false
+        undoable: Bool = false,
+        reflectionRequest: CognitiveReflectionRequest? = nil
     ) async -> Bool {
+        if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
         guard configuration.enabled, tone != 0 else { return true }
         let previousDisposition = disposition
         let previousDreamNight = dreamDispositionNight
@@ -327,6 +331,7 @@ extension CognitiveSubstrate {
                 // A3 sweep — else a same-day reflection would drop the claim.
                 payload: dispositionArtifactPayload(at: now)
             )
+            if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
             if undoable { await recordUndo(key: "disposition", what: "undertone nudge: \(source)",
                              previous: .object([
                                  "valence": .double(previousDisposition.valence),
@@ -338,6 +343,7 @@ extension CognitiveSubstrate {
             // Phase 5 B0: a later writer already built on this value while the
             // write was suspended; its own write carries it. Roll back only what
             // is still ours.
+            if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
             guard disposition == written else { return false }
             // 2026-09-06: nothing reached disk, so nothing may stay in memory.
             // A retained nudge made a same-process retry believe the night was
@@ -422,6 +428,20 @@ extension CognitiveSubstrate {
         at now: Date,
         dreamId: String? = nil
     ) async -> Bool {
+        let night = dreamResidueKey(for: dreamId, at: now)
+        if let integration = dreamIntegrations[night] { return await integration.value }
+        // Publish the in-flight result before suspending. Seeing a staged
+        // claim is not evidence of durability; duplicate deliveries join both
+        // writes and receive their original success or failure.
+        let integration = Task {
+            await integrateDreamDispositionOnce(tone: tone, at: now, dreamId: dreamId)
+        }
+        dreamIntegrations[night] = integration
+        defer { dreamIntegrations[night] = nil }
+        return await integration.value
+    }
+
+    private func integrateDreamDispositionOnce(tone: Double, at now: Date, dreamId: String?) async -> Bool {
         await waitForMaintenanceTransition()
         // IDEMPOTENT PER NIGHT (2026-09-06). This sink is two writes, and a
         // partial one used to be unrepeatable: a residue failure returned false,
@@ -525,8 +545,10 @@ extension CognitiveSubstrate {
         // minted" for the rest of the process, so a retry reported the night
         // integrated with nothing on disk and no felt node ever ingested.
         guard claimPersisted else {
-            dreamResidueClaimKey = previousClaimKey
-            dreamResidue = previousResidue
+            if dreamResidueClaimKey == key {
+                dreamResidueClaimKey = previousClaimKey
+                dreamResidue = previousResidue
+            }
             return false
         }
         // One felt node for the record: subject "the night", no summary. The id

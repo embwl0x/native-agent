@@ -7,8 +7,8 @@ import SwiftUI
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-import ChatOrchestration
 import TrustCenter
+// Blueprint: | `TrustCenterView.swift` | `TrustCenterView`; confirmation states a normal backup is kept before scope replacement, failure replaces nothing, and previous-life work stays stopped until fresh Resume |
 
 enum TrustFeaturePermissionCard: String, CaseIterable, Identifiable {
     case multimodal
@@ -368,15 +368,11 @@ struct TrustCenterView: View {
                     // the switches. Read-only: it renders no controls.
                     accessAndPolicyPanel
                     TrustGuardrailSummaryPanel(accessMode: appModel.engine.trust.policy.map { accessMode(from: $0) } ?? "auto")
-                    NativeSecurityCenterPanel(
-                        statusReader: { [root = appModel.firstRunDataRoot] limit in
-                            try await SwiftNativeSecurityCenter(dataRoot: root).status(limit: limit)
-                        },
-                        modeTitle: activePreset?.title)
+                    NativeSecurityCenterPanel(modeTitle: activePreset?.title)
                     // A remote agent is never the person: the grant it asks
                     // for is per-peer, and it is the only switch that can raise
                     // an inbound peer off the restricted agent-bridge surface.
-                    AgentPeerTrustView(dataRoot: appModel.firstRunDataRoot)
+                    AgentPeerTrustView()
                 }
 
                 if shows(.features) {
@@ -441,11 +437,12 @@ struct TrustCenterView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .navigationTitle("Trust")
+        .task { await appModel.engine.trust.observeSecurity() }
         .quietReadTask {
             if let policy = appModel.engine.trust.policy {
                 applyPolicy(policy)
             }
-            if shows(.advanced) { await appModel.refreshPrivacyMap() }
+            if shows(.advanced) { await appModel.engine.trust.refreshPrivacyMap() }
         }
         .onChange(of: appModel.engine.trust.policy) { _, newPolicy in
             if let newPolicy {
@@ -500,7 +497,7 @@ struct TrustCenterView: View {
                             defer { isApplyingPolicy = false }
                             do {
                                 let policy = try await SwiftNativeTrustCenter().reauthorizeSafePolicy()
-                                appModel.engine.trust.policy = policy
+                                appModel.engine.trust.publishPolicy(policy)
                                 applyPolicy(policy)
                                 appModel.statusText = "The damaged policy was preserved beside trust/policy.json. Safe is now authorized; choose any further access here."
                             } catch {
@@ -599,7 +596,7 @@ struct TrustCenterView: View {
     }
 
     private var privacyMapPanel: some View {
-        PrivacyMapPanel(privacyMap: appModel.privacyMap)
+        PrivacyMapPanel(privacyMap: appModel.engine.trust.privacyMap)
     }
 
     private var backupsPanel: some View {
@@ -654,7 +651,7 @@ struct TrustCenterView: View {
     private func restoreConfirmationMessage(for backup: BackupRecord) -> String {
         let scopes = backup.scope.isEmpty ? "no recorded scopes" : backup.scope.joined(separator: ", ")
         let created = UserDisplayFormatters.humanizeISOTimestamp(backup.createdAt)
-        return "Reason: \(backup.reason)\nDate: \(created)\nAffected scopes: \(scopes)\n\nCurrent data in those scopes will be overwritten. NativeAgent will create a pre-restore safety backup before changing current data."
+        return "Reason: \(backup.reason)\nDate: \(created)\nAffected scopes: \(scopes)\n\nNativeAgent will first keep a normal backup of current data before replacing these scopes. If that backup cannot be written, nothing will be replaced. Only selected readable current data needed for continuity will be carried forward. Work from the previous life stays stopped; Resume starts it fresh."
     }
 
     private func beginRestore(_ backup: BackupRecord) {
@@ -692,7 +689,7 @@ struct TrustCenterView: View {
     }
 
     private func cancelPendingFullMacPolicy() {
-        TrustPolicyPresetTransition.cancelConfirmation(isPresented: &showFullMacAlert)
+        showFullMacAlert = false
     }
 
     private func applyTrustPreset(_ preset: TrustPolicyPreset) {
@@ -833,22 +830,6 @@ private struct PrivacyMapPanelCategoryRow: View {
     }
 }
 
-enum TrustPolicyPresetTransition: Equatable {
-    case apply(TrustPolicyPresetPlan)
-    case confirmationRequired(TrustPolicyPresetPlan)
-
-    static func cancelConfirmation(isPresented: inout Bool) {
-        isPresented = false
-    }
-
-    static func request(_ preset: TrustPolicyPreset) -> Self {
-        let plan = preset.plan
-        return plan.requiresFullMacConfirmation
-            ? .confirmationRequired(plan)
-            : .apply(plan)
-    }
-}
-
 /// One authoritative preset action for Trust's visible buttons. The action
 /// owns the whole preset write — every axis in ONE patch — and refuses to
 /// enter Full Mac without the explicit confirmation transition.
@@ -974,8 +955,6 @@ struct TrustFold<Label: View, Trailing: View, Content: View>: View {
     @ViewBuilder var trailing: Trailing
     @ViewBuilder var content: Content
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
     var body: some View {
         // The Mac's own disclosure (User 09-27: all controls native).
         DisclosureGroup(isExpanded: $isExpanded) {
@@ -1011,15 +990,12 @@ extension TrustFold where Trailing == EmptyView {
 /// it asks is not "is this peer configured" but "does this peer get to act as
 /// me", and that is the question Trust Center exists to answer.
 struct AgentPeerTrustView: View {
-    let dataRoot: URL
-    @State private var rows: [AgentContactRow] = []
-    @State private var readFailure: String?
+    @Environment(AppModel.self) private var appModel
     @State private var failure: String?
-    /// Until the first read lands, "no agents" would be a guess.
-    @State private var loaded = false
-    /// Reads can finish out of order; only the newest one applies.
-    @State private var reloadGeneration = 0
-
+    private var contacts: ContactListFacade { appModel.engine.contacts }
+    private var rows: [AgentContactRow] { contacts.doors.filter { $0.contact != nil } }
+    private var readFailure: String? { contacts.loadError }
+    private var dataRoot: URL { appModel.engine.dataRoot }
     private var store: AgentPeerStore { AgentPeerStore(dataRoot: dataRoot) }
 
     var body: some View {
@@ -1029,7 +1005,7 @@ struct AgentPeerTrustView: View {
                 .font(ShellType.rowDetail)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            if loaded && rows.isEmpty && readFailure == nil {
+            if contacts.loaded && rows.isEmpty && readFailure == nil {
                 Text("No agents are connected.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
@@ -1065,7 +1041,7 @@ struct AgentPeerTrustView: View {
                 }
             }
             if let readFailure {
-                AgentContactReadFailure(message: readFailure, dataRoot: dataRoot) { Task { await reload() } }
+                AgentContactReadFailure(message: readFailure, dataRoot: dataRoot) { Task { _ = try? await contacts.refresh() } }
             }
             if let failure {
                 Text(failure)
@@ -1074,32 +1050,7 @@ struct AgentPeerTrustView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        // The first file event is the appear read; Dot's readiness is asked
-        // once, after it, when Dot is one of the peers.
-        .task {
-            let events = FileChangeEvents(paths: [store.fileURL,
-                dataRoot.appendingPathComponent("agents/conversations.json"), AgentLocalHealth.url(dataRoot),
-                InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot).appendingPathComponent("claude-bridge/claude-live"),
-                dataRoot.appendingPathComponent("chat/sessions.json")], emitInitial: true)
-            var askedDot = false
-            await withTaskCancellationHandler {
-                for await _ in events.stream {
-                    if Task.isCancelled { break }
-                    await reload()
-                    if !askedDot, rows.contains(where: { $0.contact.map(ChatGPTDotIPCTransport.owns) == true }) {
-                        askedDot = true
-                        let root = dataRoot
-                        await Task.detached(priority: .userInitiated) {
-                            _ = await SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false).chatGPTDotReadiness()
-                        }.value
-                        await reload()
-                    }
-                }
-            } onCancel: { events.cancel() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: ChatGPTDotIPCTransport.didChange)) { _ in
-            Task { await reload() }
-        }
+        .task { contacts.watch() }
     }
 
     private func binding(for peer: AgentPeerContact) -> Binding<Bool> {
@@ -1112,27 +1063,9 @@ struct AgentPeerTrustView: View {
                 } catch {
                     failure = UserFacingError.message(error, action: "save that change")
                 }
-                Task { await reload() }
+                Task { _ = try? await contacts.refresh() }
             }
         )
     }
 
-    /// peers.json is read under its lock: off the main actor.
-    private func reload() async {
-        let root = dataRoot
-        reloadGeneration += 1
-        let generation = reloadGeneration
-        let read = await Task.detached(priority: .userInitiated) {
-            await AgentContactRow.read(dataRoot: root, everyDoor: true)
-        }.value
-        guard generation == reloadGeneration else { return }
-        switch read {
-        case .success(let list):
-            rows = list.filter { $0.contact != nil }
-            readFailure = nil
-        case .failure(let error):
-            readFailure = error.localizedDescription
-        }
-        loaded = true
-    }
 }

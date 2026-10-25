@@ -8,6 +8,7 @@ import PersistenceCore
 import ScreenCaptureKit
 import Senses
 import Synchronization
+// Blueprint: | `MacScreenWatch.swift` | One exact-window ScreenCaptureKit stream per part run, generation-bound frame queries and physical hands; person-only windows refused, secret fields inspected every 500 ms and painted out, incomplete inspection ends with an owned failure. Inspection work is retained; success and failure commit only while active, so expiry cancellation cannot cut admitted settlement short or create repair debt. Authority is checked at next/read/hand; window identity at each event. Terminal errors retain their cause; outside an enclosing act Experiences owns repair until an inspected frame from the same window/region arrives or it is let go. Duration stops capture and closes admission immediately; an admitted frame read or hand has up to 10s (the maximum hand duration) to settle before the retained frame and held input retire. Non-cooperative work retains its local frame until actual exit and cannot publish after retirement. Stop, window loss/resize, revocation, part change and takeover retire immediately. |
 
 /// A part's eyes on one window for one run: one ScreenCaptureKit stream of
 /// that window's own pixels, its newest frame and the one before copied into
@@ -93,6 +94,8 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     private let lock = NSLock()
     private var stream: SCStream?
     private var tasks: [Task<Void, Never>] = []
+    private var inspectionTask: Task<Void, Never>?
+    private var settlementTask: Task<Void, Never>?
     private var newest: Frame?
     private var sequence = 0
     private var delivered = 0
@@ -109,12 +112,14 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     /// Bumped whenever the secret fields change: a frame painted under older
     /// verdicts is never kept or published.
     private var verdict = 0
-    private var waiter: CheckedContinuation<Void, Never>?
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var ended: String?
     private var failure: SenseFailure?
-    /// The watch's own time is up: the part's next `screen.next()` ends it, so
-    /// the frame and hand already in progress finish. Every other end is at once.
+    /// Duration closes capture and admission immediately. A read or hand already
+    /// admitted has at most the maximum hand duration (10s) to settle. It then
+    /// drops the retained frame and releases held input. Every other end is at once.
     private var spent = false
+    private var operations = 0
 
     /// How often the secret fields are read again while frames change: one
     /// whole-window AX walk, the desktop picture's index, costs tens to a few
@@ -184,12 +189,28 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         let binding = verbs == nil ? nil : await MacAttentionSessionStore.shared.bindDriver()
         let watch = MacScreenWatch(app: app, dataRoot: dataRoot, pid: pid, window: window, region: region, width: configuration.width,
                                    height: configuration.height, sighting: sighting, verbs: verbs, authority: authority, binding: binding)
-        let stream = SCStream(filter: filter, configuration: configuration, delegate: watch)
+        nonisolated(unsafe) let stream = SCStream(filter: filter, configuration: configuration, delegate: watch)
         do {
             try stream.addStreamOutput(watch, type: .screen, sampleHandlerQueue: watch.queue)
             watch.lock.withLock { watch.stream = stream }
-            try await stream.startCapture()
+            try await withTaskCancellationHandler {
+                let _: Bool = try await macScreenCaptureWait { request in
+                    stream.startCapture { error in
+                        // Cancellation may have retired the stream before its
+                        // asynchronous start completed. Retire that late start too.
+                        if watch.lock.withLock({ watch.ended != nil }) { stream.stopCapture { _ in } }
+                        request.receive(true, error)
+                    }
+                }
+            } onCancel: { watch.end("cancelled") }
+            try Task.checkCancellation()
+            guard watch.lock.withLock({ watch.ended == nil }) else {
+                // A delegate failure can end the watch while startCapture suspends.
+                stream.stopCapture { _ in }
+                throw watch.over ?? CancellationError()
+            }
         } catch {
+            if error is CancellationError { watch.end("cancelled"); throw error }
             watch.end("capture_failed")
             throw watch.captureFailure("SCStream.startCapture", error.localizedDescription)
         }
@@ -252,7 +273,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     // MARK: Frames
 
     public func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen,
+        guard lock.withLock({ ended == nil && !spent }), type == .screen,
               let info = (CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first,
               let raw = info[.status] as? Int, let status = SCFrameStatus(rawValue: raw) else { return }
         if status == .stopped { end("window_gone"); return }
@@ -273,7 +294,12 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
             if due { inspecting = true; inspected = now }
             return (self.secrets, verdict, due)
         }
-        if inspect { Task.detached { [weak self] in self?.inspect(window: window) } }
+        if inspect {
+            lock.withLock {
+                guard ended == nil, !spent else { return }
+                inspectionTask = Task.detached { [weak self] in self?.inspect(window: window) }
+            }
+        }
         guard let secrets else { return }
         let geometry = MacScreenViewGeometry(bounds: region, pixelWidth: width, pixelHeight: height)
         let masks = secrets.compactMap { geometry.placement(mark: 0, frame: $0) }
@@ -285,18 +311,19 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
                 }
             }
         }
-        let waiting = lock.withLock { () -> CheckedContinuation<Void, Never>? in
-            guard ended == nil, painted == verdict else { return nil }
+        let waiting = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard ended == nil, !spent, painted == verdict else { return [] }
             sequence += 1
             newest = Frame(seq: sequence, at: Int((now - started) * 1000), screen: place(window),
                            pixels: pixels, prior: newest?.pixels)
-            defer { waiter = nil }
-            return waiter
+            defer { waiters.removeAll() }
+            return Array(waiters.values)
         }
-        waiting?.resume()
+        waiting.forEach { $0.resume() }
     }
 
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
+        guard lock.withLock({ ended == nil && !spent }) else { return }
         end("capture_failed", failure: captureFailure("SCStream", error.localizedDescription))
     }
 
@@ -311,6 +338,8 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     /// cannot be placed, or a root that is not this window's alone leaves the
     /// window uninspected.
     private func inspect(window frame: MacAXFrame) {
+        defer { lock.withLock { inspectionTask = nil; inspecting = false } }
+        guard lock.withLock({ ended == nil && !spent }), !Task.isCancelled else { return }
         let source = defaultMacAXElementSource(), deadline = Date().addingTimeInterval(Self.inspectionBudget)
         func near(_ a: MacAXFrame) -> Bool {
             abs(a.x - frame.x) <= 2 && abs(a.y - frame.y) <= 2 && abs(a.w - frame.w) <= 2 && abs(a.h - frame.h) <= 2
@@ -341,7 +370,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
             return
         }
         lock.withLock {
-            inspecting = false
+            guard ended == nil, !spent, !Task.isCancelled else { return }
             inspectedSuccessfully = true
             guard fields != secrets else { return }
             // Pixels painted under the old verdicts go with them.
@@ -354,7 +383,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     private func allowed() async -> Bool {
         guard lock.withLock({ ended == nil }) else { return false }
         guard await authority() else { end("authority_revoked"); return false }
-        return true
+        return lock.withLock { ended == nil } && !Task.isCancelled
     }
 
     /// The newest frame not yet handed out, as soon as there is one (frames
@@ -362,6 +391,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     /// `timeout`, `{timedOut: true}` when that many seconds pass without one.
     /// Null once the watch has ended.
     public func next(timeout: Double?) async throws -> JSONValue {
+        let id = UUID()
         let deadline = timeout.map { ContinuousClock.now.advanced(by: .seconds(max(0, $0))) }
         let timer = deadline.map { deadline in Task { [weak self] in
             guard (try? await Task.sleep(until: deadline, clock: .continuous)) != nil else { return }
@@ -371,10 +401,11 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         while true {
             try Task.checkCancellation()
             if let failure = lock.withLock({ failure }) { throw failure }
-            if lock.withLock({ spent }) { end("budget_spent"); return .null }
+            if lock.withLock({ spent }) { return .null }
             _ = await allowed()
+            try Task.checkCancellation()
             let answer = lock.withLock { () -> JSONValue? in
-                if ended != nil { return .null }
+                if ended != nil || spent { return .null }
                 if let frame = newest, frame.seq > delivered {
                     delivered = frame.seq; seen += 1
                     return .object(["watch": .int(Int64(generation)), "seq": .int(Int64(frame.seq)), "at": .int(Int64(frame.at)),
@@ -404,7 +435,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
                     let now = lock.withLock { () -> Bool in
                         guard ended == nil, !spent, (newest?.seq ?? 0) <= delivered, !Task.isCancelled,
                               deadline.map({ ContinuousClock.now < $0 }) ?? true else { return true }
-                        waiter = continuation
+                        waiters[id] = continuation
                         return false
                     }
                     if now { continuation.resume() }
@@ -414,12 +445,47 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     }
 
     fileprivate func spend() {
-        lock.withLock { spent = true }
+        let (capture, idle) = lock.withLock { () -> (SCStream?, Bool) in
+            guard ended == nil, !spent else { return (nil, false) }
+            spent = true
+            let capture = stream
+            stream = nil
+            inspectionTask?.cancel()
+            if operations > 0 {
+                // One cleanup deadline, cancelled on actual settlement. A
+                // non-cooperative read keeps only its local frame until exit;
+                // it cannot publish after this deadline retires the watch.
+                settlementTask = Task { [weak self] in
+                    guard (try? await Task.sleep(for: .seconds(10))) != nil else { return }
+                    self?.end("budget_spent")
+                }
+            }
+            return (capture, operations == 0)
+        }
+        capture?.stopCapture { _ in }
+        if idle { end("budget_spent") }
         wake()
     }
 
     private func wake() {
-        lock.withLock { () -> CheckedContinuation<Void, Never>? in defer { waiter = nil }; return waiter }?.resume()
+        let waiting = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            defer { waiters.removeAll() }
+            return Array(waiters.values)
+        }
+        waiting.forEach { $0.resume() }
+    }
+
+    private func admitOperation() -> Bool {
+        lock.withLock {
+            guard ended == nil, !spent, !Task.isCancelled else { return false }
+            operations += 1
+            return true
+        }
+    }
+
+    private func finishOperation() {
+        let retire = lock.withLock { operations -= 1; return spent && operations == 0 }
+        if retire { end("budget_spent") }
     }
 
     /// Native answers about the newest frame, in its pixels: `{at:[x,y]}` its
@@ -429,6 +495,8 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     /// on device and redacted as one picture. A frame a newer one replaced, or
     /// of another watch, has expired; it is never answered by a newer one.
     public func read(watch: Int, seq: Int, queries: [JSONValue]) async throws -> JSONValue {
+        guard admitOperation() else { throw over ?? CancellationError() }
+        defer { finishOperation() }
         func bad() -> SenseFailure {
             SenseFailure(code: "bad_input", message: "frame.read takes 1 to 1024 queries, each {at:[x,y]}, {mean:[x,y,w,h]}, {changed:[x,y,w,h]} or {text:[x,y,w,h]}, in this frame's pixels.")
         }
@@ -439,6 +507,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         guard (1...1024).contains(queries.count) else { throw bad() }
         var answers: [JSONValue] = [], recognized: [JSONValue]?
         for query in queries {
+            try Task.checkCancellation()
             guard case .object(let fields) = query, fields.count == 1, let (kind, value) = fields.first,
                   case .array(let raw) = value, case let n = raw.compactMap({ Self.number($0).flatMap { abs($0) < 1e9 ? Int($0.rounded(.down)) : nil } }),
                   n.count == raw.count else { throw bad() }
@@ -499,6 +568,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         }
         // Answered only while the watch is open and the secret fields it was
         // painted under still stand; a newer frame arriving meanwhile is fine.
+        try Task.checkCancellation()
         guard lock.withLock({ () -> Bool in
             guard ended == nil, verdict == painted else { return false }
             self.queries += queries.count
@@ -517,6 +587,8 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     /// password fields, the watched window its app's front window at every
     /// event, the person's input never overridden.
     public func hand(_ verb: String, _ args: [String: JSONValue]) async throws -> JSONValue {
+        guard admitOperation() else { throw over ?? CancellationError() }
+        defer { finishOperation() }
         guard let verbs, let binding else {
             throw SenseFailure(code: "undeclared", message: "Declare reach hands to use hand.\(verb).")
         }
@@ -532,6 +604,8 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
             return point
         }
         let four = try await verbs()
+        try Task.checkCancellation()
+        guard lock.withLock({ ended == nil }) else { throw over ?? CancellationError() }
         let reply: MacFourVerbsReply
         var landed: JSONValue = .null
         switch verb {
@@ -587,7 +661,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     /// Why no hand goes out any more, once the watch has ended.
     private var over: SenseFailure? {
         if let failure = lock.withLock({ failure }) { return failure }
-        return lock.withLock { ended }.map { reason in
+        return lock.withLock { ended ?? (spent ? "budget_spent" : nil) }.map { reason in
             reason == "taken_over" ? SenseFailure(code: "taken_over", message: "The person took over; nothing more was sent.")
                 : SenseFailure(code: "watch_ended", message: "The watch ended (\(reason)); call screen.watch again.")
         }
@@ -599,12 +673,15 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     /// frames are dropped with every handle to them, held keys and buttons
     /// are released, and a waiting `next` answers null.
     public func end(_ reason: String, failure: SenseFailure? = nil) {
-        let ending = lock.withLock { () -> (stream: SCStream?, waiter: CheckedContinuation<Void, Never>?, tasks: [Task<Void, Never>])? in
+        let ending = lock.withLock { () -> (stream: SCStream?, waiters: [CheckedContinuation<Void, Never>], tasks: [Task<Void, Never>])? in
             guard ended == nil else { return nil }
+            // An inspection failure belongs only to an active watch. Decide
+            // under the retirement lock so expiry preserves admitted settlement.
+            guard reason != "window_uninspected" || (!spent && !Task.isCancelled) else { return nil }
             ended = reason
             self.failure = failure
-            defer { stream = nil; waiter = nil; tasks = []; newest = nil }
-            return (stream, waiter, tasks)
+            defer { stream = nil; waiters.removeAll(); tasks = []; inspectionTask = nil; settlementTask = nil; newest = nil }
+            return (stream, Array(waiters.values), tasks + [inspectionTask, settlementTask].compactMap { $0 })
         }
         guard let ending else { return }
         if enclosingAct == nil, let failure, case .object(let remedy)? = failure.remedy,
@@ -616,7 +693,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         ending.stream?.stopCapture { _ in }
         binding?.cancel()
         ending.tasks.forEach { $0.cancel() }
-        ending.waiter?.resume()
+        ending.waiters.forEach { $0.resume() }
     }
 
     /// The watch's one receipt: frames seen and skipped, queries, hands, how it ended.

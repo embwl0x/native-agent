@@ -2,6 +2,7 @@ import AuthoredCapabilities
 import Foundation
 @preconcurrency import EventKit
 import PersistenceCore
+// Blueprint: | `LocalPIMConnectorActions+Authorization.swift` | calendar read/write authorization interpretation and EventKit permission prompts; wizard status |
 
 extension LocalPIMConnectorActions {
     public enum CalendarAuthorizationAction: Equatable {

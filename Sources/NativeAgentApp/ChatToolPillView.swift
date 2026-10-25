@@ -1,10 +1,11 @@
 import SwiftUI
 import ToolRegistry
 import Foundation
-import ChatOrchestration
+import ChatToolParsing
 import ChatSessionWork
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `ChatToolPillView.swift` | `ToolPillPresentation` struct; retained metadata projection, `outcome`, `title` |
 
 private extension JSONValue {
     var stringValue: String? {
@@ -37,7 +38,9 @@ struct ToolPillPresentation: Sendable {
         let result = meta?.resultSummary.flatMap { try? JSONValue.parse(Data($0.utf8)) }
         title = Self.title(call.name)
         target = Self.boundedLine(Self.target(input), limit: 180)
-        outcome = ChatToolOutcome.displayOutcome(result: result, ok: meta?.ok, hasResult: meta?.resultSummary != nil)
+        outcome = ChatToolOutcome.projection(kind: meta?.kind, ok: meta?.ok,
+            resultSummary: meta?.resultSummary, resultStatus: meta?.resultStatus,
+            interactionState: meta?.interactionState).outcome
         summary = Self.boundedLine(ChatToolOutcome.displaySummary(outcome: outcome, input: input, result: result), limit: 240)
         durationText = Self.durationText(meta?.durationMs)
         fields = revision.expanded ? Self.fieldLines(input) + Self.fieldLines(result) : []
@@ -253,6 +256,7 @@ extension ChatToolOutcome.DisplayOutcome {
         case .connectionFailed: "exclamationmark.triangle"
         case .unknown: "questionmark.circle"
         case .needsYou: "person.crop.circle.badge.questionmark"
+        case .asked: "checkmark.bubble"
         }
     }
 }

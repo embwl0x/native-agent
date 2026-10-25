@@ -74,7 +74,7 @@ private struct MobileWorkOverviewDetail: View {
     @StateObject private var inbox = InboxStore()
     @State private var deskError: String?
     @State private var group: InboxRelatedGroup?
-    @State private var inboxDetail: InboxItemRecord?
+    @State private var inboxDetailID: String?
 
     var body: some View {
         Group {
@@ -119,7 +119,7 @@ private struct MobileWorkOverviewDetail: View {
                             InboxCardRow(item: item, onAction: { action in
                                 Task { await inbox.performAction(id: item.id, actionID: action,
                                     client: bridgeClient, pairingStore: pairingStore) }
-                            }, onView: { inboxDetail = item })
+                            }, onView: { inboxDetailID = item.id })
                             .padding()
                             if let error = inbox.bannerError { Text(error).foregroundStyle(.red).padding() }
                         }
@@ -158,21 +158,21 @@ private struct MobileWorkOverviewDetail: View {
                 }
             }
         }
-        .sheet(item: $inboxDetail) { item in
-            InboxDetailSheet(item: item, allItems: inbox.items,
-                onOpenGroup: { group = $0 }, onDone: { inboxDetail = nil })
+        .sheet(isPresented: Binding(get: { inboxDetailID != nil }, set: { if !$0 { inboxDetailID = nil } })) {
+            if let id = inboxDetailID {
+            InboxDetailSheet(itemID: id,
+                onOpenGroup: { group = $0 }, onDone: { inboxDetailID = nil })
                 .sheet(item: $group) { group in
                     InboxView(initialGroup: group).environmentObject(inbox)
                 }
+            }
         }
         .task {
             if row.reference.kind == .approval { await sync.refreshApprovalsSnapshot() }
             approvals.applySyncedApprovalsFromSnapshot(animated: false, notifyNewPending: false)
-            workshop.applySyncedTasks(sync.workshopTasks)
             inbox.applySyncedInboxFromSnapshot(animated: false, notifyNewArrivals: false)
         }
         .onChange(of: sync.approvals) { approvals.applySyncedApprovalsFromSnapshot(animated: false, notifyNewPending: false) }
-        .onChange(of: sync.workshopTasks) { workshop.applySyncedTasks(sync.workshopTasks) }
         .onChange(of: sync.inboxItems) { inbox.applySyncedInboxFromSnapshot(animated: false, notifyNewArrivals: false) }
     }
 

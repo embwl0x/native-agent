@@ -2,6 +2,7 @@ import SwiftUI
 import WebKit
 import Senses
 import PersistenceCore
+// Blueprint: | `WorkPaneSenseView.swift` | `WorkPaneSenseView`; separate offline script-enabled WebKit host, one version-bound sense event channel |
 
 /// A separate WebKit host, never the browser or Make host. Its only channel
 /// is pinned to the presenting sense version and cannot invoke door actions.

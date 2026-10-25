@@ -18,6 +18,8 @@ import CloudKit
 import DeviceSync
 #endif
 
+// Blueprint: | `MemoryView.swift` | Memory page upkeep/status components: canonical consolidate/hygiene/Spotlight actions, full text and explicit storage/embedder availability |
+
 @MainActor
 @Observable
 final class MemoryMenuActionController {
@@ -52,9 +54,7 @@ struct MemoryUpkeepPanel: View {
     @Environment(AppModel.self) private var appModel
     @State private var menuActionController = MemoryMenuActionController()
     @State private var spotlightStatus: String?
-    @State private var cloudKitStatus: String = "checking…"
     @State private var isReindexing = false
-    @State private var nativeStack: MemoryV2NativeStackSnapshot = .empty
     @State private var isRefreshing = false
     @State private var refreshNotice: MemoryToolbarRefreshPresentation?
 
@@ -97,28 +97,17 @@ struct MemoryUpkeepPanel: View {
             // One memory status block; its Advanced diagnostics fold keeps
             // every backend row, the data root and the Spotlight reindex.
             MemoryV2NativeStackPanel(
-                snapshot: nativeStack,
-                cloudKitStatus: cloudKitStatus,
-                summaryStatus: appModel.memoryV2Status,
+                snapshot: appModel.engine.memory.diagnostics,
+                summaryStatus: appModel.engine.memory.status,
                 latestHygiene: appModel.latestMemoryHygiene,
                 isReindexing: isReindexing,
                 onReindex: { Task { await reindexSpotlight() } }
             )
         }
-        .task { await refreshCloudKitStatus() }
         // Fast mode warms MiniLM at process launch. Follow that one startup
         // attempt for at most ten seconds and read only runtime state; the
         // full memory/Spotlight snapshot is intentionally not rescanned.
-        .task {
-            await refreshNativeStack()
-            for _ in 0..<10 where nativeStack.shouldPollEmbeddingStartup {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if Task.isCancelled { return }
-                var snapshot = nativeStack
-                await snapshot.refreshEmbeddingRuntime()
-                nativeStack = snapshot
-            }
-        }
+        .task { await appModel.engine.memory.refreshEmbeddingDiagnostics() }
     }
 
     /// Every result line the upkeep has to say, in the order it happened.
@@ -133,18 +122,14 @@ struct MemoryUpkeepPanel: View {
         if let refreshNotice {
             lines.append((refreshNotice.text, refreshNotice.isAdverse))
         }
+        if appModel.engine.memory.statusRefresh?.isStale == true {
+            lines.append((MemoryToolbarRefreshPresentation.resolve(staleNotice: nil, storageReadable: false).text, true))
+        }
         // F2: a disabled hygiene / consolidate says so instead of a fake success.
         if let disabled = appModel.memoryFeatureDisabledMessage, !disabled.isEmpty {
             lines.append((disabled, true))
         }
         return lines
-    }
-
-    @MainActor
-    private func refreshNativeStack() async {
-        nativeStack = await MemoryV2NativeStackSnapshot.load(
-            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
     }
 
     /// The list/proposal/status reader, the native status snapshot, and the
@@ -154,13 +139,12 @@ struct MemoryUpkeepPanel: View {
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
-        let refreshed = await MemoryToolbarRefreshOperation.run(
-            appModel: appModel,
-            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        await appModel.refreshForSidebarItem(.memories)
+        await appModel.engine.memory.refreshDiagnostics()
+        refreshNotice = MemoryToolbarRefreshPresentation.resolve(
+            staleNotice: appModel.panelStaleNotice(for: .memories),
+            storageReadable: appModel.engine.memory.diagnostics.storageReadable
         )
-        nativeStack = refreshed.nativeStack
-        await refreshCloudKitStatus()
-        refreshNotice = refreshed.presentation
     }
 
     @MainActor
@@ -172,12 +156,7 @@ struct MemoryUpkeepPanel: View {
         spotlightStatus = outcome.userMessage
         // The status line and count must be read after the durable result, not
         // retained from before a delete-and-rebuild attempt.
-        await refreshNativeStack()
-    }
-
-    @MainActor
-    private func refreshCloudKitStatus() async {
-        cloudKitStatus = await nativeAgentCloudKitAccountStatus(label: "MemoryUpkeepPanel.refreshCloudKitStatus")
+        await appModel.engine.memory.refreshDiagnostics()
     }
 
     static func localTimestamp(_ iso: String) -> String {
@@ -253,28 +232,6 @@ struct MemoryToolbarRefreshPresentation: Equatable {
             text: "Memory refreshed.",
             systemImage: "arrow.clockwise",
             isAdverse: false
-        )
-    }
-}
-
-/// The state-bearing core of the memory upkeep's Check again action. Keeping it
-/// separate from the SwiftUI closure makes the mounted control's real reads
-/// executable with an injected data root, without inventing an in-memory
-/// substitute for the MemoryV2 store.
-@MainActor
-struct MemoryToolbarRefreshOperation {
-    let nativeStack: MemoryV2NativeStackSnapshot
-    let presentation: MemoryToolbarRefreshPresentation
-
-    static func run(appModel: AppModel, dataRoot: URL) async -> Self {
-        await appModel.refreshForSidebarItem(.memories)
-        let nativeStack = await MemoryV2NativeStackSnapshot.load(dataRoot: dataRoot)
-        return Self(
-            nativeStack: nativeStack,
-            presentation: MemoryToolbarRefreshPresentation.resolve(
-                staleNotice: appModel.panelStaleNotice(for: .memories),
-                storageReadable: nativeStack.storageReadable
-            )
         )
     }
 }
@@ -526,7 +483,6 @@ enum MemoryStatusPlainCopy {
 
 private struct MemoryV2NativeStackPanel: View {
     let snapshot: MemoryV2NativeStackSnapshot
-    let cloudKitStatus: String
     // 2026-07-23 B2.5b: summary counts/backend/hygiene folded in from the
     // former standalone MemoryV2SummaryBar so this panel is the ONE Memory
     // status block. Optional so the panel still renders on a fresh install.
@@ -692,11 +648,9 @@ private struct MemoryV2NativeStackPanel: View {
                 stackRow(
                     icon: "icloud",
                     title: "CloudKit",
-                    value: cloudKitStatus,
-                    detail: snapshot.cloudKitAccountStatus == cloudKitStatus
-                        ? "account check"
-                        : "account: \(snapshot.cloudKitAccountStatus)",
-                    tint: cloudKitStatus == UserFacingError.iCloudSignedIn ? .green : .secondary
+                    value: snapshot.cloudKitAccountStatus,
+                    detail: "account check",
+                    tint: snapshot.cloudKitAccountStatus == UserFacingError.iCloudSignedIn ? .green : .secondary
                 )
             }
             // UI-5: the long-term memory profile's real filename lives here,

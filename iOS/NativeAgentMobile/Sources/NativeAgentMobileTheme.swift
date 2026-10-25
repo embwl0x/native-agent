@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+// Blueprint: | `NativeAgentMobileTheme.swift` | `NativeAgentMobileTheme` enum |
 
 extension Color {
     init(hex: UInt, opacity: Double = 1) {

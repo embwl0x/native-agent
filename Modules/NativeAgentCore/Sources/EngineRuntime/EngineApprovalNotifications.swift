@@ -7,6 +7,7 @@ import NotificationInbox
 import PersistenceCore
 import Privacy
 import TelegramBot
+// Blueprint: | `EngineApprovalNotifications.swift` | `ApprovalNotificationDelivery`: approval discovery, pending-state selection and notification delivery coordination |
 
 /// Approval discovery state belongs to the engine; the app supplies native
 /// observation events and transport effects.
@@ -72,10 +73,7 @@ public final class ApprovalNotificationDelivery {
             }
             if filed || retired > 0 {
                 do {
-                    let latest = try await engine.inbox.list()
-                    if engine.inbox.items != latest {
-                        engine.inbox.items = latest
-                    }
+                    _ = try await engine.inbox.list()
                 } catch {
                     nativeLog("[approval-notification] inbox refresh failed: %@", error.localizedDescription)
                 }

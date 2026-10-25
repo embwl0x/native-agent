@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `CognitiveSubstrate+CaringEvent.swift` | `CognitiveSubstrate` caring event admission: turn context, semantic verdict delivery and distinct encounter/refusal accounting |
+
 // CARING EVENTS, APPRAISED BY THE ONLY OWNER THAT CAN (2026-09-11, second pass).
 //
 // The organism feels tenderness but runs no appraisal; the appraisal lives here.

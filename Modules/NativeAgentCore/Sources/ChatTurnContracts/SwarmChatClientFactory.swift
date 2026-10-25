@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import TurnTrace
+// Blueprint: | `SwarmChatClientFactory.swift` | `SwarmChatClientFactory` protocol; `makeClient` |
 
 /// The ordinary chat client behind an inherited swarm worker.
 public protocol SwarmChatClient: Sendable {

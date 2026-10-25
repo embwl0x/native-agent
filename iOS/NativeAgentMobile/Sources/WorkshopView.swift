@@ -2,6 +2,7 @@
 import SwiftUI
 import UserNotifications
 import NativeAgentShared
+// Blueprint: | `WorkshopView.swift` | Shared task rows, engine-projected actionable approval state and ID-resolved details; local submission/loading state |
 
 // MARK: - WorkshopView (full parity)
 
@@ -12,9 +13,8 @@ import NativeAgentShared
 struct WorkshopView: View {
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @StateObject private var store = WorkshopStore()
-    private let sync = iCloudSyncEngine.shared
     @State private var showNewWorkshopTask = false
-    @State private var selectedWorkshopTask: WorkshopTaskRecord?
+    @State private var selectedWorkshopTaskID: String?
     @State private var notifiedTaskUnavailable = false
     @State private var didResolveNotifiedTask = false
     private let notifiedTaskID: String?
@@ -84,26 +84,26 @@ struct WorkshopView: View {
         .macSyncErrorBanner()
         .refreshable { await store.refresh() }
         .task {
-            if let sample = MobileDeskSample.tasks, store.tasks.isEmpty {
-                store.applySyncedTasks(sample)
-                if MobileDeskSample.mode == "taskdetail" { selectedWorkshopTask = sample.first }
+            if let sample = MobileDeskSample.tasks {
+                if MobileDeskSample.mode == "taskdetail" { selectedWorkshopTaskID = sample.first?.id }
                 if MobileDeskSample.mode == "tasknew" { showNewWorkshopTask = true }
                 return
             }
             await store.refresh()
             guard !Task.isCancelled, !didResolveNotifiedTask, let notifiedTaskID else { return }
             didResolveNotifiedTask = true
-            selectedWorkshopTask = store.tasks.first { $0.id == notifiedTaskID }
-            notifiedTaskUnavailable = selectedWorkshopTask == nil
-        }
-        .onChange(of: sync.workshopTasks) { _, tasks in
-            store.applySyncedTasks(tasks)
+            selectedWorkshopTaskID = notifiedTaskID
+            notifiedTaskUnavailable = !store.tasks.contains { $0.id == notifiedTaskID }
         }
         .sheet(isPresented: $showNewWorkshopTask) {
             NewWorkshopTaskSheet(store: store)
         }
-        .sheet(item: $selectedWorkshopTask) { task in
-            WorkshopTaskDetailSheet(task: task, store: store)
+        .sheet(isPresented: Binding(get: { selectedWorkshopTaskID != nil }, set: { if !$0 { selectedWorkshopTaskID = nil } })) {
+            if let task = store.tasks.first(where: { $0.id == selectedWorkshopTaskID }) {
+                WorkshopTaskDetailSheet(task: task, store: store)
+            } else {
+                MobileDeskTaskUnavailableNotice()
+            }
         }
     }
 
@@ -214,7 +214,7 @@ struct WorkshopView: View {
         _ task: WorkshopTaskRecord, @ViewBuilder label: () -> Label
     ) -> some View {
         Button {
-            selectedWorkshopTask = task
+            selectedWorkshopTaskID = task.id
         } label: {
             label().contentShape(Rectangle())
         }
@@ -259,7 +259,7 @@ enum WorkshopContentPresentation: Equatable {
 
 @MainActor
 final class WorkshopStore: ObservableObject {
-    @Published var tasks: [WorkshopTaskRecord] = []
+    var tasks: [WorkshopTaskRecord] { MobileDeskSample.tasks ?? iCloudSyncEngine.shared.workshopTasks }
     @Published var isLoading = false
     @Published var error: String?
     @Published private(set) var loadError: String?
@@ -267,15 +267,13 @@ final class WorkshopStore: ObservableObject {
     var activeTasks: [WorkshopTaskRecord] {
         tasks.filter { task in
             let status = task.status.lowercased()
-            let isAwaitingApproval = status.contains("approval")
-                || task.phase.lowercased().contains("approval")
             return ["active", "running", "queued", "paused"].contains(status)
-                && !isAwaitingApproval
+                && task.requiresApproval != true
         }
     }
 
     var pendingApprovals: [WorkshopTaskRecord] {
-        tasks.filter { $0.status.lowercased().contains("approval") || $0.phase.lowercased().contains("approval") }
+        tasks.filter { $0.requiresApproval == true }
     }
 
     var doneTasks: [WorkshopTaskRecord] {
@@ -288,13 +286,7 @@ final class WorkshopStore: ObservableObject {
         defer { isLoading = false }
         await iCloudSyncEngine.shared.refreshWorkshopTasksSnapshot()
         let next = iCloudSyncEngine.shared.workshopTasks
-        applySyncedTasks(next)
         loadError = next.isEmpty ? iCloudSyncEngine.shared.syncError : nil
-    }
-
-    func applySyncedTasks(_ next: [WorkshopTaskRecord]) {
-        if next != tasks { tasks = next }
-        if !next.isEmpty { loadError = nil }
     }
 
     func submitWorkshopTask(
@@ -464,15 +456,11 @@ struct WorkshopTaskDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var isWorking = false
 
-    private var needsApproval: Bool {
-        task.status.lowercased().contains("approval") || task.phase.lowercased().contains("approval")
-    }
-
     var body: some View {
         NavigationStack {
-            AlivePage(title: task.title, line: needsApproval ? "Needs your yes" : DeskStatusWords.word(for: task.status), style: .pushed) {
+            AlivePage(title: task.title, line: task.requiresApproval == true ? "Needs your yes" : DeskStatusWords.word(for: task.status), style: .pushed) {
 
-                if needsApproval {
+                if task.requiresApproval == true {
                     HStack(spacing: 10) {
                         Button {
                             Task {

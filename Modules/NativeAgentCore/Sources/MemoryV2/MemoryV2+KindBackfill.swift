@@ -7,8 +7,7 @@
 // through the store's own write path. NOTHING mutates silently — kinds/rates
 // are Agent/user-owned semantics (u3-memory-quality hard constraint).
 //
-// Plumbing shape mirrors the wave-1 repair stager (MemoryRepairOneShot /
-// the REM stager): stamp-file idempotence + pending-approval crash-retry
+// Backfill owns its stamp-file idempotence and pending-approval recovery
 // scan; card id == approval id so InboxView's approve/reject routes through
 // resolveApproval(id); `canceled` clears the stamp (re-stages next pass),
 // `denied` keeps it (a refused backfill is never re-proposed).
@@ -20,15 +19,19 @@
 // call and keeps the closure-injection shape (approval RECORD create +
 // pending-scan injected by the app layer): it works, it's tested, and
 // rewriting it buys nothing. New MemoryV2 code may import ApprovalInbox
-// directly. The visible inbox CARD is plain PersistenceCore JSONL written
-// here; the resolveApproval dispatch branch for `action` lives in the app
+// directly. The visible inbox CARD is written through LiveNotificationInbox;
+// the resolveApproval dispatch branch for `action` lives in the app
 // layer (NativeClient).
 
 import Foundation
 import GRDB
 import NativeAgentCore
+import NotificationInbox
 import PersistenceCore
 
+// Blueprint: | `MemoryV2+KindBackfill.swift` | `MemoryKindBackfill`: approval-staged legacy row classifications and checked apply through canonical storage |
+
+/// Staging stamps: local backup/export and memory PrivacyMap, no phone sync.
 public enum MemoryKindBackfill {
 
     /// Approval action id. Distinct from wave-1's "memory.repair" so the
@@ -271,19 +274,15 @@ public enum MemoryKindBackfill {
         return outcome
     }
 
-    // MARK: - Inbox card (PersistenceCore — wave-1 ensureInboxCard shape)
+    // MARK: - Inbox card
 
     /// Card id == approval id (InboxView routes approve/reject through
-    /// inboxAction(id) → resolveApproval(id)). Idempotent whole-file scan
-    /// before append, inside the same flock critical section.
+    /// inboxAction(id) → resolveApproval(id)). The live inbox owns the file.
     static func ensureInboxCard(
         dataRoot: URL,
         approvalId: String,
         rows: [RowProposal]
     ) async throws {
-        let inboxPath = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
         // Per-kind counts for the summary line.
         var counts: [String: Int] = [:]
         for row in rows { counts[row.proposedKind, default: 0] += 1 }
@@ -320,10 +319,7 @@ public enum MemoryKindBackfill {
             "status": .string("unread"),
             "read_at": .null,
         ])
-        // Idempotent append: shared bounded-scan helper replaces the per-append
-        // whole-inbox slurp. The staged-stamp file remains the primary re-stage
-        // guard; this is the second layer.
-        try await appendUniqueById(card, to: inboxPath, using: SwiftNativePersistenceCore())
+        try await LiveNotificationInbox.live(dataRoot: dataRoot).appendUnique(card, id: approvalId)
     }
 
     // MARK: - Stamps (idempotence + cancel-restage; wave-1 shape)

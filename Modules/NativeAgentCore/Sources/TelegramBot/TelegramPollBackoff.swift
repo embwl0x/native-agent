@@ -19,6 +19,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import BackgroundLoops
+
+// Blueprint: | `TelegramPollBackoff.swift` | `TelegramExponentialBackoff` and `TelegramErrorLog`: poll/menu failure cadence and locked bounded error-log rotation |
 
 // MARK: - TelegramExponentialBackoff
 
@@ -30,8 +33,7 @@ import PersistenceCore
 /// DOWNWARD — that still de-synchronizes multiple instances without ever
 /// exceeding the cap). One success resets the curve to zero.
 public actor TelegramExponentialBackoff {
-    private let baseDelay: TimeInterval
-    private let maxDelay: TimeInterval
+    private let policy: LoopFailureBackoffPolicy
 
     private var consecutiveFailures: Int = 0
     private var nextAttemptAt: Date?
@@ -49,8 +51,7 @@ public actor TelegramExponentialBackoff {
         baseDelay: TimeInterval = 1,
         maxDelay: TimeInterval = 60
     ) {
-        self.baseDelay = max(0, baseDelay)
-        self.maxDelay = max(0, maxDelay)
+        self.policy = LoopFailureBackoffPolicy(baseDelay: baseDelay, maxDelay: maxDelay)
     }
 
     /// True when no failure window is open (never failed, or the deadline
@@ -65,11 +66,7 @@ public actor TelegramExponentialBackoff {
     @discardableResult
     public func recordFailure() -> TimeInterval {
         consecutiveFailures += 1
-        // Exponent clamp keeps pow() finite for absurd failure counts; the
-        // min() with maxDelay is what actually bounds the curve.
-        let exponent = Double(min(consecutiveFailures - 1, 64))
-        let raw = min(maxDelay, baseDelay * pow(2, exponent))
-        let delay = min(maxDelay, raw * Double.random(in: 0.8...1.2))
+        let delay = policy.delay(forConsecutiveFailures: consecutiveFailures) { Double.random(in: $0) }
         nextAttemptAt = Date().addingTimeInterval(delay)
         return delay
     }

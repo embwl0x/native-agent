@@ -2,6 +2,7 @@ import AgentWorkspace
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `AgentConversationView.swift` | `AgentConversationView` enum; `read`, `codingReply`, `expiringReply`; `dotReply` projects Dot's existing half-hour wait from its stored send time for UI and contact reads. `claudeWorklogTail` is the shared bounded continuity/worklog reader; `claudeWorklog` exposes recent recorded work for contact reads and the read-only app action. |
 
 /// Agent evidence and presentation over an already-authorized read. No transcript, latest-
 /// conversation lookup, semantic completion inference, or execution lives here.
@@ -92,6 +93,11 @@ public enum AgentConversationView {
               ["sending", "waiting", "enqueued", "queued", "running", "working", "submitted", "accepted", "delivering", "pending", "delivered_live", "delivery_unknown", "outcome_unknown", "no_reply"].contains(status),
               case .string(let stamp)? = fields["reply_deadline"],
               let deadline = ISO8601DateFormatter().date(from: stamp), deadline <= Date() else { return receipt }
+        if fields["reply_observation"] == .string("running") {
+            fields["status"] = .string("no_reply_expired"); fields["reply_state"] = .string("no_reply_expired")
+            fields["detail"] = .string("The reply is still being observed after its reporting deadline. No finished answer has been confirmed; nothing was resent.")
+            return .object(fields)
+        }
         fields["status"] = .string("no_reply_expired")
         fields["reply_state"] = .string("no_reply_expired")
         fields["terminal"] = .bool(true)

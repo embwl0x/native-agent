@@ -1,6 +1,5 @@
 import MacIntegration
 import MacControl
-import GitHubConnector
 import TrustCenter
 import Connectors
 import SlackBot
@@ -13,8 +12,9 @@ import NotificationInbox
 import ApprovalTransactions
 import AttentionRouting
 import AppToolRuntime
-import ChatOrchestration
+import ChatToolRuntime
 import ProviderRouting
+// Blueprint: | `InteractionCardDelivery.swift` | `InteractionCardDelivery`: `answer`, `act`; shared card transactions with native navigation; `AppInlineInteractionPlatformPort`, `AppInlineInteractionControlPort`, `InteractionInboxCard` |
 
 /// The Mac door into shared card transactions; navigation remains native.
 enum InteractionCardDelivery {
@@ -80,7 +80,7 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
     }
 
     func connectorRecords(root: URL) async throws -> [InlineInteractionConnectorStatus] {
-        try await ConnectorStatusProjection.readConnectorRecords(root: root, platform: AppConnectorStatusPlatform()).map {
+        try await NativeAgentEngine.forRoot(root).connectors.refresh().get().map {
             (id: $0.id, authState: $0.authState, healthStatus: $0.healthStatus)
         }
     }
@@ -115,8 +115,8 @@ struct AppInlineInteractionControlPort: InlineInteractionControlPort {
         let outcome = await NativeOAuthFlow.saveInlineConnector(
             connector: connector,
             service: { InlineInteractionRegistry.connectorDisplayName(connector, dataRoot: dataRoot) },
-            values: values, dataRoot: dataRoot, credentialStore: GitHubCredentialStore.shared,
-            slackRequireMention: { SlackSocketModeConfig.loadIngressPolicy(dataRoot: dataRoot).requireMention },
+            values: values, dataRoot: dataRoot,
+            slackRequireMention: { try SlackSocketModeConfig.loadIngressPolicy(dataRoot: dataRoot).requireMention },
             restartSlack: { _ = await NativeAgentEngine.restartBackgroundLoop(id: "slack_socket_mode") },
             validateTelegramToken: { TelegramFacade.tokenValidationMessage(for: $0) },
             configureTelegram: { token, chats, users, requireMention in
@@ -223,8 +223,7 @@ extension AppInlineInteractionPlatformPort {
 
     func refreshInteractionInbox() async {
         do {
-            let latest = try await NativeAgentEngine.live.inbox.list()
-            if NativeAgentEngine.live.inbox.items != latest { NativeAgentEngine.live.inbox.items = latest }
+            _ = try await NativeAgentEngine.live.inbox.list()
         } catch {
             ModuleLog.app("[interaction-notification] inbox refresh failed: %@", error.localizedDescription)
         }
@@ -278,13 +277,15 @@ struct InteractionInboxCard: View {
 
     var body: some View {
         VStack(alignment: .leading) {
-            if let pointer, let card = binding.cardsByRow.values.flatMap({ $0 })
-                .first(where: { $0.id == pointer.interactionID }),
+            if let pointer, let card = appModel.engine.transcripts.card(id: pointer.interactionID, in: pointer.sessionID),
                !hidesAnswered || card.needsAttention {
                 InlineCardView(model: card) { action in
                     binding.handle(card: card, action: action, appModel: appModel)
                 }
                 .padding(.bottom, hidesAnswered ? 8 : 0)
+            } else if let pointer,
+                      case .unavailable(let reason) = appModel.engine.transcripts.transcriptReadStatus(for: pointer.sessionID) {
+                Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
             } else if !loaded {
                 ProgressView()
             }
@@ -293,7 +294,7 @@ struct InteractionInboxCard: View {
         .sheet(item: Binding(get: { binding.connectorSheet }, set: { request in
             if request == nil { Task { await binding.connectorSheetClosed() } }
         })) { request in
-            ConnectorWizardView(provider: request.provider, startsSignIn: true) {
+            ConnectorWizardView(provider: request.provider) {
                 Task { await binding.connectorSheetClosed() }
             }
             .environment(appModel)
@@ -313,19 +314,19 @@ struct InteractionInboxCard: View {
         }
         .task(id: noteID) {
             do {
-                let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+                let root = appModel.engine.transcripts.dataRoot
                 let origin: InlineInteractionDelivery.Pointer
                 if let pinned { origin = pinned } else {
                     origin = try await InlineInteractionDelivery.pointer(id: noteID, dataRoot: root)
                 }
                 pointer = origin
-                if observesOrigin { await binding.refresh(sessionID: origin.sessionID) }
+                if observesOrigin { await appModel.engine.transcripts.refreshCards(in: origin.sessionID) }
             } catch {}
             loaded = true
         }
         .onReceive(NotificationCenter.default.publisher(for: InlineInteractionWire.changedNotification)) { event in
             guard observesOrigin, let pointer, event.object as? String == pointer.sessionID else { return }
-            Task { await binding.refresh(sessionID: pointer.sessionID) }
+            Task { await appModel.engine.transcripts.refreshCards(in: pointer.sessionID) }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await binding.verifyOnReturn() } }

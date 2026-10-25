@@ -1,5 +1,6 @@
 import SwiftUI
-import KnowledgeGraph
+import MemoryV2
+// Blueprint: | `KnowledgeGraphRows.swift` | Entity rows and detail render `MemoryFacade.graphSnapshot`, without separate neighborhood reads |
 
 // ---------------------------------------------------------------------------
 // MARK: - Entity row
@@ -77,10 +78,7 @@ struct KGEntityDetailView: View {
     let selectableEntityIDs: Set<String>
     let onSelectEntity: (String) -> Void
 
-    @State private var neighbors: KnowledgeGraphNeighborhood? = nil
-    @State private var loading = false
-    @State private var loadError: String? = nil
-    @State private var loadGate = LatestAsyncRequestGate()
+    private var neighbors: KnowledgeGraphNeighborhood? { memory.neighborhood(entityID: entity.id) }
 
     var body: some View {
         ScrollView {
@@ -121,8 +119,8 @@ struct KGEntityDetailView: View {
 
                 // Edges / neighbors
                 let relationshipState = KnowledgeGraphPresentation.entityDetailRelationships(
-                    isLoading: loading,
-                    error: loadError,
+                    isLoading: memory.graphLoading,
+                    error: memory.graphLoadError,
                     rootID: entity.id,
                     response: neighbors
                 )
@@ -144,7 +142,7 @@ struct KGEntityDetailView: View {
                                 .foregroundStyle(.orange)
                                 .textSelection(.enabled)
                             Button("Retry", systemImage: "arrow.clockwise") {
-                                Task { await loadNeighbors() }
+                                Task { await memory.loadGraph() }
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -204,32 +202,6 @@ struct KGEntityDetailView: View {
                 }
             }
             .padding(NativeAgentSpacing.lg)
-        }
-        .task(id: entity.id) { await loadNeighbors() }
-        .onDisappear {
-            _ = loadGate.begin()
-            loading = false
-        }
-    }
-
-    private func loadNeighbors() async {
-        guard !Task.isCancelled else { return }
-        let request = loadGate.begin()
-        loading = true
-        defer {
-            if loadGate.accepts(request) { loading = false }
-        }
-        loadError = nil
-        neighbors = nil
-        do {
-            let loaded = try await memory.neighborhood(entityID: entity.id)
-            guard !Task.isCancelled, loadGate.accepts(request) else { return }
-            neighbors = loaded
-        } catch {
-            guard !Task.isCancelled, loadGate.accepts(request) else { return }
-            // PATCH-2026-05-07: surface-load-errors Don't swallow.
-            neighbors = nil
-            loadError = UserFacingError.message(error, action: "load related entities")
         }
     }
 }

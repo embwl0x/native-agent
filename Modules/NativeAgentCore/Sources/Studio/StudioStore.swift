@@ -1,7 +1,8 @@
-import FeedPolicy
+import NativeAgentCore
 import Foundation
 import PersistenceCore
-import Desk
+import CryptoKit
+// Blueprint: | `StudioStore.swift` | Append-only journal and corrections, consult and honest-encounter truth; timestamps use NativeTimestampFormat directly; `encounterIntakePage` exposes bounded neutral consult/corrected-history facts with a shared content digest, refuses unreadable/incomplete history and changed pages; `namedEncounterIntake` validates editable `Resources/abilities/studio-intake.js` selection against native encounter truth, retaining no Swift ordering or invitation prose |
 
 // MARK: - Studio store (desk 903 phases 1–2)
 //
@@ -39,15 +40,6 @@ import Desk
 //      turning one into an entry is a separate, deliberate act.
 //
 // This store is generic engine: no persona-specific content lives here.
-
-// MARK: - Clock
-
-/// Studio timestamps use the same ISO-8601 UTC microsecond shape as every other
-/// Swift-native feed, so entries sort lexicographically beside them.
-public enum StudioClock {
-    public static func nowISO(_ date: Date = Date()) -> String { TaskLedgerClock.nowISO(date) }
-    public static func parseISO(_ s: String) -> Date? { TaskLedgerClock.parseISO(s) }
-}
 
 // MARK: - Errors
 
@@ -798,21 +790,6 @@ public struct StudioEncounterCandidate: Sendable, Equatable, Hashable {
         self.noticedAt = noticedAt
     }
 
-    /// How it reads on a notification. Never an instruction, never a nag — the
-    /// design forbids "you haven't journaled lately" machinery, so this states
-    /// what is there and stops.
-    public var invitationLine: String {
-        var head = title ?? reference ?? originID
-        if let creator, !creator.isEmpty { head += " — \(creator)" }
-        switch source {
-        case .named:
-            return "\(head) is on the table, unanswered."
-        case .unjournaledWork:
-            return "\(head) is in the graph with nothing written about it."
-        case .crossedTheScreen:
-            return "\(head) crossed the screen and went unremarked."
-        }
-    }
 }
 
 // MARK: - Store
@@ -950,7 +927,7 @@ public struct SwiftNativeStudioStore: Sendable {
         }
         let consult = StudioConsult(
             id: Self.newIdentifier(prefix: "consult", now: now),
-            filedAt: StudioClock.nowISO(now),
+            filedAt: NativeTimestampFormat.sixDigitUTCOffset(now),
             artifactRefs: refs,
             description: (trimmedDescription?.isEmpty == false) ? trimmedDescription : nil,
             portionAvailable: portionAvailable?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1053,7 +1030,7 @@ public struct SwiftNativeStudioStore: Sendable {
             // cannot check, so it fails rather than passing unverified.
             throw StudioError.unknownConsult(ref)
         }
-        let recordedAt = StudioClock.nowISO(now)
+        let recordedAt = NativeTimestampFormat.sixDigitUTCOffset(now)
         let entry = StudioJournalEntry(
             id: Self.newIdentifier(prefix: "entry", now: now),
             encounteredAt: (encounteredAt?.isEmpty == false) ? encounteredAt! : recordedAt,
@@ -1292,7 +1269,7 @@ public struct SwiftNativeStudioStore: Sendable {
         let amendment = StudioAmendment(
             id: Self.newIdentifier(prefix: "amend", now: now),
             entryId: id,
-            amendedAt: StudioClock.nowISO(now),
+            amendedAt: NativeTimestampFormat.sixDigitUTCOffset(now),
             reason: trimmedReason,
             supersedes: passage,
             correction: trimmedCorrection
@@ -1365,7 +1342,7 @@ public struct SwiftNativeStudioStore: Sendable {
     /// trimmed lines in neither half — the exact entries the shelf exists to
     /// keep readable.
     public func journalEntriesIncludingArchive() async throws -> [StudioJournalEntry] {
-        try await journalHistory().entries
+        try await completeJournalHistory(for: "Journal entry lookup")
     }
 
     /// The whole history with its holes. Anything that concludes absence
@@ -1403,38 +1380,62 @@ public struct SwiftNativeStudioStore: Sendable {
     /// never become an encounter, so they can never become an invitation to one.
     ///
     /// Read-only. Nothing here opens a ref, and nothing here writes.
-    public func namedEncounterIntake(limit: Int = 20) async throws -> [StudioEncounterCandidate] {
-        let directory = consultsDirectory
-        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
-        // 2026-09-06: hot PLUS shelf — an archived entry answered its consult
-        // just as much as a hot one, and reading only the hot file re-offered
-        // encounters that had already been had.
-        let entries = try await completeJournalHistory(for: "Which consults were never answered")
-        let answeredConsultIDs = Set(entries.compactMap { $0.origin.ref })
-        let journaledRefs = Set(entries.flatMap(\.artifactRefs))
-
-        var candidates: [StudioEncounterCandidate] = []
-        let files = try FileManager.default
-            .contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-            .filter { $0.pathExtension == "json" }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        for file in files {
-            let raw = try await persistence.readJSON(file, ifMissing: .null)
-            guard let consult = StudioConsult.fromJSON(raw) else { continue }
-            // A description-only consult is not an encounter and never will be.
-            guard !consult.descriptionOnly, !consult.artifactRefs.isEmpty else { continue }
-            guard !answeredConsultIDs.contains(consult.id) else { continue }
-            guard journaledRefs.isDisjoint(with: consult.artifactRefs) else { continue }
-            candidates.append(StudioEncounterCandidate(
-                source: .named,
-                reference: consult.artifactRefs.first,
-                originID: consult.id,
-                noticedAt: consult.filedAt
-            ))
+    public func namedEncounterIntake(limit: Int = 20,
+        decide: @Sendable (JSONValue) async throws -> JSONValue) async throws -> [StudioEncounterCandidate] {
+        let decision = try await decide(.object(["operation": .string("named"), "limit": .int(Int64(max(0, limit)))]))
+        struct Selection: Decodable { let ids: [String] }
+        let ids = try JSONDecoder().decode(Selection.self, from: decision.serializedData(pretty: false)).ids
+        // Editable selection cannot turn a description or an answered consult
+        // into an honest encounter. Recheck truth after the part returns.
+        let history = try await completeJournalHistory(for: "Which consults were never answered")
+        let answered = Set(history.compactMap { $0.origin.ref })
+        let refs = Set(history.flatMap(\.artifactRefs))
+        let consults = try await listConsults()
+        guard ids.count <= max(0, limit), Set(ids).count == ids.count else {
+            throw PersistenceCoreError.ioFailure("Studio intake returned duplicate or excess consults.")
         }
-        // Oldest first: something left unanswered longest is the one still
-        // sitting there, and nothing about this queue is a ranking of taste.
-        return Array(candidates.sorted { $0.noticedAt < $1.noticedAt }.prefix(max(0, limit)))
+        return try ids.map { id in
+            guard let consult = consults.first(where: { $0.id == id }), !consult.descriptionOnly,
+                  !consult.artifactRefs.isEmpty, !answered.contains(id), refs.isDisjoint(with: consult.artifactRefs) else {
+                throw PersistenceCoreError.ioFailure("Studio intake selected a consult without an unanswered artifact: \(id).")
+            }
+            return StudioEncounterCandidate(source: .named, reference: consult.artifactRefs.first,
+                originID: id, noticedAt: consult.filedAt)
+        }
+    }
+
+    /// Neutral, corrected history facts and consult facts, paged from one
+    /// content epoch. A changed epoch refuses continuation; no mixed-history
+    /// absence claim and no retained second store. Missing is empty; corrupt
+    /// consults and incomplete archive history throw, never disappear.
+    public func encounterIntakePage(kind: String, offset: Int, snapshot: String?) async throws -> JSONValue {
+        let history = try await completeJournalHistory(for: "Which consults were never answered")
+        let consults = try await listConsults()
+        let packets: [String: [JSONValue]] = [
+            "history": history.map { .object(["id": .string($0.id), "origin_ref": $0.origin.ref.map(JSONValue.string) ?? .null,
+                "artifact_refs": .array($0.artifactRefs.map(JSONValue.string))]) },
+            "consults": consults.map { .object(["id": .string($0.id), "filed_at": .string($0.filedAt),
+                "description_only": .bool($0.descriptionOnly), "artifact_refs": .array($0.artifactRefs.map(JSONValue.string))]) },
+        ]
+        guard let rows = packets[kind], offset >= 0, offset <= rows.count else {
+            throw PersistenceCoreError.ioFailure("Read history or consults with an offset within that snapshot.")
+        }
+        let frozen = JSONValue.object(packets.mapValues(JSONValue.array))
+        let digest = SHA256.hash(data: try frozen.serializedData(pretty: false)).map { String(format: "%02x", $0) }.joined()
+        guard snapshot == nil && offset == 0 || snapshot == digest else {
+            throw PersistenceCoreError.ioFailure("Studio history changed during intake. No unanswered-work decision was made.")
+        }
+        // Bound each page by bytes as well as rows: no host-return truncation.
+        var page: [JSONValue] = [], bytes = 0
+        for row in rows.dropFirst(offset).prefix(100) {
+            let size = try row.serializedData(pretty: false).count
+            guard size <= 256_000 else { throw PersistenceCoreError.ioFailure("A Studio intake fact exceeds the page limit.") }
+            if bytes + size > 256_000 { break }
+            page.append(row); bytes += size
+        }
+        let next = offset + page.count
+        return .object(["status": .string("ok"), "snapshot": .string(digest), "rows": .array(page),
+            "next_offset": next < rows.count ? .int(Int64(next)) : .null])
     }
 
     /// User, 2026-09-06: what the journal has answered, identified the way the

@@ -4,6 +4,7 @@ import PersistenceCore
 import ProviderRouting
 import TurnTrace
 import ChatTurnContracts
+// Blueprint: | `SwarmChatClientFactory.swift` | `NativeSwarmChatClientFactory` struct; `makeClient` |
 
 struct NativeSwarmChatClientFactory: SwarmChatClientFactory {
     func makeClient(tools: any ToolDispatchClient, dataRoot: URL,

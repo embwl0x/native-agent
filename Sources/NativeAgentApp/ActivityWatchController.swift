@@ -1,6 +1,8 @@
 import AttentionRouting
 import ActivityWatch
 
+// Blueprint: | `ActivityWatchController.swift` | `ActivityWatchController`: app-side watcher binding and sensitive-detail-free issue notifications; Trust Center retains issue detail |
+
 /// The notification omits sensitive bundle IDs, paths and storage errors;
 /// the retained issue in Trust Center remains the detail authority.
 enum ActivityCaptureIssueNotificationPresentation {

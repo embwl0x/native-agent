@@ -2,7 +2,7 @@
 
 Share text, a URL, an image or a PDF from another app using **Share to
 NativeAgent**. The compose sheet uses **Share to [agent name]**, from the name
-cached by the main app, or NativeAgent before one is available.
+in the current pairing's shared identity, or NativeAgent before one is available.
 
 Add an optional note, tap **Save**, then **Done**, and open NativeAgent. The app
 selects Chat and imports the item into the selected conversation's durable send

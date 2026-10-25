@@ -1,5 +1,6 @@
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ToolDispatchRecord.swift` | `ToolDispatchRecord` struct; retains the call resolved before execution for outcome attribution and argument evidence |
 
 public struct ToolDispatchRecord: Sendable {
     /// Provider-issued tool-use identity when the transport supplied one.

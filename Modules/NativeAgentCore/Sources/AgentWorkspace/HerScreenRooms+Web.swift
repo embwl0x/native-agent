@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ChromeControl
+// Blueprint: | `HerScreenRooms+Web.swift` | `HerScreen`: `tabName`, `tabTitle`, `webTabCell` |
 
 /// The last Chrome page each tab showed, as the app's browser tools last
 /// read it (2026-09-24, her-screen web rooms). Home and the tab room read it
@@ -187,22 +188,21 @@ extension HerScreen {
     static func tabRoom(_ input: [String: JSONValue], dataRoot: URL, scope: String, issue: String?, now: Date) -> String {
         let tab: Int64? = if case .int(let value)? = input["tab_id"] { value } else { nil }
         guard let page = ChromePageMirror.page(tab: tab, session: scope) else {
-            return screen(["TAB", "no page read"], [["No page has been read in this tab yet."], issue.map { section("READ", [clip($0, 100)]) } ?? []],
+            return screen(["TAB", "no page read"], [["No page has been read in this tab yet."], issue.map { section("READ", [$0]) } ?? []],
                 verbs: [("browser.go", "open a website (text: its address)")], back: "Back: home · browser.")
         }
         let name = tabName(page.tab, dataRoot: dataRoot, scope: scope)
-        if !previewing { AgentWorkspacePorts.current.tools.markConsumed(peer: "web content") }
         let rows = page.text.split(separator: "\n").map(String.init)
             .filter { $0.range(of: #"^\s*\d+  "#, options: .regularExpression) != nil }
         let cap = 24
         var shown = rows.prefix(cap).map { clip($0, 110) }
-        if rows.count > cap { shown.append("+\(rows.count - cap) more rows · app chrome.snapshot reads them all") }
-        if shown.isEmpty { shown = ["nothing readable in view"] }
+        if rows.count > cap { shown.append("+\(rows.count - cap) rows in this snapshot · app {action:\"chrome.snapshot\"} reads a bounded snapshot") }
+        if shown.isEmpty { shown = ["no numbered rows in this saved snapshot"] }
         let lines = page.text.split(separator: "\n").map(String.init)
         let status = lines.dropFirst().first.map { $0.replacingOccurrences(of: #"^snapshot_id \S+ ?·? ?"#, with: "", options: .regularExpression) } ?? ""
         return screen([name, "Chrome", tabTitle(page), "read " + age(now.timeIntervalSince(page.at)) + " ago"],
             [section("AT", [clip(page.url, 100)] + (status.isEmpty ? [] : [clip(status, 100)])), section("PAGE", shown),
-             issue.map { section("READ", [clip($0, 100)]) } ?? []],
+             issue.map { section("READ", [$0]) } ?? []],
             verbs: [(name, "read it again"), (name + ".go", "open another address here (text: url)"),
                     (name + ".click", "click a row (text: its number or label)"),
                     (name + ".fill", "fill and send (text: Email: a@b; Message: hi; submit: Send)"),
@@ -214,7 +214,7 @@ extension HerScreen {
     static func browserRoom(dataRoot: URL, scope: String, person: String, now: Date) -> String {
         let link = BrowserConnectionMirror.connected == true ? person + "'s Chrome connected" : "Chrome not connected"
         var verbs: [(String, String)] = [("browser.go", "open a website in my own tab (text: its address)")]
-        var tab = ["no page open in this chat · browser.go opens one"]
+        var tab = ["no page read in this chat · browser.go opens an address"]
         if let page = ChromePageMirror.page(tab: nil, session: scope) {
             let name = tabName(page.tab, dataRoot: dataRoot, scope: scope)
             tab = [pad(name, 8) + clip(tabTitle(page), 50) + " · read " + age(now.timeIntervalSince(page.at)) + " ago",

@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import NativeAgentCore
+// Blueprint: | `ExistingCornersSourceProvider.swift` | `ExistingCornersSourceProvider`: contract ports for today's raw material and native pages; packageManifest owns package membership, symlink/type rejection and the 8,000 total-member bound, including watched directories, for watching and archive delivery; `SenseNativePages` owns readable Chrome places, bounded conversation/tab-scoped private continuation bindings, structural things/verbs and existing raw UTF-8 windows |
 
 /// Launch assembly supplies the existing, gated raw readers. Keeping the ports
 /// here avoids a dependency from Senses back into the door that consults it.
@@ -98,19 +99,39 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
     }
 
     private static func watchPaths(_ root: URL) throws -> [URL] {
-        var paths = [root, root.deletingLastPathComponent()]
-        if let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isSymbolicLinkKey]) {
-            var members = 0
-            while let member = enumerator.nextObject() as? URL {
-                members += 1
-                guard members <= 8000 else { throw SenseFailure(code: "material_too_large", message: "The document package has too many watched members.") }
-                guard try member.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
-                    throw SenseFailure(code: "source_denied", message: "A watched document package cannot contain symbolic links.")
-                }
-                paths.append(member)
-            }
+        var directory: ObjCBool = false
+        _ = FileManager.default.fileExists(atPath: root.path, isDirectory: &directory)
+        return [root, root.deletingLastPathComponent()] + (directory.boolValue ? try packageManifest(root,
+            symlinkMessage: "A watched document package cannot contain symbolic links.",
+            memberFailure: SenseFailure(code: "material_too_large", message: "The document package has too many watched members.")).map(\.url) : [])
+    }
+
+    /// Watching and delivery share the 8,000-member bound, including directories
+    /// watched for changes. Only regular files are archived for the helper.
+    static func packageManifest(_ root: URL, symlinkMessage: String = "Sense document packages cannot contain symbolic links.",
+                                memberFailure: SenseFailure = SenseFailure(code: "input_limit", message: "Sense document package exceeds its member limit.")) throws -> [(url: URL, isFile: Bool)] {
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
+        var traversalFailed = false
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: Array(keys),
+            errorHandler: { _, _ in traversalFailed = true; return false }) else {
+            throw SenseFailure(code: "source_unavailable", message: "Sense document package is unavailable.")
         }
-        return paths
+        var members: [(url: URL, isFile: Bool)] = []
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: keys)
+            guard values.isSymbolicLink != true else {
+                throw SenseFailure(code: "source_denied", message: symlinkMessage)
+            }
+            guard values.isRegularFile == true || values.isDirectory == true else {
+                throw SenseFailure(code: "source_denied", message: "Sense document package contains unsupported members.")
+            }
+            guard members.count < 8_000 else { throw memberFailure }
+            members.append((url, values.isRegularFile == true))
+        }
+        guard !traversalFailed else {
+            throw SenseFailure(code: "source_unavailable", message: "Sense document package could not be read completely.")
+        }
+        return members
     }
 
 }

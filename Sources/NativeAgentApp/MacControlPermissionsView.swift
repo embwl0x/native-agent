@@ -1,5 +1,8 @@
 import MacIntegration
+import NativeAgentCore
 import AppToolRuntime
+
+// Blueprint: | `MacControlPermissionsView.swift` | `MacControlPermissionsView`: checked policy/category controls, audit/workbench UI and explicit save/permission feedback |
 // PATCH-2026-05-07: mac-control-ui-1 Mac Control Permissions panel — master toggle + category toggles + audit log
 import AppKit
 import MacControl
@@ -9,14 +12,6 @@ import TrustCenter
 
 enum MacControlAdvancedDisclosurePresentation {
     static let preferenceKey = "macControl.showAdvancedControls"
-
-    static func isExpanded(in defaults: UserDefaults) -> Bool {
-        defaults.bool(forKey: preferenceKey)
-    }
-
-    static func setExpanded(_ isExpanded: Bool, in defaults: UserDefaults) {
-        defaults.set(isExpanded, forKey: preferenceKey)
-    }
 
     static func savePathIsVisible(isExpanded: Bool) -> Bool {
         isExpanded
@@ -65,174 +60,6 @@ struct MacControlApprovalCategory: Identifiable, Hashable {
             detail: "Moving through windows, menus, and controls the way your hands would."
         ),
     ]
-}
-
-// MARK: - Audit Entry
-
-/// Decoder for one row of `<dataRoot>/mac_control_audit.jsonl`.
-///
-/// CANONICAL DAEMON-PARITY SHAPE — keep in sync with
-/// `Modules/NativeAgentCore/Sources/MacControl/MacControl.swift` `emitBlockedAudit`
-/// and the Python `MacControl._blocked_receipt` it byte-mirrors. The full
-/// snake_case field set (in daemon insertion order) is:
-///
-///     id, method, category, args_hash, trigger, trigger_source,
-///     approval_required, approved, exit_code, stdout, stderr,
-///     duration_ms, executed_at, blocked, block_reason
-///
-/// `ts` / `action` / `detail` / `allowed` are the legacy summary fields the
-/// audit sheet UI binds to; they're synthesized from the canonical fields
-/// (executed_at, method, stderr|block_reason, blocked) at decode time so
-/// older rows still render. `var id: String` is the SwiftUI `Identifiable`
-/// row id and intentionally distinct from the canonical `id` field (the
-/// receipt UUID), which is exposed as `receiptID`.
-struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
-    // Identifiable row id: stable per row but built from receiptID when
-    // present so rows are deduped reliably in the List.
-    var id: String { receiptID ?? "\(ts)-\(method)" }
-
-    // Canonical fields (snake_case in the JSONL; camelCase in Swift via CodingKeys).
-    var receiptID: String?
-    var method: String
-    var category: String?
-    var argsHash: String?
-    var trigger: String?
-    var triggerSource: String?
-    var approvalRequired: Bool?
-    var approved: Bool?
-    var exitCode: Int?
-    var stdout: String?
-    var stderr: String?
-    var durationMs: Int?
-    var executedAt: String?
-    var blocked: Bool?
-    var blockReason: String?
-
-    // Legacy / UI-facing summary fields. Kept so the existing audit sheet
-    // bindings (`entry.action`, `entry.ts`, `entry.detail`, `entry.allowed`)
-    // keep working without churn.
-    var ts: String
-    var action: String
-    var detail: String?
-    var allowed: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        // Canonical (snake_case on disk).
-        case receiptID = "id"
-        case method
-        case category
-        case argsHash = "args_hash"
-        case trigger
-        case triggerSource = "trigger_source"
-        case approvalRequired = "approval_required"
-        case approved
-        case exitCode = "exit_code"
-        case stdout
-        case stderr
-        case durationMs = "duration_ms"
-        case executedAt = "executed_at"
-        case blocked
-        case blockReason = "block_reason"
-        // Legacy fields some pre-cutover rows may still carry.
-        case ts
-        case action
-        case detail
-        case allowed
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-
-        // Canonical fields.
-        receiptID = try c.decodeIfPresent(String.self, forKey: .receiptID)
-        let decodedMethod = try c.decodeIfPresent(String.self, forKey: .method)
-        category = try c.decodeIfPresent(String.self, forKey: .category)
-        argsHash = try c.decodeIfPresent(String.self, forKey: .argsHash)
-        trigger = try c.decodeIfPresent(String.self, forKey: .trigger)
-        triggerSource = try c.decodeIfPresent(String.self, forKey: .triggerSource)
-        approvalRequired = try c.decodeIfPresent(Bool.self, forKey: .approvalRequired)
-        approved = try c.decodeIfPresent(Bool.self, forKey: .approved)
-        exitCode = try c.decodeIfPresent(Int.self, forKey: .exitCode)
-        stdout = try c.decodeIfPresent(String.self, forKey: .stdout)
-        stderr = try c.decodeIfPresent(String.self, forKey: .stderr)
-        durationMs = try c.decodeIfPresent(Int.self, forKey: .durationMs)
-        executedAt = try c.decodeIfPresent(String.self, forKey: .executedAt)
-        blocked = try c.decodeIfPresent(Bool.self, forKey: .blocked)
-        blockReason = try c.decodeIfPresent(String.self, forKey: .blockReason)
-
-        // UI summary fields, synthesized from canonical if missing.
-        // method falls back to legacy `action` so the SwiftUI row id stays
-        // stable for pre-cutover rows that only carry the legacy keys (gpt-5.5
-        // review LOW #7 — without this fallback every legacy row collapses to
-        // id="<ts>-" and SwiftUI's List dedupes them).
-        ts = try c.decodeIfPresent(String.self, forKey: .ts)
-            ?? executedAt
-            ?? ""
-        let legacyAction = try c.decodeIfPresent(String.self, forKey: .action)
-        method = decodedMethod ?? legacyAction ?? ""
-        action = legacyAction ?? decodedMethod ?? "unknown"
-        // detail prefers a NON-EMPTY block_reason, then NON-EMPTY stderr —
-        // gpt-5.5 review MEDIUM #6: canonical successful rows can carry
-        // `block_reason: ""`, which would otherwise mask a useful stderr.
-        let decodedDetail = try c.decodeIfPresent(String.self, forKey: .detail)
-        detail = Self.firstNonEmpty(decodedDetail, blockReason, stderr)
-        if let explicit = try c.decodeIfPresent(Bool.self, forKey: .allowed) {
-            allowed = explicit
-        } else if let b = blocked {
-            allowed = !b
-        } else {
-            allowed = nil
-        }
-    }
-
-    /// Pick the first non-nil, non-empty string. Treats `""` as absent so the
-    /// canonical-row pattern `block_reason: ""` (successful execution rows)
-    /// doesn't mask a useful `stderr` underneath.
-    private static func firstNonEmpty(_ candidates: String?...) -> String? {
-        for c in candidates {
-            if let s = c, !s.isEmpty { return s }
-        }
-        return nil
-    }
-
-    init(ts: String, action: String, detail: String? = nil, allowed: Bool? = nil) {
-        self.method = action
-        self.ts = ts
-        self.action = action
-        self.detail = detail
-        self.allowed = allowed
-    }
-}
-
-enum MacControlAuditLogRead: Sendable {
-    case entries([MacControlAuditEntry], malformedLineCount: Int)
-    case sourceAbsent
-    case unreadable(String)
-
-    static func read(from url: URL, limit: Int = 100) -> Self {
-        guard FileManager.default.fileExists(atPath: url.path) else { return .sourceAbsent }
-        do {
-            let content = try String(contentsOf: url, encoding: .utf8)
-            var malformed = 0
-            let entries = content
-                .split(separator: "\n", omittingEmptySubsequences: true)
-                .compactMap { line -> MacControlAuditEntry? in
-                    guard let data = line.data(using: .utf8) else {
-                        malformed += 1
-                        return nil
-                    }
-                    do {
-                        return try JSONDecoder().decode(MacControlAuditEntry.self, from: data)
-                    } catch {
-                        malformed += 1
-                        return nil
-                    }
-                }
-            return .entries(Array(entries.suffix(limit).reversed()), malformedLineCount: malformed)
-        } catch {
-            return .unreadable(UserFacingError.cause(error, action: "read the audit log"))
-        }
-    }
 }
 
 // MARK: - MacControlPermissionsView
@@ -347,12 +174,15 @@ struct MacControlPermissionsView: View {
     }
     @State private var savedPolicy = TrustMacControlPolicy()
     @State private var policyReadState: MacControlSetupStatusBadges.PolicyReadState = .loading
+    @State private var policyRead = LatestRead()
     @State private var isSaving = false
     @State private var saveError: String?
     @State private var showAuditSheet = false
     @State private var auditEntries: [MacControlAuditEntry] = []
     @State private var auditReadProblem: String?
+    @State private var auditRead = LatestRead()
     @State private var isLoadingAudit = false
+    @State private var pendingAuditReads = 0
     @State private var testNotifStatus: String?
     @State private var isTestingNotif = false
     // The advanced group contains unsaved policy controls. Keep its expansion
@@ -418,11 +248,13 @@ struct MacControlPermissionsView: View {
             await loadPolicy()
         }
         .onChange(of: appModel.engine.trust.policy) { _, newPolicy in
+            policyRead.write {
             if let mp = newPolicy?.macControlPolicy {
                 savedPolicy = mp
                 policyReadState = .available
             } else {
                 policyReadState = .unavailable
+            }
             }
         }
         .sheet(isPresented: $showAuditSheet) {
@@ -694,7 +526,7 @@ struct MacControlPermissionsView: View {
             }
 
             AdvancedSection(title: "Ask me first about") {
-                Text("I stop and ask for your approval before I do any of these, however I was asked to.")
+                Text("I ask about these below Full Mac; in Full Mac I ask once per untrusted agent's initiating turn, and for macOS privacy resets and irreversible deletes.")
                     .font(ShellType.rowDetail)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -793,7 +625,7 @@ struct MacControlPermissionsView: View {
                 .saveMacIntegrationPreset(preset.rawValue, currentPolicy: appModel.engine.trust.policy)
             appModel.applySavedTrustPolicy(result, status: "Applied \(preset.title).")
             if let mp = result.macControlPolicy {
-                appModel.acceptEditDraft("mac-control/policy", submitted: submitted, saved: mp)
+                try appModel.acceptEditDraft("mac-control/policy", submitted: submitted, rebasingOn: mp)
                 savedPolicy = mp
                 policyReadState = .available
                 testNotifStatus = "Applied \(preset.title)."
@@ -868,17 +700,14 @@ struct MacControlPermissionsView: View {
     /// defaults. Now we explicitly fetch /v1/trust on appear and seed
     /// AppModel so subsequent reads are correct too.
     private func loadPolicy() async {
-        // Use cache if available
-        if let mp = appModel.engine.trust.policy?.macControlPolicy {
-            savedPolicy = mp
-            policyReadState = .available
-            return
-        }
-        // Fetch fresh from daemon
+        _ = await policyRead.read({ () async -> Result<TrustMacControlPolicy?, Error> in
         do {
-            let tp = try await appModel.engine.trust.load()
-            await MainActor.run { appModel.engine.trust.policy = tp }
-            if let mp = tp.macControlPolicy {
+            if let cached = appModel.engine.trust.policy?.macControlPolicy { return .success(cached) }
+            return .success(try await appModel.engine.trust.load().macControlPolicy)
+        } catch { return .failure(error) }
+        }, publish: { result in
+        do {
+            if let mp = try result.get() {
                 savedPolicy = mp
                 policyReadState = .available
             } else {
@@ -890,29 +719,35 @@ struct MacControlPermissionsView: View {
             saveError = UserFacingError.message(error, action: "load Mac Control settings")
             policyReadState = .unavailable
         }
+        })
     }
 
     private func save() async {
         isSaving = true
         saveError = nil
         let submitted = policy
+        let baseline = appModel.editDraftBaseline("mac-control/policy", seed: savedPolicy)
         do {
-            // Nothing saved yet is the default policy the edit started from.
-            let current = try await appModel.engine.trust.load().macControlPolicy ?? TrustMacControlPolicy()
-            let merged = try appModel.mergingEditDraft("mac-control/policy", edited: submitted, into: current)
             let result = try await appModel
-                .saveMacControlPolicy(merged)
-            await MainActor.run {
+                .saveMacControlPolicy(submitted, comparedTo: baseline)
+            try await MainActor.run {
                 appModel.applySavedTrustPolicy(result, status: "Mac Control policy saved")
                 if let mp = result.macControlPolicy {
-                    appModel.acceptEditDraft("mac-control/policy", submitted: submitted, saved: mp)
-                    savedPolicy = mp
-                    policyReadState = .available
+                    try appModel.acceptEditDraft("mac-control/policy", submitted: submitted, rebasingOn: mp)
+                    policyRead.write {
+                        savedPolicy = mp
+                        policyReadState = .available
+                    }
                 } else {
                     policyReadState = .unavailable
                     saveError = "Mac Control policy saved without a readable Mac Control settings block."
                 }
             }
+        } catch TrustCenterError.policyConflict {
+            // Changed elsewhere meanwhile: start again from what is saved now.
+            appModel.clearEditDraft("mac-control/policy")
+            await loadPolicy()
+            saveError = "Mac Control settings changed elsewhere while you edited, so your changes were not saved. The current settings are shown; make your change again."
         } catch {
             saveError = UserFacingError.message(error, action: "save Mac Control settings")
         }
@@ -933,29 +768,25 @@ struct MacControlPermissionsView: View {
     }
 
     private func loadAudit() async {
+        pendingAuditReads += 1
+        defer { pendingAuditReads -= 1; isLoadingAudit = pendingAuditReads > 0 }
         isLoadingAudit = true
         auditReadProblem = nil
-        let dataDir = appModel.engine.doctor.health?.dataDir ?? ""
-        let path = URL(fileURLWithPath: dataDir).appendingPathComponent("mac_control_audit.jsonl")
-        // Read + parse the (potentially large, unbounded) audit file off the
-        // MainActor; awaited so ordering vs. isLoadingAudit is preserved.
-        let read = await Task.detached(priority: .utility) {
-            MacControlAuditLogRead.read(from: path)
-        }.value
+        _ = await auditRead.read({ await appModel.engine.trust.auditLog() }, publish: { read in
         switch read {
         case .entries(let entries, let malformedLineCount):
             auditEntries = entries
             if malformedLineCount > 0 {
                 auditReadProblem = "\(malformedLineCount) malformed audit \(malformedLineCount == 1 ? "line was" : "lines were") not shown."
             }
-        case .sourceAbsent:
+        case .sourceAbsent(let path):
             auditEntries = []
             auditReadProblem = "Audit source is absent at \(path.path)."
         case .unreadable(let reason):
             auditEntries = []
             auditReadProblem = "Couldn't read the audit log. \(reason)"
         }
-        isLoadingAudit = false
+        })
     }
 }
 

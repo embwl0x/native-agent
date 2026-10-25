@@ -14,6 +14,7 @@
 // launch-argument and notification routers already send "workshop" to More.
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `AdvancedView.swift` | More reads the pairing-owned surface layout directly; shared health and runs retain local loading/error state only |
 
 enum MoreAboutPresentation {
     static let text = "Some advanced controls require a live Mac connection. Skill installs, eval runs, and Desk policy editing are Mac-only today. Desk changes sync with the paired Mac."
@@ -55,8 +56,7 @@ struct AdvancedView: View {
     @StateObject private var store = AdvancedStore()
     @State private var showPairingRecovery = false
     @State private var showDesignScreen = MobileDesignSamples.screen != nil
-    /// The Mac's layout (ui/layout.json, in the core snapshot); its seed until one arrives.
-    @State private var layout = SurfaceLayout.seed(from: "", at: "")
+    private let sync = iCloudSyncEngine.shared
     #if DEBUG
     @StateObject private var designApprovals = ApprovalsStore()
     @StateObject private var designInbox = InboxStore()
@@ -79,6 +79,7 @@ struct AdvancedView: View {
 
                 // More's sections in the layout's order, as the phone's
                 // profile shows them.
+                let layout = sync.surfaceLayout ?? SurfaceLayout.seed(from: "", at: "")
                 ForEach(layout.shown("more", profile: layout.phone).map(\.name), id: \.self) { block in
                     switch block {
                     case "rooms":
@@ -148,8 +149,6 @@ struct AdvancedView: View {
             }
         }
         .macSyncErrorBanner()
-        // Each snapshot pass that carries the layout redraws More's order.
-        .onChange(of: iCloudSyncEngine.shared.surfaceLayout, initial: true) { _, next in if let next { layout = next } }
     }
 
     private func link<Destination: View>(_ title: String, _ detail: String,
@@ -206,22 +205,20 @@ struct AdvancedView: View {
     #if DEBUG
     /// Process-local screenshot data for the Personality, Trust and Connectors rooms.
     private static func sampleSettingsStore() -> SettingsStore {
-        let store = SettingsStore()
-        store.personality = PersonalityProfile(
+        let personality = PersonalityProfile(
             name: "Sample", personaKind: "Companion",
             essence: "A steady, curious presence that keeps the day simple and the next step clear.",
             voice: "Plain and warm. Short sentences, one idea at a time, no filler.",
             traits: PersonalityTraits(warmth: 0.8, directness: 0.7, humor: 0.45, proactivity: 0.6,
                                       rigor: 0.75, autonomy: 0.55, creativity: 0.65, brevity: 0.7))
-        store.trustPolicy = TrustPolicy(
+        let store = SettingsStore(sync: iCloudSyncEngine(personality: personality))
+        store.sync.trustPolicy = TrustPolicy(
             permissionLevel: "Standard", autonomyDefault: "Ask first", requireBackups: true,
             outsideDefault: "Read only", developerMode: false,
             workshopPolicy: TrustWorkshopPolicy(enabled: true, showTimeline: true),
             trainingPolicy: TrustTrainingPolicy(dreamScheduler: true))
-        store.connectors = [
-            ConnectorRecord(id: "calendar", name: "Calendar", kind: "Calendar", enabled: true, healthStatus: "ok"),
-            ConnectorRecord(id: "github", name: "GitHub", kind: "Code", enabled: true, healthStatus: "connected"),
-            ConnectorRecord(id: "notes", name: "Notes", kind: "Notes", status: "idle", enabled: false),
+        store.sync.connectors = [
+            ConnectorRecord(id: "slack", name: "Slack", kind: "Messaging", enabled: true, healthStatus: "connected"),
         ]
         return store
     }
@@ -311,8 +308,6 @@ private struct TrustHostView: View {
 
 @MainActor
 final class AdvancedStore: ObservableObject {
-    @Published var health: RuntimeHealth?
-    @Published var runs: [RunRecord] = []
     @Published private(set) var healthLoadError: String?
     @Published private(set) var runsLoadError: String?
     private var healthRefreshInFlight = false
@@ -324,7 +319,6 @@ final class AdvancedStore: ObservableObject {
         defer { healthRefreshInFlight = false }
         let engine = iCloudSyncEngine.shared
         let outcome = await engine.refreshHealthSnapshot()
-        health = engine.health
         switch outcome {
         case .refreshed:
             healthLoadError = SnapshotHealthLog.damageSentence()
@@ -343,7 +337,6 @@ final class AdvancedStore: ObservableObject {
         defer { runsRefreshInFlight = false }
         let engine = iCloudSyncEngine.shared
         let outcome = await engine.refreshRunsSnapshot()
-        runs = engine.runs
         switch outcome {
         case .refreshed:
             runsLoadError = SnapshotHealthLog.damageSentence(for: "runs.json")
@@ -356,8 +349,7 @@ final class AdvancedStore: ObservableObject {
         }
     }
 
-    func applySyncedRuns(_ next: [RunRecord]) {
-        if next != runs { runs = next }
+    func runsDidChange(_ next: [RunRecord]) {
         if !next.isEmpty { runsLoadError = SnapshotHealthLog.damageSentence(for: "runs.json") }
     }
 }
@@ -435,7 +427,7 @@ struct StatusDetailView: View {
                 }
             } header: { AliveEyebrow("Connection") }
             Section {
-                switch MacHealthPresentation.snapshot(for: store.health) {
+                switch MacHealthPresentation.snapshot(for: sync.health) {
                 case .available(let health):
                     if let healthLoadError = store.healthLoadError {
                         Label(healthLoadError, systemImage: "exclamationmark.triangle")
@@ -609,7 +601,7 @@ struct RunsLogView: View {
             AlivePageHeader(title: "Runs Log", line: "What I've run on the Mac lately.", style: .pushed)
                 .padding(.horizontal, 4)
                 .aliveListRow(top: 4, bottom: 6)
-            switch RunsLogPresentation.state(runs: store.runs, error: store.runsLoadError) {
+            switch RunsLogPresentation.state(runs: sync.runs, error: store.runsLoadError) {
             case .unavailable(let error):
                 AliveCalmState(title: "Runs are not available", line: error)
                     .aliveListRow()
@@ -617,7 +609,7 @@ struct RunsLogView: View {
                 AliveCalmState(title: "No runs yet", line: "The latest Mac run snapshot contains no runs.")
                     .aliveListRow()
             case .content:
-                ForEach(store.runs) { run in
+                ForEach(sync.runs) { run in
                     NavigationLink {
                         RunDetailView(run: run)
                     } label: {
@@ -632,7 +624,7 @@ struct RunsLogView: View {
         .task { await store.refreshRuns() }
         .refreshable { await store.refreshRuns() }
         .onChange(of: sync.runs) { _, runs in
-            store.applySyncedRuns(runs)
+            store.runsDidChange(runs)
         }
     }
 }

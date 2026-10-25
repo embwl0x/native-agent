@@ -3,8 +3,9 @@ import AppIntents
 import Foundation
 import PersistenceCore
 import NativeAgentCore
-import PersonaEngine
+import NativeAgentShared
 import Transcripts
+// Blueprint: | `NativeAgentIntents.swift` | `NativeAgentChatIntent`: `perform`, `reply` |
 
 /// One resident agent, named by this installation's canonical persona.
 struct ResidentAgentEntity: AppEntity {
@@ -18,8 +19,10 @@ struct ResidentAgentEntity: AppEntity {
         DisplayRepresentation(title: "\(name)")
     }
 
-    static var current: ResidentAgentEntity {
-        ResidentAgentEntity(id: "resident", name: PersonaCompiler.agentDisplayName())
+    @MainActor
+    static func current() async throws -> ResidentAgentEntity {
+        let profile = try await NativeAgentEngine.live.persona.loadProfile()
+        return ResidentAgentEntity(id: "resident", name: NativeAgentIdentity.displayName(profile.name))
     }
 }
 
@@ -29,23 +32,23 @@ struct ResidentAgentQuery: EntityStringQuery {
 
     func entities(for identifiers: [String]) async throws -> [ResidentAgentEntity] {
         try await NativeAgentAppCoordinator.shared.prepare()
-        let agent = ResidentAgentEntity.current
+        let agent = try await ResidentAgentEntity.current()
         return identifiers.contains(agent.id) ? [agent] : []
     }
 
     func entities(matching string: String) async throws -> [ResidentAgentEntity] {
         try await NativeAgentAppCoordinator.shared.prepare()
-        let agent = ResidentAgentEntity.current
+        let agent = try await ResidentAgentEntity.current()
         return agent.name.localizedCaseInsensitiveContains(string) ? [agent] : []
     }
 
     func suggestedEntities() async throws -> [ResidentAgentEntity] {
         try await NativeAgentAppCoordinator.shared.prepare()
-        return [.current]
+        return [try await ResidentAgentEntity.current()]
     }
 
     func defaultResult() async -> ResidentAgentEntity? {
-        do { try await NativeAgentAppCoordinator.shared.prepare(); return .current }
+        do { try await NativeAgentAppCoordinator.shared.prepare(); return try await ResidentAgentEntity.current() }
         catch { return nil }
     }
 }
@@ -73,7 +76,7 @@ struct AskResidentAgentIntent: AppIntent {
 
     func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
         try await NativeAgentAppCoordinator.shared.prepare()
-        guard agent.id == ResidentAgentEntity.current.id else {
+        guard agent.id == (try await ResidentAgentEntity.current()).id else {
             throw $agent.needsValueError("Choose the resident agent.")
         }
         let reply: String

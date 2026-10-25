@@ -16,6 +16,8 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+// Blueprint: | `RunsView.swift` | `RunsView`: shared ledger list/details and explicit unknown/failure badge vocabulary from canonical run rows |
+
 /// Presentation facts per run kind. Shared human-facing vocabulary lives in
 /// `RunKindVocabulary`; colour and symbol remain Mac presentation choices.
 private enum RunKindStyle {
@@ -46,7 +48,7 @@ private enum RunKindStyle {
 
 struct RunsView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var selectedRun: RunRecord?
+    @State private var selectedRunID: String?
     private let isRefreshing: Bool
     private let refreshAction: (@MainActor () async -> Void)?
 
@@ -61,8 +63,8 @@ struct RunsView: View {
     var body: some View {
         Group {
             switch RunsPresentation.state(
-                runs: appModel.runs,
-                refresh: appModel.panelRefreshStatus[.diagnostics]
+                runs: appModel.engine.runs.rows,
+                readSucceeded: appModel.engine.runs.readSucceeded
             ) {
             case .loading:
                 ProgressView("Loading the run history…")
@@ -82,7 +84,7 @@ struct RunsView: View {
             case .rows(let runs):
                 List(runs) { run in
                     Button {
-                        selectedRun = run
+                        selectedRunID = run.id
                     } label: {
                         RunRow(run: run)
                     }
@@ -93,7 +95,7 @@ struct RunsView: View {
                     StalePanelNotice(text: notice)
                     List(runs) { run in
                         Button {
-                            selectedRun = run
+                            selectedRunID = run.id
                         } label: {
                             RunRow(run: run)
                         }
@@ -109,8 +111,10 @@ struct RunsView: View {
             }
             .disabled(isRefreshing)
         }
-        .sheet(item: $selectedRun) { run in
-            RunDetailSheet(run: run)
+        .sheet(isPresented: Binding(get: { selectedRunID != nil }, set: { if !$0 { selectedRunID = nil } })) {
+            if let run = appModel.engine.runs.rows.first(where: { $0.id == selectedRunID }) {
+                RunDetailSheet(run: run)
+            }
         }
     }
 
@@ -135,13 +139,10 @@ enum RunsPresentation {
 
     static func state(
         runs: [RunRecord],
-        refresh: AppModel.PanelRefreshStatus?
+        readSucceeded: Bool?
     ) -> State {
-        guard let refresh else { return .loading }
-        let runsReadFailed = refresh.failedEndpoints.contains {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "runs"
-        }
-        if runsReadFailed {
+        guard let readSucceeded else { return .loading }
+        if !readSucceeded {
             return runs.isEmpty
                 ? .unavailable("The run history could not be read. Refresh to try again.")
                 : .stale(runs, "Showing the runs that loaded last time; the run history could not be refreshed.")
@@ -180,8 +181,8 @@ enum RunStatusBadgePresentation {
             return Badge(label: "Partially completed", themeStatus: "warn", sourceStatus: sourceStatus)
         case "timeout", "timed_out":
             return Badge(label: "Timed out", themeStatus: "timeout", sourceStatus: sourceStatus)
-        case "canceled", "cancelled":
-            return Badge(label: "Cancelled", themeStatus: "interrupted", sourceStatus: sourceStatus)
+        case "stopped", "canceled", "cancelled":
+            return Badge(label: "Stopped", themeStatus: "interrupted", sourceStatus: sourceStatus)
         case "interrupted":
             return Badge(label: "Interrupted", themeStatus: "interrupted", sourceStatus: sourceStatus)
         case "blocked":

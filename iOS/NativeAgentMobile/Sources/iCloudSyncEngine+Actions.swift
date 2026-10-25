@@ -11,6 +11,7 @@ import Darwin
 import Foundation
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `iCloudSyncEngine+Actions.swift` | `iCloudSyncEngine`: `requireIdleActionForConnectionRepair`, `reconcileActionsForConnectionRepair`, `persistCloudKitActionResponse`; accepted surface-model receipts update every engine-declared group member in shared `surfaceModels`, ordered by the routing owner's committed revision, without acknowledgment fences; settings/helper/thread readbacks live here rather than in screens; settings reads cannot overtake mutations, helper receipts use `applyHelpersSnapshot` with Mac revision ordering and detail invalidation and agent summaries retain one shape |
 
 private let decisionActionPollTimeoutSeconds: Double = 300
 private let decisionActionPollIntervalSeconds: Double = 0.75
@@ -19,6 +20,7 @@ private let decisionActionPollIntervalSeconds: Double = 0.75
 /// transport receipt alone is not enough to confirm a picker selection.
 struct MobileSurfaceSelectionReceipt: Equatable, Sendable {
     let surface: String
+    let surfaces: [String]
     let providerID: String
     let model: String
     let reasoningEffort: String
@@ -35,25 +37,18 @@ struct MobileSurfaceSelectionReceipt: Equatable, Sendable {
         let expected = expectedSurface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let canonicalExpected = expected == "missions" ? "workshop" : expected
         surface = try required("surface")
+        surfaces = try required("surfaces").split(separator: ",").map(String.init)
         providerID = try required("provider_id")
         model = try required("model")
         reasoningEffort = try required("reasoning_effort")
         serviceTier = try required("service_tier")
         guard response["ok"] == "true", ["ok", "completed", "success"].contains(response["status"] ?? ""),
-              surface == canonicalExpected, ["default", "priority"].contains(serviceTier) else {
+              surface == canonicalExpected, surfaces.contains(surface),
+              ["default", "priority"].contains(serviceTier) else {
             throw SyncError.persistence("Mac selection response did not confirm the requested surface's canonical tuple")
         }
     }
 
-    /// Old Drive snapshots may omit provider/control metadata. Known fields
-    /// must match before a snapshot can retire the existing local stale fence.
-    func isAcknowledged(by preference: SurfaceModelPref?) -> Bool {
-        guard let preference, preference.model == model else { return false }
-        if let provider = preference.providerId, provider != providerID { return false }
-        if let effort = preference.reasoningEffort, effort != reasoningEffort { return false }
-        if let tier = preference.serviceTier, tier != serviceTier { return false }
-        return true
-    }
 }
 
 extension iCloudSyncEngine {
@@ -1139,37 +1134,69 @@ extension iCloudSyncEngine {
     @discardableResult
     func approveApproval(id: String) async throws -> [String: String]? {
         let action = InboxAction.make(action: "approveApproval", payload: ["approvalId": id])
-        return try requireSuccessfulActionResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try adoptApprovalResponse(await sendDecisionActionWithSignatureRetry(action))
     }
 
     @discardableResult
     func rejectApproval(id: String) async throws -> [String: String]? {
         let action = InboxAction.make(action: "rejectApproval", payload: ["approvalId": id])
-        return try requireSuccessfulActionResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try adoptApprovalResponse(await sendDecisionActionWithSignatureRetry(action))
     }
 
     @discardableResult
     func cancelApproval(id: String) async throws -> [String: String]? {
         let action = InboxAction.make(action: "cancelApproval", payload: ["approvalId": id])
-        return try requireSuccessfulActionResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try adoptApprovalResponse(await sendDecisionActionWithSignatureRetry(action))
+    }
+
+    private func adoptApprovalResponse(_ response: [String: String]?) throws -> [String: String] {
+        // The decision can settle even when its execution fails.
+        if let json = response?["approvalJSON"], let id = response?["approvalId"],
+           let revision = response?["approvalReadbackRevision"].flatMap(Double.init) {
+            let row = try JSONDecoder().decode(ApprovalRequest?.self, from: Data(json.utf8))
+            if installReadback(revision: revision, file: "approvals.json", id: id) {
+                if let index = approvals.firstIndex(where: { $0.id == id }) {
+                    if let row { approvals[index] = row } else { approvals.remove(at: index) }
+                } else if let row { approvals.append(row) }
+            }
+        }
+        return try requireSuccessfulActionResponse(response)
     }
 
     @discardableResult
     func approveMemoryProposal(proposalId: String) async throws -> [String: String]? {
         let action = InboxAction.make(action: "approveMemoryProposal", payload: ["proposalId": proposalId])
-        return try requireSuccessfulActionResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try adoptMemoryResponse(await sendDecisionActionWithSignatureRetry(action))
     }
 
     @discardableResult
     func rejectMemoryProposal(proposalId: String) async throws -> [String: String]? {
         let action = InboxAction.make(action: "rejectMemoryProposal", payload: ["proposalId": proposalId])
-        return try requireSuccessfulActionResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try adoptMemoryResponse(await sendDecisionActionWithSignatureRetry(action))
     }
 
     @discardableResult
     func deleteMemory(id: String) async throws -> [String: String]? {
         let action = InboxAction.make(action: "deleteMemory", payload: ["memoryId": id])
-        return try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        return try adoptMemoryResponse(await sendActionWithSignatureRetry(action))
+    }
+
+    private func adoptMemoryResponse(_ response: [String: String]?) throws -> [String: String] {
+        if let id = response?["resolvedProposalId"],
+           let revision = response?["memoryReadbackRevision"].flatMap(Double.init),
+           installReadback(revision: revision, file: "memory_proposals.json", id: id) {
+            memoryProposals.removeAll { $0.id == id }
+            memoryProposalsSnapshotLoaded = true
+        }
+        if let id = response?["memoryId"], let json = response?["memoryJSON"],
+           let revision = response?["memoryReadbackRevision"].flatMap(Double.init) {
+            let row = try JSONDecoder().decode(MemoryRecord?.self, from: Data(json.utf8))
+            if installReadback(revision: revision, file: "memories.json", id: id) {
+                memories.removeAll { $0.id == id }
+                if let row { memories.insert(row, at: 0) }
+            }
+        }
+        return try requireSuccessfulActionResponse(response)
     }
 
     @discardableResult
@@ -1178,18 +1205,18 @@ extension iCloudSyncEngine {
             "itemId": itemId,
             "actionId": actionId,
         ])
-        let response = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
-        await refreshActivitySnapshot()
-        schedulePostMutationActivityRefresh()
-        return response
-    }
-
-    private func schedulePostMutationActivityRefresh() {
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            guard let self else { return }
-            await self.refreshActivitySnapshot()
+        let response = await sendActionWithSignatureRetry(action)
+        if let id = response?["inboxItemId"], let json = response?["inboxItemJSON"],
+           let revision = response?["inboxReadbackRevision"].flatMap(Double.init) {
+            let row = try JSONDecoder().decode(InboxItemRecord?.self, from: Data(json.utf8))
+            if installReadback(revision: revision, file: "inbox.json", id: id) {
+                if let index = inboxItems.firstIndex(where: { $0.id == id }) {
+                    if let row { inboxItems[index] = row } else { inboxItems.remove(at: index) }
+                } else if let row { inboxItems.insert(row, at: 0) }
+                inboxSnapshotLoaded = true
+            }
         }
+        return try adoptApprovalResponse(response)
     }
 
     @discardableResult
@@ -1305,6 +1332,7 @@ extension iCloudSyncEngine {
 
     // MARK: - Telegram control
     func changeTelegram(_ change: MobileTelegramChange) async throws -> MobileTelegramSnapshot {
+        let lifecycle = lifecycleGeneration
         let action: InboxAction
         switch change {
         case .disconnect:
@@ -1315,6 +1343,8 @@ extension iCloudSyncEngine {
               let recovered = try? JSONDecoder().decode(MobileTelegramSnapshot.self, from: Data(json.utf8)) else {
             throw SyncError.unsupported("The Mac did not return readable Telegram settings. Refresh before trying again.")
         }
+        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+        applyTelegramSnapshot(recovered)
         return recovered
     }
 
@@ -1440,13 +1470,6 @@ extension iCloudSyncEngine {
         serviceTier: String
     ) async throws -> MobileSurfaceSelectionReceipt {
         let lifecycle = lifecycleGeneration
-        let normalizedSurface = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let canonicalSurface = normalizedSurface == "missions" ? "workshop" : normalizedSurface
-        let selectionID = UUID()
-        pendingPhoneSurfaceModels[selectionID] = (canonicalSurface, SurfaceModelPref(
-            model: model, reasoningEffort: reasoningEffort,
-            serviceTier: serviceTier, providerId: providerId
-        ))
         let action = InboxAction.make(action: "configure_surface_selection", payload: [
             "surface": surface,
             "provider_id": providerId,
@@ -1454,25 +1477,21 @@ extension iCloudSyncEngine {
             "reasoning_effort": reasoningEffort,
             "service_tier": serviceTier,
         ])
-        do {
-            let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
-            guard lifecycle == lifecycleGeneration else { throw CancellationError() }
-            let receipt = try MobileSurfaceSelectionReceipt(response: result, expectedSurface: surface)
-            if receipt.isAcknowledged(by: surfaceModels[receipt.surface]) {
-                pendingPhoneSurfaceModels.removeValue(forKey: selectionID)
-            } else if pendingPhoneSurfaceModels[selectionID] != nil {
-                pendingPhoneSurfaceModels[selectionID] = (receipt.surface, SurfaceModelPref(
-                    model: receipt.model, reasoningEffort: receipt.reasoningEffort,
-                    serviceTier: receipt.serviceTier, providerId: receipt.providerID
-                ))
-            }
-            return receipt
-        } catch {
-            if lifecycle == lifecycleGeneration {
-                pendingPhoneSurfaceModels.removeValue(forKey: selectionID)
-            }
-            throw error
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+        let receipt = try MobileSurfaceSelectionReceipt(response: result, expectedSurface: surface)
+        guard let revision = result["modelReadbackRevision"].flatMap(Double.init) else {
+            throw SyncError.persistence("The Mac did not return the saved model selection revision.")
         }
+        let preference = SurfaceModelPref(
+            model: receipt.model, reasoningEffort: receipt.reasoningEffort,
+            serviceTier: receipt.serviceTier, providerId: receipt.providerID
+        )
+        for surface in receipt.surfaces where revision >= (surfaceModelRevisions[surface] ?? 0) {
+            surfaceModelRevisions[surface] = revision
+            surfaceModels[surface] = preference
+        }
+        return receipt
     }
 
     func setConnectorEnabled(id: String, enabled: Bool) async throws -> ConnectorRecord {
@@ -1484,6 +1503,7 @@ extension iCloudSyncEngine {
     }
 
     private func connectorMutation(action: String, id: String, enabled: Bool?) async throws -> ConnectorRecord {
+        let lifecycle = lifecycleGeneration
         var payload = ["id": id]
         if let enabled { payload["enabled"] = String(enabled) }
         let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
@@ -1496,6 +1516,8 @@ extension iCloudSyncEngine {
               enabled != nil || row.authState == "not_connected" else {
             throw SyncError.persistence("The Mac did not return confirmed connector settings. Refresh before trying again.")
         }
+        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+        applyConnectorSnapshot(connectors.filter { $0.id != id } + [row])
         return row
     }
 
@@ -1522,35 +1544,83 @@ extension iCloudSyncEngine {
     /// `beforeID`, or one whole message through `throughID`.
     func chatHistoryPage(sessionID: String, beforeID: String? = nil, throughID: String? = nil,
                          limit: Int = 80) async throws -> (messages: [ChatMessage], hasOlder: Bool) {
+        let lifecycle = lifecycleGeneration
         var payload = ["sessionId": sessionID, "limit": String(limit)]
         payload["beforeId"] = beforeID
         payload["throughId"] = throughID
         let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
             .make(action: "chat_history_page", payload: payload)))
         guard let raw = result["messages"] else { throw SyncError.persistence("The Mac did not return the messages.") }
-        let lifecycle = lifecycleGeneration
-        let messages = try await Task.detached(priority: .userInitiated) {
+        let (records, messages) = try await Task.detached(priority: .userInitiated) {
             let records = try JSONDecoder().decode([ChatMessageRecord].self, from: Data(raw.utf8))
-            return MacBridgeClient.projectChatRecords(records)
+            return (records, MacBridgeClient.projectChatRecords(records))
         }.value
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+        let generation = result["transcriptGeneration"].flatMap(Int.init)
+        if let current = chatTranscripts[sessionID]?.generation, let generation, generation < current {
+            throw CancellationError()
+        }
+        if beforeID != nil || throughID != nil, var current = chatTranscripts[sessionID] {
+            let ids = Set(messages.map(\.id))
+            let insertion = beforeID.flatMap(UUID.init(uuidString:)).flatMap { id in
+                current.messages.firstIndex { $0.id == id }
+            } ?? current.messages.endIndex
+            if beforeID != nil {
+                current.messages.insert(contentsOf: messages.filter { row in
+                    !current.messages.contains { $0.id == row.id }
+                }, at: insertion)
+                current.historyIDs.formUnion(ids)
+            } else {
+                for row in messages {
+                    if let index = current.messages.firstIndex(where: { $0.id == row.id }) {
+                        current.messages[index] = row
+                    }
+                }
+                current.historyIDs.formUnion(ids)
+            }
+            current.generation = generation
+            chatTranscripts[sessionID] = current
+        } else {
+            adoptChatTranscripts([sessionID: .init(records: records, messages: messages,
+                generation: generation, hasOlder: result["hasOlder"] == "true")], completeSnapshot: false)
+        }
         return (messages, result["hasOlder"] == "true")
     }
 
     /// The Mac's settings page, every row as the Mac reads it.
-    func appSettings() async throws -> [MobileAppSetting] {
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
-            .make(action: "app_settings", payload: [:])))
-        guard let raw = result["settings"] else { throw SyncError.persistence("The Mac did not return its settings.") }
-        return try JSONDecoder().decode([MobileAppSetting].self, from: Data(raw.utf8))
+    func refreshAppSettings() async {
+        guard !appSettingsLoading, appSettingsSaving.isEmpty else { return }
+        appSettingsLoading = true
+        let generation = appSettingsGeneration
+        defer { appSettingsLoading = false }
+        let lifecycle = lifecycleGeneration
+        do {
+            let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+                .make(action: "app_settings", payload: [:])))
+            guard let raw = result["settings"] else { throw SyncError.persistence("The Mac did not return its settings.") }
+            guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+            if generation != appSettingsGeneration { return }
+            appSettingRows = try JSONDecoder().decode([MobileAppSetting].self, from: Data(raw.utf8))
+            appSettingsFailure = nil
+        } catch { if lifecycle == lifecycleGeneration { appSettingsFailure = "The Mac's settings could not be read: \(error.localizedDescription)" } }
     }
 
-    /// One setting, set through the Mac page's own control; returns its read-back.
-    func setAppSetting(id: String, value: String) async throws -> MobileAppSetting {
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
-            .make(action: "app_setting_set", payload: ["id": id, "value": value])))
-        guard let raw = result["setting"] else { throw SyncError.persistence("The Mac did not return the saved setting.") }
-        return try JSONDecoder().decode(MobileAppSetting.self, from: Data(raw.utf8))
+    /// One setting, set through the Mac page's own control; adopts its read-back.
+    func setAppSetting(_ setting: MobileAppSetting, to value: String) async {
+        guard !appSettingsSaving.contains(setting.id), value != setting.value else { return }
+        appSettingsGeneration &+= 1
+        appSettingsSaving.insert(setting.id)
+        defer { appSettingsSaving.remove(setting.id) }
+        let lifecycle = lifecycleGeneration
+        do {
+            let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+                .make(action: "app_setting_set", payload: ["id": setting.id, "value": value])))
+            guard let raw = result["setting"] else { throw SyncError.persistence("The Mac did not return the saved setting.") }
+            guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+            let row = try JSONDecoder().decode(MobileAppSetting.self, from: Data(raw.utf8))
+            if let index = appSettingRows.firstIndex(where: { $0.id == row.id }) { appSettingRows[index] = row }
+            appSettingsFailure = nil
+        } catch { if lifecycle == lifecycleGeneration { appSettingsFailure = "\(setting.label) was not changed: \(error.localizedDescription)" } }
     }
 
     func helperAction(_ name: String, payload: [String: String]) async throws -> (MobileHelperEdit, [String: String]) {
@@ -1559,13 +1629,17 @@ extension iCloudSyncEngine {
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
         guard let raw = result["helper"] else { throw SyncError.persistence("The Mac did not return the saved helper.") }
         let helper = try JSONDecoder().decode(MobileHelperEdit.self, from: Data(raw.utf8))
-        guard let rawRow = result["helper_row"] else { throw SyncError.persistence("The Mac did not return the helper status.") }
-        var row = try JSONDecoder().decode(MobileHelperRow.self, from: Data(rawRow.utf8))
-        if result["run_id"] != nil { row.status = "Run queued." }
-        if var snapshot = helpersSnapshot {
-            if let index = snapshot.helpers.firstIndex(where: { $0.id == row.id }) { snapshot.helpers[index] = row }
-            else { snapshot.helpers.append(row) }
-            helpersSnapshot = snapshot
+        if let id = helper.id, (helper.revision ?? 0) >= max(helperDetails[id]?.revision ?? 0,
+            helpersSnapshot?.helpers.first(where: { $0.id == id })?.revision ?? 0) {
+            helperDetails[id] = helper
+        }
+        // Accept the action receipt independently of the broader refresh.
+        do {
+            guard let rawSnapshot = result["helpers_snapshot"] else { throw SyncError.persistence("The Mac did not return the helper status.") }
+            applyHelpersSnapshot(try JSONDecoder().decode(MobileHelpersSnapshot.self, from: Data(rawSnapshot.utf8)))
+            staleSnapshotGroups["helpers_agents"] = nil
+        } catch {
+            staleSnapshotGroups["helpers_agents"] = result["helpers_snapshot_error"] ?? error.localizedDescription
         }
         return (helper, result)
     }
@@ -1587,6 +1661,12 @@ extension iCloudSyncEngine {
             try JSONDecoder().decode(MobileAgentThread.self, from: Data(raw.utf8))
         }.value
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+        if (thread.lines.last?.at ?? 0) >= (agentThreads[id]?.lines.last?.at ?? 0) {
+            agentThreads[id] = thread
+            if let index = helpersSnapshot?.agents.firstIndex(where: { $0.id == id }) {
+                helpersSnapshot?.agents[index] = thread.agent.summary
+            }
+        }
         return thread
     }
 
@@ -1612,6 +1692,9 @@ extension iCloudSyncEngine {
                 merged.jobs[index] = job
             } else {
                 merged.jobs.append(job)
+            }
+            if snapshot.capturedAt >= (schedulerJobReceiptTimes.values.max() ?? 0) {
+                merged.mac_time_zone = snapshot.mac_time_zone
             }
             schedulerJobReceiptTimes[id] = snapshot.capturedAt
             schedulerSnapshot = merged

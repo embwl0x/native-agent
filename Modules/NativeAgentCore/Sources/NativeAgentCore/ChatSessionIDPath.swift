@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ChatSessionIDPath.swift` | `NativeAgentChatSessionID`: safe filename/path components preserving legacy colon IDs while refusing traversal and separators |
+
 /// Path safety for chat session ids used as filenames or directory names.
 ///
 /// Session ids intentionally allow `:` for existing Telegram legacy sessions

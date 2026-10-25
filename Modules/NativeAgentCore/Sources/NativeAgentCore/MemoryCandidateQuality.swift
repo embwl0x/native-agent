@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `MemoryCandidateQuality.swift` | `MemoryCandidateQuality`: shared durable-candidate hygiene and explicit incomplete-fragment rejection reasons |
+
 public enum MemoryCandidateQuality {
     /// The reason string the mid-thought fragment gate emits. Named because
     /// hygiene has to be able to single this one rule out (for example, the

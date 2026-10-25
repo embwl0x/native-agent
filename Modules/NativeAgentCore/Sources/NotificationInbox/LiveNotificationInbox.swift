@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `LiveNotificationInbox.swift` | Single physical-line reader and writer for inbox cards; actor mutations and caller-owned row edits share retention and archive-before-rewrite under the inbox flock |
 
 /// Single file owner for the live macOS notification inbox.
 ///
@@ -27,6 +28,8 @@ import PersistenceCore
 /// the uncapped overflow shelf beside the inbox (`inbox_archive.jsonl`, read
 /// by delegation reconciliation) BEFORE the trimmed feed is written, mirroring
 /// the studio journal. A shelf that cannot be written aborts the whole write.
+/// File policy: inbox and overflow shelf are excluded from local backup/export;
+/// the phone receives live-card projections. PrivacyMap: Notifications.
 public actor LiveNotificationInbox {
     /// Hard bound on physical lines in the live feed. Sized like the other hot
     /// feeds in the repo (chat receipts cap at 500) so it actually binds: the
@@ -698,7 +701,7 @@ public actor LiveNotificationInbox {
         if !plan.evicted.isEmpty {
             try appendToArchive(plan.evicted, forInbox: path)
         }
-        try write(plan.kept, to: path)
+        try writeRaw(plan.kept, to: path)
     }
 
     /// Append evicted physical lines to the uncapped shelf, byte-for-byte. Runs
@@ -770,7 +773,14 @@ public actor LiveNotificationInbox {
         return parts.map { Line(raw: $0, row: try? JSONValue.parse($0)) }
     }
 
-    public static func write(_ lines: [Line], to path: URL) throws {
+    /// Whole-file callers hold the inbox flock and preserve untouched physical
+    /// lines. They use the same retention/archive boundary as actor mutations.
+    public static func write(_ lines: [Data], to path: URL) throws {
+        try write(retaining: lines.map { Line(raw: $0, row: try? JSONValue.parse($0)) },
+                  to: path, now: Date())
+    }
+
+    private static func writeRaw(_ lines: [Line], to path: URL) throws {
         try FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(), withIntermediateDirectories: true
         )

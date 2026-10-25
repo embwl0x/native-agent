@@ -5,8 +5,6 @@ import Desk
 import TurnTrace
 import Procedures
 import MemoryV2
-import MCPDispatcher
-import KnowledgeGraph
 import PersonaEngine
 import ProviderRouting
 import TrustCenter
@@ -15,6 +13,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
+// Blueprint: | `SwiftToolDispatcher+WorkshopTools.swift` | `SwiftToolDispatcher`: `impl_workshop_submit`, `impl_workshop_status`, `impl_task_ledger_post` |
 
 // MARK: - Workshop and task ledger tools
 
@@ -32,37 +31,26 @@ extension SwiftToolDispatcher {
     private func workshopRunner() -> SwiftNativeWorkshopRunner {
         // TOOL-AWARE planner: inject THIS dispatcher's own tool catalog so a
         // chat-submitted execution plans against the same tools the chat loop
-        // sees, not only chat.synthesize (root cause fixed 2026-06-15). Capped
-        // to 40 to bound prompt size (the planner itself prefixes 30).
+        // sees, including their argument schemas for binding the task folder.
         SwiftNativeWorkshopRunner(
             root: dataRoot,
             planner: SwiftNativeWorkshopPlannerLLM(
+                dataRoot: dataRoot,
                 connectorActionsProvider: { [self] in
                     // The app's own tools stay out: Workshop executes on its
                     // own dispatcher, which does not carry them.
                     let schemas = ((try? await listAvailableToolSchemas()) ?? [])
                         .filter { !contributedToolNames.contains($0.name) }
                     return schemas.prefix(200).map { schema -> JSONValue in
-                        // Append arg names so the planner fills correct args
-                        // (e.g. shell needs `cmd`); `*` = required.
-                        var desc = schema.description
-                        if let obj = try? JSONSerialization.jsonObject(with: schema.parametersJSON) as? [String: Any],
-                           let props = obj["properties"] as? [String: Any], !props.isEmpty {
-                            let req = Set((obj["required"] as? [String]) ?? [])
-                            let args = props.keys.sorted().map { req.contains($0) ? "\($0)*" : $0 }.joined(separator: ", ")
-                            desc = "\(desc) [args: \(args)]"
-                        }
-                        return JSONValue.object([
+                        var entry: [String: JSONValue] = [
                             "id": .string(schema.name),
-                            "description": .string(desc),
-                        ])
+                            "description": .string(schema.description),
+                        ]
+                        entry["parameters"] = try? JSONValue.parse(schema.parametersJSON)
+                        return .object(entry)
                     }
                 },
-                lifecycleObserver: providerLifecycleObserver,
-                // Ledger rows follow the runner's root — a dispatcher built on
-                // a test dataRoot must not append to the live runs ledger
-                // (gpt-5.5 review BLOCKING, 2026-07-02).
-                runLedgerDataRoot: dataRoot)
+                lifecycleObserver: providerLifecycleObserver)
         )
     }
 

@@ -5,6 +5,7 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import Transcripts
+// Blueprint: | `SwiftToolDispatcher+HumanConversations.swift` | `HumanConversationSnapshot` struct |
 
 /// A read model over the existing index and transcript, never another session store.
 public struct HumanConversationSnapshot: Sendable {
@@ -73,25 +74,21 @@ public enum HumanConversationReader {
         catch { return ChatToolOutcome.failure(error: error, tool: "app") }
         let current = ChatToolSessionContext.verifiedSessionId == id
         let canReply = !current && snapshot.lastMessageID != nil && routeAvailable(snapshot.route)
-        // Each message shown is read under its own row's stamp (a bridge turn's
-        // door, every peer that steered it) through the one per-line path.
         var untrusted = false
-        let messages = snapshot.messages.suffix(limit).map { message -> JSONValue in
-            let row = object(message.extras)
-            var value: [String: JSONValue] = ["role": .string(message.role), "text": .string(String(message.content.prefix(6000))),
-                "timestamp": .string(message.timestamp), "message_id": row["id"] ?? .null,
-                "truncated": .bool(message.content.count > 6000)]
-            let metadata = object(row["metadata"])
-            let bridged = message.role == "user" && (string(object(metadata["origin"])["surface"])?.hasSuffix("-bridge") == true
-                || TurnEnvelope.fromPersistedMetadata(metadata["envelope"])?.surface.hasSuffix("-bridge") == true)
-            let stamp = ContactThread.stamp(id: string(row["id"]) ?? "", metadata: metadata)
-            let speakers = ContactThread.consume(mine: !bridged, source: stamp.source, steeredBy: stamp.steeredBy, text: message.content) {
-                PeerDataTaint.markConsumed(peer: $0, line: $1)
-            }
-            if !speakers.isEmpty {
-                let principals = speakers.map { PeerTrust.principal($0, dataRoot: dataRoot) }
-                if bridged { value["agent_id"] = .string(principals[0]) }
-                let trusted = principals.allSatisfy { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) }
+        let rows = snapshot.messages.suffix(limit).map {
+            ContactThread.Line(object($0.extras), role: $0.role, text: $0.content, timestamp: $0.timestamp)
+        }
+        let messages = ContactThread.project(rows, mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) }).map { line -> JSONValue in
+            var value: [String: JSONValue] = ["role": .string(line.role), "text": .string(String(line.text.prefix(6000))),
+                "timestamp": line.timestamp.map(JSONValue.string) ?? .null, "message_id": line.id.isEmpty ? .null : .string(line.id),
+                "stamp": line.stamp.json,
+                "truncated": .bool(line.text.count > 6000)]
+            if let speaker = line.speakers.first {
+                let principal = PeerTrust.principal(speaker, dataRoot: dataRoot)
+                let trusted = PeerTrust.ownerTrusts(principal, dataRoot: dataRoot)
+                let bridged = line.role == "user" && (string(object(line.metadata["origin"])["surface"])?.hasSuffix("-bridge") == true
+                    || TurnEnvelope.fromPersistedMetadata(line.metadata["envelope"])?.surface.hasSuffix("-bridge") == true)
+                if bridged { value["agent_id"] = .string(principal) }
                 value["untrusted_remote_data"] = .bool(!trusted)
                 untrusted = untrusted || !trusted
             }

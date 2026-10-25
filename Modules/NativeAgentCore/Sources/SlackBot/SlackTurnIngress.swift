@@ -1,14 +1,17 @@
 import Foundation
 import MacControl
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import PersistenceCore
 import PersonaEngine
+
+// Blueprint: | `SlackTurnIngress.swift` | `SlackSocketModeLoop.ifConfigured`: configured Slack ingress, engine-profiled chat and settled-turn signal wiring without forged signature authority |
 
 extension SlackSocketModeLoop {
     /// Why `ifConfigured` built nothing, said as the lane's Off reason: Socket
     /// Mode switched off in the saved Slack config, or Slack not connected.
-    public static func offReason(dataRoot: URL) -> String {
-        SlackSocketModeConfig.socketModeSwitchedOff(dataRoot: dataRoot)
+    public static func offReason(dataRoot: URL) throws -> String {
+        try SlackSocketModeConfig.socketModeSwitchedOff(dataRoot: dataRoot)
             ? "Socket Mode off" : "Slack not connected (no bot and app token)"
     }
 

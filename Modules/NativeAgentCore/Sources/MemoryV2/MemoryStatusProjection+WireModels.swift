@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MemoryStatusProjection+WireModels.swift` | memory status wire models |
 
 // Swift-native embeddings backend status payload. The field names preserve
 // the former daemon wire shape so existing UI/state decoding stays stable.
@@ -68,19 +69,6 @@ public struct EmbeddingsModelState: Codable, Hashable, Sendable {
         self.lastLoadedAt = lastLoadedAt; self.lastUnloadedAt = lastUnloadedAt; self.unloadReason = unloadReason
         self.loadCount = loadCount; self.unloadCount = unloadCount; self.cacheSize = cacheSize
         self.cacheMaxSize = cacheMaxSize
-    }
-}
-
-// Result envelope for embedding settings changes.
-public struct EmbeddingsToggleResult: Codable, Hashable, Sendable {
-    public var ok: Bool?
-    public var error: String?
-    public var detail: String?
-    public var status: EmbeddingsStatus
-
-    public init(ok: Bool?, error: String?, detail: String?, status: EmbeddingsStatus) {
-        self.ok = ok; self.error = error; self.detail = detail
-        self.status = status
     }
 }
 

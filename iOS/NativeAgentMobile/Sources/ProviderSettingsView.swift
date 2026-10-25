@@ -3,6 +3,7 @@
 // atomic surface selections and connection tests cross the authenticated action
 // channel and are accepted only after the Mac returns a matching verified tuple.
 import SwiftUI
+// Blueprint: | `ProviderSettingsView.swift` | `ProviderSettingsView` struct |
 
 /// Keeps the refresh button honest once its spinner stops: a failed provider
 /// snapshot refresh remains visible instead of looking like an empty success.
@@ -99,36 +100,13 @@ enum ProviderConnectionTestPresentation {
     }
 }
 
-/// A response may arrive after the user has picked another tuple, so only the
-/// request that still owns a surface may restore its former selection.
-enum ProviderSelectionRollbackPresentation {
-    struct Selection: Equatable {
-        let providerID: String
-        let modelID: String
-    }
-
-    static func rollback(
-        currentGeneration: UInt64,
-        requestGeneration: UInt64,
-        previous: Selection
-    ) -> Selection? {
-        currentGeneration == requestGeneration ? previous : nil
-    }
-
-    static func acceptReceipt(
-        _ receipt: MobileSurfaceSelectionReceipt,
-        currentGeneration: UInt64,
-        requestGeneration: UInt64
-    ) -> Selection? {
-        guard currentGeneration == requestGeneration else { return nil }
-        return Selection(providerID: receipt.providerID, modelID: receipt.model)
-    }
-}
-
-
 // MARK: - Main View
 
 struct ProviderSettingsView: View {
+    private struct Selection {
+        let providerID: String
+        let modelID: String
+    }
     private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairingStore: PairingStore
 
@@ -147,11 +125,6 @@ struct ProviderSettingsView: View {
         }
     }
 
-    // Active provider per surface (local UI state; saves on change)
-    @State private var activeSurface: [String: String] = [:]
-    @State private var requestedModel: [String: String] = [:]
-    @State private var pendingSurfaceReceipts: [String: MobileSurfaceSelectionReceipt] = [:]
-    @State private var selectionGeneration: [String: UInt64] = [:]
     @State private var configSheet: ProviderInfo? = nil
     @State private var statusText = ""
     @State private var isRefreshing = false
@@ -166,14 +139,6 @@ struct ProviderSettingsView: View {
 
     private var selectableProviders: [ProviderInfo] {
         providers.filter { $0.auth_status.eligible }
-    }
-
-    private var defaultProviderID: String {
-        selectableProviders.first?.provider_id ?? ""
-    }
-
-    private func selectableModels(for providerID: String) -> [ProviderModelInfo] {
-        providers.first(where: { $0.provider_id == providerID })?.models ?? []
     }
 
     var body: some View {
@@ -204,7 +169,6 @@ struct ProviderSettingsView: View {
             })
         }
         .onAppear {
-            seedActiveSurface()
             #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("-designDetail") { configSheet = providers.first }
             #endif
@@ -212,15 +176,8 @@ struct ProviderSettingsView: View {
                 Task {
                     _ = await iCloudBridge.shared.drainDeviceTransport()
                     await sync.refreshProviderControlsSnapshot()
-                    seedActiveSurface()
                 }
             }
-        }
-        .onChange(of: sync.providers) { _, _ in
-            seedActiveSurface()
-        }
-        .onChange(of: sync.surfaceModels) { _, _ in
-            seedActiveSurface()
         }
     }
 
@@ -274,7 +231,7 @@ struct ProviderSettingsView: View {
 
     /// One routing group and its exact provider/model pair.
     private func surfaceRow(_ surface: String) -> some View {
-        let providerID = activeSurface[surface] ?? defaultProviderID
+        let providerID = sync.surfaceModels[surface]?.providerId ?? ""
         let providerName = selectableProviders.first(where: { $0.provider_id == providerID })?.display_name
         return Menu {
             ForEach(selectableProviders) { provider in
@@ -312,7 +269,7 @@ struct ProviderSettingsView: View {
     /// The published model, by its display name when the provider lists it.
     private func modelLabel(for surface: String, providerID: String) -> String {
         let id = selectedModelLabel(for: surface)
-        guard let model = selectableModels(for: providerID).first(where: { $0.id == id }) else { return id }
+        guard let model = providers.first(where: { $0.provider_id == providerID })?.models.first(where: { $0.id == id }) else { return id }
         return ProviderWords.modelName(model)
     }
 
@@ -322,99 +279,29 @@ struct ProviderSettingsView: View {
         isRefreshing = true
         _ = await iCloudBridge.shared.drainDeviceTransport()
         let outcome = await iCloudSyncEngine.shared.refreshProviderControlsSnapshot()
-        seedActiveSurface()
         statusText = ProviderRefreshPresentation.statusText(for: outcome)
         isRefreshing = false
     }
 
-    private func seedActiveSurface() {
-        let synced = sync.trustPolicy?.providerPolicy?.activePerSurface ?? [:]
-        let readyProviderIds = Set(selectableProviders.map(\.provider_id))
-        for surface in renderedSurfaces {
-            if let receipt = pendingSurfaceReceipts[surface] {
-                guard receipt.isAcknowledged(by: sync.surfaceModels[surface]) else { continue }
-                pendingSurfaceReceipts.removeValue(forKey: surface)
-            }
-            if let providerId = sync.surfaceModels[surface]?.providerId,
-               readyProviderIds.contains(providerId) {
-                activeSurface[surface] = providerId
-                requestedModel[surface] = sync.surfaceModels[surface]?.model
-            } else if let providerId = synced[surface], readyProviderIds.contains(providerId) {
-                activeSurface[surface] = providerId
-                requestedModel[surface] = nil
-            } else {
-                activeSurface[surface] = defaultProviderID
-                requestedModel[surface] = nil
-            }
-        }
-    }
-
-    private func currentSelection(for surface: String) -> ProviderSelectionRollbackPresentation.Selection {
-        let providerID = activeSurface[surface] ?? defaultProviderID
-        let modelID = requestedModel[surface]
-            ?? sync.surfaceModels[surface]?.model
-            ?? ""
-        return .init(providerID: providerID, modelID: modelID)
-    }
-
-    private func submitSelection(
-        surface: String,
-        selection: ProviderSelectionRollbackPresentation.Selection
-    ) {
-        let previous = currentSelection(for: surface)
-        let requestGeneration = (selectionGeneration[surface] ?? 0) &+ 1
-        selectionGeneration[surface] = requestGeneration
-        pendingSurfaceReceipts.removeValue(forKey: surface)
-        sendSelection(
-            surface: surface,
-            selection: selection,
-            previous: previous,
-            requestGeneration: requestGeneration
-        )
-    }
-
-    private func sendSelection(
-        surface: String,
-        selection: ProviderSelectionRollbackPresentation.Selection,
-        previous: ProviderSelectionRollbackPresentation.Selection,
-        requestGeneration: UInt64
-    ) {
+    private func submitSelection(surface: String, selection: Selection) {
+        let preference = sync.surfaceModels[surface]
         Task {
             do {
                 guard !selection.modelID.isEmpty else {
                     throw NSError(
-                        domain: "ProviderSettingsView",
-                        code: -1,
+                        domain: "ProviderSettingsView", code: -1,
                         userInfo: [NSLocalizedDescriptionKey: "That provider has no selectable model."]
                     )
                 }
-                let preference = sync.surfaceModels[surface]
-                let receipt = try await iCloudSyncEngine.shared.configureSurfaceSelection(
+                try await sync.configureSurfaceSelection(
                     surface: surface,
                     providerId: selection.providerID,
                     model: selection.modelID,
                     reasoningEffort: preference?.reasoningEffort ?? "high",
                     serviceTier: preference?.serviceTier ?? "default"
                 )
-                guard let committed = ProviderSelectionRollbackPresentation.acceptReceipt(
-                    receipt, currentGeneration: selectionGeneration[surface] ?? 0,
-                    requestGeneration: requestGeneration
-                ) else { return }
-                activeSurface[surface] = committed.providerID
-                requestedModel[surface] = committed.modelID
-                pendingSurfaceReceipts[surface] = receipt
-                // The signed reply is already authoritative. Do not await a
-                // second refresh whose stale snapshot could race a newer pick.
-                seedActiveSurface()
-                statusText = "\(surfaceLabel(surface)) now uses \(receipt.model)."
+                statusText = "\(surfaceLabel(surface)) now uses \(selectedModelLabel(for: surface))."
             } catch {
-                guard let restored = ProviderSelectionRollbackPresentation.rollback(
-                    currentGeneration: selectionGeneration[surface] ?? 0,
-                    requestGeneration: requestGeneration,
-                    previous: previous
-                ) else { return }
-                activeSurface[surface] = restored.providerID
-                requestedModel[surface] = restored.modelID
                 statusText = "Error: \(error.localizedDescription)"
                 iOSSystemToastCenter.shared.push(
                     error: "Couldn't update \(surfaceLabel(surface)): \(error.localizedDescription)"
@@ -424,7 +311,6 @@ struct ProviderSettingsView: View {
     }
 
     private func selectedModelLabel(for surface: String) -> String {
-        if let requested = requestedModel[surface], !requested.isEmpty { return requested }
         return MobileProviderSurfaceModelMenuPresentation.label(
             for: surface,
             surfaceModels: sync.surfaceModels

@@ -63,15 +63,6 @@ extension ChatStore {
         queuedSendID: UUID? = nil,
         steer: Bool = false
     ) -> ChatSendDisposition {
-        if !MobileChatSelectionIntent.userChoseThisLaunch {
-            // The composer may retain the adopted main while a newer Mac
-            // anchor waits for its draft to be sent or cleared.
-            // With neither identity bound yet, the Mac creates the first session.
-            guard mainSessionID == selectedSessionID else {
-                errorBanner = "Waiting for the Mac's current chat to sync."
-                return .rejected
-            }
-        }
         guard (!text.isEmpty || !attachments.isEmpty), !isSwitchingSession else { return .rejected }
         let attachments = ChatAttachmentTypeResolver.submittingSpeech(attachments, text: text)
         if isLoading, !steer {
@@ -167,6 +158,10 @@ extension ChatStore {
         // pressed while the send was still crossing to the Mac carried no run
         // id at all and the Mac treated it as a legacy unscoped cancel.
         let correlationID = queuedSendID?.uuidString ?? UUID().uuidString
+        for index in messages.indices where messages[index].id == appendedUserId || messages[index].id == placeholderId {
+            messages[index].runId = correlationID
+            messages[index].awaitingMacTranscript = true
+        }
         let preparedMessage = queuedSends.first { $0.id == queuedSendID }?.preparedMessage
 
         if !steer { sendTask?.cancel() }
@@ -183,7 +178,6 @@ extension ChatStore {
             appendedUserId: appendedUserId
         )
         pendingICloudPlaceholders[correlationID] = placeholderId
-        PhoneTurnActivity.shared.sent(correlationID)
         pendingSendArgs[correlationID] = pendingArgs
         // Durable from the moment it leaves the composer: an app closed here
         // must come back to the same unfinished exchange, not a blank chat.
@@ -237,6 +231,9 @@ extension ChatStore {
                         // pre-installed mapping rather than leaving two.
                         pendingICloudPlaceholders.removeValue(forKey: correlationID)
                         pendingSendArgs.removeValue(forKey: correlationID)
+                        for index in messages.indices where messages[index].runId == correlationID {
+                            messages[index].runId = messageId
+                        }
                     }
                     pendingICloudPlaceholders[messageId] = placeholderId
                     renamePendingExchange(from: correlationID, to: messageId)

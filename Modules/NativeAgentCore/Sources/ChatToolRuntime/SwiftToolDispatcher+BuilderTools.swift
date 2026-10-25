@@ -1,23 +1,52 @@
 import AgentWorkspace
+import Darwin
 import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
 import TurnTrace
+// Blueprint: | `SwiftToolDispatcher+BuilderTools.swift` | `SwiftToolDispatcher`: `builderSourceRepoRoot`, `builderWorkspaceRoot`, `builderAllowedRoots`; `builderLaunch`, the one way a command line starts (sandbox, starting folder, SwiftPM shim) for the shell tools and a part's program; builder and detached installer terminal audits run in SubprocessWork settlement |
 
 extension SwiftToolDispatcher {
+    /// Preserve the owner's failure contract; add operation evidence only for
+    /// errors that have not supplied a cause or recovery lever themselves.
+    static func builderFailureFields(
+        _ error: any Error, tool: String, reason: String, effects: ToolFailureError.Effects,
+        owner: String, instruction: String
+    ) -> [String: JSONValue] {
+        let result = ChatToolOutcome.failure(error: error, tool: tool, effects: effects)
+        var fields = result.objectValue!
+        fields["tool"] = .string(tool)
+        if fields["reason"] == .string("dispatch_error") {
+            fields["reason"] = .string(reason)
+            fields["failure_code"] = .string(reason)
+            if !(error is ToolFailureError) {
+                let cause = error as NSError
+                fields["cause"] = .object(["domain": .string(cause.domain), "code": .int(Int64(cause.code))])
+                fields["detail"] = .string(ChatToolOutcome.errorMessage(
+                    ToolFailureError(error.localizedDescription, effects: effects)))
+            }
+        }
+        if fields["remedy"] == nil {
+            fields["remedy"] = builderFailureRemedy(owner: owner, instruction: instruction)
+        }
+        return fields
+    }
+
+    /// The owner and its plain fix; a builder failure never routes to another
+    /// coding-agent call to repair itself (circular, and absent without Codex).
+    static func builderFailureRemedy(owner: String, instruction: String) -> JSONValue {
+        Repair.remedy(owner: owner, nextCall: nil, tap: instruction, instruction: "Tell the person: \(owner). \(instruction)")
+    }
+
     /// Conventional source checkout retained only as one validated candidate.
     /// Public installs do not need this path in order to execute ordinary work.
     static let nativeAgentRepoRoot: String =
@@ -261,17 +290,14 @@ extension SwiftToolDispatcher {
             "reason": .string("xcodebuild_requires_full_mac_posture"),
             "sandboxed": .bool(true),
             "cmd": .string(cmd),
-            "error": .string(
-                "xcodebuild cannot run from a sandboxed posture. It always resolves the "
-                + "package graph, which spawns its own sandbox-exec, and macOS cannot nest "
-                + "sandbox profiles — so it fails with 'sandbox_apply: Operation not permitted' "
-                + "(exit 74) no matter which flags are passed. It is not granted an exception, "
-                + "because an .xcodeproj can declare a Run Script build phase and would then "
-                + "execute arbitrary shell outside the sandbox. "
-                + "To run xcodebuild, switch the Trust Center to the Full Mac posture. "
-                + "SwiftPM is unaffected: `swift build`, `swift test` and `swift run` all work "
-                + "from here, and swift_build / swift_test remain available."
+            "detail": .string(
+                "xcodebuild resolves packages in its own sandbox; macOS blocks nested profiles "
+                + "('sandbox_apply: Operation not permitted', exit 74), regardless of flags. "
+                + "It has no sandbox exception: project build scripts can run arbitrary shell. "
+                + "SwiftPM (`swift build`, `swift test`, `swift run`; swift.build / swift.test) remains available."
             ),
+            "remedy": Repair.why(owner: "Trust posture", tap: "Trust Center → Full Mac",
+                instruction: "The owner can select Full Mac in Trust Center to allow xcodebuild."),
         ])
     }
 
@@ -674,6 +700,8 @@ extension SwiftToolDispatcher {
         entry: [String: Any],
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> (url: URL, error: String?) {
+        // Redacted JSON receipts and installer logs: local evidence, excluded
+        // from backup/export/phone sync; PrivacyMap: builder_audit.
         let auditDir = dataRoot
             .appendingPathComponent("builder_audit", isDirectory: true)
         let auditURL = auditDir.appendingPathComponent("\(runId).json")
@@ -910,6 +938,8 @@ extension SwiftToolDispatcher {
     /// Create (idempotently) the shim directory and return it, or nil if it could
     /// not be built. Failing to nil is fail-SAFE: the spawn keeps its sandbox and
     /// a SwiftPM command fails loudly, rather than silently running unconfined.
+    /// Executable shim/staging files live in OS temp, outside backup/export/
+    /// phone sync and the data-root PrivacyMap, like this owner's patch text.
     static func builderSwiftPMShimDirectory(baseDirectory: URL? = nil) -> URL? {
         guard let realSwift = builderRealSwiftPath() else { return nil }
         let fm = FileManager.default
@@ -1142,6 +1172,43 @@ extension SwiftToolDispatcher {
         return .workspaceWrite
     }
 
+    /// How a command line starts, decided once for every caller (the shell
+    /// tools and a part's program): the sandbox Trust selects, the folder it
+    /// may start in, and the SwiftPM shim first on PATH inside the sandbox.
+    /// Nil when that folder is not one the command may start in.
+    struct BuilderLaunch: Sendable {
+        let mode: BuilderShellSandboxMode
+        let executable: String
+        let arguments: [String]
+        let cwd: String
+        let pathPrefix: String?
+    }
+
+    static func builderLaunch(executable: String, args: [String], cwd: String, dataRoot: URL) async -> BuilderLaunch? {
+        // The workspace is infrastructure, not a model-created side effect.
+        // Launch prepares it, and this closes the race for headless/tests.
+        _ = try? NativeAgentWorkspaceRoot.prepare(dataRoot: dataRoot)
+        // Resolve the effective confinement posture before cwd validation.
+        // Full Mac YOLO deliberately removes the workspace wrapper, so it must
+        // also be able to start in a user-selected external project. Ordinary
+        // modes retain the canonical workspace/source-checkout boundary.
+        let mode = await builderShellSandboxMode(dataRoot: dataRoot)
+        guard let resolvedCwd = builderNormalizeCwd(cwd, dataRoot: dataRoot, allowOutsideWorkspace: mode == .off) else { return nil }
+        // U4 Wave B: wrap the spawn in sandbox-exec (workspace-scoped writes)
+        // unless the kill switch is set. sandbox-exec EXEC-replaces into the
+        // target, so the pid/pgid a watchdog signals is the real command.
+        //
+        // ALL builder tools are sandboxed: containment is only as strong as its
+        // weakest tool, so no builder tool gets an unsandboxed lane that a
+        // sandboxed shell/apply_patch could poison and then call.
+        guard mode != .off else {
+            return BuilderLaunch(mode: mode, executable: executable, arguments: args, cwd: resolvedCwd, pathPrefix: nil)
+        }
+        let profile = mode == .developerFullMac ? builderDeveloperSandboxProfile(dataRoot: dataRoot) : builderSandboxProfile(dataRoot: dataRoot)
+        return BuilderLaunch(mode: mode, executable: "/usr/bin/sandbox-exec", arguments: ["-p", profile, executable] + args,
+                             cwd: resolvedCwd, pathPrefix: builderSwiftPMShimDirectory()?.path)
+    }
+
     static func runShellLikeProcess(
         toolName: String,
         executable: String,
@@ -1171,30 +1238,16 @@ extension SwiftToolDispatcher {
         // live. The envelope is unchanged. Agent-host command runs only.
         onStdoutLine: (@Sendable (String) -> Void)? = nil
     ) async -> JSONValue {
-        // The workspace is infrastructure, not a model-created side effect.
-        // Launch prepares it, and this closes the race for headless/tests.
-        _ = try? NativeAgentWorkspaceRoot.prepare(dataRoot: dataRoot)
-
         // Pre-allocate runId + started timestamp BEFORE any validation so a
         // pre-spawn failure still produces an audit receipt. Audit fail-open
         // is what made the original review NEEDS_FIX list.
         let runId = UUID().uuidString
         let started = Date()
 
-        // Resolve the effective confinement posture before cwd validation.
-        // Full Mac YOLO deliberately removes the workspace wrapper, so it must
-        // also be able to start in a user-selected external project. Ordinary
-        // modes retain the canonical workspace/source-checkout boundary.
-        let sandboxMode: BuilderShellSandboxMode = await Self.builderShellSandboxMode(dataRoot: dataRoot)
-
         // Normalize and bound-check cwd. On failure: write a pre-spawn
         // audit envelope, then return a clean denied envelope (carry the
         // audit_error if the write itself failed so it's visible).
-        guard let resolvedCwd = builderNormalizeCwd(
-            cwd,
-            dataRoot: dataRoot,
-            allowOutsideWorkspace: sandboxMode == .off
-        ) else {
+        guard let launch = await builderLaunch(executable: executable, args: args, cwd: cwd, dataRoot: dataRoot) else {
             let auditEntry: [String: Any] = [
                 "toolName": toolName,
                 "runId": runId,
@@ -1227,29 +1280,12 @@ extension SwiftToolDispatcher {
         }
 
         let clampedTimeout = builderEffectiveTimeoutSeconds(timeoutSeconds)
-        let timedOut = AtomicFlag()
 
-        // U4 Wave B: wrap the spawn in sandbox-exec (workspace-scoped writes)
-        // unless the kill switch is set or the caller is a fixed-argv escape
-        // hatch such as swift_build/swift_test. sandbox-exec EXEC-replaces into
-        // the target, so the pid/pgid the timeout watchdog signals is the real
-        // command — the kill machinery below is unaffected.
-        //
-        // ALL builder tools are sandboxed: containment is only as strong as its
-        // weakest tool, so no builder tool gets an unsandboxed lane that a
-        // sandboxed shell/apply_patch could poison and then call.
+        let sandboxMode = launch.mode, resolvedCwd = launch.cwd
         let sandboxed = sandboxMode != .off
         let process = Process()
-        if sandboxed {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
-            let profile = sandboxMode == .developerFullMac
-                ? Self.builderDeveloperSandboxProfile(dataRoot: dataRoot)
-                : Self.builderSandboxProfile(dataRoot: dataRoot)
-            process.arguments = ["-p", profile, executable] + args
-        } else {
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = args
-        }
+        process.executableURL = URL(fileURLWithPath: launch.executable)
+        process.arguments = launch.arguments
 
         // Environment. SwiftPM nesting shim, only relevant when we DID wrap: `sandbox_apply` refuses to nest, and SwiftPM
         //     self-sandboxes its manifest compile, so ANY `swift build/test/run/
@@ -1275,9 +1311,9 @@ extension SwiftToolDispatcher {
             )
         }
         let resolvedCompatRewrites = effectiveCompatRewrites
-        if sandboxed, let shimDir = Self.builderSwiftPMShimDirectory() {
+        if let shimDir = launch.pathPrefix {
             let existingPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-            env["PATH"] = shimDir.path + ":" + existingPath
+            env["PATH"] = shimDir + ":" + existingPath
         }
         process.environment = env
         process.currentDirectoryURL = URL(fileURLWithPath: resolvedCwd)
@@ -1295,7 +1331,7 @@ extension SwiftToolDispatcher {
         let stdoutBuf = BoundedBuffer(cap: 16 * 1024 * 1024, onLine: onStdoutLine)
         let stderrBuf = BoundedBuffer(cap: 16 * 1024 * 1024)
 
-        func spawnFailure(_ error: Error) -> JSONValue {
+        @Sendable func spawnFailure(_ error: any Error) -> JSONValue {
             let spawnAudit: [String: Any] = [
                 "toolName": toolName,
                 "runId": runId,
@@ -1303,7 +1339,7 @@ extension SwiftToolDispatcher {
                 "completedAt": ISO8601DateFormatter().string(from: Date()),
                 "status": "failed_pre_spawn",
                 "reason": "spawn_failed",
-                "detail": String(describing: error),
+                "detail": ChatToolOutcome.errorMessage(error),
                 "cwd": resolvedCwd,
                 "executable": executable,
                 "args": args,
@@ -1311,17 +1347,16 @@ extension SwiftToolDispatcher {
                 "outer_sandbox_policy": "policy",
             ]
             let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: spawnAudit, dataRoot: dataRoot)
-            var env: [String: JSONValue] = [
-                "status": .string("failed"),
-                "effects": .string("none"),
-                "tool": .string(toolName),
-                "reason": .string("spawn_failed"),
-                "detail": .string(String(describing: error)),
+            var env = Self.builderFailureFields(error,
+                tool: toolName, reason: "spawn_failed", effects: .none,
+                owner: "process launch for \(executable) in \(resolvedCwd)",
+                instruction: "Repair the reported executable, working-directory or pipe error before another command. Nothing ran.")
+            env.merge([
                 "runId": .string(runId),
                 "sandboxed": .bool(sandboxed),
                 "outer_sandbox_policy": .string("policy"),
                 "audit_path": .string(auditURL.path),
-            ]
+            ], uniquingKeysWith: { _, receipt in receipt })
             if let auditErr { env["audit_error"] = .string(auditErr) }
             return .object(env)
         }
@@ -1337,168 +1372,134 @@ extension SwiftToolDispatcher {
                 throw error
             }
         } catch {
-            return spawnFailure(error)
+            return await settle { spawnFailure(error) }
         }
 
-        let launchedTree = LaunchedTreeBox()
-        let cancelled = AtomicFlag()
-        // Interrupt first, as a person at the terminal would, then terminate.
-        let interruptRun: @Sendable () -> Void = {
-            let pid = process.processIdentifier
-            guard pid > 0 else { return }
-            Self.interruptThenTerminate(ProcessTreeReaper.snapshot(rootPID: pid, retaining: launchedTree.value), stillRunning: { process.isRunning })
-        }
-        return await withTaskCancellationHandler {
-        await withCheckedContinuation { (cont: CheckedContinuation<JSONValue, Never>) in
-            let resumed = ResumeGuard()
-
-            process.terminationHandler = { proc in
-                // Settle anything the command backgrounded BEFORE returning, so
-                // nothing of it outlives this turn or the directory it ran in.
-                if reapDescendantsOnExit || cancelled.isSet, let tree = launchedTree.value { Self.reapLaunchedTree(tree) }
-                // The direct child exiting does NOT guarantee EOF — a
-                // backgrounded grandchild can inherit the write end and keep it
-                // open. The shared drains capture buffered bytes and stop
-                // without waiting for EOF.
-                stdoutDrain.stopAndWait()
-                stderrDrain.stopAndWait()
-                stdoutBuf.finishLines()
-                try? stdout.fileHandleForReading.close()
-                try? stderr.fileHandleForReading.close()
-
-                let stdoutText = String(decoding: stdoutBuf.data, as: UTF8.self)
-                let stderrText = String(decoding: stderrBuf.data, as: UTF8.self)
-                let pipeTruncated = stdoutBuf.truncated || stderrBuf.truncated
-                let processExitCode = proc.terminationStatus
-                let maskedExitCode = processExitCode == 0
-                    ? builderMaskedExitCode(stdout: stdoutText, stderr: stderrText)
-                    : nil
-                let exitCode = maskedExitCode ?? processExitCode
-                let durationMs = Int(Date().timeIntervalSince(started) * 1000)
-                let status = cancelled.isSet ? "cancelled" : exitIsAnswer ? "completed"
-                    : timedOut.isSet ? "timed_out" : (exitCode == 0 ? "completed" : "failed")
-
-                var auditEntry: [String: Any] = [
-                    "toolName": toolName,
-                    "runId": runId,
-                    "createdAt": ISO8601DateFormatter().string(from: started),
-                    "completedAt": ISO8601DateFormatter().string(from: Date()),
-                    "status": status,
-                    "durationMs": durationMs,
-                    "timeoutSecondsEffective": clampedTimeout,
-                    "timedOut": timedOut.isSet,
-                    "exitCode": Int(exitCode),
-                    "processExitCode": Int(processExitCode),
-                    "cwd": resolvedCwd,
-                    "executable": executable,
-                    "args": args,
-                    "stdout_len": stdoutText.count,
-                    "stderr_len": stderrText.count,
-                    "stdout": stdoutText,
-                    "stderr": stderrText,
-                    "pipe_truncated": pipeTruncated,
-                    "sandboxed": sandboxed,
-                    "sandbox_mode": sandboxMode.rawValue,
-                    "outer_sandbox_policy": "policy",
-                ]
-                if let sourcePayloadForAudit { auditEntry["sourcePayload"] = sourcePayloadForAudit }
-                if timedOut.isSet { auditEntry["reason"] = "watchdog_timeout" }
-                if let maskedExitCode {
-                    auditEntry["masked_exit_detected"] = true
-                    auditEntry["masked_exit_code"] = Int(maskedExitCode)
-                    auditEntry["reason"] = "masked_subcommand_exit"
-                }
-                if !resolvedCompatRewrites.isEmpty {
-                    auditEntry["compat_rewrites"] = resolvedCompatRewrites
-                }
-                let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
-
-                // Envelope-side truncation cap (~32KB each). Head+tail, NOT
-                // head-only: build/test errors land at the END of the stream, so
-                // a bare .prefix(32K) kept the progress noise and dropped the
-                // errors — blinding her on any build that outran the cap. Keep
-                // 8KB head (command echo + first/root-cause error) + 24KB tail
-                // (final errors + test summary + exit). Same budget, errors survive.
-                let (envStdout, envStdoutTruncated) = SwiftToolDispatcher.headTailPreserve(
-                    stdoutText, headBudget: 8_192, tailBudget: 24_576)
-                let (envStderr, envStderrTruncated) = SwiftToolDispatcher.headTailPreserve(
-                    stderrText, headBudget: 8_192, tailBudget: 24_576)
-
-                guard resumed.tryResume() else { return }
-                var envelope: [String: JSONValue] = [
-                    "status": .string(status),
-                    "tool": .string(toolName),
-                    "runId": .string(runId),
-                    "exit_code": .int(Int64(exitCode)),
-                    "process_exit_code": .int(Int64(processExitCode)),
-                    "stdout": .string(envStdout),
-                    "stderr": .string(envStderr),
-                    "durationMs": .int(Int64(durationMs)),
-                    "timeout_seconds_effective": .int(Int64(clampedTimeout)),
-                    "timed_out": .bool(timedOut.isSet),
-                    "cwd": .string(resolvedCwd),
-                    "sandboxed": .bool(sandboxed),
-                    "sandbox_mode": .string(sandboxMode.rawValue),
-                    "outer_sandbox_policy": .string("policy"),
-                    "audit_path": .string(auditURL.path),
-                ]
-                if let maskedExitCode {
-                    if !exitIsAnswer { envelope["reason"] = .string("masked_subcommand_exit") }
-                    envelope["detail"] = .string("The process exited 0, but its output reported EXIT: \(maskedExitCode)"
-                        + (exitIsAnswer ? ", so exit_code is \(maskedExitCode)." : ". Treating the tool call as failed."))
-                    envelope["masked_exit_detected"] = .bool(true)
-                    envelope["masked_exit_code"] = .int(Int64(maskedExitCode))
-                }
-                // What a person reads on the row: it ran, and what it answered.
-                if exitIsAnswer {
-                    envelope["summary"] = .string("Ran · exit \(exitCode)" + (timedOut.isSet ? " · timed out after \(clampedTimeout) s" : ""))
-                }
-                if timedOut.isSet {
-                    if !exitIsAnswer { envelope["reason"] = .string("watchdog_timeout") }
-                    envelope["detail"] = .string("The process exceeded the effective \(clampedTimeout)-second builder timeout and its process tree was terminated.")
-                }
-                if !resolvedCompatRewrites.isEmpty {
-                    envelope["compat_rewrites"] = .array(resolvedCompatRewrites.map { .string($0) })
-                }
-                if envStdoutTruncated || envStderrTruncated || pipeTruncated {
-                    envelope["_truncated"] = .bool(true)
-                }
-                if let auditErr { envelope["audit_error"] = .string(auditErr) }
-                cont.resume(returning: .object(envelope))
+        return await SubprocessWork(process).run(
+            timeoutSeconds: clampedTimeout, reapDescendantsOnExit: reapDescendantsOnExit
+        ) { exit in
+            try? stdout.fileHandleForWriting.close()
+            try? stderr.fileHandleForWriting.close()
+            // The direct child exiting does NOT guarantee EOF — a
+            // backgrounded grandchild can inherit the write end and keep it
+            // open. The shared drains capture buffered bytes and stop
+            // without waiting for EOF.
+            stdoutDrain.stopAndWait()
+            stderrDrain.stopAndWait()
+            stdoutBuf.finishLines()
+            try? stdout.fileHandleForReading.close()
+            try? stderr.fileHandleForReading.close()
+            if let error = exit.launchError {
+                return spawnFailure(ToolFailureError(error, effects: .none, code: "spawn_failed"))
             }
 
-            do {
-                try process.run()
-                // Taken here, while the child is alive and leads its own
-                // group: after it exits its descendants are reparented and
-                // cannot be found from it any more.
-                ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(process.processIdentifier)
-                launchedTree.set(ProcessTreeReaper.snapshot(rootPID: process.processIdentifier))
-                // Cancelled before the run existed: interrupt it now.
-                if cancelled.isSet { interruptRun() }
-                try? stdout.fileHandleForWriting.close()
-                try? stderr.fileHandleForWriting.close()
-            } catch {
-                stdoutDrain.stopAndWait()
-                stderrDrain.stopAndWait()
-                try? stdout.fileHandleForWriting.close()
-                try? stderr.fileHandleForWriting.close()
-                try? stdout.fileHandleForReading.close()
-                try? stderr.fileHandleForReading.close()
-                guard resumed.tryResume() else { return }
-                cont.resume(returning: spawnFailure(error))
-                return
-            }
+            let stdoutText = String(decoding: stdoutBuf.data, as: UTF8.self)
+            let stderrText = String(decoding: stderrBuf.data, as: UTF8.self)
+            let pipeTruncated = stdoutBuf.truncated || stderrBuf.truncated
+            let processExitCode = exit.code
+            let maskedExitCode = processExitCode == 0
+                ? builderMaskedExitCode(stdout: stdoutText, stderr: stderrText)
+                : nil
+            let exitCode = maskedExitCode ?? processExitCode
+            let durationMs = Int(Date().timeIntervalSince(started) * 1000)
+            // A launched shell timeout is command data; an explicit Stop is cancellation.
+            let timeoutIsAnswer = exitIsAnswer && exit.launched && exit.timedOut
+            let status = exit.stopped && !timeoutIsAnswer ? "stopped" : exitIsAnswer || exitCode == 0 ? "completed" : "failed"
 
-            armSubprocessTimeout(
-                process: process,
-                timeoutSeconds: clampedTimeout,
-                onTimeout: { timedOut.set() }
-            )
-        }
-        } onCancel: {
-            cancelled.set()
-            if process.isRunning { interruptRun() }
+            var auditEntry: [String: Any] = [
+                "toolName": toolName,
+                "runId": runId,
+                "createdAt": ISO8601DateFormatter().string(from: started),
+                "completedAt": ISO8601DateFormatter().string(from: Date()),
+                "status": status,
+                "durationMs": durationMs,
+                "timeoutSecondsEffective": clampedTimeout,
+                "timedOut": exit.timedOut,
+                "exitCode": Int(exitCode),
+                "processExitCode": Int(processExitCode),
+                "cwd": resolvedCwd,
+                "executable": executable,
+                "args": args,
+                "stdout_len": stdoutText.count,
+                "stderr_len": stderrText.count,
+                "stdout": stdoutText,
+                "stderr": stderrText,
+                "pipe_truncated": pipeTruncated,
+                "sandboxed": sandboxed,
+                "sandbox_mode": sandboxMode.rawValue,
+                "outer_sandbox_policy": "policy",
+            ]
+            if let sourcePayloadForAudit { auditEntry["sourcePayload"] = sourcePayloadForAudit }
+            if exit.stopped { auditEntry["reason"] = exit.timedOut ? "watchdog_timeout" : "stopped" }
+            if let maskedExitCode {
+                auditEntry["masked_exit_detected"] = true
+                auditEntry["masked_exit_code"] = Int(maskedExitCode)
+                if !exit.stopped { auditEntry["reason"] = "masked_subcommand_exit" }
+            }
+            if !resolvedCompatRewrites.isEmpty {
+                auditEntry["compat_rewrites"] = resolvedCompatRewrites
+            }
+            let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
+
+            // Envelope-side truncation cap (~32KB each). Head+tail, NOT
+            // head-only: build/test errors land at the END of the stream, so
+            // a bare .prefix(32K) kept the progress noise and dropped the
+            // errors — blinding her on any build that outran the cap. Keep
+            // 8KB head (command echo + first/root-cause error) + 24KB tail
+            // (final errors + test summary + exit). Same budget, errors survive.
+            let (envStdout, envStdoutTruncated) = SwiftToolDispatcher.headTailPreserve(
+                stdoutText, headBudget: 8_192, tailBudget: 24_576)
+            let (envStderr, envStderrTruncated) = SwiftToolDispatcher.headTailPreserve(
+                stderrText, headBudget: 8_192, tailBudget: 24_576)
+
+            var envelope: [String: JSONValue] = [
+                "status": .string(status),
+                "tool": .string(toolName),
+                "runId": .string(runId),
+                "exit_code": .int(Int64(exitCode)),
+                "process_exit_code": .int(Int64(processExitCode)),
+                "stdout": .string(envStdout),
+                "stderr": .string(envStderr),
+                "durationMs": .int(Int64(durationMs)),
+                "timeout_seconds_effective": .int(Int64(clampedTimeout)),
+                "timed_out": .bool(exit.timedOut),
+                "ran": .bool(exit.launched),
+                "cwd": .string(resolvedCwd),
+                "sandboxed": .bool(sandboxed),
+                "sandbox_mode": .string(sandboxMode.rawValue),
+                "outer_sandbox_policy": .string("policy"),
+                "audit_path": .string(auditURL.path),
+            ]
+            if let maskedExitCode {
+                if !exitIsAnswer { envelope["reason"] = .string("masked_subcommand_exit") }
+                envelope["detail"] = .string("The process exited 0, but its output reported EXIT: \(maskedExitCode)"
+                    + (exitIsAnswer ? ", so exit_code is \(maskedExitCode)." : ". Treating the tool call as failed."))
+                envelope["masked_exit_detected"] = .bool(true)
+                envelope["masked_exit_code"] = .int(Int64(maskedExitCode))
+            }
+            // What a person reads on the row: it ran, and what it answered.
+            if exitIsAnswer {
+                envelope["summary"] = .string(exit.launched
+                    ? "Ran · exit \(exitCode)" + (exit.timedOut ? " · timed out after \(clampedTimeout) s" : "")
+                    : "Stopped before launch")
+            }
+            if exit.timedOut {
+                if !exitIsAnswer { envelope["reason"] = .string("watchdog_timeout") }
+                envelope["detail"] = .string("The process exceeded the effective \(clampedTimeout)-second builder timeout and its process tree was terminated.")
+            } else if exit.stopped {
+                envelope["reason"] = .string("stopped")
+                envelope["detail"] = .string(exit.launched
+                    ? "Stopped the process tree. Captured output is saved in the audit; any changes already made remain."
+                    : "Stopped before launch. Nothing ran.")
+            }
+            if !resolvedCompatRewrites.isEmpty {
+                envelope["compat_rewrites"] = .array(resolvedCompatRewrites.map { .string($0) })
+            }
+            if envStdoutTruncated || envStderrTruncated || pipeTruncated {
+                envelope["_truncated"] = .bool(true)
+            }
+            if let auditErr { envelope["audit_error"] = .string(auditErr) }
+            return .object(envelope)
         }
     }
 
@@ -1955,15 +1956,14 @@ extension SwiftToolDispatcher {
                 "tmpPath": tmpURL.path,
             ]
             let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: preSpawnAudit, dataRoot: dataRoot)
-            var env: [String: JSONValue] = [
-                "status": .string("failed"),
-                "effects": .string("none"),
-                "tool": .string("apply_patch"),
-                "reason": .string("apply_patch_tmp_write_failed"),
-                "detail": .string(String(describing: error)),
+            var env = Self.builderFailureFields(error,
+                tool: "apply_patch", reason: "apply_patch_tmp_write_failed", effects: .none,
+                owner: tmpURL.path,
+                instruction: "Repair temporary patch storage at the reported path. The patch was not applied.")
+            env.merge([
                 "runId": .string(runId),
                 "audit_path": .string(auditURL.path),
-            ]
+            ], uniquingKeysWith: { _, receipt in receipt })
             if let auditErr { env["audit_error"] = .string(auditErr) }
             return .object(env)
         }
@@ -2071,7 +2071,7 @@ extension SwiftToolDispatcher {
         )
     }
 
-    static func impl_install_app(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) -> JSONValue {
+    static func impl_install_app(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> JSONValue {
         let runId = UUID().uuidString
         let started = Date()
         guard let repo = builderSourceRepoRoot(dataRoot: dataRoot) else {
@@ -2096,29 +2096,31 @@ extension SwiftToolDispatcher {
             .appendingPathComponent("\(runId)-install_app.log")
 
         guard FileManager.default.fileExists(atPath: script.path) else {
-            let auditEntry: [String: Any] = [
-                "toolName": "install_app",
-                "runId": runId,
-                "createdAt": ISO8601DateFormatter().string(from: started),
-                "completedAt": ISO8601DateFormatter().string(from: Date()),
-                "status": "failed_pre_spawn",
-                "reason": "script_missing",
-                "script": script.path,
-                "outer_sandbox_policy": "forced_off",
-            ]
-            let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
-            var env: [String: JSONValue] = [
-                "status": .string("failed"),
-                "effects": .string("none"),
-                "tool": .string("install_app"),
-                "reason": .string("script_missing"),
-                "detail": .string("The install script is missing at script_path, so nothing ran."),
-                "script_path": .string(script.path),
-                "runId": .string(runId),
-                "audit_path": .string(auditURL.path),
-            ]
-            if let auditErr { env["audit_error"] = .string(auditErr) }
-            return .object(env)
+            return await settle {
+                let auditEntry: [String: Any] = [
+                    "toolName": "install_app",
+                    "runId": runId,
+                    "createdAt": ISO8601DateFormatter().string(from: started),
+                    "completedAt": ISO8601DateFormatter().string(from: Date()),
+                    "status": "failed_pre_spawn",
+                    "reason": "script_missing",
+                    "script": script.path,
+                    "outer_sandbox_policy": "forced_off",
+                ]
+                let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
+                var env: [String: JSONValue] = [
+                    "status": .string("failed"),
+                    "effects": .string("none"),
+                    "tool": .string("install_app"),
+                    "reason": .string("script_missing"),
+                    "detail": .string("The install script is missing at script_path, so nothing ran."),
+                    "script_path": .string(script.path),
+                    "runId": .string(runId),
+                    "audit_path": .string(auditURL.path),
+                ]
+                if let auditErr { env["audit_error"] = .string(auditErr) }
+                return .object(env)
+            }
         }
 
         do {
@@ -2127,82 +2129,94 @@ extension SwiftToolDispatcher {
                 withIntermediateDirectories: true
             )
         } catch {
-            let auditEntry: [String: Any] = [
+            return await settle {
+                let auditEntry: [String: Any] = [
+                    "toolName": "install_app",
+                    "runId": runId,
+                    "createdAt": ISO8601DateFormatter().string(from: started),
+                    "completedAt": ISO8601DateFormatter().string(from: Date()),
+                    "status": "failed_pre_spawn",
+                    "reason": "log_dir_create_failed",
+                    "detail": String(describing: error),
+                    "outer_sandbox_policy": "forced_off",
+                ]
+                let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
+                var env = Self.builderFailureFields(error,
+                    tool: "install_app", reason: "log_dir_create_failed", effects: .none,
+                    owner: logURL.deletingLastPathComponent().path,
+                    instruction: "Repair the installer log directory's reported storage error. The installer did not launch.")
+                env.merge([
+                    "runId": .string(runId),
+                    "audit_path": .string(auditURL.path),
+                ], uniquingKeysWith: { _, receipt in receipt })
+                if let auditErr { env["audit_error"] = .string(auditErr) }
+                return .object(env)
+            }
+        }
+
+        @Sendable func entry(_ status: String, detail: String? = nil) -> [String: Any] {
+            var audit: [String: Any] = [
                 "toolName": "install_app",
                 "runId": runId,
                 "createdAt": ISO8601DateFormatter().string(from: started),
-                "completedAt": ISO8601DateFormatter().string(from: Date()),
-                "status": "failed_pre_spawn",
-                "reason": "log_dir_create_failed",
-                "detail": String(describing: error),
+                "status": status,
+                "reason": reason,
+                "script": script.path,
+                "repo": repo.path,
+                "log_path": logURL.path,
+                "start_delay_seconds": delay,
+                "detached": true,
+                "sandboxed": false,
+                "sandbox_mode": "off",
                 "outer_sandbox_policy": "forced_off",
             ]
-            let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
-            var env: [String: JSONValue] = [
-                "status": .string("failed"),
-                "effects": .string("none"),
-                "tool": .string("install_app"),
-                "reason": .string("log_dir_create_failed"),
-                "detail": .string(String(describing: error)),
-                "runId": .string(runId),
-                "audit_path": .string(auditURL.path),
-            ]
-            if let auditErr { env["audit_error"] = .string(auditErr) }
-            return .object(env)
+            if status != "running" { audit["completedAt"] = ISO8601DateFormatter().string(from: Date()) }
+            audit["detail"] = detail
+            return audit
         }
 
-        let command = "sleep \(delay); cd \(shellSingleQuote(repo.path)); exec /bin/bash \(shellSingleQuote(script.path)) >> \(shellSingleQuote(logURL.path)) 2>&1"
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", command]
-        process.currentDirectoryURL = repo
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-
-        var auditEntry: [String: Any] = [
-            "toolName": "install_app",
-            "runId": runId,
-            "createdAt": ISO8601DateFormatter().string(from: started),
-            "status": "scheduled",
-            "reason": reason,
-            "script": script.path,
-            "repo": repo.path,
-            "log_path": logURL.path,
-            "start_delay_seconds": delay,
-            "detached": true,
-            "sandboxed": false,
-            "sandbox_mode": "off",
-            "outer_sandbox_policy": "forced_off",
-        ]
-
+        // The detached native helper owns the delay, script process, explicit
+        // abort signals and terminal audit even after installation quits us.
+        let auditURL = logURL.deletingLastPathComponent().appendingPathComponent("\(runId).json")
+        let pid: pid_t
         do {
-            try process.run()
+            let running = TurnTraceRedactor.redactValue(JSONValue(fromFoundation: entry("running"))).mapStrings(builderAuditText)
+            try running.serializedData(pretty: true).write(to: auditURL, options: .atomic)
+            guard !Task.isCancelled else { throw CancellationError() }
+            guard let executable = Bundle.main.executablePath else {
+                throw CocoaError(.fileNoSuchFile)
+            }
+            pid = try AppRestartCoordinator.spawnDetached(argv: [executable, "--nativeagent-install-helper",
+                repo.path, script.path, logURL.path, auditURL.path, String(delay)])
         } catch {
-            auditEntry["completedAt"] = ISO8601DateFormatter().string(from: Date())
-            auditEntry["status"] = "failed_pre_spawn"
-            auditEntry["spawn_error"] = String(describing: error)
-            let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
-            var env: [String: JSONValue] = [
-                "status": .string("failed"),
-                "effects": .string("none"),
-                "tool": .string("install_app"),
-                "reason": .string("spawn_failed"),
-                "detail": .string(String(describing: error)),
-                "runId": .string(runId),
-                "audit_path": .string(auditURL.path),
-            ]
-            if let auditErr { env["audit_error"] = .string(auditErr) }
-            return .object(env)
+            let stopped = error is CancellationError
+            return await settle {
+                let (auditURL, auditErr) = builderWriteAudit(runId: runId,
+                    entry: entry(stopped ? "stopped" : "failed", detail: String(describing: error)), dataRoot: dataRoot)
+                var env = Self.builderFailureFields(error,
+                    tool: "install_app", reason: "spawn_failed", effects: .none,
+                    owner: "installer helper at \(Bundle.main.executablePath ?? "missing executable"); audit at \(auditURL.path)",
+                    instruction: "Repair the installer helper's reported audit or launch error. The installer did not launch.")
+                if stopped {
+                    env["status"] = .string("stopped")
+                    env["reason"] = .string("stopped_before_spawn")
+                    env["failure_code"] = .string("stopped_before_spawn")
+                    env["detail"] = .string("Stopped before the installer helper launched. Nothing ran.")
+                }
+                env.merge([
+                    "runId": .string(runId),
+                    "audit_path": .string(auditURL.path),
+                ], uniquingKeysWith: { _, receipt in receipt })
+                if let auditErr { env["audit_error"] = .string(auditErr) }
+                return .object(env)
+            }
         }
 
-        auditEntry["pid"] = Int(process.processIdentifier)
-        let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
-        var env: [String: JSONValue] = [
+        let env: [String: JSONValue] = [
             "status": .string("scheduled"),
             "tool": .string("install_app"),
             "runId": .string(runId),
-            "pid": .int(Int64(process.processIdentifier)),
+            "pid": .int(Int64(pid)),
             "reason": .string(reason),
             "script_path": .string(script.path),
             "log_path": .string(logURL.path),
@@ -2212,10 +2226,89 @@ extension SwiftToolDispatcher {
             "sandboxed": .bool(false),
             "sandbox_mode": .string("off"),
             "outer_sandbox_policy": .string("forced_off"),
-            "note": .string("Canonical install scheduled. It runs script/install_app.sh, rebuilds/signs/installs NativeAgent.app, and restarts the app. Keep the final reply brief before the delay elapses."),
+            "note": .string("Installation handed to helper PID \(pid). It owns the start delay, installer and terminal audit at audit_path; stopping this conversation does not abort it."),
         ]
-        if let auditErr { env["audit_error"] = .string(auditErr) }
         return .object(env)
+    }
+
+    /// The executable entry point stays synchronous: SwiftUI's App.main never
+    /// returns, so an async main would hold the main actor for the whole run and
+    /// no @MainActor launch work would ever start (10-23: her engine and bridges
+    /// never came up). In helper mode this process has no UI: it waits here for
+    /// the helper's own task and then exits.
+    public static func runScheduledInstallerHelperIfRequestedBlocking() -> Bool {
+        guard CommandLine.arguments.dropFirst().first == "--nativeagent-install-helper" else { return false }
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = await runScheduledInstallerHelperIfRequested()
+            done.signal()
+        }
+        done.wait()
+        return true
+    }
+
+    /// Executable-only mode, before runtime startup. The accepted install has
+    /// its own process owner; app shutdown does not cancel it. Sending a stop
+    /// signal to this helper is the separate explicit abort boundary.
+    static func runScheduledInstallerHelperIfRequested() async -> Bool {
+        let args = CommandLine.arguments
+        guard args.dropFirst().first == "--nativeagent-install-helper" else { return false }
+        guard args.count == 7, let delay = Int(args[6]), (5...120).contains(delay),
+              let bytes = try? Data(contentsOf: URL(fileURLWithPath: args[5])) else { return true }
+        let process = Process()
+        let work = SubprocessWork(process)
+        let startDelay = Task { try await Task.sleep(for: .seconds(delay)) }
+        let signals = [SIGTERM, SIGINT, SIGHUP].map { number -> DispatchSourceSignal in
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .global(qos: .utility))
+            source.setEventHandler { work.stop(); startDelay.cancel() }
+            source.resume()
+            return source
+        }
+        @Sendable func finish(_ status: String, code: Int32? = nil, detail: String) {
+            for source in signals { source.cancel(); source.setEventHandler(handler: nil) }
+            do {
+                var audit = try JSONDecoder().decode([String: JSONValue].self, from: bytes)
+                audit["pid"] = .int(Int64(getpid()))
+                audit["status"] = .string(status)
+                audit["exitCode"] = code.map { .int(Int64($0)) }
+                audit["detail"] = .string(detail)
+                audit["completedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
+                try JSONEncoder().encode(audit)
+                    .write(to: URL(fileURLWithPath: args[5]), options: .atomic)
+            } catch {
+                FileHandle.standardError.write(Data("Installer settlement failed: \(error)\n".utf8))
+            }
+        }
+        // A signal can interrupt admission during this user-selected delay.
+        // The physical helper owns the wait and checks cancellation before run.
+        await withTaskCancellationHandler {
+            _ = await startDelay.result
+        } onCancel: {
+            work.stop()
+            startDelay.cancel()
+        }
+        do {
+            let log = URL(fileURLWithPath: args[4])
+            try Data().write(to: log, options: .withoutOverwriting)
+            let output = try FileHandle(forWritingTo: log)
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [args[3]]
+            process.currentDirectoryURL = URL(fileURLWithPath: args[2])
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = output
+            process.standardError = output
+            await work.run(reapDescendantsOnExit: false) { exit in
+                try? output.close()
+                finish(exit.stopped ? "stopped" : exit.code == 0 ? "completed" : "failed", code: exit.code,
+                    detail: exit.launchError ?? (exit.stopped
+                        ? "Installation stopped. Installer output is saved in log_path; any completed installation steps remain."
+                        : "Installer exited; its output is saved in log_path."))
+            }
+        } catch {
+            await settle { finish("failed", detail: String(describing: error)) }
+        }
+        return true
     }
 
 }

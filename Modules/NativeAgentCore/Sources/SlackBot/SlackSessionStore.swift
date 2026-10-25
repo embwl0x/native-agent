@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
+// Blueprint: | `SlackSessionStore.swift` | `SlackSessionStore` struct; `activeSessionId`, `ensureSessionRow` |
 
 enum SlackSessionStorageError: Error, LocalizedError {
     case unavailable
@@ -214,8 +215,7 @@ struct SlackSessionStore: Sendable {
                 "messageCount": .int(0),
             ]
             rows.insert(row, at: 0)
-            let out = try ChatSessionIndexFile.serializedData(for: rows)
-            try out.write(to: sessionsPath, options: .atomic)
+            try ChatSessionIndexFile.write(rows, to: sessionsPath)
             ChatSessionRetention.enforceBestEffort(
                 dataRoot: dataRoot,
                 now: Date(),

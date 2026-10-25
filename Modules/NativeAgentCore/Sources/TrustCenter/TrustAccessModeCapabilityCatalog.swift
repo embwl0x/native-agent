@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `TrustAccessModeCapabilityCatalog.swift` | `TrustAccessModeCapabilityCatalog` enum; `normalizedMode`, `macControlPolicy` and Mac integration preset recognition |
 
 /// Canonical Mac-control policy templates used by the access-mode writer.
 public enum TrustAccessModeCapabilityCatalog {

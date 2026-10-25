@@ -1,6 +1,7 @@
 import AppIntents
 import Foundation
 import MemoryV2
+// Blueprint: | `MemoryAppIntents.swift` | `QueryMemoryIntent` struct; `perform`; pending proposals use the engine's review-eligible reader |
 
 private func formatMemoryUnavailable(_ error: Error) -> String {
     if let mv2 = error as? MemoryV2Error {
@@ -92,7 +93,7 @@ struct ListPendingMemoryProposalsIntent: AppIntent {
     func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
         do {
             try await NativeAgentAppCoordinator.shared.prepare()
-            let pending = try await SwiftNativeMemoryV2.shared.listProposals(status: "pending")
+            let pending = try await NativeAgentEngine.live.memory.proposals(status: "pending")
             if pending.isEmpty {
                 return .result(value: "0 pending proposals.", dialog: "No pending memory proposals.")
             }

@@ -1,3 +1,4 @@
+// Blueprint: | `EmbeddingStatusReadiness.swift` | `EmbeddingStatusReadiness` struct |
 /// Interpretation of the canonical runtime snapshot for status surfaces.
 public struct EmbeddingStatusReadiness {
     public let requestedCoreML: Bool

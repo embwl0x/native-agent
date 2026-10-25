@@ -2,6 +2,7 @@ import Foundation
 import MacIntegration
 import PersistenceCore
 import ChatSessionWork
+// Blueprint: | `AgentWorkspaceMail.swift` | `AgentWorkspaceMail` enum; `project` |
 
 extension AgentWorkspace {
     /// Bind observed workspace names once; caller-supplied locator fields may

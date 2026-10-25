@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `ChatCancelFlag.swift` | `ChatCancelFlag`: run-identity Stop markers and in-flight registration; later acceptance never erases a prior turn's Stop |
+
 /// The session's Stop marker, `chat/sessions/<id>/cancelled.flag`, keyed by
 /// run identity. Each accepted turn registers its run id and watches the
 /// marker through a URL carrying that id (in its fragment, which `.path`
@@ -10,6 +12,8 @@ import PersistenceCore
 /// right after a Mac Stop erased that Stop before the turn it was meant for
 /// saw it. Empty content (older writers, tests) and an untagged URL count any
 /// marker; a stale marker naming an old run never matches a new one.
+/// Storage: Stop markers are excluded from local backup, data export and phone
+/// sync; included in off-disk backup and PrivacyMap/chat.
 public enum ChatCancelFlag {
     public static func path(dataRoot: URL, sessionId: String) -> URL {
         dataRoot

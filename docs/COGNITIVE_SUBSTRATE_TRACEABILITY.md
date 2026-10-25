@@ -74,7 +74,7 @@ The UI reads these owners and subscribes to runtime invalidations.
 | CCS-P1-A3 | Quiet work admission | Source | S `+Workspace` rejects clean microcycles; R deadlines and daily recovery Loops |
 | CCS-P1-A4 | Provider-free ingress | Source | S `+Ingest` defers eligible interpretation; after-turn appraisal and reflection are separate paths |
 | CCS-P1-A5 | Disabled-path parity | Unverified | Enabled guards exist; no installed parity claim |
-| CCS-P1-A6 | Resource-pressure handling | Source | R `backgroundCognitionGate`: power/thermal/sleep refusal, conserve throttle |
+| CCS-P1-A6 | Resource-pressure handling | Source | None by design: always on while the Mac is on (User 10-24) |
 
 ## Phase 2 - Persistence And Lifecycle
 
@@ -224,7 +224,7 @@ removed assistant-prose task ledger.
 | CCS-X1 | Provider-context placement | Source | T prepares and appends the runtime projection before provider dispatch |
 | CCS-X2 | Redacted ingress | Source | T message/tool observation methods redact and bound content |
 | CCS-X3 | Background ownership | Source | R event/deadline ownership; Loops recovery registrations |
-| CCS-X4 | Pressure/dirty/disabled gates | Source | R `backgroundCognitionGate`; S `runMicrocycleChecked` |
+| CCS-X4 | Dirty/disabled gates | Source | S `runMicrocycleChecked` |
 | CCS-X5 | Observable state | Source | UI reads R detail and runtime invalidations |
 | CCS-X6 | Controls | Source | R configuration, clear, schema/view, export and ablation methods |
 | CCS-X7 | Lineage | Source | S `+Replay` timeline includes subject, instance, lineage and external evidence |

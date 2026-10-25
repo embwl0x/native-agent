@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `MacIntegrationGates.swift` | `MacIntegrationGates`: `byTool` (the switch each dispatcher tool is gated on), `refusal` (the off switch's refusal, asked before any card by the chat gate and the Workshop executor) |
 
 /// Which Mac Integration switch each tool's dispatch is gated on, and the
 /// refusal a switch User turned off gives it. One table for the dispatcher,

@@ -3,15 +3,17 @@ import Cognition
 import Desk
 import NativeAgentShared
 
+// Blueprint: | `DeviceSync.swift` | `DeviceSync` and shared aliases: resident phone bridge, snapshot/inbox assembly and overview-driven needs-person notification binding |
+
 // The app's names for the NativeAgentShared variants, kept in the moved code
 // so every unqualified reference resolves the way it did in the app.
 typealias MemoryRecord = NativeAgentShared.MemoryRecord
 typealias MultimodalAttachment = NativeAgentShared.MultimodalAttachment
 typealias ChatSession = NativeAgentShared.ChatSession
 
-/// One engine root's device sync: the CloudKit/KVS bridge to the phone, the
-/// snapshot writer and signed inbox, paired phones, the phone's Mac
-/// integration projection, APNs and the mobile notification relay.
+/// The resident app's phone bridge, snapshots, inbox and notification relay.
+/// Storage uses dataRoot; snapshot watches/integrity and CloudKit actions also
+/// use the default app root. This is not an isolated-root sync implementation.
 @MainActor
 public final class DeviceSync {
     nonisolated let storage = DeviceSyncStorage()

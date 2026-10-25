@@ -1,6 +1,8 @@
 import EngineRuntime
 import SwiftUI
 
+// Blueprint: | `PersonaWriteReceiptRow.swift` | `PersonaWriteReceiptRow`: settled persona-write receipt projection using the existing inline receipt grammar |
+
 /// The settled receipt for a line the agent wrote into its own persona.
 ///
 /// One mark, one line, and metadata naming the document and the section — the

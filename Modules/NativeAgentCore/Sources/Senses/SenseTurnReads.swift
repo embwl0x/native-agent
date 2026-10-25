@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `SenseTurnReads.swift` | `SenseTurnReads`: bounded turn-local served-version evidence |
 
 /// One box per turn, inherited by its tool calls (including parallel calls).
 /// No session/global history: the next turn starts empty.

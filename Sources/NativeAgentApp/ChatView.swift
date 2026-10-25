@@ -1,5 +1,6 @@
 import EngineRuntime
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatSessionWork
 import ToolRegistry
 import AppToolRuntime
 import MultimodalTTS
@@ -21,6 +22,7 @@ import CoreSpotlight
 #endif
 #if canImport(CloudKit)
 import CloudKit
+// Blueprint: | `ChatView.swift` | `ChatView` struct; `ChatTurnNoticePresentation` |
 #endif
 
 let chatSessionDragType = UTType(exportedAs: "com.nativeagent.chat-session")
@@ -285,8 +287,7 @@ struct ChatSidebarProjection {
 @MainActor
 final class ChatSidebarProjectionCache {
     private var sessions: [ChatSession]?
-    private var pinnedRaw = ""
-    private var anchorSessionId: String?
+    private var navigation: ChatSessionNavigation?
     private var search = ""
     private var openingRevision: UInt64 = 0
     private var cached = ChatSidebarProjection(
@@ -295,23 +296,14 @@ final class ChatSidebarProjectionCache {
     )
     private(set) var rebuildCount = 0
 
-    /// `anchorSessionId` is the conversation anchor — whichever remote
-    /// conversation is currently live. It rides at the FRONT of the strip and
-    /// is never written into the human's pin list, so their own pins, order,
-    /// and right to unpin anything are untouched. It is a cache INPUT because
-    /// a `/new` on the phone changes what the strip must show while the
-    /// sessions, the pin string, and the search are all identical; without it
-    /// the merge below would be computed once and then never again.
     func project(
         sessions newSessions: [ChatSession],
-        pinnedRaw newPinnedRaw: String,
-        anchorSessionId newAnchorSessionId: String?,
+        navigation newNavigation: ChatSessionNavigation,
         search newSearch: String,
         openingRevision newOpeningRevision: UInt64
     ) -> ChatSidebarProjection {
         if sessions == newSessions,
-           pinnedRaw == newPinnedRaw,
-           anchorSessionId == newAnchorSessionId,
+           navigation == newNavigation,
            search == newSearch,
            openingRevision == newOpeningRevision {
             return cached
@@ -324,28 +316,14 @@ final class ChatSidebarProjectionCache {
                 || ($0.lastMessagePreview ?? "").lowercased().contains(query)
                 )
         }
-        let pinnedIDs = ConversationAnchor.merged(
-            into: ChatSessionRetention.decode(newPinnedRaw),
-            anchorSessionId: newAnchorSessionId
-        )
-        let pinnedTabs: [ChatSession]
-        if pinnedIDs.isEmpty {
-            pinnedTabs = []
-        } else {
-            let byID = Dictionary(
-                newSessions.map { ($0.id, $0) },
-                uniquingKeysWith: { first, _ in first }
-            )
-            pinnedTabs = pinnedIDs.compactMap { byID[$0] }
-        }
+        let pinnedTabs = newNavigation.rows.map(\.session)
 
         let result = ChatSidebarProjection(
             sections: ChatSidebarSections.split(visible: visible, orderedPinned: pinnedTabs),
             pinnedTabs: pinnedTabs
         )
         sessions = newSessions
-        pinnedRaw = newPinnedRaw
-        anchorSessionId = newAnchorSessionId
+        navigation = newNavigation
         search = newSearch
         openingRevision = newOpeningRevision
         cached = result
@@ -431,6 +409,8 @@ struct TurnCardRoom<Card: View>: View {
     let turn: String
     @ViewBuilder let card: () -> Card
     @State private var held: CGFloat = 0
+    /// The card has gone but its room has not closed yet.
+    @State private var closing = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -441,13 +421,20 @@ struct TurnCardRoom<Card: View>: View {
                         if height > held { held = height }
                     }
                     .transition(NativeAgentMotion.fade)
+                    // Its fade has finished: now the room closes.
+                    .onDisappear {
+                        guard closing, !shows else { return }
+                        withAnimation(NativeAgentMotion.standard) { closing = false }
+                        held = 0
+                    }
             }
         }
-        .frame(height: shows ? max(floor, held) : 0, alignment: .bottom)
-        .onChange(of: shows) { _, now in
-            if !now { held = 0 }
-        }
-        .onChange(of: turn) { held = 0 }
+        // The card fades out in place first; only then does its room close, so
+        // the transcript never slides under a card still on screen (User's
+        // recording, 10-24: her last line went behind "Thought for 11s").
+        .frame(height: shows || closing ? max(floor, held) : 0, alignment: .bottom)
+        .onChange(of: shows) { _, now in closing = !now }
+        .onChange(of: turn) { if !closing { held = 0 } }
     }
 }
 
@@ -503,61 +490,15 @@ struct ChatView: View {
     @AppStorage(WorkPaneState.openKey) var workPaneOpen = false
     /// The conversation list's travelling selection bar (ChatView+ShellColumn).
     @Namespace var shellConversationBar
-    /// The inline cards of the open conversation, read back from the
-    /// transcript. Nothing durable lives here — a relaunch rebuilds it from
-    /// disk with every card's state intact.
+    /// Open controls only; cards belong to the engine transcript projection.
     @State var inlineCards = InlineInteractionChatBinding()
-    // Fix 2: draft text and pending attachments live in AppModel keyed by sessionId so they
-    // survive tab changes.
-    //
-    // H5 (2026-07-09): the draft used to be read AND WRITTEN through
-    // `appModel.chatDrafts` on every keystroke. `chatDrafts` is @Observable
-    // state, so each character invalidated the whole of ChatView.body — which
-    // re-ran the session-id fingerprint (map + join over every session), the
-    // search filter, and the pinned-session dictionary rebuild, and every other
-    // view observing `chatDrafts` (the detached chat panels) with it.
-    //
-    // The in-progress text now lives here, in view-local @State. It is
-    // COMMITTED back to `appModel.chatDrafts` only at the four points where it
-    // has to survive this view: send, session switch, view disappear, and the
-    // outbound half of an external prefill. `draftSessionId` records which
-    // session `draftText` belongs to so a commit can never file it under the
-    // wrong key after the active session moves.
-    /// User, 2026-09-13: this was four `@State` properties here, so a keystroke
-    /// invalidated the whole of `ChatView.body` — the transcript diff, every
-    /// `MessageBubble`, and the conversation list with it. It is one
-    /// `@Observable` object now and nothing in `ChatView.body` reads it; the
-    /// text field and the send button live in `ChatComposerInput`, which is the
-    /// only view a keystroke invalidates. See ChatComposerDraft.swift.
-    ///
-    /// The accessors below keep the existing call sites (send, slash commands,
-    /// attachments, voice, the empty-state chips) unchanged. They must never be
-    /// read from `body`.
-    @State var draft = ChatComposerDraft()
+    var draft: ChatComposerDraft { appModel.composerDraft(for: appModel.activeChatSessionId) }
 
-    var draftText: String {
-        get { draft.text }
-        nonmutating set { draft.text = newValue }
-    }
     var draftSessionId: String {
         get { draft.sessionId }
-        nonmutating set { draft.sessionId = newValue }
     }
-    /// 2026-09-06: the text this composer last ADOPTED. Two composers can be
-    /// pointed at one session (a detached panel over the main window), and a
-    /// composer that never changed its draft must not write over what the
-    /// other one committed meanwhile — an untouched empty panel closing used
-    /// to delete a draft typed in the main window.
-    var draftAdoptedText: String {
-        get { draft.adoptedText }
-        nonmutating set { draft.adoptedText = newValue }
-    }
-    /// 2026-09-06: when this composer's text was last changed HERE. Adopting a
-    /// stored draft is not an edit. The commit path uses it to keep the newest
-    /// text when the flush broadcast makes both composers write at once.
     var draftEditedAt: Date {
         get { draft.editedAt }
-        nonmutating set { draft.editedAt = newValue }
     }
 
     var text: String {
@@ -569,39 +510,6 @@ struct ChatView: View {
         nonmutating set { appModel.chatPendingAttachments[appModel.activeChatSessionId] = newValue }
     }
 
-    /// Persist the composer's text under the session it was typed into.
-    func commitDraft() {
-        guard !draftSessionId.isEmpty else { return }
-        // Nothing was typed here since the adopt, so this composer has nothing
-        // to say about the stored draft — and saying it would clobber another
-        // surface's newer write.
-        guard draftText != draftAdoptedText else { return }
-        // 2026-09-06: only a commit that actually landed is "adopted". A write
-        // rejected as older than the stored draft left this composer believing
-        // its text was safe, and the text was lost.
-        guard appModel.commitChatDraft(
-            draftText,
-            sessionId: draftSessionId,
-            editedAt: draftEditedAt
-        ) else { return }
-        draftAdoptedText = draftText
-    }
-
-    /// Point the composer at `sessionId`, loading whatever draft it holds.
-    func adoptDraft(for sessionId: String) {
-        // Any other live composer writes its text through first, so this reads
-        // what is on screen rather than the last commit.
-        appModel.flushLiveChatDrafts()
-        draftSessionId = sessionId
-        let stored = appModel.chatDraft(for: sessionId)
-        // Writing the same words back into the field puts the caret at its
-        // start, so a re-adopt while the person types (a chat settling its id,
-        // the view reappearing) sent the rest of the sentence before its first
-        // words (10-18). Only a different draft is written.
-        if draftText != stored { draftText = stored }
-        draftAdoptedText = stored
-        draftEditedAt = .distantPast
-    }
     @State var renameTitle = ""
     @State var sessionSearch = ""
     // sidebar-density 2026-08-10: single driver for in-list rename — exactly
@@ -634,6 +542,7 @@ struct ChatView: View {
     // Sprint 3.1 — voice input
     @State var voiceInput = VoiceInputCapture.forChat()
     @State var voiceDraftBeforeListening = ""
+    @State var voiceDraftRevision: UInt64 = 0
     /// 2026-09-06: the conversation dictation started in. Speech kept running
     /// across a session switch and the next transcript update overwrote the
     /// newly selected conversation's draft with the old one's text plus the
@@ -676,25 +585,16 @@ struct ChatView: View {
     @State var currentDispatchPlan: DispatchArgPlan? = nil
     @State var scrollCoordinator = ChatScrollCoordinator()
     @State var sidebarProjectionCache = ChatSidebarProjectionCache()
-    @State var conversationAnchor = MacConversationAnchorReading()
     /// Per-session cursor prevents a tab switch from overwriting the marker
     /// for a response that is still arriving in another conversation.
     @State var lastAutoReadMessageIds: [String: String] = [:]
     /// A session is primed from its already-loaded transcript once. Until then
     /// auto-read must not mistake old history for a newly appended reply.
     @State var autoReadPrimedSessionIds: Set<String> = []
-    /// D1: `hasAnyUsableProvider()` stats credential files on disk, so it must
-    /// not be called from `body` (which re-runs at token rate). Cached here and
-    /// refreshed at the three moments the answer can change for this view:
-    /// appearing, switching session, and a provider being connected. Starts
-    /// TRUE so a working machine can never flash the connect prompt.
-    @State var hasUsableProvider = true
-    @State private var providerReadinessTask: Task<Void, Never>?
     /// Fences overlapping "Go to" tasks. A route may need to refresh the
     /// session index before selection; an older click must not resume after a
     /// newer click and become the newest AppModel selection request.
     @State var runningSessionNavigationGeneration: UInt = 0
-    @AppStorage("NativeAgent.pinnedChatSessionIds") var pinnedChatSessionIdsRaw = ""
 
     var clearConfirmationBinding: Binding<Bool> {
         Binding(
@@ -729,8 +629,7 @@ struct ChatView: View {
     var sidebarProjection: ChatSidebarProjection {
         sidebarProjectionCache.project(
             sessions: appModel.engine.transcripts.sessions,
-            pinnedRaw: pinnedChatSessionIdsRaw,
-            anchorSessionId: conversationAnchor.sessionId,
+            navigation: appModel.engine.transcripts.navigation,
             search: sessionSearch,
             openingRevision: ChatShellOpeningLine.shared.revision
         )
@@ -858,56 +757,24 @@ struct ChatView: View {
             ChatReadAloudObserver(onChanged: speakLatestAssistantIfReady)
         }
         .navigationTitle("Chat")
-        .task(id: appModel.engine.transcripts.sessions) {
-            try? await ChatShellOpeningLine.shared.prepare(
-                appModel.engine.transcripts.sessions, dataRoot: appModel.engine.transcripts.dataRoot
-            )
-        }
         .task(id: appModel.dataRootOverride) {
-            await conversationAnchor.watch(root: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            await appModel.engine.transcripts.watchNavigation()
         }
         // Where a card's setup opens: the connector sheet, or in Simple view
         // the floating glass panel (SimpleSetupPanel.swift).
         .inlineCardSetup(inlineCards)
         .liveOnAppear {
             prunePinnedSessions()
-            refreshProviderReadiness()
-            // H5: pick up whatever draft this session already holds (a prefill
-            // that landed while Chat was off-screen, or our own last commit).
-            adoptDraft(for: appModel.activeChatSessionId)
-            // A pending card survives relaunch because the transcript does.
-            Task { await inlineCards.refresh(sessionID: appModel.activeChatSessionId) }
+            Task { await appModel.engine.transcripts.reclaimContinuations(for: appModel.activeChatSessionId) }
             // 2026-09-23: the keyboard starts in the composer, not on the
             // rail's first word. After this pass, so the window's own initial
             // first responder has already been chosen.
             DispatchQueue.main.async { if chatPageIsVisible { inputFocused = true } }
         }
-        // The same read, for the copy a quiet read mounts offscreen.
-        //
-        // Every path that fills `inlineCards` is lifecycle work the offscreen
-        // copy deliberately sleeps through — `liveOnAppear` is suppressed
-        // outright, and the two `onChange` edges need a change that never
-        // happens during the brief offscreen mount. So the binding was always
-        // EMPTY there: the tool row drew, the card mount asked for its cards,
-        // and got none. A quiet read of Chat could never show a card, whatever
-        // was on disk, which is what Agent and every `app_page_screenshot`
-        // were looking at (2026-09-13, Connect Notion).
-        //
-        // This is the read-and-assign a quiet read is allowed to make, so it
-        // goes on `quietReadTask`, which runs offscreen and is COUNTED — the
-        // renderer waits for it before it draws. `live: false` because the
-        // visible copy already loads by the route above, and `reclaim: false`
-        // because releasing a stranded claim is a WRITE.
-        .quietReadTask(live: false) { [inlineCards] in
-            await inlineCards.refresh(
-                sessionID: appModel.activeChatSessionId, reclaim: false
-            )
-        }
-        // The composer verbs reach these two objects. `liveOnAppear`, so the
-        // OFFSCREEN copy a quiet page read mounts never registers itself over
-        // the composer the person is typing in.
+        // Only the live composer registers its shell; quiet reads share the
+        // session draft owner without taking the mounted shell's place.
         .liveOnAppear {
-            QuietSelfAdmin.shared.attach(composerDraft: draft, cards: composerCardState)
+            QuietSelfAdmin.shared.attach(cards: composerCardState)
         }
         // ...and the other direction, for the offscreen copy only. That copy
         // has a shell state of its own, always closed, so a screenshot showed
@@ -923,10 +790,7 @@ struct ChatView: View {
             composerCardState.activePane = live.activePane
         }
         .onDisappear {
-            QuietSelfAdmin.shared.detachComposer(draft: draft)
-            // H5: the draft only lives in @State now — persist it before the
-            // view (and its @State) goes away on a tab change.
-            commitDraft()
+            QuietSelfAdmin.shared.detachComposer(cards: composerCardState)
             endDictation()
         }
         // 2026-09-13: leaving Chat no longer unmounts it, so `onDisappear`
@@ -934,11 +798,10 @@ struct ChatView: View {
         // into a draft nobody could see, and a start still waiting on the
         // permission prompt could begin recognition after the person left.
         // `endDictation` bumps `voiceGeneration`, which cancels that pending
-        // start too. The draft is committed for the same reason.
+        // start too.
         .onChange(of: chatPageIsVisible) { _, visible in
             if !visible { composerCardState.dismiss() }
             guard !visible else {
-                refreshProviderReadiness()
                 refreshTranscriptSearchIfPresented()
                 // Coming BACK is the "the control closed" signal for the
                 // controls that are pages rather than sheets: a card that sent
@@ -947,7 +810,6 @@ struct ChatView: View {
                 Task { await inlineCards.verifyOnReturn() }
                 return
             }
-            commitDraft()
             endDictation()
         }
         // Seed the slash catalog when chat view appears (TTL-gated, no-op if fresh).
@@ -959,38 +821,11 @@ struct ChatView: View {
         }
         .onChange(of: appModel.activeChatSessionId) { _, newSessionId in
             composerCardState.dismiss()
-            // H5: hand the old session its draft back before adopting the new
-            // one. `commitDraft` keys off `draftSessionId`, not the (already
-            // updated) active id, so the text lands where it was typed.
-            commitDraft()
             // 2026-09-06: dictation belongs to the conversation it started in.
-            // The live transcript is already in `draftText` and was just
-            // committed there; recognition stops rather than following the
-            // person into the next conversation.
+            // Recognition stops rather than following into the next session.
             endDictation()
-            adoptDraft(for: newSessionId)
-            Task { await inlineCards.refresh(sessionID: newSessionId) }
-            refreshProviderReadiness()
+            Task { await appModel.engine.transcripts.reclaimContinuations(for: newSessionId) }
             Task { await appModel.maybeSendFirstRunGreeting() }
-        }
-        // The cards follow the TRANSCRIPT, because that is where they live.
-        //
-        // They used to be re-read on three edges only — first appearance, a
-        // session switch, and a `.chatTurnCompleted` carrying this session's id
-        // — and a card is written mid-turn, by the tool-receipt writer, before
-        // either of the last two fires. A turn whose completion arrived without
-        // a session id, or against a different active session, left
-        // `cardsByRow` empty for the rest of the launch: the tool row drew, the
-        // card mount asked for it, and the binding answered with nothing. Agent
-        // saw the Connect Notion row with no Connect button on it (2026-09-13).
-        //
-        // Every path that changes the rows bumps this version, so the join
-        // heals itself instead of depending on which notification won a race.
-        //
-        // Coalesced: one turn bumps the version many times and each bump is a
-        // whole-transcript read (2026-09-14, snappiness).
-        .onChange(of: appModel.engine.transcripts.structureVersion(for: appModel.activeChatSessionId)) {
-            inlineCards.refreshSoon(sessionID: appModel.activeChatSessionId)
         }
         // A link that names a message (a miss's history locator) lands on it
         // through the transcript search's own selection, paging and scroll.
@@ -1000,40 +835,10 @@ struct ChatView: View {
             openTranscriptSearch()
             transcriptSearch.reveal(messageID: messageID)
         }
-        // H5: the only channel by which text written OUTSIDE the composer
-        // (skill-build starter, suggestion chip) reaches it. Bumped rarely and
-        // never on the keystroke path, so observing it costs nothing.
-        .onChange(of: appModel.chatDraftInjectionGeneration) {
-            let active = appModel.activeChatSessionId
-            // Prefill-if-empty is enforced HERE, not at the caller: the live
-            // draft is this view's @State, so a `chatDrafts`-based emptiness
-            // check upstream can't see uncommitted keystrokes and would let an
-            // injection overwrite text the user is looking at (gpt-5.5 review,
-            // 2026-07-09).
-            if draftSessionId == active, !draftText.isEmpty { return }
-            draftText = appModel.chatDraft(for: active)
-            draftSessionId = active
-            draftAdoptedText = draftText
-            draftEditedAt = .distantPast
-        }
-        // 2026-09-06: another surface is about to read this session's stored
-        // draft. Hand it the text that is actually on screen first.
-        .onReceive(NotificationCenter.default.publisher(for: .chatFlushLiveDrafts)) { _ in
-            commitDraft()
-        }
         .onChange(of: appModel.chatProvider) {
             // Catches the case where the user skipped the provider step at
             // onboarding and connected an LLM later in Settings.
-            refreshProviderReadiness()
             Task { await appModel.maybeSendFirstRunGreeting() }
-        }
-        .onChange(of: appModel.engine.providers.connections) { refreshProviderReadiness() }
-        // Account files can also change outside Settings.
-        .onReceive(NotificationCenter.default.publisher(
-            for: NSWindow.didBecomeKeyNotification)) { note in
-            guard chatPageIsVisible, let window = note.object as? NSWindow,
-                  window.identifier?.rawValue.contains(NativeAgentAppCoordinator.mainSceneID) == true else { return }
-            refreshProviderReadiness()
         }
         .onChange(of: chatSessionIdsFingerprint) {
             prunePinnedSessions()
@@ -1075,17 +880,6 @@ struct ChatView: View {
             appModel.systemToasts.push(warn: text)
         case .globalInfo:
             appModel.systemToasts.push(info: text, autoDismissAfter: 6)
-        }
-    }
-
-    private func refreshProviderReadiness() {
-        providerReadinessTask?.cancel()
-        let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        providerReadinessTask = Task {
-            let ready = await Task.detached(priority: .userInitiated) {
-                SwiftNativeProviderRouting(dataRoot: root).hasUsableCredentials()
-            }.value
-            if !Task.isCancelled { hasUsableProvider = ready }
         }
     }
 
@@ -1153,17 +947,21 @@ struct ChatView: View {
                         // are windowed (ChatMessageListView.windowSize).
                         ChatTranscriptStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
                             if appModel.chatMessages.isEmpty {
-                                switch ChatEmptyStateMode.mode(
-                                    hasUsableProvider: hasUsableProvider
-                                ) {
-                                case .connectProvider:
+                                switch appModel.engine.providers.readiness {
+                                case .loading:
+                                    ProgressView("Checking providers…").frame(minHeight: 360)
+                                case .unavailable(let reason):
+                                    NativeEmptyState(title: "Providers unavailable", detail: reason,
+                                                     systemImage: "exclamationmark.triangle")
+                                        .frame(minHeight: 360)
+                                case .needsConnection:
                                     // D1: never invite a message that can only
                                     // dead-end. Send the user to Providers first.
                                     ChatProviderConnectEmptyState {
                                         inlineCards.openPage(.providers)
                                     }
                                     .frame(minHeight: 360)
-                                case .suggestions:
+                                case .ready:
                                     // ui-simplify 2026-09-02: the first thing a
                                     // stranger sees is her saying hello and
                                     // three things they can ask — not a control
@@ -1174,13 +972,10 @@ struct ChatView: View {
                                             ChatEmptyStateSuggestionAction.apply(
                                                 suggestion,
                                                 model: appModel,
-                                                activeSessionID: appModel.activeChatSessionId,
-                                                draftText: &draftText,
-                                                draftSessionID: &draftSessionId
+                                                activeSessionID: appModel.activeChatSessionId
                                             )
                                             // A chip is a local edit like
                                             // any keystroke (2026-09-06).
-                                            draftEditedAt = Date()
                                         }
                                     )
                                     // The greeting sits low in the room so
@@ -1474,10 +1269,6 @@ struct ChatView: View {
                             await appModel.refreshChatMessagesAfterTurn(
                                 sessionId: completedSessionId,
                                 messagesAlreadyRefreshed: alreadyRefreshed)
-                            // The resolver posts this same signal after every
-                            // card it persists, so a settled card becomes its
-                            // receipt on the same pass that reloads the rows.
-                            await inlineCards.refresh(sessionID: completedSessionId)
                         }
                     }
                     .modifier(TranscriptChangeRefresh(appModel: appModel))

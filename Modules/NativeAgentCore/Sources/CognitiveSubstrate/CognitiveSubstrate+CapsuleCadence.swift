@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
+// Blueprint: | `CognitiveSubstrate+CapsuleCadence.swift` | `CognitiveSubstrate`: `selectInnerLine`, `innerTakeawayCadenceKey`, `threadKindPhrase` |
 
 extension CognitiveSubstrate {
     // MARK: - Inner-line cadence (2026-09-01)
@@ -18,8 +20,7 @@ extension CognitiveSubstrate {
     /// become the rut it described.
     ///
     /// A line that has led `innerLineRepeatLimit` capsules rests for
-    /// `innerLineRestTurns` and the next candidate leads. Lines whose SUBJECT is
-    /// her own phrasing get the hard cap (`selfPhrasing…`). If every candidate
+    /// `innerLineRestTurns` and the next candidate leads. If every candidate
     /// is resting the capsule carries no Inner line — silence is honest, and
     /// the rest of the capsule still speaks.
     ///
@@ -54,7 +55,8 @@ extension CognitiveSubstrate {
         dynamics dyn: PersonalityDynamicsConfiguration,
         at now: Date = Date(),
         presentationState: inout CognitiveCapsulePresentationState,
-        bypassCadence: Bool = false
+        bypassCadence: Bool = false,
+        emitReceipts: Bool = true
     ) -> String? {
         // THE REFLECTION SURFACE IS EXEMPT (2026-09-11). Cadence exists so a
         // line she says to a PERSON stops being a standing instruction. The
@@ -65,6 +67,16 @@ extension CognitiveSubstrate {
         // Repetition costs nothing in a prompt she writes to herself, and this
         // path must not consume or advance the person-facing ledger either.
         if bypassCadence { return candidates.first?.line }
+        var restedLine = false
+        var expiredLine = false
+        defer {
+            if emitReceipts, restedLine {
+                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("C06"), "site": .string("CognitiveSubstrate+CapsuleCadence.swift:selectInnerLine")]))
+            }
+            if emitReceipts, expiredLine {
+                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("C07"), "site": .string("CognitiveSubstrate+CapsuleCadence.swift:selectInnerLine")]))
+            }
+        }
         // Every resting line serves one capsule of its rest, whether or not it
         // was a candidate this turn.
         for (key, value) in presentationState.innerLineRuns where value < 0 {
@@ -94,7 +106,15 @@ extension CognitiveSubstrate {
                 || now.timeIntervalSince(seen.firstShownAt) >= State.innerTextMaxAge
         }
         guard let chosen = candidates.first(where: {
-            (presentationState.innerLineRuns[$0.cadenceKey] ?? 0) >= 0 && !expired($0)
+            guard (presentationState.innerLineRuns[$0.cadenceKey] ?? 0) >= 0 else {
+                restedLine = true
+                return false
+            }
+            guard !expired($0) else {
+                expiredLine = true
+                return false
+            }
+            return true
         }) else { return nil }
         var seen = presentationState.innerTextShown[chosen.cadenceKey]
             ?? State.InnerTextExposure(firstShownAt: now, shows: 0)
@@ -107,8 +127,7 @@ extension CognitiveSubstrate {
             presentationState.innerTextShown.removeValue(forKey: oldest)
         }
 
-        let selfPhrasing = Self.isSelfPhrasingInnerLine(chosen.line)
-        // Three cadences, one ledger. A `- Thread:` line is the strictest: it
+        // Two cadences, one ledger. A `- Thread:` line is the strictest: it
         // is the only line here whose nature is to be unwelcome, so it leads
         // once and then rests a long time.
         let limit: Int
@@ -116,15 +135,13 @@ extension CognitiveSubstrate {
         if chosen.tier == .thread {
             limit = dyn.threadLineRepeatLimit
             rest = dyn.threadLineRestTurns
-        } else if selfPhrasing {
-            limit = dyn.selfPhrasingInnerLineRepeatLimit
-            rest = dyn.selfPhrasingInnerLineRestTurns
         } else {
             limit = dyn.innerLineRepeatLimit
             rest = dyn.innerLineRestTurns
         }
         let led = (presentationState.innerLineRuns[chosen.cadenceKey] ?? 0) + 1
         presentationState.innerLineRuns[chosen.cadenceKey] = led >= limit ? -max(1, rest) : led
+        if led >= limit { restedLine = true }
         Self.boundInnerLineLedger(&presentationState.innerLineRuns)
         return chosen.line
     }
@@ -243,28 +260,6 @@ extension CognitiveSubstrate {
             .prefix(ledger.count - cap)
             .map(\.key)
         for victim in victims { ledger.removeValue(forKey: victim) }
-    }
-
-    /// Reflections whose SUBJECT is repeated wording. These are the tic wearing
-    /// the costume of insight: measured live, FOUR of her five active standing
-    /// views and two of her five most-shown Inner lines were on this one topic,
-    /// and telling her "you repeat yourself" for two hundred consecutive turns
-    /// is itself the repetition. She already carries a dedicated organ for this
-    /// (the `- Sound:` rut nudge, now change-gated) — a second, permanent copy
-    /// of it in her inner voice is the thing that made the loop self-sealing.
-    ///
-    /// Word list, not a self-reference conjunction: the live view "Familiar
-    /// warmth stays alive through variety, not repetition" names no self and is
-    /// unmistakably the same tic. Over-matching only makes the line ROTATE
-    /// sooner, which is the safe direction; under-matching keeps the loop.
-    static let selfPhrasingSubjectWords = [
-        "phrasing", "wording", "repetitive", "repetition", "repeating",
-        "repeated", "same words", "signature phrase", "vocabulary", "echoing",
-    ]
-
-    static func isSelfPhrasingInnerLine(_ line: String) -> Bool {
-        let lower = line.lowercased()
-        return selfPhrasingSubjectWords.contains(where: { lower.contains($0) })
     }
 
     // MARK: - W4/P4 — fingerprint cadence + suppress-when-unchanged

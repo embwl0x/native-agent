@@ -13,6 +13,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `MemoryV2+TextClip.swift` | `MemoryTextClip`: shared sentence/word-safe display clipping and bounded memory text presentation |
+
 // MARK: - Caps
 
 /// Max characters of full memory `content` returned per recall hit

@@ -62,7 +62,7 @@ struct ChatAttachmentSummary: Identifiable, Codable, Hashable {
 /// box and the collapsed "N tools used" summary, the same as the Mac chat.
 /// `seq` is the Mac-side monotonic `toolSeq` — used for ordering and de-duping
 /// out-of-order / duplicate iCloud KVS delivery.
-struct ToolEvent: Codable, Equatable, Identifiable {
+struct ToolEvent: Codable, Hashable, Identifiable {
     var id: String { "\(seq)-\(name)" }
     let name: String
     let seq: Int
@@ -83,9 +83,10 @@ struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
     /// the live flip-box while streaming and the collapsed summary when done.
     var toolEvents: [ToolEvent] = []
     /// A settled bridge receipt that the Mac transcript has not yet published.
-    /// Persist with the row so switching chats cannot expire its protection.
+    /// Kept in the shared projection until the matching Mac run is published.
     var awaitingMacTranscript: Bool = false
     var runId: String?
+    var turnID: String?
     var failureDetail: String?
     var interaction: InlineInteraction?
     var interactionDescriptor: InlineInteractionDescriptor?
@@ -127,7 +128,7 @@ struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, role, text, isStreaming, attachments, toolEvents, awaitingMacTranscript
-        case runId, failureDetail, completionState
+        case runId, turnID, failureDetail, completionState
         case interaction, interactionDescriptor, interactionSessionID
     }
 
@@ -141,6 +142,7 @@ struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
         toolEvents = try c.decodeIfPresent([ToolEvent].self, forKey: .toolEvents) ?? []
         awaitingMacTranscript = try c.decodeIfPresent(Bool.self, forKey: .awaitingMacTranscript) ?? false
         runId = try c.decodeIfPresent(String.self, forKey: .runId)
+        turnID = try c.decodeIfPresent(String.self, forKey: .turnID)
         failureDetail = try c.decodeIfPresent(String.self, forKey: .failureDetail)
         completionState = try c.decodeIfPresent(String.self, forKey: .completionState)
         interaction = try c.decodeIfPresent(InlineInteraction.self, forKey: .interaction)
@@ -158,6 +160,7 @@ struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
         if !toolEvents.isEmpty { try c.encode(toolEvents, forKey: .toolEvents) }
         if awaitingMacTranscript { try c.encode(true, forKey: .awaitingMacTranscript) }
         try c.encodeIfPresent(runId, forKey: .runId)
+        try c.encodeIfPresent(turnID, forKey: .turnID)
         try c.encodeIfPresent(failureDetail, forKey: .failureDetail)
         try c.encodeIfPresent(completionState, forKey: .completionState)
         try c.encodeIfPresent(interaction, forKey: .interaction)
@@ -200,43 +203,6 @@ struct ChatSessionTab: Identifiable, Hashable {
         if case .pinned(let sessionID) = kind { return sessionID }
         return nil
     }
-}
-
-/// The conversation User is in — the session he last sent to, at any door —
-/// published as `chat_anchor.json` in the same `.core` snapshot group as
-/// `sessions.json`. The phone's main chat and phone Siri follow it.
-///
-/// Field-for-field mirror of `PersistenceCore.ConversationAnchorPin`, declared
-/// here because the phone links only `NativeAgentShared`. `source` and
-/// `updatedAt` are display/diagnostics ONLY — nothing on this side may branch
-/// on which surface published the anchor. Both are optional so an older or
-/// partial file still yields a usable anchor.
-struct ConversationAnchorPin: Codable, Equatable, Sendable {
-    var sessionId: String
-    var source: String?
-    var updatedAt: String?
-
-    /// The id, or nil when the file names none. Same discipline as the Mac's
-    /// `readUnlocked`: an empty id is no anchor.
-    var cleanSessionId: String? {
-        let clean = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        return clean.isEmpty ? nil : clean
-    }
-}
-
-/// The phone's anchor-row merge, matching `ConversationAnchor.merged` over
-/// the phone's own row type.
-enum MobileConversationAnchor {
-    /// The anchor at the FRONT of the pinned rows, never duplicated.
-    ///
-    /// A DERIVED view, exactly as on the Mac: the phone never writes the anchor
-    /// into anyone's pin list and never syncs a pin back to the Mac. When the
-    /// anchor is absent the list is returned untouched.
-    static func merged(_ anchor: ChatSession?, into pinnedSessions: [ChatSession]) -> [ChatSession] {
-        guard let anchor, anchor.archived != true else { return pinnedSessions }
-        return [anchor] + pinnedSessions.filter { $0.id != anchor.id }
-    }
-
 }
 
 /// Whether the human has explicitly picked a chat session since this launch.
@@ -287,8 +253,8 @@ enum ChatSessionTabProjection {
     static func make(
         mainSessionID: String?,
         mainTitle: String,
-        pinnedSessions: [ChatSession],
-        anchorSession: ChatSession? = nil
+        navigationRows: [ChatSessionNavigation.Row],
+        openedSession: ChatSession?
     ) -> [ChatSessionTab] {
         var tabs: [ChatSessionTab] = [
             ChatSessionTab(
@@ -300,23 +266,20 @@ enum ChatSessionTabProjection {
             )
         ]
         var seen = Set([mainSessionID].compactMap { $0 })
-        let ordered = MobileConversationAnchor.merged(anchorSession, into: pinnedSessions)
-        // The anchor row is `.anchor`, never `.pinned`, even when it also
-        // appears in the published pinned rows: the Mac merges the anchor into
-        // `pinned_chat_sessions.json` itself, so presence there is not evidence
-        // that the human pinned it, and a close control offered on that guess
-        // would fire an unpin for a row they never pinned.
-        let anchorID = anchorSession.flatMap { $0.archived == true ? nil : $0.id }
-        for session in ordered where session.archived != true {
+        for row in navigationRows {
+            let session = row.session
             guard seen.insert(session.id).inserted else { continue }
-            let isAnchor = session.id == anchorID
             tabs.append(ChatSessionTab(
                 id: session.id,
-                title: cleanTitle(session.displayTitle, fallback: "Chat"),
-                systemImage: isAnchor ? "clock" : "pin.fill",
+                title: session.displayTitle,
+                systemImage: row.isAnchor ? "clock" : "pin.fill",
                 sessionID: session.id,
-                kind: isAnchor ? .anchor(session.id) : .pinned(session.id)
+                kind: row.isPinned ? .pinned(session.id) : .anchor(session.id)
             ))
+        }
+        if let session = openedSession, seen.insert(session.id).inserted {
+            tabs.append(.init(id: session.id, title: session.displayTitle, systemImage: "clock",
+                sessionID: session.id, kind: .anchor(session.id)))
         }
         return tabs
     }

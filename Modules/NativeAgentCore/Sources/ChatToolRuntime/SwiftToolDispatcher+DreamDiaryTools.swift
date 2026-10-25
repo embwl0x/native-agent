@@ -24,6 +24,7 @@
 import DreamREMCycle
 import Foundation
 import PersistenceCore
+// Blueprint: | `SwiftToolDispatcher+DreamDiaryTools.swift` | `SwiftToolDispatcher`: `impl_dream_diary_read`, `dreamDiaryEntryJSON`, `dreamDiaryStorageFields` |
 
 extension SwiftToolDispatcher {
 
@@ -245,61 +246,37 @@ extension SwiftToolDispatcher {
         return !FileManager.default.fileExists(atPath: live.path)
     }
 
-    /// The first real line of the dream — the same excerpt rule the Dreams page
-    /// uses (skip the heading and the rule, take her opening words), so the page
-    /// and the tool show the same night the same way.
-    static func dreamDiaryExcerpt(_ content: String?) -> String {
-        let first = (content ?? "")
-            .split(whereSeparator: \.isNewline)
-            .lazy
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .first { !$0.isEmpty && !$0.hasPrefix("#") && $0 != "---" } ?? ""
-        return String(first.prefix(dreamDiaryExcerptCharacters))
+    /// One night in the index: the night's dream as Today and the Dreams page
+    /// name it (the latest, by `DreamNight`), and every dream of the night when
+    /// a later run added one — a re-dream lives inside the night it is about,
+    /// so there is no separate day for it.
+    static func dreamDiaryIndexRow(_ entry: DreamEntry, dataRoot: URL) -> JSONValue {
+        let night = entry.night
+        var row: [String: JSONValue] = [
+            "date": .string(entry.date),
+            "first_line": .string(String((night.latest.map { $0.title ?? $0.firstLine } ?? "")
+                .prefix(dreamDiaryExcerptCharacters))),
+            "archived": .bool(dreamDiaryIsArchived(entry, dataRoot: dataRoot)),
+        ]
+        if night.dreams.count > 1 {
+            row["dreams"] = .array(night.dreams.map { dream in
+                var fields: [String: JSONValue] = ["title": .string(dream.title ?? dream.firstLine)]
+                if let at = dream.dreamtAgainAt { fields["dreamt_again_at"] = .string(at) }
+                return .object(fields)
+            })
+        }
+        return .object(row)
     }
 
-    /// This week, last week, then "Week of <d MMM>" — the Dreams page's own
-    /// grouping, newest week first (the reader already hands us the entries
-    /// newest-first, and the grouping preserves that order).
+    /// The index, grouped by the Dreams page's own rule (`DreamDiaryWeeks`).
     static func dreamDiaryWeeks(
         _ entries: [DreamEntry],
         dataRoot: URL,
         now: Date = Date(),
         calendar: Calendar = .current
     ) -> [DreamDiaryWeekGroup] {
-        let parser = ISO8601DateFormatter()
-        parser.formatOptions = [.withFullDate]
-        parser.timeZone = calendar.timeZone
-        var order: [String] = []
-        var grouped: [String: [JSONValue]] = [:]
-        var titles: [String: String] = [:]
-        for entry in entries {
-            let start = parser.date(from: String(entry.date.prefix(10))).map {
-                calendar.dateInterval(of: .weekOfYear, for: $0)?.start ?? $0
-            }
-            let key = start.map { parser.string(from: $0) } ?? "undated"
-            if grouped[key] == nil {
-                order.append(key)
-                titles[key] = start.map {
-                    dreamDiaryWeekTitle(weekStart: $0, now: now, calendar: calendar)
-                } ?? "Undated"
-            }
-            grouped[key, default: []].append(.object([
-                "date": .string(entry.date),
-                "first_line": .string(dreamDiaryExcerpt(entry.content)),
-                "archived": .bool(dreamDiaryIsArchived(entry, dataRoot: dataRoot)),
-            ]))
+        DreamDiaryWeeks.weeks(entries, now: now, calendar: calendar).map { week in
+            DreamDiaryWeekGroup(title: week.title, rows: week.entries.map { dreamDiaryIndexRow($0, dataRoot: dataRoot) })
         }
-        return order.map {
-            DreamDiaryWeekGroup(title: titles[$0] ?? "", rows: grouped[$0] ?? [])
-        }
-    }
-
-    static func dreamDiaryWeekTitle(weekStart: Date, now: Date, calendar: Calendar) -> String {
-        if let thisWeek = calendar.dateInterval(of: .weekOfYear, for: now)?.start {
-            if calendar.isDate(weekStart, inSameDayAs: thisWeek) { return "This week" }
-            if let lastWeek = calendar.date(byAdding: .weekOfYear, value: -1, to: thisWeek),
-               calendar.isDate(weekStart, inSameDayAs: lastWeek) { return "Last week" }
-        }
-        return "Week of " + weekStart.formatted(.dateTime.day().month(.abbreviated))
     }
 }

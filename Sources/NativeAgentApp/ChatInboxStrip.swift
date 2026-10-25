@@ -22,23 +22,7 @@ import CloudKit
 import DeviceSync
 #endif
 
-/// A failed inbox read is a distinct visible state, not an empty inbox. Keep
-/// this reducer at the presentation boundary so the file-refresh path cannot
-/// silently erase a previously rendered actionable item.
-enum InboxStripPresentation {
-    struct State: Equatable {
-        var items: [InboxItemRecord]
-        var loadError: String?
-    }
-
-    static func loaded(_ items: [InboxItemRecord]) -> State {
-        State(items: items, loadError: nil)
-    }
-
-    static func failed(previousItems: [InboxItemRecord], errorDescription: String) -> State {
-        State(items: previousItems, loadError: errorDescription)
-    }
-}
+// Blueprint: | `ChatInboxStrip.swift` | `InboxStripContainer`: compact unread-note/approval/card projection; reading does not resolve and settled origins archive their pointer |
 
 struct InboxStripContainer<Header: View>: View {
     /// Fluid glass A2: unread notes are one capsule; the host places it (the
@@ -46,21 +30,21 @@ struct InboxStripContainer<Header: View>: View {
     @ViewBuilder let header: (InboxNotesCapsule) -> Header
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
-    @State private var items: [InboxItemRecord] = []
-    // U5 W-A item 1 (ChatView:2287): a failed inbox READ was swallowed into
-    // [] — the strip rendered as "no unread items" on a corrupt/unreadable
-    // inbox. Load failures now keep the last-known items and render this
-    // inline error row instead of fabricating an empty strip.
-    @State private var loadError: String? = nil
-    @State private var reloadGeneration = 0
-    @State private var approvals: [ApprovalRecord] = []
-    @State private var approvalError: String?
+    private var items: [InboxItemRecord] {
+        appModel.engine.inbox.items.filter {
+            // Reading a request is not resolving it. Delivery archives its
+            // pointer when the originating interaction settles.
+            $0.source == InlineInteractionDelivery.source
+                ? $0.normalizedStatus != "archived"
+                : $0.isUnread
+        }
+    }
 
     /// A card already posted into the open conversation shows there, once.
     /// Her own decisions (her canon) are hers: never a card here.
     private var stripApprovals: [ApprovalRecord] {
-        approvals.filter {
-            !$0.isAgentsOwnDecision
+        appModel.engine.approvals.records.filter {
+            $0.status == "pending" && !$0.isAgentsOwnDecision
                 && (!$0.chatCardDelivered || $0.chatCardSessionId != appModel.activeChatSessionId)
         }
     }
@@ -76,9 +60,9 @@ struct InboxStripContainer<Header: View>: View {
                 try await appModel.inboxAction(id, action: actionID)
                 // Every successful action changes inbox state. Reload now so
                 // a read item leaves the unread count immediately instead of
-                // lingering until the next poll, then publish the same state
+                // lingering until the next file event, then publish the same state
                 // to peripheral surfaces.
-                await reload()
+                await appModel.engine.inbox.refresh()
                 if let inboxSnapshotWriterOverride = appModel.inboxSnapshotWriterOverride {
                     await inboxSnapshotWriterOverride()
                 } else {
@@ -86,7 +70,7 @@ struct InboxStripContainer<Header: View>: View {
                 }
             }
         ))
-        if let approvalError {
+        if let approvalError = appModel.engine.approvals.refreshErrorText {
             Text(approvalError).foregroundStyle(.orange)
         }
         if !stripApprovals.isEmpty || !stripCards.isEmpty {
@@ -108,7 +92,7 @@ struct InboxStripContainer<Header: View>: View {
             }
             .padding(.horizontal, 16)
         }
-        if let loadError {
+        if let loadError = appModel.engine.inbox.loadError {
             Label(loadError, systemImage: "exclamationmark.triangle")
                 .font(.caption)
                 .foregroundStyle(.orange)
@@ -119,58 +103,13 @@ struct InboxStripContainer<Header: View>: View {
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
-            let inboxPath = (appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-                .appendingPathComponent("notifications", isDirectory: true)
-                .appendingPathComponent("inbox.jsonl")
-            await EventDeadlinePhysiology.refreshOnChanges(paths: [inboxPath]) {
-                await reload()
-            }
+            await appModel.engine.inbox.observe()
         }
         .onChange(of: appModel.inboxReloadGeneration) { _, _ in
-            Task { await reload() }
-        }
-        .task {
-            await ApprovalRequestsLiveRefresh.observe(approvals: appModel.engine.approvals) {
-                do {
-                    approvals = try await appModel.engine.approvals.list().filter { $0.status == "pending" }
-                    approvalError = nil
-                } catch {
-                    approvalError = ApprovalLoadFailurePresentation.banner(error: error, retainedApprovalCount: approvals.count)
-                }
-            }
-        }
-    }
-
-    func reload() async {
-        reloadGeneration &+= 1
-        let generation = reloadGeneration
-        do {
-            let next = InboxStripPresentation.loaded(
-                try await appModel.engine.inbox.list().filter {
-                    // Reading a request is not resolving it. Delivery archives
-                    // its pointer when the originating interaction settles.
-                    $0.source == InlineInteractionDelivery.source
-                        ? $0.normalizedStatus != "archived"
-                        : $0.isUnread
-                }
-            )
-            guard generation == reloadGeneration else { return }
-            items = next.items
-            loadError = next.loadError
-        } catch {
-            // Keep last-known items — never fabricate an empty strip; the
-            // inline error row above renders the real failure.
-            let next = InboxStripPresentation.failed(
-                previousItems: items,
-                errorDescription: UserFacingError.message(error, action: "read your inbox")
-            )
-            guard generation == reloadGeneration else { return }
-            items = next.items
-            loadError = next.loadError
+            Task { await appModel.engine.inbox.refresh() }
         }
     }
 }
-
 // PATCH-2026-05-07: chat-provider-picker Now shows Provider → Model
 // dual picker. Provider list comes from /v1/providers (cached on AppModel
 // as providersList). Model list narrows to whatever the SELECTED provider

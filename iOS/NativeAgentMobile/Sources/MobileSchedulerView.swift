@@ -1,5 +1,6 @@
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `MobileSchedulerView.swift` | `MobileSchedulerView` struct |
 
 struct MobileSchedulerView: View {
     private let sync = iCloudSyncEngine.shared
@@ -13,6 +14,7 @@ struct MobileSchedulerView: View {
                 AliveSection("Schedule unavailable") { Text(error).aliveRow() }
             }
             if let snapshot = sync.schedulerSnapshot {
+                LabeledContent("Mac time zone", value: snapshot.mac_time_zone ?? "Not available").aliveRow()
                 if snapshot.jobs.isEmpty {
                     AliveCalmState(title: "No scheduled jobs", line: "Create a job to set something to happen later.")
                 } else {
@@ -22,7 +24,7 @@ struct MobileSchedulerView: View {
                             NavigationLink {
                                 MobileSchedulerJobDetail(jobID: job.id)
                             } label: {
-                                AliveRow(job.name, detail: "\(job.kind) · \(job.schedulerState)\n\(job.schedule)\nNext run: \(job.enabled ? schedulerDate(job.nextRunAt) : "Not scheduled")\nLast run: \(schedulerDate(job.lastRunAt)) · \(job.lastRunStatus ?? "Not run yet")") {
+                                AliveRow(job.name, detail: "\(job.kind) · \(job.schedulerState)\n\(job.schedule)\nNext run: \(job.enabled ? schedulerDate(job.nextRunAt, macTimeZone: snapshot.mac_time_zone) : "Not scheduled")\nLast run: \(schedulerDate(job.lastRunAt, macTimeZone: snapshot.mac_time_zone)) · \(job.lastRunStatus ?? "Not run yet")") {
                                     AliveChevron()
                                 }
                             }
@@ -69,8 +71,9 @@ private struct MobileSchedulerJobDetail: View {
                     LabeledContent("Kind", value: job.kind).aliveRow()
                     LabeledContent("Status", value: job.schedulerState).aliveRow()
                     Text(job.schedule).aliveRow()
-                    LabeledContent("Next run", value: job.enabled ? schedulerDate(job.nextRunAt) : "Not scheduled").aliveRow()
-                    LabeledContent("Last run", value: schedulerDate(job.lastRunAt)).aliveRow()
+                    LabeledContent("Mac time zone", value: sync.schedulerSnapshot?.mac_time_zone ?? "Not available").aliveRow()
+                    LabeledContent("Next run", value: job.enabled ? schedulerDate(job.nextRunAt, macTimeZone: sync.schedulerSnapshot?.mac_time_zone) : "Not scheduled").aliveRow()
+                    LabeledContent("Last run", value: schedulerDate(job.lastRunAt, macTimeZone: sync.schedulerSnapshot?.mac_time_zone)).aliveRow()
                     LabeledContent("Last status", value: job.lastRunStatus ?? "Not run yet").aliveRow()
                 }
                 AliveSection("Controls") {
@@ -125,14 +128,15 @@ private struct MobileSchedulerJobDetail: View {
 
 }
 
-private func schedulerDate(_ value: String?) -> String {
+private func schedulerDate(_ value: String?, macTimeZone: String?) -> String {
     guard let value, !value.isEmpty else { return "Not available" }
+    guard let macTimeZone, let timeZone = TimeZone(identifier: macTimeZone) else { return value }
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     let fractional = formatter.date(from: value)
     formatter.formatOptions = [.withInternetDateTime]
     guard let date = fractional ?? formatter.date(from: value) else { return value }
-    return date.formatted(date: .abbreviated, time: .shortened)
+    return date.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened, timeZone: timeZone))
 }
 
 private struct MobileSchedulerCreateView: View {

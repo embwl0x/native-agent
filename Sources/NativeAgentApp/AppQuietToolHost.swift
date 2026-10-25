@@ -1,4 +1,3 @@
-import GitHubConnector
 import EngineRuntime
 import ActivityWatch
 import ApprovalInbox
@@ -12,10 +11,11 @@ import NativeAgentShared
 import MemoryV2
 import PersistenceCore
 import Privacy
-import ChatOrchestration
+import ChatToolRuntime
 import Desk
 import NotificationInbox
 import TrustPersistence
+// Blueprint: | `AppQuietToolHost.swift` | `AppQuietToolHost`: `inboxFence`, `inbox`, `provider` |
 
 @MainActor final class AppQuietToolHost: AppQuietSettingsHost, QuietToolHost {
     var activeChatSessionId: String { appModel.activeChatSessionId }
@@ -118,14 +118,14 @@ import TrustPersistence
             case .failure(let failure): return (false, failure.detail, failure.fields.merging(["effects": .string("none")]) { $1 })
             }
             await appModel.restoreBackup(backup)
-            guard !appModel.statusText.hasPrefix("Restore failed") else { return (false, appModel.statusForAgent + retry, [:]) }
+            guard case .saved? = appModel.trustCenterActionOutcome else { return (false, appModel.statusForAgent + retry, [:]) }
             // Awaited: a restore that stages restarts the app once this turn ends.
             _ = await HarnessDecidedRow.record(requester: "Full Mac", tool: "backup.restore \(backup.id)",
                                                sessionID: AppToolExecutor.inputString(input["__session_id"]),
                                                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             return (true, appModel.statusForAgent, ["id": .string(backup.id)])
         case "activity_wipe":
-            let activity = ActivityWatchController.shared
+            let activity = appModel.engine.activityWatch
             let removed: Int
             switch await activity.wipeAll() {
             case .deleted(let rows): removed = rows
@@ -166,22 +166,6 @@ import TrustPersistence
                 "revision": .int(Int64(interaction.revision)),
             ]
     }
-    func saveConnectorToken(_ value: String, connector: String, dataRoot: URL) async -> String? {
-            let result: OAuthFlowResult
-            switch connector {
-            case "notion": result = await NativeOAuthFlow.saveNotionToken(value, dataRoot: dataRoot)
-            case "github": result = await NativeOAuthFlow.saveGitHubToken(value, dataRoot: dataRoot, credentialStore: GitHubCredentialStore.shared)
-            default: result = OAuthFlowResult(ok: false, error: "No token route for \(connector).")
-            }
-            if !result.ok {
-                return NativeOAuthFlow.inlineSetupFailureReason(
-                    result.error ?? "",
-                    service: InlineInteractionRegistry.connectorDisplayName(connector, dataRoot: dataRoot),
-                    typed: [value]
-                )
-            }
-        return nil
-    }
 }
 
 // MARK: - inbox
@@ -199,7 +183,7 @@ extension AppQuietToolHost: QuietInboxHost {
     }
     func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?) async throws {
         try await InboxCardActions.perform(id, action: action, metadata: metadata, quiet: quiet,
-            dataRootOverride: dataRootOverride, effects: AppInboxCardActionEffects())
+            dataRootOverride: dataRootOverride, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
     }
     func withdrawApproval(id: String, decidedBy: String) async throws {
         _ = try await ApprovalTransactionCoordinator.app(dataRootOverride: appModel.dataRootOverride)
@@ -225,7 +209,7 @@ extension AppQuietToolHost: QuietInboxHost {
             default: return "Selected the card's choice: \(item.effectiveActions.first { $0.id == action }?.label ?? action)."
             }
         }
-        switch InboxCardActions.resolvePrimaryAction(for: item, effects: AppInboxCardActionEffects()) {
+        switch InboxCardActions.resolvePrimaryAction(for: item, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox)) {
         case .openApprovals: return "Marked the note read; its approvals wait on the Approvals page. The person's screen was not moved."
         case .openDeskExecution: return "Marked the note read; its work is on the Desk. The person's screen was not moved."
         case .chatDraft: return "Marked the note read. Its action only drafts a chat message for the person, so nothing was put in their composer."
@@ -244,7 +228,6 @@ extension AppQuietToolHost {
             refresh: {
                 switch await appModel.engine.providers.refreshSettings(refreshCatalog: true, cause: UserFacingError.cause) {
                 case .loaded(let snapshot):
-                    _ = await appModel.loadProvidersForChat()
                     return (snapshot.providers, nil)
                 case .failed(let detail): return ([], detail)
                 }

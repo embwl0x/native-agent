@@ -1,4 +1,5 @@
 import SwiftUI
+// Blueprint: | `ChatView+DetachedSessionMenu.swift` | `ChatView`: `detachedSessionMenu` |
 
 extension ChatView {
     @ViewBuilder

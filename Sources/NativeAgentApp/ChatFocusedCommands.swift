@@ -1,5 +1,7 @@
 import SwiftUI
 
+// Blueprint: | `ChatFocusedCommands.swift` | `ChatFocusedCommands`: active-window chat action closures and page visibility, keeping shortcuts out of hidden controls |
+
 /// Window-focused chat actions keep keyboard shortcuts out of invisible
 /// production buttons. The active main or detached chat window owns the
 /// closures; the app command menu only invokes that focused owner.

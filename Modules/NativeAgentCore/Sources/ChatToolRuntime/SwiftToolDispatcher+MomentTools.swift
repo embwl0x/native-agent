@@ -24,6 +24,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
+// Blueprint: | `SwiftToolDispatcher+MomentTools.swift` | `SwiftToolDispatcher`: `impl_memory_moments_pending`, `impl_memory_moment_review` |
 
 extension SwiftToolDispatcher {
 

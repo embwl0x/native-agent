@@ -1,10 +1,12 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `ProviderToolNameMap.swift` | `ProviderToolNameMap`: stable provider-safe tool aliases with reverse mapping to canonical dispatch names |
+
 /// Maps NativeAgent's internal tool names to provider-safe names.
 ///
-/// Internal MCP bridge names intentionally preserve server/tool identity
-/// (`mcp__server-id__tool.name`). Some providers only accept a narrow
+/// Internal tool names may carry dots or dashes (`browser.read_text`).
+/// Some providers only accept a narrow
 /// `[A-Za-z0-9_]` name at the wire boundary, so the LLM sees aliases while
 /// dispatch still receives the original names.
 struct ProviderToolNameMap: Sendable {
@@ -35,6 +37,8 @@ struct ProviderToolNameMap: Sendable {
             }
             publicSchemas.append(LLMToolSchema(
                 name: providerName,
+                toolClass: schema.toolClass, reach: schema.reach, capabilities: schema.capabilities,
+                effectInputPolicy: schema.effectInputPolicy,
                 description: description,
                 parametersJSON: schema.parametersJSON,
                 // The Anthropic `defer_loading` flag is a property of the

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TrustCenter+Defaults.swift` | Canonical Trust/Mac schema, using immutable MacControlPolicyWireSnapshot scalar defaults shared with typed and phone reads |
 
 extension SwiftNativeTrustCenter {
     /// Default trust policy for the Swift runtime. Saved policy values are
@@ -8,12 +9,14 @@ extension SwiftNativeTrustCenter {
     public nonisolated func defaultTrustPolicy() -> [String: JSONValue] {
         var policy: [String: JSONValue] = [:]
         policy["permissionLevel"] = .string("balanced")
+        // Access-mode display/preset projection; PermissionLaw decides each call.
         policy["autonomyDefault"] = .string("supervised")
         // `enableAutonomy` is deliberately NOT here. This shape is the merge
         // base for EVERY saved policy, so a default true would silently grant
         // unattended work to an older strict policy that predates the key.
         // The fresh-install grant lives in `freshInstallTrustPolicyAdditions`,
-        // applied only when no policy file exists.
+        // applied when the file is absent or contains an empty object.
+        // Read-time default when absent on disk; patching does not stamp edits.
         policy["updatedAt"] = .string(Self.isoTimestamp(clock()))
         policy["appDataRoot"] = .string(dataRoot.path)
         // Wave 4 phase A: STILL the old key. Readers accept `workshopPolicy`
@@ -35,7 +38,7 @@ extension SwiftNativeTrustCenter {
             "allowedWorkspaceIds": .array([]),
             "workspaceRoots": .array(TrustCenterDefaultWorkspaceRoots.defaultRootPaths(dataRoot: dataRoot).map { .string($0) }),
             "requireBackupBeforeWrite": .bool(true),
-            "allowDestructiveActions": .bool(false),
+            "allowDestructiveActions": .bool(false), // Normalized from developerMode; never skips destructive approval.
             "outsideWorkspaceDefault": .string("deny"),
         ])
         policy["connectorPolicy"] = .object([
@@ -92,31 +95,10 @@ extension SwiftNativeTrustCenter {
             "storeReceipts": .bool(true),
         ])
         policy["inboxPolicy"] = .object(["enabled": .bool(true)])
-        policy["mcpPolicy"] = .object(["allow_lifecycle_ops": .bool(false)])
-        policy["macControlPolicy"] = .object([
-            "enabled": .bool(false),
-            "applescript_allowed": .bool(false),
-            "jxa_allowed": .bool(false),
-            "shortcuts_allowed": .bool(true),
-            "accessibility_allowed": .bool(false),
-            "system_control_allowed": .bool(false),
-            "file_ops_allowed": .bool(false),
-            "shell_allowed": .bool(false),
-            "notifications_allowed": .bool(true),
-            "spotlight_allowed": .bool(true),
-            "approval_required_for": .array([
-                .string("shell"), .string("file_ops"),
-                .string("applescript"), .string("jxa"), .string("accessibility"),
-            ]),
-            "remote_from_ios_allowed": .bool(false),
-            "riskGatePolicy": .object([
-                "low": .string("auto"),
-                "medium": .string("approve_each"),
-                "high": .string("approve_each"),
-                "critical": .string("approve_each"),
-            ]),
-        ])
+        policy["macControlPolicy"] = .object(Self.defaultMacControlPolicy)
         policy["securityPolicy"] = .object([
+            // Legacy stored switches below do not select execution decisions.
+            // Live controls here are signing, audit receipts, notifications and kill switch.
             "securityCenterEnabled": .bool(true),
             "capabilityPolicyEnabled": .bool(true),
             "originTrustEnabled": .bool(true),
@@ -125,21 +107,19 @@ extension SwiftNativeTrustCenter {
             "dangerGatesEnabled": .bool(true),
             "rollbackByDefault": .bool(true),
             "secretFirewallEnabled": .bool(true),
-            "toolSigningRequired": .bool(false),  // USER YOLO 2026-08-12
+            "toolSigningRequired": .bool(false),
             "auditReceiptsEnabled": .bool(true),
             "allowAppNotifications": .bool(true),
             "killSwitchEnabled": .bool(false),
             "remoteHighRiskDefault": .string("block"),
-            "criticalRequiresDeveloperMode": .bool(false),  // USER YOLO 2026-08-12
+            "criticalRequiresDeveloperMode": .bool(false),
         ])
         policy["providerPolicy"] = .object([
+            // Preserved legacy metadata; routing reads providers/active.json and surfaces.json.
             "active_per_surface": .object([
                 "chat": .string("openai_oauth_direct"),
                 "ios": .string("openai_oauth_direct"),
                 "telegram": .string("openai_oauth_direct"),
-                // Both spellings: the merge below is default-union-saved, so a
-                // saved 0.3.x policy keyed `missions` keeps working while a
-                // canonical reader finds `workshop` (P2-3).
                 "workshop": .string("openai_oauth_direct"),
                 "missions": .string("openai_oauth_direct"),
                 "training": .string("openai_oauth_direct"),
@@ -148,5 +128,17 @@ extension SwiftNativeTrustCenter {
             ]),
         ])
         return policy
+    }
+
+    /// Canonical Mac schema; scalar defaults are shared with phone decoding.
+    nonisolated static var defaultMacControlPolicy: [String: JSONValue] {
+        var mac = TrustMacControlPolicy().wireValue.mapValues { JSONValue(fromFoundation: $0) }
+        // Approval/risk settings feed UI and receipt metadata; PermissionLaw
+        // decides approval. Runtime Mac gates use enabled/category flags.
+        mac["riskGatePolicy"] = .object([
+            "low": .string("auto"), "medium": .string("approve_each"),
+            "high": .string("approve_each"), "critical": .string("approve_each"),
+        ])
+        return mac
     }
 }

@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `ApprovalLifecycle.swift` | `ApprovalLifecycleBus`: post-commit approval transition fan-out and host reply context; the inbox remains decision authority |
+
 public enum ApprovalLifecyclePhase: String, Sendable, Equatable {
     case requested
     case resolved
@@ -25,6 +27,7 @@ public struct ApprovalLifecycleEvent: Sendable, Equatable {
 
 /// Fan-out for durable approval lifecycle edges. The inbox remains the
 /// authority; this bus carries no decisions and cannot mutate an approval.
+/// Ordinary subscribers receive every phase, including replay settlement.
 public actor ApprovalLifecycleBus {
     public static let shared = ApprovalLifecycleBus()
 
@@ -47,7 +50,6 @@ public actor ApprovalLifecycleBus {
         if event.phase == .resolved || event.phase == .executed {
             if SwiftNativeApprovalInbox.terminalApprovalStatuses.contains(event.record.status),
                let id = hostCallID(event.record) { continuations[id]?.reply.yield(event) }
-            if event.phase == .executed { return }
         }
         for continuation in continuations.values where !continuation.host {
             continuation.reply.yield(event)

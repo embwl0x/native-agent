@@ -50,6 +50,13 @@ struct SurfaceModelPref: Equatable, Sendable, Codable {
     var providerId: String? = nil
 }
 
+/// The Mac's capture revision travels with the bytes it describes. Phone
+/// request/arrival order is never the age of that snapshot.
+struct MacSnapshotRead<Value: Decodable & Sendable>: Decodable, Sendable {
+    let revision: Double
+    let value: Value
+}
+
 // MARK: - iCloudSyncEngine
 
 /// The last agent name this phone heard, kept only for the pairing that
@@ -57,16 +64,16 @@ struct SurfaceModelPref: Equatable, Sendable, Codable {
 /// Mac or Apple Account pairs with a different secret), never the secret.
 /// Unpaired, or paired to someone else, the name is dropped, not shown.
 enum AgentNameCache {
-    private static let nameKey = "nativeagent.lastAgentName"
-    private static let pairingKey = "nativeagent.lastAgentName.pairing"
+    private static let nameKey = SharedChatInbox.identityNameKey
+    private static let pairingKey = SharedChatInbox.identityPairingKey
 
     static func fingerprint(_ secret: Data?) -> String? {
         guard let secret, !secret.isEmpty else { return nil }
         return SHA256.hash(data: secret).prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
-    static func remember(_ name: String, pairing secret: Data?, defaults: UserDefaults = .standard) {
-        guard let fingerprint = fingerprint(secret) else { return }
+    static func remember(_ name: String, pairing secret: Data?, defaults: UserDefaults? = SharedChatInbox.identityDefaults) {
+        guard let fingerprint = fingerprint(secret), let defaults else { return }
         defaults.set(name, forKey: nameKey)
         defaults.set(fingerprint, forKey: pairingKey)
         CommunicationNotification.remember(name: name, pairing: fingerprint)
@@ -76,8 +83,8 @@ enum AgentNameCache {
     /// pairing clears it. No secret in hand (unpaired, or the Keychain still
     /// locked at launch) shows nothing and keeps it; `forget` runs when the
     /// pairing is known to be gone.
-    static func name(pairing secret: Data?, defaults: UserDefaults = .standard) -> String? {
-        guard let name = defaults.string(forKey: nameKey), let fingerprint = fingerprint(secret) else { return nil }
+    static func name(pairing secret: Data?, defaults: UserDefaults? = SharedChatInbox.identityDefaults) -> String? {
+        guard let defaults, let name = defaults.string(forKey: nameKey), let fingerprint = fingerprint(secret) else { return nil }
         guard defaults.string(forKey: pairingKey) == fingerprint else {
             forget(defaults: defaults)
             return nil
@@ -86,9 +93,9 @@ enum AgentNameCache {
         return name
     }
 
-    static func forget(defaults: UserDefaults = .standard) {
-        defaults.removeObject(forKey: nameKey)
-        defaults.removeObject(forKey: pairingKey)
+    static func forget(defaults: UserDefaults? = SharedChatInbox.identityDefaults) {
+        defaults?.removeObject(forKey: nameKey)
+        defaults?.removeObject(forKey: pairingKey)
         CommunicationNotification.forget()
     }
 }
@@ -106,6 +113,13 @@ final class iCloudSyncEngine {
     var schedulerSnapshot: MobileSchedulerSnapshot?
     var schedulerJobReceiptTimes: [String: Double] = [:]
     var schedulerError: String?
+    var appSettingRows: [MobileAppSetting] = []
+    var appSettingsGeneration: UInt64 = 0
+    var appSettingsLoading = false
+    var appSettingsSaving: Set<String> = []
+    var appSettingsFailure: String?
+    var helperDetails: [UUID: MobileHelperEdit] = [:]
+    var agentThreads: [String: MobileAgentThread] = [:]
     /// What the Mac's Desk bounds dropped, as the Mac reported it. nil means no
     /// report was delivered (an older Mac), never "nothing was dropped".
     var deskBounds: MobileDeskProjectionReport?
@@ -113,9 +127,13 @@ final class iCloudSyncEngine {
     /// automatically beside the compact board so the text that matters can be
     /// read away from the Mac. Keyed by Desk handle.
     var deskReadingCopies: [String: MobileDeskItemReadingCopy] = [:]
-    var skills: [SkillRecord] = []
+    var skills: [SkillManifestEntry] = []
+    var tools: [ToolRecord] = []
+    var knowledgeGraph: KGEntityResponse?
     var memories: [MemoryRecord] = []
     var memoryProposals: [MemoryProposalRecord] = []
+    var snapshotReadRevisions: [String: Double] = [:]
+    var recordReadbackRevisions: [String: [String: Double]] = [:]
     var trainingProposals: [TrainingProposalSummary] = []
     /// Set only after both self-improvement projections arrive together. Empty
     /// arrays before this point mean “not published yet”, not a measured clear
@@ -151,6 +169,8 @@ final class iCloudSyncEngine {
         let fingerprint = AgentNameCache.fingerprint(secret)
         guard snapshotPairing != fingerprint else { return }
         snapshotPairing = fingerprint
+        if fingerprint == nil { AgentNameCache.forget() }
+        else { _ = AgentNameCache.name(pairing: secret) }
         lifecycleGeneration &+= 1
         refreshInFlight = false
         refreshQueued = false
@@ -167,11 +187,20 @@ final class iCloudSyncEngine {
         schedulerSnapshot = nil
         schedulerJobReceiptTimes = [:]
         schedulerError = nil
+        appSettingRows = []
+        appSettingsFailure = nil
+        helperDetails = [:]
+        agentThreads = [:]
+        PhoneTurnActivity.shared.workCorrelations = [:]
         deskBounds = nil
         deskReadingCopies = [:]
         skills = []
+        tools = []
+        knowledgeGraph = nil
         memories = []
         memoryProposals = []
+        snapshotReadRevisions = [:]
+        recordReadbackRevisions = [:]
         trainingProposals = []
         selfImprovementSnapshotPublishedAt = nil
         trustPolicy = nil
@@ -179,21 +208,18 @@ final class iCloudSyncEngine {
         personality = nil
         sessions = []
         helpersSnapshot = nil
-        pinnedChatSessions = []
-        chatAnchor = nil
+        surfaceLayout = nil
+        sessionNavigation = nil
         chatTranscripts = [:]
-        pageSnapshotVersions = [:]
-        pageVersionTask?.cancel()
-        pageVersionTask = nil
-        pageVersionQueued = false
         health = nil
         organismLivingStatus = nil
         runs = []
         connectors = []
+        telegram = nil
         providers = []
         providerSignIns = [:]
         surfaceModels = [:]
-        pendingPhoneSurfaceModels = [:]
+        surfaceModelRevisions = [:]
         approvals = []
         inboxItems = []
         turnSummaries = nil
@@ -211,10 +237,9 @@ final class iCloudSyncEngine {
     var helpersSnapshot: MobileHelpersSnapshot?
     /// The Mac's layout (ui/layout.json, in the core snapshot); More draws its sections from it.
     var surfaceLayout: SurfaceLayout?
-    var pinnedChatSessions: [ChatSession] = []
-    /// The Mac window's current chat, published beside `sessions.json`.
-    /// Main follows it; explicitly opened history keeps its own destination.
-    var chatAnchor: ConversationAnchorPin?
+    var sessionNavigation: ChatSessionNavigation?
+    var pinnedChatSessions: [ChatSession] { sessionNavigation?.rows.filter(\.isPinned).map(\.session) ?? [] }
+    var chatAnchor: ConversationAnchorPin? { sessionNavigation?.anchor }
     /// 2026-09-06: one published transcript for a session — the rows the Mac
     /// published and the version it published them at, in ONE value. Two
     /// properties would not do: only the rows map is observed, so a republished
@@ -224,12 +249,17 @@ final class iCloudSyncEngine {
     struct PublishedTranscript: Equatable, Sendable {
         var records: [ChatMessageRecord]
         var messages: [ChatMessage]
+        var otherRooms: [OtherRoomExchange] = []
         /// The Mac session's transcript version — a counter bumped on every
         /// clear and every transcript write. nil on pre-2026-09-06 Mac builds;
         /// an empty transcript with no version never clears anything.
         var generation: Int?
         /// The Mac holds rows older than the published window.
         var hasOlder = false
+        /// IDs of Mac history rows loaded beyond the snapshot window.
+        var historyIDs: Set<UUID> = []
+        var regeneratedAwayIDs: Set<UUID> = []
+        var readError: String? = nil
     }
     var chatTranscripts: [String: PublishedTranscript] = [:]
     var health: RuntimeHealth?
@@ -238,20 +268,18 @@ final class iCloudSyncEngine {
     // heavy snapshot pass) — AdvancedView's runs list finally has a source.
     var runs: [RunRecord] = []
     var connectors: [ConnectorRecord] = []
+    var telegram: MobileTelegramSnapshot?
     // PATCH-2026-05-07: leftover-1 providers snapshot — loaded from providers.json written by MacSyncEngine
     var providers: [ProviderInfo] = []
     var providerSignIns: [String: [String: String]] = [:]
     var surfaceModels: [String: SurfaceModelPref] = [:]
-    var pendingPhoneSurfaceModels: [UUID: (surface: String, preference: SurfaceModelPref)] = [:]
+    var surfaceModelRevisions: [String: Double] = [:]
     var approvals: [ApprovalRequest] = []
     var inboxItems: [InboxItemRecord] = []
     // Turn Inspector W4: read-only per-turn summaries from the Mac snapshot lane.
     var turnSummaries: TurnSummaryFile?
     var lastSyncAt: Date?
     var foregroundSnapshotGroup: NAMobileSnapshotGroup = .chat
-    var pageSnapshotVersions: [String: Data] = [:]
-    @ObservationIgnored var pageVersionTask: Task<Void, Never>?
-    @ObservationIgnored var pageVersionQueued = false
     /// When each snapshot GROUP last actually arrived — keyed by
     /// `NAMobileSnapshotGroup.rawValue`. `lastSyncAt` is renewed by every local
     /// cache read (a Desk read renews it without reading Memory), so it is the
@@ -398,7 +426,7 @@ final class iCloudSyncEngine {
     var transactionWriteTimeoutSeconds: TimeInterval = 5
     var transactionWriteTestHook: (@Sendable (_ state: String) throws -> Void)?
 
-    private init() {}
+    init(personality: PersonalityProfile? = nil) { self.personality = personality }
 }
 
 // MARK: - Errors

@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `KnowledgeGraphEdgeWireSnapshot.swift` | `KnowledgeGraphEdgeWireSnapshot`: shared immutable edge decoding; platform wrappers retain UI identity and extra fields |
+
 /// Common edge snapshot decoding; platform wrappers retain UI identity and extra fields.
 public struct KnowledgeGraphEdgeWireSnapshot: Decodable {
     public let from: String

@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ProviderCatalogWireModels.swift` | `ProviderModelInfo` and `ProviderTestResult`: shared model capabilities and typed check results, including cause and exact-key fingerprint |
+
 public struct ProviderModelInfo: Codable, Hashable, Identifiable, Sendable {
     public var id: String
     public var name: String

@@ -1,6 +1,8 @@
 import AppKit
 import Agents
-import ChatOrchestration
+import ChatToolRuntime
+import AgentWorkspace
+import AgentConversations
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -9,6 +11,95 @@ import StandingBots
 import Transcripts
 import Darwin
 import Experiences
+import Observation
+import SwarmRuns
+import AppToolRuntime
+import os
+// Blueprint: | `EngineContactThreads.swift` | ContactListFacade owns checked doors through LatestRead; shared contact/helper/crew projections and HerScreen's other-room timeline refresh on the same contact signals |
+
+/// The engine's address book: one checked row per door, including its grant
+/// and effective elevation verdict. Agents, Trust and contact threads read it.
+@MainActor @Observable
+public final class ContactListFacade {
+    public nonisolated let dataRoot: URL
+    public private(set) var doors: [AgentContactRow] = []
+    public private(set) var loaded = false
+    public private(set) var loadError: String?
+    public var rows: [AgentContactRow] { doors.filter(\.primary) }
+    @ObservationIgnored private lazy var latest = LatestRead()
+    @ObservationIgnored private var watchTask: Task<Void, Never>?
+
+    public nonisolated init(dataRoot: URL) { self.dataRoot = dataRoot }
+    deinit { watchTask?.cancel() }
+
+    @discardableResult
+    public func refresh() async throws -> [AgentContactRow] {
+        try await refreshDoors().filter(\.primary)
+    }
+
+    /// Return this read's doors even when a newer read owns publication.
+    func refreshDoors() async throws -> [AgentContactRow] {
+        let root = dataRoot
+        let result: Result<[AgentContactRow], Error> = await latest.read({
+            do {
+                return .success(try await Task.detached(priority: .utility) {
+                    let discovery = await AgentDiscoverySession.shared.candidates(dataRoot: root)
+                    let peers = try AgentPeerStore(dataRoot: root).list()
+                    let lasts = AgentConversationStore.lastExchanges(peers: peers,
+                        records: (try? AgentConversationStore(dataRoot: root).records()) ?? [], dataRoot: root).mapValues(\.summary)
+                    return AgentContactRow.rows(peers: peers, candidates: discovery, usable: [], dataRoot: root, everyDoor: true).map { row in
+                        var row = row
+                        row.lastExchange = row.contact.flatMap { lasts[$0.id] }
+                        return row
+                    }
+                }.value)
+            } catch {
+                return .failure(error)
+            }
+        }, publish: { result in
+            loaded = true
+            switch result {
+            case .success(let next):
+                doors = next
+                loadError = nil
+            case .failure(let error):
+                loadError = error.localizedDescription
+            }
+        })
+        return try result.get()
+    }
+
+    /// The former mounted address-book watchers belong to this engine now.
+    public func watch() {
+        guard watchTask == nil else { return }
+        let root = dataRoot
+        watchTask = Task { [weak self] in
+            let events = FileChangeEvents(paths: ["agents/peers.json", "agents/conversations.json",
+                "agents/discovery.json", "chat/sessions.json"].map { root.appendingPathComponent($0) }
+                + [AgentLocalHealth.url(root), InstallPaths.current.bridgeConfigRoot(dataRoot: root)
+                    .appendingPathComponent("claude-bridge/claude-live")], emitInitial: true)
+            let dot = NotificationCenter.default.addObserver(forName: ChatGPTDotIPCTransport.didChange,
+                object: nil, queue: nil) { [weak self] _ in
+                Task { @MainActor [weak self] in _ = try? await self?.refresh() }
+            }
+            var askedDot = false
+            await withTaskCancellationHandler {
+                for await _ in events.stream {
+                    if Task.isCancelled { break }
+                    _ = try? await self?.refresh()
+                    if !askedDot, self?.doors.contains(where: { $0.contact.map(ChatGPTDotIPCTransport.owns) == true }) == true {
+                        askedDot = true
+                        await Task.detached(priority: .userInitiated) {
+                            _ = await SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false).chatGPTDotReadiness()
+                        }.value
+                        _ = try? await self?.refresh()
+                    }
+                }
+            } onCancel: { events.cancel() }
+            NotificationCenter.default.removeObserver(dot)
+        }
+    }
+}
 
 /// A contact, keyed the way the agent's conversation records key it:
 /// `peer:<id>` for a saved contact, `codex` / `claude` / `omp` for a
@@ -29,7 +120,6 @@ public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
     /// desktop app and "Grok Bot" the routine).
     public var link: Link? = nil
     /// Its initials tint: a palette slot three on from the row above (SimpleAvatar).
-    public var tintSlot: Int? = nil
     /// Claude — the Claude Code bridge (Claude here) or Claude Desktop —
     /// wears Clawd instead of an app icon (User 09-28).
     public var clawd = false
@@ -37,7 +127,39 @@ public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
     public var dot = false
     public var health: AgentLocalHealth? = nil
     public var recoveredFailure = false
+    public var owedExperiences: [Experience] = []
     public var initial: String { name.first.map { String($0).uppercased() } ?? "?" }
+
+    /// One precedence for every door; dates and clipping belong to the renderer.
+    public func status(flight: AgentContactFlight?, waiting: Bool, delivery: AgentConversationDelivery?) -> String? {
+        if !owedExperiences.isEmpty { return "\(owedExperiences.count) \(owedExperiences.count == 1 ? "message" : "messages") still owed" }
+        if let problem = health?.problem { return problem }
+        if let flight {
+            if flight.stop?.state == "stopping" { return "Stopping…" }
+            if flight.stop?.state == "stopped", !flight.inFlight { return "Stopped" }
+            if flight.working { return flight.partial != nil ? "Typing…" : "Working…" }
+            if flight.queued.contains(where: { $0.state == .sending }) { return "Sending…" }
+            if !flight.inFlight {
+                if flight.queued.contains(where: { $0.state == .queued }) { return "Queued" }
+                if flight.queued.contains(where: { if case .held = $0.state { true } else { false } }) { return "Not sent" }
+            }
+        }
+        if waiting { return "Waiting for reply" }
+        if recoveredFailure, delivery == nil { return "Ready" }
+        switch delivery {
+        case .sending?, .waiting?: return "Waiting for reply"
+        case .delivered?: return "Delivered"
+        case .read?: return "Read"
+        case .answered?: return "Replied"
+        case .failed?: return "No reply"
+        case .notDelivered?: return "Not delivered"
+        case nil: return health?.word
+        }
+    }
+
+    public func latestLine(in lines: [AgentContactThreadLine]) -> AgentContactThreadLine? {
+        lines.last { !recoveredFailure || !AgentLocalHealth.authenticationFailure(.string($0.text)) }
+    }
 
     public enum Link: Equatable, Sendable {
         case desktopApp, routine
@@ -55,6 +177,7 @@ public struct AgentContactThreadLine: Identifiable, Equatable, Sendable {
     public var byPerson = false
     public var door: String? = nil
     public var fetched = false
+    public var resultID: UUID? = nil
 }
 
 /// What is moving on a contact's thread now: the other agent's live progress
@@ -106,7 +229,44 @@ public struct AgentContactFlight: Equatable, Sendable {
 
 /// Root-scoped contact reads and live reply projections shared by desktop and phone.
 public enum AgentContactThreads {
+    public struct HelperResult: Identifiable, Equatable, Sendable {
+        public let entry: ShelfEntry
+        public let preview: String?
+        public var id: UUID { entry.id }
+        public var line: String {
+            switch entry.runtimeStatus {
+            case .completed: return preview ?? "Result unavailable"
+            case .waitingForApproval: return "Waiting for approval"
+            case .waitingOnPerson: return entry.statusDetail.map { "Waiting on you — \($0)" } ?? "Waiting on you"
+            case .failed: return "Failed: " + (entry.statusDetail ?? "cause not recorded")
+            case .stopped: return "Stopped" + (entry.statusDetail.map { ": " + $0 }
+                ?? preview.map { ": " + ContactThreadsProjection.firstLine($0) } ?? "")
+            case .interrupted: return "Interrupted" + (entry.statusDetail.map { ": " + $0 }
+                ?? preview.map { ": " + ContactThreadsProjection.firstLine($0) } ?? "")
+            }
+        }
+    }
+
+    public struct HelperResults: Equatable, Sendable {
+        public let history: [HelperResult]
+        public let latestCompleted: HelperResult?
+    }
+
+    /// Shelf identity selects results; Experience owns the words on every door.
+    public static func helperResults(_ helper: BotsShelfRecord, root: URL, historyLimit: Int = 40,
+                                     representedResults: Set<UUID> = []) async throws -> HelperResults {
+        let history = Array(helper.sortedEntries.filter { !representedResults.contains($0.id) }.prefix(historyLimit))
+        let latest = helper.sortedEntries.first { $0.runtimeStatus == .completed }
+        var results: [UUID: HelperResult] = [:]
+        for entry in history + (latest.map { [$0] } ?? []) where results[entry.id] == nil {
+            results[entry.id] = HelperResult(entry: entry,
+                preview: try await ExperienceStore.at(root).experience(entry.id.uuidString)?.face?.words)
+        }
+        return HelperResults(history: history.compactMap { results[$0.id] }, latestCompleted: latest.flatMap { results[$0.id] })
+    }
+
     public struct Snapshot: Sendable {
+        public var otherRooms: [OtherRoomExchange] = []
         public var contacts: [AgentContactPresentation]
         public var lines: [String: [AgentContactThreadLine]]
         public var waiting: Set<String>
@@ -121,7 +281,8 @@ public enum AgentContactThreads {
         public init(contacts: [AgentContactPresentation], lines: [String: [AgentContactThreadLine]],
                     waiting: Set<String>, status: [String: AgentConversationDelivery],
                     flights: [String: AgentContactFlight], helpers: [BotsShelfRecord], running: Set<UUID>,
-                    flightRecords: [String: String] = [:], recordsStamp: String = "") {
+                    flightRecords: [String: String] = [:], recordsStamp: String = "", otherRooms: [OtherRoomExchange] = []) {
+            self.otherRooms = otherRooms
             (self.contacts, self.lines, self.waiting, self.status, self.flights) = (contacts, lines, waiting, status, flights)
             (self.helpers, self.running, self.flightRecords, self.recordsStamp) = (helpers, running, flightRecords, recordsStamp)
         }
@@ -129,6 +290,7 @@ public enum AgentContactThreads {
 
     /// What a read changed, worked out off the main actor; nil is unchanged.
     public struct Delta: Sendable {
+        public var otherRooms: [OtherRoomExchange]?
         public var contacts: [AgentContactPresentation]?
         public var lines: [String: [AgentContactThreadLine]]?
         public var waiting: Set<String>?
@@ -139,26 +301,17 @@ public enum AgentContactThreads {
     }
 
     public static func changes(from old: Snapshot, to new: Snapshot) -> Delta? {
-        let delta = Delta(contacts: old.contacts == new.contacts ? nil : new.contacts,
+        let delta = Delta(otherRooms: old.otherRooms == new.otherRooms ? nil : new.otherRooms,
+                          contacts: old.contacts == new.contacts ? nil : new.contacts,
                           lines: old.lines == new.lines ? nil : new.lines,
                           waiting: old.waiting == new.waiting ? nil : new.waiting,
                           status: old.status == new.status ? nil : new.status,
                           flights: old.flights == new.flights ? nil : new.flights,
                           helpers: old.helpers == new.helpers ? nil : new.helpers,
                           running: old.running == new.running ? nil : new.running)
-        let unchanged = delta.contacts == nil && delta.lines == nil && delta.waiting == nil
+        let unchanged = delta.otherRooms == nil && delta.contacts == nil && delta.lines == nil && delta.waiting == nil
             && delta.status == nil && delta.flights == nil && delta.helpers == nil && delta.running == nil
         return unchanged ? nil : delta
-    }
-
-    /// The saved contacts with their app identities, kept until what
-    /// they are made of can have changed: peers.json, the usable built-in
-    /// lanes, or an approved ACP program (each check re-hashes the program
-    /// and reads Keychain, so it is not redone on every message).
-    public struct ContactList: Sendable {
-        public var stamp: [String]
-        public var programs: [String]
-        public var contacts: [AgentContactPresentation]
     }
 
     /// A file's identity, size, times and mode; any change re-checks.
@@ -201,30 +354,16 @@ public enum AgentContactThreads {
         return contact.unavailableAt != nil || !row.credentialAvailable ? "This connection is unavailable for sending." : nil
     }
 
-    private static func contactList(root: URL, cached: ContactList?) throws -> ContactList {
-        let peersFile = root.appendingPathComponent("agents/peers.json").path
-        let peers = try AgentPeerStore(dataRoot: root).list()
-        let inboxes = peers.flatMap { $0.handles ?? [] }.compactMap {
-            AgentConversationDelivery.inbox(agent: $0, bridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root))
-        }
-        let head = [stamp(peersFile), ChatGPTDotIPCTransport.detail] + inboxes.map { stamp($0.path) }
-        if let cached, cached.stamp == head + cached.programs.map(stamp) { return cached }
-        // The same contact list the Agents page shows, minus apps that are
-        // merely installed: saved contacts, then the usable built-in lanes.
-        let programs = peers.filter { $0.transport == .acp }.compactMap { $0.approvedACPExecutable?.path }
-        // Stamped before the checks, so a change during them re-checks next time.
-        let stamps = head + programs.map(stamp)
+    private static func contactList(root: URL, owner: ContactListFacade) async throws -> [AgentContactPresentation] {
+        let rows = try await owner.refresh().filter { $0.contact != nil }
         let dates = ISO8601DateFormatter()
-        let identity = AgentContactIdentity(dataRoot: root)
-        let rows = AgentContactRow.rows(peers: peers, candidates: [], usable: [])
-        var seen: Set<String> = []
-        // Once per row: the restriction reads Keychain and the program's file.
+        // The contact owner has already selected canonical rows and checked credentials.
         let restrictions = rows.map { row in
             AgentConversationDelivery.lane(for: row.key, dataRoot: root) != nil ? nil : sendRestriction(row)
         }
         let grouped = rows.indices.sorted { a, b in
             return restrictions[a] == nil && restrictions[b] != nil
-        }.filter { seen.insert(identity.canonical(rows[$0].key)).inserted }
+        }
         let contacts = grouped.map { index in
             let row = rows[index]
             return AgentContactPresentation(id: row.id,
@@ -236,45 +375,23 @@ public enum AgentContactThreads {
                                  appBundleID: appBundleID(row),
                                  link: link(row),
                                  clawd: isClaude(row),
-                                 dot: row.contact.map(ChatGPTDotIPCTransport.owns) ?? false)
+                                 dot: row.contact.map(ChatGPTDotIPCTransport.owns) ?? false,
+                                 health: row.health)
         }
-        return ContactList(stamp: stamps, programs: programs, contacts: contacts)
+        return contacts
     }
 
-    public static func mobileThreads(root: URL) async throws -> [MobileAgentThread] {
-        Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
-        let snapshot = try read(root: root, cached: nil, includeHelpers: false).0
-        let experiences = try await ExperienceStore.at(root).projection()
-        let identity = AgentContactIdentity(dataRoot: root)
+    public static func mobileThreads(root: URL, contacts: ContactListFacade) async throws -> [MobileAgentThread] {
+        let snapshot = try await read(root: root, contacts: contacts, includeHelpers: false)
         return snapshot.contacts.map { contact in
             let lines = snapshot.lines[contact.id] ?? []
-            let owed = experiences.filter { experience in
-                experience.isOpen && experience.addressedTo.contains {
-                    $0.hasPrefix("agent:") && identity.canonical(String($0.dropFirst(6))) == identity.canonical(contact.id)
-                }
-            }.map(\.mobile)
-            let status: String
-            if !owed.isEmpty {
-                status = "\(owed.count) \(owed.count == 1 ? "message" : "messages") still owed"
-            } else if let problem = contact.health?.problem { status = problem }
-            else if snapshot.waiting.contains(contact.id) { status = "Waiting for reply" }
-            else if contact.recoveredFailure, snapshot.status[contact.id] == nil { status = "Ready" }
-            else {
-                switch snapshot.status[contact.id] {
-                case .sending?, .waiting?: status = "Waiting for reply"
-                case .delivered?: status = "Delivered"
-                case .read?: status = "Read"
-                case .answered?: status = "Replied"
-                case .failed?: status = "No reply"
-                case .notDelivered?: status = "Not delivered"
-                case nil: status = ""
-                }
-            }
-            let last = lines.last { !contact.recoveredFailure || !AgentLocalHealth.authenticationFailure(.string($0.text)) }
+            let status = contact.status(flight: snapshot.flights[contact.id],
+                waiting: snapshot.waiting.contains(contact.id), delivery: snapshot.status[contact.id]) ?? ""
+            let last = contact.latestLine(in: lines)
             var row = MobileAgentRow(id: contact.id, name: contact.name, via: contact.via,
                                      lastExchange: String((last?.text ?? "").prefix(240)), status: status,
                                      sendRestriction: contact.sendRestriction)
-            row.experiences = owed
+            row.experiences = contact.owedExperiences.map(\.mobile)
             let tail = lines.suffix(32)
             return MobileAgentThread(agent: row, lines: tail.map {
                 MobileAgentLine(id: $0.id, speaker: $0.byPerson ? "You" : $0.fromAgent ? "Agent" : contact.name,
@@ -283,9 +400,8 @@ public enum AgentContactThreads {
         }
     }
 
-    public static func read(root: URL, cached: ContactList?, includeHelpers: Bool = true) throws -> (Snapshot, ContactList) {
-        let list = try contactList(root: root, cached: cached)
-        var contacts = list.contacts
+    public static func read(root: URL, contacts contactOwner: ContactListFacade, includeHelpers: Bool = true) async throws -> Snapshot {
+        var contacts = try await contactList(root: root, owner: contactOwner)
         let identity = AgentContactIdentity(dataRoot: root)
         let displayed = Dictionary(contacts.map { (identity.canonical($0.id), $0.id) }, uniquingKeysWith: { first, _ in first })
         let ids = Set(contacts.map(\.id))
@@ -315,6 +431,7 @@ public enum AgentContactThreads {
             // only where the current send stands. A helper's is its record.
             guard id.hasPrefix("bot:") else { continue }
             let history = record.exchanges ?? []
+            let receipt = receiptReply(record.receipt)
             for exchange in history {
                 if let prompt = exchange.prompt, !prompt.isEmpty {
                     lines[id, default: []].append(.init(id: exchange.id + ":sent", fromAgent: true,
@@ -324,16 +441,17 @@ public enum AgentContactThreads {
                 // until the next send folds it into the history.
                 var reply = exchange.reply
                 if reply == nil, exchange.id == record.operationID, record.phase != "sending" {
-                    reply = receiptReply(record.receipt)
+                    reply = receipt?.text
                 }
                 if let reply, !reply.isEmpty {
                     replies[id, default: []].append(.init(id: exchange.id + ":reply", fromAgent: false,
-                        text: reply, at: exchange.sentAt.addingTimeInterval(0.001)))
+                        text: reply, at: exchange.sentAt.addingTimeInterval(0.001),
+                        resultID: exchange.id == record.operationID ? receipt?.resultID : exchange.resultID))
                 }
             }
-            if history.isEmpty, let reply = receiptReply(record.receipt) {
+            if history.isEmpty, let receipt {
                 replies[id, default: []].append(.init(id: record.id + ":reply", fromAgent: false,
-                    text: reply, at: record.updatedAt))
+                    text: receipt.text, at: record.updatedAt, resultID: receipt.resultID))
             }
         }
         // Everything a contact and the agent said to each other, from its own session.
@@ -355,13 +473,17 @@ public enum AgentContactThreads {
 
         var waiting: Set<String> = []
         var status: [String: AgentConversationDelivery] = [:]
-        let health = AgentContactHealth.read(dataRoot: root)
+        let experiences = try await ExperienceStore.at(root).projection()
         for index in contacts.indices {
-            contacts[index].health = health[contacts[index].id]
+            contacts[index].owedExperiences = experiences.filter { experience in
+                experience.isOpen && experience.addressedTo.contains {
+                    $0.hasPrefix("agent:") && identity.canonical(String($0.dropFirst(6))) == identity.canonical(contacts[index].id)
+                }
+            }
         }
         for (id, record) in latest {
             if let index = contacts.firstIndex(where: { $0.id == id }),
-               health[record.agent]?.resolves(record) == true {
+               contacts[index].health?.resolves(record) == true {
                 contacts[index].recoveredFailure = true
                 if lines[id]?.last?.fetched == true { status[id] = .read }
                 continue
@@ -402,12 +524,16 @@ public enum AgentContactThreads {
             case (nil, nil): return a.offset < b.offset
             }
         }.map(\.element)
-        let helpers = includeHelpers ? (try? BotsShelfRecord.read(root: root)) ?? [] : []
+        let helpers = includeHelpers ? (try? await NativeAgentEngine.forRoot(root).botsShelfRead()) ?? [] : []
         // Queued, or claimed by a runner in this app: the shelf's own "Running".
         let running = (try? BotRunQueue(dataRoot: root).activeOrQueuedIDs()) ?? []
-        return (Snapshot(contacts: ordered, lines: lines, waiting: waiting, status: status, flights: flights,
+        return Snapshot(contacts: ordered, lines: lines, waiting: waiting, status: status, flights: flights,
                          helpers: helpers, running: running, flightRecords: latest.mapValues(\.id),
-                         recordsStamp: recordsStamp), list)
+                         recordsStamp: recordsStamp, otherRooms: HerScreen.otherRoomExchanges(dataRoot: root, since: .distantPast).map {
+                             var event = $0
+                             event.contactID = owner(event.contactID) ?? event.contactID
+                             return event
+                         })
     }
 
     private static func threadStamp(root: URL) -> String {
@@ -453,13 +579,287 @@ public enum AgentContactThreads {
         }
     }
 
-    private static func receiptReply(_ receipt: JSONValue?) -> String? {
+    private static func receiptReply(_ receipt: JSONValue?) -> (text: String, resultID: UUID?)? {
         guard case .object(let root)? = receipt else { return nil }
         var value = root
         if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { value = job }
         for key in ["reply", "answer", "agent_reply_text", "agent_reply_text_head", "completion_text_head"] {
-            if case .string(let text)? = value[key], !text.isEmpty { return text }
+            if case .string(let text)? = value[key], !text.isEmpty {
+                let id: UUID? = if case .string(let id)? = value["entry_id"] ?? value["message_id"] { UUID(uuidString: id) } else { nil }
+                return (text, id)
+            }
         }
         return nil
+    }
+}
+
+@MainActor @Observable
+final class ContactFlightProjection {
+    @ObservationIgnored var flight: AgentContactFlight?
+    var structure: AgentContactFlight?
+    var partial: String?
+    var hasPartial = false
+
+    func update(_ value: AgentContactFlight?) {
+        flight = value
+        let text = value?.partial
+        if partial != text { partial = text }
+        if hasPartial != (text != nil) { hasPartial = text != nil }
+        var shape = value
+        if var live = shape?.live {
+            live.partial = nil
+            live.partialChars = 0
+            live.partialTruncated = false
+            live.lastActivityAt = live.startedAt
+            live.firstActivityAt = nil
+            shape?.live = live
+        }
+        if structure != shape { structure = shape }
+    }
+}
+
+@MainActor @Observable
+public final class ContactThreadsProjection {
+    public nonisolated let dataRoot: URL
+    @ObservationIgnored private var contactsWatch: Task<Void, Never>?
+    @ObservationIgnored private var crewsWatch: Task<Void, Never>?
+    @ObservationIgnored private let contactRead = LatestRead()
+    @ObservationIgnored private let crewRead = LatestRead()
+
+    private nonisolated let contactOwner: ContactListFacade
+
+    public nonisolated init(dataRoot: URL, contacts: ContactListFacade) {
+        self.dataRoot = dataRoot
+        self.contactOwner = contacts
+    }
+
+    /// Both shells observe this engine's existing projection and watches.
+    public func start() {
+        if contactsWatch == nil { restartContacts() }
+        if crewsWatch == nil {
+            let root = dataRoot
+            crewsWatch = Task { [weak self] in
+                await Self.watchCrews(root: root) { [weak self] in self }
+            }
+        }
+    }
+
+    private func restartContacts() {
+        contactsWatch?.cancel()
+        let root = dataRoot, ids = helpers.map(\.id)
+        contactsWatch = Task { [weak self] in
+            await Self.watch(root: root, helpers: ids) { [weak self] in self }
+        }
+    }
+
+    deinit { contactsWatch?.cancel(); crewsWatch?.cancel() }
+
+    /// Most recent exchange first; contacts never talked to keep their order
+    /// after them.
+    public private(set) var contacts: [AgentContactPresentation] = []
+    /// Per contact id, oldest first.
+    public private(set) var lines: [String: [AgentContactThreadLine]] = [:]
+    public private(set) var otherRooms: [OtherRoomExchange] = []
+    /// Contacts with a message still on its way or awaiting a reply.
+    public private(set) var waiting: Set<String> = []
+    /// Where each contact's latest send stands when no reply is owed or
+    /// none came: delivered, read, failed, not delivered.
+    public private(set) var status: [String: AgentConversationDelivery] = [:]
+    /// Per contact id: its live reply, queue and stop, while there are any.
+    @ObservationIgnored private var flights: [String: AgentContactFlight] = [:]
+    @ObservationIgnored private var flightSlots: [String: ContactFlightProjection] = [:]
+    public private(set) var helpers: [BotsShelfRecord] = [] {
+        didSet {
+            if oldValue.map(\.id) != helpers.map(\.id) { restartContacts() }
+        }
+    }
+    public private(set) var helperRuns: [UUID: AgentContactThreads.HelperResults] = [:]
+    /// False until the first read lands, so an empty list isn't claimed early.
+    public private(set) var loaded = false
+    /// A failed refresh keeps the last proven conversation snapshot visible.
+    public private(set) var refreshError: String?
+    /// Helpers with a run queued or under way now.
+    public private(set) var running: Set<UUID> = []
+    /// Crews at work now, then the few most recently finished.
+    public private(set) var crews: [SwarmCrew] = []
+
+    private typealias Snapshot = AgentContactThreads.Snapshot
+    private typealias ContactRead = (Snapshot, AgentContactThreads.Delta?, [UUID: AgentContactThreads.HelperResults]?)
+
+    public nonisolated static func key(_ helper: UUID) -> String { AgentContactThreads.key(helper) }
+
+    private func slot(_ id: String) -> ContactFlightProjection {
+        if let slot = flightSlots[id] { return slot }
+        let slot = ContactFlightProjection()
+        flightSlots[id] = slot
+        return slot
+    }
+
+    public func flight(for id: String) -> AgentContactFlight? {
+        let slot = slot(id)
+        _ = slot.structure
+        _ = slot.hasPartial
+        return slot.flight
+    }
+
+    public func partial(for id: String) -> String? { slot(id).partial }
+
+    /// Reload whenever the contact list, the conversation records, a chat
+    /// (any append rewrites the chat index) or the helpers' shelf change on disk, a helper's run takes its
+    /// claim (`run.lock`), or one ends (in memory, so the queue says so), or
+    /// a built-in lane's inbox marks a message read. The live hub's partials
+    /// (a few writes a second while a reply streams) re-read only the flights.
+    private static func watch(root: URL, helpers ids: [UUID], projection: @MainActor () -> ContactThreadsProjection?) async {
+        let paths = ["agents/peers.json", "agents/conversations.json", "chat/sessions.json", "bots/definitions",
+                     "bots/shelf-index.json", "bots/run-queue.json", "agents/conversation-live.json",
+                     "agents/local-health.json", "agents/reply-reads.json"]
+            + ids.map { "bots/\($0.uuidString)/run.lock" }
+        let liveFile = root.appendingPathComponent("agents/conversation-live.json").standardizedFileURL
+        let bridges = InstallPaths.current.bridgeConfigRoot(dataRoot: root)
+        let inboxes = ["claude", "codex", "omp"].compactMap { AgentConversationDelivery.inbox(agent: $0, bridgeConfigRoot: bridges) }
+        let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) } + inboxes
+            + [bridges.appendingPathComponent("claude-bridge/claude-live")], emitInitial: true)
+        let (ticks, tick) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
+        // Set by every change, cleared just before a read: a tick buffered
+        // while that read's burst settled finds it clear and is skipped.
+        // `full` for anything but the live file, which sets only `live`.
+        let pending = OSAllocatedUnfairLock(initialState: (full: false, live: false))
+        let files = Task {
+            for await url in events.stream {
+                pending.withLock { if url == liveFile { $0.live = true } else { $0.full = true } }
+                tick.yield()
+            }
+        }
+        let experienceChanges = Task {
+            for await _ in await ExperienceStore.at(root).changes() {
+                pending.withLock { $0.full = true }
+                tick.yield()
+            }
+        }
+        let ended = NotificationCenter.default.addObserver(forName: BotRunQueue.didChange, object: nil, queue: nil) { _ in
+            pending.withLock { $0.full = true }
+            tick.yield()
+        }
+        let dotChanged = NotificationCenter.default.addObserver(forName: ChatGPTDotIPCTransport.didChange, object: nil, queue: nil) { _ in
+            pending.withLock { $0.full = true }
+            tick.yield()
+        }
+        var last: Snapshot
+        do {
+            guard let owner = projection() else { return }
+            last = Snapshot(contacts: owner.contacts, lines: owner.lines, waiting: owner.waiting, status: owner.status,
+                            flights: owner.flights, helpers: owner.helpers, running: owner.running, otherRooms: owner.otherRooms)
+        }
+        await withTaskCancellationHandler {
+            for await _ in ticks {
+                guard let owner = projection() else { break }
+                guard !Task.isCancelled else { break }
+                guard pending.withLock({ $0.full || $0.live }) else { continue }
+                // One message writes several files; let the burst land first.
+                if owner.loaded { try? await Task.sleep(for: .milliseconds(150)) }
+                guard !Task.isCancelled else { break }
+                let first = !owner.loaded
+                let retry = owner.refreshError != nil
+                let full = pending.withLock { state in
+                    defer { state = (false, false) }
+                    return state.full || first || retry
+                }
+                let result = await owner.contactRead.read {
+                    do { return Result<ContactRead, Error>.success(try await Task.detached(priority: .userInitiated) { [last, contactOwner = owner.contactOwner] in
+                        // A records change that rode in on the live file's tick still gets its full read.
+                        if !full, let flights = AgentContactThreads.readFlights(root: root, last: last) {
+                            var next = last
+                            next.flights = flights
+                            return (next, AgentContactThreads.changes(from: last, to: next), Optional<[UUID: AgentContactThreads.HelperResults]>.none)
+                        }
+                        if try AgentPeerStore(dataRoot: root).list().contains(where: ChatGPTDotIPCTransport.owns) {
+                            _ = await SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false).chatGPTDotReadiness()
+                        }
+                        let snapshot = try await AgentContactThreads.read(root: root, contacts: contactOwner)
+                        let next = snapshot
+                        let delta = AgentContactThreads.changes(from: last, to: next)
+                        var runs: [UUID: AgentContactThreads.HelperResults] = [:]
+                        for helper in next.helpers {
+                            runs[helper.id] = try await AgentContactThreads.helperResults(helper, root: root,
+                                representedResults: Set((next.lines[Self.key(helper.id)] ?? []).compactMap(\.resultID)))
+                        }
+                        return (next, delta, runs)
+                    }.value) }
+                    catch { return .failure(error) }
+                } publish: { result in
+                    switch result {
+                    case .success(let (next, delta, runs)):
+                    if let delta {
+                        if let value = delta.otherRooms { owner.otherRooms = value }
+                        if let value = delta.contacts { owner.contacts = value }
+                        if let value = delta.lines { owner.lines = value }
+                        if let value = delta.waiting { owner.waiting = value }
+                        if let value = delta.status { owner.status = value }
+                        if let value = delta.flights {
+                            for id in Set(owner.flights.keys).union(value.keys) where owner.flights[id] != value[id] {
+                                owner.slot(id).update(value[id])
+                            }
+                            owner.flights = value
+                        }
+                        if let value = delta.helpers { owner.helpers = value }
+                        if let value = delta.running { owner.running = value }
+                    }
+                    if let runs, owner.helperRuns != runs { owner.helperRuns = runs }
+                    if !owner.loaded { owner.loaded = true }
+                    owner.refreshError = nil
+                    case .failure(let error):
+                        owner.refreshError = UserFacingError.message(error, action: "refresh conversations")
+                    }
+                }
+                if case .success(let (next, _, _)) = result {
+                    last = next
+                }
+            }
+        } onCancel: { events.cancel(); tick.finish() }
+        files.cancel()
+        experienceChanges.cancel()
+        NotificationCenter.default.removeObserver(ended)
+        NotificationCenter.default.removeObserver(dotChanged)
+    }
+
+    /// Crews on their own watch: runs.json keeps every finished run whole, so
+    /// it is read only when a crew changes, never on a contact's message.
+    private static func watchCrews(root: URL, projection: @MainActor () -> ContactThreadsProjection?) async {
+        let paths = ["swarms/live.json", "swarms/runs.json"].map { root.appendingPathComponent($0) }
+        // The watcher arms on the folder, so the first crew is seen even
+        // before one has ever run. An empty folder; nothing else is written.
+        await Task.detached(priority: .utility) {
+            try? FileManager.default.createDirectory(at: paths[0].deletingLastPathComponent(), withIntermediateDirectories: true)
+        }.value
+        let events = FileChangeEvents(paths: paths, emitInitial: true)
+        await withTaskCancellationHandler {
+            for await _ in events.stream {
+                guard let owner = projection() else { break }
+                guard !Task.isCancelled else { break }
+                _ = await owner.crewRead.read { () async -> Result<[SwarmCrew], Error> in
+                    do { return .success(try await Task.detached(priority: .utility) { try SwarmCrew.read(root: root) }.value) }
+                    catch { return Result<[SwarmCrew], Error>.failure(error) }
+                } publish: { result in
+                    switch result {
+                    case .success(let next): if owner.crews != next { owner.crews = next }
+                    case .failure(let error): owner.refreshError = UserFacingError.message(error, action: "refresh crews")
+                    }
+                }
+            }
+        } onCancel: { events.cancel() }
+    }
+
+    /// A bridged turn without the bracketed notes the bridge puts on top (and
+    /// the bare contact-metadata line replies carried before 09-25).
+    public nonisolated static func bridgedText(_ content: String) -> String { ContactThread.bridgedText(content) }
+
+    /// The first line of some text with its markdown marks gone, for a row.
+    public nonisolated static func firstLine(_ text: String) -> String {
+        let line = text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty } ?? ""
+        return line.replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "`", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "#>-* "))
     }
 }

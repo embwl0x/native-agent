@@ -1,4 +1,6 @@
 import AppToolRuntime
+
+// Blueprint: | `AlivePageKit.swift` | Alive page components: shared glass metrics/palette, headers, cards, pills, progress and flow layout for Today/Desk |
 // AlivePageKit.swift
 // "Alive glass", the pages — User approved the mockup 2026-09-23. The shared
 // pieces Today and Desk are built from in the Advanced shell. Cards share

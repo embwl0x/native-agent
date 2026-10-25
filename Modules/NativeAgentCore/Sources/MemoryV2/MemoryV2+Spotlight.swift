@@ -2,6 +2,7 @@ import Foundation
 import PersistenceCore
 #if canImport(CoreSpotlight)
 import CoreSpotlight
+// Blueprint: | `MemoryV2+Spotlight.swift` | Canonical generation-proven rebuild shared by launch and repair, serialized with incremental Spotlight projections before taking its snapshot; isolated roots never alter system Spotlight |
 #endif
 
 // MARK: - Phase C: Core Spotlight indexer for memory records.
@@ -90,6 +91,8 @@ public actor MockSpotlightIndexClient: SpotlightIndexClient {
 // Bridges MemoryRecord-ish tuples into SpotlightItem and pushes them through
 // a SpotlightIndexClient. Stays minimal — Phase C is just "the index path
 // exists and round-trips"; richer attribute-set fields land later.
+/// .spotlight_reindexed is this owner's generation fingerprint: local
+/// backup/export and memory PrivacyMap, never phone sync.
 public actor SwiftNativeMemoryIndexer {
     public static let defaultDomain = "memory.nativeagent"
     private let client: any SpotlightIndexClient
@@ -133,15 +136,25 @@ public actor SwiftNativeMemoryIndexer {
 
 extension SwiftNativeMemoryIndexer {
     public static func reindex(dataRoot: URL, client: any SpotlightIndexClient) async throws -> ReindexOutcome {
-        let marker = markerURL(dataRoot: dataRoot)
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        let task = await storage.enqueueSpotlightProjection {
+            try await reindex(dataRoot: dataRoot, storage: storage, client: client)
+        }
+        return try await task.value
+    }
+
+    private static func reindex(dataRoot: URL, storage: MemoryStorage,
+                                client: any SpotlightIndexClient) async throws -> ReindexOutcome {
+        let marker = markerURL(dataRoot: dataRoot)
         let generation = try await storage.spotlightGenerationFingerprint()
         let memories = try await storage.listMemories(
             persona: nil,
             status: "active",
             limit: nil
         )
-        let batch = memories.map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
+        // A cold write awaiting admission stays out, as the incremental hooks keep it.
+        let batch = memories.filter { !MemoryStorage.metadataFlag($0.metadata, MemoryStorage.pendingAdmissionKey) }
+            .map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
 
         // Delete the old proof BEFORE clearing the derived index. A crash
         // or failure after `removeAll()` must read as unconfirmed rather
@@ -156,8 +169,8 @@ extension SwiftNativeMemoryIndexer {
         let completedGeneration = try await storage.spotlightGenerationFingerprint()
         guard completedGeneration == generation else {
             // A concurrent canonical write makes this batch stale. There
-            // is intentionally no marker: the next reindex must start
-            // from the new source generation.
+            // is intentionally no marker. The queued incremental operations
+            // repair this batch next; a future rebuild uses the new generation.
             return .changedDuringReindex
         }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(

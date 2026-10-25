@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `PhoneRequest.swift` | `PhoneRequest` and `PhoneRequestResult`: typed signed request/result bodies over the existing device chat lane |
+
 /// Signed BridgeMessage bodies in the existing NAChatMessage device-sync lane.
 public struct PhoneRequest: Codable, Sendable, Identifiable {
     public enum Kind: String, Codable, Sendable {

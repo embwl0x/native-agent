@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `NativeOAuthFlow+Loopback.swift` | `NativeOAuthFlow`: `startOpenAILoopbackFlow`, `callbackTarget`, `callbackHasResult` |
 
 // MARK: - Loopback OAuth (ChatGPT / OpenAI)
 //
@@ -59,18 +60,12 @@ extension NativeOAuthFlow {
                 error: "ChatGPT sign-in failed: \(error.localizedDescription)")
         }
 
-        let (code, returnedState, providerError) = parseCallback(callbackURL)
-        if let providerError = providerError {
-            return OAuthFlowResult(ok: false,
-                error: "ChatGPT returned an error: \(providerError)")
-        }
-        guard let code = code, !code.isEmpty else {
-            return OAuthFlowResult(ok: false,
-                error: "ChatGPT did not return an authorization code.")
-        }
-        guard returnedState == state else {
-            return OAuthFlowResult(ok: false,
-                error: "OAuth state mismatch — possible CSRF; aborting.")
+        let code: String
+        switch validateCallback(callbackURL, expectedState: state,
+            providerErrorMessage: { "ChatGPT returned an error: \($0)" },
+            missingCodeMessage: "ChatGPT did not return an authorization code.") {
+        case .code(let value): code = value
+        case .failure(let message): return OAuthFlowResult(ok: false, error: message)
         }
 
         let tokens: [String: Any]
@@ -122,21 +117,15 @@ extension NativeOAuthFlow {
         let parts = requestLine.split(separator: " ")
         guard parts.count >= 2, parts[0] == "GET" else { return nil }
         let target = String(parts[1])
-        guard target.hasPrefix("/") else { return nil }
-        let path = target.split(separator: "?", maxSplits: 1).first.map(String.init) ?? target
-        guard path == openAILoopbackPath else { return nil }
+        guard OAuthLoopbackCallbackPolicy.validCallbackURL(target: target,
+            path: openAILoopbackPath, port: openAILoopbackPort) != nil else { return nil }
         return target
     }
 
     /// True only when the callback carries an OAuth result (code or error) —
     /// so a bare `/auth/callback` probe can't resolve the flow prematurely.
     public static func callbackHasResult(_ url: URL) -> Bool {
-        guard let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else {
-            return false
-        }
-        let hasCode = items.contains { $0.name == "code" && !($0.value ?? "").isEmpty }
-        let hasError = items.contains { $0.name == "error" && !($0.value ?? "").isEmpty }
-        return hasCode || hasError
+        OAuthLoopbackCallbackPolicy.hasResult(url)
     }
 
 }

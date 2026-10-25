@@ -2,6 +2,8 @@ import CryptoKit
 import Foundation
 import Darwin
 
+// Blueprint: | `PersistenceCore+FileLock.swift` | `FileLockScope`, `CredentialFileLock` and persistence lock support: current-task lock ownership, bounded acquisition and sidecar identity checks |
+
 /// Lock paths the CURRENT TASK already holds. User, 2026-09-06: `flock` is not
 /// recursive across descriptors, so a `CredentialFileLock.withLock` nested
 /// inside a `withFileLock` on the SAME path — which is what every credential
@@ -11,6 +13,22 @@ import Darwin
 /// acquisition) skips the `flock` when this task already holds that path.
 public enum FileLockScope {
     @TaskLocal public static var heldLockPaths: Set<String> = []
+}
+
+private func tryAcquireSidecar(_ fd: Int32) throws -> Int32 {
+    if flock(fd, LOCK_EX | LOCK_NB) == 0 { return 0 }
+    let error = errno
+    guard error == EINTR || error == EWOULDBLOCK else {
+        throw NSError(domain: "FileLock", code: Int(error), userInfo: [NSLocalizedDescriptionKey: "flock LOCK_EX failed: \(String(cString: strerror(error)))"])
+    }
+    return error
+}
+
+private func sidecarIsCurrent(_ fd: Int32, at path: String) -> Bool {
+    var held = stat()
+    var atPath = stat()
+    return fstat(fd, &held) == 0 && stat(path, &atPath) == 0
+        && held.st_dev == atPath.st_dev && held.st_ino == atPath.st_ino
 }
 
 /// User, 2026-09-06: an OAuth credential file has THREE writers — an adapter's
@@ -41,7 +59,7 @@ public enum CredentialFileLock {
         }
         let parent = (lockPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
-        let deadline = Date().addingTimeInterval(acquireTimeout)
+        let deadline = ProcessInfo.processInfo.systemUptime + acquireTimeout
         var attempts = 0
         while true {
             attempts += 1
@@ -50,14 +68,13 @@ public enum CredentialFileLock {
                 throw NSError(domain: "FileLock", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"])
             }
             while true {
-                if flock(fd, LOCK_EX | LOCK_NB) == 0 { break }
-                let e = errno
-                if e == EINTR { continue }
-                if e != EWOULDBLOCK {
-                    Darwin.close(fd)
-                    throw NSError(domain: "FileLock", code: Int(e), userInfo: [NSLocalizedDescriptionKey: "flock LOCK_EX failed: \(String(cString: strerror(e)))"])
-                }
-                if Date() >= deadline {
+                let e: Int32
+                do { e = try tryAcquireSidecar(fd) }
+                catch { Darwin.close(fd); throw error }
+                if e == 0 { break }
+                // Interrupted attempts share the same monotonic acquisition
+                // deadline and wait as contention; signals cannot spin forever.
+                if ProcessInfo.processInfo.systemUptime >= deadline {
                     Darwin.close(fd)
                     throw NSError(domain: "FileLock", code: Int(ETIMEDOUT), userInfo: [NSLocalizedDescriptionKey: "lock at \(lockPath) is still held after \(Int(acquireTimeout))s"])
                 }
@@ -67,13 +84,7 @@ public enum CredentialFileLock {
             // orphan sweep may unlink a lock sidecar, and a waiter that opened
             // it before the unlink would otherwise hold a detached inode while
             // a newcomer creates a fresh one — two writers, no exclusion.
-            var held = stat()
-            var atPath = stat()
-            let sameInode = fstat(fd, &held) == 0
-                && stat(lockPath, &atPath) == 0
-                && held.st_dev == atPath.st_dev
-                && held.st_ino == atPath.st_ino
-            if !sameInode {
+            if !sidecarIsCurrent(fd, at: lockPath) {
                 _ = flock(fd, LOCK_UN)
                 Darwin.close(fd)
                 if attempts >= 8 {
@@ -210,13 +221,9 @@ public extension PersistenceCoreProtocol {
                 }
             }
             while true {
-                if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+                if try tryAcquireSidecar(fd) == 0 {
                     acquired = true
                     break
-                }
-                let e = errno
-                if e != EWOULDBLOCK && e != EINTR {
-                    throw NSError(domain: "FileLock", code: Int(e), userInfo: [NSLocalizedDescriptionKey: "flock LOCK_EX failed: \(String(cString: strerror(e)))"])
                 }
                 // Contended: yield the thread and retry. Cancellation propagates
                 // (Task.sleep throws), releasing the fd via the defer above.
@@ -231,13 +238,7 @@ public extension PersistenceCoreProtocol {
                 try await Task.sleep(nanoseconds: 20_000_000)
             }
             // Do we hold the file that is CURRENTLY at lockPath?
-            var held = stat()
-            var atPath = stat()
-            let sameInode = fstat(fd, &held) == 0
-                && stat(lockPath, &atPath) == 0
-                && held.st_dev == atPath.st_dev
-                && held.st_ino == atPath.st_ino
-            if !sameInode {
+            if !sidecarIsCurrent(fd, at: lockPath) {
                 // Reaped or replaced under us. Bounded retry: a live sweep can
                 // legitimately unlink once, but repeated misses mean something
                 // pathological, and spinning forever would be worse than

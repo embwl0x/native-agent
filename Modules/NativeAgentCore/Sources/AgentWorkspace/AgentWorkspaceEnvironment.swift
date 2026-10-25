@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import NativeAgentCore
+// Blueprint: | `AgentWorkspaceEnvironment.swift` | `AgentWorkspaceEnvironment` enum; `isStatusReader`, `title` |
 
 /// A small destination card, not a second capability registry. The actual
 /// schema/catalog and the normal dispatcher remain availability/authority owners.
@@ -33,7 +34,7 @@ package enum AgentWorkspaceEnvironment {
             .union(["work_context", "artifact_find", "read_chat_message", "chat_conversations", "read_file", "agent_contacts", "agent_read", "inner_state", "agent_introspect", "context_lookup", "time_now", "search_chat_history"])
 
     /// A status check reads and changes nothing: it opens as a reading, never
-    /// as a form to fill (desk walk 09-24: `gmail.status` left a form open).
+    /// as a form to fill (desk walk 09-24: a status check left a form open).
     static func isStatusReader(_ tool: String) -> Bool {
         tool.hasSuffix("_status") && !tool.contains("set_")
     }
@@ -73,9 +74,6 @@ package enum AgentWorkspaceEnvironment {
     /// Only a target reference survives a write, never its submitted contents.
     /// Reading it is a new gated owner operation, not proof the write succeeded.
     static func readback(tool: String, input: [String: JSONValue]) -> AgentWorkspaceLocation? {
-        if tool == "google_calendar_send_invitations", let calendarID = input["calendar_id"], let eventID = input["event_id"] {
-            return .record(tool: "google_calendar_read", input: ["calendar_id": calendarID, "event_id": eventID], title: "Meeting")
-        }
         if tool.hasPrefix("browser.chrome_"), case .int(let tab)? = input["tab_id"] {
             return .record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)], title: "Selected browser page")
         }
@@ -88,9 +86,6 @@ package enum AgentWorkspaceEnvironment {
         if tool == "mail_reply", let id = input["message_id"], let expected = input["expected_message_id"] {
             return .record(tool: "mail_list_recent", input: ["message_id": id, "expected_message_id": expected].merging(
                 input.filter { ["expected_account", "expected_account_id", "position"].contains($0.key) }) { a, _ in a }, title: "Email conversation")
-        }
-        if tool == "save_skill", let name = input["name"] {
-            return .record(tool: "read_skill", input: ["name": name], title: "Saved skill")
         }
         if ["bot_create", "bot_update", "bot_pause"].contains(tool) {
             return .record(tool: "bot_list", input: input["id"].map { ["id": $0] } ?? [:], title: "My helpers")
@@ -119,7 +114,7 @@ package enum AgentWorkspaceEnvironment {
                     : "Saved tab reference, not live page evidence. Selecting this window reads that tab only while it is still mine. A missing tab or one the owner has taken over is refused.")]), items: [], actions: actions)
         case .area(let id):
             guard let place = destinations.first(where: { $0.id == id }) else { return nil }
-            if id == "today" { return try await AgentWorkspaceActivity.today(perform: perform) }
+            if id == "today" { return try await AgentWorkspaceActivity.today(dataRoot: dataRoot, perform: perform) }
             let schemas = try await catalog()
             let names = Set(schemas.map(\.name))
             var input = place.input
@@ -132,7 +127,7 @@ package enum AgentWorkspaceEnvironment {
                 if let field = place.searchField {
                     projection.actions.append(.init(label: place.searchLabel ?? "Search " + place.title, action: .perform(tool: tool, input: input, title: place.title, textField: field, isEffect: !readTools.contains(tool)), needsText: true))
                 } else if readTools.contains(tool) {
-                    projection = .project(location: .record(tool: tool, input: input, title: place.title), result: try await perform(tool, input))
+                    projection = await .project(location: .record(tool: tool, input: input, title: place.title), result: try await perform(tool, input), dataRoot: dataRoot)
                 }
             } else if place.tool != nil {
                 projection.content = .object(["status": .string("unavailable"), "message": .string("This place's reader is not advertised in this session. Available actions are shown below.")])
@@ -198,7 +193,7 @@ package enum AgentWorkspaceEnvironment {
                 items: items, actions: [])
         case .form(let form): return form.projection
         case .receipt(let tool, let title, let value, let readback):
-            var projection = AgentWorkspaceProjection.project(location: .record(tool: tool, input: [:], title: title), result: value)
+            var projection = await AgentWorkspaceProjection.project(location: .record(tool: tool, input: [:], title: title), result: value, dataRoot: dataRoot)
             projection.title = title
             projection.content = .object(["status": outcome(value), "result": projection.content,
                 "evidence": .string("Retained result of the selected action. Refresh does not execute it again and does not verify that an external state is still current.")])
@@ -236,7 +231,7 @@ package enum AgentWorkspaceEnvironment {
                 case .people: value = try await perform("agent_contacts", [:])
                 default: return nil
                 }
-                projection = .project(location: source, result: value)
+                projection = await .project(location: source, result: value, dataRoot: dataRoot)
             }
             projection.page = max(0, page)
             return projection

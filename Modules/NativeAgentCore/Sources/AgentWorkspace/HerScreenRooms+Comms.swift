@@ -1,10 +1,11 @@
 import Foundation
 import MacIntegration
 import PersistenceCore
+// Blueprint: | `HerScreenRooms+Comms.swift` | `HerScreen`: `sendTrouble`, `roomCounts`, `notConnected` |
 
-/// Her comms on her screen (2026-09-24): Mail, Messages, Gmail, AgentMail,
-/// Notes and Contacts are places, their items stable names (`mail.3`,
-/// `gmail.2`, `notes.1`, `contacts.4`) that open as short text rooms, and
+/// Her comms on her screen (2026-09-24): Mail, Messages, Notes and Contacts
+/// are places, their items stable names (`mail.3`, `messages.2`, `notes.1`,
+/// `contacts.4`) that open as short text rooms, and
 /// each item's verbs take its name (`mail.3.archive`, `notes.1.append`).
 /// Lists are the owners' own reads laid out by `textRoom`; the rooms here are
 /// one item each, from the read that opened it. Nothing is read on home.
@@ -12,10 +13,6 @@ extension HerScreen {
     // MARK: Places
 
     static let commsDestinations: [AgentWorkspaceDestination] = [
-        .init(id: "gmail", title: "Gmail", summary: "The connected Gmail inbox: newest mail, search, read.",
-              tool: "gmail_search", input: ["query": .string("in:inbox"), "limit": .int(12)]),
-        .init(id: "agentmail", title: "AgentMail", summary: "My own AgentMail inbox: read and write.",
-              tool: "agentmail_list", input: ["limit": .int(12)], tools: ["agentmail_send"]),
         .init(id: "notes", title: "Notes", summary: "Apple Notes: recent notes, find, read, add.",
               tool: "notes_search", input: ["limit": .int(12)], tools: ["notes_create"]),
         .init(id: "contacts", title: "Contacts", summary: "Mac Contacts: someone's number or email.",
@@ -24,10 +21,9 @@ extension HerScreen {
     /// The room a comms read shows under.
     static let commsFamily: [String: String] = [
         "mail_list_recent": "mail", "mail_search": "mail", "messages_recent_threads": "messages",
-        "gmail_search": "gmail", "gmail_read": "gmail", "gmail_status": "gmail", "agentmail_list": "agentmail", "agentmail_read": "agentmail",
         "notes_search": "notes", "contacts_search": "contacts",
     ]
-    static let commsReadTools: Set<String> = ["gmail_search", "gmail_read", "gmail_status", "agentmail_list", "agentmail_read", "notes_search", "contacts_search"]
+    static let commsReadTools: Set<String> = ["notes_search", "contacts_search"]
 
     /// Item verbs a list room names under its DO line.
     static let commsItemVerbs: [String: [(name: String, about: String, tool: String)]] = [
@@ -51,7 +47,7 @@ extension HerScreen {
             ((try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)) ?? []).filter { !$0.agent.hasPrefix("bot") }
         }
         let chats = bridgeChats(dataRoot: dataRoot)
-        let identity = AgentContactIdentity(dataRoot: dataRoot)
+        let identity = AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)
         let contacts = contacts(identity: identity, usable: AgentWorkspacePorts.current.tools.usableAgentLanes(dataRoot: dataRoot))
         var out: [String: String] = [:]
         let health = AgentWorkspacePorts.current.conversations.liveHealth(dataRoot: dataRoot)
@@ -92,16 +88,13 @@ extension HerScreen {
         return parts
     }
 
-    static let notConnectedLine = "Not connected. The owner can sign in by requesting a setup card in chat or opening Connectors in Advanced view."
-
     /// A service that is not connected reads the same everywhere, whatever
     /// its owner called it (a connect card, "failed", "not set up").
     static func notConnected(_ row: [String: JSONValue]) -> Bool {
-        if row["connected"] == .bool(false) || row["kind"] == .string("connector") { return true }
-        let words = ["detail", "error", "message", "reason"].compactMap { key -> String? in
-            if case .string(let text)? = row[key] { text.lowercased() } else { nil }
-        }.joined(separator: " ")
-        return ["so i can read", "not connected", "needs connecting", "not set up yet", "not_connected", "not_configured"].contains { words.contains($0) }
+        row["connected"] == .bool(false)
+            || ["reason", "failure_code", "error_code", "status"].contains { key in
+                ["not_connected", "not_configured"].contains(row[key]?.stringValue ?? "")
+            }
     }
 
     // MARK: Lists
@@ -115,31 +108,7 @@ extension HerScreen {
         let content: JSONValue = if case .object(let root) = result {
             .object(root.filter { !["messages", "notes", "contacts"].contains($0.key) })
         } else { result }
-        let more: [AgentWorkspaceButton] = if case .object(let root) = result, case .object(let next)? = root["next"] {
-            [.init(label: "More results", action: .open(.record(tool: tool, input: next, title: "Gmail")))]
-        } else { [] }
         switch tool {
-        case "gmail_search":
-            return .init(title: "Gmail", content: content, items: rows("messages").compactMap { row in
-                guard let id = text(row["id"]) else { return nil }
-                let title = text(row["subject"]) ?? "(no subject)"
-                return .init(title: title, content: .object(["sender": row["from"] ?? .null, "date": .string(rfc822(text(row["date"]))),
-                        "snippet": row["snippet"] ?? .null, "unread": row["unread"] ?? .null]),
-                    actions: [.init(label: "Read", action: .open(.record(tool: "gmail_read", input: ["id": .string(id)], title: title)))])
-            }, actions: [
-                .init(label: "Search Gmail", action: .perform(tool: "gmail_search", input: [:], title: "Gmail search", textField: "query", isEffect: false), needsText: true),
-                .init(label: "Unread", action: .open(.record(tool: "gmail_search", input: ["query": .string("in:inbox is:unread"), "limit": .int(12)], title: "Gmail unread"))),
-                // Beside home, not under whatever room was open before.
-                .init(label: "Status", action: .window(.open(.record(tool: "gmail_status", input: [:], title: "Gmail status")))),
-            ] + more)
-        case "agentmail_list":
-            return .init(title: "AgentMail", content: content, items: rows("messages").compactMap { row in
-                guard let id = text(row["message_id"]) else { return nil }
-                let title = text(row["subject"]) ?? "(no subject)"
-                return .init(title: title, content: .object(["sender": row["sender"] ?? .null, "date": row["date"] ?? .null,
-                        "snippet": row["snippet"] ?? .null, "unread": row["unread"] ?? .null]),
-                    actions: [.init(label: "Read", action: .open(.record(tool: "agentmail_read", input: ["message_id": .string(id)], title: title)))])
-            }, actions: [.init(label: "Write email", action: .configure(tool: "agentmail_send", input: [:], title: "Write email"))])
         case "notes_search":
             // The header carries the counts; the tool's "Showing 12 of 20" would say it twice.
             let noteContent: JSONValue = if case .object(let root) = content { .object(root.filter { $0.key != "message" }) } else { content }
@@ -167,8 +136,6 @@ extension HerScreen {
                     actions: [.init(label: "Open", action: .open(.record(tool: "contacts_search",
                         input: ["identifier": .string(id), "query": .string(name)], title: name)))])
             }, actions: [.init(label: "Search contacts", action: .perform(tool: "contacts_search", input: [:], title: "Contacts search", textField: "query", isEffect: false), needsText: true)])
-        case "gmail_read", "agentmail_read":
-            return .init(title: text(input["title"]) ?? "Message", content: content, items: [], actions: [])
         default: return nil
         }
     }
@@ -177,7 +144,7 @@ extension HerScreen {
 
     /// A comms record as text: one item's room, or a list read (a search, a
     /// next page) laid out like its place. Nil leaves the old view.
-    static func commsRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, dataRoot: URL, issue: String?) -> String? {
+    static func commsRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, dataRoot: URL, issue: String?) async -> String? {
         if let batch = mailBatchRoom(location, value: value, dataRoot: dataRoot) { return batch }
         guard case .record(let tool, let input, let title) = location, let value else { return nil }
         let now = Date()
@@ -186,24 +153,19 @@ extension HerScreen {
         let single: Bool = switch tool {
         case "mail_list_recent": input["message_id"] != nil
         case "messages_recent_threads": input["thread_id"] != nil
-        case "gmail_read", "agentmail_read", "gmail_status": true
         case "notes_search": input["title"] != nil || input["id"] != nil
         case "contacts_search": input["identifier"] != nil
         default: false
         }
         // Keep the connector owner's fix visible.
         if notConnected(object) {
-            return commsScreen([family.uppercased(), "not connected"], [[text(object["detail"]) ?? notConnectedLine,
-                text(object["fix"])].compactMap { $0 }], verbs: [], back: "Back: home.")
+            return screen([family.uppercased(), "not connected"], [[failureFace(value)]],
+                          verbs: [], back: "Back: home.", verbWidth: 24, omitEmptyHeader: true)
         }
-        if tool == "gmail_status", issue == nil {
-            func int(_ value: JSONValue?) -> Int? { if case .int(let n)? = value { Int(n) } else { nil } }
-            let counts = int(object["inbox_unread"]).map { "\($0) unread of \(int(object["inbox_total"]) ?? 0) in the inbox" }
-            return commsScreen(["GMAIL", "connected", text(object["email"]) ?? ""] + (counts.map { [$0] } ?? []), [], verbs: [], back: "Back: home · gmail.")
-        }
-        guard single, issue == nil else {
+        if let issue { return screen([family.uppercased(), text(object["status"]) ?? "failed"], [[issue]], verbs: []) }
+        guard single else {
             let status = issue == nil ? (text(object["status"]) ?? "ok") : "failed"
-            return textRoom(family, place: location, projection: .project(location: location, result: value),
+            return textRoom(family, place: location, projection: await .project(location: location, result: value, dataRoot: dataRoot),
                             frame: .object(["status": .string(status)]), dataRoot: dataRoot, now: now)
         }
         // The item's name is the one its list row minted: a next page of the
@@ -254,9 +216,16 @@ extension HerScreen {
             } else { [] }
             header += [clip(text(thread["name"]) ?? people.compactMap { text($0["name"]) ?? text($0["handle"]) }.joined(separator: ", "), 50)]
             let talk = rowsOf("messages").suffix(10).map { row -> String in
-                let said = text(row["text"]) ?? (row["text_status"] == .string("archived_text_not_decoded") ? "(a format I can't read here; it's in Messages)"
-                    : row["has_attachments"] == .bool(true) ? "(attachment)" : "(no text: a reaction or special message)")
-                return pad(when(text(row["date"]), now: now, short: true), 7) + pad(row["from_me"] == .bool(true) ? "me" : clip(text(row["sender_name"]) ?? who(text(row["sender"])), 16), 12) + clip(said, 90)
+                let prefix = pad(when(text(row["date"]), now: now, short: true), 7)
+                    + pad(row["from_me"] == .bool(true) ? "me" : clip(text(row["sender_name"]) ?? who(text(row["sender"])), 16), 12)
+                if text(row["text"]) == nil, row["text_status"] == .string("archived_text_not_decoded") {
+                    return prefix + failureFace(.object(["status": .string("unavailable"), "reason": .string("message_format_unsupported"),
+                        "detail": .string("This reader does not decode the message's archived text format."), "effects": .string("none"),
+                        "remedy": Repair.reconcile(instruction: "Read the original conversation in Messages with mac.look.",
+                            nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("mac.look"), "args": .object(["app": .string("Messages")])])]))]))
+                }
+                let said = text(row["text"]) ?? (row["has_attachments"] == .bool(true) ? "(attachment)" : "(no text retained)")
+                return prefix + clip(said, 90)
             }
             sections = [section("TALK", talk.isEmpty ? [clip(text(object["history_note"]) ?? "no messages to show", 110)] : talk)]
             if let older = object["older_before_message_id"], let id = text(thread["thread_id"]) {
@@ -267,30 +236,6 @@ extension HerScreen {
             if let id = text(thread["thread_id"]), !handles.isEmpty, handles.count == people.count {
                 verb("reply", "sends a reply now in this thread (text)", .perform(tool: "messages_send", input: ["thread_id": .string(id),
                     "expected_participants": .array(handles.map(JSONValue.string))], title: "Reply: " + title, textField: "body", isEffect: true))
-            }
-        case "gmail_read", "agentmail_read":
-            let sender = text(object["from"]) ?? text(object["sender"])
-            header += [who(sender), tool == "gmail_read" ? when(rfc822(text(object["date"])), now: now) : when(text(object["date"]), now: now)]
-            let retrievedBody = text(object["body"])
-            let preview = retrievedBody == nil && text(object["snippet"]) != nil
-            let body = retrievedBody ?? text(object["snippet"]) ?? ""
-            let (lines, used) = bodyLines(body)
-            sections = [section("SUBJECT", [clip(text(object["subject"]) ?? "(no subject)", 100)]),
-                        section(preview ? "PREVIEW" : "BODY", lines)]
-            if let note = text(object["bodyRetrievalNote"]) { sections.append([note]) }
-            if tool == "gmail_read", let id = text(object["id"]), let total = int(object["totalCharacters"]) {
-                let progress = if preview, case .string(let chunk)? = object["body"] { chunk.count } else { preview ? 0 : used }
-                let nextOffset = (int(object["textOffset"]) ?? 0) + progress
-                if progress > 0, nextOffset < total {
-                    verb("more", "continue the body", .open(.record(tool: tool,
-                        input: ["id": .string(id), "text_offset": .int(Int64(nextOffset))], title: title)))
-                }
-            }
-            if tool == "agentmail_read", let sender, let address = sender.split(whereSeparator: { "<> ".contains($0) }).first(where: { $0.contains("@") }) {
-                let subject = text(object["subject"]) ?? ""
-                verb("reply", "sends a reply from my inbox after the required send approval (text)", .perform(tool: "agentmail_send",
-                    input: ["to": .string(String(address)), "subject": .string(subject.lowercased().hasPrefix("re:") ? subject : "Re: " + subject)],
-                    title: "Reply: " + title, textField: "body", isEffect: true))
             }
         case "notes_search":
             guard let note = rowsOf("notes").first else { return nil }
@@ -332,7 +277,7 @@ extension HerScreen {
         default: return nil
         }
         HerNamed.shared.keep(dataRoot, keep.filter { AgentWorkspaceReadiness.allows($0.value) }, room: name)
-        return commsScreen(header, sections, verbs: verbs, back: "Back: home · \(family).")
+        return screen(header, sections, verbs: verbs, back: "Back: home · \(family).", verbWidth: 24, omitEmptyHeader: true)
     }
 
     /// `mail.3.archive` from names.json when the room that named it was shown
@@ -358,7 +303,7 @@ extension HerScreen {
             return .action(.perform(tool: "mail_triage_batch", input: input, title: "Triage selected email", textField: nil, isEffect: true))
         }
         let parts = raw.split(separator: ".").map(String.init)
-        guard parts.count == 3, let n = Int(parts[1]), commsItemVerbs.keys.contains(parts[0]) || ["messages", "gmail", "agentmail"].contains(parts[0]),
+        guard parts.count == 3, let n = Int(parts[1]), commsItemVerbs.keys.contains(parts[0]) || parts[0] == "messages",
               let place = itemPlace(parts[0], n, dataRoot: dataRoot), case .record(let tool, let input, let title) = place else { return nil }
         let bound = input.filter { MailReadLocator.fields.union(["mailbox"]).contains($0.key) }
         if tool == "mail_list_recent", bound["message_id"] != nil,
@@ -421,7 +366,7 @@ extension HerScreen {
             return lines.map { UntrustedText.neutralized($0) }
         }
         HerNamed.shared.keep(dataRoot, keep, room: "mail-batch")
-        return commsScreen(["MAIL BATCH", text(root["status"]) ?? "unknown"], sections, verbs: verbs, back: "Back: mail.")
+        return screen(["MAIL BATCH", text(root["status"]) ?? "unknown"], sections, verbs: verbs, back: "Back: mail.", verbWidth: 24, omitEmptyHeader: true)
     }
 
     // MARK: Home's mail line
@@ -440,17 +385,6 @@ extension HerScreen {
     static func mailPulse(dataRoot: URL, now: Date) -> String { HerMailStatus.shared.pulse(dataRoot: dataRoot, now: now) }
 
     // MARK: Pieces
-
-    private static func commsScreen(_ header: [String], _ sections: [[String]], verbs: [(String, String)], back: String) -> String {
-        let rule = String(repeating: "─", count: 61)
-        var lines = [header.map { clip($0, 60) }.filter { !$0.isEmpty }.joined(separator: " · ")]
-        for part in sections where !part.isEmpty { lines.append(rule); lines += part }
-        lines.append(rule)
-        let width = min(24, (verbs.map(\.0.count).max() ?? 0) + 2)
-        lines += section("DO", verbs.map { pad(clip($0.0, 40), width) + clip($0.1, 60) })
-        lines.append(back)
-        return lines.joined(separator: "\n")
-    }
 
     /// Up to 30 lines / 2400 characters of a message, each defused; and how
     /// many characters of the source those lines cover.
@@ -528,20 +462,6 @@ extension HerScreen {
         return short ? age(now.timeIntervalSince(at)) : friendly(at, now: now)
     }
 
-    /// Gmail's RFC 822 Date header as ISO, so rows read like the others.
-    private static func rfc822(_ raw: String?) -> String {
-        guard let raw = nonEmpty(raw) else { return "" }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        for format in ["EEE, d MMM yyyy HH:mm:ss Z", "d MMM yyyy HH:mm:ss Z", "EEE, d MMM yyyy HH:mm:ss zzz"] {
-            formatter.dateFormat = format
-            if let at = formatter.date(from: raw.replacingOccurrences(of: #"\s*\(.*\)$"#, with: "", options: .regularExpression)) {
-                return ISO8601DateFormatter().string(from: at)
-            }
-        }
-        return raw
-    }
-
     private static func text(_ value: JSONValue?) -> String? {
         switch value {
         case .string(let text)?: return nonEmpty(text) == nil || text == "missing value" ? nil : text
@@ -592,7 +512,7 @@ package final class HerMailStatus: @unchecked Sendable {
     }
 
     func notable(dataRoot: URL, now: Date) -> String? {
-        guard AgentWorkspaceReadiness.allows(tool: "mail_search"), AgentWorkspaceReadiness.ready(tool: "mail_search"),
+        guard AgentWorkspaceReadiness.allows(tool: "mail_search"),
               let previews = lock.withLock({ previews }), previews.root == dataRoot.standardizedFileURL.path, !previews.text.isEmpty else { return nil }
         return "Last Mail read (\(HerScreen.age(now.timeIntervalSince(previews.at))) ago); up to 4 previews, not a current inbox scan: " + previews.text
     }

@@ -4,6 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
+// Blueprint: | `SchedulerDueJobRunner.swift` | `SchedulerDueJobRunner` actor; `runDueJobs`; reads canonical job rows through `SchedulerJobs`; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
 
 public actor SchedulerDueJobRunner {
     typealias CycleNotificationDelivery = @Sendable (String, String, String, String, String?) async -> JSONValue
@@ -58,8 +59,7 @@ public actor SchedulerDueJobRunner {
     }
 
     var activityPath: URL {
-        root.appendingPathComponent("activity", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
+        SwiftNativePersistenceCore.activityEventsPath(dataRoot: root)
     }
 
     var notificationInboxPath: URL {
@@ -94,7 +94,7 @@ public actor SchedulerDueJobRunner {
 
         let now = Date()
         do {
-            let repaired = try await ensureDefaultCycleJobs(now: now)
+            let repaired = try await ensureDefaultCycleJobs(now: now).repaired
             if !repaired.isEmpty {
                 try await appendActivity(
                     jobId: nil,
@@ -115,12 +115,13 @@ public actor SchedulerDueJobRunner {
                     payload: .object(["inboxItemId": .string(backfilled)])
                 )
             }
-            let retiredJobs = try await schedulerJobs.pruneJobs { Self.pruneRetiredRows($0, now: now) }
+            let liveActions = platform.connectorActionIDs
+            let retiredJobs = try await schedulerJobs.pruneJobs { Self.pruneRetiredRows($0, liveActions: liveActions, now: now) }
             if retiredJobs > 0 {
                 try await appendActivity(
                     jobId: nil,
                     kind: "scheduler",
-                    title: "Scheduled jobs retired",
+                    title: "Scheduled Desk tasks retired",
                     detail: "Retired \(retiredJobs) job row(s); reasons recorded in scheduler/retired.jsonl",
                     status: "ok",
                     payload: .object(["removed": .int(Int64(retiredJobs))])
@@ -128,7 +129,7 @@ public actor SchedulerDueJobRunner {
             }
         } catch {
             // A failed scheduler-state repair is not safe to continue.
-            noteFault("Scheduled job state could not be repaired: \(error.localizedDescription)")
+            noteFault("Scheduled Desk task state could not be repaired: \(error.localizedDescription)")
             do {
                 try await appendActivity(
                     jobId: nil,
@@ -148,6 +149,7 @@ public actor SchedulerDueJobRunner {
         // excluded from selection so the pass keeps reaching the other due jobs
         // instead of re-detecting the same stuck row on every iteration.
         var deferredJobIds: Set<String> = []
+        var exhaustedBatch = true
         // Claim exactly one occurrence immediately before its effect. Claiming
         // a whole batch would make later untouched rows look ambiguous if the
         // process crashed while executing the first row.
@@ -156,12 +158,12 @@ public actor SchedulerDueJobRunner {
             do {
                 claimed = try await claimDueJob(now: now, excludingJobIds: deferredJobIds)
             } catch {
-                noteFault("Scheduled jobs could not be read: \(error.localizedDescription)")
+                noteFault("Scheduled Desk tasks could not be read: \(error.localizedDescription)")
                 do {
                     try await appendActivity(
                         jobId: nil,
                         kind: "scheduler",
-                        title: "Scheduled job scan failed",
+                        title: "Scheduled Desk task scan failed",
                         detail: error.localizedDescription,
                         status: "error",
                         payload: .object([:])
@@ -188,7 +190,10 @@ public actor SchedulerDueJobRunner {
                 }
             }
             guard let job = claimed.jobs.first else {
-                if claimed.recoveredUnknown.isEmpty { break }
+                if claimed.recoveredUnknown.isEmpty {
+                    exhaustedBatch = false
+                    break
+                }
                 continue
             }
 
@@ -204,7 +209,7 @@ public actor SchedulerDueJobRunner {
                 try await appendActivity(
                     jobId: job.id,
                     kind: job.kind,
-                    title: "Scheduled job \(result.status)",
+                    title: "Scheduled Desk task \(result.status)",
                     detail: "\(job.name): \(result.detail)",
                     status: result.status == "error" ? "error" : (result.status == "skipped" ? "warn" : "ok"),
                     payload: .object([
@@ -225,10 +230,15 @@ public actor SchedulerDueJobRunner {
                     try await appendActivity(
                         jobId: job.id,
                         kind: job.kind,
-                        title: "Scheduled job update failed",
-                        detail: "\(job.name): \(error.localizedDescription)",
+                        title: "Scheduled Desk task update failed",
+                        detail: "scheduler_settlement_unconfirmed: \(job.name): result \(result.status); settlement is unconfirmed: \(error.localizedDescription). Inspect this occurrence's retained output and delivery receipts before resuming it.",
                         status: "error",
-                        payload: .object(["jobId": .string(job.id)])
+                        payload: .object([
+                            "jobId": .string(job.id),
+                            "occurrenceKey": .string(job.occurrenceKey),
+                            "status": .string(result.status),
+                            "output": NativeAppSecretRedactor.redactValue(result.output),
+                        ])
                     )
                 } catch {
                     return settled
@@ -238,16 +248,21 @@ public actor SchedulerDueJobRunner {
             // stopped mid-job, executeWithTimeout returned the loud .cancelled
             // receipt (persisted just above). Stop here rather than starting the
             // remaining due rows — each would only mint its own cancelled receipt.
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                exhaustedBatch = false
+                break
+            }
             if Self.isQuarantiningResult(result) {
                 // Keep the TriggerScheduler loop's actual tick alive until the
                 // timed-out effect body is gone. BackgroundLoopsManager may
                 // bound its caller at the outer deadline, but its registration
                 // then remains quarantined on this same child lifecycle.
                 await waitForInFlightJobBodies()
+                exhaustedBatch = false
                 break
             }
         }
+        if exhaustedBatch { await requestRemainingBatch(excludingJobIds: deferredJobIds) }
         return settled
     }
 
@@ -260,16 +275,17 @@ public actor SchedulerDueJobRunner {
             try await appendActivity(
                 jobId: recovery.jobId,
                 kind: recovery.kind,
-                title: "Scheduled job outcome needs reconciliation",
+                title: recovery.reason == nil ? "Scheduled Desk task outcome needs reconciliation" : "Scheduled Desk task stopped",
                 detail: recovery.detail,
-                status: "warn",
+                status: recovery.reason == nil ? "warn" : "stopped",
                 payload: .object([
                     "occurrenceKey": .string(recovery.occurrenceKey),
-                    "outcome": .string("unknown_after_restart"),
+                    "outcome": .string(recovery.reason == nil ? "unknown_after_restart" : "stopped"),
+                    "reason": recovery.reason.map(JSONValue.string) ?? .null,
                 ])
             )
             try await appendNotificationInbox(
-                title: "\(recovery.jobName) needs a quick check",
+                title: recovery.reason == nil ? "\(recovery.jobName) needs a quick check" : "\(recovery.jobName) stopped",
                 message: recovery.detail,
                 source: "scheduler_reconciliation",
                 severity: "important",

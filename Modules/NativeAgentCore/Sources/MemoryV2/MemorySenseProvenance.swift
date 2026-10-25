@@ -3,6 +3,7 @@ import GRDB
 import NativeAgentCore
 import PersistenceCore
 import Senses
+// Blueprint: | `MemorySenseProvenance.swift` | `MemorySenseProvenance`; `MemoryStorage.markVersionWrong`: durable sense-version warning metadata |
 
 /// Descriptive provenance only: warning does not erase or retire the memory.
 public enum MemorySenseProvenance {

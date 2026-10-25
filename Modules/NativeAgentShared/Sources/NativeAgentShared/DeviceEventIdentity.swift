@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
 
+// Blueprint: | `DeviceEventIdentity.swift` | `NativeAgentDeviceEventIdentity`: payload-free stable cross-device notification/collapse identity independent of changing prose |
+
 /// Stable, payload-free identity for one user-visible cross-device event.
 ///
 /// The same semantic key produces the same 64-byte-safe APNS collapse id,
@@ -16,7 +18,7 @@ public enum NativeAgentDeviceEventIdentity {
         if let explicit = clean(userInfo["eventId"]), isCanonical(explicit) {
             return explicit.lowercased()
         }
-        let keys = ["eventId", "dedupKey", "itemId", "approvalId", "taskId", "githubCommandItemId", "trigger"]
+        let keys = ["eventId", "dedupKey", "itemId", "approvalId", "taskId", "trigger"]
         for key in keys {
             if let value = clean(userInfo[key]) {
                 return digest("notification:\(key):\(value)")

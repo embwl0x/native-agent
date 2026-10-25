@@ -3,6 +3,8 @@ import SwiftUI
 import DeviceSync
 import NativeAgentShared
 
+// Blueprint: | `MacPairingView.swift` | `MacPairingView`: shared pairing assessment, key presentation/rotation and reveal lifecycle; offscreen reads never generate keys |
+
 struct MacPairingView: View {
     @Environment(AppModel.self) private var appModel
     private var sync: SyncFacade { appModel.engine.sync }

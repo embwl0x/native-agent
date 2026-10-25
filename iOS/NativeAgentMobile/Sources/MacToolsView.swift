@@ -2,12 +2,14 @@
 import SwiftUI
 import Combine
 import NativeAgentShared
+// Blueprint: | `MacToolsView.swift` | `MacToolsView` struct; remote controls read the shared Trust snapshot |
 
 // MARK: - MacToolsView
 
 struct MacToolsView: View {
     @EnvironmentObject private var pairingStore: PairingStore
-    @State private var macPolicy: TrustMacControlPolicy?
+    private let sync = iCloudSyncEngine.shared
+    private var macPolicy: TrustMacControlPolicy? { sync.trustPolicy?.macControlPolicy }
     @State private var hasLoadedPolicy = false
     @State private var manualShortcutName = ""
     @State private var notifTitle = ""
@@ -316,18 +318,14 @@ struct MacToolsView: View {
             return
         }
         #endif
-        let snapshotLoaded = await iCloudSyncEngine.shared.refreshTrustSnapshot()
-        macPolicy = MacToolsPolicyGatePresentation.policyForGate(
-            snapshotLoaded: snapshotLoaded,
-            refreshedPolicy: iCloudSyncEngine.shared.trustPolicy?.macControlPolicy
-        )
+        _ = await sync.refreshTrustSnapshot()
         hasLoadedPolicy = true
     }
 
     #if DEBUG
     /// `-designScreen mac-tools`: an open policy and two receipts, never sent anywhere.
     private func loadDesignSample() {
-        macPolicy = TrustMacControlPolicy(enabled: true, systemControlAllowed: true, remoteFromIosAllowed: true)
+        sync.trustPolicy = TrustPolicy(macControlPolicy: TrustMacControlPolicy(enabled: true, systemControlAllowed: true, remoteFromIosAllowed: true))
         hasLoadedPolicy = true
         guard remoteActionLedger.actions.isEmpty else { return }
         let volume = remoteActionLedger.start(.volume(40), title: "Set volume", subtitle: "40%")

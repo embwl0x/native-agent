@@ -2,6 +2,8 @@ import AppKit
 import Observation
 import SwiftUI
 
+// Blueprint: | `AppearanceController.swift` | `AppearanceController`: one explicit light/dark answer applied consistently to SwiftUI and AppKit |
+
 /// The one answer to "is the window dark?".
 ///
 /// User, 2026-09-02: turning the dark window OFF used to hand SwiftUI a nil
@@ -26,6 +28,7 @@ final class AppearanceController {
 
     var isDark: Bool { preferDark || systemIsDark }
     var colorScheme: ColorScheme { isDark ? .dark : .light }
+    var appearance: NSAppearance? { NSAppearance(named: isDark ? .darkAqua : .aqua) }
 
     private init() {
         // User, 2026-09-06: dark is the default. An unset preference means
@@ -48,7 +51,9 @@ final class AppearanceController {
 
     /// Both layers, explicitly, every time.
     func apply() {
-        NSApp.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
+        NSApp.appearance = appearance
+        DetachedChatWindowController.shared.applyAppearanceToOpenPanels(appearance)
+        ShotgunController.shared.applyAppearance(appearance)
     }
 
     private static func readSystemIsDark() -> Bool {

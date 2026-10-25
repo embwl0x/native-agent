@@ -28,6 +28,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `MemoryV2+KindStamp.swift` | `MemoryKindStamp`: conservative write-time memory kind and source metadata defaults |
+
 public enum MemoryKindStamp {
 
     /// Default kind for writes that carry no kind signal. NOT in
@@ -43,18 +45,9 @@ public enum MemoryKindStamp {
     /// kind_source written by the approval-gated LLM backfill apply path.
     public static let backfillSource = "backfill_llm_v1"
 
-    /// Canonical kind taxonomy (the union of every kind the repo's memory
-    /// semantics already name — one allow-list so the LLM backfill can't
-    /// invent labels):
-    ///   - memorySupersessionSingleValuedKinds: identity, location, employment
-    ///   - memoryDecayHalfLifeDays:             volatile, project, operational
-    ///   - AdaptiveMemoryPromoter emits:        identity, location, employment,
-    ///                                          preference, attribute
-    ///   - FM fact-extractor categories:        identity, preference,
-    ///                                          relationship, goal, skill
-    ///   - write-time default:                  general
-    /// Rates/half-lives per kind stay Agent/user-owned; this list only bounds
-    /// what a classifier may propose.
+    /// Allow-list for the approval-gated backfill classifier, not the complete
+    /// kind vocabulary. Explicit caller kinds (including moment and correction)
+    /// pass through write-time stamping unchanged.
     public static let taxonomy: [String] = [
         "identity", "relationship", "preference", "attribute",
         "location", "employment", "goal", "skill",

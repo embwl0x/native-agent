@@ -2,6 +2,7 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryStorage+Proposals.swift` | `MemoryStorage`: `repairSupersededTombstones`, `stagePendingProposal`, `updateProposalMetadata` |
 
 extension MemoryStorage {
     // 2026-09-18: repair and cursor commit together. Old rows must eventually
@@ -240,7 +241,7 @@ extension MemoryStorage {
                 }
                 if let reason = MemoryCandidateQuality.rejectionReason(
                     text: review.content, source: proposal.source, kind: MemoryMoments.kind
-                ) { throw MemoryV2Error.underlying("not durable memory: \(reason)") }
+                ) { throw MemoryV2Error.rejectedCandidate(reason) }
                 proposal.content = review.content
                 proposal.embedding = review.embedding
                 proposal.embeddingEpoch = review.embeddingEpoch
@@ -407,7 +408,7 @@ extension MemoryStorage {
         }
         switch outcome {
         case .tombstoned:
-            throw MemoryStorageError.tombstoned(id)
+            throw MemoryV2Error.forgottenContent("Proposal content matches a forgotten or rejected memory; the proposal was marked rejected. Proposal id: \(id)", effects: .occurred)
         case .accepted(let result, let evicted, let demoted):
             invalidateRecallCache()
             pokeUserMDRegen(persona: result.personaId)
@@ -416,7 +417,7 @@ extension MemoryStorage {
                 pokeUserMDRegen(persona: predecessor.personaId)
                 await pokeProjectionHooks(predecessor)
             }
-            await handleBoundEvictions(evicted, reason: "proposal_acceptance")
+            await handleBoundEvictions(evicted)
             return result
         }
     }
@@ -433,21 +434,21 @@ extension MemoryStorage {
         in db: Database
     ) throws -> StoredMemory {
         guard superseding.targetId != replacement.id else {
-            throw MemoryV2Error.underlying(
-                "update target is the accepted memory itself; nothing to supersede"
-            )
+            throw ToolFailureError("Update target is the accepted memory itself; nothing to supersede.", effects: .none,
+                code: "memory_supersession_self", status: .refused,
+                instruction: "Keep the existing record; a memory cannot supersede itself.", recovery: .terminal)
         }
         guard var row = try Row.fetchOne(db, sql: """
             SELECT * FROM memories
             WHERE id = ? AND status = 'active'
               AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
         """, arguments: [superseding.targetId]).map(Self.decodeMemory) else {
-            throw MemoryV2Error.underlying(
+            throw MemoryV2Error.staleSupersession(
                 "memory this update replaces (\(superseding.targetId)) is gone or already superseded"
             )
         }
         if Self.contentHash(row.content) != superseding.expectedContentHash {
-            throw MemoryV2Error.underlying(
+            throw MemoryV2Error.staleSupersession(
                 "memory this update replaces (\(superseding.targetId)) changed since the update was staged"
             )
         }
@@ -475,9 +476,10 @@ extension MemoryStorage {
               AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
         """, arguments: [row.lifecycle, row.updatedAt, Self.encodeMetadata(row.metadata), row.id])
         guard db.changesCount > 0 else {
-            throw MemoryV2Error.underlying(
-                "could not demote the memory this update replaces (\(superseding.targetId))"
-            )
+            throw ToolFailureError("Could not demote the memory this update replaces (\(superseding.targetId)).", effects: .none,
+                owner: "memory store", nextCall: ToolFailureError.call("app", ["page": .string("memories")]),
+                code: "memory_supersession_write_failed",
+                instruction: "Inspect memory diagnostics and repair the reported write error before superseding.")
         }
         return row
     }

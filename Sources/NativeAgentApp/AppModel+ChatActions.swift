@@ -12,20 +12,17 @@ import TurnTrace
 import NativeAgentCore
 import MemoryV2
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
 import ToolExecution
 import PersonaEngine
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatSessionWork
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
+import EngineRuntime
 import Research
 import MultimodalTTS
 import TriggerScheduler
@@ -37,12 +34,12 @@ import TelegramBot
 import Dispatcher
 import MacControl
 import Onboarding
-import MacAssistantStatus
+import MacIntegration
 import WorkflowOrchestration
-import Skills
 import Connectors
 import Browser
 import DeviceSync
+// Blueprint: | `AppModel+ChatActions.swift` | `AppModel`: `compactActiveChat`, `clearActiveChatMessages`, `regenerateAssistantMessage`, `startActiveChatTurn`, `startChatTurnForSession`; turn options from `ChatTurnRuntime/MacChatTurnCommands.swift` |
 
 struct AppMutationResult: Equatable, Sendable {
     let succeeded: Bool
@@ -195,7 +192,6 @@ extension AppModel {
             statusText = "Retry draft needs its original attachment; attach it again before sending."
             return
         }
-        NotificationCenter.default.post(name: .chatFlushLiveDrafts, object: nil)
         guard chatDraft(for: sessionId).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             statusText = "The composer already has a draft; clear it before using Retry draft."
             return
@@ -437,7 +433,7 @@ extension AppModel: MacChatTurnTranscriptPort {
     }
 
     func loadMacChatSessions() async throws -> [ChatSession] {
-        try await engine.transcripts.listForPresentation()
+        try await engine.transcripts.list()
     }
 
     func appendMacChatMessage(_ message: ChatMessage, to sessionId: String) {

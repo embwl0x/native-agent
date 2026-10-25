@@ -41,6 +41,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `MacCrossAppDrag.swift` | `MacCrossAppDrag`: two-anchor drag resolution, destination raising and secure/obstructed path refusals with actual-effect evidence |
+
 public enum MacCrossAppDrag {
     // MARK: - The raise
 
@@ -146,10 +148,7 @@ public enum MacCrossAppDrag {
         source: String,
         destinationApp: String
     ) -> String {
-        "I brought \(destinationApp) forward for the drop and its window landed over \(source) — "
-            + "so pressing the mouse down would have hit \(destinationApp), not the thing I was "
-            + "asked to pick up. I stopped there: focus moved, no input was sent and nothing was "
-            + "dragged. Move the windows so both are visible at once and ask me again."
+        "Bringing \(destinationApp) forward covered \(source), so dragging stopped. Focus moved; no input was sent or drag performed. Move the windows so both are visible before continuing."
     }
 
     public static let destinationMovedReason = "destination_moved_during_raise"

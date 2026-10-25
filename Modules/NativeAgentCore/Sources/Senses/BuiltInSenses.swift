@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `BuiltInSenses.swift` | Bundle-owned native adapters and JavaScript defaults; file overrides win and accounting lives in AbilityStore state |
 
 public enum BuiltInSenses {
     // Specific grown/JS senses win the registry's exact lookup. These records

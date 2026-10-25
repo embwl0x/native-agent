@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `PersonalityDynamicsConfiguration.swift` | `PersonalityDynamicsConfiguration`: fixed felt-layer bounds and persona-derived warmth/humor parameters |
+
 /// Fixed felt-layer constants with bounded warmth and humor derived from the persona.
 public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
 
@@ -57,13 +59,6 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     public let soundRutMinimumTurnGap: Int = 2
     public let soundRutRepeatTurnGap: Int = 20
     public let soundRutRepeatWindow: TimeInterval = 6 * 60 * 60
-    /// W7/P5 — the negative-register brake. Dropping the valence SIGN gate lets
-    /// a stung-but-attested turn mirror a stung moment, which is the whole point;
-    /// the hazard is the echo→reply→node loop deepening a bad mood. After this
-    /// many consecutive negative-register echoes the next echo is drawn from the
-    /// non-negative pool, whatever the register ranking would otherwise prefer.
-    /// 0 disables negative echoes entirely; a large value disables the brake.
-    public let soundEchoNegativeRunLimit: Int = 2
     /// W7/P10 — λ. Echo ranking is `register-fit × age-decay × (1 + λ·landing)`.
     /// Deliberately small: landing RE-RANKS inside a register band, it never
     /// overrides register fit. At 0.15 the factor spans 0.85…1.15, which cannot
@@ -142,13 +137,6 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// silence-by-default.
     public let innerLineRepeatLimit: Int = 3
     public let innerLineRestTurns: Int = 12
-    /// THE TIC CAP. Two of her five most-shown inner lines were reflections
-    /// ABOUT her own repetitiveness, surfaced ~200 times between them; four of
-    /// her five ACTIVE standing views are on the same subject. A view whose
-    /// subject is her own phrasing is the rut wearing the costume of insight,
-    /// so it gets a hard cap: one lead, then a long rest.
-    public let selfPhrasingInnerLineRepeatLimit: Int = 1
-    public let selfPhrasingInnerLineRestTurns: Int = 48
     /// THE NAG'S OWN CADENCE (item 6, 2026-09-02). A `- Thread:` line is an
     /// unresolved thing intruding — the one line on the capsule whose whole
     /// nature is to be unwelcome. It shares the Inner rotation ledger (so the

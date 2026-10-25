@@ -2,6 +2,7 @@ import Foundation
 import PersistenceCore
 import PersonaEngine
 import TrustCenter
+// Blueprint: | `FirstRunWelcomeTransaction.swift` | `FirstRunWelcomeTransaction` class; `hasConversationRows`, `isPersistedFailureRow` |
 
 /// The one-time greeting writer's outcome as observed by the onboarding route.
 /// A delivery accepted by the chat owner is distinct from a deferred or

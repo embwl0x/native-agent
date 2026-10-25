@@ -4,6 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import MacIntegration
+// Blueprint: | `SwiftToolDispatcher+WorkContext.swift` | `SwiftToolDispatcher`: `impl_work_context`, `workContextDeskItem`, `boundedWorkContextValue` |
 
 /// Read-time query shaping only, never a semantic decision or another memory
 /// index. Keep a one-letter subject such as X while dropping conversational
@@ -79,10 +80,6 @@ extension SwiftToolDispatcher {
                 return $0.item.handle < $1.item.handle
             }
             let items = matches.dropFirst(deskOffset).prefix(limit).map(\.item)
-            Self.latchDeskPeers(items)
-            for item in items {
-                Self.latchDeskPeers(Array(state.children(of: item.handle).prefix(5)))
-            }
             deskResult = .object([
                 "status": .string("ok"), "source": .string("canonical_current_desk"),
                 "as_of": .string(state.generatedTs),

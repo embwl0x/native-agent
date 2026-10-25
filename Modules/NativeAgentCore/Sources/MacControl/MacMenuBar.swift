@@ -31,6 +31,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `MacMenuBar.swift` | `MacMenuBar`: bounded native menu reads, path resolution and safe semantic presentation |
+
 public enum MacMenuBar {
     /// Named levels in a path. `File › Export › PDF…` is three.
     public static let maxPathDepth = 3

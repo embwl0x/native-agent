@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `AgentLaneHandles.swift` | `AgentLaneHandles.migrate`: once-per-launch migration of historically read lanes into explicit contact handles; grants remain door-owned |
+
 /// Before contacts carried identity, a lane name stood for a host's contacts
 /// by vendor (Claude Code and Claude Desktop were "claude", Codex was
 /// "codex") on every install. Now nothing does (docs/agent-communication.md,

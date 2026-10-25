@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import Transcripts
 import CognitiveSubstrate
+// Blueprint: | `DreamCycleRunner+Messages.swift` | `DreamCycleRunner`: `gatherRecentMessagesAcrossSessions`, `feltRankIndex`, `parseDaemonISO` |
 
 extension DreamCycleRunner {
     private static let convCharBudget: Int = 80_000

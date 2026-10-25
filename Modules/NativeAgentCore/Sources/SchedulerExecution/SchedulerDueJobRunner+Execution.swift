@@ -7,18 +7,19 @@ import PersistenceCore
 import TelegramBot
 import TriggerScheduler
 import DeviceSync
+// Blueprint: | `SchedulerDueJobRunner+Execution.swift` | `SchedulerDueJobRunner`: `execute` (a `part` job fires its part's `schedule:` signal), `channelIsSwitchedOn`, `disabledDreamResult` |
 
 extension SchedulerDueJobRunner {
     func execute(job: DueJob, now: Date) async throws -> JobResult {
         guard let kind = JobKind(rawValue: job.kind) else {
             throw NSError(domain: "NativeAgentScheduler", code: -410, userInfo: [
-                NSLocalizedDescriptionKey: "Unsupported scheduled job kind: \(job.kind)"
+                NSLocalizedDescriptionKey: "schedule_kind_unsupported: Scheduled Desk task kind '\(job.kind)' is unsupported. Set a supported kind and its complete payload through schedule.update."
             ])
         }
         guard isLiveDataRoot else {
             throw NSError(domain: "NativeAgentScheduler", code: -403, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "refusing scheduled effect outside the canonical data root; inject an execution owner"
+                    "schedule_root_not_live: Scheduled effects are refused for \(root.path). Use schedule.create in NativeAgent's running app to schedule this Desk task in its active data folder."
             ])
         }
         switch kind {
@@ -58,17 +59,17 @@ extension SchedulerDueJobRunner {
         case .part:
             // The deadline only fires the signal; the run is the stem's, on its own gate chain.
             // Fires that land while the part's run still waits are one news. Posting is all
-            // this job knows: acceptance is the part's run, never claimed here.
+            // this job knows: the run's outcome is the ability's own record, never claimed here.
             let part = string(job.payload["part"]) ?? "", signal = string(job.payload["signal"]) ?? ""
             AbilityStore(dataRoot: root).signal(signal, part: part)
-            return JobResult(status: "completed", detail: "\(signal) posted for \(part); not yet accepted by its run",
+            return JobResult(status: "completed", detail: "\(signal) posted for \(part); its run is recorded on the ability: app ability.read {id:\"\(part)\"}",
                              output: .object(["part": .string(part), "delivery": .string("posted")]))
         case .workshop:
             let title = string(job.payload["title"]) ?? job.name
             let objective = string(job.payload["objective"]) ?? ""
             guard !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw NSError(domain: "NativeAgentScheduler", code: -400, userInfo: [
-                    NSLocalizedDescriptionKey: "workshop job requires an objective"
+                    NSLocalizedDescriptionKey: "schedule_objective_missing: Scheduled Desk task has no objective. Set payload.objective through schedule.update."
                 ])
             }
             let execution = try await platform.createWorkshopTask(
@@ -102,7 +103,7 @@ extension SchedulerDueJobRunner {
         let message = string(job.payload["message"]) ?? string(job.payload["body"]) ?? ""
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(domain: "NativeAgentScheduler", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "notify job requires a message"
+                NSLocalizedDescriptionKey: "schedule_message_missing: Scheduled Desk task has no notification text. Set payload.message through schedule.update."
             ])
         }
 
@@ -154,7 +155,7 @@ extension SchedulerDueJobRunner {
                     if outcome.deliveryProjection.reachedAChannel {
                         delivered.append(channel)
                     } else if outcome.deliveryProjection == .noChannel {
-                        skipped.append(channel)
+                        errors.append("\(channel): no notification channel is available; check phone notification setup")
                     } else {
                         errors.append("\(channel): notification was not delivered")
                     }
@@ -197,16 +198,11 @@ extension SchedulerDueJobRunner {
             }
         }
 
-        if delivered.isEmpty && !errors.isEmpty {
-            throw NSError(domain: "NativeAgentScheduler", code: -502, userInfo: [
-                NSLocalizedDescriptionKey: errors.joined(separator: "; ")
-            ])
-        }
-        let status = delivered.isEmpty ? "skipped" : (errors.isEmpty ? "completed" : "warn")
-        var detail = delivered.isEmpty
-            ? "No notification was delivered"
-            : errors.isEmpty ? "delivered via \(delivered.joined(separator: ","))"
-            : "delivered via \(delivered.joined(separator: ",")); errors: \(errors.joined(separator: "; "))"
+        let status = delivered.isEmpty ? (errors.isEmpty ? "skipped" : "error") : (errors.isEmpty ? "completed" : "warn")
+        var detail = !errors.isEmpty
+            ? "notification_delivery_failed: confirmed delivered: \(delivered.isEmpty ? "none" : delivered.joined(separator: ",")); failed or unconfirmed: \(errors.joined(separator: "; ")). Inspect these channel receipts before resuming this scheduled Desk task."
+            : delivered.isEmpty ? "notification_channels_off: No notification was delivered. Enable a chosen channel in Notifications settings for future scheduled Desk task notices."
+            : "delivered via \(delivered.joined(separator: ","))"
         if !skipped.isEmpty {
             detail += "; switched off: \(skipped.joined(separator: ","))"
         }
@@ -238,17 +234,12 @@ extension SchedulerDueJobRunner {
         let actionId = string(job.payload["actionId"]) ?? string(job.payload["action_id"]) ?? ""
         guard !actionId.isEmpty else {
             throw NSError(domain: "NativeAgentScheduler", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "connector_action job requires actionId"
+                NSLocalizedDescriptionKey: "schedule_action_missing: Scheduled Desk task has no connector action. Set payload.actionId through schedule.update."
             ])
         }
         let input: [String: JSONValue]
         if case .object(let obj)? = job.payload["input"] { input = obj } else { input = [:] }
-        let receipt = try await platform.runConnectorAction(
-            id: actionId,
-            dryRun: false,
-            input: input,
-            externalSendIdempotencyKey: job.occurrenceKey
-        )
+        let receipt = try await platform.runConnectorAction(id: actionId, dryRun: false, input: input)
         return JobResult(
             status: receipt.status == "completed" ? "completed" : receipt.status,
             detail: "connector action \(actionId) \(receipt.status)",
@@ -278,7 +269,9 @@ extension SchedulerDueJobRunner {
             if let disabledResult = Self.disabledDreamResult(for: error) {
                 return disabledResult
             }
-            throw error
+            // Named once here: what failed reading, by the field it names.
+            throw NSError(domain: "SchedulerDueJobRunner", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                "The nightly dream (dream cycle) failed: " + JSONValue.describe(error)])
         }
         let entries = Self.anyInt(response["entriesWritten"])
         let sessions = Self.anyInt(response["sessionsProcessed"])

@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `TelegramApprovalHandling.swift` | `TelegramApprovalHandling`: addressed-bot-aware approval parsing, callback contracts and canonical approval resolution/delivery lifecycle |
+
 public enum TelegramApprovalDecision: String, Sendable, Equatable {
     case approved
     case denied
@@ -86,6 +88,8 @@ public struct TelegramApprovalCommand: Sendable, Equatable {
 }
 
 public protocol TelegramApprovalHandling: Sendable {
+    func startApprovalDelivery() async
+    func stopApprovalDelivery() async
     func resolveTelegramApproval(
         id: String,
         decision: TelegramApprovalDecision,
@@ -103,6 +107,8 @@ public protocol TelegramApprovalHandling: Sendable {
 }
 
 extension TelegramApprovalHandling {
+    public func startApprovalDelivery() async {}
+    public func stopApprovalDelivery() async {}
     public func resolveTelegramApproval(
         id: String, decision: TelegramApprovalDecision, choice: Int?, chatId: Int, fromUserId: Int?
     ) async throws -> TelegramApprovalResolution {

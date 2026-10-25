@@ -10,6 +10,8 @@ import PersistenceCore
 import CoreML
 #endif
 
+// Blueprint: | `MemoryV2+Embedding.swift` | Embedding provider contracts and `CoreMLEmbeddingProvider`: real-model loading, artifact epochs, bounded compiled-model storage and fail-closed availability |
+
 // MARK: - Phase B: Embedding framework + on-disk store + Swift recaller
 //
 // CARVED OUT OF THIS COMMIT (still Phase B / future):
@@ -31,9 +33,17 @@ public protocol EmbeddingProvider: Sendable {
     var embeddingEpoch: MemoryEmbeddingEpoch { get }
     func embed(_ texts: [String]) async throws -> [[Float]]
     func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch
+    /// Search queries, in the same space as the stored text they are scored
+    /// against. Never for text that is stored.
+    func embedQueriesWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch
 }
 
 public extension EmbeddingProvider {
+    /// A symmetric model embeds a query like any other text.
+    func embedQueriesWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
+        try await embedWithEpoch(texts)
+    }
+
     var embeddingEpoch: MemoryEmbeddingEpoch {
         MemoryEmbeddingEpoch(
             backend: modelId,
@@ -154,15 +164,9 @@ public struct FailClosedEmbeddingProvider: EmbeddingProvider {
     }
 
     public func embed(_ texts: [String]) async throws -> [[Float]] {
-        throw NSError(
-            domain: "NativeAgentMemoryV2",
-            code: -100,
-            userInfo: [NSLocalizedDescriptionKey:
-                "CoreML embedding model unavailable. Reinstall the app to "
-                + "restore the bundled MiniLM, or set "
-                + "NATIVE_AGENT_EMBEDDING_MOCK=1 to opt into deterministic "
-                + "test vectors."]
-        )
+        throw MemoryStorageError.searchFailure("The memory search model is unavailable.",
+            code: "memory_search_model_unavailable",
+            instruction: "Tell the person: NativeAgent's bundled MiniLM search model is unavailable; read Doctor for the model failure.")
     }
 }
 
@@ -808,14 +812,6 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
 
     public func embed(_ texts: [String]) async throws -> [[Float]] {
-        if !modelLoaded {
-            // Reason copy reflects the fail-closed contract — the caller
-            // surfaces this error; mock is opt-in only (config backend=mock
-            // OR NATIVE_AGENT_EMBEDDING_MOCK=1).
-            throw EmbeddingError.modelNotLoaded(
-                reason: "CoreMLEmbeddingProvider not loaded; embed() fails closed unless config or NATIVE_AGENT_EMBEDDING_MOCK opts into mock vectors."
-            )
-        }
         #if canImport(CoreML) && !os(Linux)
         guard let model = mlModel, let tok = tokenizer else {
             throw EmbeddingError.modelNotLoaded(reason: "model or tokenizer missing")
@@ -920,12 +916,22 @@ public enum EmbeddingError: Error, LocalizedError {
     case invalidModelURL(reason: String)
     case installedModelUnusable(manifest: String, reason: String)
 
-    public var errorDescription: String? {
+    public var failure: ToolFailureError {
         switch self {
-        case .modelNotFound(let p): return "embedding model not found at \(p)"
-        case .modelNotLoaded(let r): return "embedding model not loaded: \(r)"
-        case .invalidModelURL(let r): return "invalid embedding model URL: \(r)"
-        case .installedModelUnusable(let m, let r): return "installed embedding model did not load (\(m)): \(r)"
+        case .modelNotFound(let p):
+            return MemoryStorageError.searchFailure("Memory search model not found at \(p)", code: "memory_search_model_missing",
+                instruction: "Restore the missing model at the reported path; read Doctor to verify it.")
+        case .modelNotLoaded(let r):
+            return MemoryStorageError.searchFailure("Memory search model not loaded: \(r)", code: "memory_search_model_load_failed",
+                instruction: "Read Doctor and repair the reported model load error.")
+        case .invalidModelURL(let r):
+            return MemoryStorageError.searchFailure("Invalid memory search model path: \(r)", code: "memory_search_model_path_invalid",
+                instruction: "Correct the reported model path; read Doctor to verify it.")
+        case .installedModelUnusable(let m, let r):
+            return MemoryStorageError.searchFailure("Installed memory search model did not load (\(m)): \(r)", code: "memory_search_model_unusable",
+                instruction: "Repair the installed model named in the error; read Doctor to verify it.")
         }
     }
+
+    public var errorDescription: String? { MemoryV2Error.describe(failure) }
 }

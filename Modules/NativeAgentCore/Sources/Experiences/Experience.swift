@@ -3,6 +3,7 @@ import GRDB
 import NativeAgentCore
 @_exported import NativeAgentShared
 import os
+// Blueprint: | `Experience.swift` | `ExperienceStore`, the append-only owner per data root over `experiences/experiences.sqlite`; `begin`, `append`, `experience`, `open`, indexed open/recent `projection` and commit-fed `changes`. Shared `Experience`/`ObligationPhase` live in NativeAgentShared. Recording stays off reply paths; projection drains queued writes and reports persistence gaps; a write the law refuses is logged and never poisons reads. Turn owners record answer lifetimes and recover saved-answer settlements; conversation and shelf owners publish peer obligations and completed run identities |
 
 
 /// The experience owner for one data root: `experiences/experiences.sqlite`.
@@ -66,10 +67,11 @@ public actor ExperienceStore {
     }
 
     /// Writes are records beside the real ones: queued per experience `id` in
-    /// the order asked, never retried. A write that fails or that the law
-    /// refuses is logged as a gap. Nothing awaits one except a delivery settling
-    /// an answer before the checkpoint that owns its redelivery retires; that
-    /// waits only on the answer's own writes and never throws.
+    /// the order asked, never retried. A write that fails to persist is a gap;
+    /// one the law refuses is only logged — the record stayed exact, so no read
+    /// is poisoned by it (10-24: one refused late answer froze every contact
+    /// read until relaunch). Delivery and failure accounting join their own
+    /// writes before retiring the caller's work; recording never throws.
     @discardableResult
     public static func record(_ dataRoot: URL, _ id: String,
                               _ write: @escaping @Sendable (ExperienceStore) async throws -> Void) -> Task<Void, Never> {
@@ -79,7 +81,9 @@ public actor ExperienceStore {
             let previous = tails[key]?.task
             let task = Task.detached {
                 await previous?.value
-                do { try await write(store); await store.wrote() } catch {
+                do { try await write(store) } catch let refused as LawError {
+                    log("experience write refused: %@", refused.localizedDescription)
+                } catch {
                     log("experience gap: %@", error.localizedDescription)
                     await store.failed(error)
                 }
@@ -107,13 +111,6 @@ public actor ExperienceStore {
 
     private func removeObserver(_ id: UUID) { observers[id] = nil }
     private func changed() { for observer in observers.values { observer.yield(()) } }
-    /// A write landed: the store works again, so an earlier gap no longer
-    /// stands between its readers and what it holds.
-    private func wrote() {
-        guard gap != nil else { return }
-        gap = nil
-        changed()
-    }
     private func failed(_ error: Error) {
         guard gap != error.localizedDescription else { return }
         gap = error.localizedDescription

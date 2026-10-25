@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `BrowserActionRoutes+IPC.swift` | authenticated IPC route decisions over window effects |
 
 public protocol BrowserIPCWindowEffects: BrowserRouteEffects {
     @MainActor var navigationInProgress: Bool { get }
@@ -53,10 +54,12 @@ extension BrowserActionRoutes {
         let run = try BrowserRun(row: try await BrowserActionRoutes(effects: effects).executePageEffect(name, detail: detail, effect))
         let receipt = (run.sourceReceipt.flatMap { try? $0.serializedData(pretty: false) })
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
-        return ["ok": run.status == "succeeded", "runId": run.id, "status": run.status, "error": receipt["error"] ?? NSNull()]
+        return ["ok": run.status == "succeeded", "runId": run.id, "status": run.status,
+                "error": receipt["error"] ?? NSNull(), "outcomeKind": receipt["outcomeKind"] ?? NSNull()]
     }
 
     @MainActor public static func handleIPCRoute(method: String, path: String, body: Data, effects: any BrowserIPCWindowEffects) async throws -> [String: Any] {
+        try Task.checkCancellation()
         let json = body.isEmpty ? [:] : ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:])
 
         switch path {
@@ -71,18 +74,15 @@ extension BrowserActionRoutes {
                 return ["ok": false, "error": "url_scheme_not_allowed",
                         "detail": "Only http and https URLs are permitted; got '\(scheme)://'"]
             }
-            // C7 busy rejection: serialise navigation
-            if effects.navigationInProgress {
-                return ["ok": false, "error": "browser_busy",
-                        "detail": "Another navigation is already in progress — retry after it completes"]
-            }
             let requestedRunID = (json["runId"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let runID = requestedRunID?.isEmpty == false
                 ? requestedRunID!
                 : "ipc-\(UUID().uuidString.lowercased())"
             // The same operation owner as every other navigation: a persisted
-            // run with its ownership, cancellation and recovery.
+            // run with its ownership, cancellation and recovery. Its atomic
+            // start reports a duplicate before any window effects run; distinct
+            // runs still acquire exclusive browser ownership at the effect.
             let routes = BrowserActionRoutes(effects: effects)
             let run = try BrowserRun(row: try await routes.executeVisibleBrowserRun(
                 parsed: try routes.validBrowserURL(urlStr), runID: runID, approvalId: nil,
@@ -90,6 +90,7 @@ extension BrowserActionRoutes {
             let receipt = (run.sourceReceipt.flatMap { try? $0.serializedData(pretty: false) })
                 .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
             return ["ok": run.status == "succeeded", "runId": run.id, "status": run.status,
+                    "outcomeKind": receipt["outcomeKind"] ?? NSNull(),
                     "url": receipt["ipcUrl"] ?? NSNull(), "title": receipt["ipcTitle"] ?? NSNull(),
                     "httpStatus": receipt["httpStatus"] ?? NSNull(), "error": receipt["openError"] ?? NSNull()]
 

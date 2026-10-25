@@ -6,6 +6,8 @@ import CognitiveSubstrate
 import Context
 import PersistenceCore
 
+// Blueprint: | `CognitionObservatoryView+LoopHarness.swift` | Observatory loop/workspace/association panels: same-snapshot endpoint resolution and honest unavailable receipt/graph presentation |
+
 /// The Association Graph is only meaningful when at least one of its edge
 /// endpoints can be resolved from the same cognitive snapshot. A single
 /// evicted node is ordinary decay and stays visible on its row; every endpoint

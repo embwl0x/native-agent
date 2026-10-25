@@ -1,5 +1,6 @@
 import Foundation
 import Desk
+// Blueprint: | `EngineDeskFailure.swift` | `DeskFacade`: `boundedLoadFailure`, `loadFailure` |
 
 extension DeskFacade {
     public nonisolated static func boundedLoadFailure(_ detail: String) -> String {

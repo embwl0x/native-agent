@@ -2,13 +2,14 @@
 
 import Foundation
 import BackgroundLoops
-import ChatOrchestration
 import CognitiveSubstrate
 import Context
 import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import ProviderRouting
+
+// Blueprint: | `NativeCognitionRuntime+Deadlines.swift` | `CoalescingDeadline` and cognition deadline scheduling: one cancellable wake per owner, residual repair and maintenance outcome reporting |
 
 /// One coalesced, cancellable exact-deadline wake. Extracted (C6) from the two
 /// sites that hand-rolled the identical structure — residual-repair and
@@ -87,17 +88,19 @@ extension NativeCognitionRuntime {
         // G-H2: covers every re-arm site, not just the wake re-anchor. Once
         // `flushForTermination` has latched, no path may resurrect this timer.
         guard !isFlushedForTermination else { return }
+        if let due = sourceWakes.pursuitNextAt, due <= now() {
+            sourceWakes.pursuitNextAt = nil
+            await startPursuitRefresh()
+            guard !isFlushedForTermination else { return }
+        }
         let generation = residualDeadline.invalidate()
         let opportunity = await organismKernel.residualRepairOpportunity()
         guard generation == residualDeadline.generation else { return }
-        // Desk 903 phase 4: canon tending rides the same events, throttled. No
-        // new timer, no new budget. See NativeCognitionRuntime+StudioCanon.swift.
+        // Source reads enter only on their invalidation or real time boundary;
+        // the existing deadline owns their cooldown/expiry, with no new timer.
         considerStudioCanonTending()
-        // Item 5 (2026-09-02): the forward register reads its sources on the
-        // SAME reading, on the same events. No new timer, no new budget, and no
-        // polling — the composition is rate-limited and hands off to a detached
-        // task like canon tending above it. See
-        // NativeCognitionRuntime+Expectations.swift.
+        // The forward register's source dirty bit and real eligibility/expiry
+        // boundaries gate its retained read task (+Expectations).
         considerHorizonExpectations()
         // Personality depth item 9 (2026-09-02) — HER HOUR. Same reading, same
         // events, no timer of its own. When the
@@ -105,16 +108,15 @@ extension NativeCognitionRuntime {
         // returns having read nothing and written nothing. See
         // NativeCognitionRuntime+StudioWander.swift.
         considerStudioWander()
-        // Phase 5 E1 (2026-10-03): her one initiative path (the shoulder tap
-        // folded in) rides the same events and owns no timer either. See
-        // NativeCognitionRuntime+Reach.swift.
+        // Reach uses source invalidations plus quiet, expiry and cooldown
+        // boundaries, sharing this deadline (+Reach).
         considerReach()
         let carriedDeadline = await considerCarried()
         guard generation == residualDeadline.generation else { return }
         // The same exact-deadline owner also wakes at pending prediction/model
         // expiry. That wake only re-derives pressure and may schedule the quiet
         // repair boundary; it does not perform cognition or call a provider.
-        guard let deadline = [opportunity.nextWakeAt ?? opportunity.nextRepairAt, carriedDeadline]
+        guard let deadline = [opportunity.nextWakeAt ?? opportunity.nextRepairAt, carriedDeadline, nextCognitiveSourceWake(at: now())]
             .compactMap({ $0 }).min() else {
             return
         }
@@ -264,6 +266,10 @@ extension NativeCognitionRuntime {
     /// app teardown must not re-arm the timers the flush just cancelled).
     public func reanchorDeadlinesAfterWake() async {
         guard bootstrapTask != nil, !isFlushedForTermination else { return }
+        sourceWakes.canonDirty = true
+        sourceWakes.horizonDirty = true
+        sourceWakes.reachDirty = true
+        sourceWakes.clockDirty = true
         await rescheduleCognitionMaintenanceDeadline(force: true)
         await rescheduleResidualRepairDeadline()
     }

@@ -1,23 +1,20 @@
 import DoctorChecks
+import NativeAgentCore
+import PersistenceCore
 import Foundation
 import Observation
 import TurnTrace
 import SwiftUI
-import PersistenceCore
+
+// Blueprint: | `InspectorView.swift` | `InspectorView` and `TurnInspectorStore`: per-window live/replay selection over engine traces with separate requested/displayed date provenance |
 
 // MARK: - Turn Inspector W3 — the Mac "Inspector" tab
 //
-// A live cascading per-turn timeline (subscribe to TurnTraceBus on open,
-// unsubscribe on close) + a replay mode that loads a persisted per-day
-// turn_traces JSONL. FUNCTIONAL FIRST — plain panel styling matching the
-// app's existing Advanced surfaces (DoctorView etc.); the graphical pizzazz
-// mode is W5, user-gated.
-//
-// All grouping/ordering/summary logic lives in TurnInspectorGrouping
-// (TurnTraceReadProjection.swift). This view renders cards and owns the
-// subscription lifecycle via TurnInspectorStore.
+// Cards and replay reads come from the engine's trace projection. Each
+// window owns only its mode, selected replay date and presentation result.
 
 struct InspectorView: View {
+    let feed: TurnInspectorFeed
     @State private var store = TurnInspectorStore()
 
     var body: some View {
@@ -28,9 +25,8 @@ struct InspectorView: View {
         }
         .padding(NativeAgentSpacing.lg)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        // Lifecycle: subscribe on open, UNSUBSCRIBE on close (no leaked sinks).
         .task {
-            store.start()
+            store.start(feed: feed)
         }
         .onDisappear {
             store.stop()
@@ -65,14 +61,6 @@ struct InspectorView: View {
                         .font(NativeAgentFont.label)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    if let dropLabel = TurnInspectorLiveDropPresentation.label(
-                        for: store.liveDropCountState
-                    ) {
-                        Label(dropLabel, systemImage: "exclamationmark.triangle")
-                            .font(NativeAgentFont.tag)
-                            .foregroundStyle(.orange)
-                            .help("Some steps were dropped because this page could not keep up. An unavailable count means the feed ended before it could be measured. The message itself was never slowed down.")
-                    }
                     Button("Clear", systemImage: "trash") { store.clearLive() }
                         .controlSize(.small)
                 } else {
@@ -97,6 +85,9 @@ struct InspectorView: View {
                             .font(NativeAgentFont.tag)
                             .foregroundStyle(.orange)
                     }
+                    if let issue = store.replayReadIssue {
+                        Text(issue).font(NativeAgentFont.tag).foregroundStyle(.orange)
+                    }
                     Spacer()
                     Text("Shows saved turns from an earlier day")
                         .font(NativeAgentFont.tag)
@@ -110,6 +101,9 @@ struct InspectorView: View {
 
     @ViewBuilder
     private var content: some View {
+        if store.mode == .live, let issue = feed.readIssue {
+            Text(issue).foregroundStyle(.orange)
+        }
         if store.mode == .replay, store.cards.isEmpty, store.replayPresentation.isLoading {
             ProgressView(store.replayPresentation.statusText)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -134,9 +128,9 @@ struct InspectorView: View {
                 .foregroundStyle(NativeAgentShell.secondary)
             Text(store.mode == .live
                  ? "Waiting for a turn — send a message to watch it happen."
-                 : (store.replayFileExists
+                 : (store.replayReadIssue ?? (store.replayFileExists
                     ? "No readable turns recorded for this date."
-                    : "Nothing was saved for this date."))
+                    : "Nothing was saved for this date.")))
                 .font(NativeAgentFont.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -269,26 +263,6 @@ private struct EventRowView: View {
 }
 
 
-/// The inspector must distinguish a quiet live feed from one that lost events
-/// under its own backpressure. Keep the visible wording in the same boundary
-/// that owns the bus-derived count so zero and invalid values never render a
-/// misleading warning chip.
-enum TurnInspectorLiveDropPresentation {
-    static func label(for dropCount: Int) -> String? {
-        guard dropCount > 0 else { return nil }
-        return "\(dropCount) steps dropped"
-    }
-
-    static func label(for state: TurnInspectorLiveDropState) -> String? {
-        switch state {
-        case .measured(let dropCount):
-            return label(for: dropCount)
-        case .unavailable:
-            return "dropped steps unavailable"
-        }
-    }
-}
-
 /// Requested replay dates and displayed evidence have separate provenance.
 /// A slow read may retain useful cards, but never relabel them as the new day.
 enum TurnInspectorReplayPresentation: Equatable {
@@ -317,180 +291,74 @@ enum TurnInspectorReplayPresentation: Equatable {
     }
 }
 
-// Tab lifecycle, selected replay date and coalesced presentation of core evidence.
-
+// Each window keeps its mode, replay selection and display filter.
 @MainActor
 @Observable
 final class TurnInspectorStore {
-
     enum Mode: String, CaseIterable, Identifiable {
         case live = "Live"
         case replay = "Replay"
         var id: String { rawValue }
     }
 
-    // MARK: Observed state
-
     private(set) var mode: Mode = .live
-    /// Newest-turn-first cards for the current mode's events.
-    private(set) var cards: [InspectorTurnCard] = []
-    /// Live drop count from the bus subscription (slow-consumer signal), with
-    /// its availability: an unknown count is never rendered as zero.
-    var liveDropCountState: TurnInspectorLiveDropState { feed.liveDropCountState }
-    var liveSinkActive: Bool { feed.liveSinkActive }
-    /// Replay diagnostics.
-    private(set) var replayDate: Date = Date()
-    private(set) var replaySkipped: Int = 0
+    var cards: [InspectorTurnCard] {
+        if mode == .replay { return replayCards }
+        return feed?.cards(after: clearBefore) ?? []
+    }
+    private var clearBefore: Date?
+    private var replayCards: [InspectorTurnCard] = []
+    private(set) var replayDate = Date()
+    private(set) var replaySkipped = 0
     private(set) var replayLoading = false
     private(set) var replayFileExists = true
     private(set) var replayLoadedDate: Date?
+    @ObservationIgnored private let replayRead = LatestRead()
+    private(set) var replayReadIssue: String?
+    private(set) var feed: TurnInspectorFeed?
 
     var replayPresentation: TurnInspectorReplayPresentation {
         .resolve(requested: replayDate, loaded: replayLoadedDate, isLoading: replayLoading)
     }
 
-    private let feed: TurnInspectorFeed
-
-    init(dataRootOverride: URL? = nil) {
-        feed = TurnInspectorFeed(dataRootOverride: dataRootOverride)
-        feed.onEventsChanged = { [weak self] in
-            guard let self, self.mode == .live else { return }
-            self.scheduleCardsRefresh()
-        }
-    }
-
-    func start() {
-        if feed.start() { TurnInspectorDoctor.active = self }
+    func start(feed: TurnInspectorFeed) {
+        self.feed = feed
+        feed.start()
+        TurnInspectorDoctor.active = self
     }
 
     func stop() {
         if TurnInspectorDoctor.active === self { TurnInspectorDoctor.active = nil }
-        feed.stop()
-        flushPendingCardsRefresh()
     }
-
-    // MARK: Mode switching
 
     func setMode(_ newMode: Mode) {
         guard newMode != mode else { return }
-        // A live-ingest debounce still in flight would fire under the NEW mode
-        // and regroup the wrong source. Drop it; both branches below recompute.
-        cancelPendingCardsRefresh()
         mode = newMode
-        cards = []
-        if newMode == .replay {
-            // Live cards are not evidence from this replay date. Restore only
-            // the last loaded replay while its refresh is pending.
-            recomputeCards()
-            Task { await loadReplay(for: replayDate) }
-        } else {
-            recomputeCards()
-        }
+        if newMode == .replay { Task { await loadReplay(for: replayDate) } }
     }
 
-    func clearLive() {
-        // User-initiated: the list must empty NOW, not up to a debounce later.
-        cancelPendingCardsRefresh()
-        feed.clearLive()
-        if mode == .live { recomputeCards() }
-    }
+    func clearLive() { clearBefore = Date() }
 
-    // MARK: Replay
-
-    /// Load the persisted per-day file for `date`, off the main actor, and
-    /// regroup. Parse failures are skipped (counted), an absent file is an
-    /// empty (not error) state. A generation token guards against overlapping
-    /// loads (rapid date changes) applying out of order — only the NEWEST
-    /// in-flight load is allowed to mutate state.
+    /// The engine returns grouped evidence; only this window's newest selection
+    /// may publish it, so overlapping replay dates cannot relabel old cards.
     func loadReplay(for date: Date) async {
-        if mode == .replay {
-            groupingTask?.cancel()
-            groupingGeneration &+= 1
-        }
+        guard let feed else { return }
         replayDate = date
         replayLoading = true
-        guard let result = await feed.loadReplay(for: date) else { return }
-        replayFileExists = result.exists
-        replaySkipped = result.skipped
-        if mode == .replay {
-            // Same reason as `setMode`: a live-ingest debounce landing after
-            // this would regroup with the wrong source.
-            cancelPendingCardsRefresh()
-            recomputeCards { [weak self] in
-                self?.replayLoadedDate = date
-                self?.replayLoading = false
+        _ = await replayRead.read { () -> Result<(exists: Bool, report: JSONLReadReport, cards: [InspectorTurnCard]), Error> in
+            do { return Result.success(try await feed.loadReplay(for: date)) }
+            catch { return Result<(exists: Bool, report: JSONLReadReport, cards: [InspectorTurnCard]), Error>.failure(error) }
+        } publish: { result in
+            switch result {
+            case .success(let read):
+                replayCards = read.cards
+                replayFileExists = read.exists
+                replaySkipped = read.report.malformedLineCount
+                replayReadIssue = read.report.trailingPartialLine ? "The final trace row is incomplete." : nil
+                replayLoadedDate = date
+            case .failure(let error): replayReadIssue = error.localizedDescription
             }
-        } else {
-            replayLoadedDate = date
             replayLoading = false
-        }
-    }
-
-    // MARK: Card recompute
-
-    /// Coalesce card rendering while the feed retains each incoming event.
-    private static let cardsDebounceSeconds: TimeInterval = 0.1
-    private var cardsRefreshScheduled = false
-    private var cardsRefreshTask: Task<Void, Never>?
-
-    private func scheduleCardsRefresh() {
-        guard !cardsRefreshScheduled else { return }
-        cardsRefreshScheduled = true
-        cardsRefreshTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(Self.cardsDebounceSeconds * 1_000_000_000))
-            guard let self, !Task.isCancelled else { return }
-            self.cardsRefreshTask = nil
-            self.cardsRefreshScheduled = false
-            self.recomputeCards()
-        }
-    }
-
-    /// Drop a pending window without regrouping. The caller is about to
-    /// recompute (or replace the source) itself.
-    private func cancelPendingCardsRefresh() {
-        cardsRefreshTask?.cancel()
-        cardsRefreshTask = nil
-        cardsRefreshScheduled = false
-    }
-
-    /// Drop a pending window and apply it immediately.
-    private func flushPendingCardsRefresh() {
-        guard cardsRefreshScheduled else { return }
-        cancelPendingCardsRefresh()
-        recomputeCards()
-    }
-
-    @ObservationIgnored private var groupedEvents: [String: [TurnTraceEvent]] = [:]
-    @ObservationIgnored private var groupingTask: Task<Void, Never>?
-    @ObservationIgnored private var groupingGeneration: UInt64 = 0
-
-    private func recomputeCards(onPublish: (@MainActor () -> Void)? = nil) {
-        groupingTask?.cancel()
-        groupingGeneration &+= 1
-        let generation = groupingGeneration
-        let source = (mode == .live) ? feed.liveEvents : feed.replayEvents
-        guard !source.isEmpty else {
-            groupedEvents = [:]
-            cards = []
-            onPublish?()
-            return
-        }
-        let previous = groupedEvents
-        let retained = cards
-        groupingTask = Task { [weak self] in
-            let worker = Task.detached(priority: .userInitiated) {
-                TurnInspectorGrouping.updating(source, previous: previous, cards: retained)
-            }
-            let result = await withTaskCancellationHandler {
-                await worker.value
-            } onCancel: {
-                worker.cancel()
-            }
-            guard let self, !Task.isCancelled, generation == self.groupingGeneration else { return }
-            self.groupedEvents = result.events
-            if self.cards != result.cards { self.cards = result.cards }
-            self.groupingTask = nil
-            onPublish?()
         }
     }
 }
@@ -502,22 +370,16 @@ enum TurnInspectorDoctor {
 
     static func check() -> CheckResult {
         InspectorFeedHealth.check(
-            isOpen: active != nil, sinkActive: active?.liveSinkActive ?? false,
-            dropCount: dropCount
+            isOpen: active != nil, observationActive: active?.feed?.observationActive ?? false
         )
     }
 
-    private static var dropCount: Int? {
-        guard let store = active, case .measured(let count) = store.liveDropCountState else { return nil }
-        return count
-    }
-
     static func repairDeadSink() -> DoctorRepairAttempt {
-        guard let store = active, InspectorFeedHealth.canRepair(isOpen: true, dropCount: dropCount) else {
-            return .unverified("Repair skipped: the Inspector sink is no longer terminated.")
+        guard let feed = active?.feed, !feed.observationActive else {
+            return .unverified("Repair skipped: Inspector trace observation is already active or the page is closed.")
         }
-        store.stop()
-        store.start()
-        return .completed("Completed: restarted the Inspector subscription task; the sink will be confirmed on the next Doctor read.")
+        feed.stop()
+        feed.start()
+        return .completed("Completed: re-armed Inspector trace observation; its state will be confirmed on the next Doctor read.")
     }
 }

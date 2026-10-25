@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceAwareness.swift` | `AgentWorkspaceNavigation`: `observationStamps`, `observe`, `bindCurrent` |
 
 extension AgentWorkspaceNavigation {
     func observationStamps(key: String) -> [AgentWorkspaceChanges.Stamp] {

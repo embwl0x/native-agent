@@ -1,17 +1,18 @@
 import Foundation
-import Darwin
 import NativeAgentCore
 import PersistenceCore
+import os
+
+// Blueprint: | `SavedTrustPolicyAuthority.swift` | `SavedTrustPolicyAuthority`: point-of-use saved policy reads through canonical shape/type validators; invalid authority never reads as configured |
 
 /// THE saved-trust-policy authority read for point-of-use gates (memory,
 /// multimodal, dream/REM, training). It lives beside the canonical loader and
-/// calls the SAME two validators `loadAuthorizationSnapshotChecked` uses —
+/// uses the SAME two validators `loadAuthorizationSnapshotChecked` uses —
 /// `validateAuthorityPolicyShape` and `validateKnownAuthorityPolicyTypes`
 /// against the canonical defaults — so a policy SecurityCenter rejects can
 /// never read as "configured" at a gate. One rule, no second copy.
 ///
-/// - `.absent`   no directory entry at all — the ONLY bootstrap case, so the
-///               caller applies the shipped defaults ("defaults everything on").
+/// - `.absent`   no directory entry; the caller applies shipped defaults.
 /// - `.damaged`  authority we hold but cannot trust: a dangling symlink (lstat
 ///               sees the LINK, so the entry is present and unreadable), bytes
 ///               that will not parse, a non-object root, an authority block
@@ -19,12 +20,20 @@ import PersistenceCore
 ///               `enableAutonomy`, or any known field whose saved JSON type
 ///               disagrees with its default. Every gate fails CLOSED on this,
 ///               whichever field it was asking about.
-/// - `.present`  validated saved policy; individual flags still have to be
-///               literal booleans.
+/// - `.present`  validated saved policy; flags must be literal booleans. An
+///               empty object is fresh for checked loading and first mutation.
+/// Every gate securely reads current bytes. Only an identical checked policy
+/// reuses validation; absence and read failures never borrow a saved result.
+/// policy.json is locally backed up/exported, phone-projected and listed in
+/// PrivacyMap's Trust category; this owner alone defines the saved schema.
 public enum SavedTrustPolicyAuthority: Sendable {
     case absent
     case damaged
     case present([String: JSONValue])
+
+    private static let checkedGeneration = OSAllocatedUnfairLock<(
+        path: URL, bytes: Data, authority: SavedTrustPolicyAuthority
+    )?>(initialState: nil)
 
     public static func policyURL(dataRoot: URL) -> URL {
         dataRoot
@@ -34,29 +43,24 @@ public enum SavedTrustPolicyAuthority: Sendable {
 
     public static func read(dataRoot: URL) -> SavedTrustPolicyAuthority {
         let path = policyURL(dataRoot: dataRoot)
-        // Inspect the entry WITHOUT following its final symlink: a dangling
-        // link is saved-but-unreadable authority, never bootstrap.
-        var metadata = stat()
-        if lstat(path.path, &metadata) != 0 {
-            return errno == ENOENT ? .absent : .damaged
-        }
-        // Shape half (and the parse/read failures) — identical call.
-        guard let saved = try? SwiftNativeTrustCenter.loadRawPolicyChecked(at: path) else {
-            return .damaged
-        }
-        // Known-field type half. Folded the way the canonical read folds it, so
-        // a future `workshopPolicy` spelling is held to the same types.
-        let folded = WorkshopPolicyBlockVocabulary.foldToWireKey(saved)
-        let defaults = SwiftNativeTrustCenter(dataRoot: dataRoot).defaultTrustPolicy()
         do {
-            try SwiftNativeTrustCenter.validateKnownAuthorityPolicyTypes(
-                folded,
-                against: defaults
-            )
+            // The canonical bounded, no-follow read retains the distinction
+            // between an absent entry and unreadable/nonregular authority.
+            guard let bytes = try SwiftNativeTrustCenter.policyBytesChecked(at: path) else { return .absent }
+            return try checkedGeneration.withLock { generation in
+                if let generation, generation.path == path, generation.bytes == bytes { return generation.authority }
+                let saved = try SwiftNativeTrustCenter.decodeRawPolicyChecked(bytes)
+                // Fold and validate exactly as the canonical authorization read.
+                let folded = WorkshopPolicyBlockVocabulary.foldToWireKey(saved)
+                let defaults = SwiftNativeTrustCenter(dataRoot: dataRoot).defaultTrustPolicy()
+                try SwiftNativeTrustCenter.validateKnownAuthorityPolicyTypes(folded, against: defaults)
+                let authority = SavedTrustPolicyAuthority.present(saved)
+                generation = (path, bytes, authority)
+                return authority
+            }
         } catch {
             return .damaged
         }
-        return .present(saved)
     }
 
     /// One boolean out of one policy block, read fresh from saved authority.

@@ -5,37 +5,48 @@ import PersistenceCore
 import TelegramBot
 import TriggerScheduler
 import DeviceSync
+// Blueprint: | `SchedulerDueJobRunner+Selection.swift` | `SchedulerDueJobRunner`: `nextMeaningfulDeadline`, `claimDueJob`, `dueJobs`, `ensureDefaultCycleJobs`; default cycle jobs and one `part` job per part and `schedule:` wake |
 
 extension SchedulerDueJobRunner {
-    /// Earliest persisted scheduler-job crossing. Future rows retain their
-    /// exact stored instant; an already-due row asks for one legacy-cadence
-    /// retry so a capped batch or failed persistence update cannot disappear
-    /// until the slow integrity sweep. Startup and source-change reconciliation
-    /// still run immediately through BackgroundLoopsManager.
+    /// Earliest future `SchedulerJobRuntime.scheduledEpoch` crossing: unclaimed
+    /// civil work follows the current zone; claims and retry floors keep their
+    /// instant. Capped batches request a coalesced continuation; overdue,
+    /// unreadable or failed state waits for source/repair invalidation and the
+    /// slow missed-event integrity sweep, never a fabricated retry.
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        // An unreadable inventory has no known crossing; the pass reports it.
-        guard let rows = try? await schedulerJobs.jobRows() else { return nil }
+        let rows: [JSONValue]
+        do { rows = try await schedulerJobs.jobRows() }
+        catch {
+            noteFault("Scheduled Desk tasks could not be read: \(error.localizedDescription)")
+            return nil
+        }
         let nowEpoch = now.timeIntervalSince1970
         var earliestFuture: Double?
-        var hasOverdue = false
         for row in rows {
             guard case .object(let obj) = row,
                   SchedulerJobRuntime.bool(obj["enabled"], default: true) else { continue }
             guard let epoch = SchedulerJobRuntime.scheduledEpoch(for: obj),
                   epoch.isFinite else { continue }
-            if epoch <= nowEpoch {
-                hasOverdue = true
-            } else if earliestFuture == nil || epoch < earliestFuture! {
+            if epoch > nowEpoch, earliestFuture == nil || epoch < earliestFuture! {
                 earliestFuture = epoch
             }
         }
-        if hasOverdue {
-            // Preserve the retired 60-second recovery cadence only while
-            // canonical state remains overdue; ordinary schedules no longer
-            // wake on that cadence.
-            return now.addingTimeInterval(60)
-        }
         return earliestFuture.map { Date(timeIntervalSince1970: $0) }
+    }
+
+    /// Only a cap-exhausted, healthy pass reaches this projection. Selection is
+    /// the same as claiming, so malformed rows cannot create continuation churn.
+    func requestRemainingBatch(excludingJobIds: Set<String>) async {
+        guard !Task.isCancelled, activityFeedError == nil, inFlightJobBodies == 0 else { return }
+        do {
+            let rows = try await schedulerJobs.jobRows()
+            guard !Task.isCancelled, activityFeedError == nil,
+                  !Self.dueJobs(in: rows, nowEpoch: Date().timeIntervalSince1970,
+                                excludingJobIds: excludingJobIds).isEmpty else { return }
+            NotificationCenter.default.post(name: SwiftNativeTriggerScheduler.dueWorkRemaining, object: nil)
+        } catch {
+            noteFault("Scheduled Desk tasks could not be read: \(error.localizedDescription)")
+        }
     }
 
     func claimDueJob(now: Date, excludingJobIds: Set<String> = []) async throws -> ClaimedDueJobs {
@@ -83,7 +94,7 @@ extension SchedulerDueJobRunner {
     ///   says nothing about a weekly REM job someone cancelled. Only the EXPLICIT user re-enable action
     ///   (AppModel.createDreamJob) passes true; the passive due-job bootstrap
     ///   pass keeps false so a cancelled job is not silently resurrected.
-    public func ensureDefaultCycleJobs(now: Date, reactivateCancelled: Bool = false) async throws -> [String] {
+    public func ensureDefaultCycleJobs(now: Date, reactivateCancelled: Bool = false) async throws -> (repaired: [String], nightlyDream: JSONValue) {
         let runDateKey = NativeAgentDreamCycleSchedule.runDateKey(now)
         let dreamDateKey = NativeAgentDreamCycleSchedule.dreamEntryDateKey(now)
         let dreamAlreadyHasEntry = Self.hasDreamEntry(dataRoot: root, dateKey: dreamDateKey)
@@ -101,11 +112,19 @@ extension SchedulerDueJobRunner {
 
         // A part's `schedule:<cron>` wake is one job of its own, re-armed by
         // the ordinary settlement. Unreadable abilities leave part jobs as they are.
-        let wakes = (try? AbilityStore(dataRoot: root).files(includeProposals: false))?.flatMap { file in
-            file.wakes.filter { $0.hasPrefix("schedule:") }.map { (id: "part-wake:\(file.id):\($0)", part: file.id, signal: $0) }
+        let wakes: [(id: String, part: String, signal: String)]?
+        var inventoryFault: String?
+        do {
+            wakes = try AbilityStore(dataRoot: root).files(includeProposals: false).flatMap { file in
+                file.wakes.filter { $0.hasPrefix("schedule:") }.map { (id: "part-wake:\(file.id):\($0)", part: file.id, signal: $0) }
+            }
+        } catch {
+            // Nonfatal: reported with the other unscheduled wakes, never through the abort channel.
+            inventoryFault = "part wakes could not be read (\(error.localizedDescription)); part jobs were left as they are this pass"
+            wakes = nil
         }
         let root = root
-        let (repaired, unscheduled) = try await schedulerJobs.updateJobRows { rows in
+        let (repaired, wakeFaults, nightlyDream) = try await schedulerJobs.updateJobRows { rows in
             var repaired: [String] = [], unscheduled: [String] = []
             if let wakes {
                 let wanted = Set(wakes.map(\.id))
@@ -121,7 +140,7 @@ extension SchedulerDueJobRunner {
                         if try SwiftNativeTriggerScheduler.upsertDefaultCycleJob(rows: &rows, id: wake.id, legacyNames: [],
                             name: "\(wake.part) wakes on \(wake.signal)", kind: "part", intervalSeconds: 86_400, schedule: schedule,
                             objective: wake.signal, extraPayload: ["part": .string(wake.part), "signal": .string(wake.signal)],
-                            nextRunEpoch: try Self.nextEpoch(schedule: schedule, now: now), now: now) {
+                            nextRunEpoch: try Self.nextEpoch(schedule: schedule, now: now), now: now).changed {
                             repaired.append(wake.id)
                         }
                     } catch { unscheduled.append("\(wake.part) wake \(wake.signal) is not a schedule (\(error.localizedDescription)); it is not armed") }
@@ -141,7 +160,7 @@ extension SchedulerDueJobRunner {
             let remJobName = "\(agentName) Weekly REM"
             let legacyAgentKey = agentName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 
-            if try SwiftNativeTriggerScheduler.upsertDefaultCycleJob(
+            let dream = try SwiftNativeTriggerScheduler.upsertDefaultCycleJob(
                 rows: &rows,
                 id: "nativeagent-nightly-dream",
                 legacyNames: ["nightly reflection", "assistant nightly dream", "\(legacyAgentKey) nightly dream"],
@@ -154,7 +173,8 @@ extension SchedulerDueJobRunner {
                 nextRunEpoch: dreamCatchUp ? now.timeIntervalSince1970 : try Self.nextEpoch(schedule: dreamSchedule, now: now),
                 now: now,
                 reactivateCancelled: reactivateCancelled
-            ) {
+            )
+            if dream.changed {
                 repaired.append(dreamCatchUp ? "\(dreamJobName) (catch-up due now)" : dreamJobName)
             }
 
@@ -170,16 +190,17 @@ extension SchedulerDueJobRunner {
                 extraPayload: [:],
                 nextRunEpoch: remCatchUp ? now.timeIntervalSince1970 : try Self.nextEpoch(schedule: remSchedule, now: now),
                 now: now
-            ) {
+            ).changed {
                 repaired.append(remCatchUp ? "\(remJobName) (catch-up due now)" : remJobName)
             }
 
-            return (repaired, unscheduled)
+            return (repaired, unscheduled, dream.job)
         }
+        let unscheduled = wakeFaults + (inventoryFault.map { [$0] } ?? [])
         for line in unscheduled where reportedWakes.insert(line).inserted {
             FileHandle.standardError.write(Data(("Scheduler: " + line + "\n").utf8))
         }
-        return repaired
+        return (repaired, nightlyDream)
     }
 
     func backfillDreamReceiptIfNeeded(now: Date) async throws -> String? {

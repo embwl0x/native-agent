@@ -2,6 +2,8 @@ import CryptoKit
 import Foundation
 import PersistenceCore
 import NativeAgentShared
+import os
+// Blueprint: | `LLMProviderStatusFeed.swift` | live provider status feed; byte-checked receipt decode reuse, verdict age checked at use |
 
 /// The durable, last-observed result of a user-initiated native provider
 /// reachability check. This is intentionally a single bounded record rather
@@ -102,7 +104,8 @@ public enum LLMProviderStatusFeed {
     }
 
     /// One checked read of the checks file, made once per routing snapshot;
-    /// every readiness branch asks it, never the file.
+    /// every readiness branch asks it, never the file. Only the decoded source
+    /// is reused by exact bytes; verdict age is evaluated at each use.
     public struct Receipts: Sendable {
         let rows: [String: [String: JSONValue]]
         /// Why the file could not be read; nil when it was read or is absent.
@@ -137,17 +140,29 @@ public enum LLMProviderStatusFeed {
         }
     }
 
+    private static let receiptGeneration = OSAllocatedUnfairLock<(
+        path: URL, bytes: Data, receipts: Receipts
+    )?>(initialState: nil)
+
     public static func receipts(dataRoot: URL) -> Receipts {
         let url = path(in: dataRoot)
         guard FileManager.default.fileExists(atPath: url.path) else { return Receipts(rows: [:], unreadable: nil) }
-        guard let data = try? Data(contentsOf: url), case .object(let file)? = try? JSONValue.parse(data) else {
+        guard let data = try? Data(contentsOf: url) else {
             return Receipts(rows: [:], unreadable: "\(url.path) could not be read")
         }
-        var rows: [String: [String: JSONValue]] = [:]
-        if case .object(let byProvider)? = file["byProvider"] {
-            for (id, value) in byProvider { if case .object(let row) = value { rows[id] = row } }
+        return receiptGeneration.withLock { generation in
+            if let generation, generation.path == url, generation.bytes == data { return generation.receipts }
+            guard case .object(let file)? = try? JSONValue.parse(data) else {
+                return Receipts(rows: [:], unreadable: "\(url.path) could not be read")
+            }
+            var rows: [String: [String: JSONValue]] = [:]
+            if case .object(let byProvider)? = file["byProvider"] {
+                for (id, value) in byProvider { if case .object(let row) = value { rows[id] = row } }
+            }
+            let receipts = Receipts(rows: rows, unreadable: nil)
+            generation = (url, data, receipts)
+            return receipts
         }
-        return Receipts(rows: rows, unreadable: nil)
     }
 
     public static func write(_ record: Record, to url: URL, credential: String? = nil) async throws {
@@ -196,10 +211,10 @@ public enum LLMProviderStatusFeed {
             return .unavailable("Provider status has not been written yet.")
         }
         guard let data = try? Data(contentsOf: url) else {
-            return .failed("Provider status could not be read.")
+            return .failed("Provider status file \(url.path) could not be read.")
         }
         guard let file = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return .failed("Provider status is not valid JSON.")
+            return .failed("Provider status file \(url.path) is not valid JSON.")
         }
         let own = (file["byProvider"] as? [String: [String: Any]])?[providerID]
             ?? (file["providerId"] as? String == providerID ? file : nil)
@@ -207,12 +222,12 @@ public enum LLMProviderStatusFeed {
         guard let rawStatus = object["status"] as? String,
               let status = Status(rawValue: rawStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
         else {
-            return .failed("Provider status has an unknown or missing status.")
+            return .failed("Provider status file \(url.path) has an unknown or missing status.")
         }
         guard let rawCheckedAt = object["checkedAt"] as? String,
               let checkedAt = parseTimestamp(rawCheckedAt)
         else {
-            return .failed("Provider status has no valid check timestamp.")
+            return .failed("Provider status file \(url.path) has no valid check timestamp.")
         }
         guard credentialMatches(providerID: providerID, tested: object["credential"] as? String, checkedAt: checkedAt, dataRoot: dataRoot) else {
             return .unavailable("The active provider's credential changed after its connection check.")
@@ -226,7 +241,7 @@ public enum LLMProviderStatusFeed {
             tested: object["tested"] as? Bool ?? false
         )
         if record.checkedAt.timeIntervalSince(now) > allowedClockSkew {
-            return .failed("Provider status check timestamp is too far in the future.")
+            return .failed("Provider status file \(url.path) has a check timestamp too far in the future.")
         }
         switch record.status {
         case .error:

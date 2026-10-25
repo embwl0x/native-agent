@@ -8,6 +8,7 @@ import ContextFlow
 import PersistenceCore
 import Procedures
 import PersonaEngine
+// Blueprint: | `ClaudeBridgeStateProjection.swift` | `ClaudeBridgeStateProjection` enum; `procedureStatusJSON`, `microcycleTelemetryJSON` |
 
 /// App-owned preferences and transport activity, plus the existing runtime owners.
 /// Core chooses state fields; the app encodes and writes the resulting payload.
@@ -247,7 +248,6 @@ public enum ClaudeBridgeStateProjection {
                     iso: iso,
                     details: [
                         "thermalPressure": reading.thermalPressure.rawValue,
-                        "lowPowerMode": reading.lowPowerMode,
                     ]
                 )
             } ?? NSNull(),

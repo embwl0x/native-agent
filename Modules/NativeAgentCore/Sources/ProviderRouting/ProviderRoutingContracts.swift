@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ProviderRoutingContracts.swift` | `ProviderRoutingSnapshot` carries its checked source revision and owns modelOverrideSurfaces independently of effort/Fast for settings and UI inheritance reads; `ProviderRoutingProtocol`: `listProviders`, `getProvider`, `configureProvider` |
 
 /// The Providers page offers exactly THREE choices — **Chat**, **Work**, and
 /// **Memory and mind** — and this table is the only place that says which
@@ -12,9 +13,9 @@ import PersistenceCore
 /// The page's member captions and the router's membership are generated from the
 /// SAME list, so they cannot disagree, and every routed surface is claimed by one
 /// group — there is no "one row per unclaimed surface" path any more. The
-/// resolver keeps no per-surface seed, effort or provider exception: a member
-/// with no saved pick follows its group's choice, and a group with no override
-/// follows Chat.
+/// resolver keeps no per-surface exception. Members share the group's choice;
+/// a group without a model/account override follows Chat's, with effort stored
+/// independently when explicitly set.
 ///
 /// What this replaced: hand-written per-surface seeds (`dream`/`rem`/
 /// `studio_wander` on a cheap model, `workshop`/`autonomy`/`swarms` on the
@@ -197,7 +198,7 @@ public enum ProviderModelChoice {
 // Scope: provider CONFIG/INSPECTION plus per-surface model-preference storage:
 // list providers, get one, configure one, run a connectivity test, and
 // read/write model preferences. Live chat routing is Swift-native too:
-// ChatOrchestration resolves the surface/model choice and SwiftNativeLLMClient
+// ChatTurnRuntime resolves the surface/model choice and SwiftNativeLLMClient
 // dispatches to the installed OAuth/API-key adapters. This file is not the
 // whole routing engine; it is the provider state/config surface used by the UI
 // and by that Swift chat pipeline.
@@ -396,14 +397,46 @@ public enum ProviderRoutingError: Error, LocalizedError {
     case underlying(String)
 
     public var errorDescription: String? {
+        repair.message
+    }
+
+    var repair: ToolFailureError {
+        let code: String
+        let detail: String
+        let effects: ToolFailureError.Effects
+        let instruction: String
         switch self {
-        case .invalidRequest: return "providers: invalid request"
-        case .providerNotFound: return "providers: provider not found"
-        case .configurationFailed(let m): return "providers: configuration failed: \(m)"
-        case .invalidResponse(let s): return "providers: native implementation returned unexpected status \(s)"
-        case .unavailable: return "providers: unavailable"
-        case .underlying(let m): return "providers: \(m)"
+        case .invalidRequest:
+            (code, detail, effects) = ("provider_request_invalid", "The provider request has missing or unsupported input.", .none)
+            instruction = "Read Providers and correct the request's required fields and supported values."
+        case .providerNotFound:
+            (code, detail, effects) = ("provider_not_found", "The requested account is not in Providers.", .none)
+            instruction = "Read Providers and select an account listed there."
+        case .configurationFailed(let message):
+            (code, detail, effects) = ("provider_configuration_failed", "Provider configuration failed: \(message)", .unknown)
+            instruction = "Read Providers and correct the reported configuration before saving."
+        case .invalidResponse(let status):
+            (code, detail, effects) = ("provider_http_rejected", "The provider endpoint answered HTTP \(status).", .none)
+            instruction = "Read Providers to inspect this account's connection and model access."
+        case .unavailable:
+            (code, detail, effects) = ("provider_route_unavailable", "No connected account offers a model for this request.", .none)
+            instruction = "Read Providers; connect an account and select a model it offers."
+        case .underlying(let message):
+            (code, detail, effects) = ("provider_state_unavailable", "Provider state is unavailable: \(message)", .unknown)
+            instruction = "Inspect providers.routing_repair and correct the reported saved state before changing the selection."
         }
+        let input: [String: JSONValue]
+        let control: String
+        if case .underlying = self {
+            input = ["action": .string("setting.get"), "args": .object(["setting": .string("providers.routing_repair")])]
+            control = "app {action:\"setting.get\",args:{setting:\"providers.routing_repair\"}}"
+        } else {
+            input = ["page": .string("providers")]
+            control = "app {page:\"providers\"}"
+        }
+        return ToolFailureError("\(code): \(detail) \(instruction) Use \(control).", effects: effects, owner: "provider routing",
+            nextCall: ToolFailureError.call("app", input),
+            code: code, instruction: instruction, recovery: .inspect)
     }
 }
 
@@ -411,7 +444,8 @@ public enum ProviderRoutingError: Error, LocalizedError {
 
 /// One surface's resolved preference from the in-process ProviderRouting owner.
 /// Chat members share Chat's tuple; Work and Memory and mind share their
-/// unanimous group override, or inherit Chat. ProviderRouting owns the catalog
+/// unanimous group override, or inherit Chat's model/account with independent
+/// effort. ProviderRouting owns the catalog
 /// too; `modelKnown` is optional catalog metadata, not a routing choice.
 public struct SurfacePreference: Sendable, Codable, Equatable {
     public var surface: String
@@ -459,9 +493,18 @@ public struct ProviderCatalogSnapshot: Sendable {
 /// model preferences, active providers, and explicit pins across separate
 /// locks, which could otherwise combine values from different commits.
 public struct ProviderRoutingSnapshot: Sendable, Equatable {
+    /// The checked picker files' committed source revision, read under their lock.
+    public let revision: Double
     public let preferences: [String: SurfacePreference]
     public let activeProviders: [String: String]
     public let pinnedModels: [String: String]
+    /// Model/account inheritance is independent of effort and Fast.
+    public var modelOverrideSurfaces: Set<String> {
+        Set(pinnedModels.keys).union(preferences.keys.filter { surface in
+            surface != "chat" && (preferences[surface]?.model != preferences["chat"]?.model
+                || (activeProviders[surface] ?? activeProviders["chat"]) != activeProviders["chat"])
+        })
+    }
     /// Surfaces whose saved pick cannot be used, keyed to the sentence that says
     /// why — ready to show on the Providers row and to refuse a turn with.
     ///
@@ -479,8 +522,10 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
         preferences: [String: SurfacePreference],
         activeProviders: [String: String],
         pinnedModels: [String: String],
-        unusablePicks: [String: String] = [:]
+        unusablePicks: [String: String] = [:],
+        revision: Double = 0
     ) {
+        self.revision = revision
         self.preferences = preferences
         self.activeProviders = activeProviders
         self.pinnedModels = pinnedModels
@@ -499,7 +544,8 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
 /// Every in-process LLM consumer routes through one of these surfaces.
 /// `ProviderSurfaceGroups` assigns each to Chat, Work, or Memory and mind.
 /// Members share their group's model, account, effort and service tier; Work
-/// and Memory and mind inherit Chat until a unanimous override is saved.
+/// and Memory and mind inherit Chat's model/account until a unanimous override
+/// is saved; setting effort alone preserves that inheritance.
 /// A provider-only override uses that account's default and requires a model
 /// selection when no usable default exists. Legacy `missions` keys fold to
 /// `workshop` at the checked read and write boundaries.

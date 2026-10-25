@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersonaEngine
+// Blueprint: | `ContextMarkdownCompiler.swift` | `ContextMarkdownCompiler`: bounded Markdown atom compilation and exact unchanged-source reuse; `triggerTokens` owns ordered trigger extraction with source-specific tokenization/filter/bound parameters; persona GROWTH uses the PersonaEngine episodic-log filter before hashing and parsing |
 
 // Preserve the Context module's public policy name while readers/helpers use
 // the same owner before composing source fragments into derived text.
@@ -57,6 +58,25 @@ public enum ContextMarkdownCompilerError: Error, Equatable, Sendable, CustomStri
 
 /// A deterministic, local-only compiler for registered Markdown sources.
 public struct ContextMarkdownCompiler: Sendable {
+    /// Ordered, unique triggers; each projection supplies its token and bound rules.
+    public static func triggerTokens(
+        _ texts: [String], minimumLength: Int, maximumCount: Int,
+        excluding stopwords: Set<String>, tokens: (String) -> [String],
+        bound: (String) -> String
+    ) -> [String] {
+        var result: [String] = []
+        var seen = Set<String>()
+        for text in texts {
+            for token in tokens(text) where !stopwords.contains(token) {
+                let value = bound(token)
+                guard value.count >= minimumLength, seen.insert(value).inserted else { continue }
+                result.append(value)
+                if result.count == maximumCount { return result }
+            }
+        }
+        return result
+    }
+
     /// Compiled-output format version, folded into `sourceHash`. Bump when a
     /// compiler change alters the ATOMS produced for identical input bytes —
     /// otherwise the coordinator's hash-gated store update drops the new shape
@@ -795,18 +815,9 @@ private extension ContextMarkdownCompiler {
         maximumCount: Int,
         maximumBytes: Int
     ) -> [String] {
-        var result: [String] = []
-        var seen: Set<String> = []
-        let orderedText = [documentName] + headingPath + [summary]
-        for text in orderedText {
-            for token in tokens(text) where !triggerStopwords.contains(token) {
-                let bounded = boundedUTF8(token, maximumBytes: maximumBytes, appendEllipsis: false)
-                guard bounded.count >= 2, seen.insert(bounded).inserted else { continue }
-                result.append(bounded)
-                if result.count == maximumCount { return result }
-            }
-        }
-        return result
+        triggerTokens([documentName] + headingPath + [summary], minimumLength: 2,
+            maximumCount: maximumCount, excluding: triggerStopwords, tokens: tokens,
+            bound: { boundedUTF8($0, maximumBytes: maximumBytes, appendEllipsis: false) })
     }
 
     static func tokens(_ text: String) -> [String] {

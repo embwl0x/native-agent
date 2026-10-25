@@ -4,11 +4,19 @@ import Foundation
 import NativeAgentCore
 import OSLog
 import PersistenceCore
+// Blueprint: | `FileSenseRegistry.swift` | Sense adapter to AbilityStore files and state; successful reads delegate versioned evidence to AbilityStore; bundle defaults, corner lookup, keep/restore through the shared publication authority gate with bundled materialization deferred to the admitted save, previous-version swap, final override drop and separate owner-off preservation; store-locked, root-scoped helper selection identities exclude read bookkeeping and distinguish each selected lifetime without changing saved records |
 
 /// Sense records are a projection of ability files and the bundled defaults.
 public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
     public let root: URL
     private static let logger = Logger(subsystem: "NativeAgent", category: "SenseRegistry")
+    private struct HelperSelection {
+        let metadata: JSONValue
+        let identity = UUID().uuidString
+    }
+    // Accessed only under AbilityStore.withLock. Keep the current selection,
+    // not retired epochs; selecting the same version again is a new lifetime.
+    nonisolated(unsafe) private static var helperSelections: [String: [String: HelperSelection]] = [:]
 
     struct Version: Codable, Sendable {
         var record: SenseRecord
@@ -207,7 +215,7 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
                 throw Self.failure("This sense is bundled with the app. Switch it off to stop using it.")
             }
             if !ownerAuthorized, CapabilityLifecycle.requiresOwnerToEnable(isOff: record.status == .off, disabledBy: record.disabledBy) {
-                throw SenseFailure(code: "owners_call", message: "The owner turned \(id) off; they turn it back on. Ask them.")
+                throw SenseFailure(code: "owners_call", message: "The owner switched \(id) off, so dropping it is theirs: ask them. Nothing changed.")
             }
             store.senses.remove(at: i)
             return (!preview, record)
@@ -233,6 +241,8 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
                 _ = try self.sourceFiles(resumed)
             }
             store.senses[i].versions[j].record.status = status
+            // Off is its actor's: the owner's on his switch, else hers.
+            store.senses[i].versions[j].record.disabledBy = status == .off ? (ownerAuthorized ? "owner" : "hers") : nil
             store.senses[i].versions[j].record.unavailableReason = nil
             if status == .on {
                 store.senses[i].versions[j].record.enabledAt = Date()
@@ -250,69 +260,42 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
         return record
     }
 
-    public func markUnavailable(id: String, version: Int, reason: String) async throws {
+    public func markUnavailable(id: String, selection: String, reason: String) async throws -> Bool {
         let changed = try await withStore { store in
-            let (i, j) = try Self.current(id, in: store)
-            guard store.senses[i].currentVersion == version,
-                  store.senses[i].versions[j].record.status == .on else { return (false, false) }
+            // Reconcile under the publication lock: a removed or replaced
+            // selection rejects the report rather than becoming a read failure.
+            if try self.selectHelpers(in: store)[id]?.identity != selection { return (false, false) }
             var fields = try self.abilities.states()[id]?.objectValue ?? [:]
             fields["unavailableReason"] = .string(reason)
             try self.abilities.saveState(id: id, fields: fields)
             return (false, true)
         }
         if changed { SenseDoorViews.shared.forget(senseID: id) }
+        return changed
     }
 
-    public func recordUse(senseID: String) async {
-        do {
-            try await withStore { store in
-                let (i, j) = try Self.current(senseID, in: store)
-                guard store.senses[i].versions[j].record.uses < Int.max else { throw Self.failure("Sense use counter overflow.") }
-                // Without a version this can't prove which version ran, so it
-                // never unlocks a shared sense's verbs: only the version-aware
-                // overload counts that first local run.
-                let record = store.senses[i].versions[j].record
-                if !(record.origin == .shared && record.uses == 0) { store.senses[i].versions[j].record.uses += 1 }
-                store.senses[i].versions[j].record.lastUsedAt = Date()
-                return (true, ())
-            }
-        } catch { Self.report(error) }
-    }
-
-    /// Stamp the version that actually ran, even if an upgrade arrived in flight.
+    /// AbilityStore durably records the read against the retained version that ran.
     public func recordUse(senseID: String, version: Int) async throws {
         try await withStore { store in
             let i = try Self.index(senseID, in: store)
             guard let j = store.senses[i].versions.firstIndex(where: { $0.record.version == version }) else {
                 throw Self.failure("Sense version not found.")
             }
-            guard store.senses[i].versions[j].record.uses < Int.max else { throw Self.failure("Sense use counter overflow.") }
-            store.senses[i].versions[j].record.uses += 1
-            store.senses[i].versions[j].record.lastUsedAt = Date()
-            return (true, ())
+            let record = store.senses[i].versions[j].record
+            let current = store.senses[i].versions.first { $0.record.version == store.senses[i].currentVersion }!.record
+            try self.abilities.recordRun(id: senseID, version: record.candidateDigest ?? String(version),
+                receipt: .object(["status": .string("ok"), "read": .bool(true)]), nativeSense: JSONValue.fromEncodable(current))
+            return (false, ())
         }
     }
 
     func withStore<T: Sendable>(ownerAuthorized: Bool = false, enabling: Bool = false, _ body: @escaping @Sendable (inout Store) throws -> (Bool, T)) async throws -> T {
         try Task.checkCancellation()
-        return try AbilityStore.withLock {
-            var store = try Self.decode(self.abilities.registry(kind: .sense))
+        let (result, retired) = try AbilityStore.withLock {
             let defaults = try BuiltInSenses.defaults()
-            let defaultIDs = Set(defaults.map { $0.record.id.lowercased() })
-            for file in try self.abilities.files() where defaultIDs.contains(file.id.lowercased()) && file.kind != .sense {
-                throw Self.failure("Ability id collision: \(file.id) is also a bundled sense.")
-            }
-            let states = try self.abilities.states()
-            for version in defaults where !store.senses.contains(where: { $0.id == version.record.id }) {
-                var fields = try JSONValue.fromEncodable(version.record).objectValue!
-                for (key, value) in states[version.record.id]?.objectValue ?? [:] { fields[key] = value }
-                if fields["status"] == .string("on"), case .string = fields["unavailableReason"] ?? .null {
-                    fields["status"] = .string("unavailable")
-                }
-                let record = try JSONDecoder().decode(SenseRecord.self, from: JSONValue.object(fields).serializedData(pretty: false))
-                store.senses.append(Entry(id: record.id, currentVersion: record.version, versions: [Version(record: record, files: version.files)]))
-            }
+            var store = try self.readStore(defaults: defaults)
             let before = store
+            let previousSelections = Self.helperSelections[self.root.path] ?? [:]
             let (changed, result) = try body(&store)
             if changed {
                 store = try Self.decode(CapabilityLifecycle.preservingOwnerOff(JSONValue.fromEncodable(store),
@@ -340,8 +323,67 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
                 })
                 try self.abilities.saveRegistry(.object(value), kind: .sense, ownerAuthorized: ownerAuthorized, enabling: enabling)
             }
-            return result
+            // Read committed state: previews do not publish, unavailable is a
+            // state-only write, and dropping an override reveals its default.
+            let selected = try self.selectHelpers(in: self.readStore(defaults: defaults))
+            let retired = previousSelections.compactMap { id, previous in
+                selected[id]?.identity == previous.identity ? nil : previous.identity
+            }
+            return (result, retired)
         }
+        for selection in retired { await (SensesHub.shared.runner as? HelperSenseRunner)?.retire(selection: selection) }
+        return result
+    }
+
+    private func readStore(defaults: [Version]) throws -> Store {
+        var store = try Self.decode(abilities.registry(kind: .sense))
+        let defaultIDs = Set(defaults.map { $0.record.id.lowercased() })
+        for file in try abilities.files() where defaultIDs.contains(file.id.lowercased()) && file.kind != .sense {
+            throw Self.failure("Ability id collision: \(file.id) is also a bundled sense.")
+        }
+        let states = try abilities.states()
+        for version in defaults where !store.senses.contains(where: { $0.id == version.record.id }) {
+            var fields = try JSONValue.fromEncodable(version.record).objectValue!
+            for (key, value) in states[version.record.id]?.objectValue ?? [:] { fields[key] = value }
+            if fields["status"] == .string("on"), case .string = fields["unavailableReason"] ?? .null {
+                fields["status"] = .string("unavailable")
+            }
+            fields = try AbilityStore.senseRecord(fields)
+            let record = try JSONDecoder().decode(SenseRecord.self, from: JSONValue.object(fields).serializedData(pretty: false))
+            store.senses.append(Entry(id: record.id, currentVersion: record.version, versions: [Version(record: record, files: version.files)]))
+        }
+        return store
+    }
+
+    /// The live identity is captured under the same lock as publication. Draft
+    /// helpers belong to their caller and never enter canonical retirement.
+    func helperSelection(_ record: SenseRecord) throws -> String {
+        let metadata = try Self.metadata(record)
+        if record.status == .draft {
+            return "draft:" + SHA256.hash(data: try metadata.serializedData(pretty: false))
+                .map { String(format: "%02x", $0) }.joined()
+        }
+        return try AbilityStore.withLock {
+            guard let selected = Self.helperSelections[root.path]?[record.id], selected.metadata == metadata else {
+                throw CancellationError()
+            }
+            return selected.identity
+        }
+    }
+
+    private func selectHelpers(in store: Store) throws -> [String: HelperSelection] {
+        let previous = Self.helperSelections[root.path] ?? [:]
+        var selected: [String: HelperSelection] = [:]
+        for entry in store.senses {
+            let record = entry.versions.first { $0.record.version == entry.currentVersion }!.record
+            if record.status == .on {
+                let metadata = try Self.metadata(record)
+                if let current = previous[entry.id], current.metadata == metadata { selected[entry.id] = current }
+                else { selected[entry.id] = HelperSelection(metadata: metadata) }
+            }
+        }
+        Self.helperSelections[root.path] = selected
+        return selected
     }
 
     static func metadata(_ record: SenseRecord) throws -> JSONValue {

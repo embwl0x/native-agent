@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `MotorActionReadModel.swift` | `MotorActionReadModel`: shared payload-free phase, deadline and verification language; canonical domain reducers retain authority |
+
 /// Shared, read-only language for observing action progress across NativeAgent.
 ///
 /// This is a projection, never an executor or authority owner. Domain reducers

@@ -1,8 +1,11 @@
 import Cognition
 import EngineRuntime
 import Dispatcher
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatSessionWork
 import ToolRegistry
+
+// Blueprint: | `DetachedChatPanelView.swift` | `DetachedChatPanelView`: session-bound transcript/composer, search, speech and attachment intake through shared chat owners |
 // DetachedChatPanelView — the focused chat surface hosted inside a
 // DetachedChatPanel (free-floating window for a single session).
 //
@@ -32,13 +35,6 @@ struct DetachedChatPanelView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    // The detached panel is hosted by AppKit, NOT by the SwiftUI Scene that
-    // applies the app's dark-mode preference — so without this it rendered in
-    // the OS appearance while the main window was dark (User, 2026-07-25).
-    // Same @AppStorage key the main Window/Settings scenes read, so a live
-    // toggle repaints open panels too.
-    @AppStorage("nativeagent.darkMode") private var preferDarkAppearance = true
-
     @State private var didInitialLoad = false
     // Render-cost audit F1 — streaming-delta scroll throttle.
     //
@@ -58,18 +54,19 @@ struct DetachedChatPanelView: View {
     /// It used to mount `ChatMessageListView` with no card source at all: a
     /// request that raised "Connect GitHub" in a detached window showed a bare
     /// tool row with nothing to tap, and the same conversation in the main
-    /// window showed the card. Own binding, same resolver, same durable rows.
+    /// window showed the card. Window controls, shared transcript projection.
     @State private var inlineCards = InlineInteractionChatBinding()
     /// D2 review fix: the routing decision must know the dynamically
     /// registered slash tools too, or a dynamic command typed here falls
     /// through as chat text while the built-ins toast. Same store the main
     /// window uses; refreshed once per panel.
-    @State private var capabilitiesStore = NativeAgentEngine.live.tools
+    private var capabilitiesStore: ToolsFacade { appModel.engine.tools }
     @State private var isCapturing = false
     @State private var isRetryingLoad = false
     @State private var toastMessage: String?
     @State private var voiceInput = VoiceInputCapture.forChat()
     @State private var voiceDraftBeforeListening = ""
+    @State private var voiceDraftRevision: UInt64 = 0
     /// 2026-09-06: this dictation's generation. Bumped by every end — a send,
     /// a stop, the panel closing — so a start still waiting on the microphone
     /// permission prompt cannot begin afterwards, and so a transcript that
@@ -94,17 +91,7 @@ struct DetachedChatPanelView: View {
     /// the send-next queue and was spoken twice.
     @State private var isSubmittingSend = false
 
-    // H5 (gpt-5.5 review, 2026-07-09): same treatment as ChatView's composer —
-    // in-progress text lives in view-local @State, so a keystroke here no
-    // longer writes the observable `chatDrafts` dict and re-renders every view
-    // observing it (the main window's session list among them). Committed back
-    // at the points where it must survive this panel: send-clear and window
-    // close. The panel's session is immutable, so there's no switch case.
-    // 2026-09-22: an @Observable read only by `DetachedChatComposer`, so a
-    // keystroke no longer re-runs this body and its transcript (the main
-    // window's 2026-09-13 fix; see ChatComposerDraft.swift). `adoptedText` and
-    // `editedAt` keep the 2026-09-06 adopt/commit rules.
-    @State private var panelDraft = ChatComposerDraft()
+    private var panelDraft: ChatComposerDraft { appModel.composerDraft(for: sessionId) }
 
     private var draft: String {
         get { panelDraft.text }
@@ -224,7 +211,7 @@ struct DetachedChatPanelView: View {
         .background {
             ShellSheet().overlay { WindowHaze(sessionId: sessionId) }
         }
-        .preferredColorScheme(preferDarkAppearance ? .dark : nil)
+        .preferredColorScheme(AppearanceController.shared.colorScheme)
         .task(id: sessionId) {
             // Load history into the per-session slot on first appearance.
             // task(id:) re-fires if the panel is somehow rebound to a new
@@ -232,33 +219,15 @@ struct DetachedChatPanelView: View {
             guard !didInitialLoad else { return }
             await capabilitiesStore.refreshSlashCatalog()
             didInitialLoad = true
-            // H5: adopt whatever draft this session had (typed in the main
-            // window or a previous panel) into the view-local state.
-            // 2026-09-06: the main window's composer holds its in-progress
-            // text in @State too, so ask it to commit before reading — else
-            // this panel opens showing the last commit, not the typing.
-            appModel.flushLiveChatDrafts()
-            panelDraft.text = appModel.chatDraft(for: sessionId)
-            panelDraft.adoptedText = panelDraft.text
-            panelDraft.editedAt = .distantPast
             await appModel.loadDetachedSessionMessages(sessionId)
-            await inlineCards.refresh(sessionID: sessionId)
+            await appModel.engine.transcripts.reclaimContinuations(for: sessionId)
             inputFocused = true
         }
         // Telegram, Slack, iOS, bridge, and local turns all converge on the
         // canonical transcript. Watch that exact file while this panel is
         // mounted so every surface appears live without an idle refresh loop.
         .task(id: "detached-transcript:\(sessionId)") {
-            guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
-                return
-            }
-            let transcript = PersistenceCore.defaultDataRoot()
-                .appendingPathComponent("chat/messages", isDirectory: true)
-                .appendingPathComponent("\(safeSessionId).jsonl")
-            await EventDeadlinePhysiology.refreshOnChanges(
-                paths: [transcript],
-                debounceDelay: .milliseconds(100)
-            ) {
+            await appModel.engine.transcripts.watchChanges(sessionID: sessionId) {
                 await appModel.refreshDetachedChatMessagesAfterTurn(sessionId: sessionId)
             }
         }
@@ -295,26 +264,17 @@ struct DetachedChatPanelView: View {
                     sessionId: sessionId,
                     messagesAlreadyRefreshed: alreadyRefreshed
                 )
-                await inlineCards.refresh(sessionID: sessionId)
             }
         }
         .onDisappear {
             // F1: invalidate any scroll scheduled against the now-dead proxy
             // (same contract as `ChatView.swift:1032`).
             scrollCoordinator.markViewDisappeared()
-            // H5: hand the uncommitted draft back so closing the panel never
-            // eats typed text (the main window adopts it on session switch).
-            commitPanelDraft()
             // 2026-09-06: this panel had no dictation cleanup at all — a
             // closed panel kept the microphone open, and a start still waiting
             // on the permission prompt began listening for a window that was
             // already gone.
             endPanelDictation()
-        }
-        // 2026-09-06: another surface is about to read this session's stored
-        // draft. Hand it what is on screen here first.
-        .onReceive(NotificationCenter.default.publisher(for: .chatFlushLiveDrafts)) { _ in
-            commitPanelDraft()
         }
         .focusedSceneValue(\.chatCommandActions, ChatFocusedCommandActions(
             send: send,
@@ -356,12 +316,13 @@ struct DetachedChatPanelView: View {
                                 : nil,
                             latestRequest: transcriptLatestRequest
                         )
-                        // The same join the main window makes: the transcript
-                        // asks for the cards on a row, the binding answers from
-                        // this session's persisted interactions, and a tap goes
-                        // to the resolver.
-                        .environment(\.inlineCardSource) { [inlineCards] rowID in
-                            inlineCards.cards(forRow: rowID)
+                        .safeAreaInset(edge: .top) {
+                            if case .unavailable(let reason) = appModel.engine.transcripts.transcriptReadStatus(for: sessionId) {
+                                Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                            }
+                        }
+                        .environment(\.inlineCardSource) { [appModel] rowID in
+                            appModel.engine.transcripts.cards(forRow: rowID, in: sessionId)
                         }
                         .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
                             inlineCards.handle(card: card, action: action, appModel: appModel)
@@ -452,7 +413,6 @@ struct DetachedChatPanelView: View {
             // transcript's own mutation counter catches every such write.
             .onChange(of: appModel.engine.transcripts.structureVersion(for: sessionId)) {
                 refreshTranscriptSearchIfPresented()
-                inlineCards.refreshSoon(sessionID: sessionId)
             }
             .onChange(of: transcriptSearch.selectionRevision) { _, _ in
                 guard showTranscriptSearch,
@@ -641,7 +601,7 @@ struct DetachedChatPanelView: View {
                     // already-sent phrase back into it.
                     guard voiceAcceptsTranscript else { return }
                     if ChatTranscriptPresentation.hasVisibleText(newVal) {
-                        draft = composeVoiceDraft(newVal)
+                        panelDraft.dictate(composeVoiceDraft(newVal), revision: voiceDraftRevision)
                     }
                 }
             )
@@ -699,13 +659,11 @@ struct DetachedChatPanelView: View {
                 guard draft.trimmingCharacters(in: .whitespacesAndNewlines) == text,
                       pendingAttachments == attachments
                 else { return }
-                draft = ""
                 appModel.clearChatDraftAfterSend(
                     sentDraft,
                     sessionId: sessionId,
                     editedAt: sentDraftEditedAt
                 )
-                panelDraft.adoptedText = ""
                 pendingAttachments = []
                 // 2026-09-06: sending from scrollback used to leave the new
                 // exchange offscreen — nothing here re-armed follow, so the
@@ -759,6 +717,7 @@ struct DetachedChatPanelView: View {
                       startGeneration == voiceGeneration
                 else { return }
                 voiceDraftBeforeListening = draft
+                voiceDraftRevision = panelDraft.manualEditRevision
                 voiceInput.startListening()
                 voiceAcceptsTranscript = voiceInput.isListening
                 if let msg = voiceInput.errorMessage, !voiceInput.isListening {
@@ -772,10 +731,17 @@ struct DetachedChatPanelView: View {
 
     private func finishPanelDictation() async -> Bool {
         let stoppedGeneration = voiceGeneration
+        let stoppedDraftRevision = voiceDraftRevision
         let wasListening = voiceInput.isListening
         let result = await voiceInput.stopListeningResult()
         guard stoppedGeneration == voiceGeneration else { return false }
         voiceAcceptsTranscript = false
+        guard panelDraft.manualEditRevision == stoppedDraftRevision else {
+            // The person's own edit stands, and the action they asked for goes on with it.
+            voiceDraftBeforeListening = ""
+            voiceGeneration &+= 1
+            return true
+        }
         let accepted = ChatComposerSupport.finishDictation(
             result, wasListening: wasListening, base: &voiceDraftBeforeListening,
             draft: &draft, attachments: &pendingAttachments,
@@ -845,13 +811,11 @@ struct DetachedChatPanelView: View {
                     guard draft == capturedDraft,
                           currentAttachmentIds == capturedAttachmentIds
                     else { return }
-                    draft = ""
                     appModel.clearChatDraftAfterSend(
                         capturedDraft,
                         sessionId: sessionId,
                         editedAt: capturedDraftEditedAt
                     )
-                    panelDraft.adoptedText = ""
                     pendingAttachments = []
                     // 2026-09-06: a screenshot send is a send — re-arm follow
                     // so the new exchange is not left offscreen, and end the
@@ -871,21 +835,6 @@ struct DetachedChatPanelView: View {
                 showToast(UserFacingError.message(error, action: "send the screenshot"))
             }
         }
-    }
-
-    /// Persist this panel's in-progress text. A panel that has not changed
-    /// its draft since adopting stays out of the way: another surface may have
-    /// written a newer one for the same session (2026-09-06).
-    private func commitPanelDraft() {
-        guard panelDraft.text != panelDraft.adoptedText else { return }
-        // 2026-09-06: a rejected commit is not a commit. Marking it adopted
-        // anyway is how closing this panel used to eat the text in it.
-        guard appModel.commitChatDraft(
-            panelDraft.text,
-            sessionId: sessionId,
-            editedAt: panelDraft.editedAt
-        ) else { return }
-        panelDraft.adoptedText = panelDraft.text
     }
 
     private func composeVoiceDraft(_ transcript: String) -> String {

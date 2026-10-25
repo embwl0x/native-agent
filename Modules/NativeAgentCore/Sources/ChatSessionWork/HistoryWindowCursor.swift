@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `HistoryWindowCursor.swift` | `HistoryWindowCursor`, `HistoryWindowCursorStore`; locked advancement persists only changed boundaries |
 
 // Per-session replayed-prefix window cursor (v2Prefix conversation shape).
 //
@@ -66,6 +67,8 @@ public struct HistoryWindowCursor: Codable, Sendable, Equatable {
     }
 }
 
+/// Storage: prefix cursors are local replay state, excluded from local backup,
+/// data export and phone sync; included in off-disk backup and PrivacyMap/chat.
 public actor HistoryWindowCursorStore {
     /// Pressure threshold. Below `historyChars * 1.15` the head does not move.
     static let advanceTriggerRatio = 1.15
@@ -124,13 +127,17 @@ public actor HistoryWindowCursorStore {
                 if let turnId, !turnId.isEmpty, state.lastAdvanceTurnId == turnId {
                     return (state, false)
                 }
-                // Compaction already owns this turn's rewrite.
-                guard !compactionRanThisTurn else { return (state, false) }
+                // Compaction already owns this turn's rewrite, while what it
+                // leaves fits; past that, whole older turns still go first.
+                let over = budgetChars > 0
+                    && Self.replayed(admitted, currentBoundary: state.dropBoundaryIdentity).chars > budgetChars
+                guard !compactionRanThisTurn || over else { return (state, false) }
                 guard let boundary = Self.nextBoundary(
                     admitted: admitted,
                     currentBoundary: state.dropBoundaryIdentity,
                     budgetChars: budgetChars,
-                    rowCap: rowCap
+                    rowCap: rowCap,
+                    pressed: compactionRanThisTurn
                 ) else {
                     return (state, false)
                 }
@@ -178,37 +185,22 @@ public actor HistoryWindowCursorStore {
     ///
     /// Bounding ROWS with the same hysteresis puts the head back under the
     /// cursor: it moves once, in a chunk, and then holds for many turns.
+    /// `pressed`: the history is already known to be over its budget, so the
+    /// trim runs without waiting for the trigger ratio.
     nonisolated static func nextBoundary(
         admitted: [HistoryWindowRow],
         currentBoundary: String?,
         budgetChars: Int,
-        rowCap: Int = 0
+        rowCap: Int = 0,
+        pressed: Bool = false
     ) -> String? {
         guard budgetChars > 0 || rowCap > 0, !admitted.isEmpty else { return nil }
-        let currentIndex = currentBoundary.flatMap { boundary in
-            admitted.firstIndex { $0.identity == boundary }
-        }
-        // Rows still inside the window: everything after the current boundary.
-        let liveStart = currentIndex.map { $0 + 1 } ?? 0
+        let (used, rowCount, liveStart) = replayed(admitted, currentBoundary: currentBoundary)
         guard liveStart < admitted.count else { return nil }
         let live = Array(admitted[liveStart...])
-        // Anchors and the recollection sit BEFORE the boundary and are replayed
-        // anyway, so they are part of what the model actually reads and must be
-        // counted. Leaving them out would under-report the prefix and let it run
-        // over the ceiling by exactly the bytes that can never be reclaimed.
-        // Only the compaction recollection survives ahead of the boundary now.
-        // Anchors are no longer pinned at the head: pinning them put a moving
-        // joint between them and the first live row (see the projection's
-        // cursor-drop note), and the session's opening already rides the
-        // volatile block's continuity state.
-        let pinnedAhead = admitted[..<liveStart]
-            .filter { $0.isCompactionSummary }
-        let replayed = pinnedAhead + live
-        let used = replayed.reduce(0) { $0 + $1.length + 1 }
-        let rowCount = replayed.count
         // EITHER bound can trigger; the trim below satisfies BOTH.
         let charPressure = budgetChars > 0
-            && Double(used) > Double(budgetChars) * advanceTriggerRatio
+            && Double(used) > Double(budgetChars) * (pressed ? 1 : advanceTriggerRatio)
         let rowPressure = rowCap > 0
             && Double(rowCount) > Double(rowCap) * advanceTriggerRatio
         guard charPressure || rowPressure else { return nil }
@@ -263,6 +255,26 @@ public actor HistoryWindowCursorStore {
             return nil
         }
         return candidate
+    }
+
+    /// What the window replays past `currentBoundary`: its characters, its rows,
+    /// and where the live rows start. Anchors and the recollection sit BEFORE
+    /// the boundary and are replayed anyway, so they are part of what the model
+    /// actually reads and must be counted. Leaving them out would under-report
+    /// the prefix and let it run over the ceiling by exactly the bytes that can
+    /// never be reclaimed. Only the compaction recollection survives ahead of
+    /// the boundary now. Anchors are no longer pinned at the head: pinning them
+    /// put a moving joint between them and the first live row (see the
+    /// projection's cursor-drop note), and the session's opening already rides
+    /// the volatile block's continuity state.
+    nonisolated static func replayed(_ admitted: [HistoryWindowRow], currentBoundary: String?)
+        -> (chars: Int, rows: Int, liveStart: Int) {
+        let currentIndex = currentBoundary.flatMap { boundary in admitted.firstIndex { $0.identity == boundary } }
+        // Rows still inside the window: everything after the current boundary.
+        let liveStart = currentIndex.map { $0 + 1 } ?? 0
+        let rows = admitted[..<min(liveStart, admitted.count)].filter(\.isCompactionSummary)
+            + admitted[min(liveStart, admitted.count)...]
+        return (rows.reduce(0) { $0 + $1.length + 1 }, rows.count, liveStart)
     }
 
     /// End index (exclusive) of the turn beginning at `start`, including every

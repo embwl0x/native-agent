@@ -1,7 +1,10 @@
 import Foundation
 import Darwin
-import ChatOrchestration
+import ChatTurnRuntime
+import AgentLinkTransport
 import PersistenceCore
+import NativeAgentShared
+// Blueprint: | `NativeAgentA2AWire+Parts.swift` | A2A content validation; file byte ceiling comes from Shared's `ChatAttachmentTypeResolver` |
 
 public struct AgentContactFailure: Error, Sendable {
     let code: Int
@@ -16,7 +19,7 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
     case file(name: String, mediaType: String, bytes: Data, metadata: JSONValue)
     case data(JSONValue, metadata: JSONValue)
 
-    static let maximumFileBytes = 10_000_000 // Same ceiling as the Mac composer.
+    static let maximumFileBytes = ChatAttachmentTypeResolver.fileByteLimit
     static let maximumOutputBytes = 16_000_000
     static let inputModes = ["text/plain", "application/json", "image/png", "image/jpeg", "image/heic",
         "image/webp", "image/gif", "application/pdf"]
@@ -101,7 +104,7 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
         (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(value), options: [.fragmentsAllowed])) ?? NSNull()
     }
 
-    var attachment: ChatOrchestration.MultimodalAttachment? {
+    var attachment: ChatTurnRuntime.MultimodalAttachment? {
         switch self {
         case .text: return nil
         case .file(let name, let mediaType, let bytes, _):
@@ -115,7 +118,7 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
         }
     }
 
-    public static func output(_ attachment: ChatOrchestration.MultimodalAttachment, taskID: String) throws -> Self {
+    public static func output(_ attachment: ChatTurnRuntime.MultimodalAttachment, taskID: String) throws -> Self {
         let bytes: Data
         if !attachment.base64.isEmpty {
             guard let decoded = Data(base64Encoded: attachment.base64), decoded.count <= maximumFileBytes else { throw invalidPart }

@@ -1,11 +1,13 @@
 import ApprovalInbox
-import ChatOrchestration
+import AgentWorkspace
 import CognitiveSubstrate
 import Foundation
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Desk
+
+// Blueprint: | `NativeCognitionRuntime+Expectations.swift` | `NativeCognitionRuntime` horizon expectations: composed dated evidence, refresh deadlines and toward/resolution readings |
 
 // Item 5 (2026-09-02) — TOWARD. The app-side half of the forward register.
 //
@@ -36,12 +38,9 @@ import Desk
 // written back to any of them.
 //
 // ── NO NEW TIMER, NO POLLING ─────────────────────────────────────────────────
-// Called from `rescheduleResidualRepairDeadline`,
-// which already runs on every somatic signal, every deadline fire and every
-// wake re-anchor. This lane adds no loop, no scheduler job, no second
-// authority. `horizonRefreshMinimumInterval` bounds how often the composition
-// READS DISK — I/O hygiene, not a cadence, and emphatically not a clock she is
-// being measured against.
+// Source invalidations and horizon eligibility/expiry boundaries enter the
+// existing residual deadline. The 15-minute minimum still bounds disk reads;
+// unchanged sources create no periodic rescan.
 //
 // ── WHY THE MINT RIDES A SIGNAL ──────────────────────────────────────────────
 // The rows have to live in the prediction ledger, because that is what
@@ -62,36 +61,8 @@ import Desk
 // body-schema fact, no intrinsic valence and no associations. Her horizon is
 // the only thing it can change.
 
-/// Re-entrancy latch and I/O rate limit for the horizon composition.
-///
-/// It exists for one specific reason: sending the refresh signal re-arms the
-/// residual-repair deadline, which calls `considerHorizonExpectations` again.
-/// Without a latch that is an unbounded loop. Memory-only and session-scoped —
-/// this is a `running` flag, not a store; nothing here is persisted, and a
-/// restart simply refreshes on the first deadline it sees.
-private actor HorizonRefreshGate {
-    static let shared = HorizonRefreshGate()
-
-    private var lastRefreshAt: Date?
-    private var inFlight = false
-
-    /// True exactly once per `minimumInterval`, and never while a refresh is
-    /// already running. The claim stamps the clock up front so a slow disk read
-    /// cannot let a second claim through behind it.
-    func claim(now: Date, minimumInterval: TimeInterval) -> Bool {
-        guard !inFlight else { return false }
-        if let lastRefreshAt, now.timeIntervalSince(lastRefreshAt) < minimumInterval {
-            return false
-        }
-        lastRefreshAt = now
-        inFlight = true
-        return true
-    }
-
-    func release() { inFlight = false }
-
-}
-
+/// The runtime's source state holds the re-entrancy latch and 15-minute I/O
+/// limit. The horizon refresh's own somatic signal cannot dirty its sources.
 extension NativeCognitionRuntime {
 
     // MARK: - Tuning (all in one place)
@@ -131,21 +102,32 @@ extension NativeCognitionRuntime {
     /// Called from `rescheduleResidualRepairDeadline`. Hands off to a
     /// detached task so four disk reads never sit in front of signal ingestion.
     func considerHorizonExpectations() {
-        guard !isFlushedForTermination else { return }
-        Task { [weak self] in
+        guard !isFlushedForTermination, sourceWakes.horizonReady, horizonRefreshTask == nil else { return }
+        if let due = sourceWakes.horizonNextAt, due <= now() { sourceWakes.horizonDirty = true }
+        guard sourceWakes.horizonDirty else { return }
+        if let last = sourceWakes.horizonLastAt, now().timeIntervalSince(last) < Self.horizonRefreshMinimumInterval { return }
+        horizonRefreshTask = Task { [weak self] in
             await self?.refreshHorizonExpectationsIfDue()
+            await self?.finishHorizonRefresh()
         }
+    }
+
+    private func finishHorizonRefresh() async {
+        horizonRefreshTask = nil
+        await rescheduleResidualRepairDeadline()
     }
 
     /// Rate-limited entry point. Public-ish (internal) so a test can drive one
     /// refresh without waiting on a deadline.
     func refreshHorizonExpectationsIfDue() async {
-        guard await HorizonRefreshGate.shared.claim(
-            now: now(),
-            minimumInterval: Self.horizonRefreshMinimumInterval
-        ) else { return }
+        guard !isFlushedForTermination, !Task.isCancelled, !sourceWakes.horizonRunning else { return }
+        if let last = sourceWakes.horizonLastAt, now().timeIntervalSince(last) < Self.horizonRefreshMinimumInterval { return }
+        sourceWakes.horizonRunning = true
+        sourceWakes.horizonLastAt = now()
+        sourceWakes.horizonDirty = false
+        sourceWakes.horizonNextAt = nil
+        defer { sourceWakes.horizonRunning = false }
         await refreshHorizonExpectations()
-        await HorizonRefreshGate.shared.release()
     }
 
     // MARK: - One refresh
@@ -199,6 +181,12 @@ extension NativeCognitionRuntime {
             ],
             persistSynchronously: false
         )
+        // The signal prunes the announced rows, then may settle vanished
+        // sources. Keep one pass through the existing cooldown to feel those.
+        if let after = await organismKernel.exportPersistentState()?.predictionLedger,
+           !OrganismHorizonRegister.settled(in: after).isEmpty {
+            sourceWakes.horizonDirty = true
+        }
     }
 
     /// THE DOCUMENTED READ for the felt-fingerprint builder.
@@ -349,6 +337,12 @@ extension NativeCognitionRuntime {
     /// The only rejections are horizons nobody would feel: further ahead than a
     /// week, or further behind than one.
     private func horizonDue(natural: Date, at now: Date) -> Date? {
+        // A source may enter or leave the existing seven-day window without a
+        // write. Keep those real boundaries, not a fifteen-minute sample.
+        let width = OrganismHorizonRegister.maximumHorizon
+        for boundary in [natural.addingTimeInterval(-width), natural, Self.afterInclusiveBoundary(natural.addingTimeInterval(width))] where boundary > now {
+            sourceWakes.horizonNextAt = min(sourceWakes.horizonNextAt ?? boundary, boundary)
+        }
         guard abs(natural.timeIntervalSince(now)) <= OrganismHorizonRegister.maximumHorizon else {
             return nil
         }
@@ -540,7 +534,8 @@ extension NativeCognitionRuntime {
         // Scoped to THIS install's bridge root: a copy that does not own the
         // machine-wide rendezvous must not wait on another install's jobs.
         let projector = DelegationStatusProjector(
-            configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+            configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
+            dataRoot: dataRoot
         )
         let read = projector.recentJobsWithAvailability(now: now)
         var seen: Set<String> = []

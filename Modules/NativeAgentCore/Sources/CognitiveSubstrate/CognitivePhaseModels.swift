@@ -2,6 +2,8 @@ import Foundation
 import Experiences
 import PersistenceCore
 
+// Blueprint: | `CognitivePhaseModels.swift` | Cognition phase contracts: prepared turn projections, presentation commits, attention, workspace, capsule, seeds and standing-view values |
+
 public protocol CognitiveEventObserving: Sendable {
     func observe(_ event: CognitiveEvent) async
 }
@@ -862,6 +864,8 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
     public var reason: String
     public var prompt: String
     public var surface: String
+    /// Configuration captured at planning time, not the executed route.
+    /// Execution resolves the surface again through checked provider routing.
     public var model: String
     public var provider: String
     public var reasoningEffort: String
@@ -886,10 +890,6 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         reason: String,
         prompt: String,
         surface: String = "cognition_reflection",
-        // 2026-09-13: no model chosen in code. Reflection is a Memory and mind
-        // activity and takes that group's model from the router; an empty value
-        // here means "ask the router", never a literal Anthropic id that a
-        // ChatGPT-only install cannot serve.
         model: String = "",
         provider: String = "",
         reasoningEffort: String = "high",

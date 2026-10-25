@@ -1,22 +1,17 @@
 import Foundation
 import PersistenceCore
 import ToolRegistry
+// Blueprint: | `PeerTurnEffectPolicy.swift` | Peer-origin approval floors read only the declared call class; memory notes retain origin attribution without the former human-turn read-latch exception; ability changes/growth capture use CapabilityLifecycle's common write guard |
 
 /// Peer sessions receive the ordinary full Agent context and tool policy.
 /// What a peer the person has not trusted may do alone is read; every other
 /// call it steers is the person's card, decided by the call's declared class.
 public enum PeerTurnEffectPolicy {
     /// The declared contract, not a name or argument reading: a peer-steered
-    /// call that is not a read needs the person. The other parameters are the
-    /// callers' old shape and decide nothing.
+    /// call that is not a read needs the person.
     public static func requiresPeerApproval(
         _ tool: String,
-        capabilities: [String] = [],
-        externalToolIsEffect: ((String) -> Bool)? = nil,
-        input: [String: JSONValue] = [:],
-        workspaceRoot: URL? = nil,
-        relativeBases: [URL] = [],
-        fullMac: Bool = false
+        input: [String: JSONValue] = [:]
     ) -> Bool {
         // A folded door action is a read here: it re-enters under its own tool and is judged there.
         PermissionLaw.toolClass(tool, input: input) != .read
@@ -49,18 +44,17 @@ public enum PeerTurnEffectPolicy {
 
     /// Is this surface the peer bridge?
     public static func isPeerBridge(surface: String) -> Bool {
-        let name = normalized(surface)
-        return name == "agent-bridge" || name == "agent_bridge"
+        ConversationSurfaceProfile(surface).isAgentBridge
     }
 
     /// Who is asking, when the asker is not the person: an inbound peer turn
-    /// on the bridge, or an ordinary turn that has consumed a peer's words.
+    /// on the bridge, or a continuation carrying that turn's origin.
     /// Nil on every other turn — which is what keeps all of this invisible to
     /// the person's own sessions.
     ///
-    /// `taintSource` is the latched peer description when this turn has read a
-    /// peer's words, nil otherwise. Passed in rather than read here: the taint
-    /// box lives in ChatOrchestration, which sits ABOVE this module.
+    /// `taintSource` describes the untrusted origin steering this run, nil
+    /// otherwise. Passed in rather than read here: the taint
+    /// box lives in ChatTurnRuntime, which sits ABOVE this module.
     ///
     /// `peerName` is the contact name the person gave this peer in Trust →
     /// Connected agents, resolved from the peer directory by the caller. A
@@ -92,7 +86,7 @@ public enum PeerTurnEffectPolicy {
 
     /// The floor's card: whose turn it was, the line of theirs that led
     /// here (Agent, 10-02), and what the call is by its declared class.
-    public static func floorReason(tool: String, input: [String: JSONValue] = [:], capabilities: Set<String> = [],
+    public static func floorReason(tool: String, input: [String: JSONValue] = [:],
                                    requester: String, quote: String) -> String {
         let who = requester.trimmingCharacters(in: .whitespacesAndNewlines)
         let said = quote.isEmpty ? "" : " It said: \"\(quote)\"."
@@ -152,8 +146,7 @@ public enum PeerTurnEffectPolicy {
         tool: String,
         input: [String: JSONValue],
         peer: PeerIdentity,
-        readPeerData: Bool = false,
-        person: String? = nil
+        readPeerData: Bool = false
     ) -> String? {
         let who = peer.display
         let name = normalized(ToolNameAliases.ranTool(tool, input: input))
@@ -173,7 +166,6 @@ public enum PeerTurnEffectPolicy {
                 + "note about it, but a peer cannot speak for the person. Set "
                 + "provenance=\"told\" and provenance_by=\"\(who)\", so the note "
                 + "records what \(who) reported rather than established fact."
-                + (person.map { " What \($0) said is provenance=\"told\", provenance_by=\"\($0)\"." } ?? "")
         }
         let by = string(input["provenance_by"])?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -181,9 +173,6 @@ public enum PeerTurnEffectPolicy {
             return "Set provenance_by=\"\(who)\" — provenance=\"told\" without "
                 + "who told you is the part that makes the note honest."
         }
-        // A turn the person started on his own door: he may be who told her,
-        // even after she read a peer (User, 10-03 hit). Nil on any other turn.
-        if let person, by.lowercased() == person.lowercased() { return nil }
         let accepted = peer.acceptedAttributions
         // Nothing attested: an honest attribution is the most this turn can
         // ask for, so any non-empty name passes rather than blocking her note.

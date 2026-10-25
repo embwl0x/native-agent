@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `SecurityCenter+ReceiptJSON.swift` | `SecurityToolEnvelope`: `toJSONValue` |
 
 extension SecurityToolEnvelope {
     func toJSONValue() -> JSONValue {

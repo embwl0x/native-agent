@@ -7,11 +7,13 @@
 // exactly as `inner_state` does, and the conformance that makes that cast
 // succeed belongs beside the tier it serves.
 
-import ChatOrchestration
+import ChatToolRuntime
 import CognitiveSubstrate
 import Foundation
 import PersistenceCore
 import Studio
+
+// Blueprint: | `NativeCognitionRuntime+StandingViews.swift` | `NativeCognitionRuntime` standing-view bridge: checked hold/release, resolution/retirement outcomes and proposal projections |
 
 /// Item 7 (2026-09-02) — the held tier's seam, on the same wire and for the
 /// same reason: the runtime is the one object that owns the substrate, so the

@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `SlackSocketModeSupport.swift` | `SlackConversationRef` struct; `SlackHandlingCompletion` keeps deferred settings operations within the accepted handler's lifetime, after reply settlement |
 
 struct SlackConversationRef: Sendable, Equatable {
     let id: String
@@ -89,7 +90,8 @@ actor SlackSocketHealth {
     }
 }
 
-/// Settings restarts wait for the inbound handler's reply delivery to settle.
+/// Settings restarts run after reply delivery settles, within the accepted
+/// handler's retained lifetime rather than in detached work.
 actor SlackHandlingCompletion {
     private var operations: [@Sendable () async -> Void] = []
 
@@ -97,13 +99,11 @@ actor SlackHandlingCompletion {
         operations.append(operation)
     }
 
-    func finish() {
+    func finish() async {
         let pending = operations
         operations.removeAll()
         guard !pending.isEmpty else { return }
-        Task.detached {
-            for operation in pending { await operation() }
-        }
+        for operation in pending { await operation() }
     }
 }
 

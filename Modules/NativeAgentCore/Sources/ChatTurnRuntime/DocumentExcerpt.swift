@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `DocumentExcerpt.swift` | `DocumentExcerpt.selected`: query-scored attachment line windows rendered in document order with explicit line ranges |
+
 /// Selective reading for an attachment that does not fit its per-turn
 /// allowance (third conversation pass, item 4).
 ///

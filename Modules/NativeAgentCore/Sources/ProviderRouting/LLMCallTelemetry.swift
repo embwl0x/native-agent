@@ -3,6 +3,7 @@ import NativeAgentCore
 import os
 import PersistenceCore
 import TurnTrace
+// Blueprint: | `LLMCallTelemetry.swift` | `LLMCallTraceRecorder`; successful/failed call receipts with purpose, timing, provider identity and redacted underlying failure detail; memory, digest and probe telemetry retain their own surfaces when routing inherits Chat |
 
 /// One `cache_control` marker observed on an outgoing request body.
 ///
@@ -467,6 +468,8 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
     public struct Receipt: Sendable {
         public var recorded = false
         public var ttftMs: Int?
+        /// What the request asked the provider to read, set before it is sent.
+        public var requestBytes: Int?
         public init() {}
     }
 
@@ -650,6 +653,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             "turnId": .string(turnId),
         ]
         if let ttftMs { payload["ttftMs"] = .int(Int64(ttftMs)) }
+        if let bytes = Self.requestRecorded?.withLock({ $0.requestBytes }) { payload["requestBytes"] = .int(Int64(bytes)) }
         // How the adapter's streamMessages delivered this call; absent on
         // calls that did not come through streamMessages.
         if let streamKind = LLMMessagesStreamKind.current {

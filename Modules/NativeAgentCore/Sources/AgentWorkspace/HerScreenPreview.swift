@@ -2,13 +2,12 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `HerScreenPreview.swift` | shared screen/room text projection |
 
-/// User's window into hers (her-screen Phase 8, 2026-09-24): the glance line
-/// and her home or any room, the same text she receives, read without looking.
-/// Every name resolves the way her workspace resolves it. Nothing here marks
-/// seen, writes a name or remembers a verb (HerScreen.previewing), and no tool
-/// runs: a place that opens with an owner read shows the copy she was last
-/// shown, or says what it would read.
+/// User's window into her shared glance and room renderers. Preview home omits
+/// retained workspace window titles. Names resolve as her workspace resolves
+/// them. Nothing marks seen, writes a name or remembers a verb, and no tool
+/// runs: an owner-read place shows its last copy, or says what it would read.
 package enum AgentWorkspaceScreenPreview {
     public static let didChange = Notification.Name("NativeAgent.herWorldDidChange")
     /// Home, then every place home's PLACES rows show, in order, then the
@@ -26,7 +25,7 @@ package enum AgentWorkspaceScreenPreview {
         "desk/desk_ops.jsonl", "desk/desk_ops_base.json", "workshop/executions", "bots/definitions",
         "bots/shelf-index.json", "bots/run-queue.json", "workflows/approvals/requests.json",
         "memory/memory.sqlite", "memory/memory.sqlite-wal", "memory/profile.json", "swarms/live.json", "swarms/runs.json",
-        "connectors/github/tracking_snapshot.json", "her_screen/last_seen.json", "her_screen/touched.json",
+        "her_screen/last_seen.json", "her_screen/touched.json",
         "abilities",
         // Home's sections and places in the layout's order.
         "ui/layout.json",
@@ -37,9 +36,9 @@ package enum AgentWorkspaceScreenPreview {
         if scope.hasPrefix("bot-") { return nil }
         return await HerScreen.$previewing.withValue(true) {
             let now = Date()
-            async let abilities = AgentWorkspacePorts.current.tools.builtAbilities(dataRoot: dataRoot, now: now)
+            async let parts = AgentWorkspacePorts.parts(for: "", dataRoot: dataRoot)
             let home = await HerScreen.renderGlance(dataRoot: dataRoot, scope: scope.isEmpty ? nil : scope, now: now)
-            return await [home, abilities].compactMap { $0 }.joined(separator: "\n")
+            return await [home, parts].compactMap { $0 }.joined(separator: "\n")
         }
     }
 

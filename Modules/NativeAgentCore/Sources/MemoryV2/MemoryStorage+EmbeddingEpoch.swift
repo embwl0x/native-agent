@@ -2,6 +2,7 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryStorage+EmbeddingEpoch.swift` | `MemoryStorage`: `embeddingCorpusSnapshot`, `embeddingEpochState`; derived action vectors in `memory.sqlite`, keyed by embedding epoch and exact-text SHA-256, outside the canonical corpus |
 
 extension MemoryStorage {
     /// Derived action vectors share memory's database and vector codec, never

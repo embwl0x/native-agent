@@ -1,7 +1,7 @@
 // Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
 
 import Foundation
-import ChatOrchestration
+import AgentWorkspace
 import CognitiveSubstrate
 import Context
 import NativeAgentCore
@@ -10,6 +10,8 @@ import PersistenceCore
 import Desk
 import Experiences
 import ProviderRouting
+
+// Blueprint: | `NativeCognitionRuntime+Pursuit.swift` | `NativeCognitionRuntime` pursuit projection: canonical Desk invalidations and bounded resident intent, without turn-time Desk I/O |
 
 extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
     public func queueTurnCandidates() -> (candidates: [DeskItem]?, refreshPendingAfterWrite: Bool) {
@@ -41,15 +43,24 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
     /// data-root hermeticity; `.desk` would cross-invalidate every runtime.
     func startPursuitObservationIfNeeded() {  // internal for actor extensions (move-only Wave C)
         guard !isFlushedForTermination, pursuitObservationTask == nil else { return }
+        startCognitiveSourceObservations()
+        let sourceObservations = sourceWakes
         let events = EventDeadlinePhysiology.storeAndFileEvents(paths: [
             dataRoot.appendingPathComponent("desk/desk_ops.jsonl"),
+            SwiftNativeDeskStore(dataRoot: dataRoot).basePath,
+            dataRoot.appendingPathComponent("memory/memory.sqlite"),
+            dataRoot.appendingPathComponent("memory/memory.sqlite-wal"),
             dataRoot.appendingPathComponent("workflows/approvals/requests.json"),
             dataRoot.appendingPathComponent("agents/resident-wake.json")
         ])
         pursuitObservationTask = Task { [weak self] in
-            for await _ in events {
-                guard !Task.isCancelled else { return }
-                await self?.pursuitSourceInvalidated()
+            await withTaskCancellationHandler {
+                for await _ in events {
+                    guard !Task.isCancelled else { return }
+                    await self?.pursuitSourceInvalidated()
+                }
+            } onCancel: {
+                sourceObservations.cancelObservations()
             }
         }
         carriedExperienceObservationTask = Task { [weak self, root = dataRoot] in
@@ -99,6 +110,7 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
             return
         }
         pursuitRefreshInFlight = true
+        sourceWakes.pursuitNextAt = nil
         let generation = pursuitProjectionGeneration
         let root = dataRoot
         let task = Task.detached(priority: .utility) { [weak self] in
@@ -124,6 +136,8 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
             return
         }
         if generation == pursuitProjectionGeneration, revision == SwiftNativeDeskStore.currentRevision, let state {
+            sourceWakes.pursuitNextAt = state.items.filter { !$0.status.isTerminal }
+                .compactMap { $0.deferUntil.flatMap(DeskSequencing.parseDeferStamp) }.filter { $0 > now() }.min()
             let before = Dictionary(pursuitCandidates.filter { !$0.status.isTerminal }.map { ($0.handle, $0) },
                 uniquingKeysWith: { first, _ in first })
             let root = dataRoot, at = now()
@@ -132,6 +146,7 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
             }.value
             await applyDeskRuminations(from: state, context: context, revision: revision, generation: generation)
             if generation == pursuitProjectionGeneration, revision == SwiftNativeDeskStore.currentRevision, !isFlushedForTermination {
+                if pursuitCandidates != state.items { sourceWakes.reachDirty = true }
                 pursuitCandidates = state.items
                 pursuitCarriedContext = context
                 pursuitReadRevision = revision
@@ -181,5 +196,6 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
         if needsFollowUp {
             await startPursuitRefresh()
         }
+        await rescheduleResidualRepairDeadline()
     }
 }

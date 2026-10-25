@@ -12,7 +12,7 @@
 // from NativeClient, future vision-decision loops, and tests.
 //
 // Out of scope for v1 (defer to v2): window-by-window capture, multi-display
-// selection, streaming SCStream output. (OCR lives in VisionPerception and
+// selection, streaming SCStream output. (OCR lives in MacControl and
 // runs on the four-verb path; this file still does no text extraction.)
 
 import Foundation
@@ -21,6 +21,7 @@ import ScreenCaptureKit
 import CoreGraphics
 #if canImport(AppKit)
 import AppKit
+// Blueprint: | `ScreenVision.swift` | Screen vision owner; NativeScreenCapture encoding and capture error mapping |
 #endif
 
 // MARK: - Errors

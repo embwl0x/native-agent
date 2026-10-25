@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MacFourVerbs.swift` | `MacFourVerbs` struct |
 
 // MARK: - THE FOUR VERBS — screen · act · go · wait (docs/build_plans/four-verbs.md)
 //
@@ -27,7 +28,7 @@ import PersistenceCore
 //   act    → semantic `act` when AX can name the target, otherwise the existing
 //            hand repertoire aimed at a fused screen region; then a fresh screen
 //   go     → `focus_app` or canonical `open_target`; then screen
-//   wait   → screen, on a bounded loop against an injectable clock
+//   wait   → observer-driven screen reads, at least 0.5 s apart, with timed reads
 //
 // So there is NO new gate, NO new guard, NO new verdict class and NO second
 // resolver here. The honesty and safety layers live BELOW this file and every
@@ -35,9 +36,7 @@ import PersistenceCore
 // the layers below deliberately do not do: RESOLVE A NAME AGAINST THE SCREEN AT
 // THE MOMENT OF ACTING, and SAY THE ANSWER IN WORDS.
 //
-// NO APP-SPECIFIC LOGIC. Not one branch here tests what app it is looking at
-// (feedback_build_the_general_capability). A game is simply a screen whose
-// dominant content types as CANVAS.
+// App-specific routing guidance and destination matching adapt the shared verbs.
 //
 // REDACTION IS NOT RE-IMPLEMENTED HERE, and cannot be bypassed here. Every
 // SCREEN-DERIVED string this file prints comes out of `MacScreenRender` via

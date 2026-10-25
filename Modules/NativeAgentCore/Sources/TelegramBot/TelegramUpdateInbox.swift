@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TelegramUpdateInbox.swift` | `TelegramUpdateInbox` struct; `snapshots`, `ensurePending`, `failedReplyClaims`, `repair`; maintained claim index emits delivery invalidations and can be reconstructed from checked claims without changing phases; recovery exceptions retain a terminal quarantined claim and reason, excluded from automatic replay; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
 
 enum TelegramUpdateClaimPhase: String, Sendable, Equatable, Codable {
     case pending
@@ -13,9 +14,11 @@ enum TelegramUpdateClaimPhase: String, Sendable, Equatable, Codable {
     case sentUnconfirmed = "sent_unconfirmed"
     case failedBeforeAnswer = "failed_before_answer"
     case quarantined
+    case stopped
 }
 
 struct TelegramUpdateClaim: Sendable, Equatable {
+    var lifeID: String? = nil
     let updateId: Int
     let update: TelegramUpdate
     var phase: TelegramUpdateClaimPhase
@@ -27,15 +30,11 @@ struct TelegramUpdateClaim: Sendable, Equatable {
     var noRecoverableAnswer = false
     var failedBeforeAnswer = false
     var quarantineReason: String? = nil
-    let queueAcknowledgementMessageId: Int?
-    /// 2026-09-06: for a queued `/retry`, the message text the retry resolved
-    /// to at queue time. `/retry` reads the last user message from the
-    /// coordinator's in-memory map; after a restart that map is empty, so a
-    /// queued retry replayed from this inbox answered "nothing to retry" and
-    /// settled its claim. Nil for every other update.
-    let resolvedRetryText: String?
-    let resolvedRetryMessage: TelegramMessage?
-    let resolvedSessionId: String?
+    var queueAcknowledgementMessageId: Int?
+    /// A queued retry retains its resolved request and conversation.
+    var resolvedRetryText: String?
+    var resolvedRetryMessage: TelegramMessage?
+    var resolvedSessionId: String?
     let claimedAt: String
     var updatedAt: String
 }
@@ -47,21 +46,18 @@ enum TelegramUpdateInboxError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .malformedClaim(let name):
-            return "Telegram durable inbox claim is malformed: \(name)"
+            return "telegram_claim_malformed: Inbox claim \(name) is malformed. Inspect that file in this bot's update_inbox and reconcile any delivery receipts before repairing it; do not delete it to replay the update."
         case .mismatchedUpdateId(let expected, let actual):
-            return "Telegram durable inbox claim id mismatch: expected \(expected), got \(actual)"
+            return "telegram_claim_mismatch: Inbox claim ID is \(actual), expected \(expected). Reconcile \(expected).json in this bot's update_inbox with its delivery receipts before repairing it; do not replay the update."
         }
     }
 }
 
-/// Telegram-owned durable admission state. A fetched update is written here
-/// before its upstream offset advances. Pending work can therefore survive a
-/// crash after acknowledgement; a prior-run `processing` claim is quarantined
-/// as outcome-unknown rather than replaying possibly-effecting work. Queued
-/// claims also retain their acknowledgement message id so restart recovery
-/// reclaims the original controls instead of creating a shadow queue card.
+/// Claims precede the upstream offset and resume only within their life.
+/// Processing uncertainty never replays effects; queued claims retain their controls.
 public struct TelegramUpdateInbox: Sendable {
     let directory: URL
+    private let dataRoot: URL
     private let persistence = SwiftNativePersistenceCore()
 
     enum ClaimReadKind: Sendable, Equatable, Hashable {
@@ -72,7 +68,8 @@ public struct TelegramUpdateInbox: Sendable {
 
     @TaskLocal static var claimReadObserver: (@Sendable (ClaimReadKind) -> Void)?
 
-    init(offsetURL: URL) {
+    init(offsetURL: URL, dataRoot: URL) {
+        self.dataRoot = dataRoot
         let parent = offsetURL.deletingLastPathComponent()
         if parent.lastPathComponent == "telegram" {
             self.directory = parent.appendingPathComponent("update_inbox", isDirectory: true)
@@ -84,7 +81,7 @@ public struct TelegramUpdateInbox: Sendable {
         }
     }
 
-    private init(directory: URL) { self.directory = directory }
+    private init(directory: URL, dataRoot: URL) { self.directory = directory; self.dataRoot = dataRoot }
 
     /// Reconstruct only the derived index; claims retain every phase and delivery uncertainty.
     public static func repair(dataRoot: URL, inbox: String) async throws -> JSONValue {
@@ -96,7 +93,7 @@ public struct TelegramUpdateInbox: Sendable {
             throw ToolFailureError("Pass the existing Telegram inbox path named by the failure.",
                                    argumentPath: "inbox", effects: .none)
         }
-        let store = Self(directory: directory)
+        let store = Self(directory: directory, dataRoot: dataRoot)
         do {
             return try await store.persistence.withFileLock(store.indexPath) {
                 let claims = try await store.snapshots()
@@ -146,7 +143,7 @@ public struct TelegramUpdateInbox: Sendable {
         }
         var claims: [(path: URL, at: String)] = []
         for directory in directories where FileManager.default.fileExists(atPath: directory.path) {
-            let inbox = Self(directory: directory)
+            let inbox = Self(directory: directory, dataRoot: dataRoot)
             claims += try await inbox.persistence.withFileLock(inbox.indexPath) {
                 try await inbox.loadIndex().entries.values.filter { $0.phase == .failedBeforeAnswer }
                     .map {
@@ -199,7 +196,7 @@ public struct TelegramUpdateInbox: Sendable {
             var saved = delivery
             saved.outcomeUnknown = priorVerdict != nil
             let now = _tgNowString()
-            var claim = TelegramUpdateClaim(updateId: updateId,
+            var claim = TelegramUpdateClaim(lifeID: try DataRootLife.current(in: dataRoot), updateId: updateId,
                 update: TelegramUpdate(updateId: updateId, message: TelegramMessage(messageId: updateId,
                     chatId: destination.chatId, messageThreadId: destination.threadId,
                     fromUserId: fromUserId)),
@@ -225,6 +222,7 @@ public struct TelegramUpdateInbox: Sendable {
             }
             let now = _tgNowString()
             let claim = TelegramUpdateClaim(
+                lifeID: try DataRootLife.current(in: dataRoot),
                 updateId: update.updateId,
                 update: update,
                 phase: .pending,
@@ -241,11 +239,7 @@ public struct TelegramUpdateInbox: Sendable {
         }
     }
 
-    /// 2026-09-06: `resolvedRetryText` rides the phase write. A queued
-    /// `/retry` used to become `.queued` first and pin its text in a second
-    /// write, so a crash in between left exactly the claim recovery cannot
-    /// resolve — the bug the pin was added to fix. Nil keeps whatever the
-    /// claim already carries.
+    /// Phase and resolved retry input commit together; nil preserves retained input.
     @discardableResult
     func transition(
         updateId: Int,
@@ -268,27 +262,16 @@ public struct TelegramUpdateInbox: Sendable {
                     throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
                 }
             }
-            let next = TelegramUpdateClaim(
-                updateId: current.updateId,
-                update: current.update,
-                phase: phase,
-                assistantDelivery: current.assistantDelivery,
-                assistantRunId: assistantRunId ?? current.assistantRunId,
-                assistantSessionId: assistantSessionId ?? current.assistantSessionId,
-                assistantOriginRunId: current.assistantOriginRunId,
-                settledAssistantRuns: current.settledAssistantRuns,
-                noRecoverableAnswer: current.noRecoverableAnswer,
-                failedBeforeAnswer: current.failedBeforeAnswer,
-                quarantineReason: quarantineReason ?? current.quarantineReason,
-                queueAcknowledgementMessageId: phase == .queued
-                    ? current.queueAcknowledgementMessageId
-                    : nil,
-                resolvedRetryText: resolvedRetryText ?? current.resolvedRetryText,
-                resolvedRetryMessage: resolvedRetryMessage ?? current.resolvedRetryMessage,
-                resolvedSessionId: resolvedSessionId ?? current.resolvedSessionId,
-                claimedAt: current.claimedAt,
-                updatedAt: _tgNowString()
-            )
+            var next = current
+            next.phase = phase
+            next.assistantRunId = assistantRunId ?? current.assistantRunId
+            next.assistantSessionId = assistantSessionId ?? current.assistantSessionId
+            next.quarantineReason = quarantineReason ?? current.quarantineReason
+            if phase != .queued { next.queueAcknowledgementMessageId = nil }
+            next.resolvedRetryText = resolvedRetryText ?? current.resolvedRetryText
+            next.resolvedRetryMessage = resolvedRetryMessage ?? current.resolvedRetryMessage
+            next.resolvedSessionId = resolvedSessionId ?? current.resolvedSessionId
+            next.updatedAt = _tgNowString()
             try await write(next, to: path)
             try await upsertIndex(next)
             return next
@@ -304,25 +287,9 @@ public struct TelegramUpdateInbox: Sendable {
         return try await withClaimMutationLock(path) {
             let current = try decodeClaim(at: path, kind: .mutation)
             guard current.phase == .queued else { return current }
-            let next = TelegramUpdateClaim(
-                updateId: current.updateId,
-                update: current.update,
-                phase: current.phase,
-                assistantDelivery: current.assistantDelivery,
-                assistantRunId: current.assistantRunId,
-                assistantSessionId: current.assistantSessionId,
-                assistantOriginRunId: current.assistantOriginRunId,
-                settledAssistantRuns: current.settledAssistantRuns,
-                noRecoverableAnswer: current.noRecoverableAnswer,
-                failedBeforeAnswer: current.failedBeforeAnswer,
-                quarantineReason: current.quarantineReason,
-                queueAcknowledgementMessageId: messageId,
-                resolvedRetryText: current.resolvedRetryText,
-                resolvedRetryMessage: current.resolvedRetryMessage,
-                resolvedSessionId: current.resolvedSessionId,
-                claimedAt: current.claimedAt,
-                updatedAt: _tgNowString()
-            )
+            var next = current
+            next.queueAcknowledgementMessageId = messageId
+            next.updatedAt = _tgNowString()
             try await write(next, to: path)
             try await upsertIndex(next)
             return next
@@ -411,7 +378,7 @@ public struct TelegramUpdateInbox: Sendable {
         where entry.phase == .pending || entry.phase == .processing || entry.phase == .queued
             || entry.phase == .awaitingSpeechPermission || entry.phase == .outcomeUnknown {
             let claim = try decodeClaim(at: claimPath(updateId: entry.updateId), kind: .recovery)
-            recovered.append(claim)
+            if claim.phase != .stopped { recovered.append(claim) }
             if claim.phase != entry.phase {
                 index.entries[entry.updateId] = InboxClaimIndex.Entry(
                     updateId: claim.updateId,
@@ -540,10 +507,13 @@ public struct TelegramUpdateInbox: Sendable {
                 settledRuns[run] = status
             }
         }
+        let lifeID = Self.optionalString(object["lifeID"])
+        let stopped = try !DataRootLife.isCurrent(lifeID, in: dataRoot) && (phase != .completed || delivery?.isDelivered == false)
         return TelegramUpdateClaim(
+            lifeID: lifeID,
             updateId: updateId,
             update: update,
-            phase: phase,
+            phase: stopped ? .stopped : phase,
             assistantDelivery: delivery,
             assistantRunId: Self.optionalString(object["assistantRunId"]),
             assistantSessionId: Self.optionalString(object["assistantSessionId"]),
@@ -551,7 +521,7 @@ public struct TelegramUpdateInbox: Sendable {
             settledAssistantRuns: settledRuns,
             noRecoverableAnswer: object["noRecoverableAnswer"] == .bool(true),
             failedBeforeAnswer: object["failedBeforeAnswer"] == .bool(true),
-            quarantineReason: Self.optionalString(object["quarantineReason"]),
+            quarantineReason: stopped ? DataRootLife.stoppedReason : Self.optionalString(object["quarantineReason"]),
             queueAcknowledgementMessageId: Self.optionalInt(
                 object["queueAcknowledgementMessageId"]
             ),
@@ -574,6 +544,7 @@ public struct TelegramUpdateInbox: Sendable {
         } ?? .null
         let value: JSONValue = .object([
             "schemaVersion": .int(1),
+            "lifeID": claim.lifeID.map(JSONValue.string) ?? .null,
             "updateId": .int(Int64(claim.updateId)),
             "phase": .string(claim.phase.rawValue),
             "claimedAt": .string(claim.claimedAt),

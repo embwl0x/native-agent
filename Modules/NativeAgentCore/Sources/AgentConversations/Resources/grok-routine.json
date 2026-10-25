@@ -1,0 +1,46 @@
+{
+  "mainChat": "Grok Bot",
+  "routines": "Routines",
+  "list": { "roles": ["AXList"], "subrole": "AXContentList" },
+  "pause": { "roles": ["AXCheckBox"], "subrole": "AXSwitch", "label": "Pause" },
+  "navigation": [
+    {
+      "name": "Details",
+      "scope": "window",
+      "control": { "roles": ["AXButton", "AXRadioButton", "AXTab"], "label": "Details" },
+      "action": "AXPress",
+      "alreadyOpen": { "roles": ["AXButton"], "label": "Close details" },
+      "dismissal": {
+        "control": { "roles": ["AXButton"], "label": "Close details" },
+        "action": "AXPress",
+        "ifPresent": false
+      }
+    },
+    {
+      "name": "Routines row menu",
+      "scope": "routineRow",
+      "control": { "roles": ["AXGroup"], "subrole": "AXApplicationGroup" },
+      "action": "AXShowMenu",
+      "dismissal": {
+        "control": { "roles": ["AXMenu"] },
+        "action": "AXCancel",
+        "ifPresent": true
+      }
+    },
+    {
+      "name": "Webhook",
+      "scope": "menu",
+      "control": { "roles": ["AXMenuItem"], "label": "Webhook" },
+      "action": "AXPress",
+      "dismissal": {
+        "control": { "roles": ["AXButton"], "label": "Close" },
+        "action": "AXPress",
+        "ifPresent": false
+      }
+    }
+  ],
+  "webhookURL": "Webhook URL",
+  "webhookKey": "Webhook key",
+  "copyURL": "Copy",
+  "copyKey": "Copy"
+}

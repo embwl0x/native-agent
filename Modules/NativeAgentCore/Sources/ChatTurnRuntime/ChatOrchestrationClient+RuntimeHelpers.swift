@@ -4,15 +4,13 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
+// Blueprint: | `ChatOrchestrationClient+RuntimeHelpers.swift` | `SwiftNativeChatOrchestrationClient`: `contextFingerprint`, `iso8601` |
 
 extension SwiftNativeChatOrchestrationClient {
     nonisolated static func contextFingerprint(recalledIds: [String]) -> String? {

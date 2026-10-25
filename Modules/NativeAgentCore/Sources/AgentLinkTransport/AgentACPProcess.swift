@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import NativeAgentCore
+// Blueprint: | `AgentACPProcess.swift` | `AgentACPProcess` approved spawn, process-group termination and reap |
 
 /// ACP owns and reaps its children directly: Foundation's termination observer
 /// must not reap the group leader before descendants have been signaled.

@@ -4,6 +4,8 @@ import os
 import PersistenceCore
 import TurnTrace
 
+// Blueprint: | `RunawayOutputDetector.swift` | `RunawayOutputDetector`: streamed tool/prose boundaries, complete-call retention and read/action classification through parser/registry owners |
+
 /// Correctness boundaries retain complete calls before a repeated action or
 /// fabricated result. Text after a boundary is withheld; the turn continues
 /// with the retained calls and the boundary reason.

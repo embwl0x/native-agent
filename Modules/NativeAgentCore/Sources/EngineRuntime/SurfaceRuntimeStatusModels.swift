@@ -1,26 +1,20 @@
 import Foundation
 import Browser
+// Blueprint: | `SurfaceRuntimeStatusModels.swift` | Approval-backed notification pending status and browser status models; no unwritten notification receipt or inferred authorization fields; browser status exposes capture paths, with no unused profile path |
 
 public struct NotificationRuntimeStatus: Codable, Hashable {
     public var status: String
-    public var authorization: String?
     public var pendingApprovals: Int?
-    public var receiptCount: Int?
-    public var latestReceipt: NativeActionReceipt?
     public var createdAt: String?
-    public init(status: String, authorization: String? = nil, pendingApprovals: Int? = nil, receiptCount: Int? = nil, latestReceipt: NativeActionReceipt? = nil, createdAt: String? = nil) {
+    public init(status: String, pendingApprovals: Int? = nil, createdAt: String? = nil) {
         self.status = status
-        self.authorization = authorization
         self.pendingApprovals = pendingApprovals
-        self.receiptCount = receiptCount
-        self.latestReceipt = latestReceipt
         self.createdAt = createdAt
     }
 }
 
 public struct BrowserRuntimeStatus: Codable, Hashable {
     public var status: String
-    public var profilePath: String?
     public var sourcePath: String?
     public var screenshotPath: String?
     public var approvedDomains: [String]?
@@ -29,9 +23,8 @@ public struct BrowserRuntimeStatus: Codable, Hashable {
     public var receiptCount: Int?
     public var latestReceipt: BrowserRun?
     public var createdAt: String?
-    public init(status: String, profilePath: String? = nil, sourcePath: String? = nil, screenshotPath: String? = nil, approvedDomains: [String]? = nil, domainPolicy: String? = nil, activeRuns: [BrowserRun]? = nil, receiptCount: Int? = nil, latestReceipt: BrowserRun? = nil, createdAt: String? = nil) {
+    public init(status: String, sourcePath: String? = nil, screenshotPath: String? = nil, approvedDomains: [String]? = nil, domainPolicy: String? = nil, activeRuns: [BrowserRun]? = nil, receiptCount: Int? = nil, latestReceipt: BrowserRun? = nil, createdAt: String? = nil) {
         self.status = status
-        self.profilePath = profilePath
         self.sourcePath = sourcePath
         self.screenshotPath = screenshotPath
         self.approvedDomains = approvedDomains

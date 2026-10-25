@@ -23,6 +23,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `CognitiveSubstrate+AppraisalConcerns.swift` | `CognitiveSubstrate` concern appraisal: lived concern matching, relational provenance, semantic reaction consumption and open completions |
+
 extension CognitiveSubstrate {
 
     // MARK: - Model

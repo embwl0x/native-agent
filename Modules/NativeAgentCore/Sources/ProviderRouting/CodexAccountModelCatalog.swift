@@ -1,6 +1,8 @@
 import NativeAgentShared
 import Foundation
 import PersistenceCore
+import Experiences
+// Blueprint: | `CodexAccountModelCatalog.swift` | `CodexAccountModelCatalog` enum; `load`, `signedCacheLists`; one decoded catalog for account matching and separate Codex/OAuth projections, invalidated by file attributes with auth identity checked on selection; a cache read fault owes repair under `codex.model_catalog:<file path>` with the file as owner; a later successful read settles it |
 
 /// Reads the signed, account-scoped Codex model catalog instead of advertising
 /// preview models to users whose ChatGPT/Codex account cannot select them.
@@ -8,7 +10,8 @@ public enum CodexAccountModelCatalog {
     public static func providerModels(
         providerID: String,
         cacheURL: URL? = nil,
-        useDefaultCacheWhenNil: Bool = true
+        useDefaultCacheWhenNil: Bool = true,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [ProviderModelInfo] {
         guard isAccountBackedProvider(providerID) else {
             return []
@@ -20,7 +23,8 @@ public enum CodexAccountModelCatalog {
         return load(
             providerID: providerID,
             cacheURL: cacheURL,
-            useDefaultCacheWhenNil: useDefaultCacheWhenNil
+            useDefaultCacheWhenNil: useDefaultCacheWhenNil,
+            dataRoot: dataRoot
         ).map {
             ProviderModelInfo(
                 id: $0.id,
@@ -70,27 +74,48 @@ public enum CodexAccountModelCatalog {
 
     /// Account matching and both route projections share this decode. File
     /// replacement invalidates it; auth identity is checked on every selection.
-    private static func readCache(at url: URL) -> Cache? {
+    private static func readCache(at url: URL, dataRoot: URL) -> Cache? {
         let url = url.resolvingSymlinksInPath()
         cacheLock.lock()
         defer { cacheLock.unlock() }
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+        var attributes: [FileAttributeKey: Any] = [:]
+        var cache: Cache?
+        var failure: Error?
+        do {
+            attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            if let entry = decodedByPath[url.path], NSDictionary(dictionary: entry.stamp).isEqual(to: attributes) {
+                return entry.cache
+            }
+            cache = try JSONDecoder().decode(Cache.self, from: Data(contentsOf: url))
+        } catch CocoaError.fileReadNoSuchFile {
             decodedByPath.removeValue(forKey: url.path)
             return nil
+        } catch {
+            failure = error
         }
-        if let entry = decodedByPath[url.path], NSDictionary(dictionary: entry.stamp).isEqual(to: attributes) {
+        // An attribute-read fault has no stamp; retain it until attributes become readable.
+        if attributes.isEmpty, let entry = decodedByPath[url.path], entry.stamp.isEmpty {
             return entry.cache
         }
-        let cache = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Cache.self, from: $0) }
-        guard let after = try? FileManager.default.attributesOfItem(atPath: url.path),
-              NSDictionary(dictionary: attributes).isEqual(to: after) else {
-            decodedByPath.removeValue(forKey: url.path)
-            return nil
+        if !attributes.isEmpty {
+            guard let after = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  NSDictionary(dictionary: attributes).isEqual(to: after) else {
+                decodedByPath.removeValue(forKey: url.path)
+                return nil
+            }
         }
         if decodedByPath[url.path] == nil, decodedByPath.count >= 64 {
             decodedByPath.remove(at: decodedByPath.startIndex)
         }
         decodedByPath[url.path] = (attributes, cache)
+        if let failure {
+            RepairOwed.owe(dataRoot, id: "codex-model-catalog:" + UUID().uuidString,
+                           kind: .act, operation: "codex.model_catalog:" + url.path, owner: url.path,
+                           words: "\(url.path) could not be read (\(failure)); the shipped model rows are offered until the Codex CLI rewrites it")
+        } else {
+            RepairOwed.settle(dataRoot, operation: "codex.model_catalog:" + url.path,
+                              evidence: .init(source: "providers", id: url.path))
+        }
         return cache
     }
 
@@ -128,10 +153,11 @@ public enum CodexAccountModelCatalog {
     public static func load(
         providerID: String = "codex",
         cacheURL: URL? = nil,
-        useDefaultCacheWhenNil: Bool = true
+        useDefaultCacheWhenNil: Bool = true,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [Model] {
         let url = cacheURL ?? (useDefaultCacheWhenNil ? cacheCandidate() : nil)
-        return models(providerID: providerID, cache: url.flatMap { readCache(at: $0) })
+        return models(providerID: providerID, cache: url.flatMap { readCache(at: $0, dataRoot: dataRoot) })
     }
 
     private static func models(providerID: String, cache: Cache?) -> [Model] {
@@ -180,8 +206,8 @@ public enum CodexAccountModelCatalog {
 
     /// 2026-09-22: `load` always carries every fallback row, so only the signed
     /// cache itself says this account can run a model. No cache = cannot.
-    public static func signedCacheLists(_ modelID: String, providerID: String, cacheURL: URL?) -> Bool {
-        guard let cacheURL, let cache = readCache(at: cacheURL) else { return false }
+    public static func signedCacheLists(_ modelID: String, providerID: String, cacheURL: URL?, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> Bool {
+        guard let cacheURL, let cache = readCache(at: cacheURL, dataRoot: dataRoot) else { return false }
         let directOAuth = providerID.trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() == "openai_oauth_direct"
         return cache.models.contains {
@@ -233,14 +259,12 @@ public enum CodexAccountModelCatalog {
         let (authURL, canonical) = authPath(dataRoot: dataRoot, environment: environment)
         let sibling = authURL.deletingLastPathComponent().appendingPathComponent("models_cache.json")
         let url = FileManager.default.fileExists(atPath: sibling.path) || !canonical ? sibling : cacheCandidate(environment: environment)
-        return modelCatalogFault(at: url, read: readCache(at: url) != nil, owner: "this ChatGPT account")
+        return modelCatalogFault(at: url, read: readCache(at: url, dataRoot: dataRoot) != nil, owner: "this ChatGPT account")
     }
 
     private static func authPath(dataRoot: URL, environment: [String: String]) -> (url: URL, canonical: Bool) {
         let canonical = dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
-        return (canonical
-            ? OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot, environment: environment)
-            : OpenAIOAuthDirectAdapter.boundRootReadAuthPath(dataRoot: dataRoot), canonical)
+        return (OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot, environment: environment), canonical)
     }
 
     private static func chatGPTOAuthCache(
@@ -251,7 +275,7 @@ public enum CodexAccountModelCatalog {
         if !usesCanonicalBody {
             let sibling = authURL.deletingLastPathComponent()
                 .appendingPathComponent("models_cache.json")
-            guard let cache = readCache(at: sibling), cacheMatchesAccount(cache, authURL: authURL) else { return nil }
+            guard let cache = readCache(at: sibling, dataRoot: dataRoot), cacheMatchesAccount(cache, authURL: authURL) else { return nil }
             return (sibling, cache)
         }
         return matchingCache(
@@ -262,35 +286,40 @@ public enum CodexAccountModelCatalog {
 
     public static func matchingCacheCandidate(
         oauthAuthURL: URL,
-        fallbackCacheURL: URL
+        fallbackCacheURL: URL,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> URL? {
-        matchingCache(oauthAuthURL: oauthAuthURL, fallbackCacheURL: fallbackCacheURL)?.url
+        matchingCache(oauthAuthURL: oauthAuthURL, fallbackCacheURL: fallbackCacheURL, dataRoot: dataRoot)?.url
     }
 
     static func matchingModels(
         providerID: String,
         oauthAuthURL: URL,
-        fallbackCacheURL: URL
+        fallbackCacheURL: URL,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [Model] {
         models(providerID: providerID, cache: matchingCache(
-            oauthAuthURL: oauthAuthURL, fallbackCacheURL: fallbackCacheURL
+            oauthAuthURL: oauthAuthURL, fallbackCacheURL: fallbackCacheURL, dataRoot: dataRoot
         )?.cache)
     }
 
     private static func matchingCache(
         oauthAuthURL: URL,
-        fallbackCacheURL: URL
+        fallbackCacheURL: URL,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> (url: URL, cache: Cache)? {
         let sibling = oauthAuthURL.deletingLastPathComponent()
             .appendingPathComponent("models_cache.json")
-        if let cache = readCache(at: sibling), cacheMatchesAccount(cache, authURL: oauthAuthURL) {
+        if let cache = readCache(at: sibling, dataRoot: dataRoot), cacheMatchesAccount(cache, authURL: oauthAuthURL) {
             return (sibling, cache)
         }
-        guard let cache = readCache(at: fallbackCacheURL), cacheMatchesAccount(cache, authURL: oauthAuthURL),
+        guard let cache = readCache(at: fallbackCacheURL, dataRoot: dataRoot), cacheMatchesAccount(cache, authURL: oauthAuthURL),
               let oauthAccount = persistedAccountID(at: oauthAuthURL),
               let cacheAccount = persistedAccountID(
-                at: fallbackCacheURL.deletingLastPathComponent()
-                    .appendingPathComponent("auth.json")
+                at: OpenAIOAuthDirectAdapter.preferredAuthPath(
+                    environment: ["CODEX_HOME": fallbackCacheURL.deletingLastPathComponent().path],
+                    source: .commandCLI
+                )
               ),
               oauthAccount == cacheAccount else {
             return nil

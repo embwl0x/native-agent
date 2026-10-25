@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+// Blueprint: | `NativeAgentMCPWire.swift` | MCP negotiation, parsing, caller-supplied request identity and reply projection |
 
 /// Stateless MCP transport projection only. Chat admission, context and receipts
 /// stay with the canonical bridge and chat owners.
@@ -146,7 +147,7 @@ enum NativeAgentMCPWire {
                         case "completed":
                             result["status"] = "answered"
                             result["detail"] = more ? "\(agent) answered. Follow read_with for the rest of the reply." : "\(agent) answered."
-                        case "failed", "canceled":
+                        case "failed", "canceled", "stopped":
                             result["status"] = state
                             result["detail"] = receipt["detail"] ?? "The turn did not finish. Do not resend automatically."
                             failed = true

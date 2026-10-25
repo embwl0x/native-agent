@@ -1,6 +1,6 @@
-import FeedPolicy
 import Foundation
 import PersistenceCore
+// Blueprint: | `TaskLedger.swift` | `SwiftNativeTaskLedger` owns the orchestration event feed and compaction base; the CLI and wrapper use `PersistenceCore.defaultDataRoot()` unless `--data-root` is explicit |
 
 // MARK: - Cross-agent task ledger (U6 orchestration polish, 2026-06-11)
 //
@@ -330,6 +330,9 @@ public struct TaskLedgerTaskDeleted: Error, LocalizedError, Sendable {
 /// Append-under-flock task-ledger store. Stateless — all state lives on disk.
 /// The events feed and compaction base share the events feed's flock,
 /// so replay and compaction can never race an append.
+/// Owns task_ledger.jsonl and its versioned compaction base.
+/// Local backup/export and phone sync exclude orchestration/; off-disk includes
+/// it; PrivacyMap lists the tree.
 public struct SwiftNativeTaskLedger: Sendable {
     public static let logLabel = "TaskLedger"
     /// The feed never exceeds this many lines: crossing it triggers the

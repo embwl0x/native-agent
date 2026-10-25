@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TrustedRemoteEffectNodes.swift` | Reads operator-provisioned trusted node JSON and returns SSH execution receipts to the caller; unused provisioning APIs and unread receipt-file writes are retired |
 
 public struct TrustedRemoteEffectNode: Codable, Identifiable, Hashable, Sendable {
     public let id: String
@@ -70,13 +71,13 @@ public enum TrustedRemoteEffectError: Error, LocalizedError, Equatable, Sendable
 
     public var errorDescription: String? {
         switch self {
-        case .corruptStore: "Trusted remote node configuration is corrupt; execution is disabled until it is repaired."
-        case .invalidNode(let reason): "Invalid trusted remote node: \(reason)"
-        case .unknownNode(let id): "Unknown trusted remote node: \(id)"
-        case .disabledNode(let name): "Trusted remote node is disabled: \(name)"
-        case .executableDenied(let value): "Remote executable is not allowlisted: \(value)"
-        case .invalidArgument(let reason): "Invalid remote argument: \(reason)"
-        case .transport(let reason): "Remote execution failed: \(reason)"
+        case .corruptStore: "remote_node_store_corrupt: Execution is disabled. Repair mac_control/trusted_remote_nodes.json under the app data root, preserving the original bytes; do not replace it with an empty list."
+        case .invalidNode(let reason): "invalid_remote_node: \(reason). Correct this field in mac_control/trusted_remote_nodes.json before execution."
+        case .unknownNode(let id): "remote_node_not_found: \(id). Use app {action:\"node.list\"} to select a configured node."
+        case .disabledNode(let name): "remote_node_disabled: \(name). The owner must enable this node's enabled field in mac_control/trusted_remote_nodes.json before execution."
+        case .executableDenied(let value): "remote_executable_denied: \(value). Choose an allowed executable from app {action:\"node.list\"}; only the owner may expand allowedExecutables in mac_control/trusted_remote_nodes.json."
+        case .invalidArgument(let reason): "invalid_remote_argument: \(reason). Correct the reported argument in node.run before execution."
+        case .transport(let reason): "remote_transport_failed: \(reason). Inspect the remote command's effects before another execution; correct the reported SSH connection or authentication cause in the node's host, port, user or pinned host key."
         }
     }
 }
@@ -84,44 +85,19 @@ public enum TrustedRemoteEffectError: Error, LocalizedError, Equatable, Sendable
 /// A narrow MacControl adapter. It owns no remote mind, memory, scheduler, or
 /// tool catalog. SSH identity is pinned per invocation in a temporary
 /// known_hosts file and the existing local SSH agent/keychain supplies auth.
+/// Node JSON is operator-provisioned; execution returns its receipt without
+/// writing a second, unread receipt store.
 public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
     private let root: URL
-    private let persistence: SwiftNativePersistenceCore
 
-    public init(root: URL, persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()) {
+    public init(root: URL) {
         self.root = root
-        self.persistence = persistence
     }
 
     private var nodesPath: URL { root.appendingPathComponent("mac_control/trusted_remote_nodes.json") }
-    private var receiptsPath: URL { root.appendingPathComponent("mac_control/remote_effect_receipts.jsonl") }
 
     public func list() async throws -> [TrustedRemoteEffectNode] {
         try loadStrict()
-    }
-
-    public func upsert(_ node: TrustedRemoteEffectNode) async throws -> TrustedRemoteEffectNode {
-        var normalized = try validate(node)
-        normalized.updatedAt = ISO8601DateFormatter().string(from: Date())
-        let captured = normalized
-        return try await persistence.withFileLock(nodesPath) {
-            var rows = try self.loadStrict()
-            if let index = rows.firstIndex(where: { $0.id == captured.id }) {
-                rows[index] = captured
-            } else {
-                rows.append(captured)
-            }
-            try self.write(rows)
-            return captured
-        }
-    }
-
-    public func remove(id: String) async throws {
-        try await persistence.withFileLock(nodesPath) {
-            var rows = try self.loadStrict()
-            rows.removeAll { $0.id == id }
-            try self.write(rows)
-        }
     }
 
     public func execute(
@@ -153,7 +129,7 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
             command: command,
             timeoutSeconds: max(1, min(timeoutSeconds, 300))
         )
-        let receipt = TrustedRemoteEffectReceipt(
+        return TrustedRemoteEffectReceipt(
             id: UUID().uuidString.lowercased(),
             nodeId: node.id,
             nodeName: node.name,
@@ -167,18 +143,6 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
                 ? (result.stderr.isEmpty ? "Timed out." : "\nTimed out.") : "")),
             hostKeyFingerprint: node.hostKeyFingerprint ?? "invalid"
         )
-        let data = try JSONEncoder().encode(receipt)
-        let value = try JSONValue.parse(data)
-        try await appendJSONLCapped(
-            value,
-            to: receiptsPath,
-            using: persistence,
-            maxLines: 500,
-            logLabel: "trusted-remote-effects",
-            maxBytes: 2_000_000,
-            trimToBytes: 1_500_000
-        )
-        return receipt
     }
 
     private func loadStrict() throws -> [TrustedRemoteEffectNode] {
@@ -190,12 +154,6 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
         } catch {
             throw TrustedRemoteEffectError.corruptStore
         }
-    }
-
-    private func write(_ rows: [TrustedRemoteEffectNode]) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(rows), to: nodesPath)
     }
 
     private func validate(_ node: TrustedRemoteEffectNode) throws -> TrustedRemoteEffectNode {

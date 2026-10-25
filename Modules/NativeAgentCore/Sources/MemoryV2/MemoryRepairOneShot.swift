@@ -1,65 +1,25 @@
-// U3 wave-1 item 3 (2026-06-10): one-shot, APPROVAL-GATED memory repairs.
-//
-// Two daemon-era data-quality wounds in the live store:
-//   (a) 5 rows in <dataRoot>/memory/memory.sqlite carry the old 200-char
-//       hard cap (content length 199/200, created 2026-05-16/17) — the text
-//       ends mid-sentence.
-//   (b) a legacy <dataRoot>/memory/*/notes.jsonl file can contain exact-
-//       duplicate test residue from old parity probes.
-//
-// HARD CONSTRAINT (u3-memory-quality plan): NOTHING mutates the live store
-// without explicit approval — except the inventory archive below (10-10): the
-// rows the retired skill-pointer and Workshop-execution lanes wrote were never
-// memories, and archiving
-// keeps every row and mints no tombstone, so it runs once with no card.
-// Otherwise this file stages ONE inbox approval card per
-// repair (action `memory.repair`, mirroring the rem.proposal stager /
-// resolveApproval executor shape) and owns the apply-on-approve executors
-// applyResolvedMemoryRepair dispatches to. Every apply path
-// backs up the touched store FIRST and goes through the store's own write
-// path (MemoryStorage.updateMemory — UserMD/Spotlight/KG hooks all fire).
-//
-// Staging is idempotent: a stamp file under <dataRoot>/memory/repairs/
-// plus a pending-approval scan (the REM stager's crash-retry shape) prevent
-// double-staging. `canceled` clears the stamp so the next pass re-stages;
-// `denied` keeps it — a refused repair is never re-proposed. A scan that
-// finds nothing left to repair writes `<kind>.done.json` beside the stamp,
-// and later launches stop there instead of re-reading every notes file.
+// Canonical inventory retirement and execution of previously approved
+// truncated-row repairs. Legacy notes.jsonl staging, rewriting and stamps
+// are retired; existing notes and backup files are left on disk.
 
 import Foundation
 import ApprovalInbox
-import TrustCenter
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryRepairOneShot.swift` | `archiveInventoryRows` and approved canonical truncated-row execution with safety snapshots; legacy notes staging, scanning, purge, stamps and outcome files are retired without touching existing files |
 
-/// App-owned card delivery; repair policy and persistence remain in MemoryV2.
-public protocol MemoryRepairPresentationPort: Sendable {
-    func ensureInboxCard(
-        dataRoot: URL, approvalId: String, title: String,
-        summary: String, detail: String, relatedPath: String
-    ) async throws
-}
-
+/// Inventory completion and pre-repair SQLite snapshots are locally backed
+/// up/exported and listed under memory in PrivacyMap, never phone-synced.
+/// Off-disk backup excludes memory/backups.
 public enum MemoryRepairOneShot {
 
     public static let action = "memory.repair"
     static let truncatedRowsKind = "memory.repair.truncated_rows"
-    static let legacyNoteDupsKind = "memory.repair.legacy_note_dups"
     static let inventoryRowsKind = "memory.repair.inventory_rows"
     /// Sources of the retired inventory lanes (10-10): skill pointers are found
-    /// through `find` and `skill.read`, executions live in Desk and Workshop
+    /// through `find` and `ability.read`, executions live in Desk and Workshop
     /// history; neither is recalled as a memory.
     static let inventorySources = ["skill-index", "workshop:"]
-
-    // MARK: - Boot entry point
-
-    /// Idempotent: safe to call on every app launch. Stages at most one
-    /// approval card per repair kind, ever (stamp + pending-approval scan),
-    /// and does no work once the done receipt exists.
-    public static func stageIfNeeded(dataRoot: URL, presentation: any MemoryRepairPresentationPort) async {
-        await archiveInventoryRows(dataRoot: dataRoot)
-        _ = await stageLegacyNoteDupPurge(dataRoot: dataRoot, presentation: presentation)
-    }
 
     // MARK: - Inventory rows: archived once, no card
 
@@ -67,7 +27,7 @@ public enum MemoryRepairOneShot {
     /// store's own archive (no tombstone, row stays walkable). The done receipt
     /// is written only after every row archived; a failure leaves it for the
     /// next launch.
-    static func archiveInventoryRows(dataRoot: URL) async {
+    package static func archiveInventoryRows(dataRoot: URL) async {
         let done = receiptPath(kind: inventoryRowsKind, name: "done", dataRoot: dataRoot)
         guard !FileManager.default.fileExists(atPath: done.path) else { return }
         let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
@@ -88,140 +48,6 @@ public enum MemoryRepairOneShot {
             detail: "Archived \(archived) rows from \(inventorySources.joined(separator: ", ")); nothing writes them any more.",
             dataRoot: dataRoot
         )
-    }
-
-    // MARK: - Staging: legacy note dup-purge card
-
-    @discardableResult
-    static func stageLegacyNoteDupPurge(dataRoot: URL, presentation: any MemoryRepairPresentationPort) async -> String? {
-        if let stamped = readStamp(kind: legacyNoteDupsKind, dataRoot: dataRoot) { return stamped }
-        let done = receiptPath(kind: legacyNoteDupsKind, name: "done", dataRoot: dataRoot)
-        guard !FileManager.default.fileExists(atPath: done.path) else { return nil }
-        let found: DupCandidate?
-        do {
-            found = try legacyNotesDupCandidate(dataRoot: dataRoot)
-        } catch {
-            nativeLog("[memoryRepair] legacy notes could not be inspected; next launch retries: \(String(describing: error))")
-            return nil
-        }
-        guard let candidate = found else { return nil }
-
-        let payload: JSONValue = .object([
-            "kind": .string(legacyNoteDupsKind),
-            "path": .string(candidate.relativePath),
-            "total_rows": .int(Int64(candidate.lines.count)),
-            "duplicate_rows": .int(Int64(candidate.purged)),
-            "kept_rows": .int(Int64(candidate.kept.count)),
-        ])
-        let title = "Memory repair: purge \(candidate.purged) duplicate legacy note rows"
-        let reason = "\(candidate.relativePath) contains \(candidate.purged)/\(candidate.lines.count) exact-duplicate "
-            + "test-fixture rows. Approve to back the file up and keep only the first occurrence "
-            + "of each unique note (\(candidate.kept.count) rows); deny to keep the file as is."
-        return await stage(
-            kind: legacyNoteDupsKind, dataRoot: dataRoot, presentation: presentation,
-            title: title, reason: reason, payload: payload,
-            cardSummary: "\(candidate.lines.count) rows -> \(candidate.kept.count) rows (backup written before the purge)",
-            cardDetail: "Exact-duplicate filter keeps the first occurrence of each unique note "
-                + "text. The original file is copied to a timestamped .bak alongside it before "
-                + "anything is rewritten.",
-            relatedPath: candidate.path.path
-        )
-    }
-
-    // MARK: - Shared staging core (REM stager shape: ensure, never blind-create)
-
-    private static func stage(
-        kind: String, dataRoot: URL, presentation: any MemoryRepairPresentationPort,
-        title: String, reason: String, payload: JSONValue,
-        cardSummary: String, cardDetail: String, relatedPath: String
-    ) async -> String? {
-        let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
-            .fullMacYoloAuthority(
-                tool: action,
-                origin: SecurityOriginContext(
-                    surface: "desk",
-                    source: "memory_repair_one_shot",
-                    isRemote: false
-                )
-            )
-        if yolo.admitted {
-            let timestamp = ISO8601DateFormatter().string(from: Date())
-            let admitted = ApprovalRecord(
-                id: "full-mac-yolo-\(UUID().uuidString.lowercased())",
-                title: title,
-                action: action,
-                risk: "medium",
-                reason: "Admitted by active Full Mac authority",
-                status: "resolved",
-                payload: payload,
-                payloadPreview: "",
-                createdAt: timestamp,
-                resolvedAt: timestamp,
-                decision: "approved",
-                decidedBy: "full_mac_yolo",
-                remoteResolvable: false,
-                localOnly: true
-            )
-            await applyResolvedMemoryRepair(from: admitted, dataRoot: dataRoot)
-            writeReceipt(
-                kind: kind, name: "full_mac_outcome", status: "admitted",
-                detail: "Executed through the canonical memory repair executor without an approval prompt.",
-                dataRoot: dataRoot
-            )
-            return nil
-        }
-        if yolo.state == .explicitlyBlocked {
-            writeReceipt(
-                kind: kind, name: "full_mac_outcome", status: "refused",
-                detail: "memory.repair is explicitly blocked; no approval was staged.",
-                dataRoot: dataRoot
-            )
-            return nil
-        }
-        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        // Crash-retry dedupe: a prior launch may have created the approval
-        // but died before the stamp write. Reuse the pending record. Fails
-        // closed — if the scan throws we can't know, so stage nothing and
-        // let the next launch retry.
-        let pending: [ApprovalRecord]
-        do {
-            pending = try await inbox.list(filter: ApprovalFilter(status: "pending", action: action))
-        } catch {
-            nativeLog("[memoryRepair] dedupe scan failed for \(kind): \(String(describing: error))")
-            return nil
-        }
-        if let existing = pending.first(where: { payloadKind($0.payload) == kind }) {
-            do {
-                try await presentation.ensureInboxCard(
-                    dataRoot: dataRoot, approvalId: existing.id, title: title,
-                    summary: cardSummary, detail: cardDetail, relatedPath: relatedPath)
-                writeStamp(kind: kind, approvalId: existing.id, dataRoot: dataRoot)
-                return existing.id
-            } catch {
-                nativeLog("[memoryRepair] card ensure failed for \(kind): \(String(describing: error))")
-                return nil
-            }
-        }
-        let body: JSONValue = .object([
-            "title": .string(title),
-            "action": .string(action),
-            "risk": .string("medium"),
-            "reason": .string(reason),
-            "payload": payload,
-        ])
-        do {
-            let rec = try await inbox.create(body)
-            // Card failure fails the stage (no stamp) — a stamped repair
-            // with no visible card would be invisible forever.
-            try await presentation.ensureInboxCard(
-                dataRoot: dataRoot, approvalId: rec.id, title: title,
-                summary: cardSummary, detail: cardDetail, relatedPath: relatedPath)
-            writeStamp(kind: kind, approvalId: rec.id, dataRoot: dataRoot)
-            return rec.id
-        } catch {
-            nativeLog("[memoryRepair] stage failed for \(kind): \(String(describing: error))")
-            return nil
-        }
     }
 
     private static func receiptPath(kind: String, name: String, dataRoot: URL) -> URL {
@@ -253,21 +79,10 @@ public enum MemoryRepairOneShot {
         }
     }
 
-    /// Applies a resolved memory.repair record (U3 wave-1 item 3 — mirror of
-    /// applyResolvedREMProposal's shape). Approved → run the matching
-    /// MemoryRepairOneShot executor (sqlite truncated-row completion or
-    /// legacy note duplicate purge), which backs the store up FIRST and mutates
-    /// only what the approved card's payload carries. Denied → store stays
-    /// untouched and the staging stamp stays (a refused repair is never
-    /// re-proposed). Canceled / apply-failure → stamp cleared so the next
-    /// launch re-detects and re-stages a fresh card. Every branch annotates
-    /// the approval record; an approved record must never read as silently
-    /// applied (W8 lesson).
-    /// Static + root-injectable (review blocker fix, 2026-06-10) so the
-    /// app's on-launch crash-window reconciliation can run the SAME executor
-    /// against any data root. Self-guarding and idempotent: re-running an
-    /// already-applied repair stale-skips every row (truncated kind) or
-    /// finds zero remaining legacy-note duplicates — no double mutation.
+    /// Execute an approved truncated-row repair against canonical storage with
+    /// its safety snapshot, then annotate the approval's terminal result.
+    /// Reconciliation stale-skips already applied rows; retired kinds fail
+    /// through the existing unknown-kind outcome without touching legacy files.
     public static func applyResolvedMemoryRepair(
         from rec: ApprovalRecord,
         dataRoot: URL
@@ -307,24 +122,6 @@ public enum MemoryRepairOneShot {
                             + (outcome.failed.isEmpty ? "" : ", \(outcome.failed.count) FAILED")
                             + (unrefreshed > 0 ? ", \(unrefreshed) without embedding refresh" : "")
                             + " — backup at \(outcome.backupPath)")
-                case MemoryRepairOneShot.legacyNoteDupsKind:
-                    let outcome = try await MemoryRepairOneShot.applyLegacyNoteDupPurge(dataRoot: dataRoot, payload: rec.payload)
-                    // Re-scan once so a finished repair writes its done receipt
-                    // now; a Full Mac repair leaves no stamp to stop the next
-                    // launch. A scan that cannot inspect leaves it to that launch.
-                    _ = try? MemoryRepairOneShot.legacyNotesDupCandidate(dataRoot: dataRoot)
-                    _ = try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                        rec.id,
-                        executedAction: .object([
-                            "op": .string("memory_repair_legacy_note_dups"),
-                            "kept": .int(Int64(outcome.kept)),
-                            "purged": .int(Int64(outcome.purged)),
-                            "backupPath": .string(outcome.backupPath),
-                        ]),
-                        detail: outcome.purged > 0
-                            ? "legacy note purge applied: \(outcome.purged) duplicates removed, "
-                                + "\(outcome.kept) rows kept — backup at \(outcome.backupPath)"
-                            : "legacy note purge: no duplicates remained at apply time; file untouched")
                 default:
                     nativeLog("[memoryRepair] unknown repair kind: \(kind)")
                     _ = try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
@@ -334,22 +131,16 @@ public enum MemoryRepairOneShot {
                 }
             } catch {
                 nativeLog("[memoryRepair] apply failed for \(kind): \(String(describing: error))")
-                // The approval record is terminal; clear the staging stamp so
-                // the next launch re-detects whatever is still broken and
-                // stages a fresh card instead of dead-ending.
-                MemoryRepairOneShot.clearStamp(kind: kind, dataRoot: dataRoot)
                 _ = try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
                     rec.id,
                     executedAction: .object([
                         "kind": .string(kind),
                         "error": .string("\(error)"),
                     ]),
-                    detail: "memory repair FAILED: \(error.localizedDescription) — stamp cleared; "
-                        + "next launch re-stages whatever is still repairable")
+                    detail: "memory repair FAILED: \(error.localizedDescription)")
             }
         case "denied":
-            // Store untouched; stamp stays so the refused repair is never
-            // re-proposed.
+            // Denial leaves the canonical store untouched.
             _ = try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
                 rec.id,
                 executedAction: .object([
@@ -358,14 +149,13 @@ public enum MemoryRepairOneShot {
                 ]),
                 detail: "memory repair denied — store untouched; will not be re-proposed")
         default: // canceled
-            MemoryRepairOneShot.clearStamp(kind: kind, dataRoot: dataRoot)
             _ = try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
                 rec.id,
                 executedAction: .object([
                     "op": .string("memory_repair_cancel"),
                     "kind": .string(kind),
                 ]),
-                detail: "memory repair canceled — stamp cleared; next launch re-stages it")
+                detail: "memory repair canceled — store untouched")
         }
     }
 
@@ -403,12 +193,11 @@ public enum MemoryRepairOneShot {
     /// Apply approved row repairs. Backs up the sqlite files FIRST, then
     /// updates each row through MemoryStorage.updateMemory (the store's own
     /// write path — UserMD/Spotlight/KG hooks fire). Per-row guards:
-    ///   - stale: current content no longer matches the approved card → skip.
+    ///   - stale: content no longer matches the approved card at commit → skip.
     ///   - tombstoned: proposed text is hash- or paraphrase-tombstoned → fail.
     ///   - embedding: re-embedded via the provided embedder; when embedding
     ///     fails (CoreML fail-closed on headless boxes) the content still
-    ///     repairs and the old vector is kept — the old vector encodes the
-    ///     200-char prefix of the new text, and the outcome notes the miss.
+    ///     repairs and owes a fresh vector; the outcome notes the miss.
     static func applyTruncatedRowsRepair(
         dataRoot: URL,
         repairs: [TruncatedRowRepair],
@@ -454,8 +243,10 @@ public enum MemoryRepairOneShot {
                 embedding: newEmbedding,
                 embeddingEpoch: newEmbeddingEpoch?.rawValue
             )
-            guard try await storage.updateMemory(id: repair.id, patch: patch) != nil else {
-                outcome.failed[repair.id] = "update returned no row"
+            guard try await storage.updateMemory(
+                id: repair.id, patch: patch, expectedContent: repair.currentText
+            ) != nil else {
+                outcome.skippedStale.append(repair.id)
                 continue
             }
             outcome.applied.append(repair.id)
@@ -464,84 +255,7 @@ public enum MemoryRepairOneShot {
         return outcome
     }
 
-    // MARK: - Executor (b): apply legacy note dup purge
-
-    struct DupPurgeOutcome: Equatable {
-        let kept: Int
-        let purged: Int
-        let backupPath: String
-    }
-
-    /// Re-reads the file at apply time (counts may have drifted since
-    /// staging), backs it up, then keeps the first occurrence of each unique
-    /// note text. R-M-W under the cross-process flock so a concurrent
-    /// commit_memory append can't be clobbered.
-    static func applyLegacyNoteDupPurge(dataRoot: URL, payload: JSONValue) async throws -> DupPurgeOutcome {
-        guard let notesPath = try notesPath(fromPayload: payload, dataRoot: dataRoot)
-                ?? legacyNotesDupCandidate(dataRoot: dataRoot)?.path else {
-            return DupPurgeOutcome(kept: 0, purged: 0, backupPath: "")
-        }
-        let persistence = SwiftNativePersistenceCore()
-        return try await persistence.withFileLock(notesPath) {
-            let lines = try readNonEmptyLines(notesPath)
-            let (kept, purged) = exactDupSplit(lines)
-            guard purged > 0 else {
-                return DupPurgeOutcome(kept: kept.count, purged: 0, backupPath: "")
-            }
-            let stamp = backupTimestamp()
-            let backup = notesPath.deletingLastPathComponent()
-                .appendingPathComponent("notes.jsonl.pre-purge-\(stamp).bak")
-            try FileManager.default.copyItem(at: notesPath, to: backup)
-            let body = kept.joined(separator: "\n") + "\n"
-            try Data(body.utf8).write(to: notesPath, options: .atomic)
-            return DupPurgeOutcome(kept: kept.count, purged: purged, backupPath: backup.path)
-        }
-    }
-
-    // MARK: - Stamps (idempotence + cancel-restage)
-
-    static func stampPath(kind: String, dataRoot: URL) -> URL {
-        dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("repairs", isDirectory: true)
-            .appendingPathComponent("\(kind).staged.json")
-    }
-
-    static func readStamp(kind: String, dataRoot: URL) -> String? {
-        let path = stampPath(kind: kind, dataRoot: dataRoot)
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
-              case .object(let obj) = parsed,
-              case .string(let id)? = obj["approval_id"] else { return nil }
-        return id
-    }
-
-    private static func writeStamp(kind: String, approvalId: String, dataRoot: URL) {
-        let path = stampPath(kind: kind, dataRoot: dataRoot)
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let stamp: JSONValue = .object([
-            "kind": .string(kind),
-            "approval_id": .string(approvalId),
-            "staged_at": .string(fmt.string(from: Date())),
-        ])
-        do {
-            try FileManager.default.createDirectory(
-                at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try stamp.serializedData(pretty: true).write(to: path, options: .atomic)
-        } catch {
-            nativeLog("[memoryRepair] stamp write failed for \(kind): \(String(describing: error))")
-        }
-    }
-
-    /// Canceled decision (or a failed apply): clear the stamp so the next
-    /// launch re-detects and re-stages a fresh card instead of dead-ending
-    /// on a terminal approval.
-    static func clearStamp(kind: String, dataRoot: URL) {
-        try? FileManager.default.removeItem(at: stampPath(kind: kind, dataRoot: dataRoot))
-    }
-
-    // MARK: - Helpers
+    // MARK: - Payload and SQLite safety snapshot
 
     static func payloadKind(_ payload: JSONValue) -> String? {
         guard case .object(let obj) = payload,
@@ -549,117 +263,6 @@ public enum MemoryRepairOneShot {
         return kind
     }
 
-    private static func notesPath(fromPayload payload: JSONValue, dataRoot: URL) -> URL? {
-        guard case .object(let obj) = payload,
-              case .string(let relative)? = obj["path"],
-              !relative.isEmpty,
-              !relative.hasPrefix("/")
-        else { return nil }
-        let path = dataRoot.appendingPathComponent(relative)
-        let normalizedRoot = dataRoot.standardizedFileURL.path
-        let normalizedPath = path.standardizedFileURL.path
-        guard normalizedPath == normalizedRoot || normalizedPath.hasPrefix(normalizedRoot + "/") else {
-            return nil
-        }
-        return path
-    }
-
-    typealias DupCandidate = (path: URL, relativePath: String, lines: [String], kept: [String], purged: Int)
-
-    /// The first legacy notes file still holding duplicate test residue. When
-    /// every file was read and none is left, writes the done receipt. Throws
-    /// when something could not be read, so a failed read never counts as done.
-    private static func legacyNotesDupCandidate(dataRoot: URL) throws -> DupCandidate? {
-        let fm = FileManager.default
-        let memoryRoot = dataRoot.appendingPathComponent("memory", isDirectory: true)
-        let entries = fm.fileExists(atPath: memoryRoot.path)
-            ? try fm.contentsOfDirectory(
-                at: memoryRoot,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles])
-            : []
-
-        for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-            guard try entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
-            let notesPath = entry.appendingPathComponent("notes.jsonl")
-            guard fm.fileExists(atPath: notesPath.path) else { continue }
-            let lines = try readNonEmptyLines(notesPath)
-            guard !lines.isEmpty else { continue }
-            guard containsTestFixtureLine(lines) else { continue }
-            let (kept, purged) = exactDupSplit(lines)
-            guard purged > 0 else { continue }
-            return (
-                path: notesPath,
-                relativePath: relativePath(for: notesPath, dataRoot: dataRoot),
-                lines: lines,
-                kept: kept,
-                purged: purged
-            )
-        }
-        let done = receiptPath(kind: legacyNoteDupsKind, name: "done", dataRoot: dataRoot)
-        writeReceipt(
-            kind: legacyNoteDupsKind, name: "done", status: "complete",
-            detail: "No duplicate legacy note rows remain; the repair is not checked again.",
-            dataRoot: dataRoot
-        )
-        nativeLog("[memoryRepair] \(legacyNoteDupsKind) complete; receipt at \(done.path)")
-        return nil
-    }
-
-    private static func relativePath(for path: URL, dataRoot: URL) -> String {
-        let root = dataRoot.standardizedFileURL.path
-        let full = path.standardizedFileURL.path
-        if full.hasPrefix(root + "/") {
-            return String(full.dropFirst(root.count + 1))
-        }
-        return path.lastPathComponent
-    }
-
-    private static func containsTestFixtureLine(_ lines: [String]) -> Bool {
-        for line in lines {
-            guard let data = line.data(using: .utf8),
-                  let parsed = try? JSONValue.parse(data),
-                  case .object(let obj) = parsed,
-                  case .bool(true)? = obj["_test_fixture"] else { continue }
-            return true
-        }
-        return false
-    }
-
-    private static func readNonEmptyLines(_ path: URL) throws -> [String] {
-        let raw = try String(contentsOf: path, encoding: .utf8)
-        return raw.components(separatedBy: "\n")
-            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-    }
-
-    /// Exact-dup filter: keep the first occurrence of each unique `text`
-    /// field (lines that don't parse as JSON objects with a string `text`
-    /// are kept verbatim — never destroy what we don't understand).
-    private static func exactDupSplit(_ lines: [String]) -> (kept: [String], purged: Int) {
-        var seen = Set<String>()
-        var kept: [String] = []
-        var purged = 0
-        for line in lines {
-            guard let data = line.data(using: .utf8),
-                  let parsed = try? JSONValue.parse(data),
-                  case .object(let obj) = parsed,
-                  case .string(let text)? = obj["text"] else {
-                kept.append(line)
-                continue
-            }
-            if seen.contains(text) {
-                purged += 1
-            } else {
-                seen.insert(text)
-                kept.append(line)
-            }
-        }
-        return (kept, purged)
-    }
-
-    /// Online backup of memory.sqlite into a timestamped backup dir, through
-    /// MemoryStorage's own pool (sqlite3_backup, verified before it returns).
-    /// Returns the backup directory path.
     private static func backupSQLiteStore(dataRoot: URL) async throws -> String {
         let memDir = dataRoot.appendingPathComponent("memory", isDirectory: true)
         // Short unique suffix: the executor is idempotent and may legally

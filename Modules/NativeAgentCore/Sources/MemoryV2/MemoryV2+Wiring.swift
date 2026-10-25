@@ -1,6 +1,64 @@
 import Foundation
+import GRDB
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryV2+Wiring.swift` | `SwiftNativeMemoryV2`: `duplicateProvenancePatch`, `store`, `isRejected` |
+
+extension MemoryStorage {
+    /// Both retelling lanes merge evidence against the row under its write lock.
+    func recordRetelling(id: String, pending: Bool, source: String, metadata: [String: JSONValue]) async throws {
+        let incoming = pending ? JSONValue.object(metadata)
+            : MemoryDataProvenance.stamping(try MemorySenseProvenance.stamping(.object(metadata)))
+        let updated = try await dbPool.write { db -> StoredMemory? in
+            func merge(_ current: MemoryRecord) throws -> (metadata: [String: JSONValue], observedAt: String?) {
+                var patch = SwiftNativeMemoryV2.duplicateProvenancePatch(
+                    existing: current, newSource: source, newMetadata: incoming)
+                let count: Int64?
+                if case .object(let fields)? = current.extras, case .int(let value)? = fields["recall_count"] {
+                    count = value
+                } else {
+                    count = Int64(exactly: (MemoryMoments.metadataNumber(current.extras, "recall_count") ?? 0).rounded(.towardZero))
+                }
+                guard let count, count < Int64.max else {
+                    throw MemoryStorageError.databaseUnavailable("retelling: recall_count is outside incrementable Int64 range")
+                }
+                patch["recall_count"] = .int(count + 1)
+                let observed: String? = if case .string(let value)? = patch["observed_at"] { value } else { nil }
+                if !pending { patch["observed_at"] = nil }
+                var merged: [String: JSONValue] = [:]
+                if case .object(let existing)? = current.extras { merged = existing }
+                merged.merge(patch) { _, new in new }
+                return (merged, observed)
+            }
+            if pending {
+                guard let row = try Row.fetchOne(db, sql: """
+                    SELECT * FROM proposals WHERE id = ? AND status IN ('pending', 'superseded')
+                    """, arguments: [id]).map(Self.decodeProposal) else { return nil }
+                let current = MemoryRecord(id: row.id, text: row.content, createdAt: row.stagedAt,
+                                           sourceRunId: row.source, extras: row.metadata)
+                let merged = try merge(current)
+                try db.execute(sql: "UPDATE proposals SET metadata_json = ? WHERE id = ?",
+                               arguments: [Self.encodeMetadata(.object(merged.metadata)), id])
+                return nil
+            }
+            guard var current = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id])
+                .map(Self.decodeMemory) else { throw MemoryV2Error.recordNotFound }
+            let merged = try merge(MemoryRecord(stored: current))
+            if let observed = merged.observedAt { current.observedAt = observed }
+            current.metadata = .object(merged.metadata)
+            current.updatedAt = Self.nowISO8601()
+            try Self.validateTemporalEvidence(current)
+            try db.execute(sql: "UPDATE memories SET metadata_json = ?, observed_at = ?, updated_at = ? WHERE id = ?",
+                           arguments: [Self.encodeMetadata(current.metadata), current.observedAt, current.updatedAt, id])
+            return current
+        }
+        if let updated {
+            invalidateRecallCache()
+            pokeUserMDRegen(persona: updated.personaId)
+            await pokeProjectionHooks(updated)
+        }
+    }
+}
 
 // Storage-backed memory writes and duplicate provenance on SwiftNativeMemoryV2.
 // Recall and proposals live in their named extensions; value and storage
@@ -129,18 +187,10 @@ extension SwiftNativeMemoryV2 {
     func recordRetelling(
         of row: MemoryRecord, pending: Bool, source: String, metadata: [String: JSONValue]
     ) async throws {
-        var patch = Self.duplicateProvenancePatch(existing: row, newSource: source, newMetadata: .object(metadata))
-        patch["recall_count"] = .int(Int64(MemoryMoments.metadataNumber(row.extras, "recall_count") ?? 0) + 1)
-        guard pending else {
-            _ = try await updateMemory(id: row.id, update: .object(patch))
-            return
-        }
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        var merged: [String: JSONValue] = [:]
-        if case .object(let existing)? = row.extras { merged = existing }
-        merged.merge(patch) { _, new in new }
-        _ = try await storage.updateProposalMetadata(id: row.id, metadata: .object(merged))
+        let canonical = await storage.underlyingStorage()
+        try await canonical.recordRetelling(id: row.id, pending: pending, source: source, metadata: metadata)
     }
 
     /// True when `store` would refuse this content as tombstoned — the exact
@@ -148,7 +198,7 @@ extension SwiftNativeMemoryV2 {
     /// lost write asks first: a rejected claim is settled, not lost.
     public func isTombstoned(content: String, metadata: JSONValue? = nil) async throws -> Bool {
         let metadata = try MemorySenseProvenance.stamping(metadata)
-        let content = MemoryTextClip.memoryDisplayText(content, kind: Self.metadataKind(metadata))
+        let content = MemoryTextClip.memoryDisplayText(content, kind: MemoryRecallScoring.kind(of: metadata))
         guard !content.isEmpty else { return false }
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
@@ -158,10 +208,8 @@ extension SwiftNativeMemoryV2 {
         return try await storage.matchesTombstone(embedding: embedded.vector, embeddingEpoch: embedded.epoch)
     }
 
-    /// Store a new memory record. Refuses (with `.underlying("tombstoned")`) if
-    /// the content matches a rejection tombstone — the denylist gate. Otherwise
-    /// embeds the content, inserts into storage, and returns the resulting
-    /// `MemoryRecord` with its storage-assigned id.
+    /// Store a new memory. `memory_tombstoned` refuses forgotten or rejected
+    /// content. Cold writes owe admission until their search vector is ready.
     public func store(
         content: String,
         source: String? = nil,
@@ -172,20 +220,20 @@ extension SwiftNativeMemoryV2 {
         let metadata = MemoryDataProvenance.stamping(try MemorySenseProvenance.stamping(metadata))
         let content = MemoryTextClip.memoryDisplayText(
             content,
-            kind: Self.metadataKind(metadata)
+            kind: MemoryRecallScoring.kind(of: metadata)
         )
         guard !content.isEmpty else { throw MemoryV2Error.invalidQuery }
         if let reason = MemoryCandidateQuality.rejectionReason(
             text: content,
             source: source,
-            kind: Self.metadataKind(metadata)
+            kind: MemoryRecallScoring.kind(of: metadata)
         ) {
-            throw MemoryV2Error.underlying("not durable memory: \(reason)")
+            throw MemoryV2Error.rejectedCandidate(reason)
         }
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         if try await storage.isTombstoned(content: content) {
-            throw MemoryV2Error.underlying("tombstoned: content matches a rejection denylist entry")
+            throw MemoryV2Error.forgottenContent("Content matches a forgotten or rejected memory.")
         }
         let now = Self.iso8601Now()
         // commit_memory review fix (2026-06-11): lift confidence/importance/
@@ -261,7 +309,7 @@ extension SwiftNativeMemoryV2 {
                 $0.id == id && ($0.status ?? "active") == "active"
                     && MemoryLifecycle.isRecallEligible($0.lifecycle)
             }) else {
-                throw MemoryV2Error.underlying("memory to supersede is missing or no longer active: \(id)")
+                throw MemoryV2Error.staleSupersession("Memory to supersede is missing or no longer active: \(id)")
             }
             return SupersedingAcceptance(
                 targetId: id, expectedContentHash: MemoryStorage.contentHash(row.text),
@@ -287,18 +335,20 @@ extension SwiftNativeMemoryV2 {
             embedding: embedded.vector,
             embeddingEpoch: embedded.epoch
         ) {
-            throw MemoryV2Error.underlying("tombstoned: content is a paraphrase of a rejected claim")
+            throw MemoryV2Error.forgottenContent("Content paraphrases a forgotten or rejected memory.")
         }
         var admitted = record
         if embedded == nil {
             // Saved, admitted only when its vector lands and passes the checks
-            // (under its own id when the caller owns it).
-            admitted.extras = MemoryStorage.owingAdmission(record.extras, preservingID: id != nil)
+            // (under its own id when the caller owns it). A replacement is
+            // admitted as itself and demotes what it replaces only then.
+            admitted.extras = MemoryStorage.owingAdmission(record.extras, preservingID: id != nil || !superseding.isEmpty,
+                                                           superseding: superseding)
         }
         let inserted: MemoryRecord
         if !superseding.isEmpty {
             inserted = try await storage.insert(record: admitted, embedding: embedded?.vector,
-                                              embeddingEpoch: embedded?.epoch, superseding: superseding)
+                                              embeddingEpoch: embedded?.epoch, superseding: embedded == nil ? [] : superseding)
         } else {
             guard let saved = try await storage.admit(
                     record: admitted, embedding: embedded?.vector, embeddingEpoch: embedded?.epoch,
@@ -324,31 +374,4 @@ extension SwiftNativeMemoryV2 {
         return f.string(from: Date())
     }
 
-    static func metadataKind(_ metadata: JSONValue?) -> String? {
-        guard case .object(let obj)? = metadata,
-              case .string(let kind)? = obj["kind"] else {
-            return nil
-        }
-        let trimmed = kind.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-}
-
-enum MemorySemanticDuplicateGuard {
-    /// Similar wording cannot reassert or archive a changed quantity or polarity.
-    static func sameQuantityAndNegation(_ old: String, _ new: String) -> Bool {
-        func matches(_ pattern: String, in text: String) -> [String] {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
-            let ns = text as NSString
-            return regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
-                .map { ns.substring(with: $0.range).lowercased().replacingOccurrences(of: "’", with: "'") }
-        }
-        let digits = #"[0-9]+"#
-        // Third-person memories negate with n't ("doesn't", "isn't"); count, so
-        // "does not" and "doesn't" still read as the same polarity.
-        let negations = #"\b(?:no\s+longer|not|never|cannot)\b|n['’]t\b"#
-        return matches(digits, in: old) == matches(digits, in: new)
-            && matches(negations, in: old).count == matches(negations, in: new).count
-    }
 }

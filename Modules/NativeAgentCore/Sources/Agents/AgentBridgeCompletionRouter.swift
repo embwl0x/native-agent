@@ -1,9 +1,12 @@
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import AgentWorkspace
 import CryptoKit
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `AgentBridgeCompletionRouter.swift` | Completion-route adapters and destination validation; saved let-go delivery stops at admission before asking-chat rows or dispatch; cancellation exits retry backoff and fences the next send; `AgentBridgeCompletionRouter`: `validatedRoute`, `deliverAnswer` |
 
 extension AgentBridgeCompletionRoute {
   /// The door a contact's send was asked from, for an answer from a turn
@@ -92,7 +95,7 @@ public struct AgentBridgeCompletionArtifact: Sendable, Equatable {
 
   public enum Payload: Sendable, Equatable {
     case text(String)
-    case attachment(ChatOrchestration.MultimodalAttachment)
+    case attachment(ChatTurnRuntime.MultimodalAttachment)
   }
 
   public let id: String
@@ -247,7 +250,7 @@ public enum AgentBridgeCompletionRouter {
     deliveryId: String,
     requestDigest: String,
     text: String,
-    attachments: [ChatOrchestration.MultimodalAttachment],
+    attachments: [ChatTurnRuntime.MultimodalAttachment],
     route: AgentBridgeCompletionRoute,
     client: any ChatOrchestrationClient,
     sender: any AgentBridgeCompletionSending,
@@ -263,7 +266,7 @@ public enum AgentBridgeCompletionRouter {
     deliveryId: String,
     requestDigest: String,
     text: String,
-    attachments: [ChatOrchestration.MultimodalAttachment],
+    attachments: [ChatTurnRuntime.MultimodalAttachment],
     route: AgentBridgeCompletionRoute,
     sender: any AgentBridgeCompletionSending,
     lifecycle: CodexCompletionLifecycle,
@@ -512,6 +515,10 @@ public enum AgentBridgeCompletionRouter {
       var terminalRejected = false
       var lastError = "unknown_completion_delivery_error"
       for attempt in 1...maximumAttempts {
+        guard !Task.isCancelled else {
+          lastError = "completion_delivery_cancelled"
+          break
+        }
         attempts += 1
         var retryAfterDefiniteOrIdempotentFailure = false
         let transport = await sender.send(
@@ -559,7 +566,12 @@ public enum AgentBridgeCompletionRouter {
           }
         }
         if retryAfterDefiniteOrIdempotentFailure {
-          try? await Task.sleep(nanoseconds: UInt64(attempt) * 250_000_000)
+          do {
+            try await Task.sleep(nanoseconds: UInt64(attempt) * 250_000_000)
+          } catch {
+            lastError = "completion_delivery_cancelled"
+            break
+          }
           continue
         }
         break
@@ -653,11 +665,11 @@ public enum AgentBridgeCompletionRouter {
     deliveryId: String,
     surface: String,
     text: String,
-    attachments: [ChatOrchestration.MultimodalAttachment]
+    attachments: [ChatTurnRuntime.MultimodalAttachment]
   ) throws -> [AgentBridgeCompletionArtifact] {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let validated = try attachments.map { attachment -> (
-      ChatOrchestration.MultimodalAttachment,
+      ChatTurnRuntime.MultimodalAttachment,
       AgentBridgeCompletionArtifact.AttachmentExpectation
     ) in
       guard attachment.type.lowercased() == "image",

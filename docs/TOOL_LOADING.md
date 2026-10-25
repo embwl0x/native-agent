@@ -48,33 +48,23 @@ counts. Known service blockers appear as `availability:"unavailable"` and
 `blocker`; page and index lists show the same reason. These are saved setup
 verdicts, not network-health checks, and do not change execution admission.
 
-Senses serve `mac.look`, `mac.read`, `files.read`, `web.read` and browser page
-reads through the same door. Their compact pages include named things,
-addresses, offered verbs and a `via sense …` provenance line. On these reads,
-`args {raw:true}` returns the original route with a raw-view provenance line.
-`args {wrong:true, why:"one sentence in your words"}` returns today's raw route,
-records the exact previous door reply and its source binding as a private
-`viewWrong` wall, and immediately queues stuck work for that app bundle ID,
-site host or file kind. `why` is optional. The reply says:
-“Noted. NativeAgent is growing a better view of <place>; you'll get a note when it's ready.”
-Without an earlier view of that source, today's raw reply is the rejected view.
-The generic reader remains unchanged; the body grows a corner sense, or repairs
-the corner's existing sense. Growth uses already-running windows, existing
-NativeAgent group tabs and read-only file material; it never opens apps or tabs or drives
-the desktop. A successful version announces:
-“<place> now has its own sense: v<version>, grown because: <why>”.
-Read the same place again for its new page, provenance and offered verbs. Mark
-that page wrong with the same call to grow the next version. Growth failures
-announce their reason and retain the open wall. A failed grown sense names its
-failure and serves no page. Without a matching sense, the original payload
-carries its actual generic reader's provenance or a raw-view reason.
+Senses serve `mac.look`, `mac.read`, `files.read`, `web.read` and browser pages through the same door: named things, addresses, verbs and `via sense …` provenance. `args:{raw:true}` reads the original route with raw provenance.
+`args:{wrong:true,why:"one sentence"}` reads the place and, if successful, adds repair guidance; `why` is optional. App corners keep their sense view; others use raw. The usual reply is:
+“Noted. Fix it now: write how <corner> should read with app sense.make (it runs on this place and shows you the page; keep:true makes it stay).”
+For an already-readable file, it explains why rejecting a text view does not grow a file sense. No rejected-view wall or background growth request is recorded.
+`sense.make` trials complete `sense.js` against material captured in the same conversation, without rereading. A kept trial returns `status:"kept",place,sense_id,version,page`. Reread that place for its page/provenance/verbs. Revisions need a fresh trial and `keep:true`, with code or `trial_id` and `digest`. A pageless trial is discarded with its failure; a failed sense serves no page. Without a matching sense, the original payload names its actual generic reader or raw-view reason.
 
-Sense-served file replies retain the original reader's envelope (`ok`,
-`bytes`, `version`, `has_more` and other metadata), replacing raw `content`
-with the rendered `sense_page` and adding `sense_provenance`. Native senses
-retain their original presentation. Explicit raw file reads return the
-reader's JSON envelope. A failed sense adds a provenance line:
-`raw view · sense <id> v<version> failed: <code>`.
+Sense-served file replies identify the material actually captured (`path`,
+`bytes`, `version`, `offset`, `returned_bytes`), with `sense_page`, `sense_place`
+and `sense_provenance`. `has_more` and `truncated` describe the sense's remaining
+page or folded content; `next` carries its continuation when present, not the
+raw reader's byte window. Site snapshots retain their proof envelope, put the
+original byte count in `source_bytes`, the rendered count in `bytes`, and the
+sense continuation in `sense_more`; `has_more` also retains the source's flag.
+Native senses retain their original presentation; explicit raw file reads
+return the reader's JSON envelope. A failed sense returns `ok:false`,
+`status:"failed"`, `error_code`, `error`, `raw` evidence and `remedy`, with:
+`raw view · sense <id> v<version> unavailable: <code>; no sense page served`.
 
 `find` can discover corners by `app:<bundle id>`, `file:<extension>` or
 `site:<host>`. Read one with `page` set to its corner key and `item` set to
@@ -108,23 +98,23 @@ discovery tool.
 
 - Built-in capabilities are registered app actions, not additional request
   schemas.
-- Mounted MCP tools appear as `mcp.<server>.<tool>`, generated from the live
-  server list. The built-in search action appears as `web.search`; `web.read`
-  reads a page.
-- Self-authored tools follow `tool.propose` → `tool.approve` →
-  `face.action` (an unclaimed door id) or `authored.<id>`. A proposal supplies JavaScript run(input) and optional intercepted fixtures,
-  with optional permissions and input schema. Only active registry entries
-  become authored actions; approval follows Trust. Bundled seeds install once at launch; existing parts win.
-- Skills are JavaScript routines: discovery points to `skill.run`.
-  `skill.read` returns metadata and declared params/input schema; source:true
-  reviews exact code and fixtures. A routine without declared params says to
-  read its source before running it.
-  `skill.save`, `skill.validate`, `skill.enable`, `skill.run`, `skill.resume`
-  and `skill.rollback` use the shared executor and candidate lifecycle
-  through the same app gates; a skill grants no new authority. See the
+- The built-in search action appears as `web.search`; `web.read` reads a page.
+- Grow executable abilities with `ability.save`; `ability.enable` keeps a draft
+  or turns an ability back on. Run it as `authored.<id>` or its declared
+  `face.action`; read it with `ability.read`. Full Mac can keep their own save
+  immediately; other keeps require rehearsal (`ability.validate`) and the
+  owner's exact-version card. The owner's off-switch remains theirs. Code,
+  reach, input schema and fixtures share one candidate and admission, checked
+  on every run. Legacy tool/skill authoring calls delegate to this lifecycle.
+  At launch, a changed bundled seed replaces an untouched installed seed,
+  keeping the old version as previous; authored edits are preserved. The seed
+  catalog's shipped ids and `native-` are reserved by `ability.save`; future
+  shipped parts use `native-`. See the
   [manifest spec](skill_manifest_spec.md).
+- Skills are built-in guidance, found and read through `ability.list` and
+  `ability.read`; they never run. Executable authored work is an ability.
 
-`web.search` uses Codex with direct web-tool access for general queries and SearXNG for other categories; a Codex failure falls back to SearXNG and the receipt keeps the route and the failure reason; a completed empty search stays on its route; a time range travels with either route.
+`web.search` searches SearXNG, every engine it has, and returns its results or its failure said plainly (no fallback; Doctor names a broken SearXNG); on a Mac without SearXNG the result hands their `browser_search`, the same search in a browser (Chrome through the extension when it is connected, else their own browser), which they runs and reads; a time range travels with either.
 Cancellation stops the search.
 
 ## Scripts
@@ -138,7 +128,9 @@ Every registered action is callable from a script under its ordinary gates.
 Each write retains its gates and receipt. A call that raises an
 approval card waits for the settled result; a decline throws `AppError` with
 reason `declined`, which the code can catch. `card.request` likewise waits for
-the person's answer. Full Mac writes need no approval card. Home may be read;
+the person's answer. Full Mac writes need no routine approval card; untrusted
+agent turns, macOS privacy resets and irreversible deletes retain their cards.
+Home may be read;
 use named actions for its items. Secret arguments still require a single action.
 
 The runner bounds source size, reads, actions and script time; time spent waiting on app calls is not counted.
@@ -146,6 +138,10 @@ Its receipt retains completed effects if a later step fails; a script is not
 an atomic transaction or a rollback mechanism.
 
 ## Authority and receipts
+
+Every tool declares its effect where it is defined: class (read, write, send, destructive), reach (theirs or their), capabilities and an argument policy.
+The forms carry the common case: a read is a safe read; a door action is a read when it says `read:`, else a write to app data unless it says otherwise.
+The security profile projects that declaration, and argument policy only narrows it; nothing is inferred from a tool's name.
 
 Under Full Mac, Agent can also perform actions otherwise marked the owner's.
 Explicit blocks, checked policy, actual macOS grants and connector
@@ -163,18 +159,21 @@ authority on authenticated turns; ordinary Trust and domain checks still apply.
 failure and observed effects; a response alone is not proof of an external
 outcome.
 
+Door corrections and text-tool protocol compensations emit `shim.fired` trace
+receipts with their census `id` and source `site`.
+
 ## Source owners
 
 All paths below are under `Modules/NativeAgentCore/Sources/`.
 
 | Owner | Contract |
 |---|---|
-| `AppToolRuntime/AppActionRegistry.swift` | Actions, arguments, ownership and scriptability. |
+| `AppToolRuntime/AppActionRegistry.swift` | Actions, arguments, ownership and dependency contracts. |
 | `AppToolRuntime/AppToolExecutor+AppDoor.swift` | Home, pages, discovery, previews and action dispatch. |
 | `AppToolRuntime/AppScriptRunner.swift` | JavaScript execution and bounds. |
 | `ToolRegistry/ToolNameAliases.swift` | Action translations and underlying dispatch identity. |
 | `ChatToolRuntime/SwiftToolDispatcher+ToolCatalog.swift` | The single always-on name. |
 | `ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift` | Request filtering and tool-contract traces. |
-| `Research/Research+CodexSearch.swift` | Search routing and fallback. |
+| `Research/Research+WebSearch.swift` | Search routing. |
 
 See [Anatomy of a Turn](ANATOMY_OF_A_TURN.md) for the surrounding lifecycle.

@@ -66,6 +66,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `SwiftToolDispatcher+InnerStateTools.swift` | `SwiftToolDispatcher`: `impl_inner_state`, `innerStateRawWindowHours`, `innerStateWindowHours` |
 
 /// The live mind, answering for itself. Implemented by the app's cognition
 /// runtime, which is the only object that owns both the substrate (mind) and

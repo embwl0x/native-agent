@@ -2,6 +2,8 @@ import BackgroundLoops
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `EventDeadlinePhysiology.swift` | `EventDeadlinePhysiology`: store/file invalidations and cancellable refresh adapters; canonical runners reread state and suppress only known self-write generations |
+
 /// App-owned signal adapters for event/deadline background runners. The
 /// events are invalidations only: every runner rereads its canonical store.
 public enum EventDeadlinePhysiology {

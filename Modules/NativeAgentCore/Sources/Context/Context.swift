@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `Context.swift` | `SwiftNativeContextClient`: feature-surface lookup only; no legacy receipt reader or retention. Existing `context/<runID>.json` files are left for the operator. |
 
 // MARK: - Result type
 
@@ -68,56 +69,11 @@ extension FeatureSurfaceRecord {
 
 public actor SwiftNativeContextClient {
     private let now: @Sendable () -> Date
-    private let dataRoot: URL
-    private let store: PersistenceCoreProtocol
     public init(
-        now: @escaping @Sendable () -> Date = { Date() },
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        store: PersistenceCoreProtocol = SwiftNativePersistenceCore()
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.now = now
-        self.dataRoot = dataRoot
-        self.store = store
     }
-
-    // MARK: - Path helpers
-
-    /// `<root>/chat/messages/<safeSessionId>.jsonl`.
-    private func chatMessagesPath(_ sessionID: String) -> URL {
-        dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(Self.safeChatSessionID(sessionID)).jsonl")
-    }
-
-    /// `<root>/chat/sessions.json`.
-    private func chatSessionsPath() -> URL {
-        dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
-    }
-
-    /// Mirror `safe_chat_session_id`: a value matching
-    /// `[A-Za-z0-9][A-Za-z0-9_-]{2,80}` is used verbatim; anything else would be
-    /// replaced by a fresh UUID by the daemon. For a READ we cannot replicate the
-    /// daemon's per-call UUID substitution (it would never match a stored file),
-    /// so a non-conforming id maps to a path that does not exist → empty result,
-    /// which is the only safe behavior (Python would also fail to find a file for
-    /// a randomly-substituted uuid). Conforming ids — the only ids the Mac UI
-    /// ever sends — map verbatim, matching the daemon byte-for-byte.
-    static func safeChatSessionID(_ value: String) -> String {
-        let raw = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if Self.safeSessionRegex.firstMatch(
-            in: raw, range: NSRange(raw.startIndex..., in: raw)
-        ) != nil {
-            return raw
-        }
-        return UUID().uuidString  // non-match → path miss → empty result
-    }
-
-    private static let safeSessionRegex = try! NSRegularExpression(
-        pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{2,80}$"
-    )
 
     /// Feature-surface lookup type aliases.
     private static let featureSurfaceTypes: Set<String> = [
@@ -160,59 +116,6 @@ public actor SwiftNativeContextClient {
             features: sliced.map { $0.contextLookupJSON() },
             createdAt: createdAt
         )
-    }
-
-    /// Bounded maintenance for daemon-written compatibility files. Mounted
-    /// maintenance owns this call so a context read never performs a directory
-    /// sweep or deletion as a side effect.
-    public func pruneLegacyReceipts(
-        at current: Date = Date()
-    ) async throws -> LegacyContextReceiptFeed.RetentionReport {
-        let protected = try await protectedLegacyReceiptRunIDs()
-        return await LegacyContextReceiptFeed.prune(
-            dataRoot: dataRoot,
-            protectedRunIDs: protected,
-            now: current,
-            persistence: store
-        )
-    }
-
-    private func protectedLegacyReceiptRunIDs() async throws -> Set<String> {
-        let sessions = try await store.readJSON(chatSessionsPath(), ifMissing: .array([]))
-        guard case .array(let rows) = sessions else { return [] }
-        var protected: Set<String> = []
-        for row in rows {
-            guard case .object(let session) = row else { continue }
-            if let startup = Self.coercedString(session["startupContextRunId"]), !startup.isEmpty {
-                if LegacyContextReceiptFeed.receiptPath(dataRoot: dataRoot, runID: startup) != nil {
-                    protected.insert(startup)
-                }
-            }
-            guard case .string(let sessionID)? = session["id"] else { continue }
-            let messages = (try? await store.tailJSONL(
-                chatMessagesPath(sessionID), limit: 80, maxBytes: 1_048_576
-            )) ?? []
-            for message in messages {
-                guard case .object(let values) = message,
-                      let runID = Self.coercedString(values["runId"]), !runID.isEmpty
-                else { continue }
-                if LegacyContextReceiptFeed.receiptPath(dataRoot: dataRoot, runID: runID) != nil {
-                    protected.insert(runID)
-                }
-            }
-        }
-        return protected
-    }
-
-    /// `str(value)`-equivalent string read with retired truthiness: returns the
-    /// `str()`-coercion of `value` iff `value` is PYTHON-TRUTHY, else nil.
-    /// (gpt-5.5 review finding #2: Python `str(message.get("runId") or "")`
-    /// coerces a truthy non-string — e.g. an int `runId` → "123" — so a
-    /// string-only read would diverge.) Used for `runId` / `startupContextRunId`,
-    /// which mirror Python's `str(... or "")` single-value chains.
-    static func coercedString(_ value: JSONValue?) -> String? {
-        guard let value, let s = pythonStr(value) else { return nil }
-        return s
     }
 
     /// Mirrors Python's `str(body.get(a) or body.get(b) or ...)` chain over the

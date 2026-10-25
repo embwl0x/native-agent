@@ -1,5 +1,4 @@
 import EngineRuntime
-import SelfImprovement
 import Foundation
 import Observation
 import Darwin
@@ -11,16 +10,12 @@ import PersistenceCore
 import NativeAgentCore
 import MemoryV2
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
 import ToolExecution
 import PersonaEngine
-import ChatOrchestration
+import ChatToolParsing
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
@@ -35,12 +30,14 @@ import TelegramBot
 import Dispatcher
 import MacControl
 import Onboarding
-import MacAssistantStatus
+import MacIntegration
 import WorkflowOrchestration
-import Skills
 import Connectors
 import Browser
 import AppToolRuntime
+import AuthoredCapabilities
+import Senses
+// Blueprint: | `AppModel+GraphCapabilityActions.swift` | `AppModel`: `searchGraph`, `refreshGraph`, `runResearchLab`; Lab's frozen evidence calls the editable `research-lab` part through `Parts.call` and the canonical admission-only gate; native Research commits the accepted proposal |
 
 /// A production export is successful only after the archive and its persisted
 /// registry receipt agree. Creating an archive alone is not enough for the UI
@@ -56,28 +53,23 @@ extension AppModel {
     func searchGraph(_ query: String) async {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        _ = await graphSearchRead.read({ () async -> Result<[GraphSearchResult], Error> in
+            do { return Result.success(try await engine.memory.searchGraph(query: trimmed).results) }
+            catch { return Result<[GraphSearchResult], Error>.failure(error) }
+        }, publish: { result in
         do {
-            graphSearchResults = try await engine.memory.searchGraph(query: trimmed).results
+            graphSearchResults = try result.get()
             statusText = "Graph search found \(graphSearchResults.count)"
         } catch {
             setFailureStatus(error, action: "search the knowledge graph")
         }
+        })
     }
 
     @MainActor
     func refreshGraph() async {
-        do {
-            let read = try await engine.memory.graphView()
-            agentGraph = read.agentGraph
-            graphEntities = read.entities
-            graphStatus = read.status
-            graphLoadError = nil
-            statusText = "Knowledge graph refreshed"
-        } catch {
-            let line = UserFacingError.message(error, action: "refresh the knowledge graph")
-            graphLoadError = line
-            statusText = line
-        }
+        await engine.memory.loadGraph()
+        statusText = engine.memory.graphLoadError ?? "Knowledge graph refreshed"
     }
 
     @MainActor
@@ -90,9 +82,28 @@ extension AppModel {
             return outcome
         }
         do {
-            let run = try await SwiftNativeResearchClient(dataRoot: engine.dataRoot).runResearchLab(objective: trimmed, maxResults: 5)
-            engine.desk.researchRuns.removeAll { $0.id == run.id }
-            engine.desk.researchRuns.insert(run, at: 0)
+            let root = engine.dataRoot
+            let chain = engine.bridgeToolDispatchClient(fileAccess: "read_only")
+            let host = AppToolExecutor.authoredProgramHost(dataRoot: root) { id, input in
+                do {
+                    let admission = try await AuthoredToolEffects.$admissionOnly.withValue(true) {
+                        try await chain.dispatch(tool: "app", input: ["action": .string("authored." + id),
+                            "args": .object(input)], surface: "chat")
+                    }
+                    if case .object(let fields) = admission, fields["status"] == .string("admitted") { return nil }
+                    return admission
+                } catch { return ChatToolOutcome.failure(error: error, tool: id) }
+            }
+            let run = try await SwiftNativeResearchClient(dataRoot: root).runResearchLab(objective: trimmed, maxResults: 5) { input in
+                let result: PartCallResult<ResearchLabProposal> = await OwnedProgramInvocation.$host.withValue(host) {
+                    await Parts(root: root).call(id: "research-lab", input: input)
+                }
+                switch result {
+                case .success(let value): return value
+                case .failure(let error): throw error
+                }
+            }
+            engine.desk.recordResearchRun(run)
             let outcome = ResearchLabActionOutcome.recorded(run)
             statusText = CapabilitiesResearchLabPresentation.message(for: outcome).text
             return outcome
@@ -100,22 +111,6 @@ extension AppModel {
             let outcome = ResearchLabActionOutcome.failed(UserFacingError.cause(error, action: "start the research run"))
             statusText = CapabilitiesResearchLabPresentation.message(for: outcome).text
             return outcome
-        }
-    }
-
-    /// Reads the exact persisted Research Lab receipt store. A failed read
-    /// retains prior rows rather than silently replacing them with an empty run
-    /// history, so a panel can distinguish "no runs" from "could not read".
-    func refreshResearchLabRunsForCapabilities() async -> CapabilitiesResearchLabPresentation.RunList {
-        do {
-            let rows = try await engine.desk.listResearchRuns()
-            engine.desk.researchRuns = rows
-            return CapabilitiesResearchLabPresentation.list(rows: rows)
-        } catch {
-            return CapabilitiesResearchLabPresentation.unavailableList(
-                detail: UserFacingError.cause(error, action: "list research runs"),
-                retained: engine.desk.researchRuns
-            )
         }
     }
 
@@ -171,7 +166,7 @@ extension AppModel {
                 kind: "local"
             )
             do {
-                capabilityCatalogSources = try await engine.trust.catalogSources()
+                try await engine.trust.refreshCatalogSources()
             } catch {
                 let detail = UserFacingError.cause(error, action: "reload the catalog")
                 setFailureStatus("Capability source saved, but the catalog couldn't reload. \(detail)", cause: error)
@@ -188,26 +183,42 @@ extension AppModel {
 
     @MainActor
     func checkCapabilityUpdates() async {
+        _ = await capabilityUpdatesRead.read({ () async -> Result<CapabilityUpdateCheck, Error> in
+            do {
+                let checked = try await engine.trust.checkCapabilityUpdates()
+                try? await engine.trust.refreshCatalogSources()
+                return Result.success(checked)
+            }
+            catch { return .failure(error) }
+        }, publish: { result in
         do {
-            latestCapabilityUpdateCheck = try await engine.trust.checkCapabilityUpdates()
-            capabilityCatalogSources = (try? await engine.trust.catalogSources()) ?? capabilityCatalogSources
+            latestCapabilityUpdateCheck = try result.get()
             statusText = latestCapabilityUpdateCheck?.status == "unavailable"
                 ? "Capability update checking is unavailable; source versions are not compared."
                 : "Capability updates checked"
         } catch {
             setFailureStatus(error, action: "check for updates")
         }
+        })
     }
 
     @MainActor
     func evaluateCapabilityTrust(_ capability: CapabilityRecord) async {
+        _ = await capabilityEvaluationRead.read({ () async -> Result<CapabilityTrustEvaluation, Error> in
+            do {
+                let evaluation = try await engine.trust.evaluateCapability(id: capability.id)
+                _ = await engine.trust.refreshCapabilityCatalog()
+                return Result.success(evaluation)
+            }
+            catch { return .failure(error) }
+        }, publish: { result in
         do {
-            latestCapabilityTrustEvaluation = try await engine.trust.evaluateCapability(id: capability.id)
-            engine.trust.capabilityNetwork = try? await engine.trust.loadCapabilityNetwork()
+            latestCapabilityTrustEvaluation = try result.get()
             statusText = "Capability trust evaluated"
         } catch {
             setFailureStatus(error, action: "evaluate that against trust")
         }
+        })
     }
 
     @MainActor
@@ -216,9 +227,8 @@ extension AppModel {
             _ = try await NativeActionRoutes.runNativeAction(
                 id: action.id, dryRun: dryRun, input: [:], dataRoot: dataRootOverride, browser: .app
             )
-            nativeActionReceipts = await RuntimeReadProjection.tailJSONL(
-                path: NativeActionRoutes.nativeActionReceiptsPath(dataRoot: engine.dataRoot), limit: 50)
-            engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
+            _ = await engine.tools.refreshNativePower()
+            await engine.approvals.refresh()
             statusText = "Native action recorded"
         } catch {
             setFailureStatus(error, action: "run that action")
@@ -236,17 +246,9 @@ extension AppModel {
 
         do {
             let receipt = try await nextGenActionReceipt(id: id, dryRun: dryRun)
-            latestNextGenReceipt = receipt
-            nextGenReceipts = NextGenStatusProjection.merging([receipt], into: nextGenReceipts)
-            if let snapshot = await decodeLogged("nextgen snapshot", {
-                try await NextGenStatusProjection(dataRoot: engine.dataRoot).snapshot()
-            }) {
-                nextGenSummary = snapshot.summary
-                nextGenPhases = snapshot.phases
-                nextGenReceipts = NextGenStatusProjection.merging([receipt] + snapshot.receipts, into: nextGenReceipts)
-            }
+            _ = await decodeLogged("nextgen snapshot") { try await engine.nextGen.snapshot() }
             let label = dryRun ? "Next-gen dry run" : "Next-gen action"
-            statusText = "\(label): \(latestNextGenReceipt?.displayStatus ?? "recorded")"
+            statusText = "\(label): \(receipt.displayStatus)"
             return true
         } catch {
             setFailureStatus(error, action: "run the next-gen probe")
@@ -264,11 +266,11 @@ extension AppModel {
     @MainActor
     func runBrowserDryRun(url: String = "https://example.com") async {
         do {
-            latestBrowserRun = try await BrowserActionRoutes.app.runBrowser(
+            let run = try await BrowserActionRoutes.app.runBrowser(
                 url: url, dryRun: true, captureSource: false, captureScreenshot: false, dataRoot: engine.dataRoot
             )
-            browserRuntimeStatus = try? await RuntimeReadProjection.getBrowserStatus(dataRoot: engine.dataRoot)
-            statusText = "Browser dry run: \(latestBrowserRun?.status ?? "recorded")"
+            _ = await engine.tools.refreshNativePower()
+            statusText = "Browser dry run: \(run.status)"
         } catch {
             setFailureStatus("Browser run failed: " + UserFacingError.cause(error, action: "run the browser"), cause: error)
         }
@@ -277,9 +279,9 @@ extension AppModel {
     @MainActor
     func cancelBrowserRun() async {
         do {
-            latestBrowserRun = try await BrowserActionRoutes.app.cancelBrowserRun(id: latestBrowserRun?.id, dataRoot: engine.dataRoot)
-            browserRuntimeStatus = try? await RuntimeReadProjection.getBrowserStatus(dataRoot: engine.dataRoot)
-            statusText = "Browser run \(latestBrowserRun?.status ?? "canceled")"
+            let run = try await BrowserActionRoutes.app.cancelBrowserRun(id: engine.tools.browserStatus?.latestReceipt?.id, dataRoot: engine.dataRoot)
+            _ = await engine.tools.refreshNativePower()
+            statusText = "Browser run \(run.status)"
         } catch {
             setFailureStatus(error, action: "cancel the browser run")
         }
@@ -288,17 +290,16 @@ extension AppModel {
     @MainActor
     func showVisibleBrowser() async {
         BrowserWindowController.shared.showWindow()
-        browserRuntimeStatus = try? await RuntimeReadProjection.getBrowserStatus(dataRoot: engine.dataRoot)
+        _ = await engine.tools.refreshNativePower()
         statusText = "Visible Browser opened."
     }
 
     @MainActor
     func runConnectorAction(_ action: ConnectorActionRecord) async {
         do {
-            latestConnectorActionReceipt = try await ConnectorActions(platform: AppConnectorActionPlatform(dataRoot: engine.dataRoot))
-                .runConnectorAction(id: action.id, dryRun: true)
-            connectorActionRegistry = try? await ConnectorActionRegistry.read(dataRoot: engine.dataRoot, platform: AppConnectorStatusPlatform())
-            statusText = "Connector action: \(latestConnectorActionReceipt?.status ?? "recorded")"
+            let receipt = try await runConnectorAction(id: action.id, dryRun: true)
+            _ = try? await engine.connectors.refreshActions()
+            statusText = "Connector action: \(receipt.status)"
         } catch {
             setFailureStatus(error, action: "run that connector action")
         }
@@ -307,9 +308,9 @@ extension AppModel {
     @MainActor
     func runImprovementGauntlet() async {
         do {
-            latestGauntletRun = try await ImprovementGauntletRun.run(dataRoot: engine.dataRoot)
-            improvementGauntletStatus = try? await RuntimeReadProjection.swiftImprovementGauntlet(dataRoot: engine.dataRoot)
-            statusText = "Gauntlet: \(latestGauntletRun?.status ?? "recorded")"
+            let run = try await ImprovementGauntletRun.run(dataRoot: engine.dataRoot)
+            _ = await engine.doctor.refreshHardening()
+            statusText = "Gauntlet: \(run.status)"
         } catch {
             setFailureStatus("Gauntlet failed: " + UserFacingError.cause(error, action: "run the gauntlet"), cause: error)
         }
@@ -369,7 +370,7 @@ extension AppModel {
                 statusText = "\(label) failed verification: \(detail)"
                 return .failed(support: support, detail: detail)
             }
-            productionExports = verification.records
+            engine.doctor.recordProductionExports(verification.records)
             statusText = "\(label) created and verified: \(export.id)"
             return .verified(export)
         } catch {

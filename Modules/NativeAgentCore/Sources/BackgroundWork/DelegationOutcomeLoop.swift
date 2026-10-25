@@ -2,6 +2,7 @@ import Foundation
 import BackgroundLoops
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `DelegationOutcomeLoop.swift` | Delegation terminal snapshots, exact durable cursor, outcome/liveness classification and settlement runner |
 
 // MARK: - Delegation outcome cards (W2b, upgrade campaign 2026-08 Track A)
 //
@@ -818,6 +819,7 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
 
 public struct DelegationOutcomeLoop: LoopRunner {
     public let loopId: String = "delegation_outcome"
+    public static let workRemaining = Notification.Name("NativeAgent.delegation.outcomeWorkRemaining")
     public let interval: TimeInterval
     public var tickTimeoutOverride: TimeInterval? { 120 }
 
@@ -830,10 +832,9 @@ public struct DelegationOutcomeLoop: LoopRunner {
     /// Records downstream transition evidence. `false` keeps the cursor
     /// unsettled so the same transition is retried on the next reconciliation.
     private let observeTransition: @Sendable (DelegationJobSnapshot) async -> Bool
-    /// Reports whether this tick left outcomes unsettled (the per-tick card cap
-    /// or a contiguous-settlement stop). The owner uses it to schedule a
-    /// near-term rerun instead of letting the remainder wait for the next store
-    /// event or the six-hour sweep.
+    /// Reports a healthy per-tick cap remainder after the cursor is durable.
+    /// The owner requests one coalesced continuation. Failed settlement or
+    /// unavailable state waits for a source/repair event or the integrity sweep.
     private let reportDeferral: @Sendable (Bool) async -> Void
     private let readHandledOutcomes: @Sendable () async throws -> Set<String>
     private let cursorPath: URL
@@ -1015,10 +1016,12 @@ public struct DelegationOutcomeLoop: LoopRunner {
 
         var filed = 0
         var failed = 0
+        var receiptsRecorded = 0
         for job in batch {
             if ["delivered", "owed", "sent_unconfirmed", "failed_before_answer", "legacy_before_receipts", "let_go"].contains(job.deliveryOutcome ?? "") {
                 cursor.record(source: job.source, id: job.id, outcome: job.terminalOutcome,
                               deliveryReceiptVersion: job.deliveryReceiptVersion)
+                receiptsRecorded += 1
                 continue
             }
             guard let card = DelegationOutcomeCard.make(from: job, now: now) else { continue }
@@ -1056,16 +1059,9 @@ public struct DelegationOutcomeLoop: LoopRunner {
         }
 
         let writeFailures = failed + livenessFailed
-        let failureDeferred = max(0, batch.count - filed - failed)
+        let failureDeferred = max(0, batch.count - filed - failed - receiptsRecorded)
         let livenessFailureDeferred = max(0, livenessBatch.count - livenessFiled - livenessFailed)
         let totalDeferred = deferred + failureDeferred + livenessDeferred + livenessFailureDeferred
-        // 2026-09-06: the per-tick card cap and contiguous settlement are the
-        // only reasons work is left over, and neither has a deadline of its
-        // own. Without this the remainder waited for the next STORE EVENT or
-        // the six-hour integrity sweep. The owner turns it into a near-term
-        // rerun; reporting `false` clears it again.
-        await reportDeferral(totalDeferred > 0 || writeFailures > 0)
-
         do {
             try cursor.write(to: cursorPath)
         } catch {
@@ -1074,6 +1070,12 @@ public struct DelegationOutcomeLoop: LoopRunner {
             // otherwise re-file everything this tick just filed.
             return .failed(error: "delegation outcome cursor write failed after \(filed) card(s): \(error)")
         }
+        // A cap leaves known, selectable work behind; a failure does not.
+        // Publish only after the cursor advances, so a failed write cannot
+        // turn the same unsettled batch into a self-sustaining retry loop.
+        await reportDeferral(!Task.isCancelled && stampsMayAdvance && writeFailures == 0
+            && recoveryNote == nil && deferred + livenessDeferred > 0
+            && filed + livenessFiled + receiptsRecorded > 0)
 
         var result = "filed \(filed) delegation outcome card(s)"
         if let recoveryNote { result += "; \(recoveryNote)" }

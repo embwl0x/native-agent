@@ -2,8 +2,10 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import ProviderRouting
+// Blueprint: | `AppToolPorts.swift` | `BrowserToolPlatformPort` struct; `QuietToolPresentationPort` supplies mounted visible-page input separately from the Advanced sidebar page |
 
 public struct BrowserToolPlatformPort: Sendable {
     public let setUpChrome: @Sendable () async throws -> (folder: URL?, message: String)
@@ -52,11 +54,11 @@ public struct BrowserToolPlatformPort: Sendable {
     /// One `mind_run` verb, through the call its Dreams, Self-Improvement or
     /// Observatory control makes.
     func runMind(verb: String, input: [String: JSONValue]) async -> (ok: Bool, detail: String, fields: [String: JSONValue])
-    /// One `skill_manage` verb, through the Skills and Tools pages' own calls.
+    /// One `ability_manage` verb (`Parts`), as the Tools page's own calls make it.
     /// `steer` names the peers steering this turn (`PeerDataTaint.carried`).
-    func manageSkill(verb: String, input: [String: JSONValue], steer: [String]) async -> (ok: Bool, detail: String, fields: [String: JSONValue])
-    /// The `connections` tool's verbs, through the Connectors, Telegram and
-    /// MCP pages' own buttons. Core has already refused the raising ones.
+    func managePart(verb: String, input: [String: JSONValue], steer: [String]) async -> (ok: Bool, detail: String, fields: [String: JSONValue])
+    /// The `connections` tool's verbs, through the Connectors and Telegram
+    /// pages' own buttons. Core has already refused the raising ones.
     func connections(verb: String, input: [String: JSONValue]) async -> JSONValue
     /// One `provider` verb, through the call the Providers page's button makes.
     func provider(verb: String, input: [String: JSONValue]) async -> JSONValue
@@ -68,6 +70,7 @@ public struct QuietComposerOutcome: Sendable {
     public var detail: String
     public var status: String
     public var refusal: (reason: String, detail: String, effects: ToolFailureError.Effects)?
+    public var remedy: JSONValue? = nil
     public init(changed: Bool, element: String, detail: String, refusal: (reason: String, detail: String, effects: ToolFailureError.Effects)?, status: String = "ok") {
         self.changed = changed; self.element = element; self.detail = detail; self.refusal = refusal; self.status = status
     }
@@ -84,6 +87,7 @@ public typealias QuietToolPage = NativeAgentShared.QuietToolPage
 @MainActor public protocol QuietToolPresentationPort: Sendable {
     var pages: [QuietToolPage] { get }
     var currentPage: QuietToolPage? { get }
+    var visiblePageInput: [String: JSONValue]? { get }
     func page(named: String) -> QuietToolPage?
     func contextReceiptRead(input: [String: JSONValue]) async -> JSONValue
     func agentViewRead(input: [String: JSONValue]) async -> JSONValue
@@ -107,7 +111,6 @@ public typealias QuietToolPage = NativeAgentShared.QuietToolPage
     func cardFields(_ interaction: InlineInteraction, descriptor: InlineInteractionDescriptor) -> [String: JSONValue]
     func receiptEnvelope(_ interaction: InlineInteraction) -> JSONValue
     func liveOutcomeSummary(_ interaction: InlineInteraction, dataRoot: URL) async -> String?
-    func saveConnectorToken(_ value: String, connector: String, dataRoot: URL) async -> String?
 }
 
 /// Desktop/Grok effects are still supplied by the app's platform adapters.

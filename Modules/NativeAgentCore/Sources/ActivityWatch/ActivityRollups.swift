@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ActivityRollups.swift` | `ActivityRollups`: timezone-relative buckets, top apps and exemplars; span overlap is clipped to the requested range |
+
 // MARK: - Rollup shapes
 
 /// One bucket of time in the ASKING timezone.
@@ -92,8 +94,6 @@ public struct ActivityAnswerBundle: Sendable, Equatable {
     public let exemplars: [ActivitySpan]
     /// Rows the cap removed, across every section. Reported, never silent.
     public let truncatedSections: [String]
-    /// Every row this answer contains. Pinned by a test at <= `rowCap`.
-    public var rowCount: Int { topApps.rows.count + buckets.count + exemplars.count }
 
     public init(
         from: Double, to: Double, timezoneIdentifier: String, totalSeconds: Double,

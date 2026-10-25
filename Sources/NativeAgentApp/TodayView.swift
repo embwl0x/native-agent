@@ -23,10 +23,8 @@ import AppToolRuntime
 // Every row still comes from a real reader — an absent source renders as
 // absence, never as invented copy:
 //
-//   moments awaiting review  SwiftNativeMemoryV2.listProposals(status:"pending")
-//                            filtered by MemoryMoments.isMoment(metadata)
 //   moments she kept         SwiftNativeMemoryV2.listMemory(kind: "moment")
-//   last night's dream       AppModel.fetchDreamDiary → dream_diary/<date>.md
+//   last night's dream       engine.today → engine.cognitionView.dreamDiary
 //   something she's facing   NativeCognitionRuntime.towardRead() (horizon)
 //   she wrote up the night   ChatSessionRecollections (compaction_summary rows)
 //   approvals / notifications engine.approvals.records + engine.inbox.items
@@ -44,7 +42,6 @@ import SwiftUI
 import ApprovalTransactions
 import NotificationInbox
 import NativeAgentShared
-import ChatOrchestration
 import NativeAgentCore
 import CognitiveSubstrate
 import PersistenceCore
@@ -55,6 +52,7 @@ import ApprovalInbox
 import Cognition
 import DeviceSync
 import DreamREMCycle
+// Blueprint: | `TodayView.swift` | Visible Today lanes and activity from `engine.today`; waiting shares WorkOverview with quiet Today; engine layout renders current blocks; note actions use `engine.inbox`; local row/sheet interaction state |
 
 // MARK: - Palette
 
@@ -195,46 +193,25 @@ struct TodayView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    @State private var snapshot = TodaySnapshot.empty
-    @State private var laneReadCount = 0
-    @State private var collaborationMessages: [String: [ChatMessage]] = [:]
-    @AppStorage(DisplayTimeZone.key) private var displayTimeZone = ""
-    @State private var didRows: [TodayRow] = []
-    @State private var earlierNotes: [TodayEarlierNote] = []
-    @State private var noteItems: [String: InboxItemRecord] = [:]
-    @State private var dreamUnavailable = false
+    private var today: TodayProjection { appModel.engine.today }
+    private var snapshot: TodaySnapshot { today.snapshot }
+    private var didRows: [TodayRow] { today.didRows }
+    private var earlierNotes: [TodayEarlierNote] { today.earlierNotes }
+    private var noteItems: [String: InboxItemRecord] { today.noteItems }
+    private var dreamUnavailable: Bool { today.dreamUnavailable }
     @State private var openedNote: InboxItemRecord?
     @State private var noteFlight = InboxRowActionFlight()
     @State private var earlierOpen = false
     /// The full queue a route (⌘⇧A, ⌘⇧I, a notification) or the quiet line
     /// at the foot of the page opened.
     @State private var sheet: ActivitySection?
-    /// Standing views waiting on him — not mirrored into AppModel, so this
-    /// mounted owner reads the runtime and follows its change stream.
-    @State private var cognitionSubscription = ActivityCognitionSubscription()
-
-    private struct RowInput: Equatable, Sendable {
-        let snapshot: TodaySnapshot
-        let collaboration: [String: [ChatMessage]]
-        let inbox: [InboxItemRecord]
-        let sessions: [ChatSession]
-        let activeSessionID: String
-        let messages: [ChatMessage]
-        let day: Date
-        let timeZone: String
-    }
-
-    private var rowInput: RowInput {
-        RowInput(snapshot: snapshot, collaboration: collaborationMessages,
-                 inbox: appModel.engine.inbox.items, sessions: appModel.engine.transcripts.sessions,
-                 activeSessionID: appModel.activeChatSessionId, messages: appModel.chatMessages,
-                 day: DisplayTimeZone.calendar.startOfDay(for: Date()), timeZone: DisplayTimeZone.current.identifier)
-    }
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
                 AlivePageHeader(title: "Today", line: headerLine)
+                if let error = snapshot.projectionError {
+                    Text(error).font(.caption).foregroundStyle(.secondary)
+                }
 
                 PageReadStatus(
                     isReading: isReading,
@@ -242,13 +219,13 @@ struct TodayView: View {
                 )
 
                 // The page's blocks in the layout's order (ui/layout.json, today).
-                let blocks = SurfaceLayoutLive.shared.layout.shown("today", profile: SimpleViewMode.advanced).map(\.name)
+                let blocks = appModel.engine.layout.layout.shown("today", profile: SimpleViewMode.advanced).map(\.name)
                 let waiting = blocks.contains("waiting") && hasWaiting
                 let earlier = blocks.contains("earlier") ? Self.earlierNotesLine(earlierNotes) : nil
                 let did = blocks.contains("did") ? didRows : []
-                let ahead = blocks.contains("ahead") ? WorkOverviewRead.aheadRows(snapshot) : []
+                let ahead = blocks.contains("ahead") ? snapshot.ahead : []
                 let empty = !waiting && did.isEmpty && ahead.isEmpty && earlier == nil
-                    && snapshot.loaded && !snapshot.memoryUnreadable && !dreamUnavailable
+                    && snapshot.loaded && !snapshot.memoryUnreadable && !dreamUnavailable && snapshot.projectionError == nil
                 ForEach(blocks, id: \.self) { block in
                     switch block {
                     case "waiting" where waiting:
@@ -336,12 +313,11 @@ struct TodayView: View {
                 onAction: { actionID in
                     let outcome = await noteFlight.perform {
                         try await InboxCardActions.perform(item.id, action: actionID,
-                            dataRootOverride: appModel.dataRootOverride, effects: AppInboxCardActionEffects())
+                            dataRootOverride: appModel.dataRootOverride, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
                     }
                     if case .succeeded = outcome {
-                        await appModel.engine.inbox.publishAfterAction {
-                            _ = await appModel.refreshForSidebarItem(.activity)
-                        }
+                        _ = await appModel.refreshForSidebarItem(.activity)
+                        if let sync = appModel.engine.deviceSync { await sync.engine.writeSnapshots() }
                     }
                     return outcome
                 },
@@ -368,9 +344,7 @@ struct TodayView: View {
                 appModel.pendingActivitySectionRaw = nil
                 openSection(raw)
             }
-            cognitionSubscription.start()
         }
-        .onDisappear { cognitionSubscription.stop() }
         .onReceive(NotificationCenter.default.publisher(for: .openActivitySectionRequest)) { note in
             guard !quietOffscreenRead else { return }
             appModel.pendingActivitySectionRaw = nil
@@ -380,46 +354,21 @@ struct TodayView: View {
             guard !quietOffscreenRead else { return }
             sheet = nil
         }
-        // Queue and memory changes share one coalesced refresh, re-armed
-        // whenever the window comes back to the front.
-        .liveTask(id: "\(scenePhase)-\(displayTimeZone)") {
-            guard scenePhase == .active else { return }
-            let root = PersistenceCore.defaultDataRoot()
-            await EventDeadlinePhysiology.refreshOnChanges(paths: [
-                root.appendingPathComponent("workflows/approvals/requests.json"),
-                root.appendingPathComponent("notifications/inbox.jsonl"),
-                root.appendingPathComponent("memory/memory.sqlite"),
-                root.appendingPathComponent("memory/memory.sqlite-wal"),
-                root.appendingPathComponent("trust/policy.json"),
-                root.appendingPathComponent("scheduler/jobs.json"),
-            ], notifications: [.NSSystemTimeZoneDidChange, .NSCalendarDayChanged]) {
-                // The Activity queues (approvals + notifications) are AppModel's,
-                // and this page is now their only landing. Reuse the existing
-                // five-queue read rather than opening a second door onto them.
-                _ = await appModel.refreshForSidebarItem(.activity)
-                await loadHerLanes()
+        .liveTask(id: [String(describing: scenePhase), appModel.activeChatSessionId] + WorkOverviewRead.todaySessionIDs(appModel.engine)) {
+            if scenePhase == .active {
+                today.start(engine: appModel.engine,
+                    activeSessionID: { appModel.activeChatSessionId },
+                    refreshQueues: { _ = await appModel.refreshForSidebarItem(.activity) },
+                    publishWorkStatus: { await appModel.publishWorkStatus() })
+            } else {
+                today.stop()
             }
         }
-        // The visible page is loaded by the watcher above; the offscreen copy
-        // a quiet read mounts has no watcher, so it reads the same lanes once.
+        .onDisappear { if !quietOffscreenRead { today.stop() } }
         .quietReadTask(live: false) {
             _ = await appModel.refreshForSidebarItem(.activity)
-            await loadHerLanes()
-        }
-        .task(id: rowInput) {
-            let input = rowInput
-            let surfaces = WorkOverviewRead.conversationSurfaces(input.sessions)
-            let rows = await Task.detached {
-                let did = WorkOverviewRead.didTodayRows(input.snapshot, input.collaboration,
-                    inbox: input.inbox, sessions: input.sessions, surfaces: surfaces, activeSessionID: input.activeSessionID,
-                    messages: input.messages, parseTimestamp: UserDisplayFormatters.parseISOTimestamp)
-                let earlier = WorkOverviewRead.earlierNotes(input.inbox)
-                let notes = Dictionary(WorkOverviewRead.todayNotes(input.inbox, input.snapshot)
-                    .map { ($0.row.id, $0.item) }, uniquingKeysWith: { first, _ in first })
-                return (did, earlier, notes)
-            }.value
-            guard !Task.isCancelled, input == rowInput else { return }
-            (didRows, earlierNotes, noteItems) = rows
+            await appModel.publishWorkStatus()
+            await today.refresh(appModel.engine, activeSessionID: appModel.activeChatSessionId)
         }
     }
 
@@ -443,13 +392,10 @@ struct TodayView: View {
     }
 
     private var queuesLine: some View {
-        let standing = cognitionSubscription.pending.count
+        let standing = today.pending.count
         let inboxCount = appModel.ownerWaitingKinds?[.inbox] ?? 0
         // An unreadable queue says so; it never passes for an empty one.
-        let standingUnavailable: String? = {
-            if case .unavailable(let detail) = cognitionSubscription.state { return detail }
-            return nil
-        }()
+        let standingUnavailable = today.cognitionUnavailable
         let entries: [(ActivitySection, String)] = [
             (.approvals, ActivitySection.approvals.sheetTitle),
             (.inbox, ActivitySection.inbox.sheetTitle
@@ -478,7 +424,7 @@ struct TodayView: View {
     /// looked yet does not get to say "nothing is waiting".
     private var headerLine: String? {
         guard snapshot.loaded else { return nil }
-        let hour = DisplayTimeZone.calendar.component(.hour, from: Date())
+        let hour = Calendar.autoupdatingCurrent.component(.hour, from: Date())
         let part = hour < 12 ? "morning" : hour < 17 ? "afternoon" : "evening"
         let did = didRows.count
         let day: String
@@ -521,22 +467,13 @@ struct TodayView: View {
     // MARK: loading
 
     private var isReading: Bool {
-        !snapshot.loaded || laneReadCount > 0 || appModel.panelRefreshCounts[.activity, default: 0] > 0
+        !snapshot.loaded || today.isReading || appModel.panelRefreshCounts[.activity, default: 0] > 0
     }
-
-    private func loadHerLanes() async {
-        laneReadCount += 1
-        defer { laneReadCount -= 1 }
-        (snapshot, collaborationMessages, dreamUnavailable) = await WorkOverviewRead.readLanes(appModel.engine,
-            fetchDiary: { await appModel.fetchDreamDiary(limit: 1) },
-            publishWorkStatus: { await appModel.publishWorkStatus() })
-    }
-
 
     private func readDream(_ date: String) async -> Bool {
         guard let entry = await appModel.fetchDreamEntry(date: date),
               !entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            dreamUnavailable = true
+            today.dreamUnavailable = true
             return false
         }
         _ = NativeAgentAppCoordinator.shared.request(.sidebar(.dreams))
@@ -610,6 +547,7 @@ struct TodayAhead: View {
 /// The one card that exists only when something is actually waiting on him.
 /// It NAMES each thing and carries the action beside it.
 struct TodayWaitingCard: View {
+    @Environment(AppModel.self) private var appModel
     let approvals: [ApprovalRecord]
     /// Desk items waiting on him; one row that opens the Desk.
     var deskCount = 0
@@ -618,20 +556,7 @@ struct TodayWaitingCard: View {
     /// The full request behind an approval, and the decisions already made.
     var onOpenApprovals: (() -> Void)? = nil
 
-    /// Says what the count holds: Desk items and notes by name, or just
-    /// "things" when it holds anything else or could not be told apart.
-    private var deskLine: String {
-        func counted(_ n: Int, _ one: String, _ many: String) -> String {
-            "\(DeskPageWords.spelledLower(n)) \(n == 1 ? one : many)"
-        }
-        let needs = deskCount == 1 ? "needs" : "need"
-        guard let (items, notes) = split else {
-            return TodayWords.capitalizedFirst("\(counted(deskCount, "thing", "things")) \(needs) your answer.")
-        }
-        let parts = [items > 0 ? counted(items, "Desk item", "Desk items") : nil,
-                     notes > 0 ? counted(notes, "note", "notes") : nil].compactMap { $0 }
-        return TodayWords.capitalizedFirst("\(parts.joined(separator: " and ")) \(needs) your answer.")
-    }
+    private var deskLine: String { appModel.engine.today.waitingLine(count:deskCount,split:split) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
@@ -662,6 +587,9 @@ struct TodayWaitingCard: View {
                 }
             }
             .accessibilityIdentifier("today.waiting-for-you")
+        }
+        .quietReadTask(id:[deskCount,split?.items ?? -1,split?.notes ?? -1]) {
+            if deskCount > 0 { await appModel.engine.today.prepareWaiting(appModel.engine,count:deskCount,split:split) }
         }
     }
 }
@@ -947,96 +875,5 @@ struct TodayTimelineRow: View {
         withAnimation(NativeAgentMotion.respecting(
             NativeAgentMotion.arrive, reduceMotion: reduceMotion
         )) { isOpen.toggle() }
-    }
-}
-
-/// Owns Activity's live proposal projection while the Activity root is mounted.
-/// The runtime stream is armed before the first read, so a cognition change
-/// cannot land between a stale snapshot and the subscription. Revisions are
-/// monotonic and duplicate/late notifications are ignored; each reload is
-/// awaited before another begins, keeping burst work bounded.
-@MainActor
-@Observable
-final class ActivityCognitionSubscription {
-    enum State: Equatable {
-        case idle
-        case active
-        case unavailable(String)
-        case stopped
-    }
-
-    private let cognition: CognitionViewFacade
-    @ObservationIgnored private var consumeTask: Task<Void, Never>?
-    @ObservationIgnored private var generation: UInt64 = 0
-
-    private(set) var pending = CognitionProposalsFeed.Pending()
-    private(set) var state: State = .idle
-    private(set) var lastRevision: UInt64?
-
-    init(cognition: CognitionViewFacade = NativeAgentEngine.live.cognitionView) {
-        self.cognition = cognition
-    }
-
-    func start() {
-        guard consumeTask == nil else { return }
-        generation &+= 1
-        let currentGeneration = generation
-        state = .idle
-        consumeTask = Task { [weak self, cognition] in
-            let changes = await cognition.changes()
-            guard let self, !Task.isCancelled, self.isCurrent(currentGeneration) else { return }
-            await self.refresh(currentGeneration)
-
-            for await change in changes {
-                guard !Task.isCancelled, self.isCurrent(currentGeneration) else { break }
-                guard Self.shouldRefresh(for: change, after: self.lastRevision) else { continue }
-                self.lastRevision = change.revision
-                await self.refresh(currentGeneration)
-            }
-
-            self.finish(currentGeneration, cancelled: Task.isCancelled)
-        }
-    }
-
-    func stop() {
-        generation &+= 1
-        consumeTask?.cancel()
-        consumeTask = nil
-        state = .stopped
-    }
-
-    static func shouldRefresh(
-        for change: NativeCognitionRuntimeChange,
-        after lastRevision: UInt64?
-    ) -> Bool {
-        guard let lastRevision else { return true }
-        return change.revision > lastRevision
-    }
-
-    private func isCurrent(_ candidate: UInt64) -> Bool {
-        candidate == generation
-    }
-
-    private func refresh(_ currentGeneration: UInt64) async {
-        guard isCurrent(currentGeneration) else { return }
-
-        let read = await cognition.pendingProposals()
-        guard isCurrent(currentGeneration) else { return }
-        switch read {
-        case .available(let next):
-            if pending != next { pending = next }
-            state = .active
-        case .unavailable(let detail):
-            if pending != .init() { pending = .init() }
-            state = .unavailable(detail)
-        }
-    }
-
-    private func finish(_ currentGeneration: UInt64, cancelled: Bool) {
-        guard isCurrent(currentGeneration) else { return }
-        consumeTask = nil
-        state = cancelled
-            ? .stopped
-            : .unavailable("Cognition update subscription ended. Refresh Activity to retry.")
     }
 }

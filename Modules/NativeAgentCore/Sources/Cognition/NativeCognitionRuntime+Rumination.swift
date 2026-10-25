@@ -3,13 +3,16 @@
 // other. Canonical Desk events own the replay, never a user turn.
 
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
+import AgentWorkspace
 import BackgroundLoops
 import CognitiveSubstrate
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Desk
+
+// Blueprint: | `NativeCognitionRuntime+Rumination.swift` | `NativeCognitionRuntime` rumination bridge: bounded payload-free Desk commitments and moment evidence passed into substrate rumination law |
 
 extension NativeCognitionRuntime {
 
@@ -29,17 +32,6 @@ extension NativeCognitionRuntime {
     /// conversation) or when it ages past three days. A complete owner read
     /// confirms that release; exclusion by the window never does.
     private static let maximumMomentRuminations = 4
-
-    /// Ask the clock, claim the window, read off the turn path. Cheap enough to
-    /// call from the ordinary body-sample cadence.
-    func refreshDeskRuminationsIfStale(at now: Date) async {
-        guard !isFlushedForTermination else { return }
-        guard await substrate.externalRuminationsAreStale(at: now) else { return }
-        // Claimed BEFORE the load so a burst of turns starts one read, not one
-        // each. A failed read simply waits out the window.
-        await substrate.noteExternalRuminationRefreshStarted(at: now)
-        await startPursuitRefresh()
-    }
 
     /// Map canonical Desk rows to the payload-free shape the lane consumes, and
     /// push, with canonical terminal handles as confirmed closures.
@@ -167,6 +159,9 @@ extension NativeCognitionRuntime {
             now: now,
             limit: moments.count
         )
+        let expiry = candidates.map { Self.afterInclusiveBoundary($0.occurredAt.addingTimeInterval(MemoryMoments.ruminationWindow)) }
+            .filter { $0 > now }.min()
+        if let expiry { sourceWakes.pursuitNextAt = min(sourceWakes.pursuitNextAt ?? expiry, expiry) }
         let currentIDs = Set(candidates.map(\.id))
         let closedIDs = Set(priorIDs.filter { $0.hasPrefix("moment:") }).subtracting(currentIDs)
         let recordsByID = Dictionary(moments.map { ("moment:" + $0.id, $0) }, uniquingKeysWith: { first, _ in first })

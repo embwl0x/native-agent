@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ActivitySpanEngine.swift` | `ActivitySpanEngine.process`: capture state transitions, policy gates, source title redaction and store commands |
+
 // MARK: - Clock
 
 public struct SystemActivityClock: Sendable {

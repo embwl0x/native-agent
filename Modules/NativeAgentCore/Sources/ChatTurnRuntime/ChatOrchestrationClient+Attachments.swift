@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 import MacControl
+// Blueprint: | `ChatOrchestrationClient+Attachments.swift` | image/document admission and voice evidence projection; audio remains an attachment, never a provider content block |
 
 extension SwiftNativeChatOrchestrationClient {
     /// Convert delivered `MultimodalAttachment`s into native `.image` content
@@ -108,7 +109,7 @@ extension SwiftNativeChatOrchestrationClient {
         for (index, attachment) in attachments.enumerated() {
             guard let utterance = attachment.utterance else { continue }
             let reference = attachment.path ?? runId.map {
-                attachmentURL(dataRoot: dataRoot, runId: $0, index: index).path
+                attachmentURL(chatRoot: dataRoot.appendingPathComponent("chat"), runId: $0, index: index).path
             } ?? attachment.id
             notes.append(try utterance.evidence(audioReference: reference))
         }

@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceProjection.swift` | `AgentWorkspaceProjection`: async `project` sends Music and helpers through the owned workspace part while native readers retain the other areas; record titles stay native; `AgentWorkspace` binds receipt read refs through the existing workspace name book |
 
 extension AgentWorkspace {
     package static func readReferences(_ reads: [(tool: String, input: [String: JSONValue], title: String)], dataRoot: URL) throws -> [JSONValue] {
@@ -22,7 +23,7 @@ extension AgentWorkspace {
 
     package static func attachReadReferences(tool: String, input: [String: JSONValue], result: JSONValue, dataRoot: URL) -> JSONValue {
         guard case .object(var root) = result, case .array(let messages)? = root["messages"] else { return result }
-        let items = AgentWorkspaceProjection.project(location: .record(tool: tool, input: input, title: "Mail"), result: result).items
+        let items = AgentWorkspaceMail.project(input: input, result: result).items
             .filter { if case .open(.record)? = $0.actions.first?.action { return true }; return false }
         let refs: [JSONValue]
         do { refs = try readReferences(items.compactMap { item in
@@ -52,7 +53,7 @@ extension AgentWorkspace {
 /// A view of an owner's returned evidence. This layer neither reads sources nor
 /// interprets prose as instructions, permissions, completion, or fresh state.
 extension AgentWorkspaceProjection {
-    static func project(location: AgentWorkspaceLocation, result: JSONValue) -> Self {
+    static func project(location: AgentWorkspaceLocation, result: JSONValue, dataRoot: URL) async -> Self {
         // The actual owner receipt retains diagnostics. Navigation needs its
         // evidence, not a second copy of per-call organism instrumentation.
         var result = result
@@ -71,11 +72,21 @@ extension AgentWorkspaceProjection {
             return workspaceContacts(result: result, page: page)
         case .form(let form): return form.projection
         case .page(let source, let page):
-            var view = project(location: source, result: result); view.page = page; return view
+            var view = await project(location: source, result: result, dataRoot: dataRoot); view.page = page; return view
         case .area, .capabilities, .receipt, .openPlaces, .workOverview, .savedWorkspaces, .browserBookmark, .conversations, .arrivals, .find:
             return .init(title: location.title, content: result, items: [], actions: [])
         case .record(let tool, let input, _):
             let title = location.title
+            if tool == "bot_list" {
+                var owned=await WorkspaceReadout.bots(input:input,result:result,dataRoot:dataRoot)
+                owned.title=title
+                return owned
+            }
+            if AgentWorkspaceLife.room(for:tool) == "music" {
+                var owned=await AgentWorkspaceLife.project(tool:tool,input:input,result:result,dataRoot:dataRoot)
+                owned.title=title
+                return owned
+            }
             if tool == "work_context", let query = workspaceText(input["query"]) {
                 return workspaceWork(query: query, result: result, input: input)
             }
@@ -86,7 +97,6 @@ extension AgentWorkspaceProjection {
                 ?? AgentWorkspaceApps.project(tool: tool, input: input, result: result)
                 ?? AgentWorkspaceActivity.project(tool: tool, input: input, result: result)
                 ?? HerScreen.commsProjection(tool: tool, input: input, result: result)
-                ?? AgentWorkspaceLife.project(tool: tool, input: input, result: result)
                 ?? HerScreen.coreProjection(tool: tool, input: input, result: result) {
                 projection.title = title
                 return projection

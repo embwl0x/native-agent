@@ -3,6 +3,8 @@
 import SwiftUI
 import CognitiveSubstrate
 
+// Blueprint: | `CognitionObservatoryView+Proposals.swift` | Observatory growth-week and developmental timeline: readout/receipt presentation from current cognition state |
+
 extension CognitionObservatoryView {
 
     // Standing Views + Schema Proposals rendering moved to CognitionProposalsView
@@ -21,60 +23,22 @@ extension CognitionObservatoryView {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             Text("This week")
                 .font(.caption.weight(.semibold))
-            if week.rows.isEmpty {
-                Text("Nothing settled this week.")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(week.rows, id: \.id) { row in
+            if week.projection.status != .ready {
+                Text("Growth week \(week.projection.status.rawValue): \(week.projection.error?.message ?? week.projection.status.rawValue)")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(week.projection.face?.sections ?? []) { section in
+                ForEach(section.rows) { row in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(row.line)
-                            .font(.caption)
-                            .textSelection(.enabled)
-                        if !row.originExcerpt.isEmpty {
-                            // WHY. The exact line she reflected on, kept with
-                            // the view since formation — not a later summary.
-                            Text(row.originExcerpt)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                                .textSelection(.enabled)
+                        Text(row.title).font(.caption).textSelection(.enabled)
+                        if let detail = row.detail, !detail.isEmpty {
+                            Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
                         }
-                        if row.collapsedEventCount > 0 {
-                            Text("\(row.collapsedEventCount) earlier step(s) collapsed · \(row.lineageId)")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
+                        if let value = row.value, !value.isEmpty {
+                            Text(value).font(.caption2).foregroundStyle(.tertiary)
                         }
                     }
                 }
-            }
-            // WHAT THE LIST IS NOT SHOWING, both kinds, said before the
-            // undertone — the same two lines `growthWeekLines` prints. The Mac
-            // surface rendered neither, so a capped week looked complete here
-            // and an absence of rejections could not be told from rejections
-            // not being drawn (Agent, 2026-09-14).
-            if week.omittedRowCount > 0 {
-                Text("and \(week.omittedRowCount) more this week, not shown")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            if week.hasNoReleases {
-                Text("Nothing was rejected or released this week.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(Array(week.dispositionTransitions.suffix(3).enumerated()), id: \.offset) { _, move in
-                // Which half of the change was time and which was an
-                // experience — the two the old artifact could not separate.
-                Text(String(
-                    format: "undertone %.2f → %.2f (faded %+.2f, %@ moved it %+.2f)",
-                    move.before,
-                    move.afterContribution,
-                    move.afterDecay - move.before,
-                    move.source,
-                    move.afterContribution - move.afterDecay))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
             }
             Divider()
         }

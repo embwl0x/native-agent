@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `PersonaEngine+GrowthVoiceWrites.swift` | `SwiftNativePersonaEngine`: shared document-kind normalization and selection, locked persona mutations and private backups; ordinary persona mutations; skill-specific aliases are retired |
 
 // Persona tool writes hold one cross-process file lock around each target's
 // read, backup and mutation. USER.md remains owned by MemoryV2.
@@ -18,27 +19,22 @@ extension SwiftNativePersonaEngine {
     /// `unicodedata.normalize("NFKC", str(kind or "")).strip().lower()` AND the
     /// Swift `PersonaWriteGuard` canonicalization (same byte form, so a kind that
     /// the guard upgrades resolves here to the same protected doc).
-    static func canonicalizeKind(_ kind: String) -> String {
+    package static func canonicalizeKind(_ kind: String) -> String {
         (kind)
             .precomposedStringWithCompatibilityMapping
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
     }
 
-    /// `[A-Za-z0-9_-]+`, matching the daemon `_validate_skill_name` / `_SKILL_NAME_RE`.
-    /// Resolve the on-disk persona path for a tool `kind` (post-canonicalization).
-    /// SOUL/VOICE/GROWTH/AGENTS live under the persona root; USER is deliberately
-    /// absent because MemoryV2 owns that projection. Routine authoring uses the app door.
-    /// Returns `nil` for an unknown kind.
-    func personaToolPath(kind: String) -> URL? {
-        switch kind {
-        case "soul":   return personaRoot.appendingPathComponent("SOUL.md")
-        case "voice":  return personaRoot.appendingPathComponent("VOICE.md")
-        case "growth": return personaRoot.appendingPathComponent("GROWTH.md")
-        case "agents": return personaRoot.appendingPathComponent("AGENTS.md")
-        default:
-            return nil
-        }
+    package static let personaReadKinds: Set<String> = ["soul", "user", "voice", "growth", "agents"]
+
+    /// Document selection shared by protected tool reads and guarded writes.
+    /// USER is readable here; mutation callers exclude it because MemoryV2
+    /// owns that projection. Routine authoring uses the app door.
+    package static func personaDocumentPath(kind: String, root: URL) -> URL? {
+        let kind = canonicalizeKind(kind)
+        guard personaReadKinds.contains(kind) else { return nil }
+        return root.appendingPathComponent(kind.uppercased() + ".md")
     }
 
     // MARK: - persona_write (full-doc REPLACE + backup)
@@ -61,7 +57,7 @@ extension SwiftNativePersonaEngine {
                 "kind must be one of: \(Self.personaWriteKinds.sorted().joined(separator: ", "))"
             )
         }
-        guard let target = personaToolPath(kind: canon) else {
+        guard let target = Self.personaDocumentPath(kind: canon, root: personaRoot) else {
             throw PersonaWriteError.invalidInput("Could not resolve persona path")
         }
 
@@ -116,7 +112,7 @@ extension SwiftNativePersonaEngine {
             throw PersonaWriteError.invalidInput("title is required")
         }
 
-        guard let target = personaToolPath(kind: canon) else {
+        guard let target = Self.personaDocumentPath(kind: canon, root: personaRoot) else {
             throw PersonaWriteError.invalidInput("Could not resolve persona path")
         }
 

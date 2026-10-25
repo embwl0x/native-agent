@@ -1,4 +1,5 @@
 import AuthoredCapabilities
+import ActivityWatch
 import Foundation
 import Context
 import OSLog
@@ -6,23 +7,23 @@ import ApprovalTransactions
 import BackgroundLoops
 import BackgroundWork
 import Browser
-import ChatOrchestration
+import ChatTurnRuntime
 import ChatToolRuntime
 import ChatSessionWork
 import Cognition
 import Connectors
 import ContextFlow
 import Desk
-import GitHubConnector
 import MemoryV2
 import NativeAgentCore
 import NotificationInbox
 import PersistenceCore
+import Procedures
 import PersonaEngine
-import SlackConnector
 import Transcripts
 import TurnTrace
 import WorkshopExecution
+import AgentConversations
 import Agents
 import AppToolRuntime
 import ApprovalInbox
@@ -34,7 +35,6 @@ import DreamREMCycle
 import MacControl
 import ProviderRouting
 import SchedulerExecution
-import SelfImprovement
 import SlackBot
 import StandingBots
 import TelegramBot
@@ -42,32 +42,31 @@ import TriggerScheduler
 import TrustCenter
 import TrustPersistence
 import AgentWorkspace
+import Privacy
 import Darwin
-import KnowledgeGraph
-import MCPDispatcher
 import NativeAgentShared
-import Skills
 import Senses
 import ToolExecution
+import Studio
+// Blueprint: | `EngineLaunch.swift` | `NativeAgentEngine`: canonical memory attachment and launch recovery; discovery starts independently at launch, its install observation once part wakes are registered; trusted bundled seeds installed before ingress; current seeds follow changed shipped bodies, while edited/non-seed content and other occupied slots are preserved, each failure retained by AbilityFilesCheck and reported through Doctor to the person while launch continues; an installed seed the readable bundle no longer ships, still its proof's candidate and never re-enabled, is switched off through its registry (restorable); root-bound derived-state invalidation; NativeAgentEngine launch/recovery ordering, procedure-retention root admission and terminal drain, background loop manifest and surface/workshop/scheduler composition; native effects arrive through EngineBackgroundWorkHost; MCP servers a data root kept are raised to them once by name as theirs to grow (`raiseKeptMCPServers`), their file untouched and, since a launch line can carry a key, fenced from them file readers with its backup copies; `tellRetiredConnectors` removes retired service rows and tells their once which were set up; old credentials stay untouched and unread; the engine exposes the existing activity controller through its body host |
 
 /// Native effects used by Core's background composition. Scheduling, admission
 /// and reconciliation remain with the existing engine and background owners.
 public protocol EngineBackgroundWorkHost: Sendable {
+    @MainActor var activityWatch: ActivityWatchController { get }
     var approvals: ApprovalTransactionCoordinator { get }
     var attention: AttentionRouter { get }
     var backupHost: TrustBackupHost { get }
     func postMacNotification(title: String, body: String, userInfo: [String: String], soundName: String?) async -> NativeAgentNotificationPostResult
     func notifyIfAttentionWorthy(dataRoot: URL, itemId: String, title: String, summary: String, source: String, severity: String) async
     func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> DoctorReport
-    func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue], externalSendIdempotencyKey: String) async throws -> (id: String, status: String)
+    func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue]) async throws -> (id: String, status: String)
     func makeCompletionSender(dataRoot: URL, silentTelegram: Bool, requestedResultDeliveryID: String?, authorizeTelegramReply: @escaping @Sendable (TelegramConfig, Int) -> Bool) -> any AgentBridgeCompletionSending
     var speechPermission: SpeechPermissionSnapshot { get }
     /// Asks macOS once when the grant was never decided (the system's own prompt); otherwise the live status.
     func requestSpeechPermissionIfNotDetermined() async -> SpeechPermissionSnapshot
     var voiceName: String { get }
     var agentSubject: String { get }
-    func githubRuntime(dataRoot: URL, shared: Bool) -> GitHubCommandRuntime
-    func evaluateGitHubApprovals(dataRoot: URL) async
     var triggerNotifier: TriggerNotifier { get }
     func mirrorTriggerFire(_ result: TriggerFireResult) async -> Bool
 }
@@ -88,6 +87,37 @@ private struct EngineDerivedStateInvalidationSink: DerivedStateInvalidationSink 
 }
 
 extension NativeAgentEngine {
+    @MainActor public var activityWatch: ActivityWatchController { ports.backgroundWork.activityWatch }
+    // Launch work belongs to this process lifecycle, not to the resident scheduler.
+    @MainActor private static var launchTasks: [UUID: Task<Void, Never>] = [:]
+    @MainActor private static var launchStopped = false
+    @MainActor private static var residentsStarted = false
+    @MainActor private static var runtimeObservationsInstalled = false
+    @MainActor private static var firstAnchorTask: Task<Void, Never>?
+    @MainActor private static var firstAnchorObserver: NSObjectProtocol?
+
+    @MainActor
+    private static func retainLaunchWork(_ operation: @escaping @Sendable () async -> Void) {
+        guard !launchStopped, !Task.isCancelled else { return }
+        let id = UUID()
+        launchTasks[id] = Task.detached(priority: .utility) {
+            if !Task.isCancelled { await operation() }
+            await retireLaunchWork(id)
+        }
+    }
+
+    @MainActor private static func retireLaunchWork(_ id: UUID) { launchTasks.removeValue(forKey: id) }
+
+    @MainActor
+    public static func stopLaunchWork() {
+        launchStopped = true // Close admission synchronously, before any drain suspends.
+        for task in launchTasks.values { task.cancel() }
+        firstAnchorTask?.cancel()
+        if let firstAnchorObserver { NotificationCenter.default.removeObserver(firstAnchorObserver) }
+        firstAnchorObserver = nil
+        DoctorFacade.disarmFirstTurnRefresh()
+    }
+
     public static func prepareProcessFileLimit() {
         var files = rlimit()
         if getrlimit(RLIMIT_NOFILE, &files) == 0, files.rlim_cur < 10_240 {
@@ -96,7 +126,10 @@ extension NativeAgentEngine {
         }
     }
 
+    @MainActor
     public static func installRuntimeObservationsAtLaunch(dataRoot: URL) {
+        guard !launchStopped, !runtimeObservationsInstalled else { return }
+        runtimeObservationsInstalled = true
         let crashLog = BodyReport.crashBreadcrumbs(dataRoot)
         do {
             try FileManager.default.createDirectory(at: crashLog.deletingLastPathComponent(),
@@ -106,7 +139,38 @@ extension NativeAgentEngine {
             ModuleLog.app("[crash-breadcrumbs] unavailable: %@", error.localizedDescription)
         }
         BackgroundLoopsManager.shared.receiveOrganPulses()
-        KnowledgeGraphPoolCache.installOwner(SwiftNativeMemoryV2.knowledgeGraphPool(at:))
+        // The person-input tap starts now or not at all this launch. Without
+        // it she raises the grant herself (User's law): once a launch, until
+        // granted, a card waits in the person's conversation (on a first
+        // launch, the first one there is). Nothing of hers waits on it; the
+        // card opens the pane and, once the switch is on, says one relaunch
+        // is needed.
+        if !MacPersonInput.listening,
+           let card = InlineInteractionRegistry.permission(["privacy:inputMonitoring"],
+               why: "I need Input Monitoring to tell your own typing and pointing from mine, so I know when you're here before I bring an app forward.") {
+            let published = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            firstAnchorObserver = NotificationCenter.default.addObserver(
+                forName: ConversationAnchor.didPublish, object: nil, queue: nil
+            ) { _ in published.continuation.yield(()) }
+            firstAnchorTask = Task {
+                defer {
+                    if let firstAnchorObserver { NotificationCenter.default.removeObserver(firstAnchorObserver) }
+                    firstAnchorObserver = nil
+                    firstAnchorTask = nil
+                    published.continuation.finish()
+                }
+                var session = ConversationAnchor.currentSessionId(dataRoot: dataRoot)
+                if session == nil {
+                    for await _ in published.stream {
+                        guard !Task.isCancelled else { return }
+                        session = ConversationAnchor.currentSessionId(dataRoot: dataRoot)
+                        if session != nil { break }
+                    }
+                }
+                guard let session, !Task.isCancelled, !launchStopped else { return }
+                await InlineInteractionResolver.raise(card, sessionID: session, resumable: false, dataRoot: dataRoot)
+            }
+        }
     }
 
     public static func validateProvidersAtLaunch() {
@@ -133,9 +197,10 @@ extension NativeAgentEngine {
             return false
         }
         do {
-            _ = try await Task.detached(priority: .userInitiated) {
-                try TrustBackupPersistence.resumeStagedBackupRestoreAtLaunch(dataRoot: dataRoot, host: backupHost)
+            let restored = try await Task.detached(priority: .userInitiated) {
+                try await TrustBackupPersistence.resumeStagedBackupRestoreAtLaunch(dataRoot: dataRoot, host: backupHost)
             }.value
+            for note in restored?.notCarried ?? [] { ModuleLog.app("[backup-restore] %@", note) }
         } catch {
             backupRestoreUnavailable(error.localizedDescription)
             return false
@@ -166,7 +231,6 @@ extension NativeAgentEngine {
             ChatUpdateNote.recordLaunchAtStartup(dataRoot: dataRoot, currentVersion: currentVersion, resources: resources)
         }.value
         _ = await Task.detached(priority: .userInitiated) { NativeAgentEngine.live }.value
-        await SurfaceLayoutLive.shared.attach(dataRoot: dataRoot)
         return true
     }
 
@@ -175,7 +239,17 @@ extension NativeAgentEngine {
         var failures: [String] = []
         do {
             let bundled = AbilityStore(dataRoot: resources)
-            let seeds = try FileManager.default.contentsOfDirectory(at: bundled.root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+            let seeds = try AbilityStore.seedCatalog(resources: resources)
+            // Retirement is read off the whole bundle: one unreadable seed and nothing fades this launch.
+            let shipped = seeds.map { try? AbilityStore.decode($0).id }
+            if !shipped.contains(nil) {
+                do { try fadeRetiredSeeds(abilities, shipped: Set(shipped.compactMap { $0 }), dataRoot: dataRoot) }
+                catch { failures.append("retired seeds: \(error.localizedDescription)") }
+            }
+            // Her tools and skills take the one form of a part first (idempotent),
+            // with the owner's trust in agents bound, as their admissions read it.
+            PeerTrust.install(dataRoot: dataRoot)
+            do { try await Parts(root: dataRoot).migrate() } catch { failures.append("parts: \(error.localizedDescription)") }
             let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot) { _, _ in nil }
             await OwnedProgramInvocation.$host.withValue(host) {
                 for url in seeds.sorted(by: { $0.path < $1.path }) {
@@ -188,7 +262,7 @@ extension NativeAgentEngine {
                         if let current = try abilities.read(id: seed.id, slot: .current) {
                             guard AbilityStore.isSeed(current), current.body != seed.body else { continue }
                         } else if try abilities.contains(id: seed.id) { continue }
-                        let kept = seed.kind == .tool ? try await SwiftNativeToolExecution(root: dataRoot).bundledSeed(seed) : seed
+                        let kept = seed.kind == .part ? try await Parts(root: dataRoot).bundledSeed(seed) : seed
                         try abilities.installSeed(kept)
                     } catch {
                         failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
@@ -207,12 +281,32 @@ extension NativeAgentEngine {
         }
     }
 
-    public static func installBotProviderCheck() async {
-        do { try BotDefinitionStore(dataRoot: PersistenceCore.defaultDataRoot()).migrateLegacyDefinitions() }
-        catch {
-            FileHandle.standardError.write(Data("[bots] migration unavailable: \(error)\n".utf8))
-            return
+    /// A seed the app no longer ships fades: an installed copy still exactly
+    /// the seed is switched off through its registry, the way quarantine does,
+    /// restorable and never deleted. One she changed (its bytes no longer the
+    /// candidate its seed proof names) or turned back on (`enabledAt`) is hers and stays.
+    private static func fadeRetiredSeeds(_ abilities: AbilityStore, shipped: Set<String>, dataRoot: URL) throws {
+        try AbilityStore.withLock {
+            let programs = OwnedProgramStore(root: abilities.root)
+            let retired = Set(try abilities.files(kind: .part, includeProposals: false).filter { file in
+                guard AbilityStore.isSeed(file), !shipped.contains(file.id), case .object(let proof)? = file.metadata["proof"],
+                      case .string(let digest)? = proof["candidate"] else { return false }
+                return (try? programs.load(id: file.id, digest: digest)) != nil
+            }.map(\.id))
+            guard !retired.isEmpty, case .array(var rows) = try abilities.registry(kind: .part) else { return }
+            var faded = false
+            for index in rows.indices {
+                guard case .object(var row) = rows[index], case .string(let id)? = row["id"], retired.contains(id),
+                      row["status"] != .string("disabled"), row["enabledAt"] == nil else { continue }
+                row["status"] = .string("disabled")
+                row["disabledReason"] = .string("No longer shipped with the app; restore it to use it again.")
+                rows[index] = .object(row); faded = true
+            }
+            if faded { try abilities.saveRegistry(.array(rows), kind: .part) }
         }
+    }
+
+    public static func installBotProviderCheck() async {
         await BotRunGate.installLiveCheck { bot, dataRoot in
             do { _ = try await BotChatContract.choice(for: bot, dataRoot: dataRoot); return nil }
             catch { return String(describing: error) }
@@ -227,12 +321,69 @@ extension NativeAgentEngine {
             Dictionary(labels, uniquingKeysWith: { first, _ in first }))
     }
 
+    /// NativeAgent runs no MCP servers of its own (10-21): what she reaches,
+    /// she grows. Servers a data root kept from before are hers to grow; she
+    /// hears of them once, and their file stays as it was.
+    static func raiseKeptMCPServers(dataRoot: URL) {
+        let folder = dataRoot.appendingPathComponent("mcp", isDirectory: true)
+        let registry = folder.appendingPathComponent("servers.json"), told = folder.appendingPathComponent(".told")
+        guard !FileManager.default.fileExists(atPath: told.path), let bytes = try? Data(contentsOf: registry),
+              case .array(let rows)? = try? JSONValue.parse(bytes) else { return }
+        // Names only: a launch line or endpoint can carry a credential, and the file has them.
+        let servers = rows.compactMap { row -> String? in
+            guard case .object(let fields) = row, case .string(let id)? = fields["id"] else { return nil }
+            if case .string(let name)? = fields["name"], !name.isEmpty { return name }
+            return id
+        }
+        guard !servers.isEmpty else { return }
+        let line = "MCP servers this Mac kept are yours to grow as abilities now; NativeAgent no longer runs them: "
+            + servers.joined(separator: ", ") + ". Grow each from its own documentation, and ask for any key it needs on a card."
+        guard ResidentWake.shared.request(dataRoot: dataRoot, reason: "what NativeAgent handed you",
+                                          items: [.init(id: "mcp.kept", line: line, key: "mcp.kept", home: true)]) else { return }
+        FileManager.default.createFile(atPath: told.path, contents: Data())
+    }
+
+    /// A service's ability is hers to grow (10-21): NativeAgent no longer runs
+    /// Notion, Gmail, Google Calendar, X, AgentMail, TradingView or GitHub.
+    /// Their old credentials (files and Keychain items) stay as they were and
+    /// are no longer read; she hears once which were set up, and asks for a key
+    /// on a card when she grows one. GitHub folded later the same day, so it
+    /// has its own marker: a root that already heard the first note hears it once.
+    static func tellRetiredConnectors(dataRoot: URL) async {
+        let exists = { (path: String) in FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent(path).path) }
+        let folds: [(marker: String, id: String, services: [(name: String, files: [String])], rows: [String])] = [
+            ("connectors/.retired-told", "connectors.retired", [
+                ("Notion", ["connectors/notion/auth.json"]), ("Gmail", ["connectors/gmail/auth.json"]),
+                ("Google Calendar", ["connectors/calendar/auth.json"]), ("X", ["connectors/x/auth.json", "oauth_tokens/x.json", "secrets/x.json"]),
+                ("AgentMail", ["secrets/agentmail.json"]), ("TradingView", ["secrets/tradingview.json"]),
+            ], ["notion", "gmail", "email", "gcal", "x", "agentmail"]),
+            ("connectors/.retired-github-told", "connectors.retired.github", [("GitHub", ["connectors/github/auth.json", "oauth_tokens/github.json"])], ["github"]),
+        ]
+        let pending = folds.filter { !exists($0.marker) }
+        guard let first = pending.first else { return }
+        let kept = pending.flatMap(\.services).filter { $0.files.contains(where: exists) }.map(\.name)
+        if !kept.isEmpty {
+            let line = "NativeAgent no longer runs " + kept.joined(separator: ", ")
+                + ": each is yours to grow as an ability when you are asked, with its key asked for once on a card. Their old files are untouched."
+            guard ResidentWake.shared.request(dataRoot: dataRoot, reason: "what NativeAgent handed you",
+                                              items: [.init(id: first.id, line: line, key: first.id, home: true)]) else { return }
+        }
+        do {
+            try await ConnectorOAuthRegistry.removeConnectorRegistryEntries(root: dataRoot, ids: Set(pending.flatMap(\.rows)))
+        } catch { return nativeLog("[connectors] retired rows stay until next launch: %@", error.localizedDescription) }
+        try? FileManager.default.createDirectory(at: dataRoot.appendingPathComponent("connectors"), withIntermediateDirectories: true)
+        for fold in pending { FileManager.default.createFile(atPath: dataRoot.appendingPathComponent(fold.marker).path, contents: Data()) }
+    }
+
+    @MainActor
     public static func startContextFlowAtLaunch(dataRoot: URL) {
-        Task.detached(priority: .utility) {
+        retainLaunchWork {
             await installDerivedStateInvalidationAtLaunch(dataRoot: dataRoot) {
                 await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots(includeMemories: true)
             }
+            guard !Task.isCancelled else { return }
             await NativeAgentEngine.live.contextFlow.start()
+            if Task.isCancelled { await NativeAgentEngine.live.contextFlow.stop() }
         }
     }
 
@@ -250,16 +401,18 @@ extension NativeAgentEngine {
         registerBackgroundTasks: @MainActor () -> Void,
         waitForSenses: @escaping @Sendable () async throws -> Void,
         resumeMacTurn: @escaping @Sendable (TurnCheckpoint, TurnContinuationRuntime) async throws -> Void,
-        repairPresentation: any MemoryRepairPresentationPort,
         momentsEnabled: @escaping @Sendable () -> Bool,
         approvals: ApprovalTransactionCoordinator
     ) {
-        Task.detached(priority: .utility) {
+        guard !launchStopped, !residentsStarted, !Task.isCancelled else { return }
+        residentsStarted = true
+        retainLaunchWork {
             await NativeAgentEngine.live.chrome.observeBrowserLaunches()
+            guard !Task.isCancelled else { return }
             await NativeAgentEngine.live.chrome.reconcilePolicy()
         }
-        Task.detached(priority: .utility) {
-            if await reconcileMemoryAtLaunch(dataRoot: dataRoot, storageUnavailable: storageUnavailable) {
+        retainLaunchWork {
+            if await reconcileMemoryAtLaunch(dataRoot: dataRoot, storageUnavailable: storageUnavailable), !Task.isCancelled {
                 await reindexMemory()
             }
         }
@@ -267,50 +420,50 @@ extension NativeAgentEngine {
         WorkshopPlannerCatalog.configure(makeWorkshopPlannerConnectorActionsProvider())
         // Each bring-up remains independent so one blocked store cannot hold
         // the other resident owners or the native launch callback.
-        Task.detached(priority: .utility) {
+        retainLaunchWork {
             let descriptor = embeddingDescriptorURL.flatMap { try? Data(contentsOf: $0) }
                 .flatMap { try? EmbeddingModelDownload.Descriptor.parse($0) }
             if descriptor?.distribution != "separate-download" {
                 await SwiftNativeMemoryV2.shared.reconcileEmbeddingEpochAtLaunch()
             }
         }
-        BackgroundConsolidationGate.shared.install { reason in
-            switch await NativeAgentEngine.liveCognition.backgroundCognitionGate(reason: reason) {
-            case .allowed: return .allowed
-            case .skipped(let why): return .deferred(why)
-            }
-        }
-        Task.detached(priority: .utility) { await NativeAgentEngine.liveCognition.bootstrap() }
+        retainLaunchWork { await NativeAgentEngine.liveCognition.bootstrap() }
         // Callbacks a peer is owed from before the relaunch go out now, not when the task is next read.
-        Task.detached(priority: .utility) { await NativeAgentEngine.live.agents.tasks.redeliverOwedCallbacks() }
-        Task.detached(priority: .utility) {
+        retainLaunchWork { await NativeAgentEngine.live.agents.tasks.redeliverOwedCallbacks() }
+        retainLaunchWork {
             await reconcileTranscriptsAtLaunch(dataRoot: dataRoot)
+            guard !Task.isCancelled else { return }
             // Behind her: the first launch with the index builds it; later
             // launches absorb only what changed while she was away.
             _ = ChatHistoryIndex.shared(dataRoot: dataRoot).absorbAll()
         }
+        retainLaunchWork { raiseKeptMCPServers(dataRoot: dataRoot) }
         // The person's login PATH, read once here so no caller waits on it later.
-        Task.detached(priority: .utility) { _ = AgentHostCommandLines.loginEnvironment }
-        Task.detached(priority: .utility) {
+        retainLaunchWork { _ = AgentHostCommandLines.loginEnvironment }
+        retainLaunchWork {
             do { try AgentLaneHandles.migrate(dataRoot: dataRoot) } catch {
                 Logger(subsystem: "com.nativeagent.app", category: "agents")
                     .error("lane handles not migrated: \(String(describing: error), privacy: .public)")
             }
+            guard !Task.isCancelled else { return }
             _ = await AgentDiscoverySession.shared.candidates(refresh: true, probe: false, dataRoot: dataRoot)
-            await AgentDiscoverySession.shared.watchInstalls(dataRoot: dataRoot)
         }
-        Task.detached(priority: .utility) {
+        retainLaunchWork {
+            await ProcedureArtifactStore.startRetention(dataRoot: dataRoot)
             await startBackgroundWorkAtLaunch(
                 dataRoot: dataRoot,
-                github: NativeAgentEngine.live.ports.backgroundWork.githubRuntime(dataRoot: dataRoot, shared: true),
                 makeLoops: {
                     _ = NativeAgentEngine.live
                     do { try await waitForSenses() }
                     catch { ModuleLog.app("[senses] Launch registration unavailable: %@", error.localizedDescription) }
+                    guard !Task.isCancelled else { return [] }
                     // Before the loops start: their sources signal parts, and senses watch files.
-                    EnginePartWake.start(dataRoot: dataRoot)
+                    await EnginePartWake.shared.start(dataRoot: dataRoot)
+                    guard !Task.isCancelled else { return [] }
+                    // The delegation runner starts and stops contact observation.
                     let loops = assembleAllLoops()
                     await installBotProviderCheck()
+                    guard !Task.isCancelled else { return [] }
                     return loops
                 },
                 resume: { checkpoint in
@@ -321,24 +474,31 @@ extension NativeAgentEngine {
         DoctorFacade.armFirstTurnRefresh {
             await makeAutoDoctorLoop(freshMeasurement: true).tickOutcome()
         }
-        Task.detached(priority: .utility) {
+        retainLaunchWork {
             await configureMemoryPromotionAtLaunch(dataRoot: dataRoot,
                 makeLLMClient: { makeSharedLLMClient() }, momentsEnabled: momentsEnabled)
         }
-        Task.detached(priority: .utility) {
-            await reconcileApprovalsAtLaunch(dataRoot: dataRoot, presentation: repairPresentation,
+        retainLaunchWork {
+            await reconcileApprovalsAtLaunch(dataRoot: dataRoot,
                 makeLLMClient: { makeSharedLLMClient() }, approvals: approvals,
                 stagePendingREMProposals: { await stagePendingREMProposalsAtLaunch() })
         }
     }
 
+    public static let quitRestartWake = Notification.Name("NativeAgent.quitRestartWake")
+
     public static func waitForInFlightTurnsBeforeQuit(
         _ runs: Set<String>, isRestarting: @escaping @Sendable () -> Bool
     ) async {
-        let deadline = ContinuousClock.now + .seconds(20)
-        while !NativeAgentEngine.live.turns.inFlightRunIDs().isDisjoint(with: runs),
-              ContinuousClock.now < deadline, !isRestarting() {
-            try? await Task.sleep(for: .milliseconds(200))
+        // Arm before reading: completion or restart racing the first read stays buffered.
+        let events = EventDeadlinePhysiology.storeAndFileEvents(paths: [],
+            notifications: [ChatCancelFlag.inFlightDidChange, quitRestartWake])
+        _ = await raceAgainstTimeout(seconds: 20) {
+            var iterator = events.makeAsyncIterator()
+            while !Task.isCancelled,
+                  !NativeAgentEngine.live.turns.inFlightRunIDs().isDisjoint(with: runs), !isRestarting() {
+                guard await iterator.next() != nil else { return }
+            }
         }
         let left = NativeAgentEngine.live.turns.inFlightRunIDs().intersection(runs).count
         ModuleLog.app("[quit] %@", left == 0 ? "turns finished — quitting" : "\(left) turn(s) still running at the bound — quitting anyway")
@@ -349,21 +509,49 @@ extension NativeAgentEngine {
         shutdownSenses: @escaping @Sendable () async -> Void,
         makeActivityWatchDrain: @MainActor () -> Task<Void, Never>
     ) {
+        stopLaunchWork()
+        NativeAgentEngine.live.trace.stop()
+        let otherDoorDrain = OtherDoorTurns.shared.stop()
+        AbandonedTurnReconciliationHook.disarm()
+        HerMemo.shared.shutdown()
+        HerOpened.shared.shutdown()
+        let makeDrain = NativeAgentEngine.live.make.shutdown()
+        NativeAgentNotifications.shutdown()
         let group = DispatchGroup()
+        let stemStopped = Task.detached { await EnginePartWake.shared.stop() }
+        let attention = NativeAgentEngine.live.ports.backgroundWork.attention
         group.enter()
-        Task.detached { await NativeAgentEngine.live.chrome.stop(); group.leave() }
+        Task.detached { await makeDrain.value; group.leave() }
         group.enter()
-        Task.detached { await NativeAgentEngine.liveCognition.flushForTermination(); group.leave() }
+        Task.detached { await attention.shutdown(); group.leave() }
         group.enter()
-        Task.detached { await BackgroundLoopsManager.shared.shutdown(); group.leave() }
+        Task.detached { await otherDoorDrain.value; group.leave() }
         group.enter()
-        Task.detached { await shutdownSenses(); group.leave() }
+        Task.detached { await ChatSessionAgingConsolidation.stop(); group.leave() }
         group.enter()
-        Task.detached { await SwiftNativeMCPDispatcher.stopAllSharedPools(); group.leave() }
+        Task.detached { await TurnVolatileArchiveRegistry.shared.stopOrphanRetention(); group.leave() }
         group.enter()
-        Task.detached { await SwiftToolDispatcher.closeACPConnections(); group.leave() }
+        Task.detached { await stemStopped.value; await NativeAgentEngine.live.chrome.stop(); group.leave() }
         group.enter()
-        Task.detached { await NativeAgentEngine.live.contextFlow.stop(); group.leave() }
+        Task.detached { await ProcedureArtifactStore.stopRetention(dataRoot: NativeAgentEngine.live.dataRoot); group.leave() }
+        group.enter()
+        Task.detached { await stemStopped.value; await NativeAgentEngine.liveCognition.flushForTermination(); group.leave() }
+        group.enter()
+        Task.detached { await stemStopped.value; await BackgroundLoopsManager.shared.shutdown(); group.leave() }
+        group.enter()
+        Task.detached { await SwiftNativeMemoryV2.shared.shutdownEmbeddingConvergence(); group.leave() }
+        group.enter()
+        Task.detached { await AdaptiveMemoryPromoter.shared.shutdown(); group.leave() }
+        group.enter()
+        Task.detached { await SwiftNativeMemoryV2.shared.shutdownProjections(); group.leave() }
+        group.enter()
+        Task.detached { await stemStopped.value; await shutdownSenses(); group.leave() }
+        group.enter()
+        Task.detached { await stemStopped.value; await OwnedProgramRunner.endResidents(); group.leave() }
+        group.enter()
+        Task.detached { await stemStopped.value; await SwiftToolDispatcher.closeACPConnections(); group.leave() }
+        group.enter()
+        Task.detached { await stemStopped.value; await NativeAgentEngine.live.contextFlow.stop(); group.leave() }
         group.enter()
         // Create the native drain before the main actor enters the bounded wait.
         let activityWatchDrain = makeActivityWatchDrain()
@@ -387,10 +575,9 @@ extension NativeAgentEngine {
         forward: @escaping (BridgeMessage) async -> Bool,
         registerLoginItem: @MainActor () -> Void
     ) {
-        Task { @MainActor in
-            NativeAgentEngine.liveDeviceSync.bridge.setup()
-            NativeAgentEngine.liveDeviceSync.bridge.observeIncomingMessages(onMessage: forward)
-        }
+        guard !launchStopped, !Task.isCancelled else { return }
+        NativeAgentEngine.liveDeviceSync.bridge.setup()
+        NativeAgentEngine.liveDeviceSync.bridge.observeIncomingMessages(onMessage: forward)
         // The bridge publishes the pairing key once it knows this Mac holds
         // the phone; a launch never writes it over another Mac's.
         if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: PersistenceCore.defaultDataRoot()) {
@@ -453,29 +640,32 @@ extension NativeAgentEngine {
 
     public static func reconcileApprovalsAtLaunch(
         dataRoot: URL,
-        presentation: any MemoryRepairPresentationPort,
         makeLLMClient: @escaping @Sendable () -> any LLMClient,
         approvals: ApprovalTransactionCoordinator,
         stagePendingREMProposals: @Sendable () async -> Int
     ) async {
-        // Reconcile before staging: a crash after approval but before execution
-        // leaves a staging stamp that would otherwise prevent repair forever.
+        // Settle resolved executions before staging backfills and swaps.
         let records = await ApprovalTransactionCoordinator.resolvedApprovalsForReconciliation(dataRoot: dataRoot)
+        guard !Task.isCancelled else { return }
         let repairs = await MemoryApprovalTransactions.reconcileUnappliedMemoryRepairs(dataRoot: dataRoot, records: records)
+        guard !Task.isCancelled else { return }
         OrganPulse.record("launch.memory_repairs", found: repairs, note: "\(repairs) re-run")
-        await MemoryRepairOneShot.stageIfNeeded(
-            dataRoot: dataRoot,
-            presentation: presentation)
+        await MemoryRepairOneShot.archiveInventoryRows(dataRoot: dataRoot)
+        guard !Task.isCancelled else { return }
         await LegacyCorrectionScopeMigration.runIfNeeded(dataRoot: dataRoot)
+        guard !Task.isCancelled else { return }
         // Backfills and swaps use the same approved-execution recovery path.
         let backfills = await MemoryApprovalTransactions.reconcileUnappliedKindBackfills(dataRoot: dataRoot, records: records)
+        guard !Task.isCancelled else { return }
         OrganPulse.record("launch.kind_backfills", found: backfills, note: "\(backfills) re-run")
         await MemoryApprovalTransactions.stageKindBackfillIfNeeded(
             dataRoot: dataRoot,
             makeLLMClient: makeLLMClient
         )
+        guard !Task.isCancelled else { return }
         var settled = 0, failures: [String] = []
         for swap in await MemoryConsolidationGate.reconcile(dataRoot: dataRoot) {
+            guard !Task.isCancelled else { return }
             switch swap {
             case .applied, .alreadyApplied, .staleRefused, .cleanedUpDenied: settled += 1
             case .pendingApproval: break
@@ -497,15 +687,18 @@ extension NativeAgentEngine {
         } catch {
             nativeLog("[browser] restart recovery failed: %@", String(describing: error))
         }
+        guard !Task.isCancelled else { return }
         let approvals = await approvals.reconcileUnappliedApprovalExecutions(dataRoot: dataRoot, records: records)
         OrganPulse.record("launch.approval_executions", found: approvals, note: "\(approvals) re-run")
-        Task { await ApprovalTransactionCoordinator.settleDeskWaitsOnEveryResolve(dataRoot: dataRoot) }
+        guard !Task.isCancelled else { return }
         // Revalidate legacy evidence before staging the same local-only review
         // as terminal-event reconciliation; unverified procedures stay off.
         let procedureDataRoot = dataRoot
         let keptOff = await WorkshopProcedureLegacyRevalidation.runIfNeeded(dataRoot: procedureDataRoot)
+        guard !Task.isCancelled else { return }
         OrganPulse.record("launch.procedure_revalidation", found: keptOff.count, note: "\(keptOff.count) kept off")
         for line in keptOff {
+            guard !Task.isCancelled else { return }
             let cardID = "procedure-legacy-revalidation-\(CausalTransitionEvidence.opaqueIdentity(line).prefix(16))"
             _ = try? await LiveNotificationInbox(
                 path: LiveNotificationInbox.livePath(dataRoot: procedureDataRoot)
@@ -521,58 +714,21 @@ extension NativeAgentEngine {
                 "status": .string("unread"),
             ]), id: cardID)
         }
+        guard !Task.isCancelled else { return }
         let activationCards = await WorkshopProcedureExactActivationCoordinator
             .reconcileLocalFileCopyIfQualified()
+        guard !Task.isCancelled else { return }
         OrganPulse.record("launch.procedure_activation", found: activationCards, note: "\(activationCards) review staged")
         // Catch up existing unstaged REM rows without generating another batch.
         let remStaged = await stagePendingREMProposals()
         OrganPulse.record("launch.rem_staging", found: remStaged, note: "\(remStaged) staged")
     }
 
-    public static func reconcileConnectorCredentialsAtLaunch(
-        dataRoot: URL, github: @escaping @Sendable () -> GitHubCommandRuntime
-    ) async {
-        // Before Slack's ingress starts: its tokens move from files to Keychain.
-        do { try SlackCredentials.migrate(dataRoot: dataRoot) }
-        catch { nativeLog("[slack-credential] Keychain migration failed: %@", error.localizedDescription) }
-        do { try await ConnectorOAuthRegistry.migrateXCredentials(dataRoot: dataRoot) }
-        catch { nativeLog("[x-credential] Keychain migration repair state unavailable: %@", error.localizedDescription) }
-        Task.detached(priority: .utility) {
-            let logger = Logger(subsystem: "com.nativeagent.app", category: "github-credential")
-            let github = github()
-            await github.replayResidentStateAtLaunch()
-            do {
-                let configured = try await GitHubCredentialStore.shared.reconcileAtLaunch(
-                    dataRoot: dataRoot
-                )
-                if configured {
-                    logger.info("GitHub credential Keychain reconciliation complete")
-                    await github.recoverAtLaunch()
-                }
-            } catch {
-                logger.error(
-                    "GitHub credential Keychain reconciliation failed: \(String(describing: type(of: error)), privacy: .public)"
-                )
-            }
-        }
-    }
-
-    public static func prepareExecutionStorageAtLaunch(dataRoot: URL) async throws {
-        // 2026-09-18: a first-format migration can visit every execution.
-        // Let AppKit finish launching while it runs; runtime ingress and
-        // schedulers below still start only after the migration succeeds.
-        let report = try await WorkshopStorageMigrator.prepareForReading(dataRoot: dataRoot)
-        if report.didMigrate {
-            // P2-7: the legacy missions/ absorption is deleted; the only
-            // passes that can report didMigrate now are the execution.json
-            // record rename and receipts_dir pointer repair.
-            nativeLog(
-                "[workshop-migration] normalized execution records: changed=%d conflicts=%d receipt=%@",
-                report.moved.count,
-                report.conflictsPreservedInArchive.count,
-                report.receiptRelativePath ?? "none"
-            )
-        }
+    public static func reconcileConnectorCredentialsAtLaunch(dataRoot: URL) async {
+        // Canonical metadata and verified Keychain migration precede ingress.
+        do { try SlackCredentials.withSnapshot(dataRoot: dataRoot) {} }
+        catch { nativeLog("[slack-credential] Migration failed: %@", error.localizedDescription) }
+        Task.detached(priority: .utility) { await tellRetiredConnectors(dataRoot: dataRoot) }
     }
 
     public static func installDerivedStateInvalidationAtLaunch(
@@ -584,19 +740,23 @@ extension NativeAgentEngine {
 
     public static func startBackgroundWorkAtLaunch(
         dataRoot: URL,
-        github: GitHubCommandRuntime,
         makeLoops: @Sendable () async -> [LoopRegistration],
         resume: @escaping @Sendable (TurnCheckpoint) async throws -> Void
     ) async {
-        // Prime GitHub before refresh can publish, then start reply journal
-        // owners before the checkpoint sweep hands resumed answers to them.
-        await github.replayResidentStateAtLaunch()
-        // The one start path: failure notices wired, and the startup Doctor
-        // pass that gives a relaunch its report.
-        await startBackgroundLoops(loops: await makeLoops())
-        await AbandonedTurnReconciliationHook.arm(completedTurnNotification: .chatTurnCompleted,
-            inFlight: { Set(ChatCancelFlag.inFlightTurns(dataRoot: dataRoot).map(\.turnId)) },
-            resume: resume)
+        guard !Task.isCancelled else { return }
+        // Reply journal owners start before the checkpoint sweep hands
+        // resumed answers to them. The one start path: failure notices
+        // wired, and the startup Doctor pass that gives a relaunch its report.
+        let loops = await makeLoops()
+        guard !Task.isCancelled else { return }
+        await startBackgroundLoops(loops: loops)
+        guard !Task.isCancelled else { return }
+        await MainActor.run {
+            guard !launchStopped, !Task.isCancelled else { return }
+            AbandonedTurnReconciliationHook.arm(completedTurnNotification: .chatTurnCompleted,
+                inFlight: { Set(ChatCancelFlag.inFlightTurns(dataRoot: dataRoot).map(\.turnId)) },
+                resume: resume)
+        }
     }
 
     public static func configureMemoryPromotionAtLaunch(
@@ -613,11 +773,6 @@ extension NativeAgentEngine {
         )
     }
 
-    public static func startBackgroundLoops() async {
-        guard !(await BackgroundLoopsManager.shared.isRunning()) else { return }
-        await startBackgroundLoops(loops: assembleAllLoops())
-    }
-
     public static func startBackgroundLoops(loops: [LoopRegistration]) async {
         let manager = BackgroundLoopsManager.shared
         let dataRoot = PersistenceCore.defaultDataRoot()
@@ -630,13 +785,19 @@ extension NativeAgentEngine {
             return await MaintenanceBackgroundWork.resolveLoopFailureNotice(
                 dataRoot: dataRoot, loopId: loopId, healthyAt: healthyAt)
         }
-        guard await manager.start(loops: loops) else { return }
+        guard !Task.isCancelled, await manager.start(loops: loops, residentObservation: {
+            async let desk: Void = ApprovalTransactionCoordinator.settleDeskWaitsOnEveryResolve(dataRoot: dataRoot)
+            async let grants: Void = InlineInteractionResolver.GrantWatch.shared.observe()
+            async let interactions: Void = InlineInteractionDelivery.observe(dataRoot: dataRoot)
+            _ = await (desk, grants, interactions)
+        }), !Task.isCancelled else { return }
         // Refresh the heartbeat receipt after restart without blocking startup.
-        Task { await manager.runTickOnce(loopId: "heartbeat") }
+        await retainLaunchWork { await manager.runTickOnce(loopId: "heartbeat") }
+        guard !Task.isCancelled else { return }
         guard NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) else { return }
         let config = DoctorStatusProjection.readAutoDoctorConfig(dataRoot: dataRoot)
         if (config.enabled ?? true) && (config.runOnStartup ?? true) {
-            Task { await manager.runTickOnce(loopId: "doctor_auto_run") }
+            await retainLaunchWork { await manager.runTickOnce(loopId: "doctor_auto_run") }
         }
     }
 
@@ -666,10 +827,6 @@ extension NativeAgentEngine {
 
 extension NativeAgentEngine {
 
-    /// Shared LLM client used by background REM/self-improvement/reflection
-    /// lanes. SwiftNativeLLMClient routes by model-id prefix to the three
-    /// real backend adapters (Anthropic / OpenAI / Codex CLI). Default
-    /// model resolution falls back to the router's "chat" surface preference.
     /// Resolve the one cognition owner for a loop body. Alternate roots must
     /// never observe or mutate the process-global personal runtime.
     public static func cognitionRuntime(
@@ -683,7 +840,8 @@ extension NativeAgentEngine {
     }
 
     /// Body work shares the resident turn provider assembly and its exact
-    /// credential/routing resolution, without adding a persona prompt.
+    /// credential/routing resolution. PersonaBackedBackgroundLLMClient supplies
+    /// persona, user-memory core and organism posture when persona context is absent.
     /// Background calls carry the same idle and wall as resident turns, so one
     /// stalled call cannot hold the memory promotion chain forever.
     public static func makeSharedLLMClient(
@@ -710,9 +868,9 @@ extension NativeAgentEngine {
     /// memory, self-improvement, Workshop execution executor, heartbeat, and hooks.
     /// A periodic dream wrapper is intentionally absent from this manifest:
     /// unattended dreams have exactly one owner, the `nativeagent-nightly-dream`
-    /// TriggerScheduler job at 03:30 America/Chicago. A periodic REM wrapper is
+    /// TriggerScheduler job at 03:30 Mac-local. A periodic REM wrapper is
     /// absent for the same reason: `nativeagent-weekly-rem` at 04:30
-    /// America/Chicago on Sundays owns weekly REM.
+    /// Mac-local on Sundays owns weekly REM.
     public static func assembleAllLoops(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [LoopRegistration] {
@@ -760,10 +918,6 @@ extension NativeAgentEngine {
             // `delegation_status` uses and files ONE card per newly-terminal
             // job, keyed off a durable cursor so a job cards exactly once.
             makeDelegationOutcomeLoop(dataRoot: dataRoot),
-            // Configured GitHub projects flow into durable Desk refs/items.
-            // The runner is due-driven and change-idempotent; no config or no
-            // material remote change means no state write and no notification.
-            makeGitHubTrackingLoop(dataRoot: dataRoot),
         ]
         var loops = runners.map(LoopRegistration.enabled)
         loops.append(
@@ -859,7 +1013,6 @@ extension NativeAgentEngine {
             }
         )
         TelegramApprovalFilerRef.shared.configure(approvalFiler)
-        Task { await ApprovalChatCards.promptPending(dataRoot: dataRoot, telegram: approvalFiler) }
         // Keep the exact Telegram profile and approval filer resident for the
         // loop lifetime. Routing/policy remain per-turn snapshots; only the
         // stateless orchestration graph and schema caches are reused.
@@ -867,6 +1020,15 @@ extension NativeAgentEngine {
             profile: .telegram,
             approvalFiler: approvalFiler
         )
+        let telegramFace: PartFaces.Call = { id, input, version in
+            do {
+                return try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native("telegram:projection:" + id)) {
+                    await Parts(root: dataRoot).face(id: id, input: input, version: version)
+                }
+            } catch {
+                return .failure(.init(code: "unavailable", message: error.localizedDescription))
+            }
+        }
         let telegramBot = SwiftNativeTelegramBot(
             dataRoot: dataRoot,
             completenessDeps: TelegramBotCompletenessDeps(
@@ -915,7 +1077,20 @@ extension NativeAgentEngine {
                     }
                 }
                 return outcome
-            }
+            },
+            partCall: { id, input in
+                guard let envelope = ChatToolSessionContext.envelope, envelope.surface == "telegram", envelope.workIdentity != nil else {
+                    return .failure(.init(code: "unavailable", message: "The Telegram command has no authenticated originating update."))
+                }
+                do {
+                    return try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: envelope) {
+                        await Parts(root: dataRoot).call(id: id, input: input, as: JSONValue.self)
+                    }
+                } catch {
+                    return .failure(.init(code: "unavailable", message: error.localizedDescription))
+                }
+            },
+            partFace: telegramFace
         )
         let handler = ChatSurfaceBackgroundWork.makeTelegramChatHandler(
             dataRoot: dataRoot,
@@ -936,6 +1111,7 @@ extension NativeAgentEngine {
             requireMention: cfg.requireMention,
             bot: telegramBot,
             dataRoot: dataRoot,
+            partFace: telegramFace,
             offsetURL: dataRoot
                 .appendingPathComponent("telegram", isDirectory: true)
                 .appendingPathComponent("last_offset.json"),
@@ -964,6 +1140,7 @@ extension NativeAgentEngine {
         await ChatSurfaceBackgroundWork.fileSystemPermissionNotice(
             capability: capability, dataRoot: dataRoot,
             permissionStatus: { NativeAgentEngine.live.ports.backgroundWork.speechPermission },
+            assistanceCard: { try await EngineBackgroundWorkPort().assistanceCard(dataRoot: dataRoot, input: $0) },
             notify: { root, id, title, summary, source, severity in
                 await NativeAgentEngine.live.ports.backgroundWork.notifyIfAttentionWorthy(
                     dataRoot: root, itemId: id, title: title, summary: summary,
@@ -1045,6 +1222,10 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
         try await NativeAgentEngine.live.agents.continuation.tick()
     }
 
+    func stopAgentConversations() async {
+        await NativeAgentEngine.live.agents.continuation.stop()
+    }
+
     func nextConversationDeadline(after now: Date) -> Date? {
         NativeAgentEngine.live.agents.continuation.nextDeadline(after: now)
     }
@@ -1054,15 +1235,15 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
 // MARK: - Desk notify loop (desk-side push, NO cognition)
 //
 // A throttled, desk-local loop that lets the Desk tap User on the shoulder: it
-// reads desk state, asks DeskNotifyEvaluator which direct/urgent items changed
+// reads desk state, asks her desk-notify part which items changed
 // since their last ping (cooldown-gated), fires a Mac banner + paired-device
 // push for each, then stamps lastNotifiedAt so a single change can't fan out
 // into duplicate pings (Agent's idempotency requirement).
 //
 // This NEVER touches the CognitiveSubstrate — it's a SEPARATE loop from the
 // cognition manifest in assembleAllLoops. The desk reaches out to User; it does
-// not live in her head (User's hard line, 2026-06-29). Self-gating: with no
-// item marked direct/urgent, every tick is a cheap state-read that returns nil.
+// not live in her head (User's hard line, 2026-06-29). The part proposes;
+// publication, quiet hours, delivery and stamps remain with native owners.
 
 extension NativeAgentEngine {
     public static func makeDeskNotifyLoop(
@@ -1076,6 +1257,14 @@ extension NativeAgentEngine {
             interval: intervalSeconds,
             dataRoot: dataRoot,
             attention: NativeAgentEngine.live.ports.backgroundWork.attention,
+            propose: { input in
+                try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native("background:desk_notify")) {
+                    switch await Parts(root: dataRoot).call(id: "desk-notify", input: input, as: DeskNotificationProposal.self) {
+                    case .success(let proposal): return proposal
+                    case .failure(let error): throw error
+                    }
+                }
+            },
             postMacNotification: postMacNotification,
             postNagNotification: { title, body, handle in
                 await NativeAgentEngine.live.ports.backgroundWork.postMacNotification(
@@ -1176,43 +1365,6 @@ private struct EngineREMProposalNotifications: REMProposalNotificationPort {
 
 
 extension NativeAgentEngine {
-    public static func makeGitHubTrackingLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        intervalSeconds: TimeInterval = 6 * 60 * 60
-    ) -> some EventDeadlineLoopRunner {
-        GitHubTrackingBackgroundWork.makeGitHubTrackingLoop(
-            dataRoot: dataRoot, intervalSeconds: intervalSeconds,
-            port: EngineGitHubTrackingWorkPort(dataRoot: dataRoot)
-        )
-    }
-}
-
-private struct EngineGitHubTrackingWorkPort: GitHubTrackingWorkPort {
-    let runtime: GitHubCommandRuntime
-
-    init(dataRoot: URL) {
-        if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
-            self.runtime = NativeAgentEngine.live.ports.backgroundWork.githubRuntime(dataRoot: dataRoot, shared: true)
-        } else {
-            self.runtime = NativeAgentEngine.live.ports.backgroundWork.githubRuntime(dataRoot: dataRoot, shared: false)
-        }
-    }
-
-    func processConnectorChangesIfChanged(refreshed: Bool) async {
-        await runtime.processConnectorChangesIfChanged(refreshed: refreshed)
-    }
-
-    func evaluateApprovalSnapshot(dataRoot: URL) async {
-        await NativeAgentEngine.live.ports.backgroundWork.evaluateGitHubApprovals(dataRoot: dataRoot)
-    }
-
-    func evaluateBotSnapshot(dataRoot: URL) async {
-        await BotGitHubEventWatcher.shared.evaluateSnapshot(dataRoot: dataRoot)
-    }
-}
-
-
-extension NativeAgentEngine {
     public static func makeHeartbeatLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> HeartbeatLoop {
@@ -1276,7 +1428,19 @@ extension NativeAgentEngine {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         llm: any LLMClient
     ) -> WeeklySelfImprovementLoop {
-        MaintenanceBackgroundWork(port: EngineBackgroundWorkPort()).makeWeeklySelfImprovementLoop(dataRoot: dataRoot, llm: llm)
+        MaintenanceBackgroundWork(port: EngineBackgroundWorkPort()).makeWeeklySelfImprovementLoop(
+            dataRoot: dataRoot, llm: llm, workshopOutcomes: {
+                let engine = NativeAgentEngine.forRoot(dataRoot)
+                return try await engine.tools.withPartDoor(envelope: .native("maintenance:self_improvement_sweep:weekly-outcomes")) {
+                    let input = try await SwiftNativeWorkshopRunner(root: dataRoot).weeklyOutcomeInput()
+                    let result = await Parts(root: dataRoot).call(id: "weekly-outcomes", input: input, as: String.self)
+                    try Task.checkCancellation()
+                    switch result {
+                    case .success(let text): return text
+                    case .failure(let error): throw error
+                    }
+                }
+            })
     }
 
     public static func makeDataRootDiskHygieneLoop(
@@ -1373,8 +1537,18 @@ extension NativeAgentEngine {
             worklogPath: isLiveRoot
                 ? nil
                 : standardized.appendingPathComponent("no-such-worklog.jsonl"),
-            // Secondary roots never borrow the live turn or its provider spend.
-            morningBriefSynthesizer: isLiveRoot ? makeMorningBriefSynthesizer() : nil
+            morningBriefPart: { input in
+                if !isLiveRoot, input.objectValue?["operation"] == .string("brief") {
+                    throw TriggerSchedulerError.persistenceFailure("A secondary root cannot spend the live morning-brief model route.")
+                }
+                let engine = NativeAgentEngine.forRoot(standardized)
+                return try await engine.tools.withPartDoor(envelope: .native("trigger:morning_brief"), fileAccess: "read_only") {
+                    switch await Parts(root: standardized).call(id: "native-morning-brief", input: input, as: JSONValue.self) {
+                    case .success(let value): return value
+                    case .failure(let error): throw error
+                    }
+                }
+            }
         )
     }
 
@@ -1403,14 +1577,11 @@ extension NativeAgentEngine {
             // replaced runner's checked unattended admission was never restored).
             // Manual requests queued by the user are admitted inside the scheduler
             // without this gate.
-            let bots = BotRunnerScheduler(dataRoot: standardized,
-                session: NativeAgentEngine.live.standingBotSession(),
-                isAutonomyEnabled: { await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: standardized) })
             let work = TriggerSchedulerBackgroundWork.makeJobWork(
                 runDueJobs: { await dueJobRunner.runDueJobs(maxJobs: $0) },
                 activityFailure: { await dueJobRunner.activityFeedError },
                 nextDeadline: { await dueJobRunner.nextMeaningfulDeadline(after: $0) },
-                bots: bots,
+                bots: NativeAgentEngine.live.bots,
                 continuations: makeTurnContinuationRuntime(dataRoot: standardized).makeDeskContinuationScheduler()
             )
             runDueJobs = work.runDueJobs
@@ -1431,6 +1602,8 @@ extension NativeAgentEngine {
             events: { paths, loopId in
                 EventDeadlinePhysiology.storeAndFileEvents(paths: paths, notifications: [
                     BotRunQueue.didChange,
+                    DeskContinuationScheduler.ownerReceiptChanged,
+                    SwiftNativeTriggerScheduler.dueWorkRemaining,
                     // A part's `schedule:` wakes are its own jobs, kept with its header.
                     AbilityStore.didChange,
                     // 2026-09-06: every deadline this runner reports is an ABSOLUTE
@@ -1453,19 +1626,6 @@ extension NativeAgentEngine {
         )
     }
 
-    public static func makeMorningBriefSynthesizer() -> MorningBriefSynthesizer {
-        TriggerSchedulerBackgroundWork.makeMorningBriefSynthesizer(runTurn: { prompt in
-            let client = NativeAgentEngine.live.chatClient(profile: .background)
-            let response = try await LLMCallContext.$purpose.withValue("morning_brief") {
-            try await client.runEphemeralToolTurn(
-                message: prompt,
-                fileAccess: "read_only",
-                surface: WorkshopSurfaceVocabulary.canonical
-            )
-            }
-            return response.output
-        })
-    }
 }
 
 
@@ -1641,14 +1801,11 @@ struct EngineSchedulerExecutionPlatform: SchedulerExecutionPlatform {
         )
     }
 
-    func runConnectorAction(
-        id: String, dryRun: Bool, input: [String: JSONValue],
-        externalSendIdempotencyKey: String
-    ) async throws -> (id: String, status: String) {
-        try await NativeAgentEngine.live.ports.backgroundWork.runConnectorAction(
-            id: id, dryRun: dryRun, input: input,
-            externalSendIdempotencyKey: externalSendIdempotencyKey)
+    func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue]) async throws -> (id: String, status: String) {
+        try await NativeAgentEngine.live.ports.backgroundWork.runConnectorAction(id: id, dryRun: dryRun, input: input)
     }
+
+    var connectorActionIDs: Set<String> { Set(connectorActionDescriptors().map(\.id)) }
 
     func runDream(force: Bool) async throws -> sending [String: Any] {
         try await NativeAgentEngine.runDream(dataRoot: PersistenceCore.defaultDataRoot(), force: force)
@@ -1661,9 +1818,7 @@ struct EngineSchedulerExecutionPlatform: SchedulerExecutionPlatform {
     func runHarnessBenchmark() async throws -> (id: String, status: String?) {
         let root = PersistenceCore.defaultDataRoot()
         let run = await HarnessBenchmarkRun.run(
-            dataRoot: root,
             authoredToolCount: { try await ToolsFacade(dataRoot: root).listAuthored().count },
-            mcpServerCount: { try await makeMCPDispatcher().listServers().count },
             embeddingRuntimeAvailable: { await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot() != nil },
             doctorStatuses: { try? await makeDoctorChecks().runAll().map(\.status) }
         )

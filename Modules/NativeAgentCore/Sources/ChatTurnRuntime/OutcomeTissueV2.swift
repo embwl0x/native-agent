@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ChatSessionWork
+// Blueprint: | `OutcomeTissueV2.swift` | `ResponseOutcomeObservationV2`: `make` |
 
 extension ResponseOutcomeObservationV2 {
     public static func make(
@@ -64,11 +65,8 @@ extension ResponseOutcomeObservationV2 {
                     : (toolReferences.allSatisfy { $0.resultClass != "unknown" }
                         ? .observed : .unverified)),
             "motor": motorReferences.isEmpty
-                ? (boundedDispatches.contains(where: {
-                    let ran = $0.ranCall.tool
-                    return ToolCausalBoundary.hasCanonicalMotorOwner(tool: ran)
-                        || ToolCausalBoundary.isExternalProtocolTool(ran)
-                }) ? .unknown : .notApplicable)
+                ? (boundedDispatches.contains(where: { ToolCausalBoundary.hasCanonicalMotorOwner(tool: $0.ranCall.tool) })
+                    ? .unknown : .notApplicable)
                 : aggregateMotorEvidence(motorReferences.map(\.verification)),
             "reaction": .unknown,
         ]

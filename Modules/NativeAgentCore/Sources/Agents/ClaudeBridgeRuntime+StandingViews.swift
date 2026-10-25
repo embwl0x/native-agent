@@ -2,6 +2,7 @@ import Foundation
 import Network
 import CognitiveSubstrate
 import Cognition
+// Blueprint: | `ClaudeBridgeRuntime+StandingViews.swift` | Standing-view request codec and HTTP routes through Cognition review authority; workers use the bridge's retained request ownership and cancellation, checking cancellation before a follow-up mutation |
 
 extension ClaudeBridgeRuntime {
     // MARK: - /standing_views
@@ -119,9 +120,10 @@ extension ClaudeBridgeRuntime {
 
     func handleStandingViewsList(conn: NWConnection) {
         let workLatch = WorkLatch()
-        let workTask = Task.detached(priority: .utility) { [weak self] in
+        let workTask = startRequest(conn: conn, latch: workLatch, priority: .utility) { [weak self] _ in
             guard let self else { return }
             let detail = await self.host.cognition.observatoryDetail()
+            guard !Task.isCancelled else { return }
             guard workLatch.claim() else { return }
             let views = detail.standingViews
             self.writeJSON(conn, status: 200, obj: [
@@ -133,6 +135,7 @@ extension ClaudeBridgeRuntime {
                 ),
             ])
         }
+        guard let workTask else { writeJSON(conn, status: 503, obj: ["error": "server_stopping_or_busy"]); return }
         workLatch.arm(afterSeconds: Self.readWorkDeadlineSeconds) { [weak self] in
             guard let self, workLatch.claim() else { return }
             workTask.cancel()
@@ -155,13 +158,14 @@ extension ClaudeBridgeRuntime {
         // Same WorkLatch + asyncAfter bound as handleState/handleOrganismDebug:
         // exactly one of the work Task and the deadline writes the response.
         let workLatch = WorkLatch()
-        let workTask = Task.detached(priority: .utility) { [weak self] in
+        let workTask = startRequest(conn: conn, latch: workLatch, priority: .utility) { [weak self] _ in
             guard let self else { return }
             func respond(_ status: Int, _ obj: [String: Any]) {
                 guard workLatch.claim() else { return }
                 self.writeJSON(conn, status: status, obj: obj)
             }
             let before = await self.host.cognition.observatoryDetail()
+            guard !Task.isCancelled else { return }
             switch Self.standingViewDecision(rawId: rawId, rawAction: rawAction, views: before.standingViews) {
             case .refused(let status, let code, let reason):
                 respond(status, ["error": code, "reason": reason])
@@ -171,6 +175,7 @@ extension ClaudeBridgeRuntime {
                 let result = action == .retire
                     ? await self.host.cognition.retireStandingViewWithOutcome(id: view.id)
                     : await self.host.cognition.resolveStandingViewWithOutcome(id: view.id, approved: action.approved)
+                guard !Task.isCancelled else { return }
                 let after = result.detail.standingViews.first(where: { $0.id == view.id }) ?? view
                 switch result.status {
                 case .applied(let applied):
@@ -204,6 +209,7 @@ extension ClaudeBridgeRuntime {
                 }
             }
         }
+        guard let workTask else { writeJSON(conn, status: 503, obj: ["error": "server_stopping_or_busy"]); return }
         workLatch.arm(afterSeconds: Self.readWorkDeadlineSeconds) { [weak self] in
             guard let self, workLatch.claim() else { return }
             workTask.cancel()
@@ -211,6 +217,7 @@ extension ClaudeBridgeRuntime {
                 "error": "work_timeout",
                 "path": "/standing_views/resolve",
                 "seconds": Self.readWorkDeadlineSeconds,
+                "outcome": "unknown",
             ])
         }
     }

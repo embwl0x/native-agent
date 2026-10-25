@@ -1,6 +1,7 @@
 import NativeAgentCore
 import Foundation
 import PersistenceCore
+// Blueprint: | `DeskNagConfig.swift` | `DeskNagLane`, `DeskNagPanelModel`; canonical nag scope interpretation |
 
 // MARK: - DeskNagConfig — User's nag switch, persisted (default OFF)
 //
@@ -337,6 +338,8 @@ public struct DeskNagConfig: Sendable, Equatable {
 /// be mutually consistent to the millisecond — a lost tick is one delta later,
 /// not a lost delta, because the observation baseline only advances when a
 /// delta is actually consumed).
+/// nag_config.json: excluded from local backup/export and phone sync;
+/// off-disk backup includes it; PrivacyMap lists desk/.
 public struct DeskNagConfigStore: Sendable {
     public let dataRoot: URL
     public let persistence: any PersistenceCoreProtocol
@@ -357,7 +360,7 @@ public struct DeskNagConfigStore: Sendable {
         (try? await loadChecked()) ?? DeskNagConfig()
     }
 
-    private func loadChecked() async throws -> DeskNagConfig {
+    public func loadChecked() async throws -> DeskNagConfig {
         let raw = try await persistence.readJSON(configPath, ifMissing: .null)
         if raw == .null, !FileManager.default.fileExists(atPath: configPath.path) {
             return DeskNagConfig()
@@ -415,17 +418,15 @@ public struct DeskNagConfigStore: Sendable {
         try await updating { (transform($0), ()) }.config
     }
 
-    /// `update` that also hands back a value derived from the CONFIG AS IT WAS
-    /// INSIDE THE LOCK — the unmute path needs the drift digest computed
-    /// against the same config it then consumes, and computing it from a load
-    /// outside the lock would report drift a concurrent writer had already
-    /// consumed.
+    /// Read-modify-write with a returned value. A part's proposal is computed
+    /// outside this lock, then its source config is compared here before any
+    /// baseline, ledger or window transition can commit.
     public func updating<T: Sendable>(
-        _ transform: @Sendable (DeskNagConfig) -> (DeskNagConfig, T)
+        _ transform: @Sendable (DeskNagConfig) throws -> (DeskNagConfig, T)
     ) async throws -> (config: DeskNagConfig, value: T) {
         try await persistence.withFileLock(configPath) {
             let current = try await loadChecked()
-            let (next, value) = transform(current)
+            let (next, value) = try transform(current)
             // An unchanged config is not rewritten: the desk loop watches this
             // file, and rewriting identical bytes every pass woke it again
             // every ~2s, forever (perf sweep 2026-10-05).

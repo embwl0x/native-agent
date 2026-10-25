@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `TelegramQueuedTurnControls.swift` | `TelegramQueuedTurnControlCallback`: queue control markup and callback decoding retaining forum-topic identity |
+
 enum TelegramQueuedTurnControlAction: String, Sendable, Equatable {
     case steer = "s"
     case remove = "x"

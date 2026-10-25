@@ -2,6 +2,8 @@ import SwiftUI
 import PersistenceCore
 import Desk
 
+// Blueprint: | `DeskNagsPanel.swift` | `DeskNagsPanel`: current nag configuration reads and explicit owner controls through Desk quick actions |
+
 // MARK: - DeskNagsPanel — User's nag switch, in the UI (C6)
 //
 // Sweep R4 W5. NagConfig/NagEvaluator shipped with control ONLY via the

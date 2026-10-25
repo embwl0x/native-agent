@@ -1,5 +1,7 @@
 import SwiftUI
 
+// Blueprint: | `HealthPill.swift` | `HealthPill`: compact health status color/label presentation |
+
 /// The health pill has one navigation responsibility: take the person to the
 /// mounted Doctor diagnostics surface. A queued request is useful, but it is
 /// not the same as Doctor having already rendered.
@@ -83,7 +85,8 @@ public struct HealthPill: View {
     public init() {}
 
     public var body: some View {
-        let summary = appModel.engine.doctor.systemHealthSummary
+        let health = appModel.engine.doctor.systemHealth
+        let summary = health.summary
         let label = label(for: summary)
         let statusColor = color(for: summary)
 
@@ -109,20 +112,18 @@ public struct HealthPill: View {
         .accessibilityIdentifier("health-pill.open-doctor")
         .accessibilityHint("Shows what needs repair and how to fix it")
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {
-            popoverContent(summary: summary, statusColor: statusColor)
+            popoverContent(summary: summary, issues: health.issues, statusColor: statusColor)
         }
     }
 
     @ViewBuilder
     private func popoverContent(
         summary: SystemHealthSummary,
+        issues: [(id: String, title: String, detail: String, repairAvailable: Bool)],
         statusColor: Color
     ) -> some View {
         let isChecking = appModel.engine.doctor.isRunning
         let action = HealthPillPopoverPresentation.action(isChecking: isChecking)
-        let issues = (appModel.engine.doctor.report?.checks ?? []).filter {
-            ["warn", "warning", "fail", "failed", "error"].contains($0.status.lowercased())
-        }
 
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 7) {
@@ -143,23 +144,21 @@ public struct HealthPill: View {
 
             if !issues.isEmpty {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        ForEach(issues) { check in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(check.title).font(.callout.bold())
-                                Text(check.repairFace).font(.callout)
-                                    .textSelection(.enabled)
-                                    .fixedSize(horizontal: false, vertical: true)
+                    if appModel.engine.doctor.report == nil {
+                        Text(issues.map { $0.title + ": " + $0.detail }.joined(separator: "\n\n"))
+                            .font(.callout).textSelection(.enabled)
+                    } else {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(issues, id: \.id) { check in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(check.title).font(.callout.bold())
+                                    Text(check.detail).font(.callout)
+                                        .textSelection(.enabled)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
                             }
                         }
                     }
-                }
-                .frame(maxHeight: 300)
-            } else if appModel.engine.doctor.report == nil, let card = appModel.engine.doctor.healthCard {
-                ScrollView {
-                    Text(card.subsystems.filter { ["warn", "fail", "error"].contains($0.status) }
-                        .map { $0.label + ": " + $0.detail }.joined(separator: "\n\n"))
-                        .font(.callout).textSelection(.enabled)
                 }
                 .frame(maxHeight: 300)
             }
@@ -168,7 +167,7 @@ public struct HealthPill: View {
             }
 
             HStack(spacing: 8) {
-                if issues.contains(where: { $0.repair_available == true }) {
+                if issues.contains(where: \.repairAvailable) {
                     Button("Repair safe issues") {
                         Task {
                             let outcome = await appModel.runDoctor(repair: true, repairScope: .button)

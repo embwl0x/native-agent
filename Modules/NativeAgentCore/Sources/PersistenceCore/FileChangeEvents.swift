@@ -1,11 +1,14 @@
 import Foundation
 
+// Blueprint: | `FileChangeEvents.swift` | `FileChangeEvents`: bounded cancellable async vnode event bridge with one initial edge only after successful arming |
+
 /// One bounded async event stream over canonical file changes.
 ///
 /// `FileChangeWatcher` owns the cross-process kqueue/vnode observation. This
 /// wrapper only bridges those edges into structured concurrency and emits one
 /// initial edge so callers can close the read-before-watch registration race.
-/// It performs no polling and starts no timer.
+/// Failed arming finishes the stream without an initial edge. It performs no
+/// polling and starts no timer.
 public final class FileChangeEvents: @unchecked Sendable {
     public struct Stream: AsyncSequence, Sendable {
         public typealias Element = URL
@@ -60,10 +63,17 @@ public final class FileChangeEvents: @unchecked Sendable {
 
         func didArm() {
             lock.lock()
+            guard !stopped else { lock.unlock(); return }
             armed = true
             let ready = !stopped && !paths.isEmpty
             lock.unlock()
             if ready { continuation.yield(()) }
+        }
+
+        var isArmed: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return armed && !stopped
         }
 
         func finish() {
@@ -87,17 +97,37 @@ public final class FileChangeEvents: @unchecked Sendable {
         let pending = PendingChanges()
         stream = Stream(pending: pending)
         armingTask = Task.detached(priority: .utility) { [weak self] in
-            let watcher = FileChangeWatcher(paths: normalized) { path in
+            let watcher = FileChangeWatcher(paths: normalized, onFailure: { [weak self] _ in
+                pending.finish()
+                self?.cancel()
+            }) { path in
                 pending.insert(path.standardizedFileURL)
             }
-            guard let self, self.adopt(watcher) else { watcher.cancel(); return }
+            guard !Task.isCancelled, watcher.isArmed, let self, self.adopt(watcher) else {
+                watcher.cancel()
+                pending.finish()
+                return
+            }
             if emitInitial { normalized.forEach { pending.insert($0) } }
             pending.didArm()
         }
     }
 
     /// Consumers doing their own first read must await registration first.
-    public func waitUntilArmed() async { await armingTask!.value }
+    @discardableResult
+    public func waitUntilArmed() async -> Bool {
+        await armingTask!.value
+        return isArmed
+    }
+
+    /// False after failed initial arming, re-arming failure, or cancellation.
+    public var isArmed: Bool {
+        lock.lock()
+        let watcher = !stopped && stream.pending.isArmed ? self.watcher : nil
+        lock.unlock()
+        // Readiness may wait for re-arming; cancellation keeps its own lock free.
+        return watcher?.isArmed == true
+    }
 
     private func adopt(_ watcher: FileChangeWatcher) -> Bool {
         lock.lock()
@@ -115,6 +145,7 @@ public final class FileChangeEvents: @unchecked Sendable {
             return
         }
         stopped = true
+        armingTask?.cancel()
         watcher = self.watcher
         self.watcher = nil
         lock.unlock()

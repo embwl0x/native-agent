@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TurnVolatileArchive.swift` | `TurnVolatileArchive` actor; `load`, `record`, `prune`; pruning removes only obsolete observed runs whose entries still match under the file lock; registry owns demand-triggered single-flight orphan expiry through exit and closes retention at engine termination |
 
 // Per-session archive of each turn's volatile block (v2Prefix, clear_at lanes).
 //
@@ -28,10 +29,10 @@ import PersistenceCore
 // produced it, and replayed at its original position (immediately after that
 // turn's user message, before the assistant reply) on later requests.
 //
-// BOUNDED BY THE SAME WINDOW AS THE PREFIX. Entries are pruned to the run ids
-// the projection actually replayed this turn, so when the window cursor drops
-// a turn its archived block goes with it. A block outside the replayed window
-// is not merely dead weight — replaying one would corrupt the prefix.
+// BOUNDED BY THE SAME WINDOW AS THE PREFIX. Observed runs outside the replayed
+// window are pruned only while their entries still match that snapshot. Unseen
+// or re-recorded runs wait for a later projection. A block outside the replayed
+// window is never replayed — doing so would corrupt the prefix.
 
 /// One mid-conversation system message a past turn sent, held so later turns
 /// can re-send it byte-for-byte.
@@ -115,6 +116,8 @@ public struct ArchivedVolatileBlock: Sendable, Equatable {
     }
 }
 
+/// Storage: volatile replay blocks are excluded from local backup, data export
+/// and phone sync; included in off-disk backup and PrivacyMap/chat.
 public actor TurnVolatileArchive {
     /// Hard ceiling independent of the cursor, so a session that somehow stops
     /// pruning cannot grow this file without bound. The cursor's own window is
@@ -134,9 +137,12 @@ public actor TurnVolatileArchive {
     private let persistence = SwiftNativePersistenceCore()
     private let dataRootOverride: URL?
     private var lastSweepAt: Date?
+    private var orphanSweep: Task<Void, Never>?
+    private var orphanRetentionEnabled: Bool
 
-    public init(dataRoot: URL? = nil) {
+    public init(dataRoot: URL? = nil, orphanRetentionEnabled: Bool = true) {
         self.dataRootOverride = dataRoot
+        self.orphanRetentionEnabled = orphanRetentionEnabled
     }
 
     private func dataRoot() -> URL {
@@ -164,7 +170,7 @@ public actor TurnVolatileArchive {
     /// Aging runs on its own; a history read never waits for it. An archive
     /// that cannot be read throws: the replay says so instead of looking empty.
     public func load(sessionId: String) async throws -> [String: [ArchivedVolatileBlock]] {
-        Task { await self.sweepOrphansIfDue() }
+        requestOrphanSweepIfDue()
         guard let path = pathFor(sessionId: sessionId) else { return [:] }
         return Dictionary(grouping: try await readLocked(path: path), by: \.runId)
             .mapValues { $0.sorted { $0.order < $1.order } }
@@ -174,7 +180,7 @@ public actor TurnVolatileArchive {
 
     /// Record THIS turn's block.
     ///
-    /// Window-bounded pruning is `prune(sessionId:keeping:)`'s job and runs on
+    /// Window-bounded pruning is `prune(sessionId:removing:)`'s job and runs on
     /// the BUILD path, which is the only place that knows which turns the
     /// prefix still replays. Splitting them keeps each caller honest about what
     /// it actually knows; this one only knows its own block. `maxEntries` is
@@ -225,15 +231,17 @@ public actor TurnVolatileArchive {
         }
     }
 
-    /// Prune alone, for the build path: it knows the replayed window before the
-    /// turn's own block exists.
-    public func prune(sessionId: String, keeping: Set<String>) async {
-        guard let path = pathFor(sessionId: sessionId),
+    /// Remove the build path's observed obsolete runs only if their entries
+    /// still match under the file lock; newer recordings belong to a later read.
+    public func prune(sessionId: String, removing: [String: [ArchivedVolatileBlock]]) async {
+        guard !removing.isEmpty, let path = pathFor(sessionId: sessionId),
               FileManager.default.fileExists(atPath: path.path) else { return }
         do {
             try await persistence.withFileLock(path) {
                 let entries = try await self.readLocked(path: path)
-                let kept = entries.filter { keeping.contains($0.runId) }
+                let current = Dictionary(grouping: entries, by: \.runId)
+                    .mapValues { $0.sorted { $0.order < $1.order } }
+                let kept = entries.filter { removing[$0.runId] != current[$0.runId] }
                 // 2026-09-22: batch the rewrite. Stale rows are never replayed (the
                 // projection matches run ids on replayed user rows), so rewriting
                 // the whole file each time one run slides out is pure churn.
@@ -247,12 +255,28 @@ public actor TurnVolatileArchive {
 
     // MARK: - Orphan sweep
 
-    private func sweepOrphansIfDue() async {
+    public func stopOrphanRetention() {
+        orphanRetentionEnabled = false
+        orphanSweep?.cancel()
+    }
+
+    /// Demand only: the engine-owned registry can close admission at shutdown.
+    /// One retained sweep expires old files; reads never await its disk work.
+    private func requestOrphanSweepIfDue() {
+        guard orphanRetentionEnabled, orphanSweep == nil else { return }
         let now = Date()
         if let last = lastSweepAt, now.timeIntervalSince(last) < Self.sweepIntervalSeconds {
             return
         }
         lastSweepAt = now
+        orphanSweep = Task {
+            await self.sweepOrphans(now: now)
+            self.orphanSweep = nil
+        }
+    }
+
+    private func sweepOrphans(now: Date) async {
+        guard !Task.isCancelled else { return }
         let dir = dataRoot()
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("prefix_window", isDirectory: true)
@@ -263,6 +287,7 @@ public actor TurnVolatileArchive {
             options: [.skipsHiddenFiles]
         ) else { return }
         for url in entries {
+            guard !Task.isCancelled else { return }
             let values = try? url.resourceValues(forKeys: [
                 .isDirectoryKey, .contentModificationDateKey,
             ])
@@ -277,6 +302,7 @@ public actor TurnVolatileArchive {
             // forever. Lock sidecars are reapable by design (the acquire path
             // in PersistenceCore+FileLock validates the inode it locked).
             let reaped = (try? await persistence.withFileLock(file) { () -> Bool in
+                try Task.checkCancellation()
                 guard let recheck = try? file.resourceValues(
                     forKeys: [.contentModificationDateKey]
                 ),
@@ -292,6 +318,7 @@ public actor TurnVolatileArchive {
             // of removal. It cannot recursively delete a concurrent writer's
             // newly created lock or archive. Recording retries a missing parent.
             if reaped,
+               !Task.isCancelled,
                let dirMtime = values?.contentModificationDate,
                now.timeIntervalSince(dirMtime) > Self.ttlSeconds {
                 _ = Darwin.rmdir(url.path)
@@ -349,9 +376,8 @@ public actor TurnVolatileArchive {
     }
 
     private func writeLocked(_ entries: [ArchivedVolatileBlock], path: URL) async throws {
-        // Full rewrite rather than append: pruning is the common case (every
-        // turn re-records this turn's block and drops what left the window), so
-        // an append-only file would grow and then need compaction anyway.
+        // Recording replaces this run; pruning removes unchanged observed runs
+        // outside the window. An append-only file would need compaction anyway.
         let rows = entries.map { entry in
             JSONValue.object([
                 "schema": .string("chat.prefix_window.volatile.v2"),
@@ -383,11 +409,17 @@ public actor TurnVolatileArchive {
 public actor TurnVolatileArchiveRegistry {
     public static let shared = TurnVolatileArchiveRegistry()
     private var archives: [String: TurnVolatileArchive] = [:]
+    private var orphanRetentionEnabled = true
+
+    public func stopOrphanRetention() async {
+        orphanRetentionEnabled = false
+        for archive in archives.values { await archive.stopOrphanRetention() }
+    }
 
     public func archive(dataRoot: URL?) -> TurnVolatileArchive {
         let key = dataRoot?.standardizedFileURL.path ?? ""
         if let existing = archives[key] { return existing }
-        let created = TurnVolatileArchive(dataRoot: dataRoot)
+        let created = TurnVolatileArchive(dataRoot: dataRoot, orphanRetentionEnabled: orphanRetentionEnabled)
         archives[key] = created
         return created
     }

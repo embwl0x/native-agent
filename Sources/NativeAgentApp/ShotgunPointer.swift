@@ -3,6 +3,8 @@ import AppToolRuntime
 import NativeAgentCore
 import SwiftUI
 
+// Blueprint: | `ShotgunPointer.swift` | `AgentPointerOverlay`: noninteractive agent pointer presentation and fade lifecycle, excluded from agent captures |
+
 // Her pointer (User, 10-04: "She should have her own mouse pointer so I don't
 // interfere with her"). Her pointer actions no longer leave the person's
 // cursor where she clicked (AgentPointerHold puts it back), so this shows

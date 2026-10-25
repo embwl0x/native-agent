@@ -1,5 +1,6 @@
 import Foundation
 import UserNotifications
+// Blueprint: | `MobileNotificationActions.swift` | `MobileNotificationActions` enum; `handle` |
 
 enum MobileNotificationActions {
     struct Response: Sendable {

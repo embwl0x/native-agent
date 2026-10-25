@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryV2Contracts.swift` | Current recall/proposal contracts; `MemoryPatchContract` preserves untrusted sources through rewrites and duplicate collapse |
 
 // MARK: - Request / response types
 

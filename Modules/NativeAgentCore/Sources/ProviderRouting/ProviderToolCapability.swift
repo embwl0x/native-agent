@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `ProviderToolCapability.swift` | `ProviderToolCapability`: adapter-declared tool/image transport capabilities independent of model-name inference |
+
 /// How a transport carries tools. Each adapter declares its own; nothing
 /// decides it from a provider's name.
 public enum ProviderToolWire: Sendable, Equatable {

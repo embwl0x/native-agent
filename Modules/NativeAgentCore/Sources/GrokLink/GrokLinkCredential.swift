@@ -1,5 +1,6 @@
 import Foundation
 import Security
+// Blueprint: | `GrokLinkCredential.swift` | `GrokLinkCredential`, `GrokReplyInput` |
 
 /// Shared by the signed app and its signed local helper. Never serialize this
 /// value outside Keychain or expose it in a tool/approval projection.
@@ -13,7 +14,17 @@ public struct GrokLinkCredential: Codable, Sendable {
         self.descriptorPath = descriptorPath; self.replyToken = replyToken
     }
 
-    public enum Failure: Error { case unavailable, invalid }
+    public enum Failure: Error, LocalizedError {
+        case unavailable, invalid
+        public var errorDescription: String? {
+            switch self {
+            case .unavailable:
+                return "Grok Bot's saved connection credentials are unavailable. Connect Grok Bot again to finish secure setup."
+            case .invalid:
+                return "Grok Bot connection data failed validation. Finish setup at Agents → Grok Bot → Routine credentials; never put credentials in chat."
+            }
+        }
+    }
     private static func query(_ peer: String) throws -> [String: Any] {
         guard UUID(uuidString: peer)?.uuidString.lowercased() == peer else { throw Failure.invalid }
         return [kSecClass as String: kSecClassGenericPassword,

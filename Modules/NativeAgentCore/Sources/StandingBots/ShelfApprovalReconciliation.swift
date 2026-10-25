@@ -1,6 +1,8 @@
 import Foundation
 import ApprovalInbox
 
+// Blueprint: | `ShelfApprovalReconciliation.swift` | `ShelfStore` approval reconciliation: all shelf readers project canonical approval resolution without making shelf copies authoritative |
+
 /// THE shelf-reading boundary for approval state. Every reader of a shelf entry
 /// — the Mac page, `shelf_read`, `shelf_entry` — goes through this, so an
 /// approval resolved from Telegram or the iPhone settles the entry for all of
@@ -13,15 +15,8 @@ extension ShelfStore {
     /// 300-row cap and on archive, so an id that is simply gone is decided too.
     /// nil means the inbox could not be read — then nothing is reconciled.
     public nonisolated static func pendingApprovalIDs(dataRoot: URL) -> Set<String>? {
-        let path = dataRoot.appendingPathComponent("workflows/approvals/requests.json")
-        guard let rows = try? SwiftNativeApprovalInbox.loadApprovalRowsChecked(at: path) else { return nil }
-        return Set(rows.compactMap { row -> String? in
-            guard case .object(let object) = row,
-                  case .string(let id)? = object["id"],
-                  case .string(let status)? = object["status"],
-                  status.lowercased() == "pending" else { return nil }
-            return id
-        })
+        guard let rows = try? SwiftNativeApprovalInbox(root: dataRoot).pendingUnlocked() else { return nil }
+        return Set(rows.map(\.id))
     }
 
     /// A run that stopped on an approval which has since been decided is not

@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Desk
+// Blueprint: | `WorkContextQuery.swift` | `WorkContextQuery` struct; `matchedTerms`, `score` |
 
 package struct WorkContextQuery: Sendable {
     package let terms: [String]

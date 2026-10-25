@@ -2,10 +2,13 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Desk
+// Blueprint: | `WorkshopSessionResultStore.swift` | `WorkshopSessionResultStore` struct; `path`, `save` |
 
 /// Durable terminal handoff between the one-turn runner and Desk settlement.
 /// It is a reconciliation record, not a second task owner: Desk remains the
 /// visible/canonical lifecycle and this file is deleted only by retention.
+/// Version-1 receipt JSON: local backup/export include workshop/; no phone sync;
+/// PrivacyMap lists Workshop.
 public struct WorkshopSessionResultStore: Sendable {
     let dataRoot: URL
 

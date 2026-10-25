@@ -6,6 +6,8 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 
+// Blueprint: | `WorkshopExecution+PlannerLLM.swift` | `SwiftNativeWorkshopPlannerLLM`: checked executions routing admission, live catalog binding and provider planner calls |
+
 // MARK: - Swift-native planner LLM
 
 /// Production planner used by `makeWorkshopRunner`. Connector actions are
@@ -20,7 +22,7 @@ import ProviderRouting
 /// fall back to chat. CancellationError propagates distinctly from WorkshopExecutionError
 /// so a cancelled submit() never lands a stub.
 /// Process-global tool catalog for the execution planner. WorkshopExecution
-/// can't import ChatOrchestration (the tool-catalog source), so the APP
+/// can't import ChatToolRuntime (the tool-catalog source), so the APP
 /// configures this ONCE at launch (BackgroundLoopsManager.start) with a
 /// provider built from SwiftToolDispatcher's schemas. Every planner that isn't
 /// given an explicit provider — notably the trigger scheduler's
@@ -57,7 +59,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
     /// planner test never appends rows to the developer's live ledger.
     private let runLedgerDataRoot: URL?
     /// Tool-menu source for the planner. WorkshopExecution cannot import
-    /// ChatOrchestration (its only tool-catalog source), so the real catalog
+    /// ChatToolRuntime (its only tool-catalog source), so the real catalog
     /// is injected from the APP layer. Defaults empty for back-compat — with
     /// an empty list the planner can only ever emit chat.synthesize steps,
     /// which is the pre-2026-06-15 behaviour every test relies on.
@@ -73,7 +75,6 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         processEnvironment: [String: String] = ProcessInfo.processInfo.environment,
         defaultDataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [String: String] {
-        let codexHome = OpenAIOAuthDirectAdapter.codexChildHome(dataRoot: dataRoot)
         var environment: [String: String]
         if dataRoot.standardizedFileURL == defaultDataRoot.standardizedFileURL {
             environment = processEnvironment
@@ -84,10 +85,10 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
                     environment[key] = value
                 }
             }
-            environment["HOME"] = codexHome.path
+            environment["HOME"] = dataRoot.standardizedFileURL.path
         }
-        environment["CODEX_HOME"] = codexHome.path
-        environment["NATIVE_AGENT_DATA_ROOT"] = dataRoot.standardizedFileURL.path
+        // Credential selection belongs to CodexAdapter, using this same root
+        // and the same process overrides that readiness evaluates.
         return environment
     }
 
@@ -105,7 +106,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         let codexEnvironment = Self.codexEnvironment(dataRoot: dataRoot)
         let rootedLLM = SwiftNativeLLMClient(
             router: rootedRouter,
-            codex: CodexAdapter(processEnvironmentOverride: codexEnvironment),
+            codex: CodexAdapter(processEnvironmentOverride: codexEnvironment, dataRootOverride: dataRoot),
             anthropic: AnthropicAdapter(
                 session: ProviderStreamGuard.stallOnlySession,
                 dataRootOverride: dataRoot,
@@ -118,9 +119,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             ),
             openAIOAuthDirect: OpenAIOAuthDirectAdapter(
                 session: ProviderStreamGuard.stallOnlySession,
-                authPathOverride: dataRoot
-                    .appendingPathComponent("codex_home", isDirectory: true)
-                    .appendingPathComponent("auth.json"),
+                dataRootOverride: dataRoot,
                 telemetryDataRootOverride: dataRoot
             ),
             anthropicOAuthDirect: AnthropicOAuthDirectAdapter(
@@ -176,17 +175,8 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         self.runLedgerDataRoot = runLedgerDataRoot
         let resolvedRouter: any ProviderRoutingProtocol = router ?? SwiftNativeProviderRouting()
         self.router = resolvedRouter
-        // WAVE 27 (2026-06-01): wire OpenAIOAuthDirectAdapter as the preferred
-        // OpenAI handler. In the user's production environment OPENAI_API_KEY is
-        // null and credentials live in `data/codex_home/auth.json::tokens`
-        // as a ChatGPT OAuth JWT. The OAuth-direct adapter consults the
-        // ChatGPT backend endpoint with the JWT bearer; if it's not
-        // configured (no tokens), SwiftNativeLLMClient transparently falls
-        // back to the api-key OpenAIAdapter.
-        // WAVE 28 (2026-06-01): same OAuth-direct wiring for Anthropic — the user's
-        // env has no ANTHROPIC_API_KEY; setup_token lives in
-        // data/providers/anthropic_oauth_direct.json. Without this, claude-*
-        // executions fail .notConfigured.
+        // Default adapters use the same credential resolver as the default
+        // router. Explicit secondary roots use the rooted initializer above.
         self.llm = llm ?? SwiftNativeLLMClient(
             router: resolvedRouter,
             codex: CodexAdapter(),
@@ -230,9 +220,9 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         guard let root = runLedgerDataRoot else { return error }
         let owner = root.appendingPathComponent("providers").path + " > surfaces.json (\(surface).model), active.json (\(surface)), pending-surface-configuration.json, registry.json"
         return ToolFailureError(detail, effects: .none, owner: owner,
-            nextCall: ToolFailureError.call("app", ["action": .string("codex.invoke"), "args": .object([
-                "cwd": .string(root.path), "context": .string("Provider configuration: \(owner). Failure: \(detail)"),
-                "text": .string("Repair the named provider configuration for the failed Workshop operation. Read the named routing files and retained model catalog; preserve original bytes in new sibling backups before editing. Correct only the evidenced malformed or incompatible routing fields. Preserve credentials, unrelated surfaces and authority. If the selected model is no longer offered, explicitly select an offered model on the same account for the intended operation and report that change. Do not sign in, change Trust, read persona or memories, delete retained state, build, test, install or restart. Report changed fields and remaining failure; a builder response does not prove the failed operation works.")])]))
+            nextCall: ToolFailureError.call("app", ["action": .string("setting.get"),
+                "args": .object(["setting": .string("providers.routing_repair")])]),
+            tap: "Providers", instruction: "Inspect providers.routing_repair; ask the person to resolve the reported provider configuration failure in Providers.")
     }
 
     public func runCodex(prompt: String, surface: String, timeoutSeconds: Int) async throws -> (model: String, output: String) {
@@ -294,7 +284,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             // Provider/transport completion and caller cancellation own this call.
                     // The plan's or step's instructions are in `prompt`; this
                     // only says what the call is.
-                    let system = "This is a Workshop task step. Follow the request exactly and return only what it asks for."
+                    let system = "This is a Workshop task step."
                     if let rootedTraceDataRoot = runLedgerDataRoot {
                         return try await LLMCallContext.$traceDataRootOverride.withValue(
                             rootedTraceDataRoot

@@ -1,15 +1,12 @@
 import EngineRuntime
-import PersistenceCore
 import BackgroundWork
-// Self-Improvement tab — the home for the weekly WeeklySelfImprovementLoop.
-// A simple on/off switch + the latest digest + a manual run. The one-tap
-// "apply" proposals surface in Approvals (Today ▸ Approvals and past
-// decisions).
 import AttentionRouting
 import SwiftUI
 import Foundation
 import BackgroundLoops
 import MemoryV2
+
+// Blueprint: | `SelfImprovementView.swift` | `SelfImprovementView`: weekly improvement switch, corrected-lesson growth reads and explicit manual-run feedback |
 
 struct SelfImprovementView: View {
     @Environment(AppModel.self) private var appModel
@@ -17,8 +14,7 @@ struct SelfImprovementView: View {
     // UserDefaults.standard (see makeWeeklySelfImprovementLoop).
     @AppStorage("selfImprovementEnabled") private var enabled = true
 
-    @State private var digest: String = ""
-    @State private var digestDate: String = ""
+    private var doctor: DoctorFacade { appModel.engine.doctor }
     @State private var running = false
     @State private var runNote: String = ""
 
@@ -81,7 +77,12 @@ struct SelfImprovementView: View {
                 // ── Manual run ────────────────────────────────────────────
                 HStack(spacing: 10) {
                     Button {
-                        Task { await runNow() }
+                        Task {
+                            running = true
+                            runNote = ""
+                            runNote = await Self.runManually(appModel: appModel).note
+                            running = false
+                        }
                     } label: {
                         Label(running ? "Running…" : "Run now", systemImage: "wand.and.stars")
                     }
@@ -97,44 +98,39 @@ struct SelfImprovementView: View {
                 HStack {
                     Text("Latest digest").font(.headline)
                     Spacer()
-                    if !digestDate.isEmpty {
-                        Text(digestDate).font(.caption).foregroundStyle(.secondary)
+                    if let digest = doctor.weeklyDigest {
+                        Text(digest.date).font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                if digest.isEmpty {
-                    Text(enabled
-                         ? "No run yet. Tap Run now, or wait for the weekly pass."
-                         : "Turn self-improvement on to start the weekly pass.")
-                        .font(.callout).foregroundStyle(.secondary)
-                } else {
-                    Text(digest)
+                if let error = doctor.weeklyDigestError {
+                    Text(error).font(.callout).foregroundStyle(.red)
+                }
+                if let digest = doctor.weeklyDigest {
+                    Text(digest.text)
                         .font(.system(.body, design: .monospaced))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(12)
                         .houseInset(in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
+                } else if doctor.weeklyDigestError == nil {
+                    Text(enabled
+                         ? "No run yet. Tap Run now, or wait for the weekly pass."
+                         : "Turn self-improvement on to start the weekly pass.")
+                        .font(.callout).foregroundStyle(.secondary)
                 }
             }
             .padding()
         }
         .navigationTitle("Self-Improvement")
-        .task { await loadDigest() }
-    }
-
-    @MainActor
-    private func runNow() async {
-        running = true
-        runNote = ""
-        runNote = await Self.runManually(appModel: appModel).note
-        running = false
-        await loadDigest()
+        .task { await doctor.observeWeeklyDigest() }
     }
 
     /// The Run now pass, shared with the agent's `mind_run self_improvement`.
+    /// Runs the live registered loop; digest reads follow the selected engine.
     /// Nil outcome: the run never started.
     @MainActor
     static func runManually(appModel: AppModel) async -> (outcome: LoopTickOutcome?, note: String) {
-        let result = await WeeklySelfImprovementLoop.runManually(dataRoot: PersistenceCore.defaultDataRoot()) {
+        let result = await WeeklySelfImprovementLoop.runManually(dataRoot: NativeAgentEngine.live.dataRoot) {
             await NativeAgentEngine.runBackgroundLoopOnce(loopId: "self_improvement_sweep")
         }
         guard let outcome = result.outcome else {
@@ -161,11 +157,5 @@ struct SelfImprovementView: View {
         case .failed(let error):
             return "Failed — \(EngineDoctorRuntime<AppDoctorPort>.safeDetail(error))."
         }
-    }
-
-    private func loadDigest() async {
-        let loaded = await WeeklySelfImprovementLoop.latestDigest(dataRoot: PersistenceCore.defaultDataRoot())
-        digest = loaded?.text ?? ""
-        digestDate = loaded?.date ?? ""
     }
 }

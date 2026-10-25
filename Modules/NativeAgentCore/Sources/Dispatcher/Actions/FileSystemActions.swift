@@ -4,10 +4,12 @@ import CryptoKit
 import NativeAgentCore
 import MacControl
 import PersistenceCore
+import TrustCenter
 import CoreWLAN
 import SystemConfiguration
 #if canImport(Darwin)
 import Darwin
+// Blueprint: | `FileSystemActions.swift` | `FileSystemActions` enum; `resolvePath` for reads/repository paths, mutations use NativeAgentWorkspaceRoot's shared execution/containment resolver; `allowedRoots`, part app-data reach and retained private/authority-store exclusions, `SwiftNativeSecurityCenter.fencedAttachment` (an attached file meets the same sensitive-store fence and refusal as files.read in every posture, then the workspace fence below Full Mac), shared mutation fences and reversible `trashFile`; version-checked line scanning owns file/log query selection, positions, full-source coverage and source continuation; `fileInfo` reads descriptor-bound metadata without following the final link; `listDir` owns budgeted allocated disk usage with named partial results; `gitLog`/`gitDiff` own dated repository reads; shared Git status parsing and process capture/settlement for Foundation and descriptor-pinned launches; `FileReadSourceMaterial` descriptor-only source port |
 #endif
 
 // MARK: - Native file/system connector actions
@@ -83,7 +85,7 @@ let connectorSensitiveDataSubpaths: Set<String> = [
 // App-data reach retains the private-store exclusions of the former file broker.
 let connectorPartPrivateDataSubpaths = [
     "credentials", "connectors", "telegram/config.json", "slack/config.json",
-    "catalog/.pack_signing_key", "mobile", "mobile_push", "notifications/push_tokens.json",
+    "mobile", "mobile_push", "notifications/push_tokens.json",
     "claude", "bridge-config",
 ]
 
@@ -94,7 +96,7 @@ let connectorPartPrivateDataSubpaths = [
 /// Built from a `DispatchContext`'s `repoRoot` + `extra` (`file_access`,
 /// `_na_data_root`) in `ConnectorActionContext.fromDispatch`.
 public struct ConnectorActionContext: Sendable {
-    /// Resolution base for relative paths + an always-allowed root.
+    /// Resolution base for reads/repository paths + an always-allowed root.
     public var repoRoot: String
     /// file_access dict: mode, sandbox, writableRoots, addDirs. Open-shape.
     public var fileAccess: [String: JSONValue]
@@ -179,9 +181,44 @@ public func connectorPathIsSensitiveData(_ path: URL, dataRoot: URL) -> Bool {
     )
 }
 
+extension SwiftNativeSecurityCenter {
+    public struct AttachmentRefusal: Error { public let reason: String; public let detail: String }
+
+    /// The fence `read_file` keeps, for a regular file the agent attaches: never a
+    /// sensitive store, in any posture; and inside a Trust workspace root
+    /// unless this Mac is in Full Mac. A relative path is read against her
+    /// workspace, as `read_file` reads it. make.add, the composer,
+    /// reply.attach and a resumed turn's reply all keep it.
+    public static func fencedAttachment(_ raw: String, dataRoot: URL) async -> Result<URL, AttachmentRefusal> {
+        let expanded = HomePath.expand(raw)
+        let file = (expanded.hasPrefix("/")
+            ? URL(fileURLWithPath: expanded)
+            : NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot).appendingPathComponent(expanded))
+            .standardizedFileURL.resolvingSymlinksInPath()
+        guard (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else {
+            return .failure(.init(reason: "attachment_missing",
+                detail: "No regular file is at \(file.path). Check the path with app files.list, then try again."))
+        }
+        guard !connectorPathIsSensitiveData(file, dataRoot: dataRoot) else {
+            return .failure(.init(reason: "path_not_allowed", detail: FileSystemActions.sensitiveReadRefusal(file)))
+        }
+        guard let policy = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked() else {
+            return .failure(.init(reason: "trust_mode_unreadable",
+                detail: "The saved Trust policy could not be read, so no file was attached. The person can check Trust."))
+        }
+        if PermissionLaw.posture(policy) == .fullMac { return .success(file) }
+        guard isInsideTrustedWorkspace(file, policy: policy, dataRoot: dataRoot) else {
+            return .failure(.init(reason: "attachment_outside_workspace",
+                detail: "\(file.path) is outside your Trust workspace folders, the same fence app files.read keeps. "
+                + "Ask the owner to attach it themselves, or to add its folder to the workspace roots in Trust."))
+        }
+        return .success(file)
+    }
+}
+
 enum FileSystemActions {
 
-    /// Mirror `_resolve_path`: resolve a possibly
+    /// Mirror `_resolve_path` for reads/repository paths: resolve a possibly
     /// relative path against repo_root, then canonicalise. We use
     /// `standardizedFileURL.resolvingSymlinksInPath()` so macOS
     /// `/var → /private/var` symlinks normalise the same way Python's
@@ -276,11 +313,15 @@ enum FileSystemActions {
         let pPath = resolved.path.lowercased()
         let prefix = drPath.hasSuffix("/") ? drPath : drPath + "/"
         guard pPath == drPath || pPath.hasPrefix(prefix) else { return false }
-        let relStr = pPath == drPath ? "" : String(pPath.dropFirst(prefix.count))
+        var relStr = pPath == drPath ? "" : String(pPath.dropFirst(prefix.count))
+        // A local backup's payload (backups/<id>/data/…) is the data root again: what is fenced there is fenced in it.
+        if let payload = relStr.range(of: "^backups/[^/]+/data/", options: .regularExpression) { relStr.removeSubrange(payload) }
         if ctx.appDataWrite != nil,
            connectorPartPrivateDataSubpaths.contains(where: { relStr == $0 || relStr.hasPrefix($0 + "/") }) { return true }
         if relStr == "senses/ledger" || relStr.hasPrefix("senses/ledger/") { return true }
         if relStr == "senses/news" || relStr.hasPrefix("senses/news/") { return true }
+        // Kept MCP launch lines can carry a key.
+        if relStr == "mcp/servers.json" { return true }
         let parts = relStr.split(separator: "/").map(String.init)
         guard let first = parts.first else { return false }
         if connectorSensitiveDataSubpaths.contains(first) { return true }
@@ -296,12 +337,20 @@ enum FileSystemActions {
             if parts[0] == "agents", ["peers.json", "peer-claims"].contains(parts[1]) { return true }
             if parts[0] == "workflows", parts[1] == "approvals" { return true }
             if parts[0] == "tools", parts[1].hasPrefix(".manifest_signing_key") { return true }
+            if parts[0] == "catalog", parts[1].hasPrefix(".pack_signing_key") { return true }
             if parts[0] == "memory", parts[1] == "vault" { return true }
         }
         if parts.count >= 2 && parts[0] == "nextgen" && parts[1] == "remote" { return true }
         // *.bin directly under data root (pairing secrets etc.)
         if parts.count == 1 && resolved.pathExtension.lowercased() == "bin" { return true }
         return false
+    }
+
+    /// What files.read says for a sensitive store, wherever else that store is asked for.
+    static func sensitiveReadRefusal(_ resolved: URL) -> String {
+        "Path '\(resolved.path)' is under a sensitive data sub-tree (OAuth tokens, "
+            + "pairing secrets, provider credentials, trust policy). "
+            + "Use dedicated Swift runtime tools such as app agent.introspect or memory.recall instead."
     }
 
     /// Mirror `_truncate`.
@@ -524,12 +573,7 @@ enum FileSystemActions {
             )
         }
         if isSensitiveDataPath(resolved, ctx) {
-            return errResult(
-                "Path '\(resolved.path)' is under a sensitive data sub-tree (OAuth tokens, "
-                + "pairing secrets, provider credentials, trust policy). "
-                + "Use dedicated Swift runtime tools such as app agent.introspect or memory.recall instead.",
-                code: "path_not_allowed"
-            )
+            return errResult(sensitiveReadRefusal(resolved), code: "path_not_allowed")
         }
         var isDir: ObjCBool = false
         let exists = FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir)
@@ -911,7 +955,7 @@ enum FileSystemActions {
         if isSensitiveDataPath(resolved, ctx) {
             return errResult("Path '\(resolved.path)' is under a sensitive data sub-tree. Use dedicated Swift runtime tools instead.", code: "path_not_allowed")
         }
-        if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: resolved.path) {
+        if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: resolved.path, write: write) {
             return errResult(reason, code: "path_not_allowed")
         }
         return nil
@@ -922,9 +966,9 @@ enum FileSystemActions {
         guard !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return errResult("path is required", code: "bad_input")
         }
-        let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot)
+        let dataRoot = URL(fileURLWithPath: ctx.dataRoot ?? PersistenceCore.defaultDataRoot().path)
+        let resolved = NativeAgentWorkspaceRoot.resolveFileMutationPath(rawPath, dataRoot: dataRoot)
         if let refusal = mutationRefusal(resolved, ctx) { return refusal }
-        let dataRoot = URL(fileURLWithPath: ctx.dataRoot ?? PersistenceCore.defaultDataRoot().path).resolvingSymlinksInPath()
         if isWithinRoots(dataRoot, [resolved]) {
             return errResult("Cannot trash NativeAgent's data root or a folder containing it.", code: "path_not_allowed")
         }
@@ -949,13 +993,31 @@ enum FileSystemActions {
         if let overwrite = input["overwrite"], overwrite != .null {
             guard case .bool = overwrite else { return errResult("overwrite must be true or false.", code: "bad_input") }
         }
-        let source = resolvePath(path, repoRoot: ctx.repoRoot), target = resolvePath(destination, repoRoot: ctx.repoRoot)
+        let dataRoot = URL(fileURLWithPath: ctx.dataRoot ?? PersistenceCore.defaultDataRoot().path)
+        let source = NativeAgentWorkspaceRoot.resolveFileMutationPath(path, dataRoot: dataRoot)
+        let target = NativeAgentWorkspaceRoot.resolveFileMutationPath(destination, dataRoot: dataRoot)
         for url in [source, target] {
             if let refusal = mutationRefusal(url, ctx, write: !copy || url == target) { return refusal }
         }
-        let dataRoot = URL(fileURLWithPath: ctx.dataRoot ?? PersistenceCore.defaultDataRoot().path).resolvingSymlinksInPath()
         guard source != target, !isWithinRoots(target, [source]), !isWithinRoots(dataRoot, [source]) else {
             return errResult("Cannot transfer an item onto itself, into itself, or transfer NativeAgent's data root or a folder containing it.", code: "path_not_allowed")
+        }
+        // A folder carries everything under it: no sensitive store leaves its place inside one, or arrives in one,
+        // and a folder whose whole tree does not read is not moved, since what it holds cannot be told.
+        if isWithinRoots(source, [dataRoot]) || isWithinRoots(target, [dataRoot]),
+           (try? source.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+            var unreadable: URL?
+            let tree = FileManager.default.enumerator(at: source, includingPropertiesForKeys: nil) { url, _ in unreadable = url; return false }
+            let base = source.pathComponents.count
+            while let url = tree?.nextObject() as? URL {
+                let relative = url.pathComponents.dropFirst(base).joined(separator: "/")
+                if isSensitiveDataPath(source.appendingPathComponent(relative), ctx) || isSensitiveDataPath(target.appendingPathComponent(relative), ctx) {
+                    return errResult("Path '\(source.path)/\(relative)' is under a sensitive data sub-tree, so the folder holding it is not moved. Move the other files individually.", code: "path_not_allowed")
+                }
+            }
+            if tree == nil || unreadable != nil {
+                return errResult("'\((unreadable ?? source).path)' does not read, so what the folder holds cannot be checked and it is not moved. Move the files you can read individually.", code: "path_not_allowed")
+            }
         }
         do {
             try VerifiedPath.transfer(from: source, to: target, copy: copy, overwrite: input["overwrite"] == .bool(true))
@@ -1000,7 +1062,8 @@ enum FileSystemActions {
             expectedHash = hash
         } else { expectedHash = nil }
 
-        let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot)
+        let dataRoot = URL(fileURLWithPath: ctx.dataRoot ?? PersistenceCore.defaultDataRoot().path)
+        let resolved = NativeAgentWorkspaceRoot.resolveFileMutationPath(rawPath, dataRoot: dataRoot)
         if let refusal = mutationRefusal(resolved, ctx) { return refusal }
 
         // before_content for inline diff (only on overwrite, not append), ≤ 200 kB.
@@ -1466,6 +1529,12 @@ enum FileSystemActions {
     // MARK: - system_info
 
     static func systemInfo(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
+        if input["person"] == .bool(true) {
+            // The shape the line promises: {here, idle_seconds} at the top.
+            var out: [String: JSONValue] = ["ok": .bool(true), "status": .string("ok")]
+            if case .object(let fact) = MacPersonInput.presenceDetail { out.merge(fact) { $1 } }
+            return .object(out)
+        }
         if let speed = input["speed_test"], speed != .null {
             guard case .bool = speed else { return errResult("speed_test must be true or false.", code: "bad_input") }
             guard speed != .bool(true) || ((input["app"] == nil || input["app"] == .null) && input["check_updates"] != .bool(true)) else {
@@ -1645,6 +1714,7 @@ enum FileSystemActions {
         }
 
         fields["screen_lock"] = .object(["locked": .bool(MacScreenLock.isLocked())])
+        fields["person"] = MacPersonInput.presenceDetail
 
         // Battery: pmset -g batt → percent/charging/source.
         if let batt = runCommand("/usr/bin/pmset", ["-g", "batt"]), batt.status == 0 {
@@ -2338,10 +2408,11 @@ enum FileSystemActions {
         }
         let dataRoot = resolvePath(ctx.dataRoot.flatMap { $0.isEmpty ? nil : $0 }
             ?? PersistenceCore.defaultDataRoot().path, repoRoot: ctx.repoRoot)
-        let dataPattern = foldedPattern(dataRoot.path)
+        // A local backup's payload is fenced as the data root it copies.
+        let dataPattern = foldedPattern(dataRoot.path) + "(/" + foldedPattern("backups") + "/[^/]+/" + foldedPattern("data") + ")?"
         for path in connectorSensitiveDataSubpaths.sorted() + [
             "jev/credential.json", "agents/peers.json", "agents/peer-claims",
-            "workflows/approvals", "memory/vault", "nextgen/remote",
+            "workflows/approvals", "memory/vault", "nextgen/remote", "mcp/servers.json",
         ] {
             rules.append("(deny file-read-data (regex \(quoted("^" + dataPattern + "/" + foldedPattern(path) + "(/|$)"))))")
         }
@@ -2350,6 +2421,7 @@ enum FileSystemActions {
             "/" + foldedPattern("connectors") + "/(.*/)?("
                 + ["auth.json", "credential.json", "credentials.json"].map(foldedPattern).joined(separator: "|") + ")(/|$)",
             "/" + foldedPattern("tools/.manifest_signing_key") + "[^/]*(/|$)",
+            "/" + foldedPattern("catalog/.pack_signing_key") + "[^/]*(/|$)",
         ] {
             rules.append("(deny file-read-data (regex \(quoted("^" + dataPattern + suffix))))")
         }
@@ -2614,7 +2686,7 @@ private func captureProcessOutput(
     // Process.waitUntilExit(). Semaphores settle both writes before readback.
     let timedOut = ProcessTimeoutFlag()
     let box = ProcessOutputBox()
-    let stopCapture = ProcessTimeoutFlag()
+    let stopCapture = ProcessPipeStop()
     let outDone = DispatchSemaphore(value: 0)
     let errDone = DispatchSemaphore(value: 0)
     let outFH = outPipe.fileHandleForReading
@@ -2635,29 +2707,21 @@ private func captureProcessOutput(
     // TERM then KILL bounds the child wait; pipe settlement separately bounds
     // descendants retaining writers. Keep the watchdog pool-independent too.
     let watchdogDone = ProcessTimeoutFlag()
+    let watchdogRetired = DispatchSemaphore(value: 0)
     let watchdog = Thread {
-        // Sleep in small slices so a normally-exiting process cancels promptly.
+        defer { watchdogRetired.signal() }
+        // Actual exit wakes the deadline owner; no sampling of completion.
         let deadline = Date().addingTimeInterval(timeout)
-        let killDeadline = Date().addingTimeInterval(timeout + 2.0)
-        var sentTerm = false
-        while !watchdogDone.get() {
-            Thread.sleep(forTimeInterval: 0.05)
-            if watchdogDone.get() { return }
-            let now = Date()
-            if !sentTerm && now >= deadline {
-                signalChild(SIGTERM, timedOut)
-                sentTerm = true
-            }
-            if now >= killDeadline {
-                signalChild(SIGKILL, timedOut)
-                return
-            }
-        }
+        guard !watchdogDone.wait(until: deadline) else { return }
+        signalChild(SIGTERM, timedOut)
+        guard !watchdogDone.wait(until: deadline.addingTimeInterval(2)) else { return }
+        signalChild(SIGKILL, timedOut)
     }
     watchdog.start()
 
     let status = waitForExit()
     watchdogDone.set()
+    watchdogRetired.wait()
     // Descendants may retain the pipes after the child exits. Stop the
     // nonblocking readers after a shared grace; closing a descriptor from
     // another thread does not reliably interrupt a blocking read.
@@ -2779,7 +2843,7 @@ private struct ProcessPipeCapture {
 
 /// Drain to EOF even after retaining the budget so a full pipe cannot block
 /// the engine. Existing callers with no budget keep their capture behavior.
-private func captureProcessPipe(_ handle: FileHandle, byteLimit: Int?, stop: ProcessTimeoutFlag) -> ProcessPipeCapture {
+private func captureProcessPipe(_ handle: FileHandle, byteLimit: Int?, stop: ProcessPipeStop) -> ProcessPipeCapture {
     defer { try? handle.close() }
     var result = ProcessPipeCapture()
     let limit = max(0, byteLimit ?? Int.max)
@@ -2790,16 +2854,18 @@ private func captureProcessPipe(_ handle: FileHandle, byteLimit: Int?, stop: Pro
         return result
     }
     var buffer = [UInt8](repeating: 0, count: 65_536)
-    while !stop.get() {
-        var event = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-        // Bounded readiness wait lets the owner stop a pipe held by a descendant.
-        let ready = poll(&event, 1, 100)
-        if ready == 0 { continue }
+    while true {
+        var events = [pollfd(fd: fd, events: Int16(POLLIN), revents: 0),
+                      pollfd(fd: stop.descriptor, events: Int16(POLLIN), revents: 0)]
+        // The owner closes its wake writer at the shared drain deadline. Both
+        // readers wake on HUP even if a descendant retains the output writer.
+        let ready = poll(&events, 2, -1)
         if ready < 0 {
             if errno == EINTR { continue }
             result.readFailed = true
             break
         }
+        if events[1].revents != 0 { break }
         let count = read(fd, &buffer, buffer.count)
         if count == 0 { break }
         if count < 0 {
@@ -2812,6 +2878,20 @@ private func captureProcessPipe(_ handle: FileHandle, byteLimit: Int?, stop: Pro
         if retained < count { result.truncated = true }
     }
     return result
+}
+
+/// One operation's pipe-stop signal; a close wakes every registered reader.
+private final class ProcessPipeStop: @unchecked Sendable {
+    private let pipe = Pipe()
+    private let lock = NSLock()
+    private var stopped = false
+    var descriptor: Int32 { pipe.fileHandleForReading.fileDescriptor }
+    func set() {
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped else { return }
+        stopped = true
+        try? pipe.fileHandleForWriting.close()
+    }
 }
 
 /// Readback follows both pipe semaphores, after each reader's single write.
@@ -2827,10 +2907,17 @@ private final class ProcessOutputBox: @unchecked Sendable {
 
 /// Thread-safe one-shot flag for the process watchdog and pipe shutdown.
 private final class ProcessTimeoutFlag: @unchecked Sendable {
-    private let lock = NSLock()
+    private let lock = NSCondition()
     private var value = false
-    func set() { lock.lock(); value = true; lock.unlock() }
+    func set() { lock.lock(); value = true; lock.broadcast(); lock.unlock() }
     func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func wait(until deadline: Date) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        while !value {
+            if !lock.wait(until: deadline) { break }
+        }
+        return value
+    }
 }
 
 /// Parse the leading integer that appears immediately after `marker` in `s`.

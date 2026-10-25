@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import TelegramBot
+// Blueprint: | `AttentionDeliveryPorts.swift` | `AttentionDeliveryPorts` struct |
 
 /// Transport effects supplied by the host. Destination selection, payload
 /// construction, fallback policy and delivery bookkeeping stay in the router.

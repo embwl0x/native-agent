@@ -10,8 +10,8 @@ import ProviderRouting
 import DoctorChecks
 import Research
 import TelegramBot
-import Skills
 import Connectors
+// Blueprint: | `AppModel+SkillsIntegrations.swift` | `AppModel`: built-in skill guidance and part Keep/off-switch; workspace creation, SearXNG autodetection and projection readback, Telegram settings/log actions and Doctor commands; `refreshTelegramSettingsDraft` captures and merges untouched form fields through one newest-started `LatestRead.refreshDraft` owner; connector updates verify through `engine.connectors.update` |
 
 struct TelegramSettingsDraftSnapshot: Equatable {
     var enabled: Bool
@@ -29,141 +29,92 @@ extension AppModel {
 
 @MainActor
 extension AppModel {
-    @MainActor
-    func deleteSkill(_ skill: SkillRecord) async {
-        do {
-            try await NativeSkillRegistryActions.deleteSkill(id: skill.id, dataRoot: engine.dataRoot)
-            statusText = "Skill deleted"
-            await refreshAll()
-        } catch {
-            setFailureStatus(error, action: "delete that skill")
-        }
+    /// All reads that can rebase this form share newest-started ordering.
+    /// A refresh may replace only fields unchanged since it began and clean
+    /// against its captured baseline; user edits remain drafts across reads.
+    func refreshTelegramSettingsDraft<Value>(
+        _ load: () async -> Value,
+        snapshot: (Value) -> TelegramSettingsDraftSnapshot?,
+        publish: (Value) -> Void = { _ in }
+    ) async {
+        let before = telegramSettingsDraftSnapshot
+        let baseline = telegramSettingsDraftBaseline
+        _ = await telegramSettingsRead.refreshDraft(load, apply: { value in
+            if let saved = snapshot(value) {
+                let current = telegramSettingsDraftSnapshot
+                func mayUpdate<T: Equatable>(_ key: KeyPath<TelegramSettingsDraftSnapshot, T>) -> Bool {
+                    current[keyPath: key] == before[keyPath: key]
+                        && (baseline.map { before[keyPath: key] == $0[keyPath: key] } ?? true)
+                }
+                if mayUpdate(\.enabled) { telegramEnabled = saved.enabled }
+                if mayUpdate(\.chats) { telegramAllowedChats = saved.chats }
+                if mayUpdate(\.users) { telegramAllowedUsers = saved.users }
+                if mayUpdate(\.requireMention) { telegramRequireMention = saved.requireMention }
+                telegramSettingsDraftBaseline = saved
+            }
+            publish(value)
+        })
     }
 
     @MainActor
     func loadSkillManifests() async {
         isLoadingSkillManifests = true
-        let root = engine.dataRoot
-        async let learnedSkillsTask: [SkillRecord] = try await RuntimeReadProjection.skills(dataRoot: engine.dataRoot)
-        var failures: [String] = []
-        let learnedSkills: [SkillRecord]
         do {
-            learnedSkills = try await learnedSkillsTask
+            try await engine.tools.refreshSkills(includingSource: true)
+            if skillLifecycleFeedback?.kind == .failure { dismissSkillManifestFeedback() }
         } catch {
-            learnedSkills = []
             ModuleLog.app("%@", "[skills] learned skills read failed: \(error)")
-            failures.append("learned skills")
-        }
-        let infos: [SkillInfo] = await Task.detached(priority: .utility) {
-            var infos: [SkillInfo] = []
-            for skill in learnedSkills {
-                let review = try? SwiftNativeSkillsClient(root: root).readSkill(name: skill.id, source: true)
-                let info = SkillInfo.learnedSkill(skill, review: review)
-                infos.append(info)
-            }
-            return infos
-        }.value
-        skillManifests = infos
-        if !failures.isEmpty {
-            recordSkillManifestFailure("Couldn't read \(failures.joined(separator: " or ")). Try again; if it keeps happening, the details are in the log.")
-        } else if skillLifecycleFeedback?.kind == .failure {
-            dismissSkillManifestFeedback()
+            recordSkillManifestFailure("Couldn't read learned skills. Try again; if it keeps happening, the details are in the log.")
         }
         isLoadingSkillManifests = false
-    }
-
-    /// `reviewSheet: false` is the agent's `skill_manage enable`, which also
-    /// turns a disabled skill back on; the sheet installs drafts only.
-    @MainActor
-    @discardableResult
-    func installReviewedSkill(_ info: SkillInfo, reviewSheet: Bool = true) async -> SkillReviewInstallOutcome {
-        if reviewSheet, let refusal = InstalledSkillInventory.reviewInstallRefusal(
-            version: info.registry.version, state: info.registry.state, name: info.registry.name,
-            hasCandidate: info.candidateDigest != nil && info.readme != nil,
-            validationStatus: info.validationStatus
-        ) {
-            return .refused(detail: refusal)
-        }
-        let requestedName = info.registry.name
-        do {
-            try await NativeSkillRegistryActions.enableSkill(
-                name: requestedName, dataRoot: engine.dataRoot,
-                reviewedDigest: info.candidateDigest, admitScript: true
-            )
-            await loadSkillManifests()
-            let recovered = skillManifests.first { $0.id == info.id }
-            guard let recovered,
-                  ["installed", "active"].contains(recovered.registry.state.lowercased()) else {
-                let detail = "Install could not be verified after the registry refresh."
-                recordSkillManifestFailure(detail)
-                return .failed(detail: detail)
-            }
-            let receipt = SkillReviewInstallReceipt(
-                requestedName: requestedName,
-                confirmedName: recovered.manifest.name,
-                confirmedState: recovered.registry.state.lowercased()
-            )
-            statusText = receipt.confirmedState == "active"
-                ? "Skill active"
-                : "Skill installed"
-            return .installed(receipt)
-        } catch {
-            let detail = UserFacingError.message(error, action: "install that skill")
-            recordSkillManifestFailure(detail)
-            return .failed(detail: detail)
-        }
     }
 
     @MainActor
     func quarantineTool(_ tool: ToolRecord, reason: String = "Owner switched off from NativeAgent UI.") async {
         do {
-            let updated = try await engine.tools.quarantine(id: tool.id, reason: reason, ownerAuthorized: true)
+            let updated = try await engine.tools.switchOff(id: tool.id, reason: reason)
             guard try await engine.tools.refreshAuthored(confirming: updated.id, status: "disabled") else {
-                recordToolOperationStatus(
-                    "Tool off could not be confirmed after reloading the ability.",
-                    outcome: .failed
-                )
+                recordToolOperationStatus("Ability off could not be confirmed after reloading it.", outcome: .failed)
                 return
             }
-            recordToolOperationStatus("Tool off", outcome: .succeeded)
+            recordToolOperationStatus("Ability off", outcome: .succeeded)
         } catch {
-            recordToolOperationStatus(UserFacingError.message(error, action: "turn that tool off"), outcome: .failed, cause: error)
+            recordToolOperationStatus(UserFacingError.message(error, action: "turn that ability off"), outcome: .failed, cause: error)
         }
     }
 
     @MainActor
     func promoteTool(_ tool: ToolRecord, userRequested: Bool = true) async {
-        if let refusal = ToolApprovalEligibility.refusal(for: tool, ownerAuthorized: true) {
-            recordToolOperationStatus("Tool activation unavailable: \(refusal)", outcome: .failed)
+        if let refusal = engine.tools.keepRefusal(tool) {
+            recordToolOperationStatus("Keeping unavailable: \(refusal)", outcome: .failed)
             return
         }
         do {
-            let updated = try await engine.tools.promote(id: tool.id, allowRisky: userRequested, ownerAuthorized: true)
+            let version = tool.reviewedKeepDigest
+            guard version != nil || (tool.candidateDigest ?? tool.codeFingerprint) == nil
+                && tool.activePath.map({ URL(fileURLWithPath: $0).pathExtension == "md" }) == true else {
+                throw ToolRegistryError.invalidRequest("Refresh Tools before keeping this ability.")
+            }
+            let updated = try await engine.tools.keep(id: tool.id, version: version)
             guard try await engine.tools.refreshAuthored(confirming: updated.id, status: "active") else {
-                recordToolOperationStatus(
-                    "Tool activation could not be confirmed after reloading the registry.",
-                    outcome: .failed
-                )
+                recordToolOperationStatus("Keeping could not be confirmed after reloading the ability.", outcome: .failed)
                 return
             }
-            recordToolOperationStatus("Tool activated", outcome: .succeeded)
+            recordToolOperationStatus("Ability kept", outcome: .succeeded)
         } catch {
-            recordToolOperationStatus(UserFacingError.message(error, action: "turn that tool on"), outcome: .failed, cause: error)
+            recordToolOperationStatus(UserFacingError.message(error, action: "keep that ability"), outcome: .failed, cause: error)
         }
     }
 
     @MainActor
     func addWorkspaceWithReceipt(name: String, path: String, writable: Bool) async -> WorkspaceAddOutcome {
         do {
-            let result = try await ConnectorRegistryActions.addWorkspace(
-                name: name, path: path, permissions: writable ? ["read", "write"] : ["read"], root: engine.dataRoot
-            )
+            let result = try await engine.connectors.addWorkspace(name: name, path: path, writable: writable)
             guard result.verified else {
                 let detail = "The workspace registry did not confirm the saved workspace."
                 statusText = "Workspace add failed: \(detail)"
                 return .failed(detail)
             }
-            workspaces = result.refreshed
             statusText = "Workspace added and verified"
             return .verified(result.added)
         } catch {
@@ -176,15 +127,11 @@ extension AppModel {
     @MainActor
     func updateConnector(_ connector: ConnectorRecord, enabled: Bool) async -> ConnectorUpdateOutcome {
         do {
-            let result = try await ConnectorStatusProjection.updateConnectorAndVerify(
-                id: connector.id, enabled: enabled, root: engine.dataRoot, platform: AppConnectorStatusPlatform()
-            )
-            guard let confirmed = result.confirmed else {
+            guard let confirmed = try await engine.connectors.update(id: connector.id, enabled: enabled) else {
                 let detail = "The registry did not confirm the requested \(enabled ? "enable" : "disable") change."
                 statusText = "Connector update failed: \(detail)"
                 return .failed(detail)
             }
-            connectors = result.refreshed
             statusText = "Connector \(confirmed.enabled ? "enabled" : "disabled") and verified"
             return .verified(confirmed)
         } catch {
@@ -199,7 +146,7 @@ extension AppModel {
         do {
             let detected = try await SwiftNativeResearchClient(dataRoot: engine.dataRoot).autodetectSearXNG()
             let outcome = detected.outcome
-            if case .found(let url) = outcome { searxngBaseURL = url }
+            if case .found = outcome { try await engine.configuration.readSearXNG(dataRoot: engine.dataRoot) }
             return outcome
         } catch {
             return .failed(UserFacingError.cause(error, action: "find a SearXNG server"))
@@ -223,7 +170,7 @@ extension AppModel {
         }
         guard TelegramBotTokenPresentation.canSave(
             draft: telegramToken,
-            tokenConfigured: telegramTokenConfigured
+            tokenConfigured: engine.telegram.status?.tokenConfigured == true
         ) else {
             let detail = "Add a bot token before saving settings."
             statusText = "Telegram save failed: \(detail)"
@@ -248,22 +195,26 @@ extension AppModel {
         )
         telegramReasoningEffort = normalizedEffort
         let submittedEnabled = telegramEnabled
+        let submittedModel = telegramModel
+        let submittedToken = telegramToken
         do {
             try await engine.telegram.configureTelegram(
-                token: telegramToken,
+                token: submittedToken,
                 allowedChatIds: chats.canonicalIDs,
                 allowedUserIds: users.canonicalIDs,
                 requireMention: telegramRequireMention,
-                model: telegramModel,
+                model: submittedModel,
                 reasoningEffort: normalizedEffort,
                 enabled: submittedEnabled,
                 restartPollLoop: { [backgroundLoopsManager] in _ = await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: backgroundLoopsManager) }
             )
-            telegramToken = ""
+            if telegramToken == submittedToken { telegramToken = "" }
             await refreshAll()
-            statusText = telegramTokenConfigured ? "Telegram settings saved" : "Telegram settings saved. Add a bot token to enable Telegram."
+            if pendingTelegramModel == submittedModel { pendingTelegramModel = nil }
+            if pendingTelegramReasoningEffort == normalizedEffort { pendingTelegramReasoningEffort = nil }
+            statusText = engine.telegram.status?.tokenConfigured == true ? "Telegram settings saved" : "Telegram settings saved. Add a bot token to enable Telegram."
             let outcome = TelegramSettingsSaveOutcome.saved(
-                tokenConfigured: telegramTokenConfigured,
+                tokenConfigured: engine.telegram.status?.tokenConfigured == true,
                 enabled: submittedEnabled,
                 allowlistCount: Set(chats.canonicalIDs + users.canonicalIDs).count
             )
@@ -288,6 +239,7 @@ extension AppModel {
         let restart: (@Sendable () async -> Void)? = restartPollLoop
             ? { @Sendable [backgroundLoopsManager] in _ = await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: backgroundLoopsManager) }
             : nil
+        let submittedToken = telegramToken
         do {
             try await engine.telegram.configureTelegram(
                 token: "",
@@ -300,7 +252,7 @@ extension AppModel {
                 clearToken: true,
                 restartPollLoop: restart
             )
-            telegramToken = ""
+            if telegramToken == submittedToken { telegramToken = "" }
             await refreshAll()
             statusText = "Telegram bot token cleared"
         } catch {
@@ -311,48 +263,40 @@ extension AppModel {
     @MainActor
     @discardableResult
     func refreshTelegram() async -> Bool {
-        let requestID = UUID()
-        telegramSettingsReadID = requestID
-        let before = telegramSettingsDraftSnapshot
-        let baseline = telegramSettingsDraftBaseline
         telegramStatusRefreshError = nil
+        var published = false
+        await refreshTelegramSettingsDraft({ () async -> Result<(TelegramPresentationSnapshot, Bool), Error> in
         do {
             let status: TelegramPresentationSnapshot
             var credentialUnavailable = false
             do {
-                status = try await engine.telegram.load(manager: backgroundLoopsManager)
+                status = try await engine.telegram.refresh(manager: backgroundLoopsManager)
             } catch is DeviceSecretKeychain.Failure {
                 // Keep validated authority fields editable for explicit grant
                 // replacement or disconnect; this is not transport readiness.
-                status = try await engine.telegram.load(manager: backgroundLoopsManager, credentialUnavailable: true)
+                status = try await engine.telegram.refresh(manager: backgroundLoopsManager, credentialUnavailable: true)
                 credentialUnavailable = true
             }
-            guard !Task.isCancelled, telegramSettingsReadID == requestID else { return false }
-            if credentialUnavailable { telegramStatusRefreshError = UserFacingError.advice(for: DeviceSecretKeychain.Failure.unavailable) }
-            engine.telegram.status = status
-            telegramTokenConfigured = status.tokenConfigured
-            // Refresh untouched fields only. Navigation and a read completing
-            // late must not silently discard an authorization draft.
-            func mayUpdate<T: Equatable>(_ key: KeyPath<TelegramSettingsDraftSnapshot, T>) -> Bool {
-                telegramSettingsDraftSnapshot[keyPath: key] == before[keyPath: key]
-                    && (baseline.map { before[keyPath: key] == $0[keyPath: key] } ?? true)
-            }
-            if mayUpdate(\.enabled) { telegramEnabled = status.enabled }
-            if mayUpdate(\.chats) { telegramAllowedChats = status.allowedChatIds.joined(separator: ",") }
-            if mayUpdate(\.users) { telegramAllowedUsers = status.allowedUserIds.joined(separator: ",") }
-            if mayUpdate(\.requireMention) { telegramRequireMention = status.requireMention }
-            telegramSettingsDraftBaseline = TelegramSettingsDraftSnapshot(
+            return .success((status, credentialUnavailable))
+        } catch { return .failure(error) }
+        }, snapshot: { result in
+            guard case .success(let (status, _)) = result else { return nil }
+            return TelegramSettingsDraftSnapshot(
                 enabled: status.enabled, chats: status.allowedChatIds.joined(separator: ","),
                 users: status.allowedUserIds.joined(separator: ","), requireMention: status.requireMention
             )
+        }, publish: { result in
+        switch result {
+        case .success(let (_, credentialUnavailable)):
+            if credentialUnavailable { telegramStatusRefreshError = UserFacingError.advice(for: DeviceSecretKeychain.Failure.unavailable) }
             statusText = telegramStatusRefreshError ?? "Telegram status refreshed"
-            return true
-        } catch {
-            guard !Task.isCancelled, telegramSettingsReadID == requestID else { return false }
+            published = true
+        case .failure(let error):
             setFailureStatus(error, action: "refresh Telegram")
             telegramStatusRefreshError = UserFacingError.advice(for: error)
-            return false
         }
+        })
+        return published
     }
 
     @MainActor
@@ -380,7 +324,6 @@ extension AppModel {
         defer { isClearingTelegramLogs = false }
         do {
             let receipt = try await engine.telegram.clearTelegramDiagnostics(manager: backgroundLoopsManager)
-            engine.telegram.status = receipt.status
             telegramStatusRefreshError = nil
             telegramClearLogsOutcome = .completed(receipt)
             statusText = TelegramClearLogsPresentation.summary(for: receipt)
@@ -442,6 +385,7 @@ extension AppModel {
     @MainActor
     func refreshLiveDoctorCoverage() async {
         guard let current = engine.doctor.report else { return }
+        _ = await engine.doctor.reportRead.read({
         let liveChecks = await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
             .runtime.liveDoctorCoverageChecks()
         let statusChecks = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals, repairDesk: false, stuckReason: DeskPageContent.stuckReason, safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail).checks
@@ -450,7 +394,8 @@ extension AppModel {
         var refreshed = EngineDoctorRuntime<AppDoctorPort>.mergeReport(withoutRetiredProbe, liveChecks: liveChecks + statusChecks)
         refreshed.checks = await DoctorStatusProjection.repairProjection(refreshed.checks, dataRoot: engine.dataRoot)
         refreshed.status = DoctorStatusProjection.doctorRollup(refreshed.checks.map(\.status))
-        engine.doctor.report = refreshed
+        return refreshed
+        }, publish: { engine.doctor.report = $0 })
     }
 
     private func splitIDs(_ value: String) -> [String] {

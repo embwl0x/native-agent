@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+// Blueprint: | `SecretActionEnvelope.swift` | `SecretActionEnvelope` enum; `seal` |
 
 /// Wire contract mirrored by the Mac. Seal before handing an action to any
 /// transport, pending-action store, signature, or transaction ledger.

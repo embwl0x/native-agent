@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import PersistenceCore
+// Blueprint: | `MacAppleScriptBridge+MessagesNotes.swift` | `MacAppleScriptBridge`: `messagesRecentThreads`, `messagesSend`, `notesModify` (exact-note update or reversible deletion) |
 
 extension MacAppleScriptBridge {
     // MARK: MESSAGES

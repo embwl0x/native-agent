@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `RuntimeReadProjection+Traces.swift` | `RuntimeReadProjection`: `getTraces`; `RuntimeReadError` enum |
 
 /// A caller asking for only trace rows must not receive a success-shaped
 /// empty array when the canonical evidence feed was damaged or only partially

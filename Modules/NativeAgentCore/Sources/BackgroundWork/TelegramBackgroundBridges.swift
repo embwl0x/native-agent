@@ -1,12 +1,13 @@
 import Foundation
 import NativeAgentCore
-import ChatOrchestration
+import ChatToolRuntime
 import TelegramBot
 import ProviderRouting
 import MemoryV2
 import DeviceSync
 import NotificationInbox
 import PersistenceCore
+// Blueprint: | `TelegramBackgroundBridges.swift` | `TelegramAccountModelCatalogPort` struct |
 
 /// Account-catalog observation supplied by the concrete platform client.
 public struct TelegramAccountModelCatalogPort: Sendable {

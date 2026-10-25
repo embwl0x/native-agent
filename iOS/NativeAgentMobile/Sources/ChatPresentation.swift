@@ -3,6 +3,7 @@ import UIKit
 import Speech
 import PhotosUI
 import NativeAgentShared
+// Blueprint: | `ChatPresentation.swift` | Chat controls and picker presentation; model controls read the shared `iCloudSyncEngine.surfaceModels` projection |
 
 enum ChatSessionTabPresentation {
     static func isSelectionDisabled(isSwitchingSession: Bool, isClosingSession: Bool) -> Bool {
@@ -10,9 +11,7 @@ enum ChatSessionTabPresentation {
     }
 }
 
-/// Pure decisions shared by ChatView's controls. Keeping these outside the
-/// view makes an iPhone selection an explicit, testable value before it is
-/// sent to the signed Mac route.
+/// Presentation for ChatView's controls; the shared sync projection owns choices.
 enum ChatRuntimeControlPresentation {
     static func processingModeTitle(fastMode: Bool) -> String {
         fastMode ? "Fast" : "Normal"
@@ -33,146 +32,6 @@ enum ChatRuntimeControlPresentation {
 
     static func normalizedFileAccessID(_ id: String) -> String {
         ICloudChatFileAccessPolicy.normalized(id)
-    }
-
-    static func providerID(
-        selectedProviderID: String,
-        activeProviderID: String?,
-        model: String,
-        providers: [ProviderInfo]
-    ) -> String {
-        let ready = providers.filter { $0.auth_status.eligible }
-        if ready.contains(where: { $0.provider_id == selectedProviderID }) { return selectedProviderID }
-        if let activeProviderID, ready.contains(where: { $0.provider_id == activeProviderID }) { return activeProviderID }
-        return ready.first(where: { provider in
-            provider.models.contains(where: { $0.id == model })
-        })?.provider_id ?? ""
-    }
-
-    static func shouldRollback(selectionGeneration: Int, requestGeneration: Int) -> Bool {
-        selectionGeneration == requestGeneration
-    }
-
-    struct Selection: Equatable {
-        var providerID: String
-        var model: String
-        var reasoningEffort: String
-        var fastMode: Bool
-    }
-
-    static func rollback(
-        currentGeneration: Int,
-        requestGeneration: Int,
-        previous: Selection
-    ) -> Selection? {
-        shouldRollback(selectionGeneration: currentGeneration, requestGeneration: requestGeneration)
-            ? previous
-            : nil
-    }
-
-    static let modelDefaultsKey = "chatModel"
-    static let effortDefaultsKey = "chatReasoningEffort"
-    static let fastDefaultsKey = "chatFastMode"
-    static let providerDefaultsKey = "chatProviderId"
-    static let generationDefaultsKey = "chatSurfaceSelectionGeneration"
-
-    static func persist(_ selection: Selection, in defaults: UserDefaults) {
-        defaults.set(selection.model, forKey: modelDefaultsKey)
-        defaults.set(selection.reasoningEffort, forKey: effortDefaultsKey)
-        defaults.set(selection.fastMode, forKey: fastDefaultsKey)
-        defaults.set(selection.providerID, forKey: providerDefaultsKey)
-    }
-
-    static func acceptReceipt(
-        _ receipt: MobileSurfaceSelectionReceipt,
-        defaults: UserDefaults,
-        requestGeneration: Int
-    ) -> Selection? {
-        guard receipt.surface == "ios",
-              defaults.integer(forKey: generationDefaultsKey) == requestGeneration else { return nil }
-        let selection = Selection(
-            providerID: receipt.providerID, model: receipt.model,
-            reasoningEffort: receipt.reasoningEffort, fastMode: receipt.serviceTier == "priority"
-        )
-        persist(selection, in: defaults)
-        return selection
-    }
-
-    /// The shared action seam behind every optimistic runtime-control menu.
-    /// It intentionally observes the persisted generation after the transport
-    /// result, so an older failed request cannot restore over a newer iPhone
-    /// pick—even if all four values happen to match again (ABA).
-    @MainActor
-    static func execute(
-        defaults: UserDefaults,
-        previous: Selection,
-        requested: Selection,
-        requestGeneration: Int,
-        configure: (Selection) async throws -> Void
-    ) async -> (restored: Selection?, error: Error?) {
-        persist(requested, in: defaults)
-        do {
-            try await configure(requested)
-            return (nil, nil)
-        } catch {
-            guard defaults.integer(forKey: generationDefaultsKey) == requestGeneration else { return (nil, error) }
-            persist(previous, in: defaults)
-            return (previous, error)
-        }
-    }
-}
-
-/// Resolves an eventually-consistent surface-model snapshot without allowing a
-/// stale snapshot to undo a selection the user has just sent to the Mac.
-enum ChatSurfaceModelPreferenceAdoption {
-    struct Selection: Equatable {
-        var providerID: String
-        var model: String
-        var reasoningEffort: String
-        var fastMode: Bool
-    }
-
-    struct Resolution: Equatable {
-        var selection: Selection
-        var awaitingAcknowledgement: Bool
-    }
-
-    static func resolve(
-        current: Selection,
-        preference: SurfaceModelPref,
-        awaitingAcknowledgement: Bool,
-        selectableProviderIDs: Set<String>
-    ) -> Resolution {
-        if awaitingAcknowledgement {
-            return Resolution(
-                selection: current,
-                awaitingAcknowledgement: !acknowledges(current, preference: preference)
-            )
-        }
-
-        var selection = current
-        if let providerID = preference.providerId,
-           selectableProviderIDs.contains(providerID) {
-            selection.providerID = providerID
-        }
-        selection.model = preference.model
-        if let reasoningEffort = preference.reasoningEffort {
-            selection.reasoningEffort = reasoningEffort
-        }
-        if let serviceTier = preference.serviceTier {
-            selection.fastMode = serviceTier == "priority"
-        }
-        return Resolution(selection: selection, awaitingAcknowledgement: false)
-    }
-
-    private static func acknowledges(_ selection: Selection, preference: SurfaceModelPref) -> Bool {
-        guard preference.model == selection.model else { return false }
-        if let providerID = preference.providerId, providerID != selection.providerID { return false }
-        if let reasoningEffort = preference.reasoningEffort,
-           reasoningEffort != selection.reasoningEffort { return false }
-        if let serviceTier = preference.serviceTier,
-           (serviceTier == "priority") != selection.fastMode { return false }
-        return true
     }
 }
 

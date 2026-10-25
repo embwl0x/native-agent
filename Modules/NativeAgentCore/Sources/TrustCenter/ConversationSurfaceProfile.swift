@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ConversationSurfaceProfile.swift` | `ConversationSurfaceProfile`: canonical origin normalization and remote/mobile classification; domain trust evidence stays with authority owners |
+
 /// Canonical classification for a conversation/action origin.
 ///
 /// Surface identity is security-relevant: remote callers must not become local

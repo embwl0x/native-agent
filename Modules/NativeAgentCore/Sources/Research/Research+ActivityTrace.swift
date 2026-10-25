@@ -1,8 +1,8 @@
-import FeedPolicy
 import Privacy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `Research+ActivityTrace.swift` | `SwiftNativeResearchClient`: `recordActivity`, `recordTrace`, `pythonCodepointPrefix` |
 
 extension SwiftNativeResearchClient {
     // MARK: - activity / trace emission (wave 31 W03)
@@ -21,9 +21,9 @@ extension SwiftNativeResearchClient {
     // persisted — preserved here for parity rather than swallowing.
 
     /// Mirror `Daemon.record_activity`. Envelope keys:
-    /// {id, kind, title, detail, status, missionId, payload, createdAt}.
+    /// {id, kind, title, detail, status, executionId, payload, createdAt}.
     /// title/detail/payload are redacted (Python redact_secret_text /
-    /// redact_secret_value). missionId is always null for the research case.
+    /// redact_secret_value). executionId is always null for the research case.
     func recordActivity(
         kind: String,
         title: String,
@@ -31,23 +31,20 @@ extension SwiftNativeResearchClient {
         status: String,
         payload: JSONValue
     ) async throws {
-        let event: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string(kind),
-            "title": .string(NativeAgentSecretRedactor.redactText(title)),
-            "detail": .string(NativeAgentSecretRedactor.redactText(detail)),
-            "status": .string(status),
-            "executionId": .null,
-            "payload": NativeAgentSecretRedactor.redactValue(payload),
-            "createdAt": .string(Self.isoTimestamp(Date())),
-        ])
-        // The shared owner takes the one-sided Swift flock and amortizes the
-        // newest-5000 trim behind the activity feed's byte trigger.
-        try await appendJSONLCapped(
+        let event = SwiftNativePersistenceCore.activityEvent(
+            id: UUID().uuidString.lowercased(),
+            kind: kind,
+            title: NativeAgentSecretRedactor.redactText(title),
+            detail: NativeAgentSecretRedactor.redactText(detail),
+            status: status,
+            executionId: nil,
+            payload: NativeAgentSecretRedactor.redactValue(payload),
+            createdAt: Self.isoTimestamp(Date())
+        )
+        try await SwiftNativePersistenceCore.appendActivityEvent(
             event,
             to: activityPath,
             using: persistence,
-            maxLines: JSONLLineCaps.activityEvents,
             logLabel: "Research"
         )
     }
@@ -77,15 +74,7 @@ extension SwiftNativeResearchClient {
         try await appendEnvelope(event, to: tracesPath)
     }
 
-    /// Append one JSONL envelope. When the backing store is the on-disk
-    /// SwiftNativePersistenceCore, the append is wrapped in a `<path>.lock`
-    /// flock to serialize concurrent SWIFT-side writers (e.g. a future
-    /// in-process subsystem also appending to the same feed). NOTE: this lock
-    /// is NOT symmetric with the daemon — Python's append_jsonl
-    /// is UNLOCKED and relies on POSIX O_APPEND
-    /// atomicity for sub-PIPE_BUF lines; the daemon does not take this lock.
-    /// So the flock is a one-sided Swift-only precaution, exactly like
-    /// DispatchLedger.append. Errors propagate (see ERROR PROPAGATION note).
+    /// Append through the shared path-owned JSONL writer; errors propagate.
     private func appendEnvelope(_ envelope: JSONValue, to path: URL) async throws {
         try await appendPathOwnedJSONL(
             envelope,

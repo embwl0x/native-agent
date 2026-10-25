@@ -1,11 +1,14 @@
 import MultimodalTTS
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import TrustCenter
+
+// Blueprint: | `QuietComposerCommands.swift` | `QuietComposerCommands`: draft/model/effort/persona/speech commands through composer ports; preview and execution share admission fences |
 
 public protocol QuietComposerModel: Identifiable where ID == String {
     var displayName: String { get }
@@ -29,6 +32,7 @@ public protocol QuietComposerCommandPort: QuietChatSessionCommandPort {
     var quietComposerEfforts: [ComposerEffort] { get }
     var quietComposerSupportsFast: Bool { get }
     func quietComposerDraft(_ sessionID: String) -> String
+    func quietComposerDraftRevision(_ sessionID: String) -> (Date, Int)
     func setQuietComposerDraft(_ text: String, sessionID: String)
     func clearQuietAcceptedDraft(_ message: String, sessionID: String, editedAt: Date)
     func quietComposerPaneClosed(turnID: String?) -> Bool
@@ -175,6 +179,9 @@ public enum QuietComposerCommands {
         let sessionID = fenced.session
         switch verb {
         case "set_draft", "send":
+            let revision = appModel.quietComposerDraftRevision(sessionID)
+            let draft = appModel.quietComposerDraft(sessionID)
+            let attachmentIDs = (appModel.chatPendingAttachments[sessionID] ?? []).map(\.id)
             var files: [NativeAgentShared.MultimodalAttachment] = []
             for url in attachments {
                 let read: Result<NativeAgentShared.MultimodalAttachment, ChatAttachmentTypeResolver.AttachmentRefusal>
@@ -187,6 +194,18 @@ public enum QuietComposerCommands {
                 case .failure(let refusal):
                     return .refuse("attach button", "attachment_refused", refusal.message + " Nothing was changed.")
                 }
+            }
+            // File intake suspends. Ownership and the exact draft being
+            // changed must still hold in this synchronous mutation step.
+            let current = fence(verb: verb, value: value, sessionId: sessionID, reachesUser: reachesUser,
+                                turnSessionId: turnSessionId, appModel: appModel)
+            if let refusal = current.refusal { return refusal }
+            if current.session != sessionID || ((verb == "set_draft" || value.isEmpty)
+                && (appModel.quietComposerDraftRevision(sessionID) != revision
+                    || appModel.quietComposerDraft(sessionID) != draft
+                    || (appModel.chatPendingAttachments[sessionID] ?? []).map(\.id) != attachmentIDs)) {
+                return .refuse("composer draft", "draft_changed",
+                               "The conversation or draft changed while attachments were being read. Nothing was changed.")
             }
             return verb == "send"
                 ? await send(value, sessionID: sessionID, files: files, appModel: appModel)
@@ -288,7 +307,9 @@ public enum QuietComposerCommands {
             }
             return .done("send button", "Sent into \(accepted).")
         case .rejected(let message):
-            return .refuse("send button", "send_rejected", message)
+            return reconcileFailure("send button", "send_rejected", message,
+                instruction: "Read the conversation and its queue to resolve this rejection before sending again.",
+                next: ["page": .string("chat"), "item": .string(sessionID)], effects: .none)
         }
     }
 
@@ -323,7 +344,8 @@ public enum QuietComposerCommands {
         appModel.chatFastMode = on
         let result = await appModel.saveQuietChatBrain()
         if !result.succeeded {
-            return .refuse("model card Fast toggle", "fast_write_failed", result.agentMessage, effects: .unknown)
+            return reconcileFailure("model card Fast toggle", "fast_write_failed", result.agentMessage,
+                instruction: "Read the saved Chat model settings and resolve the save error before changing Fast again.", next: ["page": .string("providers")])
         }
         return .done("model card Fast toggle", "Fast is now \(appModel.chatFastMode ? "on" : "off") for every chat (app-wide default).", changed: changed)
     }
@@ -366,11 +388,9 @@ public enum QuietComposerCommands {
             )
         }
         if let failure = await write.value {
-            return .refuse(
-                "model pane row \"\(item.displayName)\" under \(group.provider)",
-                "model_write_failed",
-                "Chat is still on \(before): \(failure)", effects: .unknown
-            )
+            return reconcileFailure(
+                "model pane row \"\(item.displayName)\" under \(group.provider)", "model_write_failed", failure,
+                instruction: "Read the saved Chat model selection and resolve the save error before changing it again.", next: ["page": .string("providers")])
         }
         // The CANONICAL tuple, read back after it landed — not what was asked.
         let after = "\(appModel.chatProvider) · \(appModel.chatModel)"
@@ -397,7 +417,8 @@ public enum QuietComposerCommands {
         appModel.chatReasoningEffort = effort
         let result = await appModel.saveQuietChatBrain()
         guard result.succeeded else {
-            return .refuse("think card", "think_write_failed", result.agentMessage, effects: .unknown)
+            return reconcileFailure("think card", "think_write_failed", result.agentMessage,
+                instruction: "Read the saved Chat model settings and resolve the save error before changing Think again.", next: ["page": .string("providers")])
         }
         return .done(
             "think card step \"\(efforts[index].label)\"",
@@ -429,9 +450,18 @@ public enum QuietComposerCommands {
             )
         }
         if let failure = await appModel.startQuietSpeech(text) {
-            return .refuse("read aloud", "speak_failed", failure, effects: .unknown)
+            return reconcileFailure("read aloud", "speak_failed", failure,
+                instruction: "Check playback and the reported speech error before speaking again; completion is unverified.", next: ["page": .string("settings")])
         }
         return .done("read aloud", "Started reading \(text.count) characters aloud. Playback completion is not confirmed.", status: "started")
+    }
+
+    private static func reconcileFailure(_ element: String, _ code: String, _ detail: String,
+                                         instruction: String, next: [String: JSONValue], effects: ToolFailureError.Effects = .unknown) -> Outcome {
+        var outcome = Outcome.refuse(element, code, detail, effects: effects)
+        outcome.remedy = Repair.reconcile(instruction: instruction,
+            nextCall: .object(["tool": .string("app"), "input": .object(next)]))
+        return outcome
     }
 
     @MainActor
@@ -441,7 +471,9 @@ public enum QuietComposerCommands {
             return .refuse("/scratch", "missing_scratch", "Pass the key (one word) in choice and the text in value.")
         }
         let result = await appModel.writeQuietScratch(key: key, value: value, sessionId: sessionID)
-        guard result.succeeded else { return .refuse("/scratch", "scratch_write_failed", result.agentMessage, effects: .unknown) }
+        guard result.succeeded else { return reconcileFailure("/scratch", "scratch_write_failed", result.agentMessage,
+            instruction: "Read this scratch key and resolve the save error before writing again.",
+            next: ["action": .string("chat.scratch_read"), "args": .object(["key": .string(key), "session_id": .string(sessionID)])]) }
         return .done("/scratch", "Scratch \(key) is set in \(sessionID); app chat.scratch_read reads it back.")
     }
 }

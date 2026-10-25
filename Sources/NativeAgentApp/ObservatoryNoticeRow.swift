@@ -1,5 +1,7 @@
 import SwiftUI
 
+// Blueprint: | `ObservatoryNoticeRow.swift` | `ObservatoryNoticeRow`: one compact tinted notice presentation shared by Observatory panels |
+
 /// Shared compact notice row used by the observatory panels. Follows the
 /// StalePanelNotice visual idiom (ChatView.swift): a tinted SF Symbol + text
 /// over a faint tinted rounded background.

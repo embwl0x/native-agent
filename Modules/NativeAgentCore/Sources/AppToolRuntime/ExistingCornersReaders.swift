@@ -3,11 +3,13 @@ import CryptoKit
 import PersistenceCore
 import Senses
 import AgentWorkspace
-import ChatOrchestration
+import ChatTurnContracts
 import MacControl
 import Dispatcher
 import ChromeControl
 import NativeAgentCore
+import AuthoredCapabilities
+// Blueprint: | `ExistingCornersReaders.swift` | `ExistingCornersSourceProvider`: gated raw readers for screen, files, documents, connectors, private web, visible browser and Chrome; event-backed Chrome material for ordinary reads/following; `NativeChromeNews` observes from tab navigation, owns one tab-bound native reader subscription into `SenseNewsBoard`, retires it when its canonical sense is disabled/replaced, observes catalog changes only while subscriptions start/live, and sends capture failures to Chrome status without consuming its successful baseline |
 
 extension ExistingCornersSourceProvider {
     /// Bind the same raw tool chain used by the app, not a second dispatcher.
@@ -244,7 +246,8 @@ extension ExistingCornersSourceProvider {
 }
 
 /// The native Chrome reader consumes the same tab-bound event stream as JS
-/// site senses. One subscription per tab; takeover/disconnect ends it at source.
+/// site senses. One subscription per tab, retired on sense disable/replacement
+/// or takeover/disconnect at source.
 actor NativeChromeNews {
     static let shared = NativeChromeNews()
     private struct Watch {
@@ -255,9 +258,36 @@ actor NativeChromeNews {
         var view: String
         var snapshot: [String: JSONValue]
         let chrome: ChromeControlRuntime
+        let senseVersion: Int
     }
     private var watches: [Int64: Watch] = [:]
     private var starting: Set<Int64> = []
+    private var catalogObserver: NSObjectProtocol?
+
+    private func observeCatalog() {
+        guard catalogObserver == nil else { return }
+        catalogObserver = NotificationCenter.default.addObserver(forName: AbilityStore.didChange, object: nil, queue: nil) { [weak self] _ in
+            Task { await self?.reconcile() }
+        }
+    }
+
+    private func reconcile() async {
+        for (tab, watch) in watches {
+            let host = URL(string: watch.url)?.host ?? "*"
+            let current = try? await SenseDoor.selectedRecord(for: .site(host: host))
+            guard watches[tab]?.id == watch.id else { continue }
+            if current?.id != "builtin-chrome" || current?.status != .on || current?.version != watch.senseVersion {
+                watches.removeValue(forKey: tab)?.task.cancel()
+            }
+        }
+        retireObserverIfIdle()
+    }
+
+    private func retireObserverIfIdle() {
+        guard watches.isEmpty, starting.isEmpty, let observer = catalogObserver else { return }
+        catalogObserver = nil
+        NotificationCenter.default.removeObserver(observer)
+    }
 
     func opened(_ receipt: JSONValue, chrome: ChromeControlRuntime) async {
         guard case .object(let fields) = receipt, case .int(let tab)? = fields["tabId"], watches[tab] == nil else { return }
@@ -294,10 +324,13 @@ actor NativeChromeNews {
 
     private func begin(tab: Int64, fields: [String: JSONValue], chrome: ChromeControlRuntime) async {
         guard watches[tab] == nil, starting.insert(tab).inserted else { return }
-        defer { starting.remove(tab) }
+        observeCatalog() // Register before the canonical read, including the subscription await.
+        defer { starting.remove(tab); retireObserverIfIdle() }
         let id = UUID()
         do {
             let changes = try await chrome.pageChanges(host: "*", tabID: tab)
+            let host = URL(string: ExistingCornersReaders.string(fields["url"]) ?? "")?.host ?? "*"
+            let record = try? await SenseDoor.selectedRecord(for: .site(host: host))
             let task = Task { [weak self] in
                 do {
                     for try await changed in changes {
@@ -309,8 +342,13 @@ actor NativeChromeNews {
                 }
                 await self?.ended(tab, id: id)
             }
+            guard let record,
+                  record.id == "builtin-chrome", record.status == .on, !Task.isCancelled else {
+                task.cancel()
+                return
+            }
             watches[tab] = Watch(id: id, task: task, version: Self.version(.object(fields)) ?? "",
-                url: ExistingCornersReaders.string(fields["url"]) ?? "", view: Self.view(fields), snapshot: fields, chrome: chrome)
+                url: ExistingCornersReaders.string(fields["url"]) ?? "", view: Self.view(fields), snapshot: fields, chrome: chrome, senseVersion: record.version)
         } catch { await chrome.recordCaptureError(error.localizedDescription, tabID: tab) }
     }
 
@@ -337,9 +375,16 @@ actor NativeChromeNews {
         guard watches[tab]?.id == id, case .object(let fields) = snapshot else { return }
         if case .string(let reason)? = fields["__sense_change_failure"] { await unavailable(reason, tab: tab); return }
         do {
-            guard case .string(let url)? = fields["url"], let host = URL(string: url)?.host,
-                  let record = try await SenseDoor.selectedRecord(for: .site(host: host)), record.id == "builtin-chrome", record.status == .on,
-                  let version = Self.version(snapshot), watches[tab]?.id == id else { return }
+            guard case .string(let url)? = fields["url"], let host = URL(string: url)?.host else { return }
+            let selected = try await SenseDoor.selectedRecord(for: .site(host: host))
+            guard watches[tab]?.id == id else { return }
+            guard let record = selected, record.id == "builtin-chrome", record.status == .on,
+                  record.version == watches[tab]?.senseVersion else {
+                watches.removeValue(forKey: tab)?.task.cancel()
+                retireObserverIfIdle()
+                return
+            }
+            guard let version = Self.version(snapshot) else { return }
             let moved = watches[tab]?.url != url || Self.newDocument(watches[tab]?.snapshot ?? [:], fields)
             let sameView = watches[tab]?.view == Self.view(fields)
             let changed = watches[tab]?.version != version
@@ -444,7 +489,10 @@ actor NativeChromeNews {
         await watches[tab]?.chrome.recordCaptureError(reason, tabID: tab)
     }
 
-    private func ended(_ tab: Int64, id: UUID) { if watches[tab]?.id == id { watches.removeValue(forKey: tab) } }
+    private func ended(_ tab: Int64, id: UUID) {
+        if watches[tab]?.id == id { watches.removeValue(forKey: tab) }
+        retireObserverIfIdle()
+    }
 }
 
 private enum ExistingCornersReaders {
@@ -516,7 +564,7 @@ private enum ExistingCornersReaders {
         }
     }
 
-    static let connectorPages: Set<String> = ["mail", "calendar", "reminders", "notes", "contacts", "messages", "github", "slack", "notion", "x", "markets", "music"]
+    static let connectorPages: Set<String> = ["mail", "calendar", "reminders", "notes", "contacts", "messages", "music"]
 
     static func string(_ value: JSONValue?) -> String? {
         if case .string(let text)? = value, !text.isEmpty { return text }

@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `MacControlActionRoutes+PlatformPolicy.swift` | checked Trust policy provider and bounded process-result interpretation |
 
 public struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
     let dataRoot: URL
@@ -15,7 +16,7 @@ public struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
 
     public func currentPolicy() async -> MacControlPolicy? {
         guard let snapshot = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked() else { return nil }
-        let policy = MacControlPolicy.fromTrustPolicyObject(snapshot.policy)
+        let policy = MacControlPolicy.fromTrustPolicyObject(snapshot.policy, dataRoot: dataRoot)
         guard let operatorOrigin else { return policy }
         let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
             tool: "mac_control", origin: operatorOrigin
@@ -23,13 +24,20 @@ public struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
         return MacControlGate.policyForAdmittedFullMac(policy, admitted: authority.admitted)
     }
 
-    /// Raw doors (the phone remote, a bridge) meet the permission law
-    /// here. The person's own Mac workbench is his decision.
+    /// Raw doors (the phone remote, a bridge) meet "Pause everything" for
+    /// every action, and the permission law for a command line, here. A raw
+    /// AppleScript can `do shell script`, so it is one: judged by the shell's
+    /// declaration, never its script. The person's own Mac workbench is his decision.
     public func authorize(tool: String, input: [String: JSONValue]) async -> (level: String, reason: String, remedy: JSONValue?)? {
         guard operatorOrigin == nil else { return nil }
         do {
             let snapshot = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
-            let answer = PermissionLaw.answer(tool: tool, input: input, policy: snapshot.policy, dataRoot: dataRoot)
+            if let paused = SwiftNativeSecurityCenter.killSwitchRefusal(policy: snapshot.policy) {
+                return ("blocked", paused.reason, paused.remedy)
+            }
+            guard tool == "shell" || tool == "applescript" else { return nil }
+            let answer = PermissionLaw.answer(tool: "shell", input: tool == "shell" ? input : nil,
+                                              policy: snapshot.policy, dataRoot: dataRoot)
             return (answer.level, answer.reason, answer.remedy)
         } catch {
             return ("blocked", "trust/policy.json could not be read, so \(tool) cannot be judged: \(error.localizedDescription)", nil)

@@ -1,4 +1,6 @@
 import ProviderRouting
+
+// Blueprint: | `AnthropicSetupTokenInput.swift` | `AnthropicSetupTokenInput`: setup-token paste, submission and visible status through existing provider setup |
 // PATCH-2026-05-07: anthropic-setup-token Paste-token UI for the Anthropic
 // OAuth direct provider.
 //

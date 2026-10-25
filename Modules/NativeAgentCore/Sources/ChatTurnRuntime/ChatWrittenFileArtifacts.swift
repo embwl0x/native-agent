@@ -3,6 +3,7 @@ import CryptoKit
 import UniformTypeIdentifiers
 import PersistenceCore
 import ChatToolRuntime
+// Blueprint: | `ChatWrittenFileArtifacts.swift` | `ChatWrittenFileArtifacts`: whole-file receipt selection and canonical recovery references |
 
 /// Whole-file write receipts shared by live delivery and canonical recovery,
 /// and what a turn left changed in the world.

@@ -1,5 +1,6 @@
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `MobileHelpersView.swift` | Helper list and ID-resolved details from the sync owner; local editable drafts and submission state |
 
 struct MobileHelpersView: View {
     private let sync = iCloudSyncEngine.shared
@@ -43,15 +44,18 @@ private struct MobileHelperDetailView: View {
     let id: UUID
     private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairing: PairingStore
-    @State private var helper: MobileHelperEdit?
     @State private var busy = false
     @State private var message: String?
     @State private var error: String?
     private var row: MobileHelperRow? { sync.helpersSnapshot?.helpers.first { $0.id == id } }
+    private var helper: MobileHelperEdit? { sync.helperDetails[id] }
 
     var body: some View {
         AlivePage(title: row?.name ?? "Helper", line: row?.status ?? "") {
             if let error { AliveSection("Couldn’t complete the request") { Text(error).aliveRow() } }
+            if let error = sync.staleSnapshotGroups["helpers_agents"] {
+                AliveSection("Couldn’t refresh helpers") { Text(error).aliveRow() }
+            }
             if let message { AliveSection(nil) { Text(message).aliveRow() } }
             if let helper {
                 AliveSection("Brief") { Text(helper.brief).textSelection(.enabled).aliveRow() }
@@ -69,7 +73,7 @@ private struct MobileHelperDetailView: View {
             }.disabled(busy || !pairing.isPaired || helper == nil)
             if busy { ProgressView("Waiting for Mac…").aliveRow() }
         }
-        .task { await perform("get_helper") }
+        .task(id: row?.revision) { await perform("get_helper") }
         .refreshable { await perform("get_helper") }
     }
 
@@ -79,7 +83,7 @@ private struct MobileHelperDetailView: View {
         defer { busy = false }
         do {
             let result = try await sync.helperAction(action, payload: extra.merging(["id": id.uuidString]) { _, new in new })
-            helper = result.0; message = result.1["message"]
+            message = result.1["message"]
         } catch { self.error = error.localizedDescription }
     }
 }
@@ -102,6 +106,9 @@ struct MobileHelperEditorView: View {
     var body: some View {
         AlivePage(title: helperID == nil ? "New helper" : "Edit helper", line: "Choose the work, model, timing, and limits.") {
             if let error { AliveSection("Couldn’t save helper") { Text(error).aliveRow() } }
+            if let error = sync.staleSnapshotGroups["helpers_agents"] {
+                AliveSection("Couldn’t refresh helpers") { Text(error).aliveRow() }
+            }
             if !loaded { ProgressView("Loading helper…").aliveRow() }
             AliveSection("Brief") {
                 TextField("Name", text: $edit.name).aliveRow()
@@ -187,14 +194,9 @@ struct MobileHelperEditorView: View {
             if edit.timing == "interval" { TextField("Hours between runs", text: $edit.hours).keyboardType(.decimalPad).aliveRow() }
             if edit.timing == "cron" {
                 TextField("Schedule (cron)", text: $edit.cron).aliveRow()
-                TextField("Time zone", text: $edit.timeZone).aliveRow()
             }
             if edit.timing == "event" {
-                Picker("Event", selection: $edit.eventSource) {
-                    Text("GitHub issue or pull request").tag("github")
-                    Text("Slack message").tag("slack")
-                }.aliveRow()
-                TextField(edit.eventSource == "github" ? "Repository (owner/repo)" : "Channel ID", text: $edit.eventFilter).aliveRow()
+                TextField("Slack channel ID", text: $edit.eventFilter).aliveRow()
                 TextField("Keyword (optional)", text: $edit.eventKeyword).aliveRow()
                 Text("Autonomy off holds the event instead of running it.").aliveRow()
             }
@@ -223,7 +225,7 @@ struct MobileHelperEditorView: View {
                 request.timing = "cron"  // no zone: the time follows the Mac
             }
             let payload = String(decoding: try JSONEncoder().encode(request), as: UTF8.self)
-            _ = try await sync.helperAction("save_helper", payload: ["edit": payload])
+            edit = try await sync.helperAction("save_helper", payload: ["edit": payload]).0
             dismiss()
         } catch { self.error = error.localizedDescription }
     }

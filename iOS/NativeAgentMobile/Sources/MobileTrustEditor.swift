@@ -1,9 +1,9 @@
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `MobileTrustEditor.swift` | `MobileTrustEditor` struct; displays the engine-resolved preset and effective permission level |
 
 struct MobileTrustEditor: View {
     let policy: TrustPolicy
-    @ObservedObject var store: SettingsStore
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var pending: MobileTrustAction?
     @State private var showConfirmation = false
@@ -12,33 +12,13 @@ struct MobileTrustEditor: View {
     @State private var showsPermissionLevel = false
 
     private var current: TrustPolicy { policy }
-    private var effectiveLevel: String? {
-        // Match MacControlGate.fullMacActive, including older mixed policies.
-        if current.effectiveOutsideDefault == "allow"
-            || current.permissionLevel == "wide_open_receipts"
-            || current.permissionLevel == "full_mac_os" { return "full_mac_os" }
-        return current.permissionLevel
-    }
     private var fullMacConfirmation: Bool {
         if case .preset(.fullMac, _) = pending { return true }
         return false
     }
 
     private var currentPreset: MobileTrustAction.Preset? {
-        if effectiveLevel == "full_mac_os", current.effectiveOutsideDefault == "allow" { return .fullMac }
-        guard current.effectiveRequireBackups == true,
-              current.developerMode == false,
-              current.filePolicy?.allowDestructiveActions == false,
-              current.macControlPolicy?.shellAllowed == false,
-              current.macControlPolicy?.systemControlAllowed == false else { return nil }
-        if current.permissionLevel == "strict", current.autonomyDefault == "supervised",
-           current.effectiveOutsideDefault == "deny" { return .safe }
-        guard current.permissionLevel == "balanced", current.autonomyDefault == "workspace_autonomous" else { return nil }
-        switch current.effectiveOutsideDefault {
-        case "deny": return .workMode
-        case "ask": return .builder
-        default: return nil
-        }
+        current.resolvedPreset.flatMap(MobileTrustAction.Preset.init(rawValue:))
     }
 
     var body: some View {
@@ -76,19 +56,19 @@ struct MobileTrustEditor: View {
             .frame(minHeight: 44)
             .disabled(isSaving || !pairingStore.isPaired)
             AliveDivider()
-            AliveValueRow(label: "Level", value: effectiveLevel.map(label) ?? TrustPolicySummaryPresentation.unknownValue)
-            if effectiveLevel == "full_mac_os" {
+            AliveValueRow(label: "Level", value: current.effectivePermissionLevel.map(label) ?? TrustPolicySummaryPresentation.unknownValue)
+            if current.effectivePermissionLevel == "full_mac_os" {
                 Text("Full Mac stays on until you change it.").aliveRow()
             }
         }
         AliveSection(nil) {
             DisclosureGroup("Permission level", isExpanded: $showsPermissionLevel) {
-                choice("Level", field: .permissionLevel, value: effectiveLevel)
+                choice("Level", field: .permissionLevel, value: current.effectivePermissionLevel)
                 AliveDivider()
                 choice("Autonomy default", field: .autonomyDefault, value: current.autonomyDefault)
                 AliveDivider()
                 choice("Outside default", field: .outsideDefault,
-                       value: effectiveLevel == "full_mac_os" ? "allow" : current.effectiveOutsideDefault)
+                       value: current.effectivePermissionLevel == "full_mac_os" ? "allow" : current.effectiveOutsideDefault)
                 AliveDivider()
                 toggle("Developer mode", field: .developerMode, value: current.developerMode)
                 AliveDivider()
@@ -100,8 +80,6 @@ struct MobileTrustEditor: View {
         .disabled(isSaving || !pairingStore.isPaired)
         AliveSection("Desk") {
             toggle("Desk enabled", field: .workshopEnabled, value: current.workshopPolicy?.enabled)
-            AliveDivider()
-            toggle("Show timeline", field: .showTimeline, value: current.workshopPolicy?.showTimeline)
         }
         .disabled(isSaving || !pairingStore.isPaired)
         AliveSection("Training") {
@@ -153,7 +131,7 @@ struct MobileTrustEditor: View {
         guard !isSaving, pairingStore.isPaired else { return }
         if case .policy(.outsideDefault, "allow", _) = request {
             pending = .preset(.fullMac, confirmed: false)
-        } else if case .policy(.outsideDefault, _, _) = request, effectiveLevel == "full_mac_os" {
+        } else if case .policy(.outsideDefault, _, _) = request, current.effectivePermissionLevel == "full_mac_os" {
             feedback = MobileTrustAction.outsideFullMacRefusal
             return
         } else if case .policy(.permissionLevel, let value, _) = request,
@@ -177,8 +155,7 @@ struct MobileTrustEditor: View {
         feedback = nil
         Task { @MainActor in
             do {
-                let saved = try await iCloudSyncEngine.shared.setTrustPolicy(request)
-                store.trustPolicy = saved
+                _ = try await iCloudSyncEngine.shared.setTrustPolicy(request)
                 feedback = "Trust policy saved on your Mac."
             } catch {
                 feedback = "Trust policy was not confirmed: \(error.localizedDescription)"

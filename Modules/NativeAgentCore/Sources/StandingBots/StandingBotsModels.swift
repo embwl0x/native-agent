@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `StandingBotsModels.swift` | Helper definitions own name, optional personality, job, output and provider/budget settings; cadence, run and shelf values |
 
 /// Legacy URL strings remain decodable; new definitions may use explicit types.
 public enum BotSource: Codable, Equatable, Sendable, ExpressibleByStringLiteral {
@@ -45,24 +46,18 @@ public enum BotRunLimits {
     public static let dailyTokens = 256_000
 }
 
-/// Configuration only. Interpreting cron expressions and scheduling belong to the future runner.
-/// TIME (User 10-15): a cron keeps a zone only when someone set one on it; with
-/// none it runs in the Mac's own zone wherever the Mac is.
+/// BotRunnerScheduler schedules this cadence through StandingBotsDisk's shared calendar math.
+/// TIME (User 10-21): a cron runs on the Mac's local clock wherever the Mac is;
+/// no zone is stored (a saved `timeZone` from before is ignored on read).
 public enum BotCadence: Codable, Equatable, Sendable {
     case manual
     case interval(seconds: TimeInterval)
-    case cron(expression: String, timeZone: String?)
-
-    /// A zone as a writer was given it: blank, "local" or "system" sets none.
-    public static func setZone(_ zone: String?) -> String? {
-        guard let zone = zone?.trimmingCharacters(in: .whitespacesAndNewlines), !zone.isEmpty,
-              !["local", "system"].contains(zone.lowercased()) else { return nil }
-        return zone
-    }
+    case cron(expression: String)
 }
 
 public struct BotBudget: Codable, Equatable, Sendable {
     public var tokens: Int
+    /// Crossing records "still finishing"; it does not cancel the helper's work.
     public var seconds: TimeInterval
     public init(tokens: Int, seconds: TimeInterval) {
         self.tokens = tokens
@@ -73,6 +68,9 @@ public struct BotBudget: Codable, Equatable, Sendable {
 public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
     public let id: UUID
     public var name: String
+    /// Who this helper is: its own personality, set by the person or by her
+    /// when it is made. Nil is a helper defined by its job alone.
+    public var personality: String? = nil
     public var brief: String
     public internal(set) var briefVersion: Int
     public var cadence: BotCadence
@@ -94,6 +92,9 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
     public var outputFormat: String?
     public var budget: BotBudget
     public var paused: Bool
+    /// Why a bot is off when the person did not switch it off; kept until it
+    /// is resumed or its timing changes.
+    public var offReason: String? = nil
     public let createdAt: Date
     public internal(set) var updatedAt: Date
 
@@ -118,14 +119,15 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
 
 extension BotDefinition {
     private enum CodingKeys: String, CodingKey {
-        case id, name, brief, briefVersion, cadence, sources, outputFormat, budget, paused, createdAt, updatedAt
+        case id, name, personality, brief, briefVersion, cadence, sources, outputFormat, budget, paused, createdAt, updatedAt
         case provider, model, modelPinned, reasoningEffort, fast, dailyTokenCeiling, notificationCondition, deleted
-        case eventTrigger
+        case eventTrigger, offReason
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
+        personality = try c.decodeIfPresent(String.self, forKey: .personality)
         brief = try c.decode(String.self, forKey: .brief)
         briefVersion = try c.decode(Int.self, forKey: .briefVersion)
         cadence = try c.decode(BotCadence.self, forKey: .cadence)
@@ -145,12 +147,23 @@ extension BotDefinition {
         dailyTokenCeiling = try c.decodeIfPresent(Int.self, forKey: .dailyTokenCeiling)
         notificationCondition = try c.decodeIfPresent(String.self, forKey: .notificationCondition)
         deleted = try c.decodeIfPresent(Bool.self, forKey: .deleted)
-        eventTrigger = try c.decodeIfPresent(BotEventTrigger.self, forKey: .eventTrigger)
+        offReason = try c.decodeIfPresent(String.self, forKey: .offReason)
+        struct SavedSource: Decodable { let source: String }
+        if try c.decodeIfPresent(SavedSource.self, forKey: .eventTrigger)?.source == "github" {
+            paused = true
+            offReason = Self.githubTriggerOff
+        } else {
+            eventTrigger = try c.decodeIfPresent(BotEventTrigger.self, forKey: .eventTrigger)
+        }
     }
+
+    /// A bot that woke on a GitHub event (before 10-21) reads as switched off
+    /// with no trigger, and the next save keeps it so; resuming it leaves it manual.
+    public static let githubTriggerOff = "GitHub events are no longer built in; an ability of hers can signal this bot"
 }
 
 public enum BotRunStatus: String, Codable, Sendable {
-    case completed, interrupted, failed
+    case completed, stopped, interrupted, failed
     case waitingForApproval = "waiting for approval"
     /// The turn raised a card and stopped on a PERSON. Distinct from
     /// `interrupted`, which says something went wrong: nothing went wrong here,

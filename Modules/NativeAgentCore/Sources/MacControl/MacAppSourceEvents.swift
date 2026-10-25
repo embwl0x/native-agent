@@ -5,11 +5,15 @@ import NativeAgentCore
 #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
 import ApplicationServices
 import AppKit
+// Blueprint: | `MacAppSourceEvents.swift` | `MacAppSourceEvents` class; event-backed running-app AX observation, coalescing, cancellation and notification-stall completion for cold reads; incomplete traversal retains prior subscriptions and only a complete read prunes missing descendants, application/window/focus subscriptions stand if any succeeds, and zero supported notifications is `source_unsupported` |
 #endif
 
 /// Event-only observation of one already-running app. AX subscriptions are
 /// installed on descendants as well as the application: most element changes
 /// do not propagate to a notification registered on the application element.
+/// Traversal attributes are optional reach, not a condition of observation:
+/// incomplete traversal retains prior subscriptions; only a complete read prunes.
+/// Any successful subscription keeps the watch.
 /// One main-run-loop turn coalesces a burst; no clock drives reads or renewal.
 public final class MacAppSourceEvents: @unchecked Sendable {
     public let stream: AsyncThrowingStream<Void, Error>
@@ -46,6 +50,7 @@ public final class MacAppSourceEvents: @unchecked Sendable {
     private let pid: Int32
     private var observer: AXObserver?
     private var subscriptions: [CFHashCode: [Subscription]] = [:]
+    private var subscriptionFailure: SenseFailure?
     private var workspaceToken: NSObjectProtocol?
     private var stopped = false
     private var deliveryScheduled = false
@@ -193,15 +198,13 @@ public final class MacAppSourceEvents: @unchecked Sendable {
             MacAXExecutionLane.sync { source.received(notification as String) }
         }
         let status = AXObserverCreate(pid, callback, &created)
+        if [.notImplemented, .notificationUnsupported].contains(status) { throw noNotifications() }
         guard status == .success, let created else {
             throw failure("create", status)
         }
         observer = created
         capped = MacAXLimits.readDeadline != nil
         try reconcileTree()
-        guard subscriptions.values.contains(where: { $0.contains(where: { !$0.kinds.isEmpty }) }) else {
-            throw SenseFailure(code: "source_unavailable", message: "The running app supports no accessibility change notifications.")
-        }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
         workspaceToken = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: nil
@@ -240,7 +243,7 @@ public final class MacAppSourceEvents: @unchecked Sendable {
                         self.focusChanged = false
                         let app = AXUIElementCreateApplication(self.pid)
                         if let focus = MacAXAttributeRead.copyElement(app, kAXFocusedUIElementAttribute) {
-                            try self.addSubtree(focus)
+                            _ = try self.addSubtree(focus)
                         }
                     }
                     self.continuation.yield(())
@@ -256,16 +259,25 @@ public final class MacAppSourceEvents: @unchecked Sendable {
     private func reconcileTree() throws {
         let previous = subscriptions
         subscriptions = [:]
+        subscriptionFailure = nil
         do {
-            try addSubtree(AXUIElementCreateApplication(pid), reusing: previous)
-        } catch {
-            // Preserve all installed handles so stop removes every registration.
-            for (hash, rows) in previous {
-                for row in rows where !(subscriptions[hash] ?? []).contains(where: { CFEqual($0.element, row.element) }) {
-                    subscriptions[hash, default: []].append(row)
+            var complete = false
+            defer {
+                // An unread subtree proves nothing about its descendants.
+                // Keep prior handles on incomplete traversal (including throws)
+                // until a complete read can prove which elements are gone.
+                if !complete {
+                    for (hash, rows) in previous {
+                        for row in rows where !(subscriptions[hash] ?? []).contains(where: { CFEqual($0.element, row.element) }) {
+                            subscriptions[hash, default: []].append(row)
+                        }
+                    }
                 }
             }
-            throw error
+            complete = try addSubtree(AXUIElementCreateApplication(pid), reusing: previous)
+        }
+        guard subscriptions.values.contains(where: { $0.contains(where: { !$0.kinds.isEmpty }) }) else {
+            throw subscriptionFailure ?? noNotifications()
         }
         guard let observer else { return }
         for (hash, rows) in previous {
@@ -275,14 +287,16 @@ public final class MacAppSourceEvents: @unchecked Sendable {
         }
     }
 
-    private func addSubtree(_ root: AXUIElement, reusing previous: [CFHashCode: [Subscription]] = [:]) throws {
-        guard let observer else { return }
+    private func addSubtree(_ root: AXUIElement, reusing previous: [CFHashCode: [Subscription]] = [:]) throws -> Bool {
+        guard let observer else { return false }
         var pending = [root]
         var examined = 0
+        var complete = true
         while let element = pending.popLast() {
             try Task.checkCancellation()
             if MacAXLimits.readDeadline != nil, examined >= MacAXLimits.deepPageMaxNodes {
-                throw failure("subscribe within the AX node budget", .cannotComplete)
+                subscriptionFailure = subscriptionFailure ?? failure("subscribe within the AX node budget", .cannotComplete)
+                return false
             }
             let hash = CFHash(element)
             guard !(subscriptions[hash] ?? []).contains(where: { CFEqual($0.element, element) }) else { continue }
@@ -293,7 +307,9 @@ public final class MacAppSourceEvents: @unchecked Sendable {
                 subscribeElement: for kind in Self.kinds {
                     try Task.checkCancellation()
                     guard MacAXAttributeRead.prepare(element) else {
-                        throw failure("subscribe within the AX time budget", .cannotComplete)
+                        subscriptions[hash, default: []].append(Subscription(element: element, kinds: kinds))
+                        subscriptionFailure = subscriptionFailure ?? failure("subscribe within the AX time budget", .cannotComplete)
+                        return false
                     }
                     let status = AXObserverAddNotification(observer, element, kind as CFString,
                         Unmanaged.passUnretained(self).toOpaque())
@@ -302,24 +318,40 @@ public final class MacAppSourceEvents: @unchecked Sendable {
                     case .notificationUnsupported, .notImplemented: break
                     case .invalidUIElement: break subscribeElement // Removed during traversal.
                     default:
-                        subscriptions[hash, default: []].append(Subscription(element: element, kinds: kinds))
-                        throw failure("subscribe to \(kind)", status)
+                        // Another notification or element can still support
+                        // observation. Keep the cause if none succeeds.
+                        subscriptionFailure = subscriptionFailure ?? failure("subscribe to \(kind)", status)
                     }
                 }
                 subscriptions[hash, default: []].append(Subscription(element: element, kinds: kinds))
             }
             let children = MacAXAttributeRead.childAttribute(element)
-            for attribute in children == kAXChildrenAttribute ? [children, kAXWindowsAttribute, kAXContentsAttribute] : [children] {
+            var attributes = children == kAXChildrenAttribute ? [children, kAXWindowsAttribute, kAXContentsAttribute] : [children]
+            if CFEqual(element, root) {
+                // These roots remain reachable even when AXChildren or
+                // AXContents is unreadable (including Electron apps).
+                attributes += [kAXFocusedWindowAttribute, kAXMainWindowAttribute, kAXFocusedUIElementAttribute]
+            }
+            for attribute in attributes {
                 try Task.checkCancellation()
                 guard MacAXAttributeRead.prepare(element) else {
-                    throw failure("read subscriptions within the AX time budget", .cannotComplete)
+                    subscriptionFailure = subscriptionFailure ?? failure("read subscriptions within the AX time budget", .cannotComplete)
+                    return false
                 }
-                if MacAXLimits.readDeadline != nil {
+                if MacAXLimits.readDeadline != nil,
+                   [children, kAXWindowsAttribute, kAXContentsAttribute].contains(attribute) {
                     var count: CFIndex = 0
                     let status = AXUIElementGetAttributeValueCount(element, attribute as CFString, &count)
-                    if [.attributeUnsupported, .noValue, .invalidUIElement].contains(status) { continue }
-                    guard status == .success, count <= MacAXLimits.deepPageMaxNodes - examined - pending.count else {
-                        throw failure("read subscriptions within the AX node budget", .cannotComplete)
+                    switch status {
+                    case .success:
+                        guard count <= MacAXLimits.deepPageMaxNodes - examined - pending.count else {
+                            complete = false
+                            continue
+                        }
+                    case .attributeUnsupported, .noValue, .invalidUIElement: continue
+                    default:
+                        complete = false
+                        continue
                     }
                 }
                 var value: CFTypeRef?
@@ -334,16 +366,21 @@ public final class MacAppSourceEvents: @unchecked Sendable {
                         pending.append(value as! AXUIElement)
                     }
                 case .attributeUnsupported, .noValue, .invalidUIElement: break
-                default: throw failure("read \(attribute) for subscriptions", status)
+                default: complete = false
                 }
             }
             examined += 1
             if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) }
         }
+        return complete
     }
 
     private func failure(_ operation: String, _ status: AXError) -> SenseFailure {
         SenseFailure(code: "source_unavailable", message: "App accessibility observation could not \(operation) (AX \(status.rawValue)).")
+    }
+
+    private func noNotifications() -> SenseFailure {
+        SenseFailure(code: "source_unsupported", message: "The running app supports no accessibility change notifications.")
     }
 
     private func resetStallDeadline() {

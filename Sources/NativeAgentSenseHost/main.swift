@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import Senses
+// Blueprint: | `Sources/NativeAgentSenseHost/main.swift` | JSON-line entry loop and bundled SDK loading for the shared JavaScript executor |
 
 let io = PlugIO()
 signal(SIGPIPE, SIG_IGN)

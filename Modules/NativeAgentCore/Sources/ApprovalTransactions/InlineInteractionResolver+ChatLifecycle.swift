@@ -1,10 +1,13 @@
 import Foundation
-import ChatOrchestration
+import NativeAgentCore
+import ChatToolRuntime
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import MacIntegration
 import MacControl
+
+// Blueprint: | `InlineInteractionResolver+ChatLifecycle.swift` | `InlineInteractionResolver` chat lifecycle: repeated-ask projection, controls, permission return checks and verified card settlement |
 
 extension InlineInteractionResolver {
     /// Legacy transcripts can contain repeated open asks. Only the newest
@@ -66,7 +69,7 @@ extension InlineInteractionResolver {
         return (kept, counts)
     }
 
-    /// Both visible cards and the quiet page use this projection and count.
+    /// The transcript owner uses this collapse for every card surface.
     public struct CollapsedCards {
         public var pairs: [(rowID: String, interaction: InlineInteraction)]
         /// How many asks each surviving line stands for, by interaction id.
@@ -74,8 +77,7 @@ extension InlineInteractionResolver {
         /// Folded asks exclude superseded rows, which still have a quiet line.
         public var foldedCount: Int
 
-        /// The heading both surfaces print: the distinct VISIBLE lines, and how
-        /// many asks were folded into them.
+        /// One heading for the distinct visible lines and their folded asks.
         public var heading: String {
             let cards = pairs.count == 1 ? "1 card" : "\(pairs.count) cards"
             return foldedCount > 0 ? "\(cards), \(foldedCount) folded" : cards
@@ -165,6 +167,19 @@ extension InlineInteractionResolver {
         case .capabilityFlag:
             if await setCapabilityFlag(interaction, controls: controls, dataRoot: dataRoot) { watch() }
             else { await finish(selection: interaction.target) }
+        case .keyring:
+            var refused: String? = "This card carries no secret to keep."
+            let name = String(interaction.target.dropFirst("secret:".count))
+            if interaction.secret?.remove == true {
+                do { try await Keyring.forget(name); refused = nil } catch { refused = "\(name) could not be removed: \(error.localizedDescription)" }
+            } else if let ask = interaction.secret {
+                // Not now while a sign-in runs leaves the card declined: the late token is not kept.
+                let id = interaction.id
+                refused = await NativeOAuthFlow.grantSecret(name, ask: ask, pasted: value, open: {
+                    await Self.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot)?.state == .running
+                }, shown: refresh)
+            }
+            await finish(selection: interaction.target, error: refused)
         case .providerAPIKey:
             let target = InlineInteractionRegistry.canonicalProviderID(interaction.target)
             let outcome = await saveAPIKey(interaction, value: value, controls: controls, dataRoot: dataRoot)
@@ -181,7 +196,7 @@ extension InlineInteractionResolver {
             }
         case .inlineChoice:
             await finish(selection: choice)
-        case .pairDevice, .connectorManualToken, .connectorOAuth, .trustPostureRequired:
+        case .pairDevice, .connectorManualToken, .trustPostureRequired:
             present(descriptor.control)
         case .unavailable, .unknown:
             break
@@ -390,52 +405,96 @@ extension InlineInteractionResolver {
         public static let shared = GrantWatch()
         public init() {}
         private var dataRoot: URL { PersistenceCore.defaultDataRoot() }
-        private var grantWatches: [String: String] = [:]
-        private var refreshers: [@MainActor () async -> Void] = []
-        private var grantWatchTask: Task<Void, Never>?
+        private var grantWatches: [String: (id: String, sessionID: String, dataRoot: URL)] = [:]
+        private var refreshers: [String: @MainActor () async -> Void] = [:]
+        private var generation: UUID?
+        private var wake: AsyncStream<Void>.Continuation?
+        private var permissionSource: Task<Void, Never>?
 
-        /// Begin the resident watch; the first tick rechecks at once.
-        public func start() {
-            guard grantWatchTask == nil else { return }
-            grantWatchTask = Task { [weak self] in
-                for await _ in InlineInteractionResolver.platform.permissionChanges() {
-                    guard let self, !Task.isCancelled else { return }
-                    await self.recheckGrants()
+        /// BackgroundLoops owns this observation's task and cancellation.
+        public func observe() async {
+            guard generation == nil, !Task.isCancelled else { return }
+            let identity = UUID()
+            generation = identity
+            let (changes, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            wake = continuation
+            // Subscribe before the first read; taps use the same coalesced wake.
+            let permissions = InlineInteractionResolver.platform.permissionChanges()
+            let source = Task {
+                defer { continuation.finish() }
+                for await _ in permissions {
+                    guard !Task.isCancelled else { return }
+                    continuation.yield(())
                 }
-                self?.grantWatchTask = nil
             }
+            permissionSource = source
+            continuation.yield(())
+            await withTaskCancellationHandler {
+                for await _ in changes {
+                    guard current(identity) else { return }
+                    await recheckGrants(identity)
+                }
+            } onCancel: {
+                continuation.finish()
+            }
+            await settle { @MainActor in
+                source.cancel()
+                await source.value
+                continuation.finish()
+                if self.generation == identity {
+                    self.generation = nil
+                    self.wake = nil
+                    self.permissionSource = nil
+                    self.grantWatches = [:]
+                    self.refreshers = [:]
+                }
+            }
+        }
+
+        private func current(_ identity: UUID) -> Bool {
+            generation == identity && !Task.isCancelled
         }
 
         /// A card the person just acted on, with the view to refresh when it settles.
-        public func watchUntilGranted(_ id: String, sessionID: String, refresh: @escaping @MainActor () async -> Void) {
-            grantWatches[id] = sessionID
-            refreshers.append(refresh)
-            start()
-            Task { await recheckGrants() }
+        public func watchUntilGranted(_ id: String, sessionID: String, dataRoot: URL, refresh: @escaping @MainActor () async -> Void) {
+            guard let wake, permissionSource?.isCancelled == false else { return }
+            let key = dataRoot.standardizedFileURL.path + ":" + id
+            grantWatches[key] = (id, sessionID, dataRoot)
+            refreshers[key] = refresh
+            wake.yield(())
         }
 
-        deinit { grantWatchTask?.cancel() }
-
-        private func recheckGrants() async {
+        private func recheckGrants(_ identity: UUID) async {
             var waiting = grantWatches
-            for card in await InlineInteractionResolver.platform.openInteractionCards() where waiting[card.id] == nil {
+            for card in await InlineInteractionResolver.platform.openInteractionCards() {
+                let key = dataRoot.standardizedFileURL.path + ":" + card.id
+                if waiting[key] != nil { continue }
+                guard current(identity) else { return }
                 // The inbox names the session it showed the card in; the card lives in its home session.
                 let home = await InlineInteractionResolver.homeSession(id: card.id, sessionID: card.sessionID, dataRoot: dataRoot)
+                guard current(identity) else { return }
                 guard let current = await InlineInteractionResolver.interaction(id: card.id, sessionID: home, dataRoot: dataRoot),
                       current.kind == .permission, current.state.isOpen else { continue }
-                waiting[card.id] = home
+                guard self.current(identity) else { return }
+                waiting[key] = (card.id, home, dataRoot)
             }
             var settled = false
-            for (id, sessionID) in waiting {
-                if await InlineInteractionResolver.completeIfVerified(id: id, sessionID: sessionID, dataRoot: dataRoot) {
-                    grantWatches[id] = nil
+            var completed: [@MainActor () async -> Void] = []
+            for (key, card) in waiting {
+                guard current(identity) else { return }
+                if await InlineInteractionResolver.completeIfVerified(id: card.id, sessionID: card.sessionID, dataRoot: card.dataRoot) {
+                    guard current(identity) else { return }
+                    grantWatches[key] = nil
+                    if let refresh = refreshers.removeValue(forKey: key) { completed.append(refresh) }
                     settled = true
                 }
             }
-            guard settled else { return }
+            guard settled, current(identity) else { return }
             await InlineInteractionResolver.platform.refreshInteractionInbox()
-            for refresh in refreshers { await refresh() }
-            if grantWatches.isEmpty { refreshers = [] }
+            for refresh in completed {
+                guard current(identity) else { return }
+                await refresh()
+            }
         }
     }
 }

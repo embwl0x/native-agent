@@ -3,6 +3,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
+// Blueprint: | `ChatSessionIndexReconciler.swift` | `ChatSessionIndexReconciler` actor; `reconcile` selects repairs and commits through ChatSessionIndexFile |
 
 /// Bounded launch repair for the one unavoidable two-file chat commit window:
 /// a transcript row is durable before `sessions.json` is synchronized. This
@@ -546,8 +547,7 @@ public actor ChatSessionIndexReconciler {
             }
             rows.insert(contentsOf: insertions, at: 0)
             if wroteRow || !insertions.isEmpty {
-                let data = try ChatSessionIndexFile.serializedData(for: rows)
-                try await persistence.writeDataAtomicDurable(data, to: sessionsPath)
+                try ChatSessionIndexFile.write(rows, to: sessionsPath)
             }
             return (insertions.count, repaired)
         }

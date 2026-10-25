@@ -1,5 +1,6 @@
 import SwiftUI
 import MemoryV2
+// Blueprint: | `EmbeddingModelDownloadRow.swift` | `EmbeddingModelDownloadRow` struct |
 
 struct EmbeddingModelDownloadRow: View {
     @State private var controller = EmbeddingModelDownloadController.shared

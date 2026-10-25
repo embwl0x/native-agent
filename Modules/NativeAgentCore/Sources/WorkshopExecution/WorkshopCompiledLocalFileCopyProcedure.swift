@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Procedures
+// Blueprint: | `WorkshopCompiledLocalFileCopyProcedure.swift` | `WorkshopCompiledProcedurePlanError` enum |
 
 public enum WorkshopCompiledProcedurePlanError: Error, LocalizedError, Equatable {
     case artifactNotEligible
@@ -215,6 +216,7 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
             sourceContentIdentity,
         ].joined(separator: "|"))
         self.encodedPlan = try JSONValue.object([
+            "working_directory": .string(workspace.path),
             "steps": .array(steps.map { step in
                 .object([
                     "id": .string(step.id),

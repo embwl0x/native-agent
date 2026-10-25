@@ -3,6 +3,8 @@ import SwiftUI
 import AppKit
 import Carbon.HIToolbox
 
+// Blueprint: | `MenuBarController.swift` | `GlobalHotkeyManager`: Carbon summon registration and tap/hold push-to-talk state with cancellable voice lifecycle |
+
 // MARK: - GlobalHotkeyManager
 
 /// Registers a global hotkey using Carbon's RegisterEventHotKey.

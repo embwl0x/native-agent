@@ -2,8 +2,10 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-/// One row of `scheduler/jobs.json` as the Schedule and the Desk show it
-/// (S10): the fields every job carries, read from the writer's listed row.
+// Blueprint: | `ScheduledJob.swift` | `ScheduledJob`: strict scheduler row decoding and projected civil next-run decoration while preserving claimed/retry instants |
+
+/// Scheduler list projection: unclaimed wall-clock nextRunAt follows the current
+/// zone; active occurrences and retry floors retain their saved instant.
 public struct ScheduledJob: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var name: String
@@ -36,7 +38,7 @@ public struct ScheduledJob: Identifiable, Codable, Hashable, Sendable {
             return "Once — scheduled time unavailable."
         }
         let formatter = DateFormatter()
-        formatter.timeZone = DisplayTimeZone.current
+        formatter.timeZone = TimeZone.autoupdatingCurrent
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
         return "Once at \(formatter.string(from: date))."

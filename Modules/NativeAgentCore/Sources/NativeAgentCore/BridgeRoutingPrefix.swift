@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `BridgeRoutingPrefix.swift` | `BridgeRoutingPrefix`: bounded stored-prefix parsing/stripping; caller retains provenance admission |
+
 /// Parses only the bounded stored bridge prefix; callers decide provenance admission.
 public enum BridgeRoutingPrefix {
     public static let prefix = "[from: "

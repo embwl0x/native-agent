@@ -3,9 +3,9 @@ import NativeAgentCore
 import DreamREMCycle
 import PersistenceCore
 import TriggerScheduler
+// Blueprint: | `NativeAgentDreamCycleSupport.swift` | `NativeAgentDreamCycleSchedule` enum; `runDateKey`, `dreamEntryDateKey` |
 
 enum NativeAgentDreamCycleSchedule {
-    static var timeZoneIdentifier: String { DreamREMSchedule.timeZoneIdentifier }
     static let dreamHour = DreamREMSchedule.dreamHour
     static let dreamMinute = DreamREMSchedule.dreamMinute
     // Forward to Core's single source of truth (DreamREMSchedule) — no literals here.
@@ -16,7 +16,6 @@ enum NativeAgentDreamCycleSchedule {
         [
             "type": .string("daily"),
             "at": .string(String(format: "%02d:%02d", dreamHour, dreamMinute)),
-            "timezone": .string(timeZoneIdentifier),
         ]
     }
 
@@ -25,7 +24,6 @@ enum NativeAgentDreamCycleSchedule {
             "type": .string("weekly"),
             "weekdays": .array([.string("sun")]),
             "at": .string(String(format: "%02d:%02d", remHour, remMinute)),
-            "timezone": .string(timeZoneIdentifier),
         ]
     }
 

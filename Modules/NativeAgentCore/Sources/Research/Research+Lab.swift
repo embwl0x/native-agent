@@ -2,6 +2,13 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Privacy
+// Blueprint: | `Research+Lab.swift` | `SwiftNativeResearchClient`: `researchLabRuns`, `runResearchLab`; SearXNG evidence explicitly distinguishes unavailable from empty, an injected L0 part call selects sources and composes the brief, native validation binds selected sources to that search, and settlement commits locked capped history plus activity/trace receipts with native status/error truth; source selection, brief wording and `buildResearchBrief` moved to `Resources/abilities/research-lab.js` |
+
+/// Authored content only. Identity, source evidence and publication remain native.
+public struct ResearchLabProposal: Codable, Sendable {
+    public let sources: [ResearchSearchResult]
+    public let brief: String
+}
 
 extension SwiftNativeResearchClient {
     // MARK: research lab (wave 30 W17)
@@ -31,101 +38,93 @@ extension SwiftNativeResearchClient {
         return sorted.map { $0.2 }
     }
 
-    public func runResearchLab(objective rawObjective: String, maxResults rawMax: Int) async throws -> ResearchLabRun {
+    public func runResearchLab(objective rawObjective: String, maxResults rawMax: Int,
+        compose: @Sendable (JSONValue) async throws -> ResearchLabProposal) async throws -> ResearchLabRun {
         // Mirror Python: objective = (objective or query).strip(); empty ->
         // ValueError("Research objective is required").
         let objective = rawObjective.trimmingCharacters(in: .whitespacesAndNewlines)
         if objective.isEmpty {
             throw ResearchClientError.malformedResponse("Research objective is required")
         }
-        // Python: max(1, min(8, int(maxResults or 5))) — note `maxResults or 5`
-        // treats 0 (and negatives via the falsy-int path? no: only 0/None are
-        // falsy) as missing -> 5. Mirror: 0 -> 5, then clamp to [1, 8].
-        let effectiveMax = (rawMax == 0) ? 5 : rawMax
-        let maxResults = max(1, min(8, effectiveMax))
-
         var results: [ResearchSearchResult] = []
         var searchError = ""
-        var enginesFailed = false
-        var needsConnector = false
+        var failure: String?
+        var engines: [String] = []
         do {
             let resp = try await search(query: objective)
-            results = Array(resp.results.prefix(maxResults))
-            if results.isEmpty, !resp.unresponsiveEngines.isEmpty {
-                enginesFailed = true
-                searchError = "Search engines returned no sources: " + resp.unresponsiveEngines.joined(separator: "; ")
+            results = resp.results
+            engines = resp.unresponsiveEngines
+            if results.isEmpty, !engines.isEmpty {
+                failure = "engines_failed"
+                searchError = "Search engines returned no sources: " + engines.joined(separator: "; ")
             }
         } catch where Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
             throw CancellationError()
         } catch {
-            // Python catches all exceptions and records the string form.
-            // ResearchClientError.notConfigured mirrors the daemon's
-            // ValueError("SearXNG base URL is not configured").
             switch error {
             case ResearchClientError.notConfigured:
-                needsConnector = true
+                failure = "not_configured"
                 searchError = "SearXNG base URL is not configured"
             default:
+                failure = "search_failed"
                 searchError = error.localizedDescription
             }
         }
 
         try Task.checkCancellation()
-        let connector: String
-        let cfg = try await persistence.readJSON(configPath, ifMissing: .object([:]))
-        if case .object(let obj) = cfg,
-           case .string(let base) = obj["searxng_base_url"] ?? .null, !base.isEmpty {
-            connector = "searxng"
-        } else {
-            connector = "none"
+        let connector = try Self.checkedSearxngBaseURL(root: receiptsDir.deletingLastPathComponent())?.isEmpty == false
+            ? "searxng" : "none"
+        let proposed = try await compose(.object([
+            "objective": .string(objective), "maxResults": .int(Int64(rawMax)),
+            "search": .object([
+                "availability": .string(failure == nil ? "available" : "unavailable"),
+                "reason": failure.map(JSONValue.string) ?? .null, "error": .string(searchError),
+                "results": .array(results.map { $0.toJSON() }),
+                "unresponsiveEngines": .array(engines.map(JSONValue.string)),
+            ]),
+        ]))
+        // A part authors the run, never its source evidence or native identity.
+        guard proposed.sources.allSatisfy({ results.contains($0) }) else {
+            throw ResearchClientError.malformedResponse("Research Lab part selected sources outside this search")
         }
-
         let run = ResearchLabRun(
             id: UUID().uuidString.lowercased(),
             objective: objective,
-            status: needsConnector ? "needs_connector" : (searchError.isEmpty ? "completed" : "failed"),
+            status: failure == "not_configured" ? "needs_connector" : (failure == nil ? "completed" : "failed"),
             query: objective,
-            sources: results,
-            brief: enginesFailed ? searchError : (needsConnector
-                ? "Research connector needs setup before this can run fully: \(searchError)"
-                : Self.buildResearchBrief(objective: objective, results: results, error: searchError)),
+            sources: proposed.sources,
+            brief: proposed.brief,
             createdAt: Self.isoTimestamp(Date()),
             connector: connector,
             error: searchError.isEmpty ? nil : searchError
         )
+        // Once accepted, save the run and its feed/trace settlement even if Stop arrives.
+        let result: Result<ResearchLabRun, Error> = await settle {
+            do { try await self.commitResearchLab(run); return .success(run) }
+            catch { return .failure(error) }
+        }
+        return try result.get()
+    }
 
-        // Persist newest-first, capped at 100 (Python `runs.insert(0, run);
-        // write_json(path, runs[:100])`). Read the EXISTING rows first so we
-        // preserve prior runs; sort matches researchLabRuns() (createdAt desc)
-        // so the freshly-inserted run lands first.
-        //
-        // The WHOLE read-insert-write is wrapped in withFileLock(labRunsPath)
-        // so multiple Swift callers cannot lose updates. The reader stays lock-free.
+    private func commitResearchLab(_ run: ResearchLabRun) async throws {
+        // Read/insert/cap/write stays one native transaction; no part runs under the lock.
         let labRunsPath = self.labRunsPath
         let writeBack: @Sendable () async throws -> Void = {
             var existing = try await self.researchLabRuns()
             existing.insert(run.toJSON(), at: 0)
             let capped = Array(existing.prefix(100))
-            try Task.checkCancellation()
             try await self.persistence.writeJSON(.array(capped), to: labRunsPath)
         }
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
-        try Task.checkCancellation()
         try await persistence.withFileLock(labRunsPath, writeBack)
 
         // Emit activity and trace side effects so the Mac activity feed and
         // trace ledger stay complete for in-process research runs.
-        let activityStatus = searchError.isEmpty ? "ok" : "warn"
-        let detail = Self.pythonCodepointPrefix(NativeAgentSecretRedactor.redactText(objective), 120)
+        let activityStatus = run.error == nil ? "ok" : "warn"
+        let detail = Self.pythonCodepointPrefix(NativeAgentSecretRedactor.redactText(run.objective), 120)
         let activityPayload: JSONValue = .object([
             "researchRunId": .string(run.id),
-            "sourceCount": .int(Int64(results.count)),
+            "sourceCount": .int(Int64(run.sources.count)),
         ])
-        try Task.checkCancellation()
         try await recordActivity(
             kind: "research",
             title: "Research lab run",
@@ -134,44 +133,16 @@ extension SwiftNativeResearchClient {
             payload: activityPayload
         )
 
-        // Python: record_trace("research.run", objective[:120],
-        //   {"researchRunId": run["id"], "status": run["status"],
-        //    "sourceCount": len(results)}). The trace envelope's `status` field
-        // is derived from payload["status"] (record_trace at L8557), so it is
-        // run.status ("completed" | "needs_connector" | "failed"), NOT the activity
-        // "ok"/"warn" mapping — preserved deliberately.
+        // Trace uses the run's status; the activity feed uses ok/warn.
         let tracePayload: JSONValue = .object([
             "researchRunId": .string(run.id),
             "status": .string(run.status),
-            "sourceCount": .int(Int64(results.count)),
+            "sourceCount": .int(Int64(run.sources.count)),
         ])
-        try Task.checkCancellation()
         try await recordTrace(
             kind: "research.run",
             title: detail,
             payload: tracePayload
         )
-
-        return run
-    }
-
-
-    /// Mirror `Daemon.build_research_brief`.
-    static func buildResearchBrief(objective: String, results: [ResearchSearchResult], error: String) -> String {
-        if !error.isEmpty {
-            return "Research failed: \(error)"
-        }
-        if results.isEmpty {
-            return "No sources returned. Configure SearXNG or broaden the query."
-        }
-        // Python: titles = [(title or url or "Source").strip() for r in results[:3]].
-        let titles = results.prefix(3).map { row -> String in
-            let t = row.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !t.isEmpty { return t }
-            let u = row.url.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !u.isEmpty { return u }
-            return "Source"
-        }
-        return "Captured \(results.count) source(s) for: \(objective). Top sources: " + titles.joined(separator: "; ")
     }
 }

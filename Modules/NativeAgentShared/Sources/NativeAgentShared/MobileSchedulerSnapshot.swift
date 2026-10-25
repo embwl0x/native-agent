@@ -1,8 +1,10 @@
 import Foundation
+// Blueprint: | `MobileSchedulerSnapshot.swift` | `MobileSchedulerSnapshot` struct |
 
 /// A value-only projection. Job payloads and execution authority stay on Mac.
 public struct MobileSchedulerSnapshot: Codable, Equatable, Sendable {
     public var capturedAt: Double
+    public var mac_time_zone: String?
     public var jobs: [MobileSchedulerJob]
 
     public init(capturedAt: Double, jobs: [MobileSchedulerJob]) {

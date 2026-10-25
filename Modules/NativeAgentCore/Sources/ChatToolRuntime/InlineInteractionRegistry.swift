@@ -6,6 +6,7 @@ import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import TrustCenter
+// Blueprint: | `InlineInteractionRegistry.swift` | `InlineInteractionRegistry` enum; `connectorSetup`, `canonicalConnectorID` |
 
 /// Turns a canonical ID into a card, without any per-service code.
 ///
@@ -18,45 +19,36 @@ import TrustCenter
 /// control.
 ///
 /// The one thing a registry cannot derive is HOW an account is set up
-/// (a pasted token vs. a native OAuth flow). That table lives here, once, and
+/// (a pasted token, or no setup flow here). That table lives here, once, and
 /// `ConnectorWizardSetupRoute` reads it instead of holding its own copy.
 public enum InlineInteractionRegistry {
 
     // MARK: - Connector setup routes
     //
     // Moved out of ConnectorWizardView so the wizard and the card cannot
-    // disagree about how a given account is connected. At review-0414f GitHub
-    // and Slack are Personal Access Tokens, NOT OAuth — the card must say
-    // "Paste a token", because offering "Sign in with GitHub" would be a lie.
+    // disagree about how a given account is connected. Slack and Telegram
+    // are pasted tokens, NOT OAuth — the card must say "Paste a token".
 
     public enum ConnectorSetup: String, Sendable, Equatable {
         case manualToken
-        case oauth
         case unavailable
     }
 
     /// Canonical connector id → how it is set up. Aliases resolve to the
-    /// canonical id first, so `email`/`calendar` land on `gmail`/`gcal`.
+    /// canonical id first.
     public static func connectorSetup(for rawID: String) -> ConnectorSetup {
         switch canonicalConnectorID(rawID) {
-        case "github", "slack", "notion", "telegram":
+        case "slack", "telegram":
             return .manualToken
-        case "x", "gmail", "gcal":
-            return .oauth
         default:
             return .unavailable
         }
     }
 
-    /// Alias folding. The registry, the OAuth store, and the wizard each grew
-    /// their own spellings (`email` → `gmail`, `calendar`/`google_calendar` →
-    /// `gcal`, `twitter` → `x`); a need raised with any of them must reach the
-    /// same descriptor.
+    /// Alias folding: a need raised with any spelling must reach the same
+    /// descriptor.
     public static func canonicalConnectorID(_ rawID: String) -> String {
         switch rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "email": return "gmail"
-        case "calendar", "google_calendar": return "gcal"
-        case "twitter": return "x"
         case "google_chrome", "chrome_extension": return "chrome"
         case "ipad", "phone", "ios": return "iphone"
         case let other: return other
@@ -95,12 +87,10 @@ public enum InlineInteractionRegistry {
                 control: {
                     switch setup {
                     case .manualToken: return .connectorManualToken
-                    case .oauth: return .connectorOAuth
                     case .unavailable: return .unavailable
                     }
                 }(),
-                // Both routes end at a browser or a pasted secret. Neither can
-                // be completed from the phone.
+                // A pasted secret cannot be completed from the phone.
                 location: .macRequired,
                 unavailableReason: setup == .unavailable
                     ? "This build has no setup flow for \(target)."
@@ -137,7 +127,9 @@ public enum InlineInteractionRegistry {
                 control: control,
                 // A macOS permission prompt happens on the Mac, by the person.
                 location: .macRequired,
-                unavailableReason: known ? nil : "No such Mac capability on this build."
+                unavailableReason: known ? nil : "No such Mac capability on this build. macOS permissions here: "
+                    + SystemPermissionCapability.requestable
+                    + " (permissions.request takes the name, card.request privacy:<name>); Automation is applescript:<bundle_id>."
             )
 
         case .modelChoice:
@@ -150,6 +142,16 @@ public enum InlineInteractionRegistry {
                 control: group == nil ? .unavailable : .providerGroupModel,
                 location: .anywhere,
                 unavailableReason: group == nil ? "No such Providers group." : nil
+            )
+
+        case .apiKey where target.hasPrefix("secret:"):
+            // A keyring secret one of her abilities names: no registry knows
+            // it, and none needs to. The person grants it once.
+            let name = String(target.dropFirst("secret:".count))
+            return InlineInteractionDescriptor(
+                kind: .apiKey, target: target, displayName: name, icon: "key",
+                control: Keyring.validName(name) ? .keyring : .unavailable, location: .macRequired,
+                unavailableReason: Keyring.validName(name) ? nil : "A secret's name is lowercase letters, digits, . _ -."
             )
 
         case .apiKey:
@@ -226,13 +228,8 @@ public enum InlineInteractionRegistry {
     /// How each connector spells its own name. Consulted only when the
     /// registry on disk does not answer.
     static let connectorDisplayNames: [String: String] = [
-        "github": "GitHub",
-        "gmail": "Gmail",
-        "gcal": "Google Calendar",
         "slack": "Slack",
-        "notion": "Notion",
         "telegram": "Telegram",
-        "x": "X",
         "chrome": "Chrome",
         "iphone": "iPhone",
     ]
@@ -350,7 +347,7 @@ public enum InlineInteractionRegistry {
               let value = try? JSONValue.parse(data),
               case .object(let root) = value
         else { return MacControlPolicy.default }
-        return MacControlPolicy.fromTrustPolicyObject(root)
+        return MacControlPolicy.fromTrustPolicyObject(root, dataRoot: dataRoot)
     }
 
     public static func providerDisplayName(_ id: String) -> String {
@@ -681,6 +678,34 @@ public enum InlineInteractionRegistry {
                 ? "I need a key for \(name)" : "I need \(name) connected")
                 + " \u{2014} add it below, "
                 + InlineInteraction.ConsequenceCopy.keepGoingSuffix
+        )
+    }
+
+    /// A keyring secret: what it is called, where it may go, and the sign-in
+    /// that fetches it when she supplied one; or its removal.
+    public static func secret(
+        _ name: String, ask: InlineInteraction.SecretAsk, why: String, declineConsequence: String? = nil
+    ) -> InlineInteraction {
+        if ask.remove == true {
+            return InlineInteraction(
+                kind: .apiKey, target: "secret:" + name, title: "Remove the \(name) key", why: why,
+                primaryActionLabel: "Remove \(name)",
+                declineConsequence: declineConsequence ?? "\(name) stays kept; nothing changes.",
+                cardProse: "Shall I have \(name) removed? Confirm below, " + InlineInteraction.ConsequenceCopy.keepGoingSuffix,
+                secret: ask
+            )
+        }
+        return InlineInteraction(
+            kind: .apiKey,
+            target: "secret:" + name,
+            title: ask.signIn == nil ? "Add the \(name) key" : "Sign in for \(name)",
+            why: why,
+            primaryActionLabel: "Connect \(name)",
+            declineConsequence: declineConsequence
+                ?? "Without it I can't use \(name)" + InlineInteraction.ConsequenceCopy.apiKeyNothingChanges,
+            persistenceNote: "Kept in this Mac's Keychain.",
+            cardProse: "I need \(name) \u{2014} add it below, " + InlineInteraction.ConsequenceCopy.keepGoingSuffix,
+            secret: ask
         )
     }
 

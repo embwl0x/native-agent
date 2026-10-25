@@ -23,6 +23,8 @@
 import Foundation
 import GRDB
 
+// Blueprint: | `MemoryV2+LaneRetention.swift` | `MemoryLaneHandle` and lane retention: bounded lane-owned row reads and archival without tombstoning user memory |
+
 /// Identity-only view of a stored memory: enough to order and retire a lane's
 /// own rows, with none of the decode cost of a full record (no embedding blob,
 /// no metadata JSON parse).

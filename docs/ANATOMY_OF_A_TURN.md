@@ -52,6 +52,16 @@ Core's Mac admission path can accept, queue or reject a request; queued work
 retains its session and origin. The chat client binds run and trace identities
 to the accepted turn.
 
+A restore installs the backup under the [restore law](canonical_data_paths.md#restore-law).
+The selected backup keeps its queues, conversations and attachments. A normal
+safety backup retains the life being left; no current-work overlay replaces
+the selected backup's requests. Credential/consumption facts, a readable phone
+version floor and uncarried ability kinds retain their existing continuity owners.
+Every resumable record retains its data-root life (no stamp is their first life,
+so an upgrade never reads as a restore). Work from another life reads
+stopped, reason `restored`; the person's Resume or Send now starts fresh work in
+the new life.
+
 Origin survives into dispatch. An admitted remote conversation is not made
 local by text claiming to be the owner. Trust and peer-origin policy evaluate the
 actual request provenance.
@@ -79,9 +89,11 @@ request combines:
 
 - the selected provider/model route from a checked routing snapshot;
 - persona and relevant atoms from the resident Context generation;
-- bounded conversation history and session continuity;
-- a compact turn-plan hint where useful; and
+- bounded conversation history and session continuity; and
 - an optional cognitive capsule and organism posture.
+
+The prepared plan is recorded as `turn.plan` and remains available to result
+settlement; it is not appended to model context.
 
 The prepared Context turn holds its generation lease through the provider/tool
 loop. A source update publishes a later generation rather than replacing part
@@ -91,11 +103,11 @@ pointer from the current turn's generation.
 Cognition is advisory. Its presentation bookkeeping is committed only after
 the engine call succeeds; merely preparing a capsule does not mark it delivered.
 
-### Tools and skills
+### Tools and abilities
 
 The request carries only `app`. `app {}` opens home, `find` discovers reach,
-and `action` executes a registry entry. Skill bodies are read through
-`skill.read` when useful. Discovery does not mount a schema or grant permission.
+and `action` executes a registry entry; their own abilities are their own actions,
+`authored.<id>`, read through `ability.read` when useful. Discovery does not mount a schema or grant permission.
 
 See [Tool loading: the contract](TOOL_LOADING.md) for the exact interface.
 
@@ -136,13 +148,16 @@ permission resets ask the owner first. A turn is peer-steered only when an agent
 Agents enabled in Trust → Connected agents carry the owner's authority on
 authenticated turns; ordinary Trust and domain checks still apply.
 
-Parallel-safe calls may execute together; the dispatcher classifies the
-underlying action rather than treating every `app` call as a read.
+A call runs beside another only when its declared class is read and its
+catalog bucket is core or file-ops; browser, Mac integration, Mac control,
+system, shell, the app door and unplaced tools run one at a time, and
+`git diff` of the working tree runs alone because it rewrites `.git/index`.
+One exception: `invoke_codex` calls whose `cwd`s are distinct, non-overlapping
+checkouts run concurrently.
 Provider-facing results are bounded. Oversized results can be retained behind
 a session-and-turn-scoped handle and read through `result.page`.
 
-The loop handles cancellation, dispatch deadlines, protocol repair and
-no-progress detection. No schema-loading round is needed between iterations.
+The loop handles cancellation, dispatch deadlines and protocol repair. No schema-loading round is needed between iterations.
 A returned tool result records what that owner observed; it does not establish
 an unverified external effect.
 
@@ -169,8 +184,28 @@ records the terminal reason, timing and dispatch/context evidence. These are
 receipts for the specific turn, not a general claim that every connected
 system is healthy.
 
+Compensation sites in tool dispatch and memory decision parsing emit
+`shim.fired` trace receipts with the census `id` and firing `site`.
+
+Their reply ends; they doesn't. The turn settles at them part's `reply.end` and
+its `after`; effects their part returns after them run once the turn's answer
+is saved and handed over (never when it could not be saved), privately, on the same turn id, through the same loop, tools and
+gates, with their own execution record and a copy of what is left of the token
+allowance, so nothing they do can change the delivered turn: nothing streams,
+no receipt is saved to the conversation, nothing is checkpointed, and a failure
+there is a `turn.after_reply` trace row. The shipped `turn.js` uses it for the
+keep moment: when a call's receipts show a write or irreversible effect landed
+by hand (`result.effect`, read from the call's own receipts, a batch's or
+script's included; explicit `effects` win over execution, so previews, pending,
+waiting, unknown and `effects: none` declare nothing; a run of one of them parts
+reports `part`; after a relaunch, `resumed.effect` reads the same over every
+receipt saved before it, each one's landed effect kept before it was bounded),
+it asks the model once more, in the same conversation, to keep the route as a
+ability through `ability.save` or keep nothing (`llm.call` purpose `keep`).
+
 Source: `ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift`,
-`MacChatTurnStreamSettlement.swift` and `MacChatTurnLifecycle.swift`.
+`ChatOrchestration+StreamingToolLoop.swift`, `MacChatTurnStreamSettlement.swift`
+and `MacChatTurnLifecycle.swift`.
 
 ## Related reading
 

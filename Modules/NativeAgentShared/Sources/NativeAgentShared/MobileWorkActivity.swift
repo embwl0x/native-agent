@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MobileWorkActivity.swift` | `Experience` and `ObligationPhase` value contracts shared by owners and phone renderers; `MobileWorkActivity` and its revisioned experience snapshot |
 
 /// One happening in her life (docs/EXPERIENCE.md), written once by the owner of
 /// the happening and only ever appended to: evidence attaches, claims accrue,

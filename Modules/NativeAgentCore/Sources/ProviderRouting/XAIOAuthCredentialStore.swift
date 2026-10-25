@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `XAIOAuthCredentialStore.swift` | Locked xAI token migration, immutable Keychain references, refresh reads and sign-out cleanup |
 
 /// xAI credentials retain their locked metadata file; only immutable Keychain
 /// references are committed there. Legacy token bytes migrate before use.

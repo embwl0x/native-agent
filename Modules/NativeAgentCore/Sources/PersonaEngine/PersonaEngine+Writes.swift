@@ -1,7 +1,9 @@
+import CryptoKit
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `PersonaEngine+Writes.swift` | `SwiftNativePersonaEngine`: profile schema preparation, including onboarding, and sole profile commit owner; fixed document specs and guarded writes; append reads current content under the write lock with the editor's cap and backup policy |
 
 // MARK: - Persona writes
 //
@@ -9,7 +11,10 @@ import PersistenceCore
 // persona document saves and missing-document scaffolding. Onboarding and
 // caller authorization still apply; no subsystem environment flag is required.
 // Mutations hold the target's shared cross-process file lock. USER.md remains
-// a MemoryV2 projection and cannot be saved or scaffolded through this owner.
+// a MemoryV2 UserMDGenerator projection and cannot be saved or scaffolded here.
+// Storage: persona Markdown/recovery copies and memory/profile.json are in local
+// and off-disk backups and the data export. Phone sync projects only the profile;
+// PrivacyMap lists persona documents under persona, profile.json under memory.
 
 public enum PersonaWriteError: Error, LocalizedError, Equatable {
     /// Mirrors the daemon `{"error":"onboarding_required", "detail": ...}`
@@ -20,11 +25,7 @@ public enum PersonaWriteError: Error, LocalizedError, Equatable {
     case unknownDocument(String)
     /// IO failure during the atomic write / read-back.
     case ioFailure(String)
-    /// Mirrors the agent-tool `{"ok": False, "error": ..., "error_code": "bad_input"}`
-    /// rejection (`_exec_persona_write` / `_exec_persona_append_section`): a bad
-    /// `kind`, a missing/invalid `skill_name`, a missing `title`, or an
-    /// unresolvable persona path. Carries the same message the tool dict returns
-    /// so a future native-dispatcher adapter can surface the identical error.
+    /// Invalid persona kind, missing title or unresolvable persona path.
     case invalidInput(String)
 
     public var errorDescription: String? {
@@ -76,12 +77,7 @@ extension SwiftNativePersonaEngine {
     /// `<dataRoot>/memory/profile.json` with `indent=2, sort_keys=True`
     /// byte-shape (PersistenceCore JSONValue `pretty: true` == Python
     /// `write_json`). The whole read-merge-write is held under a cross-process
-    /// flock on the profile file so it cannot interleave with a Python writer.
-    ///
-    /// `persona_compile_cache.clear()` is intentionally omitted — that cache
-    /// is daemon-process-only state. The daemon re-reads profile.json on the
-    /// next persona compile, so the on-disk wire output is what matters and it
-    /// is byte-identical. (Same rationale as the wave-20 onboarding port.)
+    /// flock on the profile file so concurrent mutations cannot interleave.
     ///
     /// - Parameter body: the partial profile fields to merge (the same dict
     ///   the HTTP route receives — keys NOT present are preserved from the
@@ -145,6 +141,75 @@ extension SwiftNativePersonaEngine {
         }
     }
 
+    // Profile schema preparation and commits stay here; onboarding owns intent.
+    // profile.json is backed up/exported and listed under memory in PrivacyMap;
+    // the phone receives a compiled profile projection.
+    package static func onboardingProfileUpdate(
+        profilePath: URL,
+        agentName: String,
+        personaType: String,
+        userName: String
+    ) throws -> (content: String, baseSHA256: String?) {
+        var raw: [String: Any] = [:]
+        var baseSHA256: String?
+        if FileManager.default.fileExists(atPath: profilePath.path) {
+            let data: Data
+            do {
+                data = try Data(contentsOf: profilePath)
+            } catch {
+                throw PersonaWriteError.ioFailure("read existing profile.json failed: \(error.localizedDescription)")
+            }
+            baseSHA256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            let decoded: Any
+            do {
+                decoded = try JSONSerialization.jsonObject(with: data)
+            } catch {
+                throw PersonaWriteError.ioFailure("existing profile.json is malformed; preserving original bytes")
+            }
+            guard let object = decoded as? [String: Any] else {
+                throw PersonaWriteError.ioFailure("existing profile.json is not an object; preserving original bytes")
+            }
+            raw = object
+        }
+        // First normalize to current canonical shape.
+        let current = PersonaCompiler.normalize(raw: raw, defaults: .defaults)
+
+        // Override fields per Python L20343-L20347.
+        let kindMap: [String: String] = ["female": "Female", "male": "Male", "ai": "AI"]
+        let newKind = kindMap[personaType] ?? "AI"
+        let voiceMap: [String: String] = [
+            "female": "Warm, observational, judgment-forward.",
+            "male": "Direct, dry, holds ground.",
+            "ai": "Precise, characterful, honest.",
+        ]
+        let newVoice = voiceMap[personaType] ?? voiceMap["ai"]!
+
+        // Build the on-disk dict. Re-runs normalize semantics: save_personality
+        // in Python does {existing ∪ body} → normalize → write. We constructed
+        // `current` from normalize(raw) so it already matches the
+        // first-normalize step; now apply body overrides and normalize once more.
+        var merged = SwiftNativePersonaEngine.profileToRawDict(current)
+        merged["name"] = agentName
+        merged["personaKind"] = newKind
+        merged["voice"] = newVoice
+        merged["updatedAt"] = NativeTimestampFormat.fractionalZulu(Date())
+        let renormalized = PersonaCompiler.normalize(raw: merged, defaults: .defaults)
+        var finalDict = SwiftNativePersonaEngine.profileToRawDict(renormalized)
+        // The USER's name (not the agent's `name`). Injected AFTER normalize so
+        // it survives regardless of the compiler's known-key set — the substrate
+        // reads this to address the user in her inner voice (never hardcode a
+        // name in the capsule/reflection cues). Trimmed; empty → omit.
+        let trimmedUserName = userName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedUserName.isEmpty {
+            finalDict["userName"] = trimmedUserName
+        }
+
+        let json = JSONValue(fromFoundation: finalDict)
+        let bytes = try json.serializedData(pretty: false)
+        let text = String(decoding: bytes, as: UTF8.self)
+        return (content: text, baseSHA256: baseSHA256)
+    }
+
     // MARK: - POST /v1/personality/docs  (save_personality_doc)
 
     /// Native mirror of `save_personality_doc(body)`, except USER.md is now a
@@ -189,12 +254,10 @@ extension SwiftNativePersonaEngine {
     ///   `PersonalityDoc` decode, throwing on the Mac side; the Swift gate
     ///   throws directly for identical UX). `.unknownDocument` for an id
     ///   outside the fixed spec set.
-    public func savePersonalityDoc(id: String, content: String) async throws -> PersonaDocSpec {
+    /// With `appending`, content is a suffix: read the current document under
+    /// the same write lock, retaining the document editor's cap and backup policy.
+    public func savePersonalityDoc(id: String, content: String, appending: Bool = false) async throws -> PersonaDocSpec {
         let docId = id.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        // content[:30000] by CODE POINTS (Unicode scalars), matching Python's
-        // string slice. Swift String.prefix(N) counts grapheme clusters and
-        // would diverge for combining sequences — use unicodeScalars.
-        let cappedContent = Self.capByCodePoints(content, cap: 30000)
 
         // ONBOARDING gate — SOUL.md existence is the sentinel.
         let soulURL = personaRoot.appendingPathComponent("SOUL.md")
@@ -231,15 +294,9 @@ extension SwiftNativePersonaEngine {
         // time. `docId` is the UPPER-cased id (e.g. "VOICE"), so the title is
         // "VOICE.md updated" — byte-identical to the daemon f-string.
         //
-        // LOCK ORDER: the append uses the daemon-faithful UNLOCKED
-        // `appendJSONL` (the daemon's `append_jsonl` takes NO lock — it relies
-        // on POSIX O_APPEND atomicity for sub-PIPE_BUF lines), so we do NOT
-        // take a second flock on events.jsonl while holding the doc lock. The
-        // doc lock alone serializes concurrent same-doc write+emit pairs, so
-        // both the activity-row order AND its `createdAt` track the write order
-        // exactly as the daemon's in-doc-lock emit does. A feed append failure
-        // propagates (no `try?`), matching the daemon's no-try/except
-        // `append_jsonl`.
+        // Lock order: document, then the distinct activity-feed lock in
+        // appendJSONLCapped. The timestamp is made after the document write;
+        // append failures propagate.
         //
         // SINGLE EMIT (wave-40 W17, §6.220): the daemon's `save_personality_doc`
         // emits EXACTLY ONE `record_activity` row per save (the retired daemon
@@ -250,6 +307,11 @@ extension SwiftNativePersonaEngine {
         // daemon's single `record_activity`.
         let persistence = SwiftNativePersistenceCore()
         let result: PersonaDocSpec = try await persistence.withFileLock(path) { [self] in
+            // Setup contributes only its section, never a carried-forward SOUL.
+            // An unreadable append base throws before either backup or mutation.
+            let nextContent = appending ? try String(contentsOf: path, encoding: .utf8) + content : content
+            // Preserve the editor's 30000-code-point cap on the combined document.
+            let cappedContent = Self.capByCodePoints(nextContent, cap: 30000)
             // One pre-edit copy per doc (`SOUL.md.bak`), replaced each save, so
             // the last version before any edit is always one file away.
             if FileManager.default.fileExists(atPath: path.path) {
@@ -297,37 +359,10 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - personality_doc_contents(create_missing=True) PERSISTENCE mirror
 
-    /// Native mirror of the daemon's `personality_doc_contents(create_missing=True)`
-    /// WRITE side. Once SOUL.md exists, any
-    /// MISSING fixed persona doc is atomically WRITTEN to disk with its
-    /// `default_personality_doc_content` body (parameterized by the user's
-    /// profile.json), exactly as the daemon does on every persona-docs read.
-    ///
-    /// This closes the wave-33 W19 "missing-doc default value persistence" gap:
-    /// the Swift READ path (`listPersonaDocSpecs`) renders the SAME default body
-    /// but leaves it in-memory (updatedAt nil) and never persists it. With the
-    /// write subsystem flipped, the daemon's persistence side must have a Swift
-    /// equivalent — otherwise a missing doc is regenerated in-memory on every
-    /// read but never durably created, so the next DAEMON read would scaffold it
-    /// unlocked, reopening the split-writer race the flock was meant to close.
-    ///
-    /// Semantics pinned to the daemon:
-    ///  - Pre-onboarding (SOUL.md absent) → NO-OP (`create_missing=False`), so the
-    ///    first-run wizard still renders against empty docs.
-    ///  - SOUL is never auto-scaffolded (the daemon's loop skips writing when the
-    ///    file exists; SOUL existing is the gate itself, and a SOUL write is owned
-    ///    by onboarding).
-    ///  - USER is never auto-scaffolded. MemoryV2 owns USER.md and regenerates it
-    ///    from SQLite into the active persona root.
-    ///  - Only VOICE/GROWTH/AGENTS get created-if-missing.
-    ///  - The default body is rendered from `PersonaCompiler.loadProfile` (the
-    ///    daemon calls `self.personality()` — the user's profile, NOT the
-    ///    hardcoded `default_personality()`), matching the read path.
-    ///  - Each write is atomic (temp + O_EXCL 0600 + rename) and held under the
-    ///    per-doc `<path>.lock` cross-process flock the route write uses, so it is
-    ///    symmetric with the daemon's `with file_lock(path)` writers.
-    ///  - `persona_compile_cache.clear()` / `record_activity` are daemon-only side
-    ///    effects (same boundary the route write omits, §6.76 item B.1).
+    /// After SOUL exists, create missing VOICE/GROWTH/AGENTS documents from
+    /// the profile defaults, atomically under each document's lock. SOUL is
+    /// onboarding-owned; USER is MemoryV2-owned. Publish invalidations for
+    /// created documents; unlike `savePersonalityDoc`, this emits no activity.
     ///
     /// - Returns: the ids actually written this call (empty if none / pre-onboarding).
     @discardableResult
@@ -354,11 +389,8 @@ extension SwiftNativePersonaEngine {
                 id: spec.id,
                 profile: profile
             )
-            // Per-doc flock symmetric with `savePersonalityDoc` / the daemon's
-            // `with file_lock(path)`. Re-check existence INSIDE the lock so two
-            // racing writers (or a daemon write between the outer check and the
-            // lock) don't double-write — first writer wins, matching the daemon's
-            // `if create_missing and not path.exists()` guard semantics.
+            // Share savePersonalityDoc's lock; recheck existence inside it
+            // so concurrent writers cannot replace a document that just arrived.
             let didWrite: Bool = try await persistence.withFileLock(path) {
                 if FileManager.default.fileExists(atPath: path.path) { return false }
                 try Self.atomicWriteText(body, to: path)
@@ -383,31 +415,12 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - record_activity parity (wave 36 W06, §6.138 — closes §6.76 item B.1)
 
-    /// `<root>/activity/events.jsonl` — the daemon's `Runtime.activity_path`
-    /// (`self.root / "activity" / "events.jsonl"`, the retired daemon). The
-    /// engine's `dataRoot` IS `Runtime.root` (both `dataRoot/memory/profile.json`
-    /// == `personality_path()` and `dataRoot/activity/events.jsonl` ==
-    /// `activity_path` resolve off the same base), so this is the byte-identical
-    /// path the daemon appends activity rows to.
+    /// The document-save activity feed under this engine's data root.
     var activityEventsPath: URL {
-        dataRootURL
-            .appendingPathComponent("activity", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
+        SwiftNativePersistenceCore.activityEventsPath(dataRoot: dataRootURL)
     }
 
-    /// Native mirror of `Runtime.record_activity(kind, title, detail, status,
-    /// mission_id, payload)`, scoped to the SINGLE
-    /// echo `save_personality_doc` emits — NOT a general port of the daemon's
-    /// activity feed (68 call sites with the full `redact_secret_text` /
-    /// `redact_secret_value` machinery; a future wave porting the activity feed
-    /// wholesale subsumes this, see retirement_path below).
-    ///
-    /// Builds the SAME event dict the daemon does:
-    ///   { id: uuid4, kind, title, detail, status, missionId, payload, createdAt }
-    /// and appends it to `activity/events.jsonl` via `appendJSONL`
-    /// (`serialize(pretty: false)` == Python `json.dumps(sort_keys=True)`; both
-    /// chmod the file 0600 — byte-and-permission identical to the daemon's
-    /// `append_jsonl`).
+    /// Emit the document-save event through shared `appendJSONLCapped`.
     ///
     /// REDACTION (verified pass-through for the persona-doc echo ONLY). The
     /// daemon runs `redact_secret_text` on title/detail and `redact_secret_value`
@@ -422,23 +435,11 @@ extension SwiftNativePersonaEngine {
     /// that can carry credential-shaped strings through here without porting the
     /// redactor first.
     ///
-    /// CROSS-PROCESS SAFETY. `events.jsonl` is an append-only JSONL file the
-    /// daemon writes with a BARE `open("a")` + chmod (NO flock — verified,
-    /// the retired daemon `append_jsonl` L1195-1202). `appendJSONL` uses
-    /// `O_WRONLY|O_APPEND`, which interleaves at line boundaries; a separate
-    /// flock here would only serialize against itself, not the daemon. We mirror
-    /// the daemon's single-writer-per-line atomicity exactly. The activity append targets a
-    /// DIFFERENT file than the persona doc, so emitting it while the caller still
-    /// holds `withFileLock(<doc>.md)` takes a lock on `<doc>.md.lock` only — no
-    /// second flock on `events.jsonl`, hence no reentrancy concern and no need
-    /// for the W34-W02 depth-tracked reentrant guard here (that guard exists for
-    /// `personality()` re-entering its OWN profile.json flock; this path never
-    /// re-enters any flock).
+    /// The caller holds the document lock; `appendJSONLCapped` takes the
+    /// distinct activity-feed lock. No same-lock reentry occurs.
     ///
-    /// retirement_path: subsumed by a future wave that ports the daemon activity
-    /// feed (`record_activity` + `redact_secret_text`/`redact_secret_value`)
-    /// wholesale into a Swift ActivityFeed module — at which point this calls
-    /// the shared port.
+    // activity/events.jsonl: local backup/data export/phone sync exclude it;
+    // off-disk backup and support bundles include it. PrivacyMap: activity.
     func recordPersonaDocActivity(docId: String) async throws {
         // event = record_activity("memory", f"{doc_id}.md updated",
         //                          "Personality document saved", "ok")
@@ -451,24 +452,18 @@ extension SwiftNativePersonaEngine {
         // .isoformat()`) — so the row's createdAt cannot predate the save under
         // lock contention, and a Swift-written row sorts identically to a
         // daemon-written row in the interleaved activity feed.
-        let event: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string("memory"),
-            "title": .string("\(docId).md updated"),
-            "detail": .string("Personality document saved"),
-            "status": .string("ok"),
-            "executionId": .null,
-            "payload": .object([:]),
-            "createdAt": .string(Self.nowISOPython()),
-        ])
-        // U5 fix-round (2026-06-11, gpt-5.5 review): this path was the one
-        // live activity writer still appending UNCAPPED. Routed through the
-        // shared `appendJSONLCapped` (PersistenceCore). `takeLock: true` takes
-        // the events.jsonl flock — the caller holds the DOC's flock, a
-        // different lock file, so no re-entry; lock order is safe because no
-        // path acquires the events lock before a doc lock.
+        let event = SwiftNativePersistenceCore.activityEvent(
+            id: UUID().uuidString.lowercased(),
+            kind: "memory",
+            title: "\(docId).md updated",
+            detail: "Personality document saved",
+            status: "ok",
+            executionId: nil,
+            payload: .object([:]),
+            createdAt: Self.nowISOPython()
+        )
         let persistence = SwiftNativePersistenceCore()
-        try await appendJSONLCapped(
+        try await SwiftNativePersistenceCore.appendActivityEvent(
             event, to: activityEventsPath, using: persistence,
             logLabel: "PersonaEngine"
         )
@@ -585,7 +580,7 @@ extension SwiftNativePersonaEngine {
     /// Crash-safe atomic write: the shared durable writer (0600 temp, fsync,
     /// rename, parent-directory fsync). The old hand-rolled copy renamed
     /// without an fsync, so a power loss could leave an identity doc empty.
-    static func atomicWriteText(_ content: String, to path: URL) throws {
+    package static func atomicWriteText(_ content: String, to path: URL) throws {
         do {
             try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(content.utf8), to: path)
         } catch PersistenceCoreError.ioFailure(let detail) {

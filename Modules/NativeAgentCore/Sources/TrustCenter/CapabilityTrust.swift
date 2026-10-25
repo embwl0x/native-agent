@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
 
+// Blueprint: | `CapabilityTrust.swift` | `SwiftNativeCapabilityTrust`: checked capability trust/catalog values, scoring, evaluation and display projections |
+
 // MARK: - Subsystem #12b: Capability Trust Network
 //
 // Routes ported from the retired native_agentd surface:
@@ -14,8 +16,9 @@ import ToolRegistry
 // Wave 13 disposition (2026-05-31): capabilityTrust is now FLIPPABLE.
 // All 9 dynamic prereqs have closed:
 //   1-7: list_skills / persona_skill_manifest_records / list_tools /
-//        manifest_registered_skills / list_workflows / list_mcp_servers /
-//        list_capability_catalog (CapabilityRecords+Dynamic.swift)
+//        list_workflows / list_capability_catalog
+//        (CapabilityRecords+Dynamic.swift; the manifest_registered_skills
+//        pass re-read the installed skills and is gone)
 //   8-9: catalog_sources / capability_trust_roots (ported as the two
 //        on-disk-merge actors below).
 //
@@ -235,16 +238,12 @@ public struct CapabilityTrustEvaluation: Sendable, Codable, Hashable {
 
 public enum CapabilityTrustError: Error, LocalizedError {
     case unknownCapability(String)
-    case invalidResponse(status: Int)
     case unavailable
-    case underlying(String)
 
     public var errorDescription: String? {
         switch self {
-        case .unknownCapability(let id): return "capability-trust: unknown capability: \(id)"
-        case .invalidResponse(let s): return "capability-trust: native implementation returned unexpected status \(s)"
-        case .unavailable: return "capability-trust: unavailable"
-        case .underlying(let m): return "capability-trust: \(m)"
+        case .unknownCapability(let id): return "capability_unknown: No capability matches '\(id)'. Use Capabilities > Refresh, then select a capability from the current list."
+        case .unavailable: return "capability_status_unavailable: Checked connector-action status is unavailable. Ask NativeAgent's maintainer to repair the capability-status wiring; evaluation cannot proceed without a complete checked snapshot."
         }
     }
 }
@@ -272,8 +271,7 @@ public struct CapabilityTrustScore: Sendable, Equatable {
     }
 }
 
-/// Pure score function. Mirrors `capability_trust_score` in
-/// the retired daemon byte-for-byte.
+/// Metadata heuristic, not signature verification or executable permission.
 public func scoreCapabilityRecord(_ record: [String: JSONValue]) -> CapabilityTrustScore {
     var score = 0.45
     var reasons = ["Base local capability record."]
@@ -296,7 +294,7 @@ public func scoreCapabilityRecord(_ record: [String: JSONValue]) -> CapabilityTr
     }
     if present("signature") {
         score += 0.20
-        reasons.append("Has a pack signature.")
+        reasons.append("Has signature metadata (not verified by this score).")
     }
     let status: String = {
         if case .string(let s)? = record["status"] { return s }
@@ -308,7 +306,7 @@ public func scoreCapabilityRecord(_ record: [String: JSONValue]) -> CapabilityTr
     }
     if present("lastUsedAt") || present("useCount") {
         score += 0.10
-        reasons.append("Has successful usage evidence.")
+        reasons.append("Has usage metadata.")
     }
     let risk: String = {
         if case .string(let s)? = record["riskClass"] { return s }
@@ -324,8 +322,7 @@ public func scoreCapabilityRecord(_ record: [String: JSONValue]) -> CapabilityTr
     return CapabilityTrustScore(score: scaled, reasons: reasons)
 }
 
-/// Tier threshold ports of the inline ternaries in `capability_trust_network`
-/// and `evaluate_capability_trust`.
+/// Display score tiers; "trusted" is a heuristic label, not pack admission.
 public func capabilityTrustTier(forScore score: Double) -> String {
     if score >= 0.75 { return "trusted" }
     if score >= 0.50 { return "review" }
@@ -444,8 +441,6 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
     private let clock: @Sendable () -> Date
     private let catalogSourcesActor: SwiftNativeCatalogSources
     private let trustRootsActor: SwiftNativeCapabilityTrustRoots
-    /// The MCP owner's server listing, handed in: TrustCenter imports no executor.
-    private let mcpServers: @Sendable () async throws -> [[String: JSONValue]]
     private let connectorActionStatuses: @Sendable () async throws -> [String: String]
 
     public init(
@@ -453,8 +448,7 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
         personaRoot: URL? = nil,
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         clock: @escaping @Sendable () -> Date = { Date() },
-        connectorActionStatuses: @escaping @Sendable () async throws -> [String: String],
-        mcpServers: @escaping @Sendable () async throws -> [[String: JSONValue]]
+        connectorActionStatuses: @escaping @Sendable () async throws -> [String: String]
     ) {
         self.dataRoot = dataRoot
         self.personaRoot = personaRoot
@@ -466,7 +460,6 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
         self.trustRootsActor = SwiftNativeCapabilityTrustRoots(
             dataRoot: dataRoot, persistence: persistence, clock: clock
         )
-        self.mcpServers = mcpServers
         self.connectorActionStatuses = connectorActionStatuses
     }
 
@@ -478,8 +471,7 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
             personaRoot: personaRoot,
             nowISO: nowISO,
             persistence: persistence,
-            connectorActionStatuses: connectorActionStatuses,
-            mcpServers: mcpServers
+            connectorActionStatuses: connectorActionStatuses
         )
         let sliced = Array(allRecords.prefix(200))
         var records: [CapabilityTrustRecord] = []
@@ -532,8 +524,7 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
             personaRoot: personaRoot,
             nowISO: nowISO,
             persistence: persistence,
-            connectorActionStatuses: connectorActionStatuses,
-            mcpServers: mcpServers
+            connectorActionStatuses: connectorActionStatuses
         )
         let match = records.first { rec in
             let id = jsonOptionalStringField(rec, "id") ?? ""
@@ -598,12 +589,9 @@ private func decodeCatalogSource(_ dict: [String: JSONValue]) -> CapabilityCatal
 /// when `capabilityTrust` is absent from `NATIVE_AGENT_SWIFT_SUBSYSTEMS`.
 public func makeCapabilityTrust(
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
-    connectorActionStatuses: @escaping @Sendable () async throws -> [String: String],
-    mcpServers: @escaping @Sendable () async throws -> [[String: JSONValue]]
+    connectorActionStatuses: @escaping @Sendable () async throws -> [String: String]
 ) -> any CapabilityTrustProtocol {
-    return SwiftNativeCapabilityTrust(
-        dataRoot: dataRoot, connectorActionStatuses: connectorActionStatuses, mcpServers: mcpServers
-    )
+    return SwiftNativeCapabilityTrust(dataRoot: dataRoot, connectorActionStatuses: connectorActionStatuses)
 }
 extension CapabilityRecord {
     /// One case style for every row: sentence case, proper nouns kept.
@@ -611,28 +599,14 @@ extension CapabilityRecord {
         sentenceCase(rawTitle(for: capability))
     }
 
-    /// Records that are the same capability reached another way. The X
-    /// `_v1` actions call the same endpoint as their base action, signed with
-    /// OAuth1 instead of the OAuth2 bearer. Both tools stay registered; the
-    /// list shows one row.
-    public static let displayAliases: [String: String] = [
-        "x.timeline_home_v1": "x.timeline_home",
-        "x.user_tweets_v1": "x.user_tweets",
-    ]
-
-    /// The records to list: an alias is dropped only when its base is there.
-    /// Built-in features first, then each service's actions together
-    /// (`slack.*`, `x.*`, …), by title within a group.
+    /// The records to list: built-in features first, then each service's
+    /// actions together (`slack.*`, `github.*`, …), by title within a group.
     public static func displayRecords(_ records: [CapabilityRecord]) -> [CapabilityRecord] {
-        let present = Set(records.compactMap(\.sourceId))
         func service(_ record: CapabilityRecord) -> String {
             let id = record.sourceId ?? ""
             return id.contains(".") ? String(id.prefix { $0 != "." }).lowercased() : ""
         }
-        return records.filter { record in
-            guard let source = record.sourceId, let base = displayAliases[source] else { return true }
-            return !present.contains(base)
-        }
+        return records
         .map { (service($0), title(for: $0), $0) }
         .sorted { ($0.0, $0.1.lowercased()) < ($1.0, $1.1.lowercased()) }
         .map(\.2)
@@ -690,17 +664,12 @@ extension CapabilityRecord {
         case "proactive_autonomy": return "Suggestions and updates"
         case "workflows": return "Tasks with several steps"
         case "agent_swarm": return "Help from other assistants"
-        case "mcp_runtime": return "Connected tools"
         case "research_browser": return "Web research"
         case "connectors": return "Connected apps and accounts"
         case "trust_doctor": return "Trust and diagnostics"
         case "nextgen_runtime": return "Feature readiness"
         case "native_mac_power": return "Mac controls"
         case "eval_release_ops": return "Update checks and support"
-        case "x.timeline_home", "x.timeline_home_v1": return "X Following timeline"
-        case "x.user_tweets", "x.user_tweets_v1": return "X user posts"
-        case "x.me", "x_me": return "Your X profile"
-        case "x.post_tweet", "x_post_tweet": return "Post on X"
         case "mac.jxa": return "Automate Mac apps with JavaScript"
         default:
             let name = (capability.name ?? capability.id).withoutStaleNextGenPhaseCopy
@@ -726,7 +695,6 @@ extension CapabilityRecord {
         case "proactive_autonomy": return "Let me suggest useful next steps and keep you updated."
         case "workflows": return "View saved definitions for tasks with several steps."
         case "agent_swarm": return "Ask several assistants to help with a task."
-        case "mcp_runtime": return "Connect tools from other apps and services."
         case "research_browser": return "Research topics and read web pages."
         case "connectors": return "Connect your accounts and apps."
         case "trust_doctor": return "Manage permissions and check the app's health."

@@ -1,6 +1,7 @@
 import ApprovalInbox
-import FeedPolicy
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import AgentWorkspace
 import CryptoKit
 import Foundation
 import NativeAgentCore
@@ -10,6 +11,7 @@ import PersistenceCore
 import TelegramBot
 import DeviceSync
 import Experiences
+// Blueprint: | `AttentionRouter.swift` | `AttentionRouter` actor; `delivery`, `allowed`, `releaseHeld` retain notification destinations and routing metadata through quiet hours; all sends, including pinned commands, stay retained until settlement; terminal shutdown closes new admission and accepted sends finish without an unbounded join |
 
 // MARK: - Attention router (sweep item 26, 2026-09-01)
 //
@@ -367,9 +369,8 @@ public actor AttentionRouter {
     /// never thought about the clock interrupted at 3am and the one site that
     /// had was the exception. The switch is deleted; the class decides.
     ///
-    /// Nothing is replayed when the window closes: the ledger is deliberately
-    /// left untouched (see `route`), so a deferred fact can still reach him if
-    /// it is still true, and the durable inbox card was written either way.
+    /// `route` persists held delivery in the inbox; `releaseHeld` sends it after
+    /// quiet hours and clears only destinations whose transport accepted it.
     public static func honorsQuietHours(_ importance: AttentionImportance) -> Bool {
         !wakesTheDevice(importance)
     }
@@ -554,6 +555,7 @@ public actor AttentionRouter {
     private let conversationSender: ConversationSender
     private var cached: State?
     private var inFlight: [String: Task<AttentionOutcome, Error>] = [:]
+    private var stopped = false
     var resultScanInFlight = false
     var settledResultFiles: [URL: Date] = [:]
     var resultRetryOffset = 0
@@ -573,6 +575,13 @@ public actor AttentionRouter {
             try await Self.sendToOriginatingConversation(
                 origin, text, dataRoot: dataRoot, delivery: delivery)
         }
+    }
+
+    /// Close future admission without cancelling an accepted knock. Every send,
+    /// including a pinned command, stays retained until its transport exits and
+    /// its real outcome settles. Shutdown never joins an unresponsive transport.
+    public func shutdown() {
+        stopped = true
     }
 
     private var stateURL: URL {
@@ -617,6 +626,7 @@ public actor AttentionRouter {
         postMacBanner: (@Sendable () async -> Void)? = nil,
         at date: Date = Date()
     ) async throws -> AttentionOutcome {
+        guard !stopped else { throw CancellationError() }
         // Only the caller's own origin names a conversation. The newest turn
         // trace used to fill one in, and answering into "whatever
         // conversation was newest" put a knock into an unrelated thread.
@@ -649,6 +659,7 @@ public actor AttentionRouter {
             return held
         }
         await postMacBanner?()
+        guard !stopped else { throw CancellationError() }
         guard delivery != .none else { return .routineSuccess }
 
         // The device-event id already exists and is what the APNS collapse id
@@ -668,7 +679,8 @@ public actor AttentionRouter {
             handled.knock = knockID
             return handled
         }
-        let reservation = "\(ledgerKey):\(digest)"
+        guard !stopped else { throw CancellationError() }
+        let reservation = pinnedTo == nil ? "\(ledgerKey):\(digest)" : UUID().uuidString
         if pinnedTo == nil, let existing = inFlight[reservation] {
             return try await existing.value
         }
@@ -733,10 +745,8 @@ public actor AttentionRouter {
             sent.knock = knockID
             return sent
         }
-        if pinnedTo == nil { inFlight[reservation] = send }
-        defer {
-            if pinnedTo == nil { inFlight[reservation] = nil }
-        }
+        inFlight[reservation] = send
+        defer { inFlight[reservation] = nil }
         return try await send.value
     }
 
@@ -866,8 +876,8 @@ public actor AttentionRouter {
 
     /// CHECKED read. A missing ledger is the only empty one. An unreadable
     /// or damaged ledger is not "nothing was delivered": routing throws its
-    /// cause, so no event knocks again on invented history. Damaged bytes are
-    /// renamed aside, never deleted; once they are, the ledger is known-empty.
+    /// cause, so no event knocks again on invented history. Damaged bytes stay
+    /// at their canonical path until repaired.
     private func load() async throws -> State {
         if let cached { return cached }
         let data: Data
@@ -878,35 +888,9 @@ public actor AttentionRouter {
             cached = state
             return state
         } catch {
-            throw quarantineDamagedLedger(error)
+            throw NSError(domain: "AttentionRouter", code: -2, userInfo: [NSLocalizedDescriptionKey:
+                "AttentionRouter could not decode \(stateURL.path): \(error.localizedDescription). History is unknown; bytes remain in place. Nothing was sent.", NSUnderlyingErrorKey: error])
         }
-    }
-
-    /// Rename aside, NEVER delete — the same contract the builder-inbox
-    /// self-heal (`SwiftToolDispatcher+AgentBridgeTools.quarantineBuilderInbox`)
-    /// and the chat delivery receipts store use: a file that turns out to be
-    /// recoverable is still on disk, and a human can read
-    /// `attention_router.json.quarantined-<ts>` to see exactly which events had
-    /// already been delivered.
-    private func quarantineDamagedLedger(_ damage: Error) -> Error {
-        let fileManager = FileManager.default
-        let stamp = String(Int(Date().timeIntervalSince1970))
-        var aside = stateURL.appendingPathExtension("quarantined-\(stamp)")
-        var collision = 1
-        while fileManager.fileExists(atPath: aside.path) {
-            aside = stateURL.appendingPathExtension("quarantined-\(stamp)-\(collision)")
-            collision += 1
-        }
-        let preserved: String
-        do {
-            try fileManager.moveItem(at: stateURL, to: aside)
-            preserved = "its bytes are preserved at \(aside.lastPathComponent) and the next knock starts a fresh ledger"
-        } catch {
-            preserved = "its bytes could not be moved aside (\(error.localizedDescription)); they stay in place"
-        }
-        nativeLog("attention_router: damaged ledger (%@); %@", damage.localizedDescription, preserved)
-        return NSError(domain: "AttentionRouter", code: -2, userInfo: [NSLocalizedDescriptionKey:
-            "The notification ledger is damaged (\(damage.localizedDescription)); \(preserved). Nothing was sent."])
     }
 
     /// Encode under BOTH budgets: `ledgerLimit` has already bounded the entry

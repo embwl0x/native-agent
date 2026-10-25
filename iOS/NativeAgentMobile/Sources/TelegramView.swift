@@ -1,10 +1,11 @@
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `TelegramView.swift` | `TelegramView` struct; reads the shared revision-ordered Telegram projection |
 
 struct TelegramView: View {
     private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairingStore: PairingStore
-    @State private var snapshot: MobileTelegramSnapshot?
+    private var snapshot: MobileTelegramSnapshot? { sync.telegram }
     @State private var saving = false
     @State private var failure: String?
     @State private var snapshotFailure: String?
@@ -46,7 +47,6 @@ struct TelegramView: View {
         }
         .macSyncErrorBanner()
         .task { await refresh() }
-        .onChange(of: sync.pageSnapshotVersions["telegram.json"]) { _, _ in Task { await readSnapshot() } }
         .refreshable { await refresh() }
         .confirmationDialog("Disconnect Telegram?", isPresented: $showDisconnect, titleVisibility: .visible) {
             Button("Disconnect", role: .destructive) { Task { await change(.disconnect) } }
@@ -56,22 +56,14 @@ struct TelegramView: View {
         }
     }
 
-    private func adopt(_ value: MobileTelegramSnapshot) {
-        guard value.observedAt >= (snapshot?.observedAt ?? 0) else { return }
-        snapshot = value
-    }
-
     private func refresh() async {
         failure = nil
         await readSnapshot()
-        await MobileAppSettingsStore.shared.refresh()
+        await sync.refreshAppSettings()
     }
 
     private func readSnapshot() async {
-        guard !saving else { return }
-        if let value: MobileTelegramSnapshot = await sync.loadSnapshotObjectAsync(named: "telegram.json") {
-            guard !saving else { return }
-            adopt(value)
+        if await sync.refreshTelegramSnapshot() {
             snapshotFailure = sync.staleSnapshotGroups["telegram"]
         } else {
             snapshotFailure = "Telegram settings have not arrived or could not be read. Open NativeAgent on your Mac, then refresh."
@@ -84,7 +76,7 @@ struct TelegramView: View {
         failure = nil
         defer { saving = false }
         do {
-            adopt(try await sync.changeTelegram(change))
+            _ = try await sync.changeTelegram(change)
         } catch {
             failure = "Telegram change failed: \(error.localizedDescription)"
         }

@@ -5,31 +5,28 @@ import PersistenceCore
 import TrustCenter
 import ToolRegistry
 import AgentConversations
+// Blueprint: | `PeerDataTaintDispatcher.swift` | `PeerDataTaintDispatcher` class; `peerApproval` shares live trusted-turn and peer-floor decisions between preview and execution; a peer-steered lifecycle write asks its one command card at the gate like any effect, and the ability stores refuse it until that card is answered; memory notes retain origin attribution checks; read results keep source labels without collecting steering peers or quoted lines |
 
 /// Enforces `PeerDataTaint` inside the per-turn chat dispatch chain.
 ///
 /// NOT a tool fence any more (2026-09-15). Effects raise the person's own
 /// permission card in `AutonomyGatedDispatcher`, which reads the same taint
-/// box this one latches. What survives here is the one thing that has to see
+/// box. What survives here is the one thing that has to see
 /// the tool's ARGUMENTS: Agent's provenance requirement on her own memory
-/// notes and the refusal of peer-steered ability changes.
+/// notes. A peer-steered ability change asks its command card at the gate
+/// like any effect; the ability stores refuse it until that is answered.
 public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Sendable {
     private let inner: any ToolDispatchClient
     /// The peers the PERSON has elevated in Trust → Connected agents. Nil on
     /// surfaces with no peer configuration, which simply taint as before.
     private let peerStore: AgentPeerStore?
-    /// Where the person's name and sender allowlist live; nil names no one.
-    private let dataRoot: URL?
-
-    public init(inner: any ToolDispatchClient, peerStore: AgentPeerStore? = nil, dataRoot: URL? = nil) {
+    public init(inner: any ToolDispatchClient, peerStore: AgentPeerStore? = nil) {
         self.inner = inner
         self.peerStore = peerStore
-        self.dataRoot = dataRoot
     }
 
     /// Preview and execution read the same live trust and peer approval floor.
-    public static func peerApproval(tool: String, capabilities: [String], input: [String: JSONValue],
-                                    surface: String, fullMac: Bool, protectedAction: Bool,
+    public static func peerApproval(surface: String, protectedAction: Bool,
                                     peerName: String? = nil) -> (requester: String?, required: Bool) {
         let taint = PeerDataTaint.current
         // The person answered this command's card: its peers steer no more of this run.
@@ -37,17 +34,12 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         let requester = answered || (PeerDataTaint.trustedTurn && taint?.isTainted != true) ? nil : PeerTurnEffectPolicy.peerRequester(
             surface: surface, peerID: ChatToolSessionContext.envelope?.verifiedUserId, peerName: peerName,
             taintSource: taint.flatMap { $0.isTainted ? $0.sourceDescription : nil })
-        let steered = requester != nil
-        let required = steered && (fullMac
-            ? PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: capabilities, input: input, fullMac: true)
-            : requester != nil && protectedAction)
-        return (requester, required)
+        return (requester, requester != nil && protectedAction)
     }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        // Peer provenance for THIS turn: either its words arrived as a tool
-        // result (the latch) or the whole turn came in over the peer bridge.
-        // Either way the identity is the ATTESTED one — the verified peer id
+        // Peer provenance for THIS turn comes from its origin, never a read.
+        // The identity is the ATTESTED one — the verified peer id
         // and the contact record it resolves to — so `provenance_by` is
         // checked against who the transport says is calling, not against a
         // word the peer put in its own message.
@@ -65,21 +57,15 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         } else {
             peerIdentity = nil
         }
-        if input["preview"] != .bool(true), let action = AppActionBinding.action(tool: tool, input: input),
-           action.lifecycle != nil, !action.read, let refusal = CapabilityLifecycle.turnWriteCheck()() {
-            throw refusal
-        }
         if let peerIdentity,
            let refusal = PeerTurnEffectPolicy.provenanceRefusal(
-            tool: tool, input: input, peer: peerIdentity, readPeerData: readPeerData,
-            person: readPeerData && taint?.restored != true && PeerTurnEffectPolicy.normalized(tool) == "commit_memory"
-                ? await personOnOwnDoor(surface: surface) : nil
+            tool: tool, input: input, peer: peerIdentity, readPeerData: readPeerData
            ) {
             throw AutonomyGateError.toolDenied(reason: refusal)
         }
         var result = try await inner.dispatch(tool: tool, input: input, surface: surface)
         let ranTool = ToolNameAliases.ranTool(tool, input: input)
-        if ["read_page", "mcp__searxng-local__search", "browser.read_text", "browser.read_links", "browser.chrome_snapshot"].contains(ranTool),
+        if ["read_page", "web_search", "browser.read_text", "browser.read_links", "browser.chrome_snapshot"].contains(ranTool),
            case .object(var fields) = result,
            fields["status"] != .string("failed"), fields["isError"] != .bool(true),
            ["text", "content", "results", "links", "nodes", "raw"].contains(where: { fields[$0].map(Self.containsStructuredText) == true }) {
@@ -87,39 +73,8 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
             fields["untrusted_remote_data"] = .bool(true)
             fields["source_boundary"] = .bool(true)
             result = .object(fields)
-            PeerDataTaint.markConsumed(peer: "web content", line: Self.peerLine(in: result, depth: 0) ?? "")
-        }
-        // Latch on the RESULT's own provenance label rather than on a list of
-        // tool names, so a transport added later is covered the day it starts
-        // labelling its output honestly.
-        let peers = Self.remoteProvenances(in: result)
-        if !peers.isEmpty {
-            let line = Self.peerLine(in: result, depth: 0) ?? ""
-            // Trusted transports label their own content before returning it.
-            // A selected route or a result-supplied name cannot clear a nested
-            // source's explicit untrusted provenance.
-            for peer in peers { PeerDataTaint.markConsumed(peer: peer, line: line) }
         }
         return result
-    }
-
-    /// The person's name when he started this turn himself, on one of his own
-    /// doors (the same test as `reachesUser`: no out-of-band origin, no agent
-    /// lane; Telegram and Slack only from an allowlisted sender), never a wake
-    /// or a helper's session. Nil on every other turn.
-    private func personOnOwnDoor(surface: String) async -> String? {
-        guard let dataRoot else { return nil }
-        let envelope = TurnEnvelope.current(surface: surface)
-        let door = envelope.surface.lowercased()
-        let session = ChatToolSessionContext.verifiedSessionId ?? ""
-        guard ChatPersistenceContext.originProvenance == nil, envelope.agent == nil,
-              ["chat", "app", "mac", "ios", "telegram", "slack"].contains(door),
-              session != ResidentWake.session, !session.hasPrefix("bot-") else { return nil }
-        if ["telegram", "slack"].contains(door) {
-            guard await SwiftNativeSecurityCenter(dataRoot: dataRoot).remoteSenderIsAllowlisted(.currentTurn(
-                verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface)) else { return nil }
-        }
-        return AgentBridgeRuntime.configuredNames(dataRoot: dataRoot).user
     }
 
     /// The contact the app's own agent tools routed this call to: the
@@ -137,21 +92,6 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         }
     }
 
-    /// The peer's own words in a labelled result, for the person's card.
-    static func peerLine(in value: JSONValue, depth: Int) -> String? {
-        guard depth < 6 else { return nil }
-        switch value {
-        case .object(let fields):
-            for key in ["reply", "agent_reply_text", "agent_reply_text_head", "completion_text_head", "partial_reply", "partial_text", "text"] {
-                if case .string(let text)? = fields[key],
-                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return text }
-            }
-            return fields.values.lazy.compactMap { peerLine(in: $0, depth: depth + 1) }.first
-        case .array(let items): return items.reversed().lazy.compactMap { peerLine(in: $0, depth: depth + 1) }.first
-        default: return nil
-        }
-    }
-
     /// A lane's reply, a run she just made or one its ledger or saved wakeup
     /// cached: the app wrote it from the route it ran on, so it is stamped
     /// with that route (`agent`: the contact's door, or the lane) and read
@@ -163,9 +103,8 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
                   return reply
               }).first else { return result }
         fields["agent"] = .string(agent)
-        let speakers = ContactThread.consume(mine: false, source: agent.isEmpty ? nil : agent, steeredBy: [], text: reply) {
-            PeerDataTaint.markConsumed(peer: $0, line: $1)
-        }
+        let speakers = ContactThread.consume(.init(text: reply, stamp: .init(source: agent.isEmpty ? nil : agent, steeredBy: [], contact: true)),
+            mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) })
         fields["untrusted_remote_data"] = .bool(!speakers.allSatisfy { PeerTrust.ownerTrusts(PeerTrust.principal($0, dataRoot: dataRoot), dataRoot: dataRoot) })
         return .object(fields)
     }
@@ -216,12 +155,10 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         }
     }
 
-    /// Every source a labelled result names, each latched under its own grant:
-    /// the door the app's own top-level object read from (`agent`/`agent_id`
-    /// as "peer:<id>", the attested id that carries the person's grant), and
-    /// each flagged object inside it (a history line's own `agent_id` and
-    /// `steered_by`). Latching more names never lifts one: a name a peer wrote
-    /// can add a latch, never clear the door's own.
+    /// Every source a labelled tool receipt names, for history's attribution:
+    /// the attested door, each flagged object's agent, and the `steered_by`
+    /// a line recorded. Display only: recorded steering is provenance the
+    /// history hit shows, never a speaker the turn latches.
     static func remoteProvenances(in value: JSONValue) -> [String] {
         var found: [String] = []
         func add(_ peer: String) {

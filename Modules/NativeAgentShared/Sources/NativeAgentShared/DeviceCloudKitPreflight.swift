@@ -32,6 +32,8 @@ import Foundation
 import Security
 #endif
 
+// Blueprint: | `DeviceCloudKitPreflight.swift` | `DeviceCloudKitPreflight`: entitlement/container admission before constructing CKContainer |
+
 /// Entitlement preflight for CloudKit. Every member decides whether it is safe
 /// to construct a `CKContainer`; NONE constructs one.
 public enum DeviceCloudKitPreflight {

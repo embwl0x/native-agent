@@ -1,7 +1,9 @@
 import Foundation
 
+// Blueprint: | `StoreChangeBus.swift` | `StoreChangeBus`: process-local multicast store invalidations; files remain authoritative |
+
 public struct StoreChange: Sendable, Equatable {
-    public enum Store: String, Sendable { case desk, githubCommand, replyDelivery }
+    public enum Store: String, Sendable { case desk, replyDelivery, keyring }
     public let store: Store
     public let path: URL
     public init(store: Store, path: URL) { self.store = store; self.path = path }

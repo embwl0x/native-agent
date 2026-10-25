@@ -1,5 +1,6 @@
 import Foundation
 import os
+// Blueprint: | `ChatLiveTap.swift` | `ChatLiveTap` enum; `observe` (every turn's deltas and saved answer, for the phone) |
 
 /// Every turn's text as it streams, whichever door started it. Device sync
 /// observes it so the phone can watch a turn in its conversation that it did
@@ -10,7 +11,7 @@ public enum ChatLiveTap {
         case delta(String)
         case answered(String)
         /// Saved text of a turn that stopped short; `status` is the turn's own
-        /// runtime status ("interrupted", "waiting on you").
+        /// runtime status ("stopped", "interrupted", "waiting on you").
         case incomplete(String, status: String)
         case failed(String)
         case cancelled

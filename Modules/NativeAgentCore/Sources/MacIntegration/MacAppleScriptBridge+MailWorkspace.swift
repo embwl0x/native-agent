@@ -3,6 +3,7 @@ import MacControl
 import SQLite3
 import PersistenceCore
 import UniformTypeIdentifiers
+// Blueprint: | `MacAppleScriptBridge+MailWorkspace.swift` | `MacAppleScriptBridge`: `mailWorkspaceRead`, `mailReadScope`, `mailIndexDatabase`, `mailSenders` (exact grouped sender counts), `mailFileRead`, `mailAttachment` (paired-identity .emlx bodies, MIME/table decoding and local attachments) |
 
 extension MacAppleScriptBridge {
     /// Bounded mailbox reads with opaque owner IDs. Transport fields are encoded

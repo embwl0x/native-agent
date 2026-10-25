@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ProviderAuthStatusWireSnapshot.swift` | `ProviderAuthStatusWireSnapshot`: shared compatibility decoding and bounded metadata projection; providers retain credential/routing authority |
+
 /// Provider-auth snapshot compatibility; providers retain credentials, refresh and routing authority.
 /// Platform models retain construction and encoding. Metadata projection is intentionally lossy.
 public struct ProviderAuthStatusWireSnapshot: Decodable, Sendable {

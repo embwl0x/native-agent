@@ -9,6 +9,7 @@ import Speech
 import PhotosUI
 import NativeAgentShared
 import UniformTypeIdentifiers
+// Blueprint: | `ChatView.swift` | Main reads the conversation anchor; Mac-projected other-room events interleave by time and open the Agents thread; history selection and drafts remain local |
 
 // MARK: - View
 
@@ -22,35 +23,18 @@ struct ChatView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(ChatStore.self) private var store
     private let sync = iCloudSyncEngine.shared
-    /// The iPhone is a member of the **Chat** group, so its model is the Mac's
-    /// resolved Chat choice, delivered in the synced surface preferences
-    /// (`adoptSurfaceModelPreferenceFromSync`). Empty until that snapshot
-    /// arrives — and empty is sent as NO override, so the Mac resolves the turn
-    /// (2026-09-13: no model id chosen on the phone).
     @AppStorage(HazeColor.key) private var hazeColorRaw = HazeColor.defaultValue.rawValue
-    @AppStorage("chatModel") private var selectedModel = ""
-    @AppStorage("chatReasoningEffort") private var selectedReasoningEffort = "high"
-    @AppStorage("chatFastMode") private var selectedFastMode = false
-    // U5 ABA guard (gpt-5.5 review, 2026-07-09): each pick bumps its
-    // generation; a failed round-trip only reverts if ITS generation is still
-    // current. A value-equality check alone can't tell "still my pick" from
-    // "user moved away and back while I was in flight."
-    @AppStorage("chatSurfaceSelectionGeneration") private var surfaceSelectionGeneration = 0
-    /// True once the Mac's own Chat choice has been adopted on this device. Until
-    /// then the phone has nothing of its own to send (2026-09-13 review).
-    @AppStorage("chatModelHydratedFromMac") private var hasHydratedModelFromMac = false
-    // A snapshot is eventually consistent with the configure request. Keep a
-    // freshly chosen set of runtime controls on screen until that snapshot
-    // acknowledges the same selection instead of letting an older Mac value
-    // immediately overwrite it.
-    @AppStorage("chatSurfaceSelectionAwaitingSync") private var surfaceSelectionAwaitingSync = false
+    // Every model control reads the shared Mac-owned tuple, including receipts.
+    private var selectedModel: String { sync.surfaceModels["ios"]?.model ?? "" }
+    private var selectedReasoningEffort: String { sync.surfaceModels["ios"]?.reasoningEffort ?? "high" }
+    private var selectedFastMode: Bool { sync.surfaceModels["ios"]?.serviceTier == "priority" }
+    private var selectedProviderId: String { sync.surfaceModels["ios"]?.providerId ?? "" }
     @AppStorage("chatFileAccess") private var selectedFileAccess = "auto"
-    @AppStorage("chatProviderId") private var selectedProviderId = ""
     @State private var draft = MobileChatDraft()
     @State private var showsChatSetup = false
     @State private var historyLimit = ChatView.historyPage
     @State private var showsConfiguration = false
-    @State private var inboxDetailItem: InboxItemRecord?
+    @State private var inboxDetailID: String?
     @State private var inboxGroup: InboxRelatedGroup?
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ScaledMetric(relativeTo: .footnote) private var sessionTabWidth: CGFloat = 156
@@ -94,6 +78,27 @@ struct ChatView: View {
         sync.agentDisplayName
     }
 
+    private var otherRoomRows: [String: [OtherRoomExchange]] {
+        guard let session = store.selectedSessionID ?? store.mainSessionID,
+              let transcript = sync.chatTranscripts[session] else { return [:] }
+        let shown = Set(visibleMessages.map { $0.id.uuidString.lowercased() })
+        return OtherRoomExchange.anchored(transcript.otherRooms, to: transcript.records.compactMap { row in
+            guard shown.contains(row.id.lowercased()), let at = UserDisplayFormatters.parseISOTimestamp(row.createdAt) else { return nil }
+            return (id: row.id.lowercased(), at: at)
+        })
+    }
+
+    private func exchangeRows(_ events: [OtherRoomExchange]) -> some View {
+        ForEach(events) { event in
+            NavigationLink { MobileAgentThreadView(id: event.contactID) } label: {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(event.title)
+                    Text(event.subtitle).foregroundStyle(.secondary)
+                }.font(.callout).lineLimit(1)
+            }.buttonStyle(.plain).id("other-room:" + event.id)
+        }
+    }
+
     private var composerPlaceholder: String {
         // Before any name is known the fallback is the product, not the agent.
         return agentDisplayName == NativeAgentIdentity.displayName(nil) ? "Message…" : "Message \(agentDisplayName)…"
@@ -126,14 +131,14 @@ struct ChatView: View {
             let extras = ProcessInfo.processInfo.arguments.contains("-chatSampleExtras")
             if extras {
                 messages[3] = ChatMessage(id: messages[3].id, role: .assistant, text: messages[3].text,
-                                          toolEvents: [ToolEvent(name: "calendar_read", seq: 1),
+                                          toolEvents: [ToolEvent(name: "mac_calendar_list_upcoming", seq: 1),
                                                        ToolEvent(name: "weather_forecast", seq: 2),
                                                        ToolEvent(name: "read_skill", seq: 3)])
             }
             if ProcessInfo.processInfo.arguments.contains("-chatSampleStreaming") {
                 messages.append(ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000006")!,
                                             role: .assistant, text: extras ? "" : "Writing the next step…", isStreaming: true,
-                                            toolEvents: extras ? [ToolEvent(name: "calendar_read", seq: 1)] : []))
+                                            toolEvents: extras ? [ToolEvent(name: "mac_calendar_list_upcoming", seq: 1)] : []))
             }
             return messages
         }
@@ -180,8 +185,8 @@ struct ChatView: View {
         ChatSessionTabProjection.make(
             mainSessionID: effectiveMainSessionID,
             mainTitle: mainSessionTitle,
-            pinnedSessions: sync.pinnedChatSessions,
-            anchorSession: anchorSession
+            navigationRows: sync.sessionNavigation?.rows ?? [],
+            openedSession: anchorSession
         )
     }
 
@@ -190,7 +195,7 @@ struct ChatView: View {
     private var anchorSession: ChatSession? {
         guard let selectedID = store.selectedSessionID,
               selectedID != effectiveMainSessionID,
-              !sync.pinnedChatSessions.contains(where: { $0.id == selectedID }) else { return nil }
+              sync.sessionNavigation?.rows.contains(where: { $0.session.id == selectedID }) != true else { return nil }
         return sync.sessions.first(where: { $0.id == selectedID && $0.archived != true })
     }
 
@@ -199,7 +204,7 @@ struct ChatView: View {
     /// against this, not the raw snapshot, or it would bounce an anchor
     /// selection straight back to the main tab.
     private var visiblePinnedSessionIDs: Set<String> {
-        var ids = Set(sync.pinnedChatSessions.map(\.id))
+        var ids = Set(sync.sessionNavigation?.rows.map { $0.session.id } ?? [])
         if let anchorSession { ids.insert(anchorSession.id) }
         return ids
     }
@@ -214,18 +219,19 @@ struct ChatView: View {
         return (sync.sessions.first { $0.id == sessionID }?.messageCount ?? 0) > 0
     }
 
+    private var transcriptReadError: String? {
+        let sessionID = store.selectedSessionID ?? effectiveMainSessionID
+        return sessionID.flatMap { sync.chatTranscripts[$0]?.readError }
+    }
+
     /// History is User's own conversations that have something in them, newest
     /// first, a page (the Mac's ⌘K count) at a time behind "Show older".
-    /// Agent-bridge, bot and bridge-routed chats, and empty throwaways, were
-    /// most of the list.
+    /// The engine's working-conversation classification owns bridge filtering.
     private var historySessions: [ChatSession] {
         let shown = sync.sessions.filter { session in
-            let source = (session.source ?? "").lowercased()
-            let title = session.title.trimmingCharacters(in: .whitespaces)
             return session.archived != true && session.id != effectiveMainSessionID
                 && (session.messageCount ?? 0) > 0
-                && !["agent-bridge", "bot"].contains(source)
-                && !(title.hasPrefix("[from: ") && title.contains("via bridge]"))
+                && session.isWorkingConversation == false
         }
         return shown.sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
     }
@@ -256,7 +262,6 @@ struct ChatView: View {
                                     status: "pending", localOnly: true, remoteResolvable: false)]
         }
         #endif
-        guard store.sessionCacheLoadTask == nil else { return [] }
         return MobileChatApprovalProjection.pendingApprovals(
             sessionId: store.selectedSessionID,
             approvals: sync.approvals
@@ -266,8 +271,7 @@ struct ChatView: View {
     /// Cards raised in another thread and mirrored into this conversation for
     /// User; their buttons answer the original through the signed inbox action.
     private var inlineChatCards: [InboxItemRecord] {
-        guard store.sessionCacheLoadTask == nil,
-              let session = store.selectedSessionID, !session.isEmpty else { return [] }
+        guard let session = store.selectedSessionID, !session.isEmpty else { return [] }
         let interactions = Set(visibleMessages.compactMap { $0.interaction.map { "interaction:\($0.id)" } })
         return sync.inboxItems.filter { item in
             item.source == "interaction" && item.chat_session_id == session
@@ -290,7 +294,7 @@ struct ChatView: View {
                         store.errorBanner = error.localizedDescription
                     }
                 }
-            }, onView: { inboxDetailItem = item })
+            }, onView: { inboxDetailID = item.id })
         }
     }
 
@@ -313,7 +317,7 @@ struct ChatView: View {
     }
 
     private var effectiveMainSessionID: String? {
-        store.mainSessionID ?? sync.chatAnchor?.cleanSessionId
+        sync.chatAnchor?.cleanSessionId
     }
 
     private var mainSessionTitle: String {
@@ -330,15 +334,12 @@ struct ChatView: View {
             reasoningEffort: selectedReasoningEffort,
             serviceTier: selectedFastMode ? "priority" : "default",
             fileAccess: ChatRuntimeControlPresentation.normalizedFileAccessID(selectedFileAccess),
-            providerId: providerId(for: selectedModel)
+            providerId: selectedProviderId
         )
     }
 
     var body: some View {
         chatBody
-            .onChange(of: sync.surfaceModels) { _, _ in
-                adoptSurfaceModelPreferenceFromSync()
-            }
             // 2026-09-06: this fires on a version change as well as a row
             // change, because both live in the one published value. A cleared
             // chat republished with a newer version but the same (empty) rows
@@ -427,12 +428,16 @@ struct ChatView: View {
     private var chatBody: some View {
         let approvals = inlineChatApprovals
         let cards = inlineChatCards
-        let anchor = approvals.isEmpty && cards.isEmpty ? nil : MobileChatApprovalProjection.anchorMessageID(in: visibleMessages)
+        let cardAnchor = cards.isEmpty ? nil : visibleMessages.last(where: { $0.role == .assistant })?.id ?? visibleMessages.last?.id
+        let exchanges = otherRoomRows
         return NavigationStack {
             VStack(spacing: 0) {
                 // One banner lane: the newest notice shows, the rest wait
                 // behind a count instead of stacking down the screen.
                 MobileChatBannerLane(banners: chatBanners)
+                if let reason = transcriptReadError {
+                    Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                }
 
                 runtimeControlsBar
                 if showsChatSessionTabs {
@@ -454,12 +459,14 @@ struct ChatView: View {
                                     .frame(maxWidth: .infinity)
                                 }
 	                                ForEach(visibleMessages) { msg in
+                                        exchangeRows(exchanges[msg.id.uuidString.lowercased()] ?? [])
 	                                    BubbleView(
 	                                        message: msg,
 	                                        streamingHint: store.streamingHint(for: msg),
 	                                        isTimedOut: store.isTimedOut(msg),
 	                                        onRetry: { store.retry(messageId: msg.id, client: bridgeClient) },
-	                                        isLiveTurn: store.liveTurnBubbles.values.contains(msg.id)
+	                                        isLiveTurn: store.liveTurnBubbles.values.contains(msg.id),
+                                            cardsAvailable: transcriptReadError == nil
 	                                    )
                                         .equatable()
                                         // The paced reveal grows the live reply
@@ -505,13 +512,14 @@ struct ChatView: View {
 	                                    // this turn is waiting on renders right
 	                                    // here instead of only in the Activity
 	                                    // tab. Activity stays canonical.
-	                                    if msg.id == anchor {
-                                            inlinePendingCards(approvals: approvals, cards: cards)
-	                                    }
+                                        inlinePendingCards(
+                                            approvals: approvals.filter { MobileChatApprovalProjection.anchorMessageID(for: $0, in: visibleMessages) == msg.id },
+                                            cards: msg.id == cardAnchor ? cards : [])
 	                                }
-                                if anchor == nil {
-                                    inlinePendingCards(approvals: approvals, cards: cards)
-                                }
+                                exchangeRows(exchanges[""] ?? [])
+                                inlinePendingCards(
+                                    approvals: approvals.filter { MobileChatApprovalProjection.anchorMessageID(for: $0, in: visibleMessages) == nil },
+                                    cards: cardAnchor == nil ? cards : [])
                                 // Reaching the bottom by hand is following again:
                                 // the Latest button goes away on its own.
                                 Color.clear.frame(height: 1)
@@ -592,6 +600,7 @@ struct ChatView: View {
                     .onChange(of: store.messages.count) {
                         scheduleScrollToBottom(proxy, animated: false)
                     }
+                    .onChange(of: exchanges) { scheduleScrollToBottom(proxy, animated: false) }
                     .onChange(of: store.messages.last?.text) {
                         scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 16)
                     }
@@ -652,14 +661,14 @@ struct ChatView: View {
                     dismissedSyncError = nil
                 }
             }
-            .sheet(item: $inboxDetailItem, onDismiss: { inboxGroup = nil }) { item in
+            .sheet(isPresented: Binding(get: { inboxDetailID != nil }, set: { if !$0 { inboxDetailID = nil } }), onDismiss: { inboxGroup = nil }) {
                 if let inboxGroup {
                     InboxView(initialGroup: inboxGroup)
                 } else {
-                    InboxDetailSheet(item: item, allItems: sync.inboxItems, onOpenGroup: { group in
+                    InboxDetailSheet(itemID: inboxDetailID ?? "", onOpenGroup: { group in
                         inboxGroup = group
                     }) {
-                        inboxDetailItem = nil
+                        inboxDetailID = nil
                     }
                 }
             }
@@ -716,14 +725,6 @@ struct ChatView: View {
                 adoptMainSessionFromSnapshots()
                 if MobileQuickAskRoute.consume() { composerIsFocused = true }
                 consumeNotifiedChatSessionIfNeeded()
-                // 2026-09-13 review: local model state left over from an older
-                // build is CLEARED before anything can be sent, not kept until a
-                // catalog happens to arrive. Waiting for a snapshot meant an
-                // early or offline send transmitted a stale override and the Mac
-                // honoured it. The phone hydrates only from the Mac's synced
-                // choice; until that lands it sends no override at all.
-                clearLegacyLocalModelStateIfNeeded()
-                adoptSurfaceModelPreferenceFromSync()
                 importSharedItems()
                 // Wire TTS callback into store
                 store.onReply = { [voiceOutput] text in
@@ -790,8 +791,7 @@ struct ChatView: View {
                         afterPinnedIDs: visiblePinnedSessionIDs
                     )
                     adoptConversationAnchorIfNeeded()
-                    if !sync.refreshInFlight { store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages()) }
-                    await MainActor.run { seedProviderIfNeeded() }
+                    if !sync.refreshInFlight { store.refresh(using: bridgeClient) }
                 }
                 // PATCH-2026-05-11: foreground-refresh — pull latest history on appear.
             }
@@ -809,7 +809,7 @@ struct ChatView: View {
                             afterPinnedIDs: visiblePinnedSessionIDs
                         )
                         adoptConversationAnchorIfNeeded()
-                        store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages())
+                        store.refresh(using: bridgeClient)
                     }
                 }
             }
@@ -826,7 +826,6 @@ struct ChatView: View {
             .onChange(of: store.isSwitchingSession) { _, switching in
                 if !switching { importSharedItems() }
             }
-            .onChange(of: agentDisplayName) { _, _ in rememberShareAgentName() }
             // 2026-09-06: a reply notification names the conversation it came
             // from. Consume it here too — onAppear only fires when the chat
             // surface was not already mounted.
@@ -1253,7 +1252,7 @@ struct ChatView: View {
         if let heard = store.activeTurnHeardByMac ?? (isChatSample && visibleMessages.last?.isStreaming == true ? true : nil) {
             guard heard else { return ("Sending…", .working) }
             let replying = visibleMessages.last.map { $0.role == .assistant && $0.isStreaming && !$0.text.isEmpty } ?? false
-            return (replying ? "Replying…" : "Thinking…", .working)
+            return (replying ? "Replying…" : "Received by Mac", replying ? .working : .waiting)
         }
         if !inlineChatApprovals.isEmpty { return ("Waiting on you", .waiting) }
         return ("Here", .here)
@@ -1297,38 +1296,19 @@ struct ChatView: View {
                 Menu {
                     ForEach(reasoningOptions, id: \.id) { option in
                         Button {
-                            let previousModel = selectedModel
-                            let previous = selectedReasoningEffort
-                            let previousFastMode = selectedFastMode
-                            let previousProvider = selectedProviderId
-                            selectedReasoningEffort = option.id
                             let requestedModel = selectedModel
                             let requestedProvider = selectedProviderId
                             let requestedServiceTier = selectedFastMode ? "priority" : "default"
-                            let myGeneration = beginSurfaceSelectionUpdate()
                             Task {
                                 do {
-                                    let receipt = try await sync.configureSurfaceSelection(
+                                    try await sync.configureSurfaceSelection(
                                         surface: "ios",
                                         providerId: requestedProvider,
                                         model: requestedModel,
                                         reasoningEffort: option.id,
                                         serviceTier: requestedServiceTier
                                     )
-                                    adoptCanonicalSurfaceSelection(receipt, requestGeneration: myGeneration)
                                 } catch {
-                                    finishSurfaceSelectionFailure(requestGeneration: myGeneration)
-                                    // Generation, not value (ABA) — see model menu above.
-                                    if let restored = ChatRuntimeControlPresentation.rollback(
-                                        currentGeneration: surfaceSelectionGeneration,
-                                        requestGeneration: myGeneration,
-                                        previous: .init(providerID: previousProvider, model: previousModel, reasoningEffort: previous, fastMode: previousFastMode)
-                                    ) {
-                                        selectedModel = restored.model
-                                        selectedReasoningEffort = restored.reasoningEffort
-                                        selectedFastMode = restored.fastMode
-                                        selectedProviderId = restored.providerID
-                                    }
                                     iOSSystemToastCenter.shared.push(
                                         error: "Couldn't set reasoning to \(option.label): \(error.localizedDescription)"
                                     )
@@ -1376,13 +1356,6 @@ struct ChatView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
         .tint(AlivePalette.text)
-        // Seed the provider pill off this small subview rather than the main
-        // `body` chain — adding another modifier to body tips its expression
-        // past the Swift type-checker's complexity budget (build timeout).
-        // seedProviderIfNeeded() is idempotent, so repeated fires are safe.
-        .onChange(of: sync.providers) { _, _ in
-            seedProviderIfNeeded()
-        }
     }
 
     /// One row of the options card: what it is on the left, the current
@@ -1426,49 +1399,15 @@ struct ChatView: View {
     }
 
     private func selectModel(_ model: String, providerID: String) {
-        // Optimistic set, then confirm against the Mac. If the
-        // iCloud round-trip fails the pick used to stay on screen
-        // until a later snapshot silently reverted it; now we undo
-        // it here and say why.
-        let previous = selectedModel
-        let previousEffort = selectedReasoningEffort
-        let previousFastMode = selectedFastMode
-        let previousProvider = selectedProviderId
-        selectedProviderId = providerID
-        selectedModel = model
-        // The Mac decides what effort and speed this model takes; its signed
-        // receipt below is the tuple the phone shows.
-        let requestedProvider = selectedProviderId
-        let requestedEffort = selectedReasoningEffort
-        let requestedFastMode = selectedFastMode
-        let myGeneration = beginSurfaceSelectionUpdate()
+        let effort = selectedReasoningEffort
+        let tier = selectedFastMode ? "priority" : "default"
         Task {
-            let result = await ChatRuntimeControlPresentation.execute(
-                defaults: .standard,
-                previous: .init(providerID: previousProvider, model: previous, reasoningEffort: previousEffort, fastMode: previousFastMode),
-                requested: .init(providerID: requestedProvider, model: model, reasoningEffort: requestedEffort, fastMode: requestedFastMode),
-                requestGeneration: myGeneration
-            ) { requested in
-                let receipt = try await sync.configureSurfaceSelection(
-                    surface: "ios",
-                    providerId: requested.providerID,
-                    model: requested.model,
-                    reasoningEffort: requested.reasoningEffort,
-                    serviceTier: requested.fastMode ? "priority" : "default"
+            do {
+                try await sync.configureSurfaceSelection(
+                    surface: "ios", providerId: providerID, model: model,
+                    reasoningEffort: effort, serviceTier: tier
                 )
-                adoptCanonicalSurfaceSelection(receipt, requestGeneration: myGeneration)
-            }
-            if let restored = result.restored {
-                // Only undo if no NEWER pick happened while this
-                // round-trip was in flight — generation, not value:
-                // the user may have moved away and back (ABA).
-                selectedModel = restored.model
-                selectedReasoningEffort = restored.reasoningEffort
-                selectedFastMode = restored.fastMode
-                selectedProviderId = restored.providerID
-            }
-            if let error = result.error {
-                finishSurfaceSelectionFailure(requestGeneration: myGeneration)
+            } catch {
                 iOSSystemToastCenter.shared.push(
                     error: "Couldn't switch to \(modelLabel(model)): \(error.localizedDescription)"
                 )
@@ -1482,114 +1421,21 @@ struct ChatView: View {
             iOSSystemToastCenter.shared.push(error: "Fast mode is not available for \(modelLabel(selectedModel)).")
             return
         }
-        let previous = ChatRuntimeControlPresentation.Selection(
-            providerID: selectedProviderId,
-            model: selectedModel,
-            reasoningEffort: selectedReasoningEffort,
-            fastMode: selectedFastMode
-        )
-        selectedFastMode = enabled
-        let requested = ChatRuntimeControlPresentation.Selection(
-            providerID: selectedProviderId,
-            model: selectedModel,
-            reasoningEffort: selectedReasoningEffort,
-            fastMode: enabled
-        )
-        let myGeneration = beginSurfaceSelectionUpdate()
+        let providerID = selectedProviderId
+        let model = selectedModel
+        let effort = selectedReasoningEffort
         Task {
             do {
-                let receipt = try await sync.configureSurfaceSelection(
-                    surface: "ios",
-                    providerId: requested.providerID,
-                    model: requested.model,
-                    reasoningEffort: requested.reasoningEffort,
-                    serviceTier: requested.fastMode ? "priority" : "default"
+                try await sync.configureSurfaceSelection(
+                    surface: "ios", providerId: providerID, model: model,
+                    reasoningEffort: effort, serviceTier: enabled ? "priority" : "default"
                 )
-                adoptCanonicalSurfaceSelection(receipt, requestGeneration: myGeneration)
             } catch {
-                finishSurfaceSelectionFailure(requestGeneration: myGeneration)
-                if let restored = ChatRuntimeControlPresentation.rollback(
-                    currentGeneration: surfaceSelectionGeneration,
-                    requestGeneration: myGeneration,
-                    previous: previous
-                ) {
-                    selectedProviderId = restored.providerID
-                    selectedModel = restored.model
-                    selectedReasoningEffort = restored.reasoningEffort
-                    selectedFastMode = restored.fastMode
-                }
                 iOSSystemToastCenter.shared.push(
                     error: "Couldn't change processing mode: \(error.localizedDescription)"
                 )
             }
         }
-    }
-
-    private func seedProviderIfNeeded() {
-        adoptSurfaceModelPreferenceFromSync()
-    }
-
-    /// The phone holds no model of its own. Anything in local storage that the
-    /// Mac has not just told us about is a leftover from a build that did, and it
-    /// goes before a turn can carry it. Runs once per install generation.
-    private func clearLegacyLocalModelStateIfNeeded() {
-        if !hasHydratedModelFromMac, sync.surfaceModels["ios"] == nil, !selectedModel.isEmpty {
-            selectedModel = ""
-            selectedProviderId = ""
-        }
-    }
-
-    private func adoptSurfaceModelPreferenceFromSync() {
-        guard let preference = sync.surfaceModels["ios"] else { return }
-        let resolution = ChatSurfaceModelPreferenceAdoption.resolve(
-            current: .init(
-                providerID: selectedProviderId,
-                model: selectedModel,
-                reasoningEffort: selectedReasoningEffort,
-                fastMode: selectedFastMode
-            ),
-            preference: preference,
-            awaitingAcknowledgement: surfaceSelectionAwaitingSync,
-            selectableProviderIDs: Set(selectableProviders.map(\.provider_id))
-        )
-        surfaceSelectionAwaitingSync = resolution.awaitingAcknowledgement
-        hasHydratedModelFromMac = true
-        guard resolution.selection != .init(
-            providerID: selectedProviderId,
-            model: selectedModel,
-            reasoningEffort: selectedReasoningEffort,
-            fastMode: selectedFastMode
-        ) else { return }
-        selectedProviderId = resolution.selection.providerID
-        selectedModel = resolution.selection.model
-        selectedReasoningEffort = resolution.selection.reasoningEffort
-        selectedFastMode = resolution.selection.fastMode
-    }
-
-    private func beginSurfaceSelectionUpdate() -> Int {
-        surfaceSelectionGeneration += 1
-        surfaceSelectionAwaitingSync = true
-        return surfaceSelectionGeneration
-    }
-
-    private func adoptCanonicalSurfaceSelection(_ receipt: MobileSurfaceSelectionReceipt, requestGeneration: Int) {
-        guard let selection = ChatRuntimeControlPresentation.acceptReceipt(
-            receipt, defaults: .standard, requestGeneration: requestGeneration
-        ) else { return }
-        selectedProviderId = selection.providerID
-        selectedModel = selection.model
-        selectedReasoningEffort = selection.reasoningEffort
-        selectedFastMode = selection.fastMode
-        // Keep stale projections fenced until this exact canonical tuple is
-        // observed. The matching snapshot may already have arrived mid-await.
-        hasHydratedModelFromMac = true
-        surfaceSelectionAwaitingSync = true
-        adoptSurfaceModelPreferenceFromSync()
-    }
-
-    private func finishSurfaceSelectionFailure(requestGeneration: Int) {
-        guard surfaceSelectionGeneration == requestGeneration else { return }
-        surfaceSelectionAwaitingSync = false
     }
 
     private var reasoningOptions: [(id: String, label: String)] {
@@ -1668,8 +1514,7 @@ struct ChatView: View {
         guard sessionID != store.selectedSessionID else { return }
         store.switchSession(
             to: sessionID,
-            using: bridgeClient,
-            fallbackMessages: snapshotMessages(for: sessionID)
+            using: bridgeClient
         )
     }
 
@@ -1688,26 +1533,12 @@ struct ChatView: View {
               }),
               let anchorID = sync.chatAnchor?.cleanSessionId,
               sync.sessions.contains(where: { $0.id == anchorID && $0.archived != true }) else { return }
-        store.replaceMainSessionID(anchorID)
         guard !MobileChatSelectionIntent.userChoseThisLaunch,
               store.selectedSessionID != anchorID else { return }
         if isInitialBinding {
             store.migrateQueuedSends(from: nil, to: anchorID)
         }
-        store.switchSession(to: anchorID, using: bridgeClient,
-                            fallbackMessages: snapshotMessages(for: anchorID))
-    }
-
-    /// Rows to show while a real read is in flight. 2026-09-06: still nil for an
-    /// empty transcript — this is a fallback provider, and only the store's
-    /// apply path is allowed to treat an empty publication as authority.
-    private func snapshotMessages(for sessionID: String?) -> [ChatMessage]? {
-        let mapped = sync.transcriptRead(for: sessionID).messages
-        return mapped.isEmpty ? nil : mapped
-    }
-
-    private func currentSnapshotMessages() -> [ChatMessage]? {
-        snapshotMessages(for: store.selectedSessionID ?? effectiveMainSessionID)
+        store.switchSession(to: anchorID, using: bridgeClient)
     }
 
     private func reconcilePublishedChatSessions() {
@@ -1719,9 +1550,7 @@ struct ChatView: View {
     }
 
     private func applyPublishedTranscriptToVisibleSession() {
-        // 2026-09-06: hand the store the read itself. The empty case used to be
-        // dropped here, so a chat cleared on the Mac published its empty
-        // transcript and the phone silently ignored it.
+        // Ingestion already updated the shared rows; settle the pending exchange.
         let sessionID = store.selectedSessionID ?? effectiveMainSessionID
         store.applyMacTranscriptRead(sync.transcriptRead(for: sessionID), sessionID: sessionID)
     }
@@ -1735,8 +1564,7 @@ struct ChatView: View {
             explicitlySelectedSessionID: MobileChatSelectionIntent.notifiedSessionID
         ) else { return }
         store.switchToMainSession(
-            using: bridgeClient,
-            fallbackMessages: snapshotMessages(for: effectiveMainSessionID)
+            using: bridgeClient
         )
     }
 
@@ -1753,11 +1581,11 @@ struct ChatView: View {
         case .main:
             MobileChatSelectionIntent.followMain()
             adoptMainSessionFromSnapshots()
-            store.switchToMainSession(using: bridgeClient, fallbackMessages: snapshotMessages(for: tab.sessionID ?? effectiveMainSessionID))
+            store.switchToMainSession(using: bridgeClient)
         case .pinned, .anchor:
             guard let sessionID = tab.sessionID else { return }
             MobileChatSelectionIntent.noteNotifiedSelection(sessionID)
-            store.switchSession(to: sessionID, using: bridgeClient, fallbackMessages: snapshotMessages(for: sessionID))
+            store.switchSession(to: sessionID, using: bridgeClient)
         }
     }
 
@@ -1774,21 +1602,13 @@ struct ChatView: View {
                     // resends, and closing a tab twice is harmless.
                     _ = try await sync.unpinChatSession(sessionId: sessionID)
                 }
-                // The Mac response is the authority receipt. Remove the
-                // mirrored row immediately; the snapshot/KVS write performed
-                // before that response will then converge the durable mirror.
-                // 2026-09-06: this is a write of the session-list state, so it
-                // invalidates the reads already in flight — otherwise a
-                // session-list read that started before the unpin completes
-                // after it and puts the closed tab straight back.
-                sync.chatSessionListRefreshGeneration &+= 1
-                sync.pinnedChatSessions.removeAll { $0.id == sessionID }
+                // Render the navigation published by the Mac owner after its receipt.
+                await sync.refreshChatSessionListSnapshot()
                 if store.selectedSessionID == sessionID {
                     MobileChatSelectionIntent.followMain()
                     adoptMainSessionFromSnapshots()
                     store.switchToMainSession(
-                        using: bridgeClient,
-                        fallbackMessages: snapshotMessages(for: effectiveMainSessionID)
+                        using: bridgeClient
                     )
                 }
             } catch SyncError.timeout {
@@ -1799,17 +1619,6 @@ struct ChatView: View {
                 store.errorBanner = "Couldn't close that tab — try again."
             }
         }
-    }
-
-    private func providerId(for modelId: String) -> String {
-        let activeChatProvider = sync.trustPolicy?.providerPolicy?.activePerSurface?["ios"]
-            ?? sync.trustPolicy?.providerPolicy?.activePerSurface?["chat"]
-        return ChatRuntimeControlPresentation.providerID(
-            selectedProviderID: selectedProviderId,
-            activeProviderID: activeChatProvider,
-            model: modelId,
-            providers: sync.providers
-        )
     }
 
     private func reasoningLabel(_ id: String) -> String {
@@ -1876,8 +1685,7 @@ struct ChatView: View {
                 ForEach(historySessions.prefix(historyLimit)) { session in
                     Button {
                         MobileChatSelectionIntent.noteNotifiedSelection(session.id)
-                        store.switchSession(to: session.id, using: bridgeClient,
-                                            fallbackMessages: snapshotMessages(for: session.id))
+                        store.switchSession(to: session.id, using: bridgeClient)
                     } label: {
                         if session.id == store.selectedSessionID {
                             Label(session.displayTitle, systemImage: "checkmark")
@@ -2077,13 +1885,7 @@ struct ChatView: View {
 
 
     private func importSharedItems() {
-        rememberShareAgentName()
         store.importSharedItems(controls: runtimeControls)
-    }
-
-    private func rememberShareAgentName() {
-        do { try SharedChatInbox.rememberAgentName(agentDisplayName) }
-        catch { store.errorBanner = "Sharing is unavailable: \(error.localizedDescription)" }
     }
 
     private func scheduleScrollToBottom(
@@ -2094,9 +1896,10 @@ struct ChatView: View {
     ) {
         guard !visibleMessages.isEmpty else { return }
         guard force || autoFollowChat else { return }
-        guard let targetID = visibleMessages.last?.id else { return }
+        guard let lastMessage = visibleMessages.last else { return }
+        let targetID = otherRoomRows[""]?.last.map { "other-room:" + $0.id } ?? lastMessage.id.uuidString
         guard let serial = scrollScheduler.schedule(
-            targetID: targetID.uuidString,
+            targetID: targetID,
             animated: animated,
             force: force
         ) else { return }

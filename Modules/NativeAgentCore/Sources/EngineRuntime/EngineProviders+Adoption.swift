@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import ProviderRouting
+// Blueprint: | `EngineProviders+Adoption.swift` | Blank-surface adoption delegates to the routing transaction and publishes its committed snapshot through LatestRead.write; serialized chat-brain saves retain pending edits, while canonical selection derives from ProvidersFacade.settings. |
 
 extension ProvidersFacade {
     /// After a provider is connected (especially the FIRST one, at onboarding),
@@ -18,7 +19,7 @@ extension ProvidersFacade {
     public func adoptProviderForBlankSurfaces(
         _ providerId: String, dataRoot: URL,
         failure: (Error, String) -> Void,
-        clearOverride: (String) async throws -> Void
+        clearOverride _: (String) async throws -> Void
     ) async -> Bool {
         let available: Set<String> = Set(
             ((try? await list()) ?? [])
@@ -28,41 +29,21 @@ extension ProvidersFacade {
         // Never point surfaces at a provider that isn't actually ready (e.g. a
         // connect that didn't fully land) — that would break routing.
         guard available.contains(providerId) else { return false }
-        // Current per-surface assignments from the SOURCE OF TRUTH (active.json
-        // on disk), not the possibly-stale trust snapshot — so we never overwrite
-        // a surface that active.json already pins to a valid connected provider.
-        //
-        // 2026-09-13 review: the SAVED assignments, never the resolved snapshot.
-        // Resolution fills Chat in from the sole connected account, so right
-        // after the first sign-in this read said "a choice is already saved" and
-        // adoption wrote nothing. Connecting a second account then removed the
-        // sole-account answer, adoption saw a blank Chat and adopted the SECOND
-        // account plus its default model — Chat, and every group inheriting it,
-        // switched without anyone touching the picker.
+        // Saved assignments (without sole-account resolution) are re-read
+        // inside the picker's transaction. No stale per-surface clear follows.
         let routing = SwiftNativeProviderRouting(
             dataRoot: dataRoot
         )
-        let current: [String: String]
         do {
-            current = try await routing.savedActiveProvidersChecked()
-        } catch {
-            failure(error, "read your providers")
-            return false
-        }
-        let chatAssignment = (current["chat"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if chatAssignment.isEmpty || !available.contains(chatAssignment) {
-            // Sign-in connects an account. The picker alone selects its model.
-            do { try await self.routing.setActiveProvider(surface: "chat", providerId: providerId) }
-            catch { failure(error, "select the connected account") }
-        }
-        // Anything else that is blank already follows Chat. Anything pointing at
-        // a provider that is not connected is a leftover, not a choice: clear it
-        // so it follows Chat as well.
-        for surface in MODEL_SURFACES where surface != "chat" {
-            let cur = (current[surface] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !cur.isEmpty, !available.contains(cur) {
-                try? await clearOverride(surface)
+            let result = try await routing.adoptConnectedProvider(providerId)
+            try publishCommittedRouting(result.snapshot)
+            await refreshSessionsAfterRoutingWrite()
+            if result.surfacesChanged.contains("cognition_reflection") {
+                await NativeAgentEngine.liveCognition.refreshConfiguration()
             }
+        } catch {
+            failure(error, "select the connected account")
+            return false
         }
         return true
     }
@@ -100,10 +81,7 @@ extension ProvidersFacade {
                 return completed.result
             }
         }
-        return .failed(
-            message: "save coordinator stopped before producing a canonical result",
-            rolledBackTo: chatBrainCanonicalSelection
-        )
+        return .failed(message: "save coordinator stopped before producing a canonical result")
     }
 
     private func drainChatBrainSaves(
@@ -116,10 +94,8 @@ extension ProvidersFacade {
         }
         while let pending = chatBrainPendingSave {
             chatBrainPendingSave = nil
-            let rollback = await canonicalChatBrainForRollback()
             do {
                 let selection = try await writeChatBrainSelection(pending.selection)
-                chatBrainCanonicalSelection = selection
                 // Newer optimistic fields belong to the pending edit.
                 if chatBrainPendingSave != nil { continue }
                 let result = ChatBrainSaveResult.saved(selection)
@@ -127,23 +103,14 @@ extension ProvidersFacade {
                 completion(result, nil)
             } catch {
                 if chatBrainPendingSave != nil { continue }
-                let canonical = (try? await readCanonicalChatBrainSelection()) ?? rollback
-                if let canonical { chatBrainCanonicalSelection = canonical }
+                _ = await refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
                 let result = ChatBrainSaveResult.failed(
-                    message: failure(error), rolledBackTo: canonical,
-                    cause: error.localizedDescription
+                    message: failure(error), cause: error.localizedDescription
                 )
                 chatBrainLastSaveResult = (pending.generation, result)
                 completion(result, error)
             }
         }
-    }
-
-    private func canonicalChatBrainForRollback() async -> ChatBrainSelection? {
-        if let chatBrainCanonicalSelection { return chatBrainCanonicalSelection }
-        let canonical = try? await readCanonicalChatBrainSelection()
-        if let canonical { chatBrainCanonicalSelection = canonical }
-        return canonical
     }
 
     private func writeChatBrainSelection(_ selection: ChatBrainSelection) async throws -> ChatBrainSelection {
@@ -152,7 +119,7 @@ extension ProvidersFacade {
             reasoningEffort: selection.reasoningEffort,
             serviceTier: selection.fastMode ? "priority" : "default", providerID: nil
         )
-        self.catalog = catalog
+        _ = await refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
         let canonical = catalog.current.chat
         return ChatBrainSelection(
             model: canonical.model, reasoningEffort: canonical.reasoningEffort,
@@ -160,16 +127,6 @@ extension ProvidersFacade {
         )
     }
 
-    private func readCanonicalChatBrainSelection() async throws -> ChatBrainSelection {
-        guard let preference = try await SwiftNativeProviderRouting().computeModelPreferences()["chat"] else {
-            throw NSError(domain: "NativeAgent.ChatBrain", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "canonical chat routing is missing"])
-        }
-        return ChatBrainSelection(
-            model: preference.model, reasoningEffort: preference.reasoningEffort,
-            fastMode: preference.serviceTier == "priority"
-        )
-    }
 }
 
 extension ProvidersFacade {
@@ -214,13 +171,12 @@ extension ProvidersFacade {
 extension ProvidersFacade {
     public func saveConnection(
         _ providerID: String, apiKey: String?, authMode: String, defaultModel: String,
-        didSave: () -> Void, readback: ([ProviderInfo]) -> Void,
+        didSave: () -> Void,
         refreshProviders: () async -> Void, failure: (Error, String) -> Void,
         clearOverride: (String) async throws -> Void
     ) async throws {
         try await configureProvider(id: providerID, apiKey: apiKey, authMode: authMode, defaultModel: defaultModel)
         didSave()
-        readback(try await list())
         await refreshProviders()
         if await adoptProviderForBlankSurfaces(
             providerID, dataRoot: dataRoot, failure: failure, clearOverride: clearOverride

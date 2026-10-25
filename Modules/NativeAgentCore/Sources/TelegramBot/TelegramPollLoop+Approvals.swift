@@ -2,6 +2,7 @@ import Foundation
 import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TelegramPollLoop+Approvals.swift` | `TelegramPollLoop`; approval commands/callbacks use ApprovalInbox's life-bound continuation; the unstamped legacy continuation importer and its duplicate record are deleted |
 
 extension TelegramPollLoop {
     func handleApprovalSlashCommand(
@@ -27,11 +28,7 @@ extension TelegramPollLoop {
                 chatId: message.chatId,
                 fromUserId: message.fromUserId
             )
-            // 2026-09-06: `/approve <id>` may be typed in any topic of the
-            // supergroup, but the interrupted turn lives in the topic the
-            // approval was raised in. The continuation, its card and its reply
-            // go there; the acknowledgement for the typed command stays where
-            // the command was typed, so the person who typed it sees an answer.
+            // The reply returns to its recorded topic; acknowledge the command here.
             let continuationDestination = resolution.destination ?? message.destination
             if let prompt = resolution.continuationPrompt {
                 if continuationDestination != message.destination {
@@ -76,7 +73,7 @@ extension TelegramPollLoop {
             // claim after its command finishes.
             await Task {
                 do {
-                    _ = try await TelegramUpdateInbox(offsetURL: offsetURL).transition(
+                    _ = try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).transition(
                         updateId: update.updateId, from: [.processing, .queued], to: .completed
                     )
                 } catch {
@@ -88,7 +85,7 @@ extension TelegramPollLoop {
         if !admitted {
             await Task {
                 do {
-                    _ = try await TelegramUpdateInbox(offsetURL: offsetURL).transition(
+                    _ = try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).transition(
                         updateId: update.updateId, from: [.processing, .queued], to: .pending
                     )
                 } catch {
@@ -102,10 +99,7 @@ extension TelegramPollLoop {
 
     private func resolveApprovalCallback(update: TelegramUpdate, callback: JSONValue) async -> Bool {
         guard let parsed = TelegramApprovalCallback(callback) else { return false }
-        // Fail-closed perimeter, same contract as the message gate (2026-08-13
-        // gpt-5.5 BLOCKING: with an empty allowlist a stale/forged approval
-        // button could resolve an approval and start a chat continuation while
-        // the front door was supposedly closed).
+        // Approval callbacks obey the same inbound allowlist as messages.
         let hasAllowlist = !allowedChatIds.isEmpty || !allowedUserIds.isEmpty
         guard hasAllowlist else {
             await recordBlocked(reason: "allowlist_empty_fail_closed", update: update, message: nil, text: nil)
@@ -228,15 +222,8 @@ extension TelegramPollLoop {
     }
 
 
-    /// Resume the exact Telegram conversation whose non-blocking approval just
-    /// completed. The prompt is internal (`suppressUserAppend`) and carries the
-    /// redacted replay result, so the assistant can finish the interrupted
-    /// request without fabricating a second user message or rerunning the tool.
-    ///
-    /// 2026-09-06: the hand-off is durable. The record below is written BEFORE
-    /// the turn is admitted and completed only once the continuation has been
-    /// answered, so a restart in between resumes it instead of leaving the
-    /// sender with a tool that ran and an answer that never came.
+    /// Report the approval's retained result to its exact conversation, without
+    /// another user message or tool replay. ApprovalInbox owns admission and life.
     private func deliverApprovalContinuation(
         approvalId: String,
         prompt: String,
@@ -264,12 +251,7 @@ extension TelegramPollLoop {
         do {
             guard try await approvalInbox.queueChatContinuation(approvalId, delivery: pending.toJSON()) else { return }
         } catch {
-            // 2026-09-06: a continuation that cannot be recorded is REFUSED.
-            // The tool behind this approval has already run, and the whole
-            // point of the record is to say whether its turn started; running
-            // without it means a restart in the wrong moment either replays the
-            // tool's effects or reports nothing at all. A refused follow-up
-            // costs the sender a reply it is told about and can ask for again.
+            // Never admit a reporting turn without its durable claim.
             await recordError(
                 context: "approval_continuation_record",
                 error: String(describing: error)
@@ -280,22 +262,11 @@ extension TelegramPollLoop {
         }
         let inbox = approvalInbox
         let operation: @Sendable (UUID) async -> Void = { turnId in
-                // The turn is running: from here a replay could repeat tool
-                // calls, so a restart reports the loss instead of replaying.
-                //
-                // 2026-09-06: that write is the ONLY thing standing between a
-                // restart and a second run of tools that already ran, so its
-                // failure aborts the continuation instead of being swallowed.
-                // The record on disk is still unclaimed; a turn that
-                // ran anyway would be replayed verbatim after a restart.
+                // Mark the reporting turn started before any of its effects.
                 do {
                     guard try await inbox.annotateChatContinuation(approvalId, done: false) else { return }
                 } catch {
-                    // The record is LEFT in place, still unclaimed. That
-                    // is the state a restart replays verbatim, which is safe
-                    // precisely because this turn never ran: the tool's result
-                    // is already inside the prompt. Removing it would throw the
-                    // only remaining route to the answer away.
+                    // Keep the unstarted record for its owner to settle or resume.
                     await recordError(
                         context: "approval_continuation_start_record",
                         error: String(describing: error)
@@ -304,7 +275,7 @@ extension TelegramPollLoop {
                     try? await sendMessage(token, destination, notice)
                     return
                 }
-                let card = makeTurnProgressCard(
+                let card = await makeTurnProgressCard(
                     destination: destination,
                     turnId: turnId,
                     errorContext: "approval_continuation_card",
@@ -401,8 +372,7 @@ extension TelegramPollLoop {
         }
     }
 
-    /// 2026-09-06: await completion before returning, so restart repair cannot
-    /// report a lost answer that was already delivered.
+    /// Delivery settlement completes before returning.
     func finishApprovalContinuation(approvalId: String) async {
         do {
             _ = try await approvalInbox.annotateChatContinuation(approvalId, done: true)
@@ -455,47 +425,9 @@ extension TelegramPollLoop {
         return false
     }
 
-    /// Import before either shared or Telegram recovery scans the inbox, so
-    /// launch ordering cannot hide an owed delivery behind the history cutoff.
-    public static func importLegacyApprovalContinuations(dataRoot: URL, inbox: SwiftNativeApprovalInbox) async throws {
-        let legacyPath = dataRoot.appendingPathComponent("telegram/approval_continuations.json")
-        guard FileManager.default.fileExists(atPath: legacyPath.path) else { return }
-        let legacy = try JSONDecoder().decode(
-            TelegramLegacyApprovalContinuations.self, from: Data(contentsOf: legacyPath))
-        guard legacy.schemaVersion == 1 else {
-            throw TelegramBotError.underlying("unsupported Telegram approval continuation schema")
-        }
-        for raw in legacy.continuations {
-            let delivery = try JSONDecoder().decode(
-                TelegramPendingApprovalContinuation.self, from: raw.serializedData(pretty: false))
-            guard case .object(let value) = raw, case .bool(let started)? = value["started"] else {
-                throw TelegramBotError.underlying("malformed Telegram approval continuation")
-            }
-            do {
-                _ = try await inbox.queueChatContinuation(delivery.approvalId,
-                    delivery: delivery.toJSON(), alreadyStarted: started, previouslyQueued: true)
-            } catch ApprovalInboxError.notFound(_) {
-                // The legacy file outlives archived approvals; never recreate them.
-                continue
-            }
-        }
-    }
-
-    /// 2026-09-06: once per process, answer for the approval continuations the
-    /// previous process was holding. One that never started is replayed
-    /// verbatim — the tool already ran and its result is inside the prompt, so
-    /// running the turn repeats nothing. One that HAD started may have called
-    /// tools of its own, so it is never replayed: the sender is told what
-    /// happened, which is still better than the silence this used to be.
+    /// Recover only continuations the approval owner retains in this life.
     func replayApprovalContinuationsIfNeeded() async {
         guard await turnCoordinator.claimApprovalRecovery() else { return }
-        do {
-            // 2026-09-18: import the old hand-off without ever resetting a claim.
-            // Leave legacy bytes alone; completed approval markers prevent reimport.
-            try await Self.importLegacyApprovalContinuations(dataRoot: dataRoot, inbox: approvalInbox)
-        } catch {
-            await recordError(context: "approval_continuation_legacy_import", error: String(describing: error))
-        }
         do { try await reconcileSavedReplies() }
         catch { await recordError(context: "approval_answer_recovery", error: String(describing: error)) }
         let records: [(approval: ApprovalRecord, delivery: TelegramPendingApprovalContinuation)]
@@ -555,16 +487,7 @@ extension TelegramPollLoop {
         }
     }
 }
-
-/// One approval continuation that has been admitted but not yet answered.
-///
-/// 2026-09-06: the approval resolution runs the tool FIRST and only then hands
-/// the reply back as a continuation turn. Between those two moments the record
-/// is resolved, so a second `/approve` is refused as "not pending" — a restart
-/// in that window lost the answer to an action that had already happened, with
-/// no way for anyone to ask for it again. This is the durable half of that
-/// hand-off: written before the turn is admitted, marked when it actually
-/// starts, completed when it is answered. The approval owns that state.
+/// The approval's retained Telegram delivery payload; its owner holds the life stamp.
 struct TelegramPendingApprovalContinuation: Sendable, Codable, Equatable {
     let approvalId: String
     let prompt: String
@@ -581,10 +504,4 @@ struct TelegramPendingApprovalContinuation: Sendable, Codable, Equatable {
     var destination: TelegramDestination {
         TelegramDestination(chatId: chatId, threadId: threadId)
     }
-}
-
-/// Read-only compatibility for hand-offs filed before the approval owned them.
-private struct TelegramLegacyApprovalContinuations: Decodable {
-    let schemaVersion: Int
-    let continuations: [JSONValue]
 }

@@ -1,9 +1,12 @@
-import ChatOrchestration
+import ChatToolParsing
 import Dispatcher
 import Foundation
 import PersistenceCore
+// Blueprint: | `AppToolExecutor+PagePresentation.swift` | screenshot results and quiet page/read rendering |
 
 extension AppToolExecutor {
+    /// PNG outputs: excluded from local/off-disk backup, export and phone sync;
+    /// listed in PrivacyMap. The returned path is a live output artifact.
     public static func pageScreenshotResult(
         page: QuietToolPage, tabKey: String, dataRoot: URL,
         rendered: (data: Data, width: Int, height: Int)
@@ -18,7 +21,11 @@ extension AppToolExecutor {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             try rendered.data.write(to: file, options: .atomic)
         } catch {
-            return AppToolExecutor.failure("write_failed", "The picture could not be saved: \(error.localizedDescription)", extra: ["effects": .string("unknown")])
+            var failure = Self.ownedFailure(error, code: "page_image_save_failed", owner: file.path,
+                instruction: "Inspect the output directory and reported storage error; rendering succeeded, but saving was not verified.",
+                next: ["action": .string("files.list"), "args": .object(["path": .string(folder.path)])], effects: .unknown).objectValue ?? [:]
+            failure["attempted_path"] = .string(file.path)
+            return .object(failure)
         }
         do {
             // The current file stays protected until delivery. Inline delivery
@@ -26,8 +33,10 @@ extension AppToolExecutor {
             // already handed to an active model continuation.
             try prunePageShots(in: folder, preserving: file)
         } catch {
-            return AppToolExecutor.failure("retention_failed", "The picture was saved, but diagnostic retention could not finish: \(error.localizedDescription)",
-                                           extra: ["path": .string(file.path), "effects": .string("occurred")])
+            return AppToolExecutor.doorRefusal("page_image_retention_failed", "The PNG was saved, but retention failed: \(error.localizedDescription)",
+                remedy: "inspect", "Use the saved PNG; delivery was not attempted. Inspect the reported retention error before another screenshot.",
+                next: ["action": .string("files.read"), "args": .object(["path": .string(file.path)])],
+                extra: ["path": .string(file.path), "effects": .string("occurred")])
         }
         // A text-only call (the Claude bridge) has no turn to show pixels in:
         // the path comes back instead.
@@ -43,7 +52,17 @@ extension AppToolExecutor {
             rendered.data, name: "\(page.id).png",
             width: rendered.width, height: rendered.height
         ) else {
-            return AppToolExecutor.failure("image_delivery_failed", "The picture could not be handed to the model.", extra: ["effects": .string("occurred")])
+            return AppToolExecutor.doorRefusal("page_image_delivery_failed", "The PNG was saved; delivery to the model was not verified.",
+                remedy: "inspect", "Read the saved PNG; do not render another copy to recover delivery.",
+                next: ["action": .string("files.read"), "args": .object(["path": .string(file.path)])],
+                extra: ["path": .string(file.path), "effects": .string("occurred")])
+        }
+        if !ChatToolOutcome.outputLooksSuccessful(.object(delivery)) {
+            delivery["reason"] = .string("page_image_delivery_failed")
+            delivery["effects"] = .string("occurred")
+            delivery["remedy"] = Repair.reconcile(instruction: "Read the saved PNG; resolve the reported delivery cause before sending pixels again.",
+                nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("files.read"),
+                    "args": .object(["path": .string(file.path)])])]))
         }
         delivery["page"] = .string(page.id)
         delivery["title"] = .string(page.title)
@@ -92,8 +111,9 @@ extension AppToolExecutor {
             return AppToolExecutor.pageReadResult(page: "agent_view", fields: ["status": .string("ok"), "title": .string("Agent view"), "tabs": tabs])
         }
         guard rooms.contains(room) else {
-            return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("not_found"), "reason": .string("unknown_room"), "detail": .string("The Agent view has no tab called that."),
-                            "requested": .string(room), "tabs": tabs]))
+            return AppToolExecutor.doorRefusal("unknown_room", "The Agent view has no tab called that.",
+                remedy: "read_tabs", "Read the available tabs, then pass one as item on agent_view.",
+                next: ["page": .string("agent_view")], extra: ["requested": .string(room), "tabs": tabs])
         }
         let named = pageInputText(input["session_id"])
         let scope = named.isEmpty ? activeSessionID : named

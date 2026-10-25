@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import NotificationInbox
 import PersistenceCore
+// Blueprint: | `TriggerNotificationInbox.swift` | `TriggerNotificationInbox`: proactive identity matcher, checked locked mirror, `archiveSupersededMorningBriefs` |
 
 /// The host publishes the inbox snapshot through its paired-device transport.
 public protocol TriggerSnapshotDeliveryPort: Sendable {

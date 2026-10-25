@@ -5,6 +5,7 @@ import TrustCenter
 import Dispatcher
 import Browser
 import TrustPersistence
+// Blueprint: | `NativeActionRoutes.swift` | `NativeActionRoutes` enum; `runNativeAction`, `swiftNativeActionRecords`; native receipts use Browser's shared path and appendPathOwnedJSONL retention |
 
 public enum NativeActionRoutes {
     /// `dataRoot` nil keeps the established persona/workspace resolver; only
@@ -153,13 +154,6 @@ public enum NativeActionRoutes {
         swiftNativeActionRecords().first { $0.id == id }
     }
 
-    public static func nativeActionReceiptsPath(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> URL {
-        dataRoot
-            .appendingPathComponent("native_power", isDirectory: true)
-            .appendingPathComponent("actions", isDirectory: true)
-            .appendingPathComponent("receipts.jsonl")
-    }
-
     public static func appendNativeActionReceipt(
         action: NativeActionRecord,
         status: String,
@@ -185,11 +179,9 @@ public enum NativeActionRoutes {
             record["requiresApproval"] = .bool(true)
         }
         let recordValue = JSONValue.object(record)
-        let path = nativeActionReceiptsPath(dataRoot: dataRoot)
+        let path = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot).nativeActionsReceiptsPath
         let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            try await persistence.appendJSONL(recordValue, to: path)
-        }
+        try await appendPathOwnedJSONL(recordValue, to: path, using: persistence, logLabel: "NativeActions.receipts")
         let data = try recordValue.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode(NativeActionReceipt.self, from: data)
     }

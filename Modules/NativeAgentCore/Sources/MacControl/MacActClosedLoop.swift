@@ -4,6 +4,7 @@ import PersistenceCore
 import TrustCenter
 #if canImport(ApplicationServices)
 import ApplicationServices
+// Blueprint: | `MacActClosedLoop.swift` | `MacActClosedLoop.verify` owns the declared-effect verdict for semantic, menu and physical act receipts: exact complete AXValue, selection range, selected/state/focus, owned window/sheet creation, confirmed removal or process exit and AX surface transitions; pixels are witnesses only; readable mismatches are `acted_mismatch`, unavailable readback (including canonically masked text values) is `acted_unobserved` |
 #endif
 
 // MARK: - THE CLOSED LOOP (native-look item 3)
@@ -396,12 +397,7 @@ public enum MacActClosedLoop {
         guard active else { return nil }
         return SecureInputRefusal(
             reason: secureInputReason,
-            note: "Something on this Mac has secure keyboard entry on — my typing would go "
-                + "nowhere. macOS routes keystrokes past every synthetic source while that is "
-                + "true, so I did not post anything rather than posting into a void and calling "
-                + "the unchanged screen a mystery. It is usually a focused password field, a "
-                + "`sudo` prompt in Terminal, or a password manager window. Dismiss or unfocus "
-                + "that, and ask me again."
+            note: "Secure keyboard entry blocks synthetic typing; nothing was posted. Dismiss or unfocus its source, often a password field, Terminal sudo prompt or password manager, before continuing."
         )
     }
 
@@ -492,7 +488,7 @@ public enum MacActClosedLoop {
                 note: "this frame was captured from pid \(framePid) but \(who) is frontmost now. A "
                     + "synthesized key or mouse event is delivered to the KEY window, so it would have "
                     + "landed in \(who), not in the window you looked at — nothing was posted and "
-                    + "nothing was selected. Bring that window to the front and call mac_look again."
+                    + "nothing was selected. Bring that window to the front and call mac.look again."
             )
         }
         // Right app, wrong window of it. Asserted ONLY when both handles are
@@ -1323,186 +1319,139 @@ public enum MacActClosedLoop {
             self.reason = reason
             self.note = note
         }
-    }
 
-    /// `ok`/`performed` say the event went out. THIS says whether anything was
-    /// seen to happen — and for a navigation verb, whether what was seen is
-    /// evidence of navigation.
-    ///
-    /// `diff` is the post-act percept diff, or `nil` when there was no post-act
-    /// read to compare against (the window closed under the act, the app quit,
-    /// the anchor drifted). A `nil` diff is NOT counted as "no navigation": the
-    /// frame dying is itself a transition, and those paths already name
-    /// themselves in `effect.percept`.
-    ///
-    /// The evidence it consults is `diff.navigated` — STRUCTURAL change only.
-    /// It excludes the added/removed CENSUS whenever the two compiles were not
-    /// comparable, and excludes readouts, focus and affordance-value changes
-    /// entirely, because Agent round 6 proved each of those can move while the
-    /// surface goes nowhere.
-    /// Did the field end up carrying the edit we asked for?
-    ///
-    /// `nil` = NOT CHECKABLE (no text to look for, or the control would not
-    /// read its value back — a secure field returns bullets or nothing). Not
-    /// checkable is not success, and the caller says so rather than falling
-    /// back to "a notification fired".
-    public static func editLandedInField(
-        typed: String?,
-        valueBefore: String?,
-        valueAfter: String?
-    ) -> Bool? {
-        guard let typed, !typed.isEmpty else { return nil }
-        guard let valueAfter, !valueAfter.isEmpty else { return nil }
-        // The field reads exactly what was typed: that is the edit, even when
-        // it retyped the same text (a replace of "hello.txt" with itself).
-        if valueAfter == typed { return true }
-        // `contains`, not `==`: replace mode leaves exactly the text, append
-        // mode leaves it at the end of what was already there. Both are the
-        // edit landing.
-        guard valueAfter.contains(typed) else { return false }
-        // gpt-5.5 round-7 BLOCKING (and its follow-up): `contains` alone
-        // promotes STALE content — a pre-existing occurrence of the text
-        // satisfies it while the field goes untouched, or while the value
-        // changes SOMEWHERE ELSE. When the pre-act value is known, the edit
-        // landed only if the read-back carries MORE occurrences of the text
-        // than the field started with — replace and append both add one.
-        // (The case this refuses wrongly — replace-mode retyping the field's
-        // exact current text — is indistinguishable from an inert field from
-        // here, and a conservative refusal is the contract.) A nil
-        // `valueBefore` (the view refused AXValue pre-act) leaves `contains`
-        // as the best available evidence rather than manufacturing a refusal.
-        // Residual, documented: a drift ADDING the text between resolve-time
-        // read and keystroke still over-credits; closing it needs an
-        // immediately-pre-keystroke read seam.
-        guard let valueBefore else { return true }
-        func occurrences(in text: String) -> Int {
-            var n = 0
-            var searchFrom = text.startIndex
-            while let r = text.range(of: typed, range: searchFrom..<text.endIndex) {
-                n += 1
-                searchFrom = r.upperBound
-            }
-            return n
+        var receipt: [String: JSONValue] {
+            ["status": .string(status), "verified": .bool(status == "acted"),
+             "status_reason": reason.map(JSONValue.string) ?? .null,
+             "status_note": note.map(JSONValue.string) ?? .null,
+             "verification_evidence": status == "acted" ? note.map(JSONValue.string) ?? .null : .null,
+             "verification_scope": .string("declared_effect")]
         }
-        return occurrences(in: valueAfter) > occurrences(in: valueBefore)
     }
 
-    public static func classify(
-        performedOK: Bool,
-        verb: MacActVerb,
-        notificationObserved: Bool,
-        diff: EffectDiff?,
-        /// The label/content identity of the element the verb NAMED, for
-        /// destination matching. Nil ⇒ intent unchecked, structural floor only.
-        intendedTarget: String? = nil,
-        intendedTargetJSON: JSONValue? = nil,
-        windowTitleJSON: JSONValue? = nil,
-        /// `type` only: the text the caller asked to land, the acted element's
-        /// value BEFORE the act, and what it reads AFTER. Never echoed into
-        /// any payload.
-        typedText: String? = nil,
-        valueBefore: String? = nil,
-        valueAfter: String? = nil
+    /// The act declares its effect before input. All routes use this judge;
+    /// pixels and notification counts alone cannot satisfy a declaration.
+    enum DeclaredEffect {
+        case text(String?)
+        case selectAll
+        case selected
+        case state(String?)
+        case focus
+        case surface(String?)
+        case dismissed
+        case scroll
+        case pointer
+    }
+
+    static func verify(
+        _ effect: DeclaredEffect,
+        value: String? = nil, selection: NSRange? = nil,
+        selected: Bool? = nil, focused: Bool? = nil,
+        surfaceChanged: Bool? = nil, dismissed: Bool? = nil, processGone: Bool = false,
+        diff: EffectDiff? = nil, notifications: [String] = [],
+        pointerOnTarget: Bool? = nil, redactingText: Bool = false,
+        press: (before: MacLookFrame, target: MacLookFrameEntry)? = nil,
+        destinationJSON: JSONValue? = nil, windowTitleJSON: JSONValue? = nil
     ) -> ActClassification {
-        guard performedOK else { return ActClassification(status: "failed") }
-        // A successful readback is evidence even when the app omitted an AX
-        // notification. Notifications trigger observation; they do not veto it.
-        let editVerified = verb == .type && editLandedInField(typed: typedText, valueBefore: valueBefore, valueAfter: valueAfter) == true
-        guard notificationObserved || diff?.windowChanged == true || editVerified else {
-            return ActClassification(
-                status: "acted_unobserved",
-                reason: "none_observed",
-                note: "the event was delivered and the app published nothing inside wait_ms — "
-                    + "that is an answer, not a failure; look again if you expected a change"
-            )
-        }
-        // VERB-SEMANTIC SUCCESS (Agent's bird's-eye, 2026-08-22): the predicate
-        // is what the VERB means, never "some delta appeared". `type` succeeds
-        // when the intended field carries the intended edit — a notification, a
-        // readout moving, or focus shifting are supporting evidence at best.
-        // Only when the caller actually told us what it tried to type. With no
-        // intended edit there is nothing semantic to check, and the pre-existing
-        // licensing stands rather than a manufactured failure.
-        if verb == .type, let typedText, !typedText.isEmpty {
-            switch editLandedInField(
-                typed: typedText, valueBefore: valueBefore, valueAfter: valueAfter
-            ) {
-            case .some(true):
-                return ActClassification(status: "acted")
-            case .some(false):
-                return ActClassification(
-                    status: "acted_unobserved",
-                    reason: "edit_not_in_field",
-                    note: "the keystrokes were delivered and the app reacted, but the field does "
-                        + "not read back what was typed as a NEW edit — the text may have gone "
-                        + "somewhere else, been rejected or transformed, or the field already "
-                        + "read exactly this and did not change. mac_look before typing again"
-                )
-            case .none:
-                // Unreadable value (a secure field reads back bullets or
-                // nothing). Say that plainly instead of scoring the act on a
-                // notification that proves only that something happened.
-                return ActClassification(
-                    status: "acted_unobserved",
-                    reason: "edit_unverifiable",
-                    note: "the keystrokes were delivered, but this control does not read its value "
-                        + "back, so whether the edit landed cannot be confirmed from here — that is "
-                        + "normal for a secure field. Confirm visually if it matters"
-                )
+        let matches: Bool?
+        let readback: String
+        var mismatch = "The declared effect differs from the target's accessibility state."
+        switch effect {
+        case .text(let expected):
+            readback = "The complete AXValue matches the declared edit."
+            // Canonical field masking makes the complete text unavailable,
+            // including short masked values and fields with no secure subrole.
+            guard let expected, let value,
+                  !MacScreenViewBuilder.isSecretField(role: "AXTextField", subrole: nil, label: nil, value: value) else {
+                return ActClassification(status: "acted_unobserved", reason: "effect_unreadable",
+                    note: "The input went out, but the complete text value could not be read back.")
             }
+            matches = value == expected
+            if matches == false {
+                let offset = zip(expected.utf16, value.utf16).prefix { $0 == $1 }.count
+                func excerpt(_ text: String) -> String {
+                    if redactingText { return "[redacted]" }
+                    if case .object = MacScreenViewTextRedaction.redactedLegendString(
+                        text, valueChars: MacAXLimits.hardValueChars) { return "[redacted]" }
+                    let tail = String(decoding: Array(text.utf16.dropFirst(max(0, offset - 1)).prefix(40)), as: UTF16.self)
+                    return receiptText(tail) ?? ""
+                }
+                return ActClassification(status: "acted_mismatch", reason: "text_mismatch",
+                    note: "AXValue differs at UTF-16 offset \(offset): expected \"\(excerpt(expected))\", read \"\(excerpt(value))\" (expected length \(expected.utf16.count), read length \(value.utf16.count)).")
+            }
+        case .selectAll:
+            readback = "AXSelectedTextRange covers the complete AXValue."
+            matches = value.flatMap { value in selection.map { $0 == NSRange(location: 0, length: value.utf16.count) } }
+            if matches == false, let selection, let value {
+                return ActClassification(status: "acted_mismatch", reason: "selection_mismatch",
+                    note: "AXSelectedTextRange is \(selection.location):\(selection.length); expected 0:\(value.utf16.count).")
+            }
+        case .selected:
+            readback = "The target reads AXSelected:true."
+            matches = selected
+            if selected == false {
+                return ActClassification(status: "acted_mismatch", reason: "selection_mismatch",
+                    note: "The target reads AXSelected:false; expected true.")
+            }
+        case .state(let expected):
+            readback = "The target's AXValue matches the declared state."
+            matches = expected.flatMap { expected in value.map { $0 == expected } }
+            if matches == false, let expected, let value {
+                return ActClassification(status: "acted_mismatch", reason: "state_mismatch",
+                    note: "AXValue reads \"\(receiptText(value) ?? "")\"; expected \"\(receiptText(expected) ?? "")\".")
+            }
+        case .focus:
+            readback = "The target owns accessibility focus in its process and window."
+            mismatch = "The target does not own accessibility focus in its process and window."
+            matches = focused
+        case .surface(let destination):
+            let windowCreated = notifications.contains("AXWindowCreated")
+            let sheetCreated = notifications.contains("AXSheetCreated")
+            readback = processGone ? "The target app is no longer running."
+                : sheetCreated && surfaceChanged == true ? "A sheet opened in the target app."
+                : windowCreated && surfaceChanged == true ? "A window opened in the target app."
+                : dismissed == true || diff?.modalDisappeared == true
+                    ? "The target window or modal is no longer present in its process."
+                : diff?.modalAppeared == true ? "A modal appeared in the target app."
+                : "The target's accessibility surface changed."
+            mismatch = "The target's AX surface is unchanged; a surface transition was expected."
+            // Notifications wake the read; only the owning process's window
+            // inventory or its modal readback establishes the declared effect.
+            if processGone || dismissed == true || diff?.modalDisappeared == true
+                || surfaceChanged == true || diff?.modalAppeared == true {
+                matches = true
+            } else if let diff {
+                if diff.windowTitleChanged, let destination,
+                   destinationMatchesIntent(title: diff.windowTitleAfter, intendedTarget: destination) == false {
+                    return ActClassification(status: "acted_mismatch", reason: "destination_mismatch",
+                        note: "The window reads \"\(receiptText(diff.windowTitleAfter, redacted: windowTitleJSON) ?? "")\"; expected destination \"\(receiptText(destination, redacted: destinationJSON) ?? "")\".")
+                }
+                let moved = press.map { pressEvidence(diff, before: $0.before, pressed: $0.target, clicked: true).consequence }
+                    ?? diff.navigated
+                matches = moved ? true : diff.diffComparable ? false : nil
+            } else { matches = surfaceChanged }
+        case .dismissed:
+            readback = "The target window or modal is no longer present in its process."
+            mismatch = "The target window or modal is still present; dismissal was expected."
+            matches = processGone || dismissed == true || diff?.modalDisappeared == true
+                ? true : dismissed ?? diff.map { $0.modalDisappeared }
+        case .scroll:
+            readback = "The target's accessibility scroll state changed."
+            mismatch = "AXScrollBar reads the same value; a scroll position change was expected."
+            matches = diff?.changed.first { $0.role == "AXScrollBar" }.flatMap { row in
+                row.beforeValue.flatMap { before in row.afterValue.map { $0 != before } }
+            }
+        case .pointer:
+            readback = "The system pointer is inside the target's freshly observed bounds."
+            mismatch = "The system pointer is outside the target's freshly observed bounds."
+            matches = pointerOnTarget
         }
-        // NOT reached for a nil diff: that is the window-died path
-        // (frame_window_gone / frame_app_gone / window_drifted), where the frame
-        // dying IS a transition and `effect.percept` already names which one.
-        guard navigationVerbs.contains(verb), let diff else {
-            return ActClassification(status: "acted")
-        }
-        // STRUCTURAL evidence only — see `EffectDiff.navigated`. The round-5
-        // cut asked for `windowChanged`, which counts every channel, and Agent
-        // round 6 licensed a false `acted` off one noisy readout.
-        guard diff.navigated else {
-            // A notification fired and NOT ONE compiled channel moved: no title
-            // change, no focus change, no modal, no readout, no identity-keyed
-            // affordance change. The app twitched; it did not go anywhere.
-            let census = diff.diffComparable
-                ? ""
-                : " The added/removed affordance census was not comparable"
-                    + (diff.diffIncomparableReason.map { " (\($0))" } ?? "")
-                    + ", so it was not counted as evidence."
-            return ActClassification(
-                status: "acted_unobserved",
-                reason: "navigation_unverified",
-                note: "\(verb.rawValue) was delivered and the app published a notification, but "
-                    + "nothing STRUCTURAL moved — same window title, no modal, no comparable "
-                    + "affordance turnover — so there is no evidence it navigated. A readout or a "
-                    + "selection changing is the app reacting, not the app going somewhere.\(census) "
-                    + "Two things look like this and "
-                    + "the closed loop cannot tell them apart, because it re-reads the window you "
-                    + "looked at: the open did nothing, or it landed somewhere this window cannot "
-                    + "see (a new window, another app). Either way you are not where you asked to "
-                    + "be as far as this frame knows — mac_look to find out which"
-            )
-        }
-        // INTENT MATCH (Agent's bird's-eye, round 6): a navigation verb NAMES a
-        // destination, so "something structural changed" is the floor, not the
-        // verdict. If the destination is comparable and does not correspond,
-        // that is a structural change we cannot credit to this act.
-        if diff.windowTitleChanged,
-           let matched = destinationMatchesIntent(
-               title: diff.windowTitleAfter, intendedTarget: intendedTarget
-           ),
-           matched == false {
-            return ActClassification(
-                status: "acted_unobserved",
-                reason: "navigation_intent_unmatched",
-                note: "\(verb.rawValue) produced a real structural change — the window is now "
-                    + "titled \"\(receiptText(diff.windowTitleAfter, redacted: windowTitleJSON) ?? "?")\" — but that is not the "
-                    + "destination this act named (\"\(receiptText(intendedTarget, redacted: intendedTargetJSON) ?? "?")\"). Something "
-                    + "moved; it was not necessarily what you asked for. mac_look to see where "
-                    + "you actually are before acting again"
-            )
-        }
-        return ActClassification(status: "acted")
+        return ActClassification(
+            status: matches.map { $0 ? "acted" : "acted_mismatch" } ?? "acted_unobserved",
+            reason: matches.map { $0 ? nil : "effect_mismatch" } ?? "effect_unreadable",
+            note: matches.map { $0 ? readback : mismatch }
+                ?? "The input went out, but the declared effect could not be read back."
+        )
     }
 
     // MARK: - Open-target resolution (Agent acceptance round 4, finding 1a)
@@ -1687,14 +1636,14 @@ public enum MacActClosedLoop {
         after: MacLookCompileCaps?
     ) -> (comparable: Bool, reason: String?) {
         if before?.truncated == true, after?.truncated == true {
-            return (false, "both the look's walk and the post-act walk truncated")
+            return (false, "both the look's walk and the post-action walk truncated")
         }
         if before?.truncated == true { return (false, "the look's walk truncated") }
-        if after?.truncated == true { return (false, "the post-act walk truncated") }
+        if after?.truncated == true { return (false, "the post-action walk truncated") }
         guard let before, let after else { return (true, nil) }
         func mismatch(_ name: String, _ lhs: Int?, _ rhs: Int?) -> String? {
             guard let lhs, let rhs, lhs != rhs else { return nil }
-            return "\(name) was \(lhs) for the look and \(rhs) for the post-act compile"
+            return "\(name) was \(lhs) for the look and \(rhs) for the post-action compile"
         }
         let reasons = [
             mismatch("max_affordances", before.maxAffordances, after.maxAffordances),

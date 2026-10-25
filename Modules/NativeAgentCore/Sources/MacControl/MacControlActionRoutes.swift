@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `MacControlActionRoutes.swift` | Mac control dispatch receipts plus workbench availability and category policy |
 
 public struct MacControlRunResult {
     public let statusCode: Int

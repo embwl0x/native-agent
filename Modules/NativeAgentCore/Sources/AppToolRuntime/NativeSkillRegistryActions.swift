@@ -1,36 +1,32 @@
 import Foundation
 import PersistenceCore
-import Skills
 import Senses
+import ToolExecution
 import TrustCenter
+// Blueprint: | `NativeSkillRegistryActions.swift` | owner-facing enable/disable through `Parts` and capability-pack script-host binding; `enableSkill`, `disableSkill` |
 
+/// The owner's own hand on a part: the Skills page's Install, an approved
+/// card, a self-improvement apply. Each goes through the one lifecycle (`Parts`).
 public enum NativeSkillRegistryActions {
     public static func installDemoCapabilityPack(dataRoot: URL) async throws -> CapabilityPackInstall {
-        let host = AppScriptRunner.Host(call: { _ in .null }, toolHost: true, dataRoot: dataRoot)
+        let host = AppScriptRunner.Host(call: { _ in .null }, dataRoot: dataRoot)
         return try await OwnedProgramInvocation.$host.withValue(host) {
             try await CapabilityPackInstall.installDemo(dataRoot: dataRoot)
         }
     }
 
-    public static func deleteSkill(id: String, dataRoot: URL) async throws {
-        let impl = makeSkillsClient(root: dataRoot)
-        _ = try await impl.deleteSkill(id: id, ownerAuthorized: true)
-    }
-
-    /// Enable a skill. `admitScript` binds the complete candidate digest as
-    /// User's (the one he reviewed, refused if any artifact changed since); an
-    /// approved card binds the complete candidate, including fixtures and dependencies.
-    public static func enableSkill(
-        name: String, dataRoot: URL, reviewedDigest: String?, admitScript: Bool
-    ) async throws {
-        let host = AppScriptRunner.Host(call: { _ in .null }, toolHost: true, dataRoot: dataRoot)
-        _ = try await OwnedProgramInvocation.$host.withValue(host) {
-            try await SwiftNativeSkillsClient(root: dataRoot).enableSkill(
-                name: name, admittedBy: admitScript ? "user" : nil, reviewedDigest: reviewedDigest, ownerAuthorized: true)
+    /// The owner keeps a part, or turns it back on. `reviewedDigest` is the
+    /// exact version the owner read (a card's); one changed since keeps nothing.
+    public static func enableSkill(name: String, dataRoot: URL, reviewedDigest: String?) async throws {
+        let host = AppScriptRunner.Host(call: { _ in .null }, dataRoot: dataRoot)
+        let outcome = await OwnedProgramInvocation.$host.withValue(host) {
+            await Parts(root: dataRoot).enable(name, version: reviewedDigest, fullMac: false, ownerAuthorized: true)
         }
+        guard outcome.ok else { throw PartError.invalid(outcome.text) }
     }
 
     public static func disableSkill(name: String, dataRoot: URL) async throws {
-        _ = try await makeSkillsClient(root: dataRoot).disableSkill(name: name)
+        let outcome = Parts(root: dataRoot).disable(name, reason: nil, fullMac: false, ownerAuthorized: true)
+        guard outcome.ok else { throw PartError.invalid(outcome.text) }
     }
 }

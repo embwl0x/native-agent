@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import PersistenceCore
+// Blueprint: | `OrganismPrediction.swift` | `OrganismPredictiveBody` enum; `predictionID`, `applying` |
 
 public enum OrganismPredictiveBody {
     private static let maximumPredictions = 96

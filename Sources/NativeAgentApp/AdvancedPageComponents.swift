@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+// Blueprint: | `AdvancedPageComponents.swift` | `AdvancedEyebrow` struct |
 
 /// A stable quiet slot for a page read; cached content stays mounted below it.
 struct PageReadStatus: View {
@@ -170,7 +171,6 @@ enum AdvancedStatusWords {
         "warn": "Warning",
         "fail": "Failed",
         "info": "Working",
-        "mcp": "MCP",
     ]
 }
 

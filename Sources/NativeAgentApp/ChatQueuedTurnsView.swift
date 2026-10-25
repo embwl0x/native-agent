@@ -1,5 +1,7 @@
 import SwiftUI
-import ChatOrchestration
+import ChatTurnRuntime
+
+// Blueprint: | `ChatQueuedTurnsView.swift` | `ChatQueuedTurnsView`: bounded session-scoped send-next chips, overflow and steer/send-now controls |
 
 enum ChatQueuePresentation {
     /// Chips that take layout space; the rest wait behind "+N more".

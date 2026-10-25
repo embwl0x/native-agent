@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `ToolResultSections.swift` | `ToolResultSections` enum; `pages`; complete line/value records, search records first and then shortest fields first (a result's verdict before its bulk), source-order query selection, raw references for oversized records |
 
 /// Complete values and lines for reading; the retained byte stream remains
 /// available separately for exact reconstruction, including unusually large atoms.
@@ -72,12 +73,16 @@ package enum ToolResultSections {
             case .object(let fields):
                 if fields.isEmpty { append(value, path: path) }
                 // Search records precede metadata; their source ranking is preserved.
-                let keys = fields.keys.sorted {
-                    let priority = ["results", "hits", "matches", "text", "content"]
-                    let lhs = priority.firstIndex(of: $0) ?? priority.count
-                    let rhs = priority.firstIndex(of: $1) ?? priority.count
-                    return lhs == rhs ? $0 < $1 : lhs < rhs
-                }
+                // Then what happened (status, reason, error, its result), before
+                // any echo of what was asked; the rest go shortest first, so the
+                // first page says what the result is before the bulk it carries.
+                let priority = ["results", "hits", "matches", "text", "content",
+                                "status", "reason", "error", "detail", "message", "result"]
+                let rank = Dictionary(uniqueKeysWithValues: fields.map { key, value in
+                    (key, priority.firstIndex(of: key).map { ($0, 0) }
+                        ?? (priority.count, (try? value.serialize(pretty: false))?.utf8.count ?? 0))
+                })
+                let keys = fields.keys.sorted { rank[$0]! == rank[$1]! ? $0 < $1 : rank[$0]! < rank[$1]! }
                 for key in keys { visit(fields[key]!, path: path + [.string(key)]) }
             default: append(value, path: path)
             }

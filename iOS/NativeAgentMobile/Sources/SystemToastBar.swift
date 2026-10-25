@@ -283,7 +283,7 @@ struct MacStatusChip: View {
         .accessibilityLabel("Mac connection: \(AliveConnection.line(bridgeClient.connection))")
         .popover(isPresented: $showDetail) {
             MacStatusDetail(status: status, connection: bridgeClient.connection,
-                            lastSeenAt: bridgeClient.lastSeenAt, lastSyncAt: sync.lastSyncAt)
+                            lastSeenAt: bridgeClient.lastSeenAt, lastSnapshotReadAt: sync.lastSyncAt)
                 .presentationCompactAdaptation(.popover)
         }
     }
@@ -315,7 +315,7 @@ private struct MacStatusDetail: View {
     let status: BridgeStatus
     let connection: NAPhoneConnection
     let lastSeenAt: Date?
-    let lastSyncAt: Date?
+    let lastSnapshotReadAt: Date?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -335,9 +335,9 @@ private struct MacStatusDetail: View {
                 }
                 .font(.footnote)
             }
-            if let lastSyncAt {
-                LabeledContent("Last synced") {
-                    Text(lastSyncAt, style: .relative).foregroundStyle(.secondary)
+            if let lastSnapshotReadAt {
+                LabeledContent("Last snapshot read") {
+                    Text(lastSnapshotReadAt, style: .relative).foregroundStyle(.secondary)
                 }
                 .font(.footnote)
             }

@@ -1,5 +1,6 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnContracts
+// Blueprint: | `NativeAgentNotificationActions.swift` | `NativeAgentNotificationActions` |
 
 public enum NativeAgentNotificationActions {
     public static let approvalCategory = "nativeagent.approval"

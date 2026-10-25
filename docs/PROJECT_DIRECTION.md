@@ -68,12 +68,11 @@ Scripts stop at a blocked action and wait at a card for the answer; completed
 earlier actions stay done. Standalone tool names are refused with a translated `app` call. There is
 no tool-loading step.
 
-Self-authored executable tools follow `tool.propose` → `tool.approve` →
-`authored.<id>`, all through `app`. Mounted MCP actions appear as
-`mcp.<server>.<tool>`. `web.search` uses Codex with direct web-tool access for general queries and SearXNG for other categories; a Codex failure falls back to SearXNG and the receipt keeps the route and the failure reason; a completed empty search stays on its route; a time range travels with either route.
-A skill is a part like a tool or a sense: one file in `abilities/` with the
-one header, guidance as `.md` or a JavaScript routine as `.js`, read through
-`skill.read` and run through `skill.run`; see the
+Their abilities follow `ability.save` → kept (theirs under Full Mac, else the owner's
+card) → `authored.<id>`, all through `app`. `web.search` searches SearXNG, every engine it has, and returns its results or its failure said plainly (no fallback; Doctor names a broken SearXNG); on a Mac without SearXNG the result hands their `browser_search`, the same search in a browser (Chrome through the extension when it is connected, else their own browser), which they runs and reads; a time range travels with either.
+An ability they grows is one file in `abilities/` with the one header, whatever
+door made it: read through `ability.read` and run as `authored.<id>`. A skill is
+built-in guidance from the persona, read and never run; see the
 [part header and skill contract](skill_manifest_spec.md).
 
 ## Authority

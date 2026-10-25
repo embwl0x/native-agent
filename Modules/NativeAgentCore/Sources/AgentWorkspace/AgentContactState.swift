@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentContactState.swift` | Folds validated contact projections from `AgentPeerStore` into presentation identities; labels only ACP/MCP schemes as such. `AgentLocalHealth` owns 600-second freshness and 300-second refresh spacing; exact pull-reply read receipts. |
 
 /// Who each saved contact is (docs/agent-communication.md, "Every agent is
 /// itself"): its own who, or the who it is explicitly associated with
@@ -10,18 +11,9 @@ public struct AgentContactIdentity: Sendable {
     public let doors: [String: String]
     let peers: [[String: String]]
 
-    public init(dataRoot: URL) {
-        let peers = (try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")))
-            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [[String: Any]] } ?? []
-        self.init(peers: peers.map { $0.compactMapValues { $0 as? String } },
-                  handles: Dictionary(peers.compactMap { peer in
-                      (peer["id"] as? String).map { ($0, (peer["handles"] as? [String]) ?? []) }
-                  }, uniquingKeysWith: { first, _ in first }))
-    }
-
-    init(peers: [[String: String]], handles: [String: [String]] = [:]) {
+    package init(peers: [[String: String]], handles: [String: [String]] = [:]) {
         self.peers = peers
-        let byID = Dictionary(peers.compactMap { peer in peer["id"].map { ($0, peer) } }, uniquingKeysWith: { first, _ in first })
+        let byID = Dictionary(uniqueKeysWithValues: peers.compactMap { peer in peer["id"].map { ($0, peer) } })
         // An association to a contact that no longer exists is no association.
         func who(_ id: String) -> String { byID[id]?["who"].flatMap { byID[$0] == nil ? nil : $0 } ?? id }
         func key(_ who: String) -> String { handles[who]?.first?.lowercased() ?? "peer:" + who }
@@ -31,7 +23,7 @@ public struct AgentContactIdentity: Sendable {
             if name != "peer:" + id { aliases["peer:" + id] = name }
             if whoID == id { for handle in handles[id] ?? [] { aliases[handle.lowercased()] = name } }
             guard name != "peer:" + id, let url = peer["endpoint"].flatMap(URL.init(string:)) else { continue }
-            doors["peer:" + id] = (peer["name"] ?? url.host ?? "") + (url.scheme == "acp" ? " (ACP)" : " (MCP)")
+            doors["peer:" + id] = (peer["name"] ?? url.host ?? "") + (url.scheme == "acp" ? " (ACP)" : url.scheme == "mcp" ? " (MCP)" : "")
         }
         self.aliases = aliases; self.doors = doors
     }
@@ -50,13 +42,15 @@ public struct AgentContactIdentity: Sendable {
 
 /// Cheap local observations, never transport authority or proof a model will answer.
 public struct AgentLocalHealth: Codable, Sendable, Equatable {
+    public static let refreshInterval: TimeInterval = 300
+    public static func isRecent(_ at: Date) -> Bool { Date().timeIntervalSince(at) < 600 }
     private var observedStatus: String?
     private var observedDetail: String
     private var presence: String? = nil
     private var presenceWords: String? = nil
     private var presenceAt: Date? = nil
     public var presenceStatus: String? {
-        presence == "recent_activity" && Date().timeIntervalSince(presenceAt ?? .distantPast) >= 600 ? "waiting" : presence
+        presence == "recent_activity" && !Self.isRecent(presenceAt ?? .distantPast) ? "waiting" : presence
     }
     public var presenceDetail: String? {
         presence == "recent_activity" && presenceStatus == "waiting" ? "No recent activity from Claude's bridge." : presenceWords
@@ -125,7 +119,7 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     }
     /// Said until a newer observation replaces it, not only while fresh.
     public var sticky: Bool { brokenSince != nil || ["unverified", "interrupted", "stalled", "no_reply_by_deadline"].contains(observedStatus ?? "") }
-    public var current: Bool { presenceStatus != nil || sticky || Date().timeIntervalSince(checkedAt) < 600 }
+    public var current: Bool { presenceStatus != nil || sticky || Self.isRecent(checkedAt) }
     public var word: String? {
         guard current else { return nil }
         let text = status.replacingOccurrences(of: "_", with: " ")
@@ -180,7 +174,7 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
         let observations = read(root).values
         let last = observations.filter { !$0.sticky }.map(\.checkedAt).min()
             ?? (observations.isEmpty ? .distantPast : now)
-        return max(now.addingTimeInterval(30), last.addingTimeInterval(300))
+        return max(now.addingTimeInterval(30), last.addingTimeInterval(refreshInterval))
     }
 }
 

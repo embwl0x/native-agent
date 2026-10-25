@@ -158,8 +158,8 @@ struct ActivityView: View {
     // Activity before he could read the dream. Avoid the fragile nested
     // navigation entirely: the user actually wants to *read* the dream,
     // not navigate to a list, so "More" now presents InboxDetailSheet
-    // directly with the item.
-    @State private var inboxDetailItem: InboxItemRecord?
+    // directly with the item's current shared projection.
+    @State private var inboxDetailItemID: String?
 
     init(
         skipInitialRefresh: Binding<Bool> = .constant(false),
@@ -300,18 +300,19 @@ struct ActivityView: View {
             // Reuses InboxDetailSheet (the same sheet InboxView presents),
             // so dream / detail rendering stays consistent across both
             // surfaces.
-            .sheet(item: $inboxDetailItem) { item in
+            .sheet(isPresented: Binding(get: { inboxDetailItemID != nil }, set: { if !$0 { inboxDetailItemID = nil } })) {
+                if let id = inboxDetailItemID {
                 InboxDetailSheet(
-                    item: item,
-                    allItems: sync.inboxItems,
+                    itemID: id,
                     onOpenGroup: { _ in
                         // Group filtering only makes sense inside InboxView;
                         // here we just close the sheet so the user can drill
                         // through Activity → Inbox if they want that view.
-                        inboxDetailItem = nil
+                        inboxDetailItemID = nil
                     },
-                    onDone: { inboxDetailItem = nil }
+                    onDone: { inboxDetailItemID = nil }
                 )
+                }
             }
         }
     }
@@ -329,7 +330,7 @@ struct ActivityView: View {
         switch MobileDesignSamples.screen {
         case "approvals": openRequestedSection(.approvals)
         case "inbox": openRequestedSection(.inbox)
-        case "inboxItem": inboxDetailItem = pendingInbox.first
+        case "inboxItem": inboxDetailItemID = pendingInbox.first?.id
         default: break
         }
     }
@@ -347,8 +348,8 @@ struct ActivityView: View {
             InlineInboxPreviewCard(item: inboxItem) {
                 // 2026-06-07: present the detail sheet directly with the
                 // tapped item instead of pushing onto the parent
-                // NavigationPath — see comment on inboxDetailItem.
-                inboxDetailItem = inboxItem
+                // NavigationPath — see comment on inboxDetailItemID.
+                inboxDetailItemID = inboxItem.id
             }
         case .memory(let proposal):
             InlineMemoryProposalPreviewCard(proposal: proposal)
@@ -540,7 +541,7 @@ private struct InlineApprovalPreviewCard: View {
 /// Inbox card with its top two actions plus "Read". The owning Activity view
 /// passes a callback that presents the InboxDetailSheet directly with this
 /// card's item (the previous "drill into InboxView" wiring bounced on iOS —
-/// see ActivityView.inboxDetailItem).
+/// see ActivityView.inboxDetailItemID).
 private struct InlineInboxPreviewCard: View {
     @EnvironmentObject private var inboxStore: InboxStore
     let item: InboxItemRecord

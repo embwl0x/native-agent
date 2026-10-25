@@ -1,6 +1,7 @@
 import NativeAgentCore
 import Foundation
 import PersistenceCore
+// Blueprint: | `ProcedureCompilation.swift` | `ProcedureTerminalClass` enum |
 
 // MARK: - Payload-free trajectory extraction
 

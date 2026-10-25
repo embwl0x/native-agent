@@ -1,13 +1,14 @@
 import GrokLink
 import SwiftUI
 import Agents
-import ChatOrchestration
-import PersistenceCore
+import AgentConversations
+
+// Blueprint: | `GrokSecureSetupCard.swift` | `GrokSecureSetupCard`: masked credential submission through secure setup, without exposing secret values in the view |
 
 /// The masked field writes only to Keychain, never via chat or a tool.
 struct GrokSecureSetupCard: View {
     let dataRoot: URL
-    @State private var contact: AgentPeerContact?
+    let contact: AgentPeerContact
     @State private var paste = ""
     @State private var status = ""
     @State private var busy = false
@@ -15,7 +16,7 @@ struct GrokSecureSetupCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let contact, ["creating", "secure-paste"].contains(contact.grokSetup ?? "") {
+            if ["creating", "secure-paste"].contains(contact.grokSetup ?? "") {
                 Text("Routine credentials").font(.headline)
                 if contact.grokConversation == nil {
                     Text("Connect briefly brings Grok Bot forward to send the routine request. If the current Bot cannot be identified, enter its exact sidebar name here, then Connect again.").font(.caption)
@@ -29,7 +30,7 @@ struct GrokSecureSetupCard: View {
                         } catch { status = "Could not save the Bot selection." }
                     }.disabled(busy || botName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                Text(contact.grokSetup == "creating" ? "Routine setup is not confirmed. Check Grok Bot for its approval or sign-in prompt; the request will not be resent. Paste the URL and key together at Agents → Grok Bot → Routine credentials; never in chat." : GrokBotRoute.securePasteBlocker).font(.caption)
+                Text(contact.grokSetup == "creating" ? "Routine setup is not confirmed. Connect again to continue this contact's setup. If a request was already submitted, it will not be sent again; approve it in Grok Bot if asked." : GrokBotRoute.securePasteBlocker).font(.caption)
                 Button("Read routine securely") { importNative(contact) }.disabled(busy)
                 SecureField("Paste {\"url\":\"…\",\"key\":\"…\"}", text: $paste)
                     .textFieldStyle(.roundedBorder).privacySensitive()
@@ -39,15 +40,6 @@ struct GrokSecureSetupCard: View {
                 Button("Save securely to Keychain") { save(contact) }.disabled(paste.isEmpty || busy)
             }
             if !status.isEmpty { Text(status).font(.caption) }
-        }
-        .task {
-            let events = FileChangeEvents(paths: [AgentPeerStore(dataRoot: dataRoot).fileURL], emitInitial: true)
-            await withTaskCancellationHandler {
-                for await _ in events.stream {
-                    if Task.isCancelled { break }
-                    contact = try? AgentPeerStore(dataRoot: dataRoot).list().first { $0.transport == .grokBot && $0.grokSetup != "disconnected" }
-                }
-            } onCancel: { events.cancel() }
         }
         .onDisappear { paste = "" }
     }
@@ -69,7 +61,7 @@ struct GrokSecureSetupCard: View {
                     desktop: NativeAgentEngine.live.agents.desktop) else { return }
                 ready()
             } catch {
-                status = (error as? GrokRoutineAccessibility.Blocker)?.rawValue ?? "The credentials could not be imported securely."
+                status = error.localizedDescription
             }
         }
     }

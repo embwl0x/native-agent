@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `BrowserActionRoutes+NativeActions.swift` | `BrowserActionRoutes`: `runBrowserNativeAction`, `stringInput` |
 
 extension BrowserActionRoutes {
     public func runBrowserNativeAction(

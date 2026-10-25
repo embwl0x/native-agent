@@ -4,6 +4,7 @@ import PersistenceCore
 import ToolRegistry
 #if canImport(CryptoKit)
 import CryptoKit
+// Blueprint: | `MacInjectionRedaction.swift` | `MacInjectionArgRedaction` enum; `carriesSecretArgs`, `appDoorSecretKeys` |
 #endif
 
 // MARK: - Typed-secret redaction (W2/W3-FIX 4)
@@ -48,8 +49,8 @@ public enum MacInjectionArgRedaction {
 
     /// Script source that names an action taking a key or token, by its id or
     /// by its two words apart (`app.card["answer"]`), each a whole word
-    /// ("contacts" does not name act). The runner refuses such a call, but the
-    /// source itself is never kept.
+    /// ("contacts" does not name act). Traces withhold its source even when
+    /// the script's credential detector admits ordinary typed text.
     public static func namesAppDoorSecretAction(_ source: String) -> Bool {
         let text = source.lowercased()
         let words = Set(text.split { !($0.isLetter || $0.isNumber || $0 == "_") }.map(String.init))

@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import GRDB
+// Blueprint: | `MemoryStorage+Integrity.swift` | `MemoryStorage`: `requireSemanticIntegrity`, `spotlightGenerationFingerprint` hashes only eligible exported payload; `createConsistentBackup` |
 
 extension MemoryStorage {
     /// Validate the semantic payloads SQLite itself cannot type-check. SQLite's
@@ -108,6 +109,7 @@ extension MemoryStorage {
             let rows = try Row.fetchCursor(db, sql: """
                 SELECT id, content, status FROM memories
                 WHERE status = 'active' AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
+                    AND json_extract(metadata_json, '$.\(Self.pendingAdmissionKey)') IS NOT 1
                 ORDER BY id
                 """)
             let encoder = JSONEncoder()

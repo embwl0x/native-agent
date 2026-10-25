@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MacControl+OperationSupport.swift` | `SwiftNativeMacControl`: `attachingOperation`, `replayResult`, `unknownResult` |
 
 final class MacControlOneShot<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
@@ -121,7 +122,7 @@ public enum MacControlReceiptOutcome: String, Sendable, Equatable {
         case .refused: return "Refused"
         case .cancelled: return "Cancelled"
         case .timedOut: return "Timed out"
-        case .effectUnconfirmed: return "Effect unconfirmed; observe before repeating"
+        case .effectUnconfirmed: return "Outcome unknown; inspect the affected app before another action"
         }
     }
 
@@ -211,14 +212,29 @@ extension SwiftNativeMacControl {
         action: String,
         record: MacControlOperationRecord
     ) -> MacControlResult {
-        MacControlResult(
+        let cause: String
+        switch record.outcomeCode {
+        case "restart_interrupted": cause = "NativeAgent restarted before the action's external effect could be verified."
+        case "deadline_effect_unknown": cause = "The action's time limit expired before its external effect could be verified."
+        case "cancel_effect_unknown": cause = "Cancellation was requested before the action's external effect could be verified."
+        default: cause = "The action's external effect could not be verified."
+        }
+        return MacControlResult(
             ok: false,
             action: action,
             output: .object([
                 "status": .string("outcome_unknown"),
                 "retryable": .bool(false),
+                "reason": .string(record.outcomeCode ?? "mac_action_result_unavailable"),
+                "effects": .string("unknown"),
+                "detail": .string("Outcome unknown. " + cause),
+                "remedy": Repair.reconcile(
+                    instruction: "Inspect the affected app from the original request before another action; name it in mac.look args.app if it is not in front.",
+                    nextCall: .object(["tool": .string("app"), "input": .object([
+                        "action": .string("mac.look"), "args": .object([:]),
+                    ])])),
             ]),
-            error: "Mac Control stopped waiting, but the external effect could not be verified; do not retry automatically",
+            error: record.outcomeCode ?? "mac_action_result_unavailable",
             durationMs: 0,
             httpStatus: 409,
             operationId: record.operationId,
@@ -280,6 +296,8 @@ extension SwiftNativeMacControl {
         result: MacControlResult
     ) -> MotorVerificationState {
         if resultTimedOut(result) || !result.ok { return .failed }
+        if case .object(let object) = result.output,
+           object["status"] == .string("acted_mismatch") { return .failed }
         if case .object(let object) = result.output,
            case .bool(let verified)? = object["verified"] {
             return verified ? .satisfied : .unverified

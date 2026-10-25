@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Desk
+// Blueprint: | `DeskItemInspector.swift` | `DeskItemInspector` struct |
 
 /// Item-level controls on the primary Desk; all writes use its tool router.
 struct DeskItemInspector: View {

@@ -1,8 +1,9 @@
 import Foundation
 import MacControl
-import MCPDispatcher
 import PersistenceCore
 import TurnTrace
+import NativeAgentShared
+// Blueprint: | `ChatToolOutcome.swift` | exact/display result classes, explanation and common waiting/failure predicates; `projection` gives folds and expanded receipts one interaction-metadata precedence; below ApprovalInbox so readers share classification without importing session persistence |
 
 /// Exact result evidence shared by approvals, transcripts and live turn receipts.
 public enum ChatToolOutcome {
@@ -64,11 +65,45 @@ public enum ChatToolOutcome {
         /// A raised inline card. The call asked the person a question; it did
         /// not fail, and it has not run (2026-09-14).
         case needsYou = "Needs you"
+        case asked = "Asked you first"
+    }
+
+    public enum FoldStatus: Equatable, Sendable {
+        case plain, failed, needsYou, asked
+    }
+
+    /// One transcript result for both the fold and the expanded receipt.
+    /// Persisted interaction metadata outranks an older raise-time envelope.
+    public static func projection(
+        kind: String?, ok: Bool?, resultSummary: String?, resultStatus: String? = nil,
+        interactionState: String? = nil
+    ) -> (status: FoldStatus, outcome: DisplayOutcome) {
+        let result = resultSummary.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+        guard kind == InlineInteractionWire.transcriptKind else {
+            return (ok == false ? .failed : .plain,
+                    displayOutcome(result: result, ok: ok, hasResult: resultSummary != nil))
+        }
+        for recorded in [resultStatus, interactionState] {
+            switch (recorded ?? "").lowercased() {
+            case "pending", "running": return (.needsYou, .needsYou)
+            case "settled", "declined", "superseded", "cancelled": return (.asked, .asked)
+            case "failed": return (.failed, .failed)
+            default: continue
+            }
+        }
+        guard let result, case .object(let fields) = result,
+              case .string(let status)? = fields["status"] else { return (.needsYou, .needsYou) }
+        switch status.lowercased() {
+        case InlineInteractionWire.waitingStatus, "pending", "running":
+            return carriesFailureEvidence(result) ? (.failed, .failed) : (.needsYou, .needsYou)
+        case "failed", "error": return (.failed, .failed)
+        default: return (.asked, .asked)
+        }
     }
 
     /// Pure projection of the dispatch envelope, never of the transport success bit.
-    /// The catch boundary projects AutonomyGateError and MCPSubprocessError to
-    /// these exact wire forms; do not search arbitrary result prose for errors.
+    /// The catch boundary projects AutonomyGateError to these exact wire
+    /// forms; do not search arbitrary result prose for errors.
     public static func displayOutcome(result: JSONValue?, ok: Bool?, hasResult: Bool) -> DisplayOutcome {
         guard hasResult else { return ok == false ? .failed : (ok == nil ? .pending : .unknown) }
         guard let value = result else { return ok == false ? .failed : .unknown }
@@ -110,6 +145,7 @@ public enum ChatToolOutcome {
         let macOutcome = value.flatMap { MacControlReceiptOutcome.projecting(envelope: $0) }
         switch outcome {
         case .pending: return "No result yet"
+        case .asked: return "Asked you first"
         // A question, not a result. The envelope's own one-liner is the reason
         // the card exists, so it is what the pill says.
         case .needsYou:
@@ -258,9 +294,7 @@ public enum ChatToolOutcome {
     /// never treats a missing status as success. Pending transport, approval,
     /// partial, and ambiguous envelopes stay unknown.
     public static func exactResultClass(_ output: JSONValue) -> ExactResultClass {
-        if MCPInvocationOutcome.classify(response: output).providerToolResultIsError {
-            return .failed
-        }
+        if reportsError(output) { return .failed }
         // Native in-process tools such as read_file and list_dir return their
         // terminal value directly. Reaching this boundary with a string,
         // array, number, or boolean means dispatch completed; thrown failures
@@ -292,6 +326,7 @@ public enum ChatToolOutcome {
         if case .bool(true)? = object["isError"] { return .failed }
         if case .bool(true)? = object["is_error"] { return .failed }
         if case .bool(true)? = object["failed"] { return .failed }
+        if let status, ["cancelled", "canceled", "stopped"].contains(status) { return .cancelled }
         if !completed, case .bool(true)? = object["timed_out"] { return .timeout }
         if case .bool(true)? = object["timeout"] { return .timeout }
         if let status, failureStatuses.contains(status) { return .failed }
@@ -306,13 +341,33 @@ public enum ChatToolOutcome {
         default: break // Running/unconfirmed is finality's; success still faces the vetoes.
         }
         if saysOutcomeOpen(output) { return .unknown }
-        if let status, ["cancelled", "canceled"].contains(status) { return .cancelled }
         if let status, successStatuses.contains(status) { return .succeeded }
         if MacControlReceiptOutcome.projecting(envelope: output) == .succeeded { return .succeeded }
         if case .bool(true)? = object["ok"] { return .succeeded }
         if case .bool(true)? = object["success"] { return .succeeded }
         if numericExitCode(object["exit_code"]) == 0 { return .succeeded }
         return .unknown
+    }
+
+    /// An error reported at the envelope's top level, or in the one adapter
+    /// layer that wraps a raw result under `result`, fails the call whatever
+    /// else it says; arbitrary nested business payloads are not protocol state.
+    private static func reportsError(_ output: JSONValue) -> Bool {
+        func errorShape(_ object: [String: JSONValue]) -> Bool {
+            if case .bool(true)? = object["isError"] { return true }
+            if case .bool(false)? = object["ok"] { return true }
+            if case .bool(false)? = object["success"] { return true }
+            if let error = object["error"], error != .null { return true }
+            if case .string(let raw)? = object["status"] {
+                return ["denied", "error", "failed", "failure", "rejected"]
+                    .contains(raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+            }
+            return false
+        }
+        guard case .object(let object) = output else { return false }
+        if errorShape(object) { return true }
+        if case .object(let nested)? = object["result"] { return errorShape(nested) }
+        return false
     }
 
     private static func numericExitCode(_ value: JSONValue?) -> Double? {

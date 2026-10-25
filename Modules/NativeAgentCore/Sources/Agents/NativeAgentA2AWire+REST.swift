@@ -1,6 +1,8 @@
 import Foundation
 import Network
 
+// Blueprint: | `NativeAgentA2AWire+REST.swift` | `AgentContactA2AEndpoint.handleREST`: authenticated REST binding over the shared A2A parser, task owner and projections |
+
 extension AgentContactA2AEndpoint {
     public enum RESTResponse: @unchecked Sendable {
         case json(Int, [String: Any], onSent: (@Sendable () async -> Void)? = nil)

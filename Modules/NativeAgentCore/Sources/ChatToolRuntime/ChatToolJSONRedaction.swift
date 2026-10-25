@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import MacControl
 import TrustCenter
+// Blueprint: | `ChatToolJSONRedaction.swift` | `ChatToolJSONRedaction` enum; `injectionRedactedArgJSON`, `injectionRedactedResultJSON` |
 
 package enum ChatToolJSONRedaction {
     /// W2/W3-FIX-R2 — redact an injection tool's ARGUMENT json before it is

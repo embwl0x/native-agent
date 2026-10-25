@@ -4,13 +4,14 @@ import Transcripts
 import SwiftUI
 import UniformTypeIdentifiers
 import DeviceSync
+// Blueprint: | `ChatView+PinnedSessions.swift` | `ChatView`: `humanPinnedSessionIds`, `savePinnedSessionIds`, `prunePinnedSessions` |
 
 extension ChatView {
     /// The human's pins WITHOUT the anchor — what `savePinnedSessionIds` must
     /// persist. Writing the merged list back would silently adopt the anchor as
     /// a real pin, and it would stay pinned after it stopped being the anchor.
     func humanPinnedSessionIds() -> [String] {
-        ChatSessionRetention.decode(pinnedChatSessionIdsRaw)
+        appModel.engine.transcripts.pinnedSessionIDs
     }
 
     /// 2026-09-06: `includeTranscripts` exists because the published transcript
@@ -21,20 +22,14 @@ extension ChatView {
     /// unpinning still do not — they only ever remove.
     @discardableResult
     func savePinnedSessionIds(_ ids: [String], includeTranscripts: Bool = false) -> Bool {
+        let encoded: String
         do {
-            pinnedChatSessionIdsRaw = try ChatSessionRetention.save(ids)
+            encoded = try appModel.engine.transcripts.savePinnedSessionIDs(ids)
         } catch {
             showToast("Pinned tabs could not be updated")
             return false
         }
-        guard ChatSessionRetention.request(
-            encodedPinnedIDs: pinnedChatSessionIdsRaw,
-            publish: { _ in
-                NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(
-                    includeTranscripts: includeTranscripts
-                )
-            }
-        ) else {
+        guard appModel.engine.transcripts.publishPins(encoded, includeTranscripts: includeTranscripts) else {
             showToast("Pinned tabs were saved on this Mac, but could not be shared with your phone")
             return false
         }
@@ -71,15 +66,9 @@ extension ChatView {
 
     func unpinSession(_ sessionId: String) {
         do {
-            switch try ChatSessionRetention.closePinnedTab(sessionID: sessionId) {
+            switch try appModel.engine.transcripts.closePinnedTab(sessionId) {
         case .closed(let encoded):
-            pinnedChatSessionIdsRaw = encoded
-            guard ChatSessionRetention.request(
-                encodedPinnedIDs: encoded,
-                publish: { _ in
-                    NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: false)
-                }
-            ) else {
+            guard appModel.engine.transcripts.publishPins(encoded, includeTranscripts: false) else {
                 showToast("Pinned tab closed locally, but its phone snapshot could not be verified")
                 return
             }

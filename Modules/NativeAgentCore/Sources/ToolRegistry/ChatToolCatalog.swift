@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `ChatToolCatalog.swift` | `ChatToolCatalogSnapshot`, schema and dispatch-plan values: typed tool inventory and runtime safety categories, with presentation-only taxonomy |
+
 // MARK: - The catalog as the Tools page reads it (S10, 2026-09-26)
 
 /// One row of the full tool manifest (`SwiftToolDispatcher.toolManifest`): what the tool is (Core's row)
@@ -12,6 +14,7 @@ public struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
     public var description: String
     public var parametersPreview: String?
     public var dispatchableVia: String?
+    /// Legacy manifest field: floor membership (`loaded`/`hidden`), not a loading lifecycle.
     public var loadState: String?
     public var effectiveAutonomy: String?
     public var availableNow: Bool?
@@ -46,10 +49,11 @@ public struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-/// The full tool manifest, typed: every row, what is loaded, and the
+/// The full tool manifest, typed: every row, membership in the fixed floor, and the
 /// Full Mac lanes the Trust Center has open or locked.
 public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
     public var tools: [ChatCatalogTool]
+    /// Legacy manifest field: the always-on floor intersected with the model-visible catalog.
     public var currentlyLoaded: Set<String>
     public var builderAvailable: [String]
     public var builderPolicyLocked: [String]
@@ -201,28 +205,8 @@ extension ChatCatalogTool {
         case "mac.ax_act", "mac.act": return "Use a control on your Mac's screen."
         case "mobile.notify", "mobile_notify": return "Send a notification to your iPhone."
         case "mac.notify", "mac_notify": return "Show a notification on your Mac."
-        case "x.status", "x_status": return "Check your X connection."
-        // Per-action copy: the family line below ("Find conversations and
-        // exchange messages") was landing on every Slack row, status included.
-        case "slack.status", "slack_status": return "Check your Slack connection."
-        case "slack.list_channels", "slack_list_channels": return "List the Slack channels I can reach."
-        case "slack.search_messages", "slack_search_messages": return "Search messages in Slack."
-        case "slack.post_message", "slack_post_message": return "Post a message to a Slack channel."
-        case "slack.list_unreads": return "See which Slack channels have unread messages."
-        case "github.status", "github_status": return "Check your GitHub connection."
-        case "gmail.status", "gmail_status": return "Check your Gmail connection."
-        case "agentmail.status": return "Check my AgentMail connection."
-        case "calendar.status": return "Check your Google Calendar connection."
-        case "notion.status", "notion_status": return "Check your Notion connection."
-        case "markets.status": return "Check which market data sources are ready."
-        case "x.me", "x_me": return "Read your X profile."
-        case "x.search_recent", "x_search": return "Search recent posts on X."
-        case "x.post_tweet": return "Publish a post on X."
-        case "x.timeline_home", "x.timeline_home_v1", "x_timeline": return "Read posts from people you follow on X."
-        case "x.user_tweets", "x.user_tweets_v1", "x_user_tweets": return "Read someone's recent posts on X."
         case "local_files.search", "mac.spotlight_search", "mac_spotlight_search": return "Find files on your Mac."
-        case "searxng.search": return "Search the web."
-        case "searxng.fetch", "read_page": return "Read a web page."
+        case "read_page": return "Read a web page."
         case "telegram.test": return "Send a test message to Telegram."
         case "mac.read_file", "read_file": return "Read a file."
         case "mac.write_file", "write_file": return "Save content to a file."
@@ -263,7 +247,6 @@ extension ChatCatalogTool {
         case "commit_memory": return "Remember something for later."
         case "search_chat_history", "session_search": return "Find an earlier conversation."
         case "request_interaction": return "Ask you for a choice or an answer."
-        case "list_skills", "read_skill", "save_skill": return "Find, review or save a task routine."
         case "agent_swarm": return "Ask other assistants for help."
         case "claude_message", "invoke_claude", "codex_message", "invoke_codex", "omp_message": return "Exchange messages with another assistant."
         default: break
@@ -272,13 +255,8 @@ extension ChatCatalogTool {
         switch family {
         case "mac": return "Use your Mac's apps and controls."
         case "mac_assistant": return "Choose what to watch for on your Mac."
-        case "markets", "market", "tradingview": return "Look up market prices and watchlists."
-        case "github", "gh": return "Work with GitHub projects, issues, and pull requests."
-        case "gmail", "email", "mail": return "Find, read, or prepare email messages."
-        case "agentmail": return "Manage messages in the assistant's email account."
-        case "calendar", "google": return "Check your calendar and manage events."
-        case "notion": return "Find and work with your Notion pages."
-        case "slack": return "Find conversations and exchange messages in Slack."
+        case "email", "mail": return "Find, read, or prepare email messages."
+        case "calendar": return "Check your calendar and manage events."
         case "telegram": return "Check or use your Telegram connection."
         case "scheduler": return "Manage tasks scheduled for later."
         case "activity": return "Look back at recent activity."
@@ -337,6 +315,30 @@ public struct ToolInputSchema: Decodable, Hashable, Sendable {
     public let properties: [String: ToolInputProp]?
     // ordered list of required field names
     public let required: [String]?
+    public let raw: JSONValue
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(properties)
+        hasher.combine(required)
+    }
+
+    public init(from decoder: Decoder) throws {
+        raw = try JSONValue(from: decoder)
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        properties = try fields.decodeIfPresent([String: ToolInputProp].self, forKey: .properties)
+        required = try fields.decodeIfPresent([String].self, forKey: .required)
+    }
+
+    public var containsSecret: Bool {
+        func contains(_ value: JSONValue) -> Bool {
+            switch value {
+            case .object(let fields): fields["format"] == .string("password") || fields["writeOnly"] == .bool(true) || fields.values.contains(where: contains)
+            case .array(let values): values.contains(where: contains)
+            default: false
+            }
+        }
+        return contains(raw)
+    }
 
     enum CodingKeys: String, CodingKey {
         case properties, required
@@ -369,7 +371,7 @@ public struct ToolCapability: Identifiable, Decodable, Hashable, Sendable {
         case sideEffects          = "side_effects"
         case providerConstraints  = "provider_constraints"
         case availableNow         = "available_now"
-        case inputSchema          = "input_schema"
+        case inputSchema          = "parameters"
     }
 }
 

@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentShared
+// Blueprint: | `MobileIntentRuntime.swift` | `MobileIntentRuntime` enum; `prepare`, `agent` |
 
 /// Siri and notification actions use the same signed transport owners as the
 /// phone UI, including when no scene has mounted yet.
@@ -47,14 +48,9 @@ enum MobileIntentRuntime {
         // Siri continues the conversation User is in, whichever door he last
         // spoke at — not whatever the chat screen last adopted.
         if let anchor = iCloudSyncEngine.shared.chatAnchor?.cleanSessionId { return anchor }
-        if let existing = ChatStore.shared.mainSessionID { return existing }
-        let published = iCloudSyncEngine.shared.sessions.first {
-            (NativeAgentICloudBridgeConstants.isMobileSourceKey($0.sourceKey)
-                || (($0.source ?? "").lowercased() == "ios" && ($0.sourceKey ?? "").isEmpty))
-                && $0.archived != true
-        }?.id
-        let id = published ?? UUID().uuidString
-        ChatStore.shared.rememberMainSessionIDIfNeeded(id)
+        if let pending = ChatStore.shared.locallyCreatedSessionID { return pending }
+        let id = UUID().uuidString
+        ChatStore.shared.markLocallyCreatedSession(id)
         return id
     }
 

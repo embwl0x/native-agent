@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `MacTransientMenus.swift` | `MacTransientMenus`: bounded near-focus native menu evidence and capture geometry, without a second window address space |
+
 /// Current native menu evidence, not a second accessibility address space.
 /// Item paths remain private to this read and are never used as window paths.
 public enum MacTransientMenus {

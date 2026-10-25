@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `OpenAIExecutionControls.swift` | `OpenAIExecutionControls`: transport-specific catalog capability admission and reasoning/service-tier wire serialization |
+
 /// Capability-aware controls for public OpenAI requests and ChatGPT/Codex
 /// account-backed requests. A signed account catalog can expose reasoning
 /// levels that are not valid public API values, so those contracts stay

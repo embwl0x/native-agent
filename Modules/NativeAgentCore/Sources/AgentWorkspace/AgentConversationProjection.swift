@@ -4,10 +4,12 @@ import NativeAgentShared
 import os
 import PersistenceCore
 import Transcripts
+// Blueprint: | `AgentConversationProjection.swift` | `AgentConversationRecord`: reply expectation is explicit or defaults true except short acknowledgements; `nextReadAt` schedules eligible automatic reads/delivery, not reply lifetime. Associated-door history projects through Transcripts' `ContactThread.project`; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
 
 /// App-owned routing bookmarks, not another transcript or authority store.
 /// The last receipt is a bounded cache; the adapter remains the evidence owner.
 public struct AgentConversationRecord: Codable, Sendable {
+    public var lifeID: String?
     public var id: String
     public var scopeSessionID: String
     public var agent: String
@@ -24,6 +26,7 @@ public struct AgentConversationRecord: Codable, Sendable {
     public var automaticRead: Bool = false
     public var deliveryState: String?
     public var deliveryRunID: String?
+    /// Deadline for an eligible automatic read or delivery, not a reply lifetime.
     public var nextReadAt: Date?
     public var peerRouteFingerprint: String?
     public var replyRoute: [String: String]?
@@ -35,9 +38,8 @@ public struct AgentConversationRecord: Codable, Sendable {
     /// The current send was typed by the person in the contact's thread, so
     /// its answer settles here and never starts an agent turn.
     public var personInitiated: Bool?
-    /// The current send wants an answer (a question or a request), fixed at
-    /// send time. False for an FYI, a report or a receipt: once delivered it
-    /// is done, never "waiting". Nil on records saved before 2026-09-25.
+    /// Fixed at send time: explicit sender choice, otherwise true except for
+    /// short acknowledgements. Nil on records saved before 2026-09-25.
     public var expectsReply: Bool?
     /// Follow-ups written while a reply was still in flight, oldest first.
     /// Each goes by itself, in order, once the reply ahead of it settles.
@@ -60,12 +62,12 @@ public struct AgentConversationRecord: Codable, Sendable {
     /// answering turn's door and steering when one wrote it there
     /// (`reply_from`, `reply_steered_by`), else the route this record's
     /// transport read, which is what the app wrote the receipt from.
-    public var cachedReplyStamp: (source: String, steeredBy: [String]) {
-        guard case .object(let receipt)? = receipt, case .string(let from)? = receipt["reply_from"] else { return (agent, []) }
+    public var cachedReplyStamp: TranscriptRowStamp {
+        guard case .object(let receipt)? = receipt, case .string(let from)? = receipt["reply_from"] else { return .init(source: agent, steeredBy: [], contact: true) }
         let steering: [String] = if case .array(let values)? = receipt["reply_steered_by"] {
             values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
         } else { [] }
-        return (from, steering)
+        return .init(source: from, steeredBy: steering, contact: true)
     }
 
     package init(id: String,
@@ -139,20 +141,24 @@ public struct AgentConversationNotice: Codable, Sendable, Equatable {
 /// second message used to be refused). Never dropped: it goes, or it stays
 /// here `held` with the reason, and is never resent by itself after that.
 public struct AgentConversationQueued: Codable, Sendable, Equatable {
+    public var lifeID: String?
     public var id: String
     public var text: String
     public var queuedAt: Date
     public var byPerson: Bool?
+    public var arguments: [String: JSONValue]?
     public var held: String?
     package init(id: String,
                  text: String,
                  queuedAt: Date,
                  byPerson: Bool? = nil,
+                 arguments: [String: JSONValue]? = nil,
                  held: String? = nil) {
         self.id = id
         self.text = text
         self.queuedAt = queuedAt
         self.byPerson = byPerson
+        self.arguments = arguments
         self.held = held
     }
 
@@ -184,10 +190,14 @@ public struct AgentConversationStop: Codable, Sendable, Equatable {
 /// Bounded display history inside the routing bookmark. Never provider context,
 /// replay input, settlement authority, or a replacement for the reply's owner.
 public struct AgentConversationExchange: Codable, Sendable {
+    public var lifeID: String?
     public var id: String
     public var sentAt: Date
     public var prompt: String?
     public var reply: String?
+    /// The shelf result this reply belongs to, retained when the next send starts.
+    public var resultID: UUID?
+    public var partialReply: String?
     public var promptTruncated: Bool
     public var replyTruncated: Bool
     public var phase: String
@@ -232,32 +242,11 @@ public struct AgentConversationExchange: Codable, Sendable {
 /// One contact's conversation with her lives in one chat session the contact
 /// owns (User 10-01, "one brain, many doors"): what she sends it, what it says
 /// to her, and the turns either one starts. Every view of the contact reads it.
-public enum ContactThread {
+public typealias ContactThread = Transcripts.ContactThread
+
+extension ContactThread {
     /// Every session a contact owns starts with this: its id, hashed.
     public static func prefix(owner: String) -> String { ChatSessionRetention.contactSessionPrefix(owner: owner) }
-
-    /// Reading a line she is shown: for a contact's line the principal its own
-    /// row attests (another agent when it attests none), marked read under its
-    /// own current grant. Her own lines are hers and latch nothing, whatever
-    /// steered the turn that wrote them (User 10-20: only the message from an
-    /// outside agent steers, and only the turn that reads it; the steering a
-    /// row records is provenance to show, never a speaker). Every presentation
-    /// of thread lines consumes what it shows here, never under the owner.
-    @discardableResult
-    public static func consume(_ line: Line, mark: (_ principal: String, _ words: String) -> Void) -> [String] {
-        consume(mine: line.mine, source: line.source, steeredBy: line.steeredBy, text: line.text, mark: mark)
-    }
-
-    /// The same reading for a row shown from another chat's log (`HerScreen.logTail`).
-    @discardableResult
-    public static func consume(mine: Bool, source: String?, steeredBy: [String], text: String,
-                               mark: (_ principal: String, _ words: String) -> Void) -> [String] {
-        // The speaker, once; what steered the row's turn is shown, not latched.
-        _ = steeredBy
-        let speakers = mine ? [] : [source ?? "another agent"]
-        for speaker in speakers { mark(speaker, text) }
-        return speakers
-    }
 
     /// A transcript message id a history page or selection may name: bounded,
     /// letters, digits and hyphens (a row's UUID, or an imported `<UUID>-sent`).
@@ -270,31 +259,6 @@ public enum ContactThread {
     /// name); for a peer, the one its MCP door opens.
     public static func session(owner: String) -> String { prefix(owner: owner) + "mcp-" + owner }
 
-    /// One thing said: hers (`mine`; the person's when `byPerson`) or the contact's.
-    public struct Line: Sendable, Equatable {
-        public let id: String
-        public let mine: Bool
-        public let text: String
-        public let at: Date
-        public let byPerson: Bool
-        public var door: String? = nil
-        public var fetched = false
-        /// A reply's send id: the message of hers it answers.
-        public var answers: String? = nil
-        /// Her send's id: the record exchange that holds its state (held, delivered, replied).
-        public var sendID: String? = nil
-        /// That state as kept on the send's own row once the ledger let it go (`Entry.state`).
-        public var sendState: String? = nil
-        /// Who said a contact's line: the principal its own row attests (the
-        /// verified door id its envelope carries, or its lane), never the
-        /// thread's owner, which can hold an associated door's words. Nil: the
-        /// row attests no one. Its grant is that principal's alone.
-        public var source: String? = nil
-        /// The peers whose words steered the turn that wrote this row
-        /// (`untrusted_sources`), each read under its own grant.
-        public var steeredBy: [String] = []
-    }
-
     /// Presentation-only union for Simple and home rows. Route readers use lines.
     /// Everything said between her and the contact, oldest first, from its
     /// sessions: the live logs and the copies each compaction kept, once each
@@ -302,9 +266,8 @@ public enum ContactThread {
     /// The contact's lines are the turns it sent and its saved replies; hers
     /// are her sends (each carries its send id) and her answers to turns it
     /// started. Her turn on one of its replies is her own: it went nowhere.
-    public static func mergedLines(dataRoot: URL, owner: String, tailBytes: Int? = nil, identity: AgentContactIdentity? = nil,
+    public static func mergedLines(dataRoot: URL, owner: String, tailBytes: Int? = nil, identity: AgentContactIdentity,
                                    transcripts: [(String, URL)]? = nil) throws -> [Line] {
-        let identity = identity ?? AgentContactIdentity(dataRoot: dataRoot)
         let owners = identity.owners(owner)
         var seen: Set<String> = []
         return try owners.flatMap { door -> [Line] in
@@ -330,71 +293,21 @@ public enum ContactThread {
         let stamp = (plan.map(\.1) + [ContactReplyReads.url(dataRoot)]).map { fileStamp($0.path) }
         if let hit = cache.withLock({ $0[key] }), hit.stamp == stamp { return hit.lines }
         let fetched = ContactReplyReads.read(dataRoot)
-        let dates = ISO8601DateFormatter()
-        dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        var seen: Set<String> = [], started: Set<String> = [], found: [(line: Line, run: String?)] = []
+        var rows: [Line] = []
         for (session, file) in plan {
             guard let text = read(file, tailBytes: tailBytes) else { continue }
-            for row in text.split(separator: "\n") {
-                guard let object = try? JSONSerialization.jsonObject(with: Data(row.utf8)) as? [String: Any],
-                      let role = object["role"] as? String, let id = object["id"] as? String, !seen.contains(id),
-                      let content = object["content"] as? String else { continue }
-                let metadata = object["metadata"] as? [String: Any]
-                let origin = metadata?["origin"] as? [String: Any]
-                let envelope = metadata?["envelope"] as? [String: Any]
-                let run = object["runId"] as? String
-                var said = content
-                let answers = (origin?["replyTo"] as? String).flatMap {
-                    $0.hasPrefix("agent-conversation:") ? String($0.dropFirst("agent-conversation:".count)) : nil
-                }
-                if role == "user" {
-                    // A peer's turns come over the agent bridge; a built-in lane's carry its name; a
-                    // trusted contact's handed-over reply runs as chat and names it in its sources.
-                    guard envelope?["surface"] as? String == "agent-bridge" || origin?["agent"] as? String == owner
-                            || (origin?["peerSources"] as? [String])?.contains("peer:" + owner) == true else { continue }
-                    // A reply handed to her, or a pull of Dot's room: her answer stays hers.
-                    let handed = answers != nil
-                        || (envelope?["correlationId"] as? String)?.hasPrefix("dot-room:") == true
-                    if !handed, let run { started.insert(run) }
-                    said = bridgedText(content)
-                    // The note under Dot's turn is for her, not his words.
-                    if let note = said.range(of: "(Dot sees your answer only if", options: .backwards) {
-                        said = said[..<note.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-                    }
-                } else if role != "assistant" || !(metadata?["dotClientUserMessageID"] is String || run != nil) {
-                    continue
-                }
-                seen.insert(id)
-                guard !said.isEmpty else { continue }
-                let at = (object["createdAt"] as? String).flatMap { dates.date(from: $0) } ?? .distantPast
-                found.append((Line(id: id, mine: role == "assistant", text: said, at: at,
-                                   byPerson: metadata?["byPerson"] as? Bool == true,
-                                   fetched: role == "assistant" && fetched.contains { $0.session == session && $0.run == run },
-                                   answers: role == "user" ? answers : nil,
-                                   sendID: role == "assistant" ? metadata?["dotClientUserMessageID"] as? String : nil,
-                                   sendState: metadata?["sendState"] as? String,
-                                   source: role == "user" ? Self.stamp(id: id, metadata: metadata).source : nil,
-                                   steeredBy: Self.stamp(id: id, metadata: metadata).steeredBy),
-                              metadata?["dotClientUserMessageID"] is String ? nil : run))
+            for raw in text.split(separator: "\n") {
+                guard case .object(let object)? = try? JSONValue.parse(Data(raw.utf8)),
+                      case .string? = object["id"], case .string? = object["content"],
+                      case .string(let role)? = object["role"], role == "user" || role == "assistant" else { continue }
+                var line = Line(object, role: role)
+                line.fetched = line.mine && fetched.contains { $0.session == session && $0.run == line.run }
+                rows.append(line)
             }
         }
-        // A live reply's starting turn may now live only in compaction originals.
-        let result = found.filter { !$0.line.mine || ($0.run.map(started.contains) ?? true) }
-            .map(\.line).sorted { $0.at < $1.at }
+        let result = project(rows, style: .thread, thread: owner).sorted { $0.at < $1.at }
         cache.withLock { $0[key] = (stamp, result) }
         return result
-    }
-
-    /// A saved row's stamp (`TranscriptRowStamp`, the one projection every
-    /// reader uses): the principal it attests and the peers that steered it.
-    static func stamp(id: String, metadata: [String: Any]?) -> (source: String?, steeredBy: [String]) {
-        let stamp = TranscriptRowStamp.of(id: id, role: "user", metadata: metadata)
-        return (stamp.source, stamp.steeredBy)
-    }
-
-    public static func stamp(id: String, metadata: [String: JSONValue]) -> (source: String?, steeredBy: [String]) {
-        let stamp = TranscriptRowStamp.of(id: id, role: "user", metadata: metadata)
-        return (stamp.source, stamp.steeredBy)
     }
 
     /// `lines` re-parsed every session file a contact owns on each Simple
@@ -411,25 +324,12 @@ public enum ContactThread {
             + "\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec) \(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
     }
 
-    /// A bridged turn without the bracketed notes the bridge puts on top (and
-    /// the bare contact-metadata line replies carried before 09-25).
-    public static func bridgedText(_ content: String) -> String {
-        let text = BridgeRoutingPrefix.stripping(content)
-        var rows = text.split(separator: "\n", omittingEmptySubsequences: false)[...]
-        while let first = rows.first?.trimmingCharacters(in: .whitespaces),
-              first.isEmpty || (first.hasPrefix("[") && first.hasSuffix("]")) || (first.hasPrefix("{\"agent\"") && first.hasSuffix("}")) {
-            rows = rows.dropFirst()
-        }
-        return rows.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
     private static func read(_ file: URL, tailBytes: Int?) -> String? {
         guard let tailBytes else { return try? String(contentsOf: file, encoding: .utf8) }
         guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
-        try? handle.seek(toOffset: size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0)
-        guard var data = try? handle.readToEnd() else { return nil }
+        guard var data = read(handle, from: size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0) else { return nil }
         // The first line of a cut window is partial.
         if size > UInt64(tailBytes), let end = data.firstIndex(of: 0x0A) { data = data[data.index(after: end)...] }
         return String(data: data, encoding: .utf8)

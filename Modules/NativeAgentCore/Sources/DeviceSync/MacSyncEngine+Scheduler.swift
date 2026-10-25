@@ -1,7 +1,9 @@
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TriggerScheduler
+// Blueprint: | `MacSyncEngine+Scheduler.swift` | `MacSyncEngine`: `schedulerSnapshotData`, `startSchedulerSnapshotObservation` |
 
 enum MobileSchedulerProjection {
     static func read(using writer: any SchedulerJobWriter, jobID: String? = nil) async throws -> MobileSchedulerSnapshot {
@@ -33,7 +35,6 @@ enum MobileSchedulerProjection {
                     "interval_seconds": "Seconds", "intervalSeconds": "Seconds",
                     "minutes": "Minutes", "hours": "Hours", "days": "Days",
                     "at": "At", "time": "Time", "hour": "Hour", "minute": "Minute",
-                    "timezone": "Time zone", "tz": "Time zone",
                     "weekdays": "Weekdays", "weekday": "Weekday",
                     "day": "Day", "monthday": "Day", "monthDay": "Day",
                     "expression": "Cron", "cron": "Cron", "firstRunAt": "First run",
@@ -56,7 +57,10 @@ enum MobileSchedulerProjection {
                 cancelledAt: try optionalString("cancelledAt")
             )
         }
-        return MobileSchedulerSnapshot(capturedAt: capturedAt, jobs: jobs)
+        var snapshot = MobileSchedulerSnapshot(capturedAt: capturedAt, jobs: jobs)
+        // The Mac's current zone rides with the facts; the phone shows them in it (Law 7).
+        snapshot.mac_time_zone = TimeZone.autoupdatingCurrent.identifier
+        return snapshot
     }
 }
 

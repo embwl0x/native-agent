@@ -6,6 +6,6 @@ Test the access they actually asked about, and do not infer it from something ad
 
 If it is still blocked, two things worth investigating are whether macOS granted it to a different executable than the one you run inside, and whether the app has been relaunched since the grant. Investigate them; do not announce either as the diagnosis.
 
-Keep the kinds of access separate. Pixels, accessibility, and app control are different grants: reading text through accessibility does not universally require Screen Recording, capturing the screen does, and controlling apps needs automation. Each is granted on its own and needs its own check.
+Check each grant separately: Accessibility permits UI reads and actions; Screen Recording permits screen pixels; Automation permits Apple Events to each target app. Accessibility text reads do not universally need Screen Recording, and UI control does not universally need Automation.
 
 No single read proves all your access. Report the shape honestly — what you reached, what you did not — and name the check you ran.

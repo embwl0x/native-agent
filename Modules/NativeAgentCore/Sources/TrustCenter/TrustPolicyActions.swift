@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TrustPolicyActions.swift` | `TrustPolicyActions` struct; `developerModePatchBody`, `saveMemoryPolicy`, `saveAgentAccessMode`; `saveMacControlPolicy` patches edited fields and checks their baseline inside the policy lock |
 
 
 /// Operator choices mapped to the canonical checked TrustCenter writer.
@@ -104,16 +105,29 @@ public struct TrustPolicyActions: Sendable {
         return try await postTrustWrite(body: ["memoryPolicy": memoryPolicy])
     }
 
-    // PATCH-2026-05-07: mac-control-ui-1 POST macControlPolicy block to /v1/trust.
+    /// Save only edited fields. Compare their original values with the current
+    /// effective policy inside the canonical writer's lock; a conflicting edit
+    /// leaves the policy untouched, and unrelated concurrent choices survive.
     public func saveMacControlPolicy(
         _ policy: TrustMacControlPolicy,
+        comparedTo baseline: TrustMacControlPolicy,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
     ) async throws -> TrustPolicy {
-        let body: [String: Any] = ["macControlPolicy": policy.wireValue]
+        let baselineValues = baseline.wireValue.mapValues { JSONValue(fromFoundation: $0) }
+        let changes = policy.wireValue.filter { baselineValues[$0.key] != JSONValue(fromFoundation: $0.value) }
+        let changedKeys = Array(changes.keys)
         return try await TrustPolicyToolWriter.applyTrustPolicyPatch(
-            body: body,
+            body: ["macControlPolicy": changes],
             dataRoot: dataRoot,
-            guardedByLockedPolicy: guardedByLockedPolicy
+            guardedByLockedPolicy: { locked in
+                try guardedByLockedPolicy?(locked)
+                let current = try TrustPolicy(policyObject: SwiftNativeTrustCenter.normalizeTrustPolicy(locked))
+                    .macControlPolicy ?? TrustMacControlPolicy()
+                let currentValues = current.wireValue.mapValues { JSONValue(fromFoundation: $0) }
+                guard changedKeys.allSatisfy({ currentValues[$0] == baselineValues[$0] }) else {
+                    throw TrustCenterError.policyConflict
+                }
+            }
         )
     }
 

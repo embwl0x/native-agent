@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+// Blueprint: | `SecretActionEnvelope.swift` | `SecretActionEnvelope` enum; `open` |
 
 /// Wire contract mirrored by the phone. Only call open after transport and
 /// paired-device signature verification. Never put decrypted fields in receipts.

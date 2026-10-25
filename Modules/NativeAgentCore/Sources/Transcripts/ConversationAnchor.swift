@@ -2,6 +2,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+import NativeAgentShared
+
+// Blueprint: | `ConversationAnchor.swift` | `ConversationAnchor`: shared current-person conversation publication, protected sessions and adoption decisions across surfaces |
 
 // MARK: - The conversation anchor
 //
@@ -47,28 +50,14 @@ import TurnTrace
 // recently became active on. That is the only rule, it needs no arbitration
 // table, and it degrades correctly as surfaces are added.
 
-/// The published anchor. Deliberately three fields — anything more would be a
-/// routing table wearing a pin's name.
-public struct ConversationAnchorPin: Sendable, Equatable, Codable {
-    /// The chat session id the anchor names. A storage key, as always: it is
-    /// NOT identity and confers no trust (see `TurnEnvelope`).
-    public let sessionId: String
-    /// Which surface published it — for display and diagnostics ONLY. No
-    /// consumer may branch on this value.
-    public let source: String
-    /// ISO8601. Most recent publish wins.
-    public let updatedAt: String
-
-    public init(sessionId: String, source: String, updatedAt: String) {
-        self.sessionId = sessionId
-        self.source = source
-        self.updatedAt = updatedAt
-    }
-}
-
 /// The publish/consume seam. Static because it owns exactly one file and has
 /// no state of its own.
+/// Storage: anchor_pin.json is excluded from local backup and data export;
+/// included in off-disk backup, the phone's chat navigation and PrivacyMap/chat.
 public enum ConversationAnchor {
+    /// Posted after a publish moves the anchor.
+    public static let didPublish = Notification.Name("NativeAgent.ConversationAnchor.didPublish")
+
     /// `<dataRoot>/chat/anchor_pin.json`.
     public static func path(dataRoot: URL) -> URL {
         dataRoot
@@ -142,7 +131,7 @@ public enum ConversationAnchor {
             .appendingPathComponent("sessions.json")
         let anchorPath = path(dataRoot: dataRoot)
 
-        return try await persistence.withFileLock(sessionsPath) { () async throws -> PublishOutcome in
+        let outcome = try await persistence.withFileLock(sessionsPath) { () async throws -> PublishOutcome in
             let parent = anchorPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
             let existing = readUnlocked(at: anchorPath)
@@ -184,6 +173,8 @@ public enum ConversationAnchor {
             )
             return .published(pin)
         }
+        if case .published = outcome { NotificationCenter.default.post(name: didPublish, object: nil) }
+        return outcome
     }
 
     /// The current anchor, or nil. A plain read — no lock, because a torn read

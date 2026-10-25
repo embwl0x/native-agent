@@ -2,6 +2,8 @@ import AppToolRuntime
 import SwiftUI
 import PersistenceCore
 
+// Blueprint: | `SimpleViewMode.swift` | `ViewModeSwitch`: Simple/Advanced/Agent selection and shared top chrome placement |
+
 // Simple view, User 2026-09-23 (approved from a mockup): one floating glass
 // sidebar — the agent, the agents it talks to, its helpers — beside the
 // agent's ordinary chat. No settings pages; everything else is asked of the

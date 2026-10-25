@@ -22,6 +22,8 @@ import NativeAgentCore
 import PersistenceCore
 import Transcripts
 
+// Blueprint: | `REMLessonOrigin.swift` | `REMLessonOrigin`: approved lesson provenance and origin moments, retaining what changed and the exchange that taught it |
+
 public enum REMLessonOrigin {
     public static let kind = "lesson_origin"
     static let momentLimit = 3
@@ -44,9 +46,10 @@ public enum REMLessonOrigin {
         Set(text.lowercased().split { !$0.isLetter }.map(String.init).filter { $0.count >= 4 })
     }
 
-    /// The moments behind the lesson: same conversation, same lived day,
-    /// ranked by the words they share with the passages and what changed. A
-    /// moment that shares none is not evidence of this lesson.
+    /// The moments behind the lesson: same conversation, same lived day (when
+    /// it happened, not when it was reviewed), ranked by the words they share
+    /// with the passages and what changed. A moment that shares none is not
+    /// evidence of this lesson.
     public static func originMoments(
         for row: REMProposalRow,
         moments: [MemoryRecord],
@@ -59,7 +62,7 @@ public enum REMLessonOrigin {
         let ranked: [(MemoryRecord, Int)] = moments.compactMap { record in
             guard (record.status ?? "active") == "active", MemoryMoments.isMoment(record.extras),
                   let session = MemoryMoments.metadataString(record.extras, "session_id"),
-                  let at = MemoryMoments.parseTimestamp(record.createdAt),
+                  let at = MemoryMoments.parseTimestamp(record.observedAt ?? record.createdAt),
                   days.contains("\(session)|\(MemoryMoments.dayKey(at))"),
                   ownExchange(record, session: session, peerSessionTrusted: peerSessionTrusted) else { return nil }
             let shared = words(record.text).intersection(about).count
@@ -89,7 +92,7 @@ public enum REMLessonOrigin {
     public static func originText(for row: REMProposalRow, moment: MemoryRecord?) -> String? {
         guard let changed = row.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines),
               !changed.isEmpty else { return nil }
-        let lived = moment.flatMap { MemoryMoments.parseTimestamp($0.createdAt) }.map { MemoryMoments.dayKey($0) }
+        let lived = moment.flatMap { MemoryMoments.parseTimestamp($0.observedAt ?? $0.createdAt) }.map { MemoryMoments.dayKey($0) }
             ?? row.livedDates?.last ?? String(row.createdAt.prefix(10))
         guard let said = moment.flatMap({ MemoryMoments.metadataString($0.extras, "quote") })?
             .trimmingCharacters(in: .whitespacesAndNewlines), !said.isEmpty else {

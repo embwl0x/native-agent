@@ -1,7 +1,8 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import Skills
+import PersonaEngine
+// Blueprint: | `PersonaSystemActions.swift` | Protected persona tool reads through PersonaEngine's document selection and the filesystem owner's sensitive-path/regular-descriptor checks; skill/workspace read adapters; `ClockReply` owns timezone selection and date projection with local/chat field adapters |
 
 // MARK: - Native persona/system connector actions
 //
@@ -9,14 +10,7 @@ import Skills
 // workspace listings and the clock. Persona reads resolve the sensitive-path
 // fence before opening a verified regular-file descriptor.
 
-// MARK: - Constants
-
-/// the retired daemon `_SKILL_DESC_MAX_LEN = 280`
-
-/// the retired daemon `_PERSONA_READ_KINDS`.
-let personaReadKinds: Set<String> = ["soul", "user", "voice", "growth", "agents"]
-
-enum PersonaSystemActions {
+package enum PersonaSystemActions {
 
     // MARK: helpers
 
@@ -38,45 +32,17 @@ enum PersonaSystemActions {
         return PersistenceCore.defaultDataRoot()
     }
 
-    static func personaPath(kind: String, personaRoot: URL) -> URL? {
-        switch kind {
-        case "soul":   return personaRoot.appendingPathComponent("SOUL.md")
-        case "user":   return personaRoot.appendingPathComponent("USER.md")
-        case "voice":  return personaRoot.appendingPathComponent("VOICE.md")
-        case "growth": return personaRoot.appendingPathComponent("GROWTH.md")
-        case "agents": return personaRoot.appendingPathComponent("AGENTS.md")
-        default:
-            return nil
-        }
-    }
-
     // MARK: - persona_read
 
-    static func personaRead(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
-        // Wave 36 W11 (pre-flip parity fix, gpt-5.5 review): canonicalize `kind`
-        // with the SAME pipeline the daemon's `_exec_persona_read` uses —
-        // `unicodedata.normalize("NFKC", str(inp.get("kind") or "")).strip().lower()`
-        //. The
-        // original wave-34 W06 port only `.trimmingCharacters`-trimmed, so a
-        // cased (" SOUL "), fullwidth ("ＳＯＵＬ" U+FF33…), or NBSP/ideographic-
-        // whitespace variant of a valid kind — which the daemon ACCEPTS — would
-        // be REJECTED natively as bad_input, a real divergence on the flip path.
-        // Use `precomposedStringWithCompatibilityMapping` (= NFKC, folds
-        // fullwidth → ASCII; NFC does NOT) then strip then lower, identical to
-        // the verified PersonaWriteGuard canonicalization. `.whitespacesAndNewlines`
-        // trims NBSP/ideographic/narrow-NBSP, matching Python `str.strip()` after
-        // NFKC maps NBSP U+00A0 → ASCII space.
-        let kind = FileSystemActions.stringField(input, "kind")
-            .precomposedStringWithCompatibilityMapping
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        if !personaReadKinds.contains(kind) {
-            let allowed = personaReadKinds.sorted().joined(separator: ", ")
+    package static func personaRead(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
+        let kind = SwiftNativePersonaEngine.canonicalizeKind(FileSystemActions.stringField(input, "kind"))
+        if !SwiftNativePersonaEngine.personaReadKinds.contains(kind) {
+            let allowed = SwiftNativePersonaEngine.personaReadKinds.sorted().joined(separator: ", ")
             return FileSystemActions.errResult(
                 "kind must be one of: \(allowed)", code: "bad_input")
         }
         let personaRoot = personaRootURL(ctx)
-        guard let target = personaPath(kind: kind, personaRoot: personaRoot) else {
+        guard let target = SwiftNativePersonaEngine.personaDocumentPath(kind: kind, root: personaRoot) else {
             return FileSystemActions.errResult("Could not resolve persona path", code: "bad_input")
         }
 
@@ -353,6 +319,23 @@ enum PersonaSystemActions {
     // MARK: - time_now
 
     static func timeNow(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
+        ClockReply.read(input) { $0.local }
+    }
+}
+
+/// One clock projection, with the existing local-action and chat field adapters.
+package struct ClockReply {
+    let now: Date
+    let zone: TimeZone
+    let zoneName: String
+
+    private var calendar: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        return calendar
+    }
+
+    package static func read(_ input: [String: JSONValue], project: (ClockReply) -> JSONValue) -> JSONValue {
         // Python: inp.get("timezone") or inp.get("tz") or "" ; .strip()
         var tzName = FileSystemActions.stringField(input, "timezone")
         if tzName.isEmpty { tzName = FileSystemActions.stringField(input, "tz") }
@@ -372,12 +355,35 @@ enum PersonaSystemActions {
             if tzName.isEmpty { tzName = "local" }
         }
 
-        let now = Date()
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = tz
-        let comps = cal.dateComponents(
-            [.year, .month, .day, .hour, .minute, .second, .weekday], from: now)
+        return project(ClockReply(now: Date(), zone: tz, zoneName: tzName))
+    }
 
+    package var chat: JSONValue {
+        let tz = zone, cal = calendar
+        let comps = cal.dateComponents([.weekday], from: now)
+        let local = ISO8601DateFormatter()
+        local.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        local.timeZone = tz
+        let human = DateFormatter()
+        human.dateStyle = .full
+        human.timeStyle = .medium
+        human.timeZone = tz
+        return .object([
+            "status": .string("ok"),
+            "iso_utc": .string(ISO8601DateFormatter().string(from: now)),
+            "iso_local": .string(local.string(from: now)),
+            "epoch_seconds": .int(Int64(now.timeIntervalSince1970)),
+            "weekday": .string(weekdayName(comps.weekday ?? 1)),
+            "day_of_year": .int(Int64(cal.ordinality(of: .day, in: .year, for: now) ?? 0)),
+            "human": .string(human.string(from: now)),
+            "timezone": .string(tz.identifier),
+            "timezone_offset_seconds": .int(Int64(tz.secondsFromGMT(for: now))),
+        ])
+    }
+
+    package var local: JSONValue {
+        let tz = zone, tzName = zoneName, cal = calendar
+        let comps = cal.dateComponents([.year, .month, .day, .hour, .minute, .second, .weekday], from: now)
         // ISO-8601 with offset (mirror datetime.isoformat() incl. +HH:MM offset).
         let isoLocal = isoFormat(now, tz: tz)
         let isoUTC = isoFormat(now, tz: TimeZone(identifier: "UTC")!)

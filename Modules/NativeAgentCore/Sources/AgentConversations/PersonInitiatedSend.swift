@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `PersonInitiatedSend.swift` | `PersonInitiatedSend` class; `matches`, `claim` |
 
 /// A message the person typed into a contact's thread and sent with their own
 /// click or Return. That act is the consent for exactly that one send, so the

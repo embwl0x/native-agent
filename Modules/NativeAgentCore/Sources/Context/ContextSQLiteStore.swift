@@ -3,6 +3,8 @@ import Foundation
 import GRDB
 import PersistenceCore
 
+// Blueprint: | `ContextSQLiteStore.swift` | `ContextSQLiteStore`: derived immutable Context generations, feedback, health and pruning; canonical sources remain authoritative |
+
 public struct ContextStoreHealthSnapshot: Sendable, Equatable {
     public let databaseURL: URL
     public let activeGenerationID: Int64?
@@ -31,6 +33,8 @@ public struct ContextStoreHealthSnapshot: Sendable, Equatable {
 /// Rebuildable ContextFlow storage. Canonical persona, memory, skill, and
 /// project sources remain authoritative; this actor only publishes immutable
 /// derived generations.
+/// Storage: local backup excludes this derived SQLite store; off-disk backup
+/// includes it. No data export or phone sync; PrivacyMap category: context.
 public actor ContextSQLiteStore {
     public static let diskStorageOwner = DiskStorageOwner.retained(id: "context", roots: ["context"],
         policy: "Kept to keep recall available; this active derived index cannot be safely dropped during cleanup.")

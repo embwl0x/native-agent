@@ -7,6 +7,7 @@ import Transcripts
 import TurnTrace
 import ProviderRouting
 import Experiences
+// Blueprint: | `ChatOrchestration+Continuation.swift` | `SwiftNativeTurnEngine`: `executeTurnWithStreamingToolLoop`; `TurnCheckpointScope`, serialized `TurnCheckpointWriter`; same-turn transcript/receipt recovery and finished-run cleanup |
 
 public enum TurnCheckpointScope {
     @TaskLocal public static var resuming: TurnCheckpoint?
@@ -49,6 +50,7 @@ actor TurnCheckpointWriter {
     func receiptWritten() {
         pendingCalls = max(0, pendingCalls - 1)
         record.runningStep = pendingCalls > 0 ? 1 : nil
+        record.replyChoices = ReplyChoices.current?.paths ?? record.replyChoices
         record.peerSources = PeerDataTaint.current?.checkpointSources ?? record.peerSources
         record.answeredPeers = PeerDataTaint.current?.elevatedSources ?? record.answeredPeers
         persist()
@@ -105,8 +107,7 @@ extension SwiftNativeChatOrchestrationClient {
                 "sessionId": .string(sessionId), "runId": .string(savedRun)])
             fields["metadata"] = .object(metadata)
             rows[index] = .object(fields)
-            let text = try rows.map { try $0.serialize(pretty: false) }.joined(separator: "\n") + "\n"
-            try await persistence.writeDataAtomicDurable(Data(text.utf8), to: path)
+            try ContactThread.replace(rows, to: path)
         }
     }
 
@@ -162,7 +163,7 @@ extension SwiftNativeChatOrchestrationClient {
         for turnId in try TurnCheckpoint.turnIds(dataRoot: dataRoot, sessionId: sessionId) {
             do {
                 if let checkpoint = try TurnCheckpoint.read(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId),
-                   checkpoint.runId == runId { found.matching.append(checkpoint) }
+                   checkpoint.stoppedReason == nil, checkpoint.runId == runId { found.matching.append(checkpoint) }
             } catch {
                 found.damaged.append(turnId)
                 nativeLog("Turn checkpoint %@ is unreadable and may be run %@; its answer stays owed: %@",
@@ -206,12 +207,12 @@ extension SwiftNativeChatOrchestrationClient {
                 attachments: try CodexCompletionTranscriptEvidence.decodeAttachments(metadata["attachments"]), terminalState: state)
             if case .int(let count)? = metadata["workingCommentaryChars"] { response.workingCommentaryCharacters = Int(count) }
             if state != .completed {
-                response.runtimeStatus = state == .waiting ? "waiting on you" : state == .failed ? "failed" : "interrupted"
+                response.runtimeStatus = state == .waiting ? "waiting on you" : state.rawValue
             }
             let answerRef = Self.transcriptRef(sessionId, outcome.messageID)
             let heardID = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])?.answerExperienceID ?? outcome.turnID
             // The same birth the turn wrote, so a lost one is restored and a kept one stands.
-            Self.recordAnswer(id: Experience.answer(run: runId), heardID: heardID, evidence: answerRef, state: state,
+            await Self.recordAnswer(id: Experience.answer(run: runId), heardID: heardID, evidence: answerRef, state: state,
                               dataRoot: dataRoot) { [attachments = response.attachments ?? []] in
                 var answer = Experience(id: Experience.answer(run: runId), kind: .answer, cause: [heardID],
                     evidence: [answerRef], face: Self.face(content, attachments), addressedTo: ["conversation:" + sessionId])
@@ -256,6 +257,7 @@ extension SwiftNativeChatOrchestrationClient {
 
     public func resumeTurn(_ checkpoint: TurnCheckpoint, request: TurnRequest,
                            progress: ChatOrchestrationProgressHandler? = nil) async throws -> ChatResponse {
+        guard try DataRootLife.isCurrent(checkpoint.lifeID, in: dataRoot) else { throw CancellationError() }
         let history = try await history.messagesWithStats(forSessionId: checkpoint.sessionId, strictEvidence: true)
         guard history.stats.malformedRowCount == 0, history.stats.invalidShapeRowCount == 0 else {
             throw ChatOrchestrationError.underlying("Repair this turn's transcript before resuming it.")
@@ -266,13 +268,17 @@ extension SwiftNativeChatOrchestrationClient {
             let state = response.terminalState ?? .completed
             let reason: TurnEngineResult.TerminalReason = state == .completed ? .replyCompleted
                 : state == .waiting ? .interactionRequired : state == .failed ? .executionFailed : .incomplete
-            try await TurnCheckpointScope.$resuming.withValue(checkpoint) {
-            try await settleTurnCheckpoint(TurnTraceEvent(turnId: checkpoint.turnId, kind: "turn.terminal",
+            let terminal = TurnTraceEvent(turnId: checkpoint.turnId, kind: "turn.terminal",
                 sessionId: checkpoint.sessionId, surface: checkpoint.surface, payload: .object([
                     "schema": .string("metacognition.observed.v1"), "status": .string(state.rawValue),
-                    "terminalReason": .string(reason.rawValue), "observedBy": .string("checkpoint_recovery")])),
-                sessionId: checkpoint.sessionId, runId: checkpoint.runId)
+                    "terminalReason": .string(reason.rawValue), "observedBy": .string("checkpoint_recovery")]))
+            let settled: Result<Void, any Error> = await settle { [self] in
+                do {
+                    try await settleTurnCheckpoint(terminal, sessionId: checkpoint.sessionId, runId: checkpoint.runId)
+                    return .success(())
+                } catch { return .failure(error) }
             }
+            try settled.get()
             return response
         }
         guard let user = rows.first(where: { $0.role == "user" }) else {
@@ -324,7 +330,7 @@ extension SwiftNativeChatOrchestrationClient {
 
 extension SwiftNativeTurnEngine {
     /// What an accepted turn owes its door, from the bindings it runs under.
-    nonisolated static func continuation(runId: String?, sessionId: String?, surface: String, userMessage: String,
+    nonisolated static func continuation(dataRoot: URL, runId: String?, sessionId: String?, surface: String, userMessage: String,
                                          fileAccess: String, capabilityProfile: String?) throws -> DeskContinuation? {
         guard let runId, !runId.isEmpty else { return nil }
         let envelope = TurnEnvelope.current(surface: surface)
@@ -336,11 +342,13 @@ extension SwiftNativeTurnEngine {
                              ("correlationId", route?.correlationId), ("requesterUserId", route?.requesterUserId)] {
             if let value { reply[key] = .string(value) }
         }
-        return DeskContinuation(runID: runId, sessionID: sessionId, surface: surface,
+        var record = DeskContinuation(runID: runId, sessionID: sessionId, surface: surface,
                 envelope: metadata, replyRoute: reply, remainingWork: userMessage, fileAccess: fileAccess,
                 peerSources: PeerDataTaint.current?.checkpointSources, capabilityProfile: capabilityProfile,
                 commandSignatureVerified: envelope.commandSignatureVerified, declaredRemote: envelope.declaredRemote,
                 helperDefinition: try StandingBotContinuity.currentBot.map { try JSONValue.fromEncodable($0) })
+        record.lifeID = try DataRootLife.current(in: dataRoot)
+        return record
     }
 
     /// Stop is the turn's one cancel link: the run's raised flag cancels its
@@ -370,7 +378,7 @@ extension SwiftNativeTurnEngine {
             userMessage: saved.remainingWork, envelope: saved.envelope, replyRoute: saved.replyRoute,
             fileAccess: saved.fileAccess, capabilityProfile: saved.capabilityProfile, peerSources: saved.peerSources,
             commandSignatureVerified: saved.commandSignatureVerified, declaredRemote: saved.declaredRemote,
-            helperDefinition: saved.helperDefinition)
+            helperDefinition: saved.helperDefinition, lifeID: saved.lifeID)
     }
 
     public func executeTurnWithStreamingToolLoop(
@@ -393,8 +401,8 @@ extension SwiftNativeTurnEngine {
             }
             await progress?(event)
         }
-        let saved = remPinsDataRoot == nil ? nil : try Self.continuation(runId: runId, sessionId: sessionId,
-            surface: surface, userMessage: userMessage, fileAccess: fileAccess, capabilityProfile: capabilityProfile)
+        let saved = try remPinsDataRoot.map { try Self.continuation(dataRoot: $0, runId: runId, sessionId: sessionId,
+            surface: surface, userMessage: userMessage, fileAccess: fileAccess, capabilityProfile: capabilityProfile) } ?? nil
         let journal: DeskContinuationTurn?
         if let current = DeskContinuationScope.current { journal = current }
         else if let root = remPinsDataRoot, let saved {

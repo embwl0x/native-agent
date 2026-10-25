@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 
+// Blueprint: | `PromptPrefixHealthCheck.swift` | `PromptPrefixHealthCheck`: measured prefix/cache-shape health from real turn observations and provider token receipts |
+
 // MARK: - Prompt prefix health (Runtime)
 //
 // The v2Prefix shape (a08a8814 and the commits around it) makes the identity
@@ -115,14 +117,14 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
     public func run() async -> CheckResult {
         let moment = Date()
         if let memo = await cache.fresh(now: moment) { return memo }
-        let result = measure()
+        let result = await measure()
         await cache.store(result, at: moment)
         return result
     }
 
     // MARK: - Measurement
 
-    private func measure() -> CheckResult {
+    private func measure() async -> CheckResult {
         var v2FirstCalls: [String: TurnObservation] = [:]   // turnId → first call
         var callsByTurn: [String: [TurnObservation]] = [:]
         var toolFingerprints: [String: String] = [:]        // turnId → tool schema sha
@@ -135,7 +137,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
 
         let moment = Date()
         let window = DoctorWindowFloor.resolve(root: root, now: moment)
-        let summary = TurnTraceWindowReader.scan(
+        let summary = await TurnTraceWindowReader.scan(
             root: root,
             now: moment,
             days: window.dayFilesToRead(now: moment, maximum: maximumDayFiles),
@@ -208,16 +210,12 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         if let day = summary.unreadableDays.first {
             let file = root.appendingPathComponent("turn_traces/\(day).jsonl")
             return CheckResult(source: file.path,
-                nextCall: ToolFailureError.fileRepairCall(file, dataRoot: root,
-                    shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."),
                 id: id, title: title, status: "fail",
                 detail: "\(summary.unreadableDays.count) turn-trace day file(s) exist but could"
-                    + " not be read (\(summary.unreadableDays.joined(separator: ", ")))."
-                    + " Prefix-cache health is UNMEASURED \(window.describedAs) — this row"
-                    + " is not reporting zero problems, it is reporting that it could not"
-                    + " look.",
-                harm: "Prefix reuse problems cannot be diagnosed from the saved turns."
-            )
+                    + " not be read (\(summary.unreadableDays.joined(separator: ", "))), so prefix-cache health is unmeasured \(window.describedAs).",
+                harm: "Prefix reuse problems cannot be diagnosed from the saved turns.",
+                human_action: ToolFailureError.fileRepairInstruction(file,
+                    shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."))
         }
 
         var coverageParts: [String] = []
@@ -231,19 +229,18 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         if summary.malformedLines > 0 {
             coverageParts.append("\(summary.malformedLines) trace line(s) did not parse")
         }
-        let coverageDetail = coverageParts.isEmpty ? "" : " " + coverageParts.joined(separator: "; ") + "."
+        let coverageDetail = coverageParts.isEmpty ? "" : "; " + coverageParts.joined(separator: "; ")
 
         let shapeLine = shapeMixLine(
             v2: v2CallCount, v1: v1CallCount, unshaped: unshapedCallCount
-        ) + " Ignored \(ignoredSurfaces) calls outside chat and \(ignoredSmallCalls) chat calls"
-            + " below \(minimumCacheInputTokens) input tokens (too small to judge cache reuse)."
+        ) + "; ignored \(ignoredSurfaces) calls outside chat and \(ignoredSmallCalls) chat calls"
+            + " below \(minimumCacheInputTokens) input tokens (too small to judge cache reuse)"
 
         if summary.isEmptyFeed {
             return CheckResult(source: "turn_traces/",
                 id: id, title: title, status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
-                    + " data/turn_traces. Prefix-cache health has not been observed."
-                    + " \(shapeLine)",
+                    + " data/turn_traces, so prefix-cache health has not been observed; \(shapeLine).",
                 repair: nil
             )
         }
@@ -253,8 +250,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 id: id, title: title, status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
                     + " trace day(s) read and \(summary.matchedRows) row(s) in window, but not"
-                    + " one eligible chat call used the current prompt format. Nothing about prefix reuse"
-                    + " can be measured. \(shapeLine)\(coverageDetail)",
+                    + " one eligible chat call used the current prompt format, so prefix reuse cannot be measured; \(shapeLine)\(coverageDetail).",
                 repair: nil
             )
         }
@@ -489,18 +485,14 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 "\(excess) violation(s) above the tolerance of \(toleratedPerSessionDay)"
                     + " per session per day"
             )
-            repair = "The v2 prefix is not being reused. Check that the identity block is still"
-                + " a strict prefix of the stable block and that only one cache breakpoint sits"
-                + " at the end of the stable mass (v2Prefix)."
+            repair = "Correct NativeAgent's prompt assembly so the identity block remains a strict prefix of the stable block and one cache breakpoint sits at the end of the stable mass (v2Prefix)."
         } else if !anthropicBelowFloor.isEmpty {
             status = "warn"
             parts.append(
                 "Anthropic lane(s) below the \(Int(minimumAnthropicHitPercent))% floor:"
                     + " \(anthropicBelowFloor.joined(separator: ", "))"
             )
-            repair = "Low read share on an Anthropic lane means the cached prefix is being"
-                + " rebuilt more often than it is read. Compare volatileBlockChars against the"
-                + " stable mass for the affected sessions."
+            repair = "Review NativeAgent's prompt assembly using volatileBlockChars and the stable mass for the affected Anthropic sessions to correct repeated prefix rebuilds."
         } else if !coverageParts.isEmpty || unjudgedFirstCalls > 0 {
             // Incomplete coverage or missing metrics cannot certify health.
             status = "unmeasured"

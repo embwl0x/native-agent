@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `SubconsciousVitalsCheck.swift` | `SubconsciousVitalsCheck`: measured capsule/felt vocabulary and chemistry health from canonical local evidence |
+
 // MARK: - Subconscious vitals (Cognition)
 //
 // The cognitive capsule is the one part of her that nobody sees. It rides
@@ -55,14 +57,14 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
     public func run() async -> CheckResult {
         let moment = Date()
         if let memo = await cache.fresh(now: moment) { return memo }
-        let result = measure()
+        let result = await measure()
         await cache.store(result, at: moment)
         return result
     }
 
     // MARK: - Measurement
 
-    private func measure() -> CheckResult {
+    private func measure() async -> CheckResult {
         var eligibleTurns = Set<String>()
         var capsulePresent = Set<String>()
         var capsuleUnjudged = Set<String>()
@@ -77,7 +79,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
 
         let moment = Date()
         let window = DoctorWindowFloor.resolve(root: root, now: moment)
-        let summary = TurnTraceWindowReader.scan(
+        let summary = await TurnTraceWindowReader.scan(
             root: root,
             now: moment,
             days: window.dayFilesToRead(now: moment, maximum: maximumDayFiles),
@@ -125,28 +127,22 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         if let day = summary.unreadableDays.first {
             let file = root.appendingPathComponent("turn_traces/\(day).jsonl")
             return CheckResult(source: file.path,
-                nextCall: ToolFailureError.fileRepairCall(file, dataRoot: root,
-                    shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."),
                 id: id, title: title, status: "fail",
                 detail: "\(summary.unreadableDays.count) turn-trace day file(s) exist but could"
-                    + " not be read (\(summary.unreadableDays.joined(separator: ", ")))."
-                    + " Her subconscious vitals are UNMEASURED \(window.describedAs) — this"
-                    + " row is not reporting healthy, it is reporting that it could not look.",
-                harm: "Her subconscious behavior cannot be checked from the saved turns."
-            )
+                    + " not be read (\(summary.unreadableDays.joined(separator: ", "))), so her subconscious vitals are unmeasured \(window.describedAs).",
+                harm: "Her subconscious behavior cannot be checked from the saved turns.",
+                human_action: ToolFailureError.fileRepairInstruction(file,
+                    shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."))
         }
 
         let chemistry = readChemistry()
         if case .unreadable(let reason) = chemistry {
             return CheckResult(source: "cognition/organism_state.json",
-                nextCall: ToolFailureError.fileRepairCall(root.appendingPathComponent("cognition/organism_state.json"), dataRoot: root,
-                    shape: "This JSON object retains organism state, including a chemicalState object with finite numeric agency, confidence, coherence and warmth values. Recover only values supported by the retained bytes."),
                 id: id, title: title, status: "fail",
-                detail: "data/cognition/organism_state.json exists but \(reason)."
-                    + " Her chemistry is UNMEASURED, which is a finding about this row's"
-                    + " coverage, not a clean reading.",
-                harm: "Her saved body state cannot be read."
-            )
+                detail: "data/cognition/organism_state.json exists but \(reason), so her chemistry is unmeasured.",
+                harm: "Her saved body state cannot be read.",
+                human_action: ToolFailureError.fileRepairInstruction(root.appendingPathComponent("cognition/organism_state.json"),
+                    shape: "This JSON object retains organism state, including a chemicalState object with finite numeric agency, confidence, coherence and warmth values. Recover only values supported by the retained bytes."))
         }
 
         var coverageParts: [String] = []
@@ -160,14 +156,14 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         if summary.malformedLines > 0 {
             coverageParts.append("\(summary.malformedLines) trace line(s) did not parse")
         }
-        let coverageDetail = coverageParts.isEmpty ? "" : " " + coverageParts.joined(separator: "; ") + "."
+        let coverageDetail = coverageParts.isEmpty ? "" : "; " + coverageParts.joined(separator: "; ")
 
         if summary.isEmptyFeed {
             return CheckResult(source: "turn_traces/ and cognition/organism_state.json",
                 id: id, title: title, status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
-                    + " data/turn_traces. "
-                    + chemistryLine(chemistry).sentence
+                    + " data/turn_traces; "
+                    + chemistryLine(chemistry).sentence + "."
             )
         }
         guard !eligibleTurns.isEmpty else {
@@ -177,9 +173,8 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
                     + " trace day(s) read and \(summary.matchedRows) context.snapshot row(s)"
                     + " in window, but none on a capsule surface"
-                    + " (\(capsuleSurfaces.sorted().joined(separator: "/")))."
-                    + " Nothing about her subconscious can be measured. "
-                    + chemistryLine(chemistry).sentence + coverageDetail
+                    + " (\(capsuleSurfaces.sorted().joined(separator: "/"))), so her subconscious behavior cannot be measured; "
+                    + chemistryLine(chemistry).sentence + coverageDetail + "."
             )
         }
 
@@ -335,7 +330,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 .joined(separator: ", ")
             return (
                 sentence + "; PINNED at a rail: \(named)",
-                "unmeasured"
+                missing.isEmpty ? nil : "unmeasured"
             )
         }
     }

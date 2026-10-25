@@ -19,56 +19,7 @@ import CoreSpotlight
 import CloudKit
 #endif
 
-/// The mounted Scheduler's canonical jobs-feed lifecycle. The stream arms
-/// before its first read, so a job mutation racing view appearance is replayed
-/// instead of leaving an enabled/paused row stale until the screen is reopened.
-enum SchedulerJobsLiveRefresh {
-    @MainActor
-    static func observe(
-        path: URL,
-        refresh: @escaping @MainActor @Sendable () async -> Void
-    ) async {
-        await EventDeadlinePhysiology.refreshOnChanges(
-            paths: [path],
-            debounceDelay: .milliseconds(100),
-            refresh: refresh
-        )
-    }
-}
-
-/// Scheduler has two legitimate refresh sources while mounted: the canonical
-/// jobs-file watcher and an explicit Retry. Keep those reads single-flight,
-/// while preserving one edge that arrives during the active read so a mutation
-/// is not lost merely because the first snapshot was still being decoded.
-struct SchedulerJobsRefreshCoalescer: Equatable {
-    private(set) var isRefreshing = false
-    private(set) var trailingRefreshQueued = false
-
-    mutating func requestRefresh() -> Bool {
-        guard !isRefreshing else {
-            trailingRefreshQueued = true
-            return false
-        }
-        isRefreshing = true
-        trailingRefreshQueued = false
-        return true
-    }
-
-    mutating func completeRefresh() -> Bool {
-        guard isRefreshing else { return false }
-        if trailingRefreshQueued {
-            trailingRefreshQueued = false
-            return true
-        }
-        cancel()
-        return false
-    }
-
-    mutating func cancel() {
-        isRefreshing = false
-        trailingRefreshQueued = false
-    }
-}
+// Blueprint: | `SchedulerView.swift` | `SchedulerView`: scheduled job controls and explicit accepted/refused toggle receipts |
 
 /// What the Scheduler screen says after a pause/resume settles. The switch is a
 /// control now (item 36), so every outcome gets a line: a refused write must
@@ -114,11 +65,10 @@ enum SchedulerJobTogglePresentation {
 
 struct SchedulerView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var isLoadingJobs = true
+    private var isLoadingJobs: Bool { appModel.engine.desk.jobsFeedState == nil || appModel.engine.desk.isRefreshingJobs }
     @State private var isAddingReflection = false
     @State private var reflectionOutcome: NightlyReflectionJobOutcome?
-    @State private var jobsLoadResult: SchedulerJobsRefreshResult?
-    @State private var refreshCoalescer = SchedulerJobsRefreshCoalescer()
+    private var jobsLoadResult: SchedulerJobsFeedState? { appModel.engine.desk.jobsFeedState }
     @State private var togglingJobIDs: Set<String> = []
     @State private var toggleMessage: SchedulerJobTogglePresentation.Message?
 
@@ -154,7 +104,7 @@ struct SchedulerView: View {
                     systemImage: "exclamationmark.triangle",
                     actionTitle: "Retry",
                     actionImage: "arrow.clockwise",
-                    action: { Task { await loadJobs() } }
+                    action: { Task { await appModel.refreshSchedulerJobs() } }
                 )
             } else {
                 VStack(alignment: .leading, spacing: 8) {
@@ -210,10 +160,7 @@ struct SchedulerView: View {
         .padding()
         .navigationTitle("Scheduler")
         .task(id: appModel.engine.desk.jobsPath) {
-            let jobsPath = appModel.engine.desk.jobsPath
-            await SchedulerJobsLiveRefresh.observe(path: jobsPath) {
-                await loadJobs()
-            }
+            await appModel.engine.desk.watchJobs()
         }
     }
 
@@ -245,18 +192,5 @@ struct SchedulerView: View {
         }
     }
 
-    @MainActor
-    private func loadJobs() async {
-        guard refreshCoalescer.requestRefresh() else { return }
-        isLoadingJobs = true
-        repeat {
-            jobsLoadResult = await appModel.refreshSchedulerJobs()
-            guard !Task.isCancelled else {
-                refreshCoalescer.cancel()
-                isLoadingJobs = false
-                return
-            }
-        } while refreshCoalescer.completeRefresh()
-        isLoadingJobs = false
-    }
+
 }

@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `CloudKitTimeoutResultLatch.swift` | `CloudKitTimeoutResultLatch` actor; `wait`, `finish`, `race`; shared timeout race for detached diagnostics and budget-inheriting transport tasks |
 
 enum CloudKitTimeoutOutcome<T: Sendable>: Sendable {
     case success(T)

@@ -7,23 +7,19 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import ToolRegistry
 import TrustCenter
-import KnowledgeGraph
-import XConnector
-import GitHubConnector
-import SlackConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
 import ToolExecution
-import Skills
 import Studio
 import Senses
 import Research
+import TurnTrace
+// Blueprint: | `SwiftToolDispatcher+Dispatch.swift` | `SwiftToolDispatcher`: `withWebScheme`, `dispatch`, `preApprovalRefusal`; due-reminders passes the requesting dispatcher's data root through its Mac bridge; image generation binds its native receipt's exact output paths for Make registration, and keeps completed generation artifacts and metadata top-level beside `make_registration_failed` so every reply surface retains the artifacts; `mac_location` answers with the fix the kept CoreLocation owner holds, and its age, or requests its ordinary Location permission card |
 
 // 2026-09-18: strict providers fill unused optionals with null. Normalize from
 // the native schema before approval and execution, including nested objects;
@@ -31,28 +27,24 @@ import Research
 public enum ToolArguments {
     @TaskLocal static var current: (tool: String, input: [String: JSONValue])?
 
-    public static func normalized(_ input: [String: JSONValue], schema: JSONValue, preserving: Set<String> = []) -> [String: JSONValue] {
+    public static func normalized(_ input: [String: JSONValue], schema: JSONValue, preserving: Set<String> = [], recordShims: Bool = true) -> [String: JSONValue] {
         guard case .object(let schema) = schema,
               case .object(let properties)? = schema["properties"] else { return input }
         let required: [JSONValue]
         if case .array(let values)? = schema["required"] { required = values } else { required = [] }
         var result = input
-        // 09-26: some models also fill every unused optional with a blank
-        // default ("" / 0; mail_list_recent's message_id 0 turned a list into
-        // a message read). An optional "" is absent, and so is an optional 0
-        // the schema's own minimum rules out. false and a valid 0 stay.
         for (key, value) in input {
             guard let field = properties[key] else { continue }
             if preserving.contains(key), case .object(let shape) = field, shape["type"] == nil { continue }
-            let normalized = normalizedValue(value, schema: field)
-            if !required.contains(.string(key)), value == .null || value == .string("")
-            || ((normalized == .int(0) || normalized == .double(0)) && positiveMinimum(field)) {
+            let normalized = normalizedValue(value, schema: field, recordShims: recordShims)
+            if !required.contains(.string(key)), value == .null {
                 result.removeValue(forKey: key)
+                if recordShims { TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T01"), "site": .string("SwiftToolDispatcher+Dispatch.swift:normalized")])) }
             } else {
                 result[key] = normalized
             }
         }
-        // With "" absent, a tool that clears a field on "" declares
+        // A tool that clears a field declares
         // clear_fields: each optional field its enum lists, named there and
         // not also given a value, is passed on as "". Every pass re-applies it, so a second
         // normalization cannot drop the clear.
@@ -66,59 +58,20 @@ public enum ToolArguments {
         return result
     }
 
-    private static func positiveMinimum(_ schema: JSONValue) -> Bool {
-        guard case .object(let field) = schema else { return false }
-        switch field["minimum"] {
-        case .int(let minimum)?: return minimum > 0
-        case .double(let minimum)?: return minimum > 0
-        default: return false
-        }
-    }
-
-    // Only coerce an unambiguous declared type. Free-form content and invalid
-    // values stay intact for the tool's own validation; never invent a default.
-    private static func normalizedValue(_ value: JSONValue, schema: JSONValue) -> JSONValue {
+    // Recurse through the declared object/array shape for optional nulls.
+    private static func normalizedValue(_ value: JSONValue, schema: JSONValue, recordShims: Bool = true) -> JSONValue {
         guard case .object(let field) = schema else { return value }
-        if case .object(let object) = value { return .object(normalized(object, schema: schema)) }
+        if case .object(let object) = value { return .object(normalized(object, schema: schema, recordShims: recordShims)) }
         if case .array(let values) = value, let items = field["items"] {
-            return .array(values.map { normalizedValue($0, schema: items) })
+            return .array(values.map { normalizedValue($0, schema: items, recordShims: recordShims) })
         }
-        let types: [JSONValue]
-        if case .array(let values)? = field["type"] { types = values.filter { $0 != .string("null") } }
-        else { types = field["type"].map { [$0] } ?? [] }
-        guard types.count == 1 else { return value }
-        switch (types[0], value) {
-        case (.string("boolean"), .string(let raw)):
-            switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "true": return .bool(true)
-            case "false": return .bool(false)
-            default: return value
-            }
-        case (.string("integer"), .string(let raw)):
-            return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines)).map(JSONValue.int) ?? value
-        case (.string("integer"), .double(let number)):
-            return Int64(exactly: number).map(JSONValue.int) ?? value
-        case (.string("number"), .string(let raw)):
-            let raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let integer = Int64(raw) { return .int(integer) }
-            if let number = Double(raw), number.isFinite { return .double(number) }
-            return value
-        case (.string("string"), .int(let number)):
-            return .string(String(number))
-        case (.string("string"), .double(let number)) where number.isFinite:
-            return .string(Int64(exactly: number).map(String.init) ?? String(number))
-        case (.string("string"), .string(let raw)):
-            guard case .array(let choices)? = field["enum"], !choices.contains(value) else { return value }
-            func spelling(_ text: String) -> String {
-                text.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: "_")
-            }
-            let matches = choices.filter {
-                guard case .string(let choice) = $0 else { return false }
-                return spelling(choice) == spelling(raw)
-            }
-            return matches.count == 1 ? matches[0] : value
-        default: return value
+        // JSON has one number type: 1.0 is the integer 1 a declared integer
+        // field reads. Protocol, not a model habit, so no receipt.
+        if case .double(let number) = value, field["type"] == .string("integer") || field["type"] == .array([.string("integer"), .string("null")]),
+           let integer = Int64(exactly: number) {
+            return .int(integer)
         }
+        return value
     }
 }
 
@@ -131,13 +84,16 @@ public extension ToolDispatchClient {
         if let current = ToolArguments.current, current.tool == identity, current.input == input { return try await body(input) }
         let schemas = try await listAvailableToolSchemas()
         let canonical = ToolNameAliases.canonical(tool) { name in schemas.contains { $0.name == name } }
-        let input = ToolNameAliases.hostArgs(canonical, ToolNameAliases.doorArgs(canonical, input))
+        if canonical != tool {
+            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T04"), "site": .string("SwiftToolDispatcher+Dispatch.swift:canonical")]))
+        }
+        let input = ToolNameAliases.hostArgs(canonical, ToolNameAliases.doorArgs(canonical, input, reportShim: true), reportShim: true)
         if canonical == "desk_close" {
             try SwiftToolDispatcher.validateDeskClose(input)
             return try await body(input)
         }
         let schema = schemas.first { $0.name == canonical || $0.name.replacingOccurrences(of: ".", with: "_") == canonical }
-        let authoring = ["save_skill", "sense_make"].contains(canonical) || (canonical == "skill_manage" && input["verb"] == .string("tool_propose"))
+        let authoring = canonical == "sense_make" || (canonical == "ability_manage" && input["verb"] == .string("save"))
         let normalized = schema.flatMap { try? JSONValue.parse($0.parametersJSON) }
             .map { ToolArguments.normalized(input, schema: $0, preserving: authoring ? ["learned", "choices"] : []) } ?? input
         return try await ToolArguments.$current.withValue((identity, normalized)) { try await body(normalized) }
@@ -196,22 +152,9 @@ extension SwiftToolDispatcher {
     }
 
     private func dispatchNormalized(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
-        // The gated chat dispatcher already binds its transport-verified
-        // session in task-local context. Keep direct diagnostics fail-closed,
-        // but do not make a model repeat that internal routing field on every
-        // lazy tool call. LLMCallContext is the lower-authority compatibility
-        // seam for direct tool-loop dispatchers that bind no gate wrapper.
-        // An explicit non-empty input value remains authoritative only when
-        // neither canonical task-local owner is present.
-        var input = rawInput
-        let taskSession = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty }
-        if let taskSession {
-            input["__session_id"] = .string(taskSession)
-        }
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
-        if ToolCallParser.isIgnorableToolName(tool) {
+        var input = ChatToolSessionInjection.apply(toolName: tool, input: rawInput)
+        if ToolCallParser.isIgnorableToolName(tool, recordShim: true) {
             return .object([
                 "status": .string("ignored"),
                 "reason": .string("placeholder_tool_name"),
@@ -242,7 +185,8 @@ extension SwiftToolDispatcher {
             ])
         }
         // An item another conversation is working is theirs (desk.3402).
-        if Self.deskItemTools.contains(tool), let taskSession, let held = await deskHeld(input, session: taskSession) {
+        if Self.deskItemTools.contains(tool), let taskSession = ChatToolSessionInjection.currentSession,
+           let held = await deskHeld(input, session: taskSession) {
             return held
         }
         // A contributed tool runs in its owner's executor.
@@ -262,6 +206,31 @@ extension SwiftToolDispatcher {
             return try await impl_maps_search(input: input)
         case "maps_route":
             return try await impl_maps_route(input: input)
+        case "web_search":
+            func text(_ key: String) -> String {
+                guard case .string(let value)? = input[key] else { return "" }
+                return value.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            let query = text("query"), categories = text("categories"), timeRange = text("time_range")
+            guard !query.isEmpty else {
+                throw ToolFailureError("search needs query: the words to search for.", argumentPath: "query", effects: .none)
+            }
+            let reader = pageReader
+            let tools = appTools
+            var result = await WebSearchRoutes.search(query: query, categories: categories, timeRange: timeRange, chromeConnected: {
+                guard let tools, case .object(let status)? = try? await tools.execute(tool: "browser.chrome_status", input: [:], surface: surface)
+                else { return false }
+                return status["extension_connected"] == .bool(true)
+            }) {
+                try await reader.search(query: query, categories: categories.isEmpty ? nil : categories,
+                                        timeRange: timeRange.isEmpty ? nil : timeRange)
+            }
+            // A search only reads: a failed one changed nothing.
+            if case .object(var fields) = result, fields["status"] != .string("ok") {
+                fields["effects"] = .string("none")
+                result = .object(fields)
+            }
+            return result
         case "read_page":
             guard case .string(let raw)? = input["url"], case let url = Self.withWebScheme(raw),
                   let parsed = URL(string: url),
@@ -275,12 +244,6 @@ extension SwiftToolDispatcher {
                 return .object(["status": .string("failed"), "http_status": .int(Int64(status)),
                     "url": .string(url), "effects": .string("none"),
                     "message": .string("HTTP \(status) refused this public read.")])
-            }
-            if case .object(let fields) = fetched {
-                let text: String = if case .string(let value)? = fields["text"] { value } else { "" }
-                if fields["untrusted_remote_data"] == .bool(true) || !text.isEmpty {
-                    PeerDataTaint.markConsumed(peer: "web content", line: text)
-                }
             }
             let observedURL: String = if case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"],
                 case .string(let finalURL)? = coverage["final_url"] { finalURL } else { url }
@@ -426,14 +389,11 @@ extension SwiftToolDispatcher {
         case "agent_introspect": return try await impl_agent_introspect(input: input)
         case "tool_result_page": return await impl_tool_result_page(input: input)
         case "request_interaction": return await impl_request_interaction(input: input)
-        case "list_skills":     return try await impl_list_skills(input: input)
-        case "read_skill":      return try await impl_read_skill(input: input)
-        case "save_skill":      return try await impl_save_skill(input: input, surface: surface)
         case "context_lookup": return try await impl_context_lookup(input: input)
         case "context_expand": return try await impl_context_expand(input: input, surface: surface)
         case "scratchpad_read": return try await impl_scratchpad_read(input: input)
         case "recent_trace_summary": return try await impl_recent_trace_summary(input: input)
-        case "time_now": return Self.impl_time_now()
+        case "time_now": return ClockReply.read(input) { $0.chat }
         // Personality depth item 3 (2026-09-02): a PURE read of her own inner
         // state. No mutation, no persistence, no provider call — reading never
         // changes what it reads (substrate design law 5).
@@ -443,7 +403,7 @@ extension SwiftToolDispatcher {
         // REQUIRED upstream; default autonomy is `confirm` so every call
         // queues an approval. Audit trail at data/builder_audit/<uuid>.json.
         // Available on the claude/codex bridge as of the user's 2026-06-13 "open the
-        // bridges" call, yolo-gated like local chat (only mcp__ stays denied).
+        // bridges" call, yolo-gated like local chat.
         case "shell":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
                 return builderFullMacRequired(tool: "shell")
@@ -488,7 +448,7 @@ extension SwiftToolDispatcher {
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
                 return builderFullMacRequired(tool: "install_app")
             }
-            return Self.impl_install_app(input: input, dataRoot: dataRoot)
+            return await Self.impl_install_app(input: input, dataRoot: dataRoot)
         // restart_app (2026-06-10) — Agent's self-restart, restored from the
         // daemon-era Telegram /restart. Same Full Mac policy gate as the
         // builder tools; the heavy lifting (cooldown flock, audit, detached
@@ -508,126 +468,34 @@ extension SwiftToolDispatcher {
                 source: "chat:\(surface)"
             )
         case "agent_swarm": return try await impl_agent_swarm(input: input, surface: surface)
-        case "market_status": return try await impl_market_status(input: input)
-        case "market_configure": return try await impl_market_configure(input: input)
-        case "market_watchlists": return try await impl_market_watchlists(input: input)
-        case "tradingview_watchlist": return try await impl_tradingview_watchlist(input: input)
-        case "market_quote": return try await impl_market_quote(input: input)
-        // X (Twitter) — route to XConnector module which already wraps
-        // OAuth2 user-context + OAuth1 HMAC-SHA1 against the user's stored creds
-        // at <dataRoot>/connectors/x/.
-        case "x_status":      return try await XConnectorActions.status(input: input)
-        case "x_me":          return try await XConnectorActions.me(input: input)
-        case "x_search":      return try await XConnectorActions.searchRecent(input: input)
-        case "x_timeline", "x_user_tweets":
-            return try await xDeclaredRoute(tool: tool, input: input)
-        case "gmail_status":
-            return await impl_gmail_status(input: input)
-        case "gmail_search":
-            return await impl_gmail_search(input: input)
-        case "gmail_read":
-            return await impl_gmail_read(input: input)
-        case "google_calendar_status":
-            return await impl_google_calendar_status(input: input)
-        case "google_calendar_list":
-            return await impl_google_calendar_list(input: input)
-        case "google_calendar_calendars":
-            return await impl_google_calendar_calendars(input: input)
-        case "google_calendar_free_busy":
-            return await impl_google_calendar_free_busy(input: input)
-        case "google_calendar_read":
-            return await impl_google_calendar_read(input: input)
-        case "google_calendar_send_invitations":
-            return await impl_google_calendar_send_invitations(input: input)
-        case "notion_status":
-            return await impl_notion_status(input: input)
-        case "notion_search":
-            return await impl_notion_search(input: input)
-        case "notion_read_page":
-            return await impl_notion_read_page(input: input)
-        case "github_status":
-            return try await GitHubConnectorActions.status(input: input, dataRoot: dataRoot)
-        case "github_list_repos":
-            return try await GitHubConnectorActions.listRepos(input: input, dataRoot: dataRoot)
-        case "github_list_runs":
-            return try await GitHubConnectorActions.listRuns(input: input, dataRoot: dataRoot)
-        case "github_run_jobs":
-            return try await GitHubConnectorActions.runJobs(input: input, dataRoot: dataRoot)
-        case "github_list_notifications":
-            return try await GitHubConnectorActions.listNotifications(input: input, dataRoot: dataRoot)
-        case "github_get_repository":
-            return try await GitHubConnectorActions.getRepository(input: input, dataRoot: dataRoot)
-        case "github_read_repository_content":
-            return try await GitHubConnectorActions.readRepositoryContent(input: input, dataRoot: dataRoot)
-        case "github_list_commits":
-            return try await GitHubConnectorActions.listCommits(input: input, dataRoot: dataRoot)
-        case "github_list_issues":
-            return try await GitHubConnectorActions.listIssues(input: input, dataRoot: dataRoot)
-        case "github_search":
-            return try await GitHubConnectorActions.search(input: input, dataRoot: dataRoot)
-        case "github_list_pull_requests":
-            return try await GitHubConnectorActions.listPullRequests(input: input, dataRoot: dataRoot)
-        case "github_get_issue":
-            return try await GitHubConnectorActions.getIssue(input: input, dataRoot: dataRoot)
-        case "github_get_pull_request":
-            return try await GitHubConnectorActions.getPullRequest(input: input, dataRoot: dataRoot)
-        case "github_pull_request_files":
-            return try await GitHubConnectorActions.pullRequestFiles(input: input, dataRoot: dataRoot)
-        case "github_pull_request_activity":
-            return try await GitHubConnectorActions.pullRequestActivity(input: input, dataRoot: dataRoot)
-        case "github_discover_tracking":
-            return try await GitHubConnectorActions.discoverTracking(input: input, dataRoot: dataRoot)
-        case "github_project_digest":
-            return try await GitHubConnectorActions.projectDigest(input: input, dataRoot: dataRoot)
-        case "github_mutate":
-            return try await GitHubConnectorActions.mutate(input: input, dataRoot: dataRoot)
-        case "github_set_repo_visibility":
-            return try await GitHubConnectorActions.setRepoVisibility(input: input, dataRoot: dataRoot)
-        case "slack_status":
-            return try await SlackConnectorActions.status(input: input, dataRoot: dataRoot)
-        case "slack_list_channels":
-            return try await SlackConnectorActions.listChannels(input: input)
-        case "slack_search_messages":
-            return try await SlackConnectorActions.searchMessages(input: input)
-        case "slack_post_message":
-            if await fullMacYoloAdmitted(tool: tool, surface: surface) {
-                return await ExternalSendApprovalLifecycle.executeAdmittedYoloToolResult(
-                    invokedAs: tool,
-                    input: input,
-                    dataRoot: dataRoot
-                )
-            }
-            return await ExternalSendApprovalLifecycle.stageToolResult(
-                invokedAs: tool,
-                input: input,
-                surface: surface,
-                dataRoot: dataRoot
-            )
-        case "agentmail_list":
-            return AgentWorkspace.attachReadReferences(tool: tool, input: input, result: await AgentMailActions.listRecent(input: input, dataRoot: dataRoot), dataRoot: dataRoot)
-        case "agentmail_read":
-            return await AgentMailActions.readMessage(input: input, dataRoot: dataRoot)
-        case "agentmail_send":
-            if await fullMacYoloAdmitted(tool: tool, surface: surface) {
-                return await ExternalSendApprovalLifecycle.executeAdmittedYoloToolResult(
-                    invokedAs: tool,
-                    input: input,
-                    dataRoot: dataRoot
-                )
-            }
-            return await ExternalSendApprovalLifecycle.stageToolResult(
-                invokedAs: tool,
-                input: input,
-                surface: surface,
-                dataRoot: dataRoot
-            )
         case "image_generate":
-            // Each image is also a Make version: a new ref, or `__make_ref`'s
-            // when the Make view's Try again runs the same prompt again.
-            return Self.studioImageInvitation(MakeStudio.registerGenerated(
-                await impl_image_generate(input: input, surface: surface),
-                prompt: jsonString(input["prompt"]) ?? jsonString(input["description"]) ?? "",
-                ref: jsonString(input["__make_ref"]), dataRoot: dataRoot))
+            let generated = await impl_image_generate(input: input, surface: surface)
+            guard case .object(let generation) = generated, generation["status"] == .string("ok") else { return generated }
+            let paths = (generation["images"]?.arrayValue ?? []).compactMap { image -> String? in
+                guard let path = jsonString(image.objectValue?["path"]) else { return nil }
+                return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+            }
+            // Provider execution stays native; the part composes its raw
+            // artifact result with make.add. Only this native receipt grants
+            // output provenance, not the part's returned or supplied JSON.
+            let registration = await MakeStudio.$generatedImagePaths.withValue(Set(paths)) {
+                await Parts(root: dataRoot).call(id: "make-generated", input: .object([
+                    "generated": generated, "prompt": .string(jsonString(input["prompt"]) ?? jsonString(input["description"]) ?? ""),
+                    "ref": jsonString(input["__make_ref"]).map(JSONValue.string) ?? .null]),
+                    within: .init(actions: ["make.add"], capabilities: []), as: JSONValue.self)
+            }
+            switch registration {
+            case .success(let result): return Self.studioImageInvitation(result)
+            case .failure(let error):
+                // Registration failed after generation completed. Keep the
+                // artifacts top-level for every reply surface and persistence.
+                var response = generation
+                response["status"] = .string("failed")
+                response["reason"] = .string("make_registration_failed")
+                response["detail"] = .string(error.message)
+                response["effects"] = .string("unknown")
+                return .object(response)
+            }
         // ── Mac integration chat tools (2026-06-07) ──
         // Each tool is permission-gated through MacIntegrationPermissionStore.
         // The real backend (EventKit / UserNotifications / Spotlight) is
@@ -637,7 +505,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.calendar,
                 mode: .read,
-                fixHint: "Toggle Read ON for Calendar in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Calendar and enable Read.",
                 input: input,
                 run: { bridge, input in HerLifePulse.noted("calendar", try await bridge.calendarListUpcoming(input: input)) }
             )
@@ -655,7 +523,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .read,
-                fixHint: "Toggle Read ON for Reminders in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Reminders and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.remindersQuery(input: input) }
             )
@@ -664,7 +532,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .read,
-                fixHint: "Toggle Read ON for Reminders in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Reminders and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.remindersRead(input: input) }
             )
@@ -673,7 +541,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .write,
-                fixHint: "Toggle Write ON for Reminders in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Reminders and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.remindersUpdate(input: input) }
             )
@@ -682,16 +550,16 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .read,
-                fixHint: "Toggle Read ON for Reminders in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Reminders and enable Read.",
                 input: input,
-                run: { bridge, input in HerLifePulse.noted("reminders", try await bridge.remindersListDueToday(input: input)) }
+                run: { bridge, input in HerLifePulse.noted("reminders", try await bridge.remindersListDueToday(input: input, dataRoot: dataRoot)) }
             )
         case "mac_notify":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.notifyMac,
                 mode: .write,
-                fixHint: "Toggle Write ON for Mac Notifications in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Mac Notifications and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.macNotify(input: input) }
             )
@@ -737,7 +605,7 @@ extension SwiftToolDispatcher {
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.notifyMobile, mode: .write,
-                fixHint: "Toggle Write ON for iPhone Notifications in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → iPhone Notifications and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.phoneRequest(input: input) }
             )
@@ -746,16 +614,16 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.notifyMobile,
                 mode: .write,
-                fixHint: "Toggle Write ON for iPhone Notifications in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → iPhone Notifications and enable Write.",
                 input: input,
-                run: { bridge, input in try await bridge.mobileNotify(input: input) }
+                run: { bridge, input in try await bridge.mobileNotify(input: input, surface: surface) }
             )
         case "mac_spotlight_search":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.spotlight,
                 mode: .read,
-                fixHint: "Toggle Read ON for Spotlight Search in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Spotlight Search and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.spotlightSearch(input: input) }
             )
@@ -769,7 +637,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.contacts,
                 mode: .read,
-                fixHint: "Toggle Read ON for Contacts in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Contacts and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.contactsSearch(input: input) }
             )
@@ -778,14 +646,14 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.contacts,
                 mode: .write,
-                fixHint: "Toggle Write ON for Contacts in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Contacts and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.contactsCreateOrUpdate(input: input) }
             )
         case "mail_save_attachment":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface, integration: MacIntegrationID.mail, mode: .read,
-                fixHint: "Toggle Read ON for Mail in Settings → Mac Integration.", input: AgentWorkspace.bindMail(input, dataRoot: dataRoot),
+                fixHint: "Open Trust → Mac → Mail and enable Read.", input: AgentWorkspace.bindMail(input, dataRoot: dataRoot),
                 run: { bridge, input in
                     if let error = input["binding_error"] { return .object(["status": .string("failed"), "message": error]) }
                     let attachment = try await bridge.mailAttachment(input: input)
@@ -801,7 +669,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .read,
-                fixHint: "Toggle Read ON for Mail in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Mail and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.mailListRecent(input: input) }
             )
@@ -824,7 +692,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .read,
-                fixHint: "Toggle Read ON for Mail in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Mail and enable Read.",
                 input: input,
                 run: { bridge, input in
                     if tool == "mail_senders" { return try await bridge.mailSenders(input: input) }
@@ -838,7 +706,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
-                fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Mail and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.mailSend(input: input) }
             )
@@ -847,7 +715,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.messages,
                 mode: .read,
-                fixHint: "Toggle Read ON for Messages in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Messages and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.messagesRecentThreads(input: input) }
             )
@@ -856,7 +724,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.messages,
                 mode: .write,
-                fixHint: "Toggle Write ON for Messages in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Messages and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.messagesSend(input: input) }
             )
@@ -865,7 +733,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.notes,
                 mode: .read,
-                fixHint: "Toggle Read ON for Notes in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Notes and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.notesSearch(input: input) }
             )
@@ -874,7 +742,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.notes,
                 mode: .write,
-                fixHint: "Toggle Write ON for Notes in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Notes and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.notesCreate(input: input) }
             )
@@ -883,7 +751,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.music,
                 mode: .read,
-                fixHint: "Toggle Read ON for Music in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Music and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.musicNowPlaying(input: input) }
             )
@@ -892,7 +760,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.music,
                 mode: .write,
-                fixHint: "Toggle Write ON for Music in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Music and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.musicControl(input: input) }
             )
@@ -904,7 +772,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.calendar,
                 mode: .write,
-                fixHint: "Toggle Write ON for Calendar in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Calendar and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.calendarCreateEvent(input: input) }
             )
@@ -913,7 +781,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.calendar,
                 mode: .write,
-                fixHint: "Toggle Write ON for Calendar in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Calendar and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.calendarModifyEvent(input: input) }
             )
@@ -922,7 +790,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.calendar,
                 mode: .write,
-                fixHint: "Toggle Write ON for Calendar in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Calendar and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.calendarDeleteEvent(input: input) }
             )
@@ -931,7 +799,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .write,
-                fixHint: "Toggle Write ON for Reminders in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Reminders and enable Write.",
                 input: input,
                 run: { bridge, input in
                     switch tool {
@@ -946,7 +814,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .write,
-                fixHint: "Toggle Write ON for Reminders in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Reminders and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.remindersComplete(input: input) }
             )
@@ -955,7 +823,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .write,
-                fixHint: "Toggle Write ON for Reminders in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Reminders and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.remindersDelete(input: input) }
             )
@@ -964,7 +832,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
-                fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Mail and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.mailMarkRead(input: input) }
             )
@@ -973,7 +841,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
-                fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Mail and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.mailArchive(input: input) }
             )
@@ -982,7 +850,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
-                fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Mail and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.mailDelete(input: input) }
             )
@@ -991,7 +859,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
-                fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Mail and enable Write.",
                 input: input,
                 run: { bridge, input in
                     if tool == "mail_draft" { return try await bridge.mailDraft(input: input) }
@@ -1003,7 +871,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.notes,
                 mode: .write,
-                fixHint: "Toggle Write ON for Notes in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Notes and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.notesModify(input: input, deleting: tool == "notes_delete") }
             )
@@ -1012,7 +880,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.music,
                 mode: .read,
-                fixHint: "Toggle Read ON for Music in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Music and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.musicSearchLibrary(input: input) }
             )
@@ -1021,7 +889,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.music,
                 mode: .read,
-                fixHint: "Toggle Read ON for Music in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Music and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.musicListLibrary(input: input) }
             )
@@ -1030,7 +898,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.music,
                 mode: .read,
-                fixHint: "Toggle Read ON for Music in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Music and enable Read.",
                 input: input,
                 run: { bridge, input in try await bridge.musicListPlaylists(input: input) }
             )
@@ -1039,7 +907,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.contacts,
                 mode: .write,
-                fixHint: "Toggle Write ON for Contacts in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Contacts and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.contactsDelete(input: input) }
             )
@@ -1051,7 +919,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.scheduler,
                 mode: .write,
-                fixHint: "Toggle Write ON for Scheduler in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Scheduler and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.schedulerListJobs(input: input) }
             )
@@ -1060,7 +928,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.scheduler,
                 mode: .write,
-                fixHint: "Toggle Write ON for Scheduler in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Scheduler and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.schedulerCreateJob(input: input) }
             )
@@ -1069,7 +937,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.scheduler,
                 mode: .write,
-                fixHint: "Toggle Write ON for Scheduler in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Scheduler and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.schedulerCancelJob(input: input) }
             )
@@ -1078,7 +946,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.scheduler,
                 mode: .write,
-                fixHint: "Toggle Write ON for Scheduler in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Scheduler and enable Write.",
                 input: input,
                 run: { bridge, input in
                     try await bridge.schedulerSetJobEnabled(input: input, enabled: tool == "scheduler_resume_job")
@@ -1089,7 +957,7 @@ extension SwiftToolDispatcher {
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.scheduler,
                 mode: .write,
-                fixHint: "Toggle Write ON for Scheduler in Settings → Mac Integration.",
+                fixHint: "Open Trust → Mac → Scheduler and enable Write.",
                 input: input,
                 run: { bridge, input in try await bridge.schedulerUpdateJob(input: input) }
             )
@@ -1138,42 +1006,26 @@ extension SwiftToolDispatcher {
         case let name where Self.fullMacAccessibilityInjectionToolNames.contains(name):
             return try await impl_mac_injection_tool(tool: name, input: input, surface: surface)
         default:
-            if let bridged = Self.parseMCPToolName(tool) {
-                return try await impl_mcp_tool(
-                    serverId: bridged.serverId,
-                    toolName: bridged.toolName,
-                    input: input,
-                    surface: surface
-                )
-            }
-            // Admitted authored ability files route
-            // through the sandboxed ToolExecution engine — the same lane
-            // WorkflowOrchestration tool_run steps use. runTool enforces
-            // active-status, code-fingerprint match, and the subprocess
-            // sandbox/timeout; promotion itself is human-approved upstream.
-            // Before this route, registry names were catalog-visible but
-            // undispatchable (the custom-tool activation gap).
-            // Reserved built-in names never reach here (the switch matches
-            // them first), so this route only ever executes genuine customs.
+            // Authored calls use Parts.run with the selected fingerprint.
+            // Parts verifies admission on every run; keeping follows its
+            // Full Mac/owner authority rule. Built-ins matched above.
             if let record = try registryToolRecord(tool) {
-                // Review finding 3 fix: runTool only VERIFIES a fingerprint
-                // when one exists. The chat lane fails closed on unsigned
-                // tools rather than silently weakening the invariant.
                 guard case .string(let fingerprint)? = record["codeFingerprint"], !fingerprint.isEmpty else {
                     return .object([
                         "status": .string("failed"),
                         "effects": .string("none"),
                         "reason": .string("unsigned_tool"),
                         "tool": .string(tool),
-                        "fix": .string("Tool '\(tool)' has no codeFingerprint in registry.json or its active manifest. Re-promote it so the promote engine stamps one."),
+                        "fix": .string("Part '\(tool)' has no codeFingerprint in its selected abilities/<id>.js file. Read it with ability.read, then keep it with ability.enable."),
                     ])
                 }
                 // The admitted fingerprint is threaded through so a registry
                 // or manifest swap between this check and the run fails as
                 // fingerprintMismatch instead of downgrading to unverified
                 // (review round-2 TOCTOU finding).
-                return try await SwiftNativeToolExecution(root: dataRoot)
-                    .runTool(id: tool, input: .object(input.filter { $0.key != "__session_id" }), requiredFingerprint: fingerprint)
+                return try await Parts(root: dataRoot)
+                    .run(id: tool, input: .object(input.filter { $0.key != "__session_id" }),
+                         requiredFingerprint: OwnedProgramInvocation.valueCall.flatMap { $0.id == tool ? $0.version : nil } ?? fingerprint)
             }
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(tool)' is not in the dispatch table"
@@ -1193,12 +1045,8 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
     public func preApprovalRefusal(
         tool requestedTool: String, input rawInput: [String: JSONValue], surface: String
     ) async -> JSONValue? {
-        var input = rawInput
-        let taskSession = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty }
-        if let taskSession { input["__session_id"] = .string(taskSession) }
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
+        let input = ChatToolSessionInjection.apply(toolName: tool, input: rawInput)
         if let refusal = await argumentRefusal(tool: tool, input: input) { return refusal }
         if ["studio_canon_resolve", "hold_view", "release_view"].contains(tool),
            case .failure(let refusal) = StudioCanonSeatGate.liveTurnProvenance(dispatchSurface: surface) {
@@ -1263,13 +1111,8 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
     /// else — the by-name setup path and no other shape of the call.
     private func agentHostProposal(tool: String, input: [String: JSONValue])
         -> Result<AgentHostConnection.Proposal, AgentHostConnection.Refusal>? {
-        guard tool == "agent_connect", usesCanonicalBody,
-              case .string(let name)? = input["name"],
-              input["endpoint"] == nil || input["endpoint"] == .null || input["endpoint"] == .string(""),
-              input["app_bundle_id"] == nil || input["app_bundle_id"] == .null || input["app_bundle_id"] == .string(""),
-              input["disconnect"] == nil || input["disconnect"] == .null || input["disconnect"] == .bool(false),
-              input["transport"] == nil || input["transport"] == .null
-                || input["transport"] == .string("") || input["transport"] == .string("auto") else { return nil }
+        guard usesCanonicalBody, AgentHostConnection.isNamedConnect(tool: tool, input: input),
+              case .string(let name)? = input["name"] else { return nil }
         let folder: String?
         if case .string(let path)? = input["working_directory"] { folder = path } else { folder = nil }
         let workspace: String?
@@ -1285,8 +1128,8 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         tool requestedTool: String, input: [String: JSONValue], surface: String
     ) async -> String? {
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
-        // ACP's live connect card binds the exact resolved executable and
-        // reported version. It is also required when ordinary tool trust allows.
+        // ACP's live connect card binds the exact resolved executable; its
+        // version is read only after approval. It is also required when ordinary tool trust allows.
         if tool == "agent_connect", case .string(let name)? = input["name"],
            AgentHostDirectory.row(named: name)?.acp != nil { return nil }
         if let sentence = standingBotApprovalReason(tool: tool, input: input) {
@@ -1344,29 +1187,5 @@ extension SwiftToolDispatcher {
             wrote(URL(fileURLWithPath: NSString(string: path).expandingTildeInPath))
         }
         return result
-    }
-}
-
-extension SwiftToolDispatcher {
-    /// X reads run the route the connector's saved configuration declares;
-    /// a sign-in refusal is the receipt, naming that route and its lever.
-    func xDeclaredRoute(tool: String, input: [String: JSONValue]) async throws -> JSONValue {
-        let config = XConnectorActions.authRouteConfigPath(dataRoot: dataRoot).path
-        let lever = "Set auth_route to oauth1 or oauth2 in \(config), or sign in to X again on Connectors."
-        let route: String
-        do { route = try XConnectorActions.declaredAuthRoute(dataRoot: dataRoot) } catch {
-            return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("invalid_auth_route"),
-                            "detail": .string("\(error.localizedDescription) Nothing was read. " + lever)])
-        }
-        let result: JSONValue = switch (tool, route) {
-        case ("x_timeline", "oauth1"): try await XConnectorActions.timelineHomeV1(input: input)
-        case ("x_timeline", _): try await XConnectorActions.timelineHome(input: input)
-        case (_, "oauth1"): try await XConnectorActions.userTweetsV1(input: input)
-        default: try await XConnectorActions.userTweets(input: input)
-        }
-        guard case .object(var fields) = result, case .int(let code)? = fields["statusCode"], code == 401 || code == 403 else { return result }
-        fields["auth_route"] = .string(route)
-        fields["remedy"] = Repair.why(owner: "X connector, \(route) route (\(config) auth_route)", tap: lever)
-        return .object(fields)
     }
 }

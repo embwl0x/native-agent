@@ -2,6 +2,8 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Observation
+// Blueprint: | `MemoryV2+EmbeddingRuntime.swift` | `EmbeddingRuntimeSnapshot`; canonical runtime embedding backend with performance residency and the query form (bge queries carry its retrieval instruction, stored text never); durable action-index updates at warm-up and inventory changes, with serialized missing-text fills and background epoch rebuilds; engine termination closes admission, removes passive observations and cancels/drains both convergence flights through actual exit |
 
 public struct EmbeddingRuntimeSnapshot: Sendable, Equatable {
     public var requestedBackend: String
@@ -27,6 +29,11 @@ public struct EmbeddingRuntimeSnapshot: Sendable, Equatable {
     public var idleUnloadSeconds: Int?
 }
 
+/// config/embeddings.json owns the backend selection; excluded from local
+/// backup/export and phone sync, listed in PrivacyMap as Embedding Settings.
+@Observable
+/// embeddings.json: excluded from local backup/export and phone sync;
+/// off-disk includes it; PrivacyMap lists config/embeddings.json.
 public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
     public static let coreMLBackend = "coreml-minilm"
     public static let mockBackend = "mock"
@@ -150,6 +157,21 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     public func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
+        try await embedWithEpoch(texts, asQueries: false)
+    }
+
+    /// BGE v1.5 is trained asymmetric: a search query carries this
+    /// instruction, the stored passages it is scored against do not. Other
+    /// models (MiniLM, the mock) embed a query like any text.
+    static func queryInstruction(forModel modelID: String) -> String? {
+        modelID.lowercased().contains("bge") ? "Represent this sentence for searching relevant passages: " : nil
+    }
+
+    public func embedQueriesWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
+        try await embedWithEpoch(texts, asQueries: true)
+    }
+
+    private func embedWithEpoch(_ texts: [String], asQueries: Bool) async throws -> MemoryEmbeddingBatch {
         let config = Self.readBackend(dataRoot: dataRoot)
         guard config != Self.mockBackend else {
             return try await mock.embedWithEpoch(texts)
@@ -174,13 +196,14 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 domain: "NativeAgentMemoryV2",
                 code: -100,
                 userInfo: [NSLocalizedDescriptionKey:
-                    "CoreML embedding model \(resolvedModelID) did not load: "
+                    "CoreML memory search model \(resolvedModelID) did not load: "
                     + "\(error.localizedDescription)"]
             )
         }
         noteUse()
         // Prediction failures and cancellation retain the resident model.
-        return try await provider.embedWithEpoch(texts)
+        let instruction = asQueries ? Self.queryInstruction(forModel: provider.modelId) : nil
+        return try await provider.embedWithEpoch(instruction.map { prefix in texts.map { prefix + $0 } } ?? texts)
     }
 
     public func snapshot() -> EmbeddingRuntimeSnapshot {
@@ -242,10 +265,9 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 modelId: modelId,
                 dimensions: effectiveBackend == Self.mockBackend
                     ? mock.dimensions : loadedProvider?.dimensions ?? installedModel?.dimensions ?? 384,
-                embeddingEpoch: loadedProvider?.embeddingEpoch.rawValue
-                    ?? (effectiveBackend == Self.mockBackend
-                        ? mock.embeddingEpoch.rawValue
-                        : nil),
+                embeddingEpoch: effectiveBackend == Self.mockBackend
+                    ? mock.embeddingEpoch.rawValue
+                    : loadedProvider?.embeddingEpoch.rawValue,
                 coreMLResourcesAvailable: resourcesAvailable,
                 coreMLLoaded: loaded,
                 modelLoadable: resourcesAvailable && state.lastLoadError == nil,
@@ -396,7 +418,7 @@ private extension NSLock {
 extension SwiftNativeMemoryV2 {
     public func installActionIndex(paths: [URL], notifications: [Notification.Name],
                                    source: @escaping @Sendable () async throws -> [String]) {
-        guard actionIndexSource == nil else { return }
+        guard !embeddingConvergenceStopped, actionIndexSource == nil else { return }
         actionIndexSource = source
         actionIndexWatcher = FileChangeWatcher(paths: paths) { [weak self] _ in
             Task { await self?.requestActionIndexUpdate() }
@@ -418,23 +440,52 @@ extension SwiftNativeMemoryV2 {
     /// Coalesce owner changes, including changes arriving while a batch embeds.
     /// No request waits for an epoch rebuild and no timer drives this work.
     public func requestActionIndexUpdate() {
-        guard actionIndexSource != nil else { return }
+        guard !embeddingConvergenceStopped, actionIndexSource != nil else { return }
         actionIndexDirty = true
         guard actionIndexUpdate == nil else { return }
         actionIndexUpdate = Task(priority: .utility) {
             defer { actionIndexUpdate = nil }
-            while actionIndexDirty {
+            while !embeddingConvergenceStopped, !Task.isCancelled, actionIndexDirty {
                 actionIndexDirty = false
                 do {
                     guard let source = actionIndexSource else { return }
-                    try await fillActionIndex(try await source())
+                    let texts = try await source()
+                    try checkEmbeddingConvergence()
+                    try await fillActionIndex(texts)
+                    try checkEmbeddingConvergence()
                     actionIndexFailure = nil
                 } catch {
+                    guard !embeddingConvergenceStopped, !Task.isCancelled else { return }
                     actionIndexFailure = error.localizedDescription
                     nativeLog("[action-index] update failed: %@", error.localizedDescription)
                 }
             }
         }
+    }
+
+    /// Close admission and passive observation before draining. The flight
+    /// handles remain owned until their bodies (including detached fills) exit;
+    /// the engine's existing bounded termination wait never releases them early.
+    public func shutdownEmbeddingConvergence() async {
+        embeddingConvergenceStopped = true
+        actionIndexSource = nil
+        actionIndexDirty = false
+        embeddingEpochDirty = false
+        actionIndexWatcher?.cancel()
+        actionIndexWatcher = nil
+        actionIndexObservers.withLock { tokens in
+            tokens.forEach { NotificationCenter.default.removeObserver($0) }
+            tokens.removeAll()
+        }
+        actionIndexUpdate?.cancel()
+        embeddingEpochReconcile?.cancel()
+        await actionIndexUpdate?.value
+        _ = await embeddingEpochReconcile?.value
+    }
+
+    func checkEmbeddingConvergence() throws {
+        try Task.checkCancellation()
+        guard !embeddingConvergenceStopped else { throw CancellationError() }
     }
 
     private static func actionTextHash(_ text: String) -> String {
@@ -449,7 +500,7 @@ extension SwiftNativeMemoryV2 {
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         guard let epoch = residentEmbeddingEpoch() else {
             requestActionIndexUpdate()
-            throw MemoryV2Error.underlying(actionIndexFailure ?? "The MemoryV2 action index waits for the memory-search model to load; an index update has been requested.")
+            throw MemoryV2Error.underlying(actionIndexFailure ?? "Action search awaits the memory search model; an index update was requested.")
         }
         let indexed = try await storage.underlyingStorage().actionEmbeddings(epoch: epoch)
         let hashes = texts.map(Self.actionTextHash)
@@ -457,9 +508,9 @@ extension SwiftNativeMemoryV2 {
         guard hashes.allSatisfy({ indexed[$0]?.count == dimensions }) else {
             requestActionIndexUpdate()
             if let actionIndexFailure {
-                throw MemoryV2Error.underlying("The MemoryV2 action index for epoch \(epoch.rawValue) could not be built: \(actionIndexFailure)")
+                throw MemoryV2Error.underlying("Action search index could not be built: \(actionIndexFailure)\nEpoch evidence: \(epoch.rawValue)")
             }
-            throw MemoryV2Error.underlying("The MemoryV2 action index for epoch \(epoch.rawValue) is incomplete; an index update has been requested.")
+            throw MemoryV2Error.underlying("Action search index is incomplete; an update was requested.\nEpoch evidence: \(epoch.rawValue)")
         }
         return MemoryEmbeddingBatch(epoch: epoch, vectors: hashes.compactMap { indexed[$0] })
     }
@@ -468,30 +519,44 @@ extension SwiftNativeMemoryV2 {
     /// task, so prediction never occupies this actor; vectors live in SQLite.
     private func fillActionIndex(_ texts: [String]) async throws {
         try await ensureCanonicalAttachment()
+        try checkEmbeddingConvergence()
         guard let storage, let embedder else { throw MemoryV2Error.storageUnavailable }
         let disk = await storage.underlyingStorage()
-        try await Task.detached(priority: .utility) {
+        try checkEmbeddingConvergence()
+        let fill = Task.detached(priority: .utility) {
             let epoch = embedder.embeddingEpoch
             let byHash = Dictionary(texts.map { (Self.actionTextHash($0), $0) }, uniquingKeysWith: { first, _ in first })
             let dimensions = embedder.dimensions
             let indexed = try await disk.actionEmbeddings(epoch: epoch).filter { $0.value.count == dimensions }
+            try await self.checkEmbeddingConvergence()
             let missing = byHash.keys.filter { indexed[$0] == nil }.sorted()
             for start in stride(from: 0, to: missing.count, by: 8) {
                 let hashes = Array(missing[start..<min(start + 8, missing.count)])
                 let batch = try await embedder.embedWithEpoch(hashes.map { byHash[$0]! })
+                try await self.checkEmbeddingConvergence()
                 guard batch.epoch == epoch, embedder.embeddingEpoch == epoch else {
                     await self.requestActionIndexUpdate()
                     throw MemoryV2Error.underlying("The MemoryV2 action index changed epoch while updating.")
                 }
                 guard batch.vectors.count == hashes.count,
                       batch.vectors.allSatisfy({ !$0.isEmpty && $0.count == dimensions && $0.allSatisfy(\.isFinite) && $0.contains(where: { $0 != 0 }) }) else {
-                    throw MemoryV2Error.underlying("The MemoryV2 action index received unusable vectors from the memory-search model.")
+                    throw MemoryV2Error.underlying("Action search received unusable vectors from the memory search model.")
                 }
                 // Each chunk lands as it finishes, so an interrupted fill keeps its progress.
                 try await disk.writeActionEmbeddings(Dictionary(uniqueKeysWithValues: zip(hashes, batch.vectors)), epoch: epoch)
+                try await self.checkEmbeddingConvergence()
             }
-            try await disk.writeActionEmbeddings([:], epoch: epoch, retaining: Set(byHash.keys))
-        }.value
+            // Vectors are content-addressed: keep every one this epoch embedded, so a
+            // find whose action set differs from this pass's (a turn's own parts,
+            // a lane coming up) never loses the vectors it needs. Only other
+            // epochs are retired.
+            try await disk.writeActionEmbeddings([:], epoch: epoch, retaining: Set(indexed.keys).union(byHash.keys))
+        }
+        try await withTaskCancellationHandler {
+            try await fill.value
+        } onCancel: {
+            fill.cancel()
+        }
     }
 
     public func warmUpEmbeddingsAtLaunch() async {
@@ -523,20 +588,17 @@ extension SwiftNativeMemoryV2 {
         }
     }
 
-    public static func configureEmbeddingBackendAndReindex(enabled: Bool, dataRoot: URL) async throws -> (report: MemoryEmbeddingEpochActivationReport, runtime: EmbeddingRuntimeSnapshot) {
-        let memory = resolvedOwner(dataRoot: dataRoot)
-        let before = await memory.embeddingRuntimeSnapshot()
+    public func configureEmbeddingBackendAndReindex(enabled: Bool) async throws {
+        let before = embeddingRuntimeSnapshot()
         do {
-            try await memory.configureEmbeddingBackend(enabled: enabled)
-            let report = try await memory.reindexAllMemoryEmbeddingsForCurrentProvider()
-            let runtime = try await MemoryStatusProjection.embeddingRuntime(dataRoot: dataRoot)
-            return (report, runtime)
+            try await configureEmbeddingBackend(enabled: enabled)
+            _ = try await reindexAllMemoryEmbeddingsForCurrentProvider()
         } catch {
             // A backend is not allowed to change while canonical vectors stay
             // in the prior space. Restore the requested backend so recall
             // immediately returns to the previously active epoch.
             let wasEnabled = before?.requestedBackend != ManagedEmbeddingProvider.mockBackend
-            try? await memory.configureEmbeddingBackend(enabled: wasEnabled)
+            try? await configureEmbeddingBackend(enabled: wasEnabled)
             throw error
         }
     }

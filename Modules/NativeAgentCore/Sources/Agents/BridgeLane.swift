@@ -1,5 +1,7 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnContracts
+
+// Blueprint: | `BridgeLane.swift` | `BridgeLane`: bridge surface spelling and agent-authorship classification, without assigning identity or effect authority |
 
 /// Every agent door carries agent authorship. Surface spellings remain readable
 /// in saved rows and approvals, without assigning identity or authority.

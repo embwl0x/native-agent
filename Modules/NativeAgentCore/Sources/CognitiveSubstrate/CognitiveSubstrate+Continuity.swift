@@ -16,6 +16,8 @@
 import Foundation
 import NativeAgentCore
 
+// Blueprint: | `CognitiveSubstrate+Continuity.swift` | `CognitiveSubstrate` continuity cues: dream-theme association and since-gap candidates compete for the existing felt slot |
+
 /// One residue phrase from last night's diary, scored against this message.
 public struct CognitiveDreamTheme: Sendable, Equatable {
     /// `<diary date>#<n>`: stable per phrase per diary. The ledger key, and

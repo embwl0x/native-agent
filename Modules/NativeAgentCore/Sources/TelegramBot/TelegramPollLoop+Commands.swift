@@ -1,6 +1,9 @@
 import Foundation
+import ChatTurnContracts
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
+// Blueprint: | `TelegramPollLoop+Commands.swift` | `TelegramPollLoop`: `handleControlHandoff`, `clearQueueAcknowledgement`, `handleSlashCommand`; admitted commands/callbacks bind their Telegram surface, verified chat/sender and work identity in TurnEnvelope; Telegram has no command-signature scheme |
 
 extension TelegramPollLoop {
     func handleControlHandoff(update: TelegramUpdate, message: TelegramMessage, text: String,
@@ -37,6 +40,16 @@ extension TelegramPollLoop {
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String
+    ) async -> Bool {
+        await ChatToolSessionContext.$envelope.withValue(TurnEnvelope(surface: "telegram", verifiedChatId: String(message.chatId),
+            verifiedUserId: message.fromUserId.map(String.init), commandSignatureVerified: nil,
+            workIdentity: "telegram:command:\(botIdentity):\(update.updateId)")) {
+            await handleAdmittedSlashCommand(update: update, message: message, text: text)
+        }
+    }
+
+    private func handleAdmittedSlashCommand(
+        update: TelegramUpdate, message: TelegramMessage, text: String
     ) async -> Bool {
         guard text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") else {
             return false
@@ -157,6 +170,14 @@ extension TelegramPollLoop {
             return true
         }
 
+        return await ChatToolSessionContext.$envelope.withValue(TurnEnvelope(surface: "telegram", verifiedChatId: String(parsed.chatId),
+            verifiedUserId: parsed.fromUserId.map(String.init), commandSignatureVerified: nil,
+            workIdentity: "telegram:callback:\(botIdentity):\(parsed.callbackId)")) {
+            await dispatchAuthenticatedModelSelection(parsed, update: update)
+        }
+    }
+
+    private func dispatchAuthenticatedModelSelection(_ parsed: TelegramModelSelectionCallback, update: TelegramUpdate) async -> Bool {
         guard let menu = await bot.telegramModelMenuForSurface("telegram") else {
             try? await answerCallbackQuery(token, parsed.callbackId, "Model menu is not available.")
             return true
@@ -165,12 +186,13 @@ extension TelegramPollLoop {
         switch parsed.action {
         case .providers:
             do {
+                let presentation = try await bot.modelPickerPresentation("providers", menu: menu)
                 try await editMessageTextWithReplyMarkup(
                     token,
                     parsed.chatId,
                     parsed.messageId,
-                    TelegramModelSelectionUI.providerText(menu: menu),
-                    TelegramModelSelectionUI.providerReplyMarkup(menu: menu)
+                    presentation.text,
+                    presentation.markup
                 )
                 try? await answerCallbackQuery(token, parsed.callbackId, "Choose a provider.")
             } catch {
@@ -183,19 +205,18 @@ extension TelegramPollLoop {
             let matches = menu.providers.indices.filter {
                 TelegramModelSelectionCallback.selectionKey(menu.providers[$0].id) == key
             }
-            guard matches.count == 1, let providerIndex = matches.first,
-                  let text = TelegramModelSelectionUI.modelText(menu: menu, providerIndex: providerIndex),
-                  let markup = TelegramModelSelectionUI.modelReplyMarkup(menu: menu, providerIndex: providerIndex) else {
+            guard matches.count == 1, let providerIndex = matches.first else {
                 try? await answerCallbackQuery(token, parsed.callbackId, "That provider is no longer available.")
                 return true
             }
             do {
+                let presentation = try await bot.modelPickerPresentation("models", menu: menu, providerId: menu.providers[providerIndex].id)
                 try await editMessageTextWithReplyMarkup(
                     token,
                     parsed.chatId,
                     parsed.messageId,
-                    text,
-                    markup
+                    presentation.text,
+                    presentation.markup
                 )
                 try? await answerCallbackQuery(token, parsed.callbackId, "Choose a model.")
             } catch {
@@ -220,6 +241,8 @@ extension TelegramPollLoop {
                 return true
             }
             do {
+                let presentation = try await bot.modelPickerPresentation("selected", menu: menu, providerId: provider.id, modelId: model.id)
+                try Task.checkCancellation()
                 try await bot.saveTelegramModelSelection(
                     surface: "telegram",
                     provider: provider.id,
@@ -229,8 +252,8 @@ extension TelegramPollLoop {
                     token,
                     parsed.chatId,
                     parsed.messageId,
-                    TelegramModelSelectionUI.selectedText(provider: provider, model: model),
-                    TelegramModelSelectionUI.selectedReplyMarkup(providerId: provider.id)
+                    presentation.text,
+                    presentation.markup
                 )
                 try? await answerCallbackQuery(token, parsed.callbackId, "Chat model set to \(model.id).")
             } catch {
@@ -257,12 +280,25 @@ extension TelegramPollLoop {
             )
             return
         }
+        let presentation: (text: String, markup: JSONValue)
+        do {
+            presentation = try await bot.modelPickerPresentation("providers", menu: menu)
+        } catch {
+            await recordError(context: "model_menu_part", error: String(describing: error), update: update, message: message, text: text)
+            if !Task.isCancelled {
+                await sendCommandReply(
+                    "Telegram model picker failed: \(Self._tgRedactToken(TurnTraceRedactor.redactText(error.localizedDescription)))",
+                    kind: "model_menu_part_failed", update: update, message: message, text: text
+                )
+            }
+            return
+        }
         do {
             try await sendMessageWithReplyMarkup(
                 token,
                 message.destination,
-                TelegramModelSelectionUI.providerText(menu: menu),
-                TelegramModelSelectionUI.providerReplyMarkup(menu: menu)
+                presentation.text,
+                presentation.markup
             )
             await recordReceipt(
                 kind: "model_menu",
@@ -323,19 +359,19 @@ extension TelegramPollLoop {
                 .recentSessions(destination: message.destination, fromUserId: message.fromUserId, limit: 8)
             let reply: String
             if sessions.isEmpty {
-                reply = "No chat sessions found."
+                reply = "No conversations found."
             } else {
                 let lines = sessions.map { session -> String in
                     let updated = session.updatedAt.map { ", updated \($0)" } ?? ""
                     return "\(session.id) - \(session.title) (\(session.source), \(session.messageCount) message(s)\(updated))"
                 }
-                reply = (["Recent sessions:"] + lines + ["Use /resume <id> to bind this Telegram chat."])
+                reply = (["Recent conversations:"] + lines + ["Use /resume <id> to bind this Telegram chat."])
                     .joined(separator: "\n")
             }
             await sendCommandReply(reply, kind: "slash_reply", update: update, message: message, text: text)
         } catch {
             await sendCommandReply(
-                "Could not list sessions: \(Self._tgRedactToken(String(describing: error)))",
+                "Could not list conversations: \(Self._tgRedactToken(String(describing: error)))",
                 kind: "slash_error",
                 update: update,
                 message: message,
@@ -366,7 +402,7 @@ extension TelegramPollLoop {
             admissionReady()
             let description = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             await sendCommandReply(
-                "Could not resume session: \(Self._tgRedactToken(description))",
+                "Could not resume conversation: \(Self._tgRedactToken(description))",
                 kind: "slash_error",
                 update: update,
                 message: message,
@@ -381,7 +417,7 @@ extension TelegramPollLoop {
         message: TelegramMessage,
         text: String
     ) async -> Bool {
-        let updateInbox = TelegramUpdateInbox(offsetURL: offsetURL)
+        let updateInbox = TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot)
         do {
             var pending: TelegramUpdateClaim?
             for claim in try await updateInbox.snapshots().reversed()
@@ -503,6 +539,8 @@ extension TelegramPollLoop {
                     )
                 }
             } catch {
+                // Release ingress ownership so a later tick can rehydrate the queued claim.
+                await turnCoordinator.endUpdateProcessing(update.updateId)
                 await recordError(context: "retry_claim_read", error: String(describing: error), update: update)
                 return
             }
@@ -692,7 +730,7 @@ extension TelegramPollLoop {
         retryMessage: TelegramMessage?,
         sessionId: String
     ) async {
-        let card = makeTurnProgressCard(
+        let card = await makeTurnProgressCard(
             destination: message.destination,
             turnId: turnId,
             errorContext: "retry_turn_card",
@@ -717,7 +755,7 @@ extension TelegramPollLoop {
             text: commandText
         )
         do {
-            _ = try await TelegramUpdateInbox(offsetURL: offsetURL).transition(
+            _ = try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).transition(
                 updateId: update.updateId, from: [.processing], to: .processing,
                 assistantRunId: turnId.uuidString, assistantSessionId: sessionId
             )
@@ -824,32 +862,28 @@ extension TelegramPollLoop {
     func buildStatusReply(destination: TelegramDestination) async -> String {
         let turn = await turnCoordinator.snapshot(destination: destination)
         let phase = await turnCoordinator.activeCard(destination: destination)?.snapshot().state.phase
-        let waitingOnUser = phase == .blocked
-
-        var sentence: String
-        if waitingOnUser {
-            sentence = "The agent is waiting for approval"
-        } else if turn.isRunning {
-            if let preview = turn.promptPreview, !preview.isEmpty {
-                sentence = "The agent is working on \u{201C}\(Self.statusPreview(preview))\u{201D}"
-            } else {
-                sentence = "The agent is working on a request"
-            }
-        } else {
-            sentence = "The agent is idle"
-        }
-
-        sentence += "."
-        if let model = await bot.telegramPlainModelPhrase() {
-            sentence += " Next-turn model: \(model)."
-        }
-        sentence += " " + (await bot.approvalStatusSentence(destination: destination))
-        return sentence
+        let model = await bot.telegramPlainModelPhrase()
+        let approvals = await bot.approvalStatus(destination: destination)
+        let input: JSONValue = .object([
+            "kind": .string("status"), "waitingOnUser": .bool(phase == .blocked),
+            "running": .bool(turn.isRunning),
+            "hasPreview": .bool(turn.promptPreview?.isEmpty == false),
+            "preview": turn.promptPreview.map { .string(Self.statusPreview($0)) } ?? .null,
+            "model": .object(["status": .string(model == nil ? "unavailable" : "available"),
+                "phrase": model.map(JSONValue.string) ?? .null]),
+            "approvals": approvals
+        ])
+        let face = await TelegramProgressFace(dataRoot: dataRoot, call: partFace)
+        let text = await face.text(input: input, row: "status")
+        await face.close()
+        return text + (model == nil ? " Next-turn model is unavailable." : "")
+            + (approvals.objectValue?["status"] == .string("unavailable")
+            ? " Approval status is unavailable; check the pending buttons or Desk in the Mac app." : "")
     }
 
     /// A short, single-line, token-redacted echo of what she's working on.
     static func statusPreview(_ raw: String) -> String {
-        let flattened = _tgRedactToken(raw)
+        let flattened = _tgRedactToken(TurnTraceRedactor.redactText(raw))
             .replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if flattened.count <= 60 { return flattened }
@@ -936,7 +970,7 @@ extension TelegramPollLoop {
             // `true` means a tracked turn took the claim; that turn settles it.
             guard !transferred else { return }
             do {
-                _ = try await TelegramUpdateInbox(offsetURL: loop.offsetURL).transition(
+                _ = try await TelegramUpdateInbox(offsetURL: loop.offsetURL, dataRoot: loop.dataRoot).transition(
                     updateId: update.updateId,
                     from: [.processing, .queued],
                     to: .completed

@@ -2,6 +2,8 @@ import SwiftUI
 import Foundation
 import os
 
+// Blueprint: | `TranscriptLayoutProbe.swift` | `TranscriptLayoutProbe`: opt-in per-row layout measurement and bounded diagnostic ledger, without changing transcript content |
+
 /// Per-row layout cost for the chat transcript.
 ///
 /// The 04:05 pin (2026-09-04) had no app code in it: `NSHostingView`

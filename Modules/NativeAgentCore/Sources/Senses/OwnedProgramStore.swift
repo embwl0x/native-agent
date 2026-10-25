@@ -3,6 +3,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `OwnedProgramStore.swift` | Retained ability file URLs, candidate identity, sealed rehearsal and publication through AbilityStore headers; rehearsal scopes supplied inputs and reached calls, never behavioral proof from intercepted replies; trusted bundled-seed proofs seal exact bytes without validation receipts or staging; kept proofs seal their Full Mac keeps without rehearsal; source-bound sense reads bind captured-material proof; OwnedProgramFixtures reads live and intercepts tool/routine effects and decisions |
 
 /// Executable metadata and source share the ability's current, previous or next file.
 public struct OwnedProgramStore: Sendable {
@@ -32,7 +33,15 @@ public struct OwnedProgramStore: Sendable {
         public let fixtures: JSONValue
         public let dependencyShapes: JSONValue
         public let prior: JSONValue
+        /// Candidate identity, sealing all authored inputs, not just source.
         public var digest: String { program.version }
+        /// The program as it runs: under the ability that owns its file. A
+        /// migrated version may be sealed under another ability's id; its bytes keep it.
+        public var owned: OwnedProgram {
+            OwnedProgram(kind: program.kind, id: id, version: program.version, source: program.source,
+                entry: program.entry, schema: program.schema, dependencies: program.dependencies,
+                permissions: program.permissions, reach: program.reach, seconds: program.seconds, resident: program.isResident)
+        }
 
         public init(program: OwnedProgram, manifest: JSONValue, fixtures: JSONValue,
                     dependencyShapes: JSONValue, prior: JSONValue) throws {
@@ -48,7 +57,7 @@ public struct OwnedProgramStore: Sendable {
         }
     }
 
-    public func directory(id: String, digest: String) throws -> URL {
+    public func fileURL(id: String, digest: String) throws -> URL {
         guard Self.component(id), digest.count == 64,
               digest.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
             throw SenseFailure(code: "bad_input", message: "Invalid owned program identity.")
@@ -71,7 +80,7 @@ public struct OwnedProgramStore: Sendable {
                 if let file = try abilities.read(id: candidate.id, slot: slot), file.metadata["candidate"] != nil,
                    try decode(file) == candidate { return }
             }
-            guard let kind = AbilityStore.Kind(rawValue: candidate.program.kind.rawValue) else {
+            guard let kind = candidate.program.storeKind else {
                 throw SenseFailure(code: "bad_input", message: "This program is not an ability.")
             }
             let id = candidate.id
@@ -89,10 +98,6 @@ public struct OwnedProgramStore: Sendable {
         if kind != .sense, try BuiltInSenses.defaults().contains(where: { $0.record.id.caseInsensitiveCompare(id) == .orderedSame }) {
             throw SenseFailure(code: "bad_input", message: "Ability id collision: \(id) is a bundled sense.")
         }
-        let guidance = defaultPersonaRoot(dataRoot: root.deletingLastPathComponent()).appendingPathComponent("skills/bodies/\(id).md")
-        if kind != .skill, FileManager.default.fileExists(atPath: guidance.path) {
-            throw SenseFailure(code: "bad_input", message: "Ability id collision: \(id) is a built-in skill.")
-        }
         var descriptor = try value(candidate).objectValue!
         var program = descriptor["program"]!.objectValue!
         program.removeValue(forKey: "source")
@@ -101,14 +106,14 @@ public struct OwnedProgramStore: Sendable {
             script.removeValue(forKey: "source"); manifest["script"] = .object(script)
             descriptor["manifest"] = .object(manifest)
         }
-        return AbilityStore.File(id: candidate.id, kind: kind,
+        return try AbilityStore.File(id: candidate.id, kind: kind,
             metadata: ["candidate": .object(descriptor), "version": .int(version)], body: candidate.program.source, pathExtension: "js")
     }
 
     /// Bundle bytes are trusted at installation; no validation run took place.
     package func bundledSeed(_ candidate: Candidate, version: Int64, key: Data) throws -> AbilityStore.File {
         try check(candidate)
-        guard let kind = AbilityStore.Kind(rawValue: candidate.program.kind.rawValue) else {
+        guard let kind = candidate.program.storeKind else {
             throw SenseFailure(code: "bad_input", message: "This program is not an ability.")
         }
         var file = try file(candidate, kind: kind, version: version)
@@ -147,7 +152,7 @@ public struct OwnedProgramStore: Sendable {
         let program = OwnedProgram(kind: decoded.kind, id: decoded.id, version: decoded.version,
             source: decoded.source, entry: decoded.entry, schema: schema, dependencies: decoded.dependencies,
             permissions: decoded.permissions, reach: decoded.reach, seconds: decoded.seconds, resident: decoded.isResident)
-        let expected = AbilityStore.File(id: file.id, kind: file.kind, metadata: ["candidate": .object(fields)], body: file.body, pathExtension: file.pathExtension)
+        let expected = try AbilityStore.File(id: file.id, kind: file.kind, metadata: ["candidate": .object(fields)], body: file.body, pathExtension: file.pathExtension)
         guard file.part == expected.part else { throw SenseFailure(code: "integrity", message: "Part header differs from its exact candidate. Propose it again.") }
         var candidate = try Candidate(program: program, manifest: manifest, fixtures: fixtures,
                                       dependencyShapes: dependencies, prior: prior)
@@ -182,6 +187,18 @@ public struct OwnedProgramStore: Sendable {
             evidence["capturedFixtures"] = captured
             evidence["capture"] = .string(OwnedProgramFixtures.summary(captured))
         }
+        return try seal(candidate, evidence: evidence, key: key)
+    }
+
+    /// Kept by her under Full Mac, with no rehearsal (User 10-15): a rehearsal
+    /// proves no live behavior, so its first real run is its proof, and a
+    /// failing run owes repair as any part's does.
+    public func kept(_ candidate: Candidate, key: Data) throws {
+        try CapabilityLifecycle.requireWrite()
+        _ = try seal(candidate, evidence: ["domain": .string("owned-program-kept")], key: key)
+    }
+
+    private func seal(_ candidate: Candidate, evidence: [String: JSONValue], key: Data) throws -> JSONValue {
         let proof = try sealedProof(candidate, evidence: evidence, key: key)
         try AbilityStore.withLock {
             let slot = try slot(candidate)
@@ -241,7 +258,7 @@ public struct OwnedProgramStore: Sendable {
             var final: [String: JSONValue] = [:]
             for pass in 0...answers.count {
                 let receipt = await SkillRunContext.$handsBack.withValue(true) {
-                    await runner.run(candidate.program, input: input, preview: false, replay: replay, host: interceptor)
+                    await runner.run(candidate.owned, input: input, preview: false, replay: replay, host: interceptor)
                 }
                 final = receipt.objectValue ?? [:]
                 receipts.append(.object(final.merging(["input": input]) { _, input in input }))
@@ -262,7 +279,7 @@ public struct OwnedProgramStore: Sendable {
             if recording {
                 let fixture: JSONValue = .array([.object(["input": input, "calls": .array(await interceptor.recorded),
                                                          "expected": final["returned"] ?? .null])])
-                guard try fixture.serializedData(pretty: false).count <= (candidate.program.kind == .tool ? candidate.program.returnLimit : 256 * 1024) else {
+                guard try fixture.serializedData(pretty: false).count <= candidate.program.returnLimit else {
                     throw SenseFailure(code: "output_limit", message: "The captured fixture exceeds the candidate's material limit. Supply smaller input or explicit fixtures.")
                 }
                 captured = fixture
@@ -285,7 +302,7 @@ public struct OwnedProgramStore: Sendable {
     public func proof(_ candidate: Candidate, key: Data) throws -> JSONValue {
         guard case .object(var fields)? = try abilities.read(id: candidate.id, slot: slot(candidate))?.metadata["proof"],
               case .string(let saved)? = fields.removeValue(forKey: "seal"),
-              [JSONValue.string("owned-program-validation"), .string("owned-program-seed")].contains(fields["domain"] ?? .null),
+              [JSONValue.string("owned-program-validation"), .string("owned-program-seed"), .string("owned-program-kept")].contains(fields["domain"] ?? .null),
               fields["candidate"] == .string(candidate.digest),
               fields["fixtures"] == .string(try Self.hash(candidate.fixtures)),
               fields["entry"] == .string(candidate.program.entry.rawValue),
@@ -306,7 +323,7 @@ public struct OwnedProgramStore: Sendable {
             guard try load(id: candidate.id, digest: candidate.digest) == candidate else {
                 throw SenseFailure(code: "integrity", message: "Candidate changed before publication.")
             }
-            guard let kind = AbilityStore.Kind(rawValue: candidate.program.kind.rawValue) else {
+            guard let kind = candidate.program.storeKind else {
                 throw SenseFailure(code: "bad_input", message: "This program is not an ability.")
             }
             _ = try proof(candidate, key: key)
@@ -375,6 +392,15 @@ public struct OwnedProgramStore: Sendable {
     }
 }
 
+/// A thought's output and nested effect evidence, even when it failed or stopped.
+public struct OwnedProgramThought: Sendable {
+    public let output: Result<String, any Error>
+    public let effects: String
+    public init(output: Result<String, any Error>, effects: String) {
+        self.output = output; self.effects = effects
+    }
+}
+
 /// The originating app door contributes metadata and the existing Trust gate.
 /// A declaration identifies a dependency; it never admits its execution.
 public protocol OwnedProgramToolHost: OwnedProgramHostProfile {
@@ -384,9 +410,14 @@ public protocol OwnedProgramToolHost: OwnedProgramHostProfile {
     func dependencyPin(_ id: String) -> String?
     func dependencyMatches(_ id: String, _ saved: JSONValue?) -> Bool
     func admitTool(_ id: String, input: [String: JSONValue]) async -> JSONValue?
+    /// The canonical tool-turn owner, with the part's restricted effect host.
+    func think(messages: [LLMMessage], tools: [String], surface: String?, host: any OwnedProgramHostProfile) async -> OwnedProgramThought
 }
 
 public extension OwnedProgramToolHost {
+    func think(messages: [LLMMessage], tools: [String], surface: String?, host: any OwnedProgramHostProfile) async -> OwnedProgramThought {
+        .init(output: .failure(SenseFailure(code: "unavailable", message: "This host has no canonical tool-turn owner.")), effects: "none")
+    }
     func dependencyPin(_ id: String) -> String? {
         dependencyShape(id).flatMap { try? OwnedProgramStore.hash($0) }
     }
@@ -515,6 +546,9 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
 
 public enum OwnedProgramInvocation {
     @TaskLocal public static var host: (any OwnedProgramToolHost)?
+    /// A value call pins before it waits at any gate. Presentation must retain
+    /// its runner envelope, and dispatch must execute this version or refuse.
+    @TaskLocal public static var valueCall: (id: String, version: String)?
 }
 
 private extension JSONValue {

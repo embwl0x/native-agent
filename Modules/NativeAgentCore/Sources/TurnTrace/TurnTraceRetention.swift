@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `TurnTraceRetention.swift` | `TurnTraceRetention.enforce`: date-based expiry of trace artifacts and their lock sidecars with retention receipts |
+
 /// M7 (honesty sweep, 2026-07-09): `<dataRoot>/turn_traces/` accumulated one
 /// `<yyyy-MM-dd>.jsonl` plus one orphaned `<yyyy-MM-dd>.jsonl.lock` per day and
 /// nothing ever removed them (~236MB/yr). `ChatSessionRetention` bounded the

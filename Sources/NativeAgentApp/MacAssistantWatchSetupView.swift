@@ -1,72 +1,30 @@
-import MacAssistantStatus
 import SwiftUI
 import MacIntegration
-import Observation
+import EngineRuntime
 
-/// Appearance, manual refresh, and completed setup/probe actions can overlap.
-/// Only the newest requested inventory may replace the mounted readiness state.
-@MainActor @Observable
-final class MacAssistantWatchSetupReadState {
-    private(set) var loadState: MacAssistantWatchSetupLoadState = .loading
-    private(set) var isLoading = false
-    @ObservationIgnored private var generation: UInt64 = 0
-
-    @discardableResult
-    func reload(read: @MainActor () async throws -> MacAssistantStatusResult) async -> Bool {
-        generation &+= 1
-        let request = generation
-        isLoading = true
-        defer {
-            if request == generation { isLoading = false }
-        }
-        do {
-            let status = try await read()
-            guard !Task.isCancelled, request == generation else { return false }
-            loadState = .current(status)
-            return true
-        } catch {
-            guard !Task.isCancelled, request == generation else { return false }
-            loadState = loadState.afterFailure(
-                UserFacingError.message(error, action: "refresh background watches")
-            )
-            return false
-        }
-    }
-}
+// Blueprint: | `MacAssistantWatchSetupView.swift` | `MacAssistantWatchSetupView`: assistant watch/access controls, readiness reads and actionable Mail/permission checks |
 
 struct MacAssistantWatchSetupView: View {
-    typealias StatusReader = @MainActor () async throws -> MacAssistantStatusResult
-
     var refreshToken: Int
-    private let statusReader: StatusReader?
     private let loadsOnAppear: Bool
 
     @Environment(AppModel.self) private var appModel
-    @State private var readState = MacAssistantWatchSetupReadState()
-    /// The last Check Mail result. The status read has no Mail source of its
-    /// own (it can only say "not checked yet"). Current access failures still
-    /// override this cached outcome.
-    @State private var mailCheck: (status: String, word: String, next: String?)?
     @State private var isCheckingMail = false
 
-    private var loadState: MacAssistantWatchSetupLoadState { readState.loadState }
-    private var isLoading: Bool { readState.isLoading }
+    private var loadState: MacAssistantWatchSetupLoadState { appModel.engine.macIntegration.watchState }
+    private var isLoading: Bool { appModel.engine.macIntegration.isLoadingWatches }
 
     init(
         refreshToken: Int = 0,
-        statusReader: StatusReader? = nil,
         loadsOnAppear: Bool = true
     ) {
         self.refreshToken = refreshToken
-        self.statusReader = statusReader
         self.loadsOnAppear = loadsOnAppear
     }
 
     // Alive glass (2026-09-23): the watches and what they can use are two
     // eyebrows over one group card each. Status words are quiet; only a read
-    // that failed is trouble. "Needs proof" is a state, not trouble: the
-    // templates are inert until scheduled, and the connector proof this build
-    // uses never verifies on its own.
+    // that failed is trouble.
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
@@ -167,13 +125,9 @@ struct MacAssistantWatchSetupView: View {
     }
 
     private func templateRow(_ template: MacAssistantWatchTemplate) -> some View {
-        let plain = Self.plainTemplate[template.id]
-        let when = template.scheduleLabel.prefix(1).lowercased() + template.scheduleLabel.dropFirst()
-        let sentence = plain.map { $0.sentence.replacingOccurrences(of: "{when}", with: when) }
-            ?? [template.scheduleLabel, template.summary].joined(separator: " · ")
         return statusRow(
-            title: plain?.title ?? template.title,
-            detail: sentence,
+            title: template.displayTitle,
+            detail: template.displaySummary,
             nextStep: nil,
             status: template.status,
             word: Self.templateWord(template.status)
@@ -183,22 +137,18 @@ struct MacAssistantWatchSetupView: View {
     private func accessRow(_ item: MacAssistantAccessItem) -> some View {
         let plain = Self.plainAccess[item.id]
         let title = plain?.title ?? item.title
-        let check = item.id == "local_mail" && ["probe_needed", "ready"].contains(item.status) ? mailCheck : nil
-        let status = check?.status ?? item.status
-        let notConnected = item.nextStep == "Configure connector proof in the NativeAgent app"
+        let status = item.status
         // The macOS prompt note matters only until access is ready.
         var detail = plain?.detail ?? item.detail
         if status != "ready", let note = Self.promptNote[item.id] {
             detail = detail + note
         }
-        // The two next steps that are a place in this app become a button to
+        // A next step that is a place in this app becomes a button to
         // that place, not a sentence pointing at it; Mac Mail gets a real check.
         let action: (label: String, go: () -> Void)? = if item.id == "local_mail" {
             isCheckingMail ? nil : ("Check Mail", { Task { await checkMail() } })
         } else {
             switch item.nextStep {
-            case "Configure connector proof in the NativeAgent app":
-                ("Connect \(title)", { NativeAgentAppCoordinator.shared.request(.sidebar(.connectors)) })
             case "Configure mobile push in NativeAgent settings":
                 ("Set up iPhone notifications", {
                     // The iPhone is paired on Connectors' iPhone tab. The route
@@ -210,8 +160,8 @@ struct MacAssistantWatchSetupView: View {
             default: nil
             }
         }
-        let next = check.map(\.next)
-            ?? (action != nil ? nil : item.nextStep.flatMap { $0.isEmpty ? nil : (Self.plainNextStep[$0] ?? $0) })
+        let next = item.id == "local_mail" && ["failed", "needs_permission", "needs_setup"].contains(status)
+            ? item.nextStep : action != nil ? nil : item.nextStep.flatMap { $0.isEmpty ? nil : (Self.plainNextStep[$0] ?? $0) }
         return statusRow(
             title: title,
             detail: detail,
@@ -219,7 +169,7 @@ struct MacAssistantWatchSetupView: View {
             action: status == "ready" ? nil : action,
             status: status,
             word: isCheckingMail && item.id == "local_mail" ? "Checking…"
-                : check?.word ?? (notConnected ? "Not connected" : Self.accessWord(item.status))
+                : item.id == "local_mail" && status == "failed" ? "Check failed" : Self.accessWord(item.status)
         )
     }
 
@@ -228,12 +178,7 @@ struct MacAssistantWatchSetupView: View {
     private func checkMail() async {
         isCheckingMail = true
         defer { isCheckingMail = false }
-        do {
-            mailCheck = MacAssistantStatusResult.mailReadiness(
-                from: try await MacAppleScriptBridge.mailListRecent(input: ["limit": .int(1)]))
-        } catch {
-            mailCheck = ("failed", "Check failed", UserFacingError.cause(error, action: "check Mail"))
-        }
+        await appModel.engine.macIntegration.checkMail()
     }
 
     private func statusRow(
@@ -288,13 +233,7 @@ struct MacAssistantWatchSetupView: View {
     }
 
     private func load() async {
-        await readState.reload {
-            if let statusReader {
-                return try await statusReader()
-            } else {
-                return try await appModel.getMacAssistantStatus()
-            }
-        }
+        await appModel.engine.macIntegration.refreshWatches()
     }
 
     // MARK: - Plain words
@@ -312,7 +251,6 @@ struct MacAssistantWatchSetupView: View {
         case "ready", "ok", "succeeded": "Ready"
         case "probe_needed": "Not checked yet"
         case "needs_policy": "Off"
-        case "needs_proof": "Not verified"
         case "needs_permission": "Needs macOS permission"
         case "needs_setup", "attention": "Needs setup"
         case "failed", "error", "unavailable": "Unavailable"
@@ -323,28 +261,14 @@ struct MacAssistantWatchSetupView: View {
     private static func templateWord(_ status: String) -> String {
         switch status.lowercased() {
         case "needs_policy": "Needs Mac control"
-        case "needs_proof": "Needs a verified account"
         default: accessWord(status)
         }
     }
-
-    /// The watches the status client offers, by id, in first person. `{when}`
-    /// is the template's own schedule label, so a changed schedule reads true.
-    private static let plainTemplate: [String: (title: String, sentence: String)] = [
-        "gmail_unread_digest": ("Gmail digest", "I check your unread Gmail {when} and note what I find for your digest."),
-        "google_calendar_window_watch": ("Google Calendar", "I check your upcoming Google Calendar events {when}."),
-        "local_mail_watch": ("Mac Mail", "I check Mail for unread messages {when} (read only)."),
-        "local_calendar_watch": ("Mac Calendar", "I check Calendar for the next day {when} (read only)."),
-        "local_reminders_watch": ("Mac Reminders", "I check Reminders for due and overdue items {when} (read only)."),
-        "morning_brief_watch": ("Morning brief", "I turn your email and calendar into a brief card {when}."),
-    ]
 
     private static let plainAccess: [String: (title: String, detail: String)] = [
         "mac_control": ("Mac control", "Lets me run shortcuts, post notifications, read files and script apps on this Mac."),
         "mac_notifications": ("Mac notifications", "I post notifications on this Mac."),
         "iphone_push": ("iPhone notifications", "I send what a watch found to your iPhone."),
-        "gmail": ("Gmail", "I read Gmail only once the connection is verified, not just because you are signed in."),
-        "google_calendar": ("Google Calendar", "I read events only after a fresh check that the account works."),
         "local_mail": ("Mac Mail", "I read your Mail inbox (read only)."),
         "local_calendar": ("Mac Calendar", "I read Calendar (read only)."),
         "local_reminders": ("Mac Reminders", "I read Reminders (read only)."),
@@ -370,53 +294,4 @@ struct MacAssistantWatchSetupView: View {
         "Enable Calendar access for NativeAgent in System Settings > Privacy & Security.": "Allow Calendar for NativeAgent in System Settings → Privacy & Security.",
         "Enable Reminders access for NativeAgent in System Settings > Privacy & Security.": "Allow Reminders for NativeAgent in System Settings → Privacy & Security.",
     ]
-}
-
-enum MacAssistantWatchSetupLoadState: Equatable {
-    case loading
-    case current(MacAssistantStatusResult)
-    case stale(MacAssistantStatusResult, message: String)
-    case unavailable(message: String)
-
-    var response: MacAssistantStatusResult? {
-        switch self {
-        case .current(let response), .stale(let response, _): response
-        case .loading, .unavailable: nil
-        }
-    }
-
-    var badgeText: String {
-        switch self {
-        case .loading: "Loading"
-        case .current(let response): response.status.replacingOccurrences(of: "_", with: " ").capitalized
-        case .stale: "Stale"
-        case .unavailable: "Unavailable"
-        }
-    }
-
-    var badgeStatus: String {
-        switch self {
-        case .loading: "unknown"
-        case .current(let response): response.status
-        case .stale: "attention"
-        case .unavailable: "failed"
-        }
-    }
-
-    var diagnosticText: String? {
-        switch self {
-        case .stale(_, let message), .unavailable(let message): message
-        case .loading, .current: nil
-        }
-    }
-
-    var isCurrent: Bool {
-        if case .current = self { return true }
-        return false
-    }
-
-    func afterFailure(_ message: String) -> Self {
-        guard let response else { return .unavailable(message: message) }
-        return .stale(response, message: message)
-    }
 }

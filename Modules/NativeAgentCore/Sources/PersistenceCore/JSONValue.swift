@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import Darwin
 import NativeAgentCore
+// Blueprint: | `JSONValue.swift` | `JSONValue` enum; `ToolSchema` shared object/string/boolean/integer/enum/parameter constructors; shared schema checker for app arguments, Workshop and owned-code model replies (whole-tree preflight of enforced keywords, unknown keywords ignored, caller-owned error formatting); `fromEncodable`, `mapStrings`, `decodedExactly` (a store's one shape check, naming the field), `digest`, `differences`; `JSONRow` checked row reads for typed owner records |
 
 // MARK: - JSONValue
 
@@ -676,5 +677,62 @@ extension JSONValue {
     public static func differences(_ old: JSONValue, _ new: JSONValue, path: String = "") -> [String] {
         guard case .object(let before) = old, case .object(let after) = new else { return old == new ? [] : [String(path.dropLast())] }
         return Set(before.keys).union(after.keys).sorted().flatMap { differences(before[$0] ?? .null, after[$0] ?? .null, path: path + $0 + ".") }
+    }
+}
+
+/// Shared JSON-schema constructors; each tool owner still supplies its own schema.
+package enum ToolSchema {
+    package static func obj(_ pairs: [(String, JSONValue)]) -> JSONValue {
+        var d: [String: JSONValue] = [:]
+        for (k, v) in pairs { d[k] = v }
+        return .object(d)
+    }
+    package static func strSchema(_ desc: String? = nil) -> JSONValue {
+        var props: [(String, JSONValue)] = [("type", .string("string"))]
+        if let desc { props.append(("description", .string(desc))) }
+        return obj(props)
+    }
+    package static func enumStringSchema(_ values: [String], _ desc: String? = nil) -> JSONValue {
+        var props: [(String, JSONValue)] = [
+            ("type", .string("string")),
+            ("enum", .array(values.map(JSONValue.string))),
+        ]
+        if let desc { props.append(("description", .string(desc))) }
+        return obj(props)
+    }
+    package static func intSchema(
+        _ desc: String? = nil,
+        minimum: Int? = nil,
+        maximum: Int? = nil
+    ) -> JSONValue {
+        var props: [(String, JSONValue)] = [("type", .string("integer"))]
+        if let minimum { props.append(("minimum", .int(Int64(minimum)))) }
+        if let maximum { props.append(("maximum", .int(Int64(maximum)))) }
+        if let desc { props.append(("description", .string(desc))) }
+        return obj(props)
+    }
+    package static func boolSchema(_ desc: String? = nil) -> JSONValue {
+        var props: [(String, JSONValue)] = [("type", .string("boolean"))]
+        if let desc { props.append(("description", .string(desc))) }
+        return obj(props)
+    }
+    package static func params(properties: [(String, JSONValue)], required: [String]) -> Data {
+        let v = obj([
+            ("type", .string("object")),
+            ("properties", obj(properties)),
+            ("required", .array(required.map { .string($0) })),
+        ])
+        // serializedData throws only on un-serializable JSONValue payloads;
+        // ours are plain string/array/object literals, so this never throws
+        // in practice. Fail-soft to `{}` to avoid crashing the chat turn.
+        return (try? v.serializedData(pretty: false)) ?? Data("{}".utf8)
+    }
+}
+
+extension DataRootLife {
+    /// The life a stored JSON stamp names; no stamp is her first life.
+    public static func life(of stamp: JSONValue?) -> String {
+        if case .string(let id)? = stamp { return id }
+        return first
     }
 }

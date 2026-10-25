@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import ApprovalInbox
 import MacControl
+// Blueprint: | `InjectionApprovalVerifier.swift` | `ApprovalInboxInjectionApprovalVerifier` struct; `verifyInjectionApproval` |
 
 // MARK: - W2/W3-FIX-R2 1 — replay evidence must be CHECKED, never asserted
 

@@ -1,10 +1,10 @@
 import CognitiveSubstrate
 import Foundation
-import KnowledgeGraph
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Studio
+// Blueprint: | `SwiftToolDispatcher+StudioTools.swift` | `SwiftToolDispatcher`: `impl_studio_shelf`, `studioImageInvitation`, `impl_studio_consult`; journal refresh holds the existing journal flock from read through graph commit and audit |
 
 // MARK: - Studio chat lane (studio_*) — desk 903 phases 1–2
 //
@@ -336,9 +336,13 @@ extension SwiftToolDispatcher {
         // recorded.
         let unknown = StudioFieldSpec.journalEntry.unknownPaths(in: .object(input))
         guard unknown.isEmpty else {
-            throw AutonomyGateError.toolDenied(
-                reason: "studio_journal: unknown field(s) \(unknown.joined(separator: ", ")) — no field by that name exists on a journal entry at that position. There is no rating, score, confidence, or sentiment field anywhere in an entry, at any depth, by design; the judgment lives in `response` and the stance in `stance.kind`."
-            )
+            throw ToolFailureError(
+                "Unknown journal fields: \(unknown.joined(separator: ", ")). No rating, score, confidence or sentiment field exists at any depth.",
+                argumentPath: unknown.joined(separator: ", "), effects: .none,
+                nextCall: ToolFailureError.call("app", ["find": .string("studio.journal")]),
+                code: "studio_journal_unknown_fields", status: .refused,
+                instruction: "Remove unknown fields; put judgment in response and stance in stance.kind. Read accepted fields with next_call.",
+                recovery: .correctArguments)
         }
 
         guard let workObject = try studioObject(input, "work", tool: "studio_journal"),
@@ -467,9 +471,13 @@ extension SwiftToolDispatcher {
         let known: Set<String> = ["entry_id", "reason", "correction", "supersedes"]
         let unknown = input.keys.filter { !known.contains($0) }.sorted()
         guard unknown.isEmpty else {
-            throw AutonomyGateError.toolDenied(
-                reason: "studio_journal_amend: unknown field(s) \(unknown.joined(separator: ", ")) — an amendment carries only entry_id, reason, correction and (optionally) supersedes. It cannot change the work, the stance, the refs or the date of an entry: those are what the entry recorded, and a later encounter is what revises them (studio_journal with relations)."
-            )
+            throw ToolFailureError(
+                "Unknown amendment fields: \(unknown.joined(separator: ", ")). Amendments accept entry_id, reason, correction and optional supersedes; they cannot change work, stance, refs or entry date.",
+                argumentPath: unknown.joined(separator: ", "), effects: .none,
+                nextCall: ToolFailureError.call("app", ["find": .string("studio.amend")]),
+                code: "studio_amend_unknown_fields", status: .refused,
+                instruction: "Use studio.journal with relations for a later encounter; use studio.amend only for factual corrections. Read accepted fields with next_call.",
+                recovery: .correctArguments)
         }
         let entryId = try requireString(input, "entry_id")
         do {
@@ -552,28 +560,33 @@ extension SwiftToolDispatcher {
     @discardableResult
     private func indexStudioJournalIntoGraph(reason: String) async -> StudioGraphIndexReport? {
         do {
-            // 2026-09-06: hot PLUS shelf — an archived entry still names its
-            // work and its relations, and indexing only the hot file dropped
-            // those edges out of the graph on the first cap trim.
-            let entries = try await studioStore().journalEntriesIncludingArchive()
-            guard !entries.isEmpty else { return nil }
-            let indexer = try SwiftNativeKnowledgeGraphIndexer(
-                // The SAME store `NativeKnowledgeGraphContextProjection` reads,
-                // so a studio edge is selectable exactly like the other 94.
-                memorySQLitePath: dataRoot
-                    .appendingPathComponent("memory/memory.sqlite")
-                    .standardizedFileURL
-            )
-            let report = try await indexer.indexStudioJournal(entries)
-            // Agent's addendum (2026-09-01): relations stay provenance-only and
-            // accepted, WITH a guard — every relation must have a graph edge
-            // citing that entry id back. Same trigger as the backfill. Fail
-            // loud, never repair, never block recall.
-            await StudioCanonTending.recordAudit(
-                (try? await indexer.auditStudioRelations(entries)) ?? .unavailable,
-                dataRoot: dataRoot
-            )
-            return report
+            // Keep the journal's existing flock through the graph commit. A
+            // later refresh must read after this one writes, never replace
+            // newer citations with a snapshot read before their append.
+            return try await SwiftNativePersistenceCore().withFileLock(studioStore().journalPath) {
+                // 2026-09-06: hot PLUS shelf — an archived entry still names its
+                // work and its relations, and indexing only the hot file dropped
+                // those edges out of the graph on the first cap trim.
+                let entries = try await studioStore().journalEntriesIncludingArchive()
+                guard !entries.isEmpty else { return nil }
+                let indexer = try SwiftNativeKnowledgeGraphIndexer(
+                    // The SAME store `NativeKnowledgeGraphContextProjection` reads,
+                    // so a studio edge is selectable exactly like the other 94.
+                    memorySQLitePath: dataRoot
+                        .appendingPathComponent("memory/memory.sqlite")
+                        .standardizedFileURL
+                )
+                let report = try await indexer.indexStudioJournal(entries)
+                // Agent's addendum (2026-09-01): relations stay provenance-only and
+                // accepted, WITH a guard — every relation must have a graph edge
+                // citing that entry id back. Same trigger as the backfill. Fail
+                // loud, never repair, never block recall.
+                await StudioCanonTending.recordAudit(
+                    (try? await indexer.auditStudioRelations(entries)) ?? .unavailable,
+                    dataRoot: dataRoot
+                )
+                return report
+            }
         } catch {
             nativeLog("[studio] knowledge-graph index skipped (%@): %@",
                   reason, String(describing: error))
@@ -585,6 +598,7 @@ extension SwiftToolDispatcher {
     /// on disk have to arrive once even if she never files another. Guarded by a
     /// receipt beside the journal, so it runs once per install and not once per
     /// call; a run that finds no graph writes NO receipt and is retried later.
+    /// JSON existence marker: off-disk backup only; no local backup/export/phone sync; PrivacyMap: studio.
     func ensureStudioGraphIndexed() async {
         let receipt = studioStore().studioRoot
             .appendingPathComponent("journal", isDirectory: true)
@@ -594,7 +608,7 @@ extension SwiftToolDispatcher {
               report.graphAvailable else { return }
         try? await SwiftNativePersistenceCore().writeJSON(
             .object([
-                "ran_at": .string(StudioClock.nowISO()),
+                "ran_at": .string(NativeTimestampFormat.sixDigitUTCOffset(Date())),
                 "works": .int(Int64(report.worksIndexed)),
                 "creators": .int(Int64(report.creatorsIndexed)),
                 "edges": .int(Int64(report.edgesWritten)),

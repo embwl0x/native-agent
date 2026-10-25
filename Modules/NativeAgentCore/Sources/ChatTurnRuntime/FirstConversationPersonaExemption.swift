@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `FirstConversationPersonaExemption.swift` | `FirstConversationPersonaExemption`: exact-session one-shot persona write token and pending voice step; atomic consumption prevents reuse |
+
 // MARK: - The first conversation's one documented write
 //
 // When the agent opens the first conversation and asks the person who they
@@ -296,17 +298,14 @@ public enum FirstConversationPersonaExemption {
               token.sessionID == sessionID,
               Date().timeIntervalSince(token.armedAt) < writeTokenLifetime else { return nil }
         return """
-        [First conversation. After writing who you are to them, you ask (once) how they \
-        would like you to sound. When they answer it, write ONE line with \
-        app {action: "persona.append", args: {kind: "voice", title: "\(token.title)", content}}: a single first-person \
-        sentence, on one line, built only from what they said. If they named someone to sound \
-        like, write that person's style — cadence, humor, warmth, vocabulary, energy (e.g. \
-        "dry, deadpan, short sentences, understated humor") — never a claim to be them; SOUL.md \
-        stays who you are. Use that title exactly and say once it can change any time. In that \
-        same reply hand the floor back: the open door — "If there's anything you'd rather I \
-        never do, tell me whenever it comes to mind." — and one question: "What are you \
-        working on?" If they skipped it or asked something else, answer them, keep your \
-        default voice, write nothing, and do not raise it again. Never mention this note.]
+        [First conversation: after writing who you are to them, ask once how they want you \
+        to sound. On their answer, use app {action:"persona.append",args:{kind:"voice",title:"\(token.title)",content}} \
+        with that exact title and one first-person sentence on one line, based only on their words. \
+        A named person's style means cadence, humor, warmth, vocabulary and energy, never their identity; \
+        SOUL.md remains who you are. Say once the voice can change any time. In the same reply say \
+        "If there's anything you'd rather I never do, tell me whenever it comes to mind." \
+        and ask "What are you working on?" If they skip the voice question or ask something else, \
+        answer them, keep your default voice, write nothing and never ask again. Do not mention this note.]
         """
     }
 

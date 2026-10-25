@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `DreamPayload.swift` | `DreamPayload` struct |
 
 struct DreamPayload: Decodable {
     let title: String

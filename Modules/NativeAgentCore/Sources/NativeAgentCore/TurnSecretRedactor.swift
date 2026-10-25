@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `TurnSecretRedactor.swift` | `TurnSecretRedactor`: credential-name/token recognition and shared presentation/trace scrubbing; callers own size bounds |
+
 /// Credential scrubbing shared by presentation and trace boundaries; callers own bounding.
 public enum TurnSecretRedactor {
     // 2026-09-22: X search's next_token/pagination_token are cursors the
@@ -148,9 +150,21 @@ public enum TurnSecretRedactor {
                 var safe = "", start = 0
                 safe.reserveCapacity(text.utf8.count)
                 for match in matches {
-                    safe += nsText.substring(with: NSRange(location: start, length: match.range.location - start))
+                    var range = match.range
+                    // A quoted name is a structured field and is always cut. A bare
+                    // named pair is prose, cut only when its value is credential-shaped,
+                    // and then only the value: "GitHub: connected." is prose.
+                    if kind == "NAMED_SECRET", !#""'\"#.utf16.contains(nsText.character(at: range.location)) {
+                        let whole = nsText.substring(with: range)
+                        guard let colon = whole.firstIndex(where: { $0 == "=" || $0 == ":" }) else { continue }
+                        let value = whole[whole.index(after: colon)...].drop(while: \.isWhitespace)
+                        guard isTokenShaped(String(value)) else { continue }
+                        let offset = (String(whole[..<value.startIndex]) as NSString).length
+                        range = NSRange(location: range.location + offset, length: range.length - offset)
+                    }
+                    safe += nsText.substring(with: NSRange(location: start, length: range.location - start))
                     safe += "[REDACTED_\(kind)]"
-                    start = match.range.location + match.range.length
+                    start = range.location + range.length
                 }
                 safe += nsText.substring(from: start)
                 text = safe

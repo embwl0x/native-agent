@@ -8,6 +8,7 @@ import PersistenceCore
 import ProviderRouting
 import TelegramBot
 import TrustCenter
+// Blueprint: | `QuietSelfAdminSettings+LowerOnly.swift` | lower-only settings rows and cognition/provider controls; Mac permission reductions enforce their subset under the authority file lock |
 
 extension QuietProviderAccount {
     public init(providerID: String, authState: String, eligible: Bool, models: [ProviderModelInfo]) {
@@ -46,7 +47,7 @@ extension QuietCognitionLane {
     func configureQuietTelegram(chats: [String], users: [String], mention: Bool, enabled: Bool) async throws
     func refreshQuietTelegram() async
     func slackIsEnabled() async -> Bool
-    func slackIngressPolicy(dataRoot: URL) -> (allowedChannelIds: Set<String>, allowedUserIds: Set<String>, requireMention: Bool)
+    func slackIngressPolicy(dataRoot: URL) throws -> (allowedChannelIds: Set<String>, allowedUserIds: Set<String>, requireMention: Bool)
     func afterCurrentSlackHandling(_ operation: @escaping @Sendable () async -> Void) async -> Bool
     func saveSlackIngress(channels: Set<String>, users: Set<String>, mention: Bool, dataRoot: URL) async -> (ok: Bool, error: String?)
     func refreshQuietConnectors() async
@@ -140,12 +141,12 @@ extension QuietLowerOnlySettingsHost {
                 else { return nil }
                 return wanted == "read_write" ? ["read", "write"] : wanted == "off" ? [] : [wanted]
             }
-            // Access gained is User's. Asked by `check` for the preview and
-            // again by `write` against the access it reads itself.
+            // Access gained is User's. This previews the refusal; the writer
+            // enforces the subset against current access under its file lock.
             let users: @Sendable (Set<String>, Set<String>) -> QuietSettingError? = { want, now in
                 let gained = want.subtracting(now)
                 return gained.isEmpty ? nil : QuietSettings.usersCall(
-                    "Giving \(name) \(gained.sorted().joined(separator: " and ")) access", "Trust → Mac integration → \(name)")
+                    "Giving \(name) \(gained.sorted().joined(separator: " and ")) access", "Trust → Mac → \(name)")
             }
             rows.append(QuietSetting(
                 id: "trust.mac_integration_\(integration)", page: "mac_integration",
@@ -159,15 +160,25 @@ extension QuietLowerOnlySettingsHost {
                 write: { _, value in
                     // `check` has refused a bad value.
                     guard let want = wants(value) else { return }
-                    if let refused = users(want, await current()) { throw refused }
+                    let onlyRemovingAxes = !(QuietSettings.fullMac || QuietSettings.byOwner || QuietSettings.restoringPreviousValue)
                     // Written even when it reads the same: an explicit off is
                     // what holds under Full Mac.
-                    if let phone = PhoneSettingChange.current {
-                        try await store.setWithReceipt(
-                            integrationId: integration, read: want.contains("read"), write: want.contains("write"),
-                            actionID: phone.actionID, surface: "ios_icloud", provenance: .signedIOS(clientID: phone.clientID))
-                    } else {
-                        try await store.set(integrationId: integration, read: want.contains("read"), write: want.contains("write"))
+                    do {
+                        if let phone = PhoneSettingChange.current {
+                            try await store.setWithReceipt(
+                                integrationId: integration, read: want.contains("read"), write: want.contains("write"),
+                                actionID: phone.actionID, surface: "ios_icloud", provenance: .signedIOS(clientID: phone.clientID),
+                                onlyRemovingAxes: onlyRemovingAxes)
+                        } else {
+                            try await store.set(integrationId: integration, read: want.contains("read"), write: want.contains("write"),
+                                                onlyRemovingAxes: onlyRemovingAxes)
+                        }
+                    } catch MacIntegrationPermissionStoreError.wouldGainAxes(let gained) {
+                        if let refused = QuietSettings.usersCall(
+                            "Giving \(name) \(gained.joined(separator: " and ")) access", "Trust → Mac → \(name)") {
+                            throw refused
+                        }
+                        throw MacIntegrationPermissionStoreError.wouldGainAxes(gained)
                     }
                 },
                 check: { _, value in
@@ -250,7 +261,9 @@ extension QuietLowerOnlySettingsHost {
         ))
 
         // ── Slack: the connector wizard's save, with the saved tokens ─────
-        let slack = { self.slackIngressPolicy(dataRoot: root) }
+        // A write reads the saved policy and refuses when it is unreadable; a
+        // read of an unreadable policy shows the fail-closed state (nobody, @mention on).
+        let slack = { try self.slackIngressPolicy(dataRoot: root) }
         let saveSlack: @MainActor @Sendable (Set<String>, Set<String>, Bool) async throws -> Void = { channels, users, mention in
             // The wizard's save also marks Slack on, so it may only run while
             // Slack is on already.
@@ -276,27 +289,27 @@ extension QuietLowerOnlySettingsHost {
         rows.append(QuietSettings.lowerOnly(
             id: "slack.require_mention", page: "connectors", label: "Slack: require an @mention in channels",
             safe: true, whereUserDoesIt: "Connectors → Slack → Who can message your agent",
-            read: { _ in slack().requireMention },
+            read: { _ in (try? slack())?.requireMention ?? true },
             write: { _, on in
-                let policy = slack()
+                let policy = try slack()
                 try await saveSlack(policy.allowedChannelIds, policy.allowedUserIds, on)
             }
         ))
         rows.append(QuietSettings.narrowOnly(
             id: "slack.allowed_channel_ids", page: "connectors", label: "Slack allowed channel IDs",
             whereUserDoesIt: "Connectors → Slack → Who can message your agent",
-            read: { _ in slack().allowedChannelIds.sorted() },
+            read: { _ in (try? slack())?.allowedChannelIds.sorted() ?? [] },
             write: { _, ids in
-                let policy = slack()
+                let policy = try slack()
                 try await saveSlack(Set(ids), policy.allowedUserIds, policy.requireMention)
             }
         ))
         rows.append(QuietSettings.narrowOnly(
             id: "slack.allowed_user_ids", page: "connectors", label: "Slack allowed user IDs",
             whereUserDoesIt: "Connectors → Slack → Who can message your agent",
-            read: { _ in slack().allowedUserIds.sorted() },
+            read: { _ in (try? slack())?.allowedUserIds.sorted() ?? [] },
             write: { _, ids in
-                let policy = slack()
+                let policy = try slack()
                 try await saveSlack(policy.allowedChannelIds, Set(ids), policy.requireMention)
             }
         ))

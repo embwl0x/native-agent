@@ -12,6 +12,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Studio
+// Blueprint: | `CognitiveSubstrate+StandingViews.swift` | `CognitiveSubstrate`: `standingViewTermsMatch`, `createStandingView`, `normalizedStandingViewBody` |
 
 /// The result of a standing-view lifecycle transition (2026-09-06): the view as
 /// it now stands, plus the persistence failure if the transition never reached
@@ -147,6 +148,7 @@ extension CognitiveSubstrate {
         wouldChangeMind: String = "",
         at now: Date
     ) async -> CognitiveStandingView? {
+        guard ownsReflectionReservation(receipt.request) else { return nil }
         let trimmedBody = bounded(body.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 300)
         guard !trimmedBody.isEmpty else { return nil }
         let id = stableArtifactID("reflection_standing_view|\(receipt.id.uuidString)|\(stableDigest(trimmedBody))")
@@ -197,6 +199,7 @@ extension CognitiveSubstrate {
             paraphrased = lexicalTwin(of: trimmedBody, among: samePolarity)
             if paraphrased == nil { paraphrased = await paraphraseTwin(of: trimmedBody, among: samePolarity) }
         }
+        guard ownsReflectionReservation(receipt.request) else { return nil }
         if let twin = paraphrased {
             return await revisitStandingView(
                 twin, receipt: receipt, evidenceNodeIds: evidenceNodeIds, evidenceExcerpts: evidenceExcerpts,
@@ -244,8 +247,10 @@ extension CognitiveSubstrate {
         pruneRetiredStandingViews()
         markDirty(at: now)
         await persistStandingView(view)
+        guard ownsReflectionReservation(receipt.request) else { return nil }
         await recordUndo(key: "view:\(id.uuidString)", what: "formed view: \(view.title)",
                          previous: .null, stamp: Self.undoStamp(view))
+        guard ownsReflectionReservation(receipt.request) else { return nil }
         _ = await recordTimelineEvent(
             kind: .schemaProposal,
             // A revision says so on its face. "Revised" and "proposed" are two
@@ -264,7 +269,9 @@ extension CognitiveSubstrate {
                 + (contradicted.map { ["revises:\($0.id.uuidString)"] } ?? [])
         )
         for old in displaced {
+            guard ownsReflectionReservation(receipt.request) else { return nil }
             await deleteArtifactRecord(id: old.id)
+            guard ownsReflectionReservation(receipt.request) else { return nil }
             _ = await recordTimelineEvent(
                 kind: .proposalResolution,
                 // OUT OF THE CURRENT SET, NOT A CHANGE OF MIND (Agent,
@@ -390,7 +397,8 @@ extension CognitiveSubstrate {
         }
         // The await above lets a review (approve, retire) land first; a revisit
         // never writes back the copy it read before that.
-        guard let current = standingViews[existing.id], current == existing else {
+        guard ownsReflectionReservation(receipt.request),
+              let current = standingViews[existing.id], current == existing else {
             return standingViews[existing.id] ?? existing
         }
         var view = existing
@@ -414,8 +422,10 @@ extension CognitiveSubstrate {
         standingViews[view.id] = view
         markDirty(at: now)
         await persistStandingView(view)
+        guard ownsReflectionReservation(receipt.request) else { return view }
         await recordUndo(key: "view:\(view.id.uuidString)", what: "revisited view: \(view.title)",
                          previous: existing.toJSON(), stamp: Self.undoStamp(view))
+        guard ownsReflectionReservation(receipt.request) else { return view }
         _ = await recordTimelineEvent(
             kind: .schemaProposal,
             title: "Standing view revisited (\(view.revisitCount))",

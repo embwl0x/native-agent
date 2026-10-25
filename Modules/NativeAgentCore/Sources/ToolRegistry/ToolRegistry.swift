@@ -1,6 +1,8 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ToolRegistry.swift` | `ToolRecord` and AbilityStore's checked part-record projection: missing required fields are omitted; invalid authored fields fail listing and dispatch discovery; `keepReview` and `reviewedKeepDigest` bind waiting or selected code to the review captured under the ability-store lock |
 
 // MARK: - Errors
 
@@ -26,15 +28,8 @@ public enum ToolRegistryError: Error, LocalizedError {
 
 // MARK: - ToolRecord
 //
-// The daemon writes a schema-loose dict per tool. We carve a small set of
-// "typed" fields the Swift impl reasons about (id/name/status, the lifecycle
-// stamps, the signing block carve-outs, validationStatus, phase) and stash
-// EVERYTHING ELSE in `extras` so a round-trip never drops daemon-written
-// keys. presence-tracking optionals distinguish absent (nil → omit on write)
-// from explicit-null (presentNullKeys → re-emit as JSON null).
-//
-// `extras` is JSONValue.object(...) when non-empty, nil otherwise — same
-// shape as MCPDispatcher's records.
+// Retained tool records preserve typed fields, unknown extras and explicit
+// nulls on round-trip. AbilityStore owns migration into the unified store.
 
 public struct ToolRecord: Sendable, Equatable {
     // Required fields — always present.
@@ -48,22 +43,18 @@ public struct ToolRecord: Sendable, Equatable {
     public var phase: String?
     public var lastUsedAt: String?
     public var manifestSignature: String?
+    /// Selected candidate seal, including manifest/fixtures/dependencies/prior; not source SHA-256.
     public var codeFingerprint: String?
     public var signedAt: String?
     public var activePath: String?
     public var proposalPath: String?
     public var validationStatus: String?
 
-    /// Bag of unknown / non-typed keys the daemon writes. Lossless on
-    /// round-trip. Subject to the `__presentNullKeys` reserved-name strip
-    /// (extras may never contain a key named `__presentNullKeys`).
+    /// Unknown fields preserved on round-trip, excluding `__presentNullKeys`.
     public var extras: JSONValue?
 
-    /// Bookkeeping: which TYPED keys arrived as JSON null (not absent). On
-    /// emit, these get re-written as explicit null so the daemon never sees
-    /// a field disappear just because Swift parsed it through an optional.
-    /// NOT public, NOT part of `extras`. The reserved name
-    /// `__presentNullKeys` is stripped from extras on read AND on write.
+    /// Typed keys that arrived as explicit JSON null, preserved on serialization.
+    /// Internal bookkeeping; `__presentNullKeys` is excluded from extras.
     private var presentNullKeys: Set<String>
 
     public init(
@@ -246,6 +237,19 @@ extension ToolRecord {
 
     public var language: String? { extraString("language") }
     public var candidateDigest: String? { extraString("candidateDigest") }
+    /// Review material and identity captured together by the ability-store read.
+    /// Never substitute a fresh catalog digest for the version a row displayed.
+    public var keepReview: [String: JSONValue]? {
+        guard let digest = candidateDigest ?? codeFingerprint, !digest.isEmpty,
+              case .object(let review)? = extra("keepReview"),
+              review["version"] == .string(digest), case .string? = review["code"],
+              case .object? = review["reach"] else { return nil }
+        return review
+    }
+    public var reviewedKeepDigest: String? {
+        guard case .string(let digest)? = keepReview?["version"] else { return nil }
+        return digest
+    }
     public var pendingCandidate: Bool {
         guard let candidate = candidateDigest else { return false }
         return candidate != codeFingerprint
@@ -333,18 +337,7 @@ public actor SwiftNativeToolRegistry {
     // MARK: list / get
 
     public func listTools(filter: ToolFilter) async throws -> [ToolRecord] {
-        let items = try ToolRegistryActions.entries(dataRoot: root)
-        // One malformed part never locks the registry: it is named and left out,
-        // and every other part stays usable.
-        let records = items.enumerated().compactMap { index, item -> ToolRecord? in
-            guard let record = ToolRecord(json: item) else {
-                var id = ""
-                if case .object(let fields) = item, case .string(let name)? = fields["id"] { id = " (" + name + ")" }
-                nativeLog("ToolRegistry: row %ld%@ has missing or invalid required fields; left out", index + 1, id)
-                return nil
-            }
-            return record
-        }
+        let records = try AbilityStore(dataRoot: root).checkedToolRecords()
         // Newest effective timestamp first; ties retain their on-disk order.
         func sortKey(_ r: ToolRecord) -> String {
             (r.updatedAt?.isEmpty == false ? r.updatedAt : nil) ?? r.createdAt
@@ -367,25 +360,36 @@ public actor SwiftNativeToolRegistry {
         return all.first { $0.id == id }
     }
 
-    @discardableResult
-    public func quarantine(id: String, reason: String, ownerAuthorized: Bool = false) async throws -> ToolRecord {
-        try await ToolRegistryActions.mutate(id: id, dataRoot: root, ownerAuthorized: ownerAuthorized) { current in
-            guard var fields = current else { throw ToolRegistryError.toolNotFound(id) }
-            fields["status"] = .string("disabled"); fields["phase"] = .string("disabled")
-            fields["updatedAt"] = .string(Self.isoTimestamp(self.clock()))
-            fields["disabledReason"] = .string(reason)
-            return fields
-        }
-        guard let updated = try await getTool(id: id) else { throw ToolRegistryError.toolNotFound(id) }
-        return updated
-    }
-
     // MARK: ISO timestamp helper
 
     /// Match Python's `now_iso()`: ISO-8601 with fractional seconds,
-    /// `+00:00` suffix (not `Z`). Same convention as MCPDispatcher +
+    /// `+00:00` suffix (not `Z`). Same convention as
     /// ApprovalInbox.
     public nonisolated static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
+    }
+}
+
+/// The checked part-record projection shared by listing and dispatch discovery.
+/// Missing required fields are omitted; invalid authored fields fail the read.
+extension AbilityStore {
+    public func checkedToolRecords() throws -> [ToolRecord] {
+        guard case .array(let items) = try registry(kind: .part) else {
+            throw ToolRegistryError.registryUnreadable(reason: "abilities must contain ability records")
+        }
+        // One malformed part never locks the registry: it is named and left out,
+        // and every other part stays usable.
+        return try items.enumerated().compactMap { index, item -> ToolRecord? in
+            guard let record = ToolRecord(json: item) else {
+                var id = ""
+                if case .object(let fields) = item, case .string(let name)? = fields["id"] { id = " (" + name + ")" }
+                nativeLog("ToolRegistry: row %ld%@ has missing or invalid required fields; left out", index + 1, id)
+                return nil
+            }
+            if let field = record.authoredFieldProblem {
+                throw ToolRegistryError.registryUnreadable(reason: "tool \(record.id) has no valid \(field)")
+            }
+            return record
+        }
     }
 }

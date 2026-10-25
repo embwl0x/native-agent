@@ -24,6 +24,8 @@
 import SwiftUI
 import AppKit
 
+// Blueprint: | `SessionDragSourceView.swift` | `SessionDragSource`: AppKit drag completion/desktop-detach bridge with pasteboard identity and monitor teardown |
+
 enum SessionDragPresentation {
     static func shouldDetach(
         pressedMouseButtons: Int,

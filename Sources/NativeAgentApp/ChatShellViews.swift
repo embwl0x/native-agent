@@ -1,8 +1,10 @@
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatSessionWork
 import EngineRuntime
 import SwiftUI
 import NativeAgentShared
 import TrustCenter
+// Blueprint: | `ChatShellViews.swift` | `ShellRoomHeader` struct |
 
 // ui-simplify 2026-09-02 (Lane A): the room's furniture.
 //
@@ -127,7 +129,6 @@ struct ShellConversationRow: View {
 
     @State private var hovering = false
     @FocusState private var pinFocused: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         // The native List draws selection and takes the click (User 09-27:
@@ -291,62 +292,46 @@ struct ShellEnvelopeRow: View {
 /// ONE quiet row per turn. Opening it says what she actually touched, in
 /// sentences, and each sentence opens onto that call's result.
 struct ShellToolRow: View {
+    @Environment(AppModel.self) private var appModel
     var messages: [ChatMessage]
     @State private var expanded = false
-
-    @State private var statuses: [ChatShellToolSummary.Status] = []
-    @State private var details: [String] = []
-    private struct Revision: Equatable, Sendable {
-        let messages: [ChatMessage]
-        let expanded: Bool
-    }
+    private struct Revision: Equatable, Sendable { let messages: [ChatMessage]; let expanded: Bool }
     @State private var preparedRevision: Revision?
-
+    private var words: PresentationFaces { appModel.engine.transcripts.presentation }
+    private var headlineKey: String { "headline:"+(messages.first?.id ?? "empty") }
 
     var body: some View {
-        let current = preparedRevision == Revision(messages: messages, expanded: expanded)
-        let details = current ? self.details : []
-        let statuses = current ? self.statuses : []
-        let shown = Array(zip(messages.prefix(ChatShellToolSummary.detailLimit), details))
-        let headline = ChatShellToolSummary.headline(
-            count: messages.count, failed: statuses.filter { $0 == .failed }.count,
-            needsYou: statuses.filter { $0 == .needsYou }.count)
-        ChatActivityRow(title: headline, isExpanded: $expanded) {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(shown, id: \.0.id) { pair in
-                    ToolPillView(message: pair.0, headline: pair.1)
+        let shown=Array(messages.prefix(ChatShellToolSummary.detailLimit))
+        let current=preparedRevision == Revision(messages:messages,expanded:expanded)
+        let headline=current ? (words.words(headlineKey) ?? "Activity unavailable.") : "Reading activity…"
+        ChatActivityRow(title:headline,isExpanded:$expanded) {
+            VStack(alignment:.leading,spacing:0) {
+                ForEach(shown,id:\.id) { message in
+                    ToolPillView(message:message,headline:current ? (words.words("detail:"+message.id) ?? "Readout unavailable.") : "Reading activity…")
                 }
-                if let overflow = ChatShellToolSummary.overflowLine(
-                    total: messages.count, shown: shown.count
-                ) {
-                    Text(overflow)
-                        .foregroundStyle(NativeAgentShell.tertiary)
-                        .padding(.vertical, NativeAgentSpacing.xs)
+                if let overflow=ChatShellToolSummary.overflowLine(total:messages.count,shown:shown.count) {
+                    Text(overflow).foregroundStyle(NativeAgentShell.tertiary).padding(.vertical,NativeAgentSpacing.xs)
                 }
             }
         }
-        .accessibilityElement(children: .contain)
+        .accessibilityElement(children:.contain)
         .accessibilityLabel(headline)
-        .task(id: Revision(messages: messages, expanded: expanded)) {
-            let revision = Revision(messages: messages, expanded: expanded)
-            let prepared = await Task.detached(priority: .userInitiated) {
-                let statuses = revision.messages.map { message in
-                    ChatShellToolSummary.status(
-                        kind: message.metadata?.kind, ok: message.metadata?.ok,
-                        resultSummary: message.metadata?.resultSummary, resultStatus: message.metadata?.resultStatus,
-                        interactionState: message.metadata?.interactionState)
+        .quietReadTask(id:Revision(messages:messages,expanded:expanded)) {
+            let revision=Revision(messages:messages,expanded:expanded)
+            let statuses=revision.messages.map { message in
+                ChatShellToolSummary.status(kind:message.metadata?.kind,ok:message.metadata?.ok,
+                    resultSummary:message.metadata?.resultSummary,resultStatus:message.metadata?.resultStatus,
+                    interactionState:message.metadata?.interactionState)
+            }
+            await words.prepare(headlineKey,input:ChatShellToolSummary.headlineInput(count:revision.messages.count,
+                failed:statuses.filter { $0 == .failed }.count,needsYou:statuses.filter { $0 == .needsYou }.count))
+            if revision.expanded {
+                for (message,status) in zip(revision.messages,statuses).prefix(ChatShellToolSummary.detailLimit) {
+                    await words.prepare("detail:"+message.id,input:ChatShellToolSummary.detailInput(toolName:message.metadata?.toolName,
+                        inputJSON:message.metadata?.inputJSON,status:status))
                 }
-                let details = revision.expanded
-                    ? zip(revision.messages, statuses).prefix(ChatShellToolSummary.detailLimit).map { message, status in
-                        ChatShellToolSummary.detailLine(toolName: message.metadata?.toolName,
-                                                       inputJSON: message.metadata?.inputJSON, status: status)
-                    } : []
-                return (statuses, details)
-            }.value
-            guard !Task.isCancelled else { return }
-            self.statuses = prepared.0
-            self.details = prepared.1
-            preparedRevision = revision
+            }
+            if !Task.isCancelled { preparedRevision=revision }
         }
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import os
+// Blueprint: | `ModuleLogging.swift` | `ModuleLog`: shared formatted, credential-redacted public diagnostics with each module's existing category |
 
 /// Module diagnostics. Callers must keep credential values out of messages.
 public struct ModuleLog: Sendable {

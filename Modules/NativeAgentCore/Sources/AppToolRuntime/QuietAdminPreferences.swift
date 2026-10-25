@@ -1,5 +1,6 @@
 import PersistenceCore
 import Foundation
+// Blueprint: | `QuietAdminPreferences.swift` | `ShotgunPreference`, `MoodTintPreference`, `SimpleViewMode`, `HazeColor`, `MomentsLaneSetting`; shared appearance, view and moments preferences |
 
 /// The revert seam. On for a fresh install (User: fresh installs turn every
 /// feature on; users switch off what they want), off in one flip, and the same

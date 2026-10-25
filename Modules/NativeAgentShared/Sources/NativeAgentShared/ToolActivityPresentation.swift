@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ToolActivityPresentation.swift` | `ToolActivityPresentation`: shared card/progress/approval copy from bounded call names; tool IDs and execution arguments stay unchanged |
+
 /// Display copy only. Tool identifiers and execution payloads stay unchanged.
 public enum ToolActivityPresentation {
     public static func title(_ name: String) -> String {
@@ -166,7 +168,7 @@ public enum ToolActivityPresentation {
         "list_tools": "Looking up tools", "omp_message": "Send a helper request",
         "invoke_codex": "Ask a coding helper", "invoke_claude": "Ask a helper",
         "agent_swarm": "Start background work", "read_skill": "Read a skill", "list_skills": "Check skills",
-        "desk_breakdown": "Break down a task", "mcp__notes__search": "Search notes",
+        "desk_breakdown": "Break down a task",
         "mac_calendar_delete_event": "Delete a calendar event",
         "mac_calendar_create_event": "Create a calendar event",
         "mac_calendar_modify_event": "Update a calendar event",

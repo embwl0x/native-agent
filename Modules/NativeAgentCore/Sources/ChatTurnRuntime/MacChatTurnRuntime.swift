@@ -4,6 +4,7 @@ import NativeAgentShared
 import NativeAgentCore
 import Transcripts
 import PersistenceCore
+// Blueprint: | `MacChatTurnRuntime.swift` | Canonical Mac admission/lifecycle and Send-next projection; queue writes use MacChatTurnLifecycleStore; cross-life requests stay stopped until the person's Resume or Send now creates fresh requests without old steering or continuations |
 
 /// Admission, durable queue and lifecycle authority for Mac chat. Presentation
 /// facades observe this same state; no second queue or lifecycle is retained.
@@ -40,6 +41,17 @@ public final class MacChatTurnRuntime {
     }
     public var tasks: [String: Task<Void, Never>] = [:]
     public var taskGenerations: [String: Int] = [:]
+    @ObservationIgnored private var nextTaskGeneration = 0
+
+    /// One session reservation for sends, retries and checkpoint resumes,
+    /// acquired synchronously before any admission read can suspend.
+    public func reserveTurn(sessionId: String) -> Int? {
+        guard tasks[sessionId] == nil, !busySessions.contains(sessionId) else { return nil }
+        nextTaskGeneration += 1
+        taskGenerations[sessionId] = nextTaskGeneration
+        busySessions.insert(sessionId)
+        return nextTaskGeneration
+    }
     public var lifecycleBySession: [String: MacChatTurnLifecycleState] = [:]
     @ObservationIgnored public var activeTurnIDsBySession: [String: String] = [:]
     @ObservationIgnored public var streamProgressAppliedAt: [String: (turnId: String, at: Date)] = [:]
@@ -108,6 +120,16 @@ public final class MacChatTurnRuntime {
         await queueLoad?.value
     }
 
+    public func restartStoppedQueuedTurns(sessionId: String) async -> Bool {
+        await updateQueuedTurns { queues in
+            queues[sessionId] = queues[sessionId]?.map { turn in
+                guard turn.stoppedReason != nil else { return turn }
+                return QueuedChatTurn(text: turn.text, attachments: turn.attachments,
+                    hideUserBubble: turn.hideUserBubble, origin: turn.origin)
+            }
+        }
+    }
+
     private func restoreQueuedTurns() async {
         do {
             let loaded = try await lifecycleStore.queuedTurns()
@@ -116,6 +138,11 @@ public final class MacChatTurnRuntime {
             for (session, turns) in saved where turns.contains(where: { $0.startedTurnID != nil }) {
                 var waiting: [QueuedChatTurn] = []
                 for var turn in turns {
+                    if turn.stoppedReason != nil {
+                        turn.startedTurnID = nil
+                        waiting.append(turn)
+                        continue
+                    }
                     if let started = turn.startedTurnID {
                         let identity = MacChatTurnIdentity(sessionId: session, turnId: started)
                         let wasSteering = started != turn.id
@@ -139,6 +166,10 @@ public final class MacChatTurnRuntime {
                 saved[session] = waiting.isEmpty ? nil : waiting
             }
             queueState = saved == loaded ? saved : try await lifecycleStore.saveQueuedTurns(saved)
+            for (session, turns) in queueState where turns.contains(where: { $0.stoppedReason != nil }) {
+                pausedQueueSessions.insert(session)
+                queuePauseReasons[session] = "Stopped: restored. Resume starts these requests fresh."
+            }
         } catch {
             self.queueStorageError = "Send-next storage is unavailable. Repair chat/mac_turn_lifecycle.json and restart NativeAgent before sending: \(error.localizedDescription)"
         }
@@ -199,12 +230,16 @@ public final class MacChatTurnRuntime {
             pausedQueueSessions.remove(sessionId)
         }
         let activeTask = tasks[sessionId]
+        // A reservation still reading admission data has no task to cancel.
+        // Revoke that reservation now; its suspended holder must not start.
+        if activeTask == nil, let reserved = taskGenerations[sessionId] {
+            _ = finishRuntime(sessionId: sessionId, generation: reserved)
+        }
         let generation = (pendingStopWriteGenerations[sessionId] ?? 0) + 1
         pendingStopWriteGenerations[sessionId] = generation
         let previousWrite = pendingStopWrites[sessionId]
         if revokeDriverControl == nil {
             activeTask?.cancel()
-            tasks[sessionId] = nil
             streamingSessions.remove(sessionId)
         }
         let write = Task { @MainActor in
@@ -212,7 +247,6 @@ public final class MacChatTurnRuntime {
                 await revokeDriverControl()
                 activeTask?.cancel()
                 if tasks[sessionId] == activeTask {
-                    tasks[sessionId] = nil
                     streamingSessions.remove(sessionId)
                 }
             }
@@ -227,10 +261,11 @@ public final class MacChatTurnRuntime {
         return write
     }
 
-    /// `runId` stops that run alone, beside any the marker already names: one
-    /// door's task in a session other doors' queued runs share (a contact's one
-    /// conversation), where the session's in-flight list would stop them too.
-    public nonisolated func stop(sessionId: String, runId: String? = nil) async throws {
+    /// Explicit `runId` / `runIDs` stop only those runs, beside any the marker
+    /// already names: one door's task in a session other doors' queued runs
+    /// share (a contact's one conversation), where the session's in-flight
+    /// list would stop them too.
+    public nonisolated func stop(sessionId: String, runId: String? = nil, runIDs: [String] = []) async throws {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw NSError(
                 domain: "NativeAgentChatSession",
@@ -238,13 +273,14 @@ public final class MacChatTurnRuntime {
                 userInfo: [NSLocalizedDescriptionKey: "Cannot cancel chat session: invalid chat session id"]
             )
         }
+        let namedRuns = runIDs + (runId.map { [$0] } ?? [])
         let flagPath = ChatCancelFlag.path(dataRoot: dataRoot, sessionId: safeSessionId)
         try await SwiftNativePersistenceCore().withFileLock(flagPath) {
             let parent = flagPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            let content = runId.map { run in
-                ((try? String(contentsOf: flagPath, encoding: .utf8)).map { $0 + "\n" } ?? "") + run
-            } ?? ChatCancelFlag.stopContent(forFlagAt: flagPath)
+            let content = namedRuns.isEmpty ? ChatCancelFlag.stopContent(forFlagAt: flagPath)
+                : ((try? String(contentsOf: flagPath, encoding: .utf8)).map { $0 + "\n" } ?? "")
+                    + namedRuns.joined(separator: "\n")
             try Data(content.utf8).write(to: flagPath, options: .atomic)
         }
     }

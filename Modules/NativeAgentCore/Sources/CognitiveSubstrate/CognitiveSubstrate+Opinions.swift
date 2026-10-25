@@ -23,6 +23,8 @@ import PersistenceCore
 import Studio
 import Transcripts
 
+// Blueprint: | `CognitiveSubstrate+Opinions.swift` | `CognitiveSubstrate` opinion/interest experiment: independent recurrence, reconsideration and bounded standing-view transitions |
+
 extension CognitiveSubstrate {
     static let maximumOpinions = 8
     static let maximumInterests = 5
@@ -146,18 +148,11 @@ extension CognitiveSubstrate {
     /// median 0.54. 0.80 would have missed 5 of the 8 true pairs.
     static let paraphraseCosineFloor = 0.72
 
-    static func cosine(_ a: [Float], _ b: [Float]) -> Double {
-        guard a.count == b.count, !a.isEmpty else { return 0 }
-        var dot: Float = 0, na: Float = 0, nb: Float = 0
-        for i in a.indices { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
-        return na > 0 && nb > 0 ? Double(dot / (na.squareRoot() * nb.squareRoot())) : 0
-    }
-
     /// The existing view this body restates, if the embedder can say so.
     func paraphraseTwin(of body: String, among views: [CognitiveStandingView]) async -> CognitiveStandingView? {
         guard !views.isEmpty, let vectors = await dependencies.embedTexts([body] + views.map(\.body)),
               vectors.count == views.count + 1 else { return nil }
-        let scored = views.indices.map { (views[$0], Self.cosine(vectors[0], vectors[$0 + 1])) }
+        let scored = views.indices.map { (views[$0], VectorMath.cosine(vectors[0], vectors[$0 + 1])) }
             .filter { $0.1 >= Self.paraphraseCosineFloor }
         return scored.max { $0.1 < $1.1 }?.0
     }
@@ -232,6 +227,7 @@ extension CognitiveSubstrate {
             .sorted { $0.createdAt < $1.createdAt }
         for proposal in candidates {
             await waitForMaintenanceTransition()
+            guard ownsReflectionReservation(trigger.request) else { return }
             // Only her own view lines, matched view to view, from reflections
             // no untrusted peer fed — never topic words in the prose.
             let occurrences = Self.countedOccurrences(proposal)
@@ -248,32 +244,38 @@ extension CognitiveSubstrate {
             guard await saveOwnViewTransition(opinion, released: released, previousViews: previousViews, at: now) else {
                 continue
             }
+            guard ownsReflectionReservation(trigger.request) else { return }
             await recordUndo(key: "view:\(opinion.id.uuidString)", what: "formed opinion: \(opinion.title)",
                              previous: proposal.toJSON(), stamp: Self.undoStamp(opinion))
+            guard ownsReflectionReservation(trigger.request) else { return }
             await recordReceipt(kind: "opinion.formed", payload: .object([
                 "id": .string(opinion.id.uuidString),
                 "occurrences": .array(opinion.occurrences.map { .string(String($0.prefix(60))) }),
             ]))
+            guard ownsReflectionReservation(trigger.request) else { return }
             _ = await recordTimelineEvent(
                 kind: .proposalResolution,
                 title: "Opinion formed (came back on \(opinion.occurrences.count) separate days)",
                 summary: "\(opinion.body)\nbecause: \(opinion.because)\nunless: \(opinion.wouldChangeMind)",
                 artifactId: opinion.id, lineageId: opinion.lineageId,
                 externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.held)])
-            await recordCapacityRelease(released)
+            guard ownsReflectionReservation(trigger.request) else { return }
+            await recordCapacityRelease(released, reflectionRequest: trigger.request)
         }
     }
 
     /// Her own set is full: the least recently touched one leaves the current
     /// set. Capacity, recorded as such — not a change of mind, not age.
-    func recordCapacityRelease(_ released: [CognitiveStandingView]) async {
+    func recordCapacityRelease(_ released: [CognitiveStandingView], reflectionRequest: CognitiveReflectionRequest? = nil) async {
         for old in released {
+            if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return }
             _ = await recordTimelineEvent(
                 kind: .proposalResolution, title: "Out of the current set",
                 summary: "out of the current set (capacity, not reconsidered): \(old.body)",
                 artifactId: old.id, lineageId: old.lineageId,
                 externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.outOfSet)])
         }
+        if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return }
         let current = standingViews.values.filter { $0.status != .retired }
         var protected = Set(current.compactMap(\.revisesViewId))
         for entry in undoLedger where entry.key.hasPrefix("view:") {
@@ -358,7 +360,7 @@ extension CognitiveSubstrate {
     /// the clock that asked starts again. Never a change by age.
     func settleOpinionReconsideration(receipt: CognitiveReflectionReceipt, source: String) async {
         await waitForMaintenanceTransition()
-        guard configuration.viewsExperimentEnabled,
+        guard ownsReflectionReservation(receipt.request), configuration.viewsExperimentEnabled,
               let shown = standingViews.values.first(where: {
                   $0.status == .opinion && receipt.request.prompt.contains("opinion for a while: \"\($0.body)\"")
               }) else { return }
@@ -366,7 +368,7 @@ extension CognitiveSubstrate {
         // A reflection an untrusted peer fed may not revise her opinion.
         if !lines.revise.isEmpty, !reflectionIsTainted(receipt.request), !lines.reviseBecause.isEmpty {
             _ = await reviseOpinion(id: shown.id, stance: lines.revise, evidence: lines.reviseBecause,
-                                    wouldChangeMind: lines.reviseUnless, by: "reflection")
+                                    wouldChangeMind: lines.reviseUnless, by: "reflection", reflectionRequest: receipt.request)
             return
         }
         var kept = shown
@@ -379,6 +381,7 @@ extension CognitiveSubstrate {
             if standingViews[kept.id] == kept { standingViews[kept.id] = shown }
             return
         }
+        guard ownsReflectionReservation(receipt.request) else { return }
         _ = await recordTimelineEvent(
             kind: .proposalResolution, title: "Opinion reconsidered — still holds",
             summary: kept.body, artifactId: kept.id, lineageId: kept.lineageId, externalEvidenceIds: [])
@@ -391,9 +394,11 @@ extension CognitiveSubstrate {
     /// Returns nil when revised, else why not.
     @discardableResult
     func reviseOpinion(
-        id: UUID, stance: String, evidence: String, wouldChangeMind: String = "", by: String
+        id: UUID, stance: String, evidence: String, wouldChangeMind: String = "", by: String,
+        reflectionRequest: CognitiveReflectionRequest? = nil
     ) async -> String? {
         await waitForMaintenanceTransition()
+        if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return nil }
         guard configuration.enabled, configuration.viewsExperimentEnabled else {
             return "opinions are switched off (personality.views_experiment)"
         }
@@ -426,14 +431,18 @@ extension CognitiveSubstrate {
             if standingViews[id] == view { standingViews[id] = previous }
             return "the opinion revision was not saved: \(error)"
         }
+        if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return nil }
         await recordUndo(key: "view:\(id.uuidString)", what: "revised opinion: \(view.title)",
                          previous: previous.toJSON(), stamp: Self.undoStamp(view))
+        if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return nil }
         await dependencies.feltCause(0, 0.05)
+        if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return nil }
         await recordReceipt(kind: "opinion.revised", payload: .object([
             "id": .string(id.uuidString), "by": .string(by),
             "from": .string(bounded(previous.body, maxCharacters: 200)),
             "evidence": .string(because),
         ]))
+        if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return nil }
         _ = await recordTimelineEvent(
             kind: .proposalResolution, title: "Opinion revised",
             summary: "I used to think: \(previous.body)\nNow: \(newStance)\nWhat changed it: \(because)",

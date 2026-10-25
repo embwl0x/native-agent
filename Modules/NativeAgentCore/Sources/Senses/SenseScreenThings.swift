@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `SenseScreenThings.swift` | Exact screen thing selections, captured related-action bindings on composite rows, and in-turn mac.act verb requests |
 
 /// Window handles retain exact selections. Supplemental AX surfaces use the
 /// existing native target resolver, which re-observes them before acting.

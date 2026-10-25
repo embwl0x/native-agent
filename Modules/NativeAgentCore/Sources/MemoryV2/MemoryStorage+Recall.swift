@@ -2,11 +2,11 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MemoryStorage+Recall.swift` | `MemoryStorage`: `invalidateRecallCache`, shared `rankedRecall` scoring and bounded `recall` deduplication, canonical recall-generation cache |
 
 extension MemoryStorage {
     struct RecallCandidate {
         var memory: StoredMemory
-        let norm: Float            // precomputed Self.l2norm(embedding) — bit-identical to per-turn recompute
         let lexicalDocument: MemoryRecallScoring.LexicalDocument
     }
     struct RecallCache {
@@ -97,9 +97,8 @@ extension MemoryStorage {
             let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
             return try rows.map { row in
                 let m = try Self.decodeMemory(row)
-                let norm = m.embedding.map(Self.l2norm) ?? 0
                 return RecallCandidate(
-                    memory: m, norm: norm,
+                    memory: m,
                     lexicalDocument: MemoryRecallScoring.LexicalDocument(m.content)
                 )
             }
@@ -158,9 +157,8 @@ extension MemoryStorage {
         let candidates = persona == nil
             ? allCandidates
             : allCandidates.filter { $0.memory.personaId == persona }
-        let queryNorm = Self.l2norm(query)
         // A directionless query cannot honestly answer semantic recall.
-        guard queryNorm > 0 else {
+        guard VectorMath.cosine(query, query) > 0 else {
             throw MemoryStorageError.embeddingActivationInvalid(
                 .unusableCandidate, "semantic recall query has no usable vector"
             )
@@ -175,11 +173,8 @@ extension MemoryStorage {
         for (idx, candidate) in candidates.enumerated() {
             let m = candidate.memory
             guard let e = m.embedding, e.count == query.count else { continue }
-            let n = candidate.norm
-            guard n > 0 else { continue }
-            var dot: Float = 0
-            for i in 0..<e.count { dot += e[i] * query[i] }
-            let sim = Double(dot) / (Double(queryNorm) * Double(n))
+            guard VectorMath.cosine(e, e) > 0 else { continue }
+            let sim = VectorMath.cosine(e, query)
             let lexicalBoost = (idx < lexicalScores.count)
                 ? memoryBM25LexicalBoost * lexicalScores[idx]
                 : 0
@@ -213,7 +208,7 @@ extension MemoryStorage {
         // `prefix` walks it once for `count` and again to copy — 10-10 crash).
         var out: [(memory: StoredMemory, similarity: Double)] = []
         for candidate in scored {
-            let key = normalizedRecallContent(candidate.0.content)
+            let key = comparisonKey(candidate.0.content, mode: .recall)
             if !key.isEmpty {
                 let scope = MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: candidate.0))
                 if seen[key]?.contains(scope) ?? false { continue }
@@ -225,10 +220,4 @@ extension MemoryStorage {
         return out
     }
 
-    static func normalizedRecallContent(_ content: String) -> String {
-        content
-            .lowercased()
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 }

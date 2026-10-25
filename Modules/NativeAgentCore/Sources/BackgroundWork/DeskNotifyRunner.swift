@@ -1,32 +1,24 @@
 import Foundation
 import AttentionRouting
 import BackgroundLoops
-import ChatOrchestration
+import ChatTurnRuntime
 import Cognition
 import NotificationInbox
 import PersistenceCore
 import Desk
+// Blueprint: | `DeskNotifyRunner.swift` | `DeskNotifyRunner`: calls the desk-notify part through the scheduled owner's originating app door; revision-checked native commit before notification delivery, quiet hours, stamps and exact-deadline scheduling; already-committed held deliveries retain their native release path even when a new proposal fails |
 
-// MARK: - Desk notify loop (desk-side push, NO cognition)
-//
-// A throttled, desk-local loop that lets the Desk tap User on the shoulder: it
-// reads desk state, asks DeskNotifyEvaluator which direct/urgent items changed
-// since their last ping (cooldown-gated), fires a Mac banner + paired-device
-// push for each, then stamps lastNotifiedAt so a single change can't fan out
-// into duplicate pings (Agent's idempotency requirement).
-//
-// This NEVER touches the CognitiveSubstrate — it's a SEPARATE loop from the
-// cognition manifest in assembleAllLoops. The desk reaches out to User; it does
-// not live in her head (User's hard line, 2026-06-29). Self-gating: with no
-// item marked direct/urgent, every tick is a cheap state-read that returns nil.
-
+// The part proposes; this native owner commits bookkeeping and delivers.
 public struct DeskNotifyRunner: EventDeadlineLoopRunner {
+    private let propose: @Sendable (JSONValue) async throws -> DeskNotificationProposal
     private let attention: AttentionRouter
     private let postNagNotification: @Sendable (String, String, String?) async -> Bool
     public init(interval: TimeInterval, dataRoot: URL,
                 attention: AttentionRouter,
+                propose: @escaping @Sendable (JSONValue) async throws -> DeskNotificationProposal,
                 postMacNotification: @escaping @Sendable (String, String, [String: String], String?) async -> Bool,
                 postNagNotification: @escaping @Sendable (String, String, String?) async -> Bool) {
+        self.propose = propose
         self.interval = interval
         self.dataRoot = dataRoot
         self.attention = attention
@@ -46,6 +38,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         // The inbox too: a knock held for quiet hours books their end.
         return EventDeadlinePhysiology.storeAndFileEvents(
             paths: [store.opsPath, store.basePath, DeskNagConfigStore(dataRoot: dataRoot).configPath,
+                    dataRoot.appendingPathComponent("abilities/desk-notify.js"),
                     LiveNotificationInbox.livePath(dataRoot: dataRoot), dataRoot.appendingPathComponent("user_prefs.json")],
             stores: [.desk],
             notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange],
@@ -54,58 +47,61 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
     }
 
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        guard let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() else {
-            return nil
-        }
-        let notify = DeskNotifyEvaluator.nextMeaningfulDeadline(state, after: now)
-        let nagConfig = await DeskNagConfigStore(dataRoot: dataRoot).load()
         let held = await AttentionRouter.hasHeld(dataRoot: dataRoot)
-        let quietEnd: Date? = {
-            guard held || nagConfig.enabled || DeskNotifyEvaluator.decisions(state, now: now).contains(where: { $0.level != .urgent }),
-                  AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot, at: now),
-                  let window = TurnQuietHoursWindow.read(dataRoot: dataRoot) else { return nil }
-            return window.end(after: now)
-        }()
-        // Nag lane deadlines (mute end / earliest in-scope defer end) share the
-        // tick — load() is the same read-only, file-creating-nothing call the
-        // nag pass uses for its inertness pre-check.
-        let nag = DeskNagEvaluator.nextMeaningfulDeadline(
-            state: state,
-            config: nagConfig,
-            after: now
-        )
-        return [notify, nag, quietEnd].compactMap { $0 }.min()
+        let quietEnd = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot, at: now)
+            ? TurnQuietHoursWindow.read(dataRoot: dataRoot)?.end(after: now) : nil
+        do {
+            let read = try await DeskNotificationRead.read(dataRoot: dataRoot, now: now)
+            let proposal = try await propose(read.input)
+            try read.validate(proposal)
+            let needsQuietEnd = held || read.config.enabled || proposal.notifications.contains(where: { $0.level != "urgent" })
+            return [proposal.deadline.map { Date(timeIntervalSince1970: $0) }, needsQuietEnd ? quietEnd : nil].compactMap { $0 }.min()
+        } catch {
+            nativeLog("desk_notify: deadline proposal failed: \(error)")
+            return held ? quietEnd : nil
+        }
     }
 
     public func tickOutcome() async -> LoopTickOutcome {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        let state: DeskState
+        var quietHours = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
+        let prepared: Result<(DeskNotificationRead, DeskNotificationProposal), Error>
         do {
-            state = try await store.liveState()
+            try Task.checkCancellation()
+            let read = try await DeskNotificationRead.read(dataRoot: dataRoot, now: Date())
+            let proposal = try await propose(read.input)
+            quietHours = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
+            _ = try await read.commit(proposal, dataRoot: dataRoot, quietHours: quietHours)
+            try Task.checkCancellation()
+            prepared = .success((read, proposal))
         } catch {
-            return .failed(error: "Desk notification state read: \(error)")
+            quietHours = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
+            prepared = .failure(error)
         }
-        let decisions = DeskNotifyEvaluator.decisions(state, now: Date())
-
+        // Already-committed inbox deliveries retain their native release path
+        // when a new Desk proposal fails. Stop still prevents new delivery.
+        let released = quietHours || Task.isCancelled ? 0 : await AttentionRouter.releaseHeld(
+            dataRoot: dataRoot, router: attention, banner: postMacNotification)
+        let read: DeskNotificationRead
+        let proposal: DeskNotificationProposal
+        switch prepared {
+        case .success(let value): (read, proposal) = value
+        case .failure(let error):
+            return .failed(error: "Desk notification proposal/commit: \(error)"
+                + (released > 0 ? "; released \(released) held notification(s)" : ""))
+        }
+        let state = read.state
+        let decisions = proposal.notifications
         var failures: [String] = []
         var notified = 0
-        // The nag pass runs on EVERY tick, not only when a direct/urgent ping
-        // is due — its triggers (a blocker closing, a defer elapsing) have
-        // nothing to do with the notify evaluator's decisions (gpt-5.5
-        // campaign review, BLOCKING 1: the old early-return starved the nag
-        // lane whenever no item was marked direct/urgent).
-        let quietHours = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
-        let nagCount = quietHours ? 0 : await runNagPass(state: state, failures: &failures)
-        // What her resident wake held for quiet hours goes out once they end.
-        let released = quietHours ? 0 : await AttentionRouter.releaseHeld(
-            dataRoot: dataRoot, router: attention, banner: postMacNotification)
+        let nagCount = quietHours ? 0 : await publishNags(proposal, failures: &failures)
         if decisions.isEmpty && nagCount == 0 && released == 0 && failures.isEmpty {
             return .skipped(reason: "no Desk notification due")
         }
         // Quiet hours hold a direct ping's Mac banner exactly as they hold its
         // push. Nothing is stamped, so it still lands on the first tick after
         // the window. An urgent item is never held: it posts and routes now.
-        for decision in decisions where !quietHours || decision.level == .urgent {
+        for decision in decisions where !quietHours || decision.level == "urgent" {
             // Dual delivery: Mac banner + paired-device push (the same backends
             // mac_notify / mobile_notify use). Best-effort; outcomes logged so a
             // failure isn't silent. v1 marks after attempting; success-gated retry
@@ -123,7 +119,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             // projection instead.
             let outcome = try? await attention.route(
                 eventId: "desk_notify:\(decision.handle):\(revision)",
-                importance: decision.level == .urgent ? .adverse : .ownerWaiting,
+                importance: decision.level == "urgent" ? .adverse : .ownerWaiting,
                 title: decision.title,
                 body: decision.body,
                 userInfo: ["screen": "inbox", "source": "desk"]
@@ -170,104 +166,21 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             + (nagCount > 0 ? " + \(nagCount) nag(s)" : ""))
     }
 
-    // MARK: - Nag lane (Wave 3)
-
-    /// The nag pass rides the SAME tick and the SAME delivery path as the
-    /// notify pass — one desk loop, two evaluators.
-    ///
-    /// SELF-GATING BY DEFAULT: with the global switch off (the fresh-install
-    /// state) `evaluate` returns no nags, no digest, and the config UNCHANGED,
-    /// so this pass never writes a file and never posts anything. Zero
-    /// behaviour change until User opts in.
-    ///
-    /// DELIVERY RULE (Agent's, enforced here and not only in the trigger):
-    /// digest lines are NEVER pushed on their own. Stale-and-static rides along
-    /// with a nag that was already going out, or with the unmute drift report.
-    /// Nags always go out at `.digest` level — this lane cannot escalate.
-    private func runNagPass(state: DeskState, failures: inout [String]) async -> Int {
-        let configStore = DeskNagConfigStore(dataRoot: dataRoot)
-        // Cheap unlocked pre-check ONLY to preserve fresh-install inertness
-        // (a disabled config never even opens the flock, so no file is ever
-        // created). Every decision below re-reads the config INSIDE the lock —
-        // this pre-check is an optimization, never an authority (gpt-5.5
-        // campaign review, BLOCKING 2+3: deciding on an unlocked snapshot let
-        // the loop resurrect a config User had just changed via
-        // desk_nag_control, and clear a fresh mute he set mid-tick).
-        guard await configStore.load().enabled else { return 0 }
-
-        let now = Date()
-        let plan = DeskSequencing.compute(state, now: now)
-
-        // Everything — the enabled check, the expired-mute transition, and the
-        // evaluation — happens in ONE locked read-modify-write against the
-        // CURRENT config, so a concurrent desk_nag_control call can never be
-        // overwritten by a stale snapshot. Persist-before-deliver is preserved:
-        // `updating` writes the returned config before we post anything.
-        enum NagAction: Sendable {
-            case none
-            case unmuteDigest([String])
-            case fire(DeskNagEvaluator.Outcome)
-        }
-        let action: NagAction
-        do {
-            let (_, act) = try await configStore.updating { current -> (DeskNagConfig, NagAction) in
-                guard current.enabled else { return (current, .none) }
-                // A mute that has EXPIRED is a transition the loop owns:
-                // report the drift, consume it, and open the new window —
-                // otherwise an expiring mute would silently dump every
-                // accumulated delta as nags. Decided against CURRENT, so a
-                // fresh mute User set after our pre-check is respected.
-                if current.muteHasElapsed(now: now) {
-                    let drift = DeskNagEvaluator.digestOnUnmute(state: state, plan: plan, config: current, now: now)
-                    let consumed = DeskNagEvaluator.consumingDrift(state: state, plan: plan, config: current, now: now).unmuted()
-                    return (consumed, .unmuteDigest(drift))
-                }
-                let outcome = DeskNagEvaluator.evaluate(state: state, plan: plan, config: current, now: now)
-                return (outcome.updatedConfig, .fire(outcome))
+    /// Ledger and baseline transitions have committed before publication.
+    /// A digest never travels alone, except for the mute-expiry drift report.
+    private func publishNags(_ proposal: DeskNotificationProposal, failures: inout [String]) async -> Int {
+        if proposal.openWindow {
+            if !proposal.digest.isEmpty {
+                await deliverNag(title: proposal.digestTitle, body: proposal.digestBody,
+                    label: "unmute digest", failures: &failures)
             }
-            action = act
-        } catch {
-            nativeLog("desk_notify: nag config transaction failed: \(error) — skipping delivery to avoid a re-fire")
-            failures.append("nag config transaction: \(error)")
             return 0
         }
-
-        let outcome: DeskNagEvaluator.Outcome
-        switch action {
-        case .none:
-            return 0
-        case .unmuteDigest(let drift):
-            if !drift.isEmpty {
-                await deliverNag(
-                    title: "Desk · back on",
-                    body: (["Your mute elapsed. What moved while you were quiet:"] + drift).joined(separator: "\n"),
-                    label: "unmute digest",
-                    failures: &failures
-                )
-            }
-            // The window just opened; the next tick evaluates against the
-            // freshly consumed baselines.
-            return 0
-        case .fire(let o):
-            outcome = o
+        for nag in proposal.nags {
+            await deliverNag(title: nag.title, body: nag.body, label: nag.handle,
+                deskHandle: nag.handle, failures: &failures)
         }
-        guard !outcome.nags.isEmpty else { return 0 }
-
-        for (idx, nag) in outcome.nags.enumerated() {
-            var body = nag.body
-            // Digest lines ride along with the FIRST nag only.
-            if idx == 0, !outcome.digestLines.isEmpty {
-                body += "\n\nAlso sitting still:\n" + outcome.digestLines.joined(separator: "\n")
-            }
-            await deliverNag(
-                title: nag.title,
-                body: body,
-                label: nag.handle,
-                deskHandle: nag.handle,
-                failures: &failures
-            )
-        }
-        return outcome.nags.count
+        return proposal.nags.count
     }
 
     /// Same dual delivery as the notify pass (Mac banner + paired-device push),

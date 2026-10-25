@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `DeskObservationApplier.swift` | `DeskObservationApplier`: applies observation verdicts to Desk; evidence receipts land before closing work |
+
 // MARK: - Applying an observation verdict to the desk
 //
 // `DeskObservationEvaluator` decides; this applies. Split on purpose: the

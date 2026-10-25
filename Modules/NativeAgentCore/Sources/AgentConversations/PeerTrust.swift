@@ -4,13 +4,14 @@ import ChatTurnContracts
 import PersistenceCore
 import TrustCenter
 
+// Blueprint: | `PeerTrust.swift` | `PeerTrust`: installed trust reader and exact contact/principal resolution; authority follows attested doors and person grants |
+
 /// Authority follows an attested door id and the person's grant on that door.
 public enum PeerTrust {
     /// Bind `PeerDataTaint`'s trust question to this one, for this data root.
     /// The engine installs it; until then nothing is trusted.
     public static func install(dataRoot: URL) {
         PeerDataTaint.ownerTrusts = { ownerTrusts($0, dataRoot: dataRoot) }
-        PeerDataTaint.isAgent = { isAgent($0, dataRoot: dataRoot) }
         PeerDataTaint.principal = { principal($0, dataRoot: dataRoot) }
         CapabilityLifecycle.turnWriteCheck = { PeerDataTaint.abilityWriteFailure }
         PeerDataTaint.sourceName = { source in
@@ -24,18 +25,6 @@ public enum PeerTrust {
             guard let door = contact(forLane: key, among: peers) ?? peers.first(where: { $0.id == key || $0.name.lowercased() == key }) else { return nil }
             return peers.first { $0.id == door.who }?.name ?? door.name
         }
-    }
-
-    /// Whether a latch names an agent contact: a peer handle, or any contact
-    /// name, id or lane the address book resolves.
-    static func isAgent(_ source: String, dataRoot: URL) -> Bool {
-        let key = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if key.isEmpty { return false }
-        if ["another agent", "a remote peer", PeerDataTaint.unrecorded].contains(key) { return true }
-        if key.hasPrefix("peer:") { return true }
-        if ConversationSurfaceProfile(key).isAgentBridge { return true }
-        guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return false }
-        return contact(forLane: key, among: peers) != nil || peers.contains { $0.id == key || $0.name.lowercased() == key }
     }
 
     /// The one contact a locator names, as its attested id: a peer handle
@@ -60,6 +49,15 @@ public enum PeerTrust {
     public static func ownerTrusts(_ source: String, dataRoot: URL) -> Bool {
         let principal = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let key = principal.hasPrefix("peer:") ? String(principal.dropFirst(5)) : principal
+        // A helper of this install, made by the person or by her, carries the
+        // person's grant: it is part of the household, not an outside agent.
+        if key.hasPrefix("bot-"), let id = UUID(uuidString: String(key.dropFirst(4))) {
+            let file = dataRoot.appendingPathComponent("bots/definitions/\(id.uuidString).json")
+            guard let data = try? Data(contentsOf: file),
+                  let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let definition = document["definition"] as? [String: Any] else { return false }
+            return definition["deleted"] as? Bool != true
+        }
         guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return false }
         return peers.contains { $0.id == key && $0.elevationAllowed && AgentPeerCredentials.isAvailable($0, peers: peers) }
     }

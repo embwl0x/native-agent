@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `NativeAgentAppChatSurfaceProfile.swift` | `NativeAgentAppChatSurfaceProfile` enum |
 
 /// Canonical construction policy for every production chat execution surface.
 /// Authority remains with SecurityCenter, TrustCenter, and the gated dispatcher.

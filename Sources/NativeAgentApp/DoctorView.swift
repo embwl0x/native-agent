@@ -21,6 +21,8 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+// Blueprint: | `DoctorView.swift` | `DoctorView`: measured report rows/footer, run/repair/support actions and explicit action failure presentation |
+
 /// The bottom-of-report summary is a receipt view: it describes the checks we
 /// have and when their full Doctor pass completed. It intentionally derives
 /// severity from the individual check rows, not the report's free-form status
@@ -227,7 +229,7 @@ enum DoctorSafeRepairIssuesPresentation {
 
 struct DoctorView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var loopVerdicts: [LoopHealthVerdict] = []
+    private var loopVerdicts: [LoopHealthVerdict] { appModel.engine.doctor.loopVerdicts }
     @State private var runNotice: DoctorRunButtonPresentation.Notice?
     @State private var snapshotNotice: DoctorSupportSnapshotPresentation.Notice?
 
@@ -340,9 +342,7 @@ struct DoctorView: View {
 
             healthSummaryPanel
 
-            // Background-loop health (2026-07-16): github_tracking failed every
-            // tick for 4 days with zero surfacing. Rule + receipt parsing live
-            // in DoctorLoopHealth (pure, unit-tested); this is display only.
+            // The engine publishes these verdicts with the report's loop row.
             NativePanel(title: "Background tasks", systemImage: "arrow.triangle.2.circlepath", tint: loopPanelTint,
                         contentInsets: Self.panelInsets) {
                 if loopVerdicts.isEmpty {
@@ -395,9 +395,6 @@ struct DoctorView: View {
                         .font(NativeAgentFont.label)
                     }
                 }
-            }
-            .task(id: appModel.engine.doctor.isRunning) {
-                loopVerdicts = await DoctorLoopHealth.current()
             }
 
             if appModel.engine.doctor.report != nil {

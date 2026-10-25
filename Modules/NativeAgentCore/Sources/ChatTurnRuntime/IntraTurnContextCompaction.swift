@@ -5,6 +5,8 @@ import PersistenceCore
 import TurnTrace
 import ProviderRouting
 
+// Blueprint: | `IntraTurnContextCompaction.swift` | `IntraTurnContextCompaction`: context-window measurement, in-flight compaction and pressure receipts within turn deadlines |
+
 // MARK: - Intra-turn context compaction (2026-09-05)
 //
 // A turn must never die because its IN-FLIGHT conversation outgrew the model's
@@ -174,7 +176,6 @@ public enum IntraTurnContextCompaction {
         windowTokens: Int?,
         distill: Distill,
         surface: String,
-        turnRecoveries: Int,
         progress: ChatOrchestrationProgressHandler?
     ) async throws -> Receipt? {
         guard estimatedChars(conversation) > pressureChars(windowTokens: windowTokens) else {
@@ -191,7 +192,7 @@ public enum IntraTurnContextCompaction {
                 kind: TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue,
                 surface: surface,
                 payload: IntraTurnContextCompaction.tracePayload(
-                    receipt, trigger: "pressure", turnRecoveries: turnRecoveries
+                    receipt, trigger: "pressure"
                 )
             )
             await progress?(.notice(
@@ -230,7 +231,7 @@ public enum IntraTurnContextCompaction {
                 && conversation[idx].content.contains { block in
                     switch block {
                     case .toolUse: return true
-                    case .text(let text): return !ToolCallParser.parse(text, parseInvoke: true).isEmpty
+                    case .text(let text): return !ToolCallParser.parse(text, parseInvoke: true, recordShims: false).isEmpty
                     default: return false
                     }
                 }
@@ -443,10 +444,10 @@ public enum IntraTurnContextCompaction {
     /// what it returned, and what I was about to do next.
     static let workingNotesSystem = """
     You are writing private working notes for yourself, in the middle of a task. \
-    The steps below are about to be dropped from your context; these notes are \
-    the ONLY thing that will survive, and in a moment you will read them as your \
-    own recollection of what you have done so far. Write them so future-you can \
-    carry on without losing anything.
+    These notes replace the older steps below. Recent rounds and tool-state \
+    messages remain separately; recorded dispatch receipts are reachable through \
+    the supplied trace pointer. Preserve what you need to continue, without \
+    treating notes or dispatch as proof of verified effects.
 
     Write in strict FIRST PERSON, as your own work: "I", "me", "my". Never use \
     your own name as the subject of a sentence.
@@ -480,8 +481,7 @@ public enum IntraTurnContextCompaction {
     /// no), so the two halves stay tellable apart in one feed.
     static func tracePayload(
         _ receipt: Receipt,
-        trigger: String,
-        turnRecoveries: Int
+        trigger: String
     ) -> JSONValue {
         .object([
             "mode": .string(receipt.mode),
@@ -489,7 +489,6 @@ public enum IntraTurnContextCompaction {
             "trigger": .string(trigger),
             "charsBefore": .int(Int64(receipt.charsBefore)),
             "charsAfter": .int(Int64(receipt.charsAfter)),
-            "turnRecoveries": .int(Int64(turnRecoveries)),
         ])
     }
 

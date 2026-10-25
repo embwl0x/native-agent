@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SecurityCenter+RegistryReceipts.swift` | `SwiftNativeSecurityCenter`: `receiptSummary`, `isoTimestamp` |
 
 extension SwiftNativeSecurityCenter {
     static func receiptSummary(_ value: JSONValue) -> SecurityReceiptSummary? {

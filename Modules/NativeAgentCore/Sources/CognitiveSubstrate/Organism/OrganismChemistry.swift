@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `OrganismChemistry.swift` | `OrganismChemistry` enum; `applying`, `dosedByCaringEvent` |
 
 public enum OrganismChemistry {
     public static func applying(
@@ -409,7 +410,7 @@ public enum OrganismChemistry {
         tenderNamed: Bool = true
     ) -> String? {
         if bodySchema.resourcePressure == .critical {
-            return "- Body: the Mac is under thermal or low-power pressure; keep the next move lightweight."
+            return "- Body: the Mac is under thermal pressure; keep the next move lightweight."
         }
         if let tired = fatigueBodyLine(chemicalState.fatigue, diurnal: diurnal) {
             return tired
@@ -891,7 +892,7 @@ public enum OrganismChemistry {
             case "nominal", "normal", "low": return .nominal
             case "elevated", "medium": return .elevated
             case "high": return .high
-            case "critical", "thermal", "low_power", "low-power": return .critical
+            case "critical", "thermal": return .critical
             default: continue
             }
         }
@@ -933,10 +934,10 @@ public enum OrganismCircadian {
     /// Hard cap on the curiosity lean the curve applies. ≤ 0.15 by contract.
     public static let curiosityAmplitude = 0.09
 
-    /// Local seconds since midnight, and the local hour, in the clock's zone.
-    static func localHour(_ date: Date, clock: OrganismDiurnalClock) -> Double {
+    /// Local seconds since midnight, and the local hour, on the Mac's clock.
+    static func localHour(_ date: Date) -> Double {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = clock.timeZone
+        calendar.timeZone = .autoupdatingCurrent
         let parts = calendar.dateComponents([.hour, .minute, .second], from: date)
         let hour = Double(parts.hour ?? 0)
         let minute = Double(parts.minute ?? 0)
@@ -957,7 +958,7 @@ public enum OrganismCircadian {
     /// The read. −1 at the trough, +1 twelve hours later; phase and nightliness
     /// alongside it. Pure.
     public static func read(at date: Date, clock: OrganismDiurnalClock) -> OrganismDiurnalRead {
-        let hour = localHour(date, clock: clock)
+        let hour = localHour(date)
         let phase = (hour / 24).truncatingRemainder(dividingBy: 1)
         // Signed distance from the trough, wrapped into [−12, 12).
         var offset = hour - troughHour(clock)

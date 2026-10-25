@@ -4,8 +4,9 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import NativeAgentShared
-import enum ChatOrchestration.ChatAttachmentTypeResolver
+import enum ChatTurnRuntime.ChatAttachmentTypeResolver
 import ScreenVision
+// Blueprint: | `ChatView+Attachments.swift` | `ChatView`: `endDictation`, `toggleVoice`, `captureScreen` |
 
 extension ChatView {
     /// Stop recognition without writing anything through the composer. Called
@@ -63,6 +64,7 @@ extension ChatView {
                       voiceGeneration == startGeneration
                 else { return }
                 voiceDraftBeforeListening = text
+                voiceDraftRevision = draft.manualEditRevision
                 voiceSessionId = startSessionId
                 voiceInput.startListening()
                 // startListening sets errorMessage if the audio engine refused
@@ -79,11 +81,19 @@ extension ChatView {
     func finishDictation() async -> Bool {
         let listeningSession = voiceSessionId
         let stoppedGeneration = voiceGeneration
+        let stoppedDraftRevision = voiceDraftRevision
         let wasListening = voiceInput.isListening
         let result = await voiceInput.stopListeningResult()
         guard listeningSession == appModel.activeChatSessionId,
               voiceSessionId == listeningSession,
               stoppedGeneration == voiceGeneration else { return false }
+        guard draft.manualEditRevision == stoppedDraftRevision else {
+            // The person's own edit stands over late recognition, and the
+            // action they asked for (Send, capture) goes on with it.
+            voiceSessionId = ""
+            voiceDraftBeforeListening = ""
+            return true
+        }
         let accepted = ChatComposerSupport.finishDictation(
             result, wasListening: wasListening, base: &voiceDraftBeforeListening,
             draft: &text, attachments: &pendingAttachments,
@@ -172,19 +182,11 @@ extension ChatView {
                     guard text == capturedDraft,
                           currentAttachmentIds == capturedAttachmentIds
                     else { return }
-                    text = ""
-                    // 2026-09-06: a screenshot send is a send. It used to
-                    // commit an empty draft with a FRESH timestamp, which
-                    // outranked — and deleted — newer text typed in a detached
-                    // panel on the same session; and it left a live dictation
-                    // running, whose cumulative transcript wrote the words
-                    // just sent straight back into the emptied box.
                     appModel.clearChatDraftAfterSend(
                         capturedDraft,
                         sessionId: captureSessionId,
                         editedAt: capturedDraftEditedAt
                     )
-                    draftAdoptedText = ""
                     pendingAttachments = []
                     endDictation()
                 case .rejected(let message):
@@ -198,8 +200,9 @@ extension ChatView {
         }
     }
 
-    func composeVoiceDraft(_ transcript: String) -> String {
-        ChatComposerSupport.voiceDraft(base: voiceDraftBeforeListening, transcript: transcript)
+    func composeVoiceDraft(_ transcript: String) {
+        draft.dictate(ChatComposerSupport.voiceDraft(base: voiceDraftBeforeListening, transcript: transcript),
+                      revision: voiceDraftRevision)
     }
 
     /// Prefer a copied image; otherwise let the person choose files.

@@ -2,25 +2,25 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `LLMClient+XAIOAuthDirectAdapter.swift` | `XAIOAuthDirectAdapter`: app-owned OAuth token lifecycle and Grok completion/stream transport with shared refresh serialization |
+
 public let XAIOAuthDirectExhaustedMarker = "xai_oauth_direct_exhausted: re-sign-in required"
 
 /// xAI Grok OAuth provider for NativeAgent-owned credentials.
 ///
-/// This is independent from Agent's X/Twitter connector. It authenticates
-/// against xAI and calls Grok models at https://api.x.ai/v1.
+/// It authenticates against xAI and calls Grok models at https://api.x.ai/v1.
 public final class XAIOAuthDirectAdapter: LLMAdapter {
     public static let toolWire = ProviderToolWire.native
     public let providerId: String = "xai_oauth_direct"
 
     public static let defaultEndpoint = URL(string: "https://api.x.ai/v1/chat/completions")!
-    public static let defaultRefreshEndpoint = URL(string: "https://auth.x.ai/oauth/token")!
-    public static let clientID = "b1a00492-073a-47ea-816f-4c329264a828"
+    public static let defaultRefreshEndpoint = URL(string: ProviderOAuthConfig.xaiTokenEndpoint)!
+    public static let clientID = ProviderOAuthConfig.xaiClientID
     /// The first row of this provider's own catalog (2026-09-13): computed, not
     /// a model id chosen in code — same rule as the Moonshot adapter.
     public static var defaultModel: String {
         FirstPartyModelCatalog.models(forProviderID: "xai_oauth_direct").first?.id ?? ""
     }
-    static let tokenExpiryBufferSec: TimeInterval = 120
 
     private let session: URLSession
     private let endpoint: URL
@@ -175,7 +175,6 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                         lastSentAccessToken = access
                         var req = URLRequest(url: endpoint)
                         req.httpMethod = "POST"
-                        req.timeoutInterval = 240
                         req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
                         applyStreamingLLMHeaders(to: &req)
                         let body = try Self.buildChatCompletionsBody(
@@ -191,9 +190,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                         let bytes: URLSession.AsyncBytes
                         let response: URLResponse
                         do {
-                            if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-                            (bytes, response) = try await session.bytes(for: req)
-                            if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
+                            (bytes, response) = try await ProviderWire.open(session, req)
                         } catch {
                             throw mapTransportError(error, fallback: self.transientNetworkError(error, operation: "streamMessages"))
                         }
@@ -372,7 +369,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             if forceRefresh, let staleToken, !staleToken.isEmpty, access != staleToken {
                 return access
             }
-            let shouldRefresh = forceRefresh || Self.accessTokenIsExpiring(state, skew: Self.tokenExpiryBufferSec)
+            let shouldRefresh = forceRefresh || Self.accessTokenIsExpiring(state, skew: NativeOAuthSupport.renewalMargin)
             guard shouldRefresh else { return access }
             let refreshed = try await self.refreshTokens(state: state, requestAccount: requestAccount)
             return refreshed.accessToken
@@ -408,11 +405,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         guard !access.isEmpty, !refresh.isEmpty else {
             throw LLMError.notConfigured(provider: "xai_oauth_direct")
         }
-        let endpointRaw = ((obj["discovery"] as? [String: Any])?["token_endpoint"] as? String)
-            ?? (obj["token_endpoint"] as? String)
-            ?? Self.defaultRefreshEndpoint.absoluteString
-        guard let endpoint = URL(string: endpointRaw),
-              Self.isTrustedXAIURL(endpoint) else {
+        guard let endpoint = tokenEndpoint(in: obj) else {
             throw LLMError.providerError(message: "xai_oauth_direct token endpoint is not on x.ai")
         }
         return TokenState(
@@ -426,21 +419,16 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
 
     private func refreshTokens(state: TokenState, requestAccount: OAuthRequestAccount) async throws -> TokenState {
         try OAuthRefreshBinding.requireRefresh(state.object, provider: "xai_oauth_direct")
-        var req = URLRequest(url: state.tokenEndpoint)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 20
-        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.httpBody = NativeOAuthSupport.formEncode([
+        let body = [
             "grant_type": "refresh_token",
             "client_id": Self.clientID,
             "refresh_token": state.refreshToken,
-        ]).data(using: .utf8)
+        ]
 
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            (data, response) = try await NativeOAuthSupport.post(state.tokenEndpoint, body, session: session)
         } catch {
             if error is CancellationError { throw CancellationError() }
             throw transientNetworkError(error, operation: "refresh")
@@ -565,18 +553,34 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     /// The earlier of the two wins when both are present, so an out-of-band
     /// rotation cannot leave a token being served past its real expiry.
     private static func accessTokenIsExpiring(_ state: TokenState, skew: TimeInterval) -> Bool {
-        let jwt = jwtExpiry(state.accessToken)
-        let persisted = persistedExpiry(state.object)
-        let effective: Date? = {
-            switch (jwt, persisted) {
-            case let (.some(a), .some(b)): return min(a, b)
-            case let (.some(a), .none):    return a
-            case let (.none, .some(b)):    return b
-            case (.none, .none):           return nil
-            }
-        }()
-        guard let effective else { return false }
+        guard let effective = effectiveExpiry(state.accessToken, object: state.object) else { return false }
         return effective.timeIntervalSinceNow <= skew
+    }
+
+    private static func effectiveExpiry(_ access: String, object: [String: Any]) -> Date? {
+        [jwtExpiry(access), persistedExpiry(object)].compactMap { $0 }.min()
+    }
+
+    private static func tokenEndpoint(in object: [String: Any]) -> URL? {
+        let raw = ((object["discovery"] as? [String: Any])?["token_endpoint"] as? String)
+            ?? (object["token_endpoint"] as? String) ?? defaultRefreshEndpoint.absoluteString
+        return URL(string: raw).flatMap { isTrustedXAIURL($0) ? $0 : nil }
+    }
+
+    public static func credentialStatus(_ auth: [String: Any]?) -> (usable: Bool, detail: String, health: OAuthCredentialHealth) {
+        let object = auth ?? [:]
+        let tokens = OAuthRefreshBinding.tokenSet(object, provider: "xai_oauth_direct")
+        let access = OAuthRefreshBinding.string(tokens["access_token"])
+        let refresh = OAuthRefreshBinding.string(tokens["refresh_token"])
+        let expiry = effectiveExpiry(access ?? "", object: object)
+        let canRefresh = refresh != nil && OAuthRefreshBinding.permitsRefresh(object, provider: "xai_oauth_direct")
+        let needsRefresh = expiry.map { $0.timeIntervalSinceNow <= NativeOAuthSupport.renewalMargin } ?? false
+        let usable = access != nil && refresh != nil && (!needsRefresh || canRefresh)
+            && tokenEndpoint(in: object) != nil
+        let detail = usable ? (needsRefresh ? "Signed in. Your session will renew on your next chat." : "Signed in")
+            : object.isEmpty ? "Sign in to your xAI account in Providers." : "Reconnect your xAI account in Providers."
+        return (usable, detail, OAuthCredentialHealth(configured: usable, expiresAt: expiry,
+            canRefresh: canRefresh, requiresRefresh: needsRefresh))
     }
 
     public static func isTrustedXAIURL(_ url: URL) -> Bool {
@@ -593,7 +597,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     }
 
     private static func redactedErrorBody(_ raw: String) -> String {
-        var out = raw
+        var out = NativeOAuthSupport.redact(raw, bearerReplacement: "Bearer ***")
         if let re = try? NSRegularExpression(
             pattern: #"(?i)"(access_token|refresh_token|id_token|authorization|api_key|token)"\s*:\s*"[^"]+""#
         ) {

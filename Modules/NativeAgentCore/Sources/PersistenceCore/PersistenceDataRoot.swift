@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import NativeAgentCore
+// Blueprint: | `PersistenceDataRoot.swift` | `ResolvedDataRootCache` class; `resolve` |
 
 // MARK: - Data root resolution
 
@@ -138,7 +139,7 @@ public func missingLaunchRoots(
 
 /// `~/Library/Application Support/NativeAgent` BARE — no `/data` suffix, no
 /// directory creation. Matches Python's fallback at the retired daemon.
-/// Subsystems (ApprovalInbox, MCPDispatcher) used to duplicate this resolution;
+/// Subsystems (ApprovalInbox) used to duplicate this resolution;
 /// they now delegate here.
 public func libraryAppSupportFallback(
     fileManager: FileManager = .default,

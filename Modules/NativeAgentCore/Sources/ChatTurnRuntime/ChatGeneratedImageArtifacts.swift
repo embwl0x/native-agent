@@ -1,6 +1,9 @@
 import CryptoKit
 import Foundation
 import PersistenceCore
+import ToolRegistry
+
+// Blueprint: | `ChatGeneratedImageArtifacts.swift` | `ChatGeneratedImageArtifacts`: reply attachment projection from actual generation receipts and explicit reply choices |
 
 /// The artifacts a reply carries: its face's, which every surface renders.
 public enum ChatGeneratedImageArtifacts {
@@ -15,13 +18,49 @@ public enum ChatGeneratedImageArtifacts {
         var out: [MultimodalAttachment] = []
         var seen: Set<String> = []
         // app image.generate is image_generate too.
-        let generated = dispatches.filter { $0.ranCall.tool == "image_generate" }
-            .flatMap { attachments(fromToolResult: $0.result, dataRoot: dataRoot) }
+        let generated = dispatches.flatMap { generations($0.ranCall.tool, $0.ranCall.input, $0.result) }
+            .flatMap { attachments(fromToolResult: $0, dataRoot: dataRoot) }
         for attachment in generated + chosen.compactMap({ attachment(URL(fileURLWithPath: $0)) })
             where attachment.path.map({ seen.insert($0).inserted }) == true {
             out.append(attachment)
         }
         return out
+    }
+
+    /// A call's generation receipts: its own, or each of its list's. An
+    /// `app {actions}` list pairs its entries with its receipts in order; a
+    /// call fanned out over a list of values ran its one tool for each; a
+    /// script's ledger names each call's action on its row.
+    private static func generations(_ tool: String, _ input: [String: JSONValue], _ result: JSONValue) -> [JSONValue] {
+        guard case .object(let fields) = result else { return [] }
+        // A saved receipt too big to keep whole carries them, kept before it was bounded.
+        if let kept = fields["generatedImages"] { return [.object(["images": kept])] }
+        if case .array(let calls)? = fields["calls"] {
+            return calls.flatMap { row -> [JSONValue] in
+                guard case .object(let ran) = row, let action = ran["call"] else { return [] }
+                return generations(ToolNameAliases.ranTool("app", input: ["action": action]), [:], row)
+            }
+        }
+        guard case .array(let receipts)? = fields["receipts"] else {
+            return tool == "image_generate" ? [result] : []
+        }
+        guard case .array(let entries)? = input["actions"] else {
+            return receipts.flatMap { generations(tool, input, $0) }
+        }
+        return zip(entries, receipts).flatMap { entry, receipt -> [JSONValue] in
+            guard case .object(let call) = entry else { return [] }
+            let ran = ToolNameAliases.ranCall("app", input: call)
+            return generations(ran.tool, ran.input, receipt)
+        }
+    }
+
+    /// Every image a call's generations made, in one list: what its saved
+    /// receipt keeps before it is bounded, so a resumed turn still has them.
+    public static func generatedImages(_ tool: String, _ input: [String: JSONValue], _ result: JSONValue) -> [JSONValue] {
+        generations(tool, input, result).flatMap { generation -> [JSONValue] in
+            guard case .object(let fields) = generation, case .array(let images)? = fields["images"] else { return [] }
+            return images
+        }
     }
 
     public static func attachments(

@@ -3,6 +3,8 @@ import PersistenceCore
 import Desk
 import CognitiveSubstrate
 
+// Blueprint: | `AutonomousPursuitProposer.swift` | `AutonomousPursuitProposer`: at most one reflection pursuit proposal from resolved pre-existing evidence |
+
 // Wave C2b — AUTONOMOUS PURSUIT PROPOSAL (Agent's volition ignition).
 //
 // After a scheduled reflection runs, Agent MAY propose ONE new self-pursuit
@@ -19,8 +21,9 @@ import CognitiveSubstrate
 // pursuit — she can form a `.proposed` view, but only User's approval flips it
 // `.active`, and this core refuses anything that is not `.active` at proposal time.
 //
-// This file is a PURE, testable decision core — no IO, no substrate handle, no
-// store. The reflection path (NativeCognitionRuntime) reads the REAL substrate for
+// This decision core has no substrate handle or store; its only observation is
+// a turn-bound shim receipt when it rejects a near-duplicate. The reflection
+// path (NativeCognitionRuntime) reads the REAL substrate for
 // both the candidate list AND the resolver, then hands them here; the core
 // independently re-confirms each cited view is `.active` before it will build a
 // Pursuit. Everything fails CLOSED: an unresolvable, non-active, capped, or
@@ -77,7 +80,6 @@ public enum AutonomousPursuitProposer {
         candidates: [StandingViewCandidate],
         openAgentPursuitCount: Int,
         standingViewIdsWithOpenPursuit: Set<String>,
-        openPursuitTitles: [String] = [],
         maxOpenAgentPursuits: Int = SwiftNativeDeskStore.maxOpenAgentPursuits,
         resolveStatus: (String) -> CognitiveStandingView.Status?
     ) -> PursuitProposal? {
@@ -94,54 +96,9 @@ public enum AutonomousPursuitProposer {
             guard !standingViewIdsWithOpenPursuit.contains(id) else { continue }
             // (d) Build + self-validate against the store's own gate.
             guard let proposal = buildProposal(from: candidate, resolvedId: id) else { continue }
-            // (e) PARAPHRASE RUT GUARD (2026-08-08): the id dedup in (c) can't
-            // see two standing views that are the SAME THOUGHT reworded — the
-            // live desk held "Absence is a system at rest…" and "A quiet
-            // system is at rest…" as separate pursuits, opened 2 days apart.
-            // Refuse a proposal whose title is a near-duplicate of any OPEN
-            // pursuit's title; the next candidate may still pass.
-            guard !openPursuitTitles.contains(where: {
-                titlesAreNearDuplicates($0, proposal.title)
-            }) else { continue }
             return proposal   // at most ONE per run.
         }
         return nil
-    }
-
-    /// Token-set Jaccard over normalized words, grammatical stopwords dropped.
-    /// Pure and deterministic — no model call: the paraphrases this guards
-    /// against share almost all content words by construction (they derive
-    /// from near-identical standing-view sentences).
-    ///
-    /// 0.7, not lower: the live paraphrase pair scores 0.78 (blocked), while
-    /// legitimately distinct surface-variant pursuits like "Improve memory
-    /// recall for Telegram conversations" vs "…for Slack conversations"
-    /// score 0.67 (allowed — gpt-5.5 review example). Under-blocking is the
-    /// right failure mode for a volition lane: the per-view id dedup still
-    /// bounds true duplicates, and over-blocking silently starves autonomy.
-    static let nearDuplicateThreshold = 0.7
-    static let stopwords: Set<String> = [
-        "a", "an", "the", "is", "are", "was", "were", "be", "been",
-        "it", "its", "this", "that", "these", "those",
-        "i", "me", "my", "you", "your", "we", "our",
-        "of", "to", "in", "on", "at", "for", "and", "or", "until",
-        "with", "as", "by", "from", "into", "pursue",
-    ]
-
-    static func titlesAreNearDuplicates(_ a: String, _ b: String) -> Bool {
-        let ta = contentTokens(a)
-        let tb = contentTokens(b)
-        guard !ta.isEmpty, !tb.isEmpty else { return false }
-        let intersection = ta.intersection(tb).count
-        let union = ta.union(tb).count
-        guard union > 0 else { return false }
-        return Double(intersection) / Double(union) >= nearDuplicateThreshold
-    }
-
-    static func contentTokens(_ s: String) -> Set<String> {
-        let words = s.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-        return Set(words.filter { $0.count > 1 && !stopwords.contains($0) })
     }
 
     /// Derive the bounded pursuit from a resolved-active standing view. Returns nil

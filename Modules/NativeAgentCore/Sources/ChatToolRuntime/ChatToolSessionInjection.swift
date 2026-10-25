@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import ChatTurnContracts
+// Blueprint: | `ChatToolSessionInjection.swift` | `ChatToolSessionInjection`: verified-session → tool-loop-session selection and shared internal/tool-specific session injection |
 
 /// Single source of truth for injecting the per-turn session id into tool input
 /// before dispatch, so the LLM doesn't have to remember to pass it. Both the
@@ -8,6 +10,18 @@ import PersistenceCore
 /// earlier divergence between the two copies bounced calls with
 /// missing_session_id. Keep this the ONLY implementation.
 package enum ChatToolSessionInjection {
+    /// Transport-verified session first, then the direct tool loop's session.
+    /// Without either, leave the caller's explicit input intact.
+    package static var currentSession: String? {
+        [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+    }
+
+    package static func apply(toolName: String, input: [String: JSONValue]) -> [String: JSONValue] {
+        apply(toolName: toolName, input: input, sessionId: currentSession)
+    }
+
     package static func apply(
         toolName: String,
         input: [String: JSONValue],

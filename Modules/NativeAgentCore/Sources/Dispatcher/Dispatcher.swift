@@ -1,8 +1,10 @@
 import Experiences
 import Foundation
+import ChatToolParsing
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `Dispatcher.swift` | `DispatchResult`, read-only `SwiftNativeDispatcher` with a fail-closed writable-handler boundary, `makeDispatcher`; `dispatchSlashCommand`; dispatch status and read verification derive from `ChatToolOutcome` exact/display classes; partial reads retain visible output without a fabricated error or verification claim |
 
 // MARK: - Native dispatcher infrastructure
 //
@@ -91,7 +93,7 @@ public struct DispatchError: Sendable, Equatable {
 public struct DispatchResult: Sendable, Equatable {
     public var ok: Bool
     public var tool: String
-    public var status: String          // "ok"|"failed"|"blocked"|"pending_approval"|"dry_run"
+    public var status: String          // "ok"|"partial"|"failed"|"blocked"|"pending_approval"|"dry_run"
     public var output: DispatchOutput?
     public var error: DispatchError?
     public var executed: Bool
@@ -178,16 +180,14 @@ private func validateDispatchValues(_ value: JSONValue, path: String = "") throw
 
 // MARK: - Dispatch ledger
 //
-// Append-only JSONL writer. Each entry is one `record_trace`-shaped envelope
-// at `<dataRoot>/traces/events.jsonl`. The Swift side wraps the append in a
-// `<path>.lock` flock as a one-sided precaution; Python's `append_jsonl`
-// is unlocked and relies on POSIX O_APPEND
-// atomicity for sub-PIPE_BUF lines. See the retired daemon for the lock
-// surface the Swift side reuses.
+// Trace envelopes at <dataRoot>/traces/events.jsonl, appended through the
+// shared `appendPathOwnedJSONL` persistence owner.
+// Local JSONL evidence, excluded from backup/export/phone sync; PrivacyMap: traces.
+// One envelope, event-kind-specific payloads (dispatch, tool.dispatch, memory.commit, etc.).
 
 public struct DispatchLedgerEntry: Sendable, Equatable {
     public var id: String
-    public var kind: String              // always "dispatch"
+    public var kind: String              // identifies the payload schema
     public var title: String             // "tool:<name>"
     public var status: String            // "ok"|"failed"|"blocked"|"dry_run"|"pending_approval"
     public var payload: JSONValue        // dispatch trace_event body
@@ -514,12 +514,12 @@ public actor SwiftNativeDispatcher {
         }
         let elapsedUs = DispatchClockMonotonic.elapsedMicros(since: t0)
 
-        // Interpret the native result dict's ok/error_code.
-        var resultOK = true
+        // Use the same terminal outcome as chat before assigning verification.
+        let outcome = ChatToolOutcome.exactResultClass(raw)
+        let isPartial = ChatToolOutcome.displayOutcome(result: raw, ok: nil, hasResult: true) == .partial
         var errorCode: String? = nil
         var errorMessage = ""
         if case .object(let obj) = raw {
-            if case .bool(let b)? = obj["ok"] { resultOK = b }
             // Missing or empty handler error codes use the dispatch default.
             if case .string(let s)? = obj["error_code"], !s.isEmpty { errorCode = s }
             if case .string(let s)? = obj["error"] { errorMessage = s }
@@ -531,14 +531,20 @@ public actor SwiftNativeDispatcher {
         let dispatchError: DispatchError?
         let executed = true
         // Successful read-only handlers marked trivialVerify need no separate
-        // effect verification. Failed results leave verification unset.
+        // effect verification. Partial and failed results leave verification unset.
         let verifyPassed: Bool?
-        if resultOK {
+        if isPartial {
+            // A partial read has useful output without a confirmed full result.
+            // Keep it visible to slash receipts without inventing a failure.
+            status = "partial"
+            dispatchError = nil
+            verifyPassed = nil
+        } else if outcome == .succeeded {
             status = "ok"
             dispatchError = nil
             verifyPassed = actions.isTrivialVerify(tool) ? true : nil
         } else {
-            status = "failed"
+            status = outcome.rawValue
             verifyPassed = nil
             // Executed failures remain recoverable and keep the handler's own
             // error code, with the established handler_raised default.
@@ -562,7 +568,7 @@ public actor SwiftNativeDispatcher {
         )
 
         return DispatchResult(
-            ok: resultOK,
+            ok: outcome == .succeeded || isPartial,
             tool: tool,
             status: status,
             // Python attaches output=result even on a failed handler return

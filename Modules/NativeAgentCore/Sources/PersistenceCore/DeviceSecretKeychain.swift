@@ -1,5 +1,6 @@
 import Foundation
 import Security
+// Blueprint: | `DeviceSecretKeychain.swift` | Verified device-only Keychain secret bytes and a service's account list; callers own locked reference commits and migration |
 
 /// Device-only secret bytes. Callers own reference commits and serialize their
 /// lifecycle with the same lock as the legacy file they replace.
@@ -21,6 +22,19 @@ public enum DeviceSecretKeychain {
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = result as? Data else { throw Failure.unavailable }
         return data
+    }
+
+    /// Every account kept under `service`.
+    public static func accounts(service: String) throws -> [String] {
+        var request = query(service: service, account: "")
+        request.removeValue(forKey: kSecAttrAccount as String)
+        request[kSecReturnAttributes as String] = true
+        request[kSecMatchLimit as String] = kSecMatchLimitAll
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(request as CFDictionary, &result)
+        if status == errSecItemNotFound { return [] }
+        guard status == errSecSuccess, let rows = result as? [[String: Any]] else { throw Failure.unavailable }
+        return rows.compactMap { $0[kSecAttrAccount as String] as? String }
     }
 
     public static func insert(_ data: Data, service: String, account: String) throws {

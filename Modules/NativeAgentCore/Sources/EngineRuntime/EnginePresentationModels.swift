@@ -1,5 +1,8 @@
 import ToolRegistry
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatToolRuntime
+import ChatSessionWork
+import ChatToolParsing
 import MacIntegration
 import ChromeControl
 import ApprovalTransactions
@@ -10,7 +13,54 @@ import Foundation
 import NativeAgentShared
 import TelegramBot
 import PersistenceCore
+import ProviderRouting
 import NativeAgentCore
+import AuthoredCapabilities
+import ToolExecution
+import Senses
+import Observation
+// Blueprint: | `EnginePresentationModels.swift` | Root-scoped `PresentationFaces` feeds L0's pure `presentation-copy.js` cache outside rendering; page subtitles and tool phrases are removed from Swift, while sanitized tool facts, classification and identity grammar stay native. `TelegramPresentationSnapshot`, shared route vocabulary, `SidebarItem.shellFirstTab`, `SidebarItem.shellHome`, `UserDisplayFormatters`, temporal/receipt values and shared inline card presentation remain |
+
+/// Root-scoped authored copy. Native read owners and view tasks feed frozen
+/// inputs; rendering reads L0 snapshots, including canonical unavailable status.
+@MainActor @Observable
+public final class PresentationFaces {
+    private let dataRoot: URL
+    private var faces: [String:PartFaces] = [:]
+    @ObservationIgnored private var inputs: [String:JSONValue] = [:]
+    @ObservationIgnored private var epochs: [String:UInt64] = [:]
+    public nonisolated init(dataRoot: URL) { self.dataRoot=dataRoot }
+
+    public func words(_ key: String) -> String? {
+        if let snapshot=faces[key]?.snapshots["presentation-copy"] {
+            if snapshot.status == .ready { return snapshot.face?.sections.first?.rows.first?.title }
+            return "Readout "+snapshot.status.rawValue+": "+(snapshot.error?.message ?? snapshot.status.rawValue)
+        }
+        return nil
+    }
+
+    @discardableResult
+    public func prepare(_ key: String, input: JSONValue) async -> String {
+        let snapshot = await prepareSnapshot(key,input:input)
+        if snapshot.status == .ready, let text=snapshot.face?.sections.first?.rows.first?.title { return text }
+        return "Readout "+snapshot.status.rawValue+": "+(snapshot.error?.message ?? snapshot.status.rawValue)
+    }
+
+    public func prepareSnapshot(_ key: String, input: JSONValue) async -> PartFaceSnapshot {
+        if inputs[key] != input { inputs[key]=input; epochs[key,default:0] += 1 }
+        if faces[key] == nil {
+            let root=dataRoot
+            faces[key]=PartFaces(dataRoot:root) { id,input,version in
+                let host=AppToolExecutor.authoredProgramHost(dataRoot:root) { _,_ in nil }
+                return await OwnedProgramInvocation.$host.withValue(host) {
+                    await Parts(root:root).face(id:id,input:input,version:version)
+                }
+            }
+        }
+        return await faces[key]!.sourceChanged(id:"presentation-copy",epoch:epochs[key] ?? 0,input:input)
+    }
+}
+
 /// UI diagnostics around the canonical transport/configuration values.
 public struct TelegramPresentationSnapshot: Equatable, Sendable {
     public var transport: TelegramBot.TelegramStatus
@@ -342,8 +392,7 @@ public struct ModelCatalogResponse: Codable, Hashable, Sendable {
     /// actually came from — `live`, `live_incomplete`, `cached`, `stale`,
     /// `unavailable`. A failed refresh used to be indistinguishable from a
     /// successful one, so the Providers UI reported "Model catalog refreshed"
-    /// for a refresh that never reached the network. Additive and optional:
-    /// a persisted `models.json` written before this decodes exactly as before.
+    /// for a refresh that never reached the network.
     public var catalogFreshness: String?
     /// S12a: why the provider's list could not be loaded, and how old a
     /// last-known list is — nil when the rows are the provider's current answer.
@@ -541,102 +590,9 @@ extension TelegramPresentationSnapshot: AppToolTelegramDiagnosticStatus {
 // applies uniformly when we improve it.
 
 
-public enum UserDisplayFormatters {
-    // MARK: - Timestamps
+public typealias UserDisplayFormatters = NativeAgentShared.UserDisplayFormatters
 
-    /// Fractional-first Foundation formatter semantics for stored timestamps.
-    /// Callers retain their own whitespace and empty-input rules. Keep these
-    /// formatters local: they are not Sendable, and the cached display parser
-    /// below uses distinct value-typed parsing strategies.
-    public static func parseFoundationISOTimestamp(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
-    }
-
-    // Value-typed, immutable parse strategies are safe to share and avoid
-    // constructing two Foundation formatter objects for every timestamp in a
-    // list render. Fractional and plain wire shapes remain distinct because
-    // both are produced by NativeAgent's durable stores.
-    private static let fractionalISO = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
-    private static let plainISO = Date.ISO8601FormatStyle()
-    private static let timestampParseCache = TimestampParseCache(capacity: 2_048)
-
-    /// Convert an ISO-8601 timestamp (with or without fractional seconds) to
-    /// a relative phrase like "5 weeks ago" / "in 3 hours". On parse failure
-    /// returns the raw input — better than dropping the field, but signals
-    /// upstream to investigate. Power-user UI should also surface the raw
-    /// value in a tooltip.
-    public static func humanizeISOTimestamp(_ iso: String) -> String {
-        let trimmed = iso.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return "" }
-        let date = parseISOTimestamp(trimmed)
-        guard let date else { return trimmed }
-        let rel = RelativeDateTimeFormatter()
-        rel.unitsStyle = .full
-        return rel.localizedString(for: date, relativeTo: Date())
-    }
-
-    /// Parse an ISO-8601 timestamp to a Date (fractional seconds tolerated).
-    public static func parseISOTimestamp(_ iso: String) -> Date? {
-        let trimmed = iso.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return nil }
-        return timestampParseCache.value(for: trimmed) {
-            (try? fractionalISO.parse(trimmed)) ?? (try? plainISO.parse(trimmed))
-        }
-    }
-
-    /// Timestamp used under a chat bubble. Kept here with the canonical wire
-    /// parser so every bubble does not rebuild its own pair of ISO formatters.
-    public static func chatTimestamp(_ iso: String, calendar: Calendar = .current) -> String {
-        guard let date = parseISOTimestamp(iso) else { return iso }
-        return date.formatted(
-            date: calendar.isDateInToday(date) ? .omitted : .abbreviated,
-            time: .shortened
-        )
-    }
-
-    /// Relative phrase ("5m ago") with a caller-chosen units style. Use this
-    /// when a call site wants a shorter form than `humanizeISOTimestamp`'s
-    /// `.full`. On parse failure returns `fallback` — pass the raw input to
-    /// echo it back, or a placeholder like "recently".
-    public static func relativeISOTimestamp(
-        _ iso: String,
-        unitsStyle: RelativeDateTimeFormatter.UnitsStyle,
-        fallback: String
-    ) -> String {
-        guard let date = parseISOTimestamp(iso) else { return fallback }
-        // Clock skew can put a fresh stamp a hair in the future; "in 0s" is
-        // nonsense to a person, so anything under a minute reads "now".
-        let now = Date()
-        if date > now || now.timeIntervalSince(date) < 60 { return "now" }
-        let rel = RelativeDateTimeFormatter()
-        rel.unitsStyle = unitsStyle
-        return rel.localizedString(for: date, relativeTo: now)
-    }
-
-    /// Time-of-day only, localized ("6:02 PM"). On parse failure returns the
-    /// raw input (never drop the field). Uses the current locale/timezone.
-    public static func shortTime(_ iso: String) -> String {
-        guard let date = parseISOTimestamp(iso) else { return iso }
-        let out = DateFormatter()
-        out.dateStyle = .none
-        out.timeStyle = .short
-        return out.string(from: date)
-    }
-
-    /// Medium date + short time, localized ("May 26, 2026 at 6:02 PM"). On
-    /// parse failure returns the raw input. Uses the current locale/timezone.
-    public static func mediumDateTime(_ iso: String) -> String {
-        guard let date = parseISOTimestamp(iso) else { return iso }
-        let out = DateFormatter()
-        out.locale = .current
-        out.timeZone = .current
-        out.dateStyle = .medium
-        out.timeStyle = .short
-        return out.string(from: date)
-    }
-
+extension UserDisplayFormatters {
     // MARK: - Paths
 
     /// Hide the user's home directory in displayed paths. "/Users/foo/x" →
@@ -837,54 +793,6 @@ public enum UserDisplayFormatters {
     }
 }
 
-/// ISO timestamps are immutable wire values and recur throughout lists and
-/// status chrome. Keep both successful and failed parses in a small FIFO so a
-/// SwiftUI redraw does not rebuild the same Date over and over. The lock keeps
-/// the shared formatter helper safe for background projections too.
-private final class TimestampParseCache: @unchecked Sendable {
-    private enum Entry {
-        case date(Date)
-        case invalid
-
-        var date: Date? {
-            if case .date(let date) = self { return date }
-            return nil
-        }
-    }
-
-    private let capacity: Int
-    private let lock = NSLock()
-    private var entries: [String: Entry] = [:]
-    private var order: [String] = []
-
-    init(capacity: Int) {
-        self.capacity = max(1, capacity)
-    }
-
-    func value(for key: String, load: () -> Date?) -> Date? {
-        lock.lock()
-        if let entry = entries[key] {
-            lock.unlock()
-            return entry.date
-        }
-        lock.unlock()
-
-        let loaded = load()
-        lock.lock()
-        if let raced = entries[key] {
-            lock.unlock()
-            return raced.date
-        }
-        entries[key] = loaded.map(Entry.date) ?? .invalid
-        order.append(key)
-        if order.count > capacity {
-            entries.removeValue(forKey: order.removeFirst())
-        }
-        lock.unlock()
-        return loaded
-    }
-}
-
 extension String {
     /// Truncate a display string, appending `suffix` when (and only when) the
     /// string is longer than `limit` — a string of exactly `limit` chars is
@@ -938,7 +846,6 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     case diagnostics = "Diagnostics"     // Doctor + Status + Runs Log
     case inboxPolicy = "Inbox Policy"
     case panels = "Panels"
-    case mcp = "MCP"                     // MCP server hub: registry, tools, recent calls
     case inspector = "Inspector"         // Turn Inspector: live per-turn readout + replay (W3)
 
     // ── Routed child surfaces (not listed as sidebar rows) ────────────────
@@ -1007,7 +914,6 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         case .knowledge: (.memories, "knowledge")
         case .dreams: (.personality, "dreams")
         case .macIntegration: (.trust, "mac")
-        case .mcp: (.connectors, "mcp")
         case .telegram: (.connectors, "telegram")
         case .cognition: (.diagnostics, "Cognition")
         case .inspector: (.diagnostics, "Inspector")
@@ -1019,13 +925,8 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     // The pages that are tabs now. Still listed so the palette and deep links
     // reach them; each lands on its rail page with that tab open.
     public static let advancedItems: [SidebarItem] = [
-        .skills, .macIntegration, .knowledge, .dreams, .mcp, .cognition, .inspector,
+        .skills, .macIntegration, .knowledge, .dreams, .cognition, .inspector,
     ]
-
-    // Returns true for items shown in the Advanced disclosure section
-    public var isAdvanced: Bool {
-        SidebarItem.advancedItems.contains(self)
-    }
 
     public var systemImage: String {
         switch self {
@@ -1054,7 +955,6 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         case .inboxPolicy: "tray.and.arrow.down"
         case .panels: "rectangle.grid.2x2"
         case .tools: "wrench.and.screwdriver"
-        case .mcp: "network"
         case .inspector: "waveform.path.ecg"
         // Legacy aliases — use the normalized icon
         case .memory: "brain"
@@ -1081,20 +981,6 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     /// One plain sentence under a rail page's title, in the agent's own voice —
     /// the same line Today, Memories and the Desk carry. Nil means the page
     /// writes its own (or needs none).
-    public var shellPageSubtitle: String? {
-        switch normalized {
-        case .providers: "I think with the model accounts you connect here."
-        case .capabilities: "This is what I can do and what's installed."
-        case .inboxPolicy: "I decide here what to bring you and what to keep quiet."
-        case .bots: "I run small jobs on my own here, on a schedule you set."
-        case .trust: "This is what I'm allowed to do on this Mac without asking you first."
-        case .connectors: "I reach your other apps and services through what you connect here."
-        case .diagnostics: "This is how I'm running, and what to check when something looks wrong."
-        case .personality: "This is who I am here — my name, my voice, and the documents behind them."
-        default: nil
-        }
-    }
-
     // ui-simplify 2026-09-02: the rail is icon-over-word, so it carries the
     // word a person would use rather than the internal tab name. Activity is
     // "Today" on the rail; the destination and every route are unchanged (Lane
@@ -1122,138 +1008,21 @@ extension ReasoningEffortOption: QuietComposerEffort {}
 public enum ChatShellToolSummary {
     public static let detailLimit = 4
 
-    /// One line, e.g. "Looked something up · 2 tools".
-    ///
-    /// 2026-09-06: a failure shows in the closed row. The detail lines already
-    /// say which call failed, but they are behind the fold — the headline read
-    /// the same whether every call worked or none did, so a turn that failed
-    /// looked like a turn that went fine until the user opened it.
-    /// What a tool row is, for the fold and the detail lines. A row that raised
-    /// an inline card ASKED the person something; that is neither a success nor
-    /// a failure, and it read as `failed` on every surface until 2026-09-14
-    /// ("1 of 3 failed" for a card nobody had answered yet, and "2 of 3 failed"
-    /// once the person declined one).
-    public enum Status: Equatable, Sendable {
-        case plain
-        case failed
-        /// A card still waiting for an answer.
-        case needsYou
-        /// A card the person already answered or declined, or one a newer card
-        /// replaced. Asked and answered — never a failure.
-        case asked
-    }
+    public typealias Status = ChatToolOutcome.FoldStatus
 
-    /// The row's status from the two fields every surface already carries: the
-    /// transcript `kind` and the persisted result envelope. An inline-interaction
-    /// row keeps that kind forever, so the envelope's status is what says
-    /// whether it is still open.
+    /// The same metadata precedence as the expanded tool receipt.
     public static func status(
         kind: String?, ok: Bool?, resultSummary: String?, resultStatus: String? = nil,
         interactionState: String? = nil
     ) -> Status {
-        guard kind == InlineInteractionWire.transcriptKind else {
-            return ok == false ? .failed : .plain
-        }
-        // The row's own interaction state outranks the envelope. Superseding
-        // rewrites the state under the transcript lock; a row written before
-        // that rewrite also rewrote `resultSummary` still carries a stale
-        // `needs_input` receipt, and counting it left a fold reading
-        // "1 needs you" with every card answered. `needs_input` is not listed
-        // here on purpose: it falls through to the envelope below, which is
-        // where failure evidence is weighed.
-        //
-        // `result_status` is the newer of the two, so a row superseded before
-        // it existed has none — and those are exactly the rows carrying the
-        // stale receipt. The interaction ITSELF was rewritten on every one of
-        // them, in every build, so it is read second and the envelope third.
-        for recorded in [resultStatus, interactionState] {
-            switch (recorded ?? "").lowercased() {
-            case "pending", "running": return .needsYou
-            case "settled", "declined", "superseded", "cancelled": return .asked
-            case "failed": return .failed
-            default: continue
-            }
-        }
-        // The raise-time envelope says `needs_input`; the resolver overwrites it
-        // on settle with succeeded / cancelled (declined) / failed. An envelope
-        // we cannot read is a card we cannot call answered.
-        guard let resultSummary,
-              let value = try? JSONValue.parse(Data(resultSummary.utf8)),
-              case .object(let fields) = value,
-              case .string(let status)? = fields["status"]
-        else { return .needsYou }
-        switch status.lowercased() {
-        case InlineInteractionWire.waitingStatus, "pending", "running":
-            // Same rule as the pill and the trace: an envelope that says it is
-            // waiting while carrying an error is a failure, not a question.
-            return ChatToolOutcome.carriesFailureEvidence(value) ? .failed : .needsYou
-        // The card's own action ran and failed — a real failure, not a question.
-        case "failed", "error": return .failed
-        default: return .asked
-        }
+        ChatToolOutcome.projection(kind: kind, ok: ok, resultSummary: resultSummary,
+            resultStatus: resultStatus, interactionState: interactionState).status
     }
 
-    public static func headline(count: Int, failed: Int = 0, needsYou: Int = 0) -> String {
-        let failed = max(0, min(failed, count))
-        let needsYou = max(0, min(needsYou, count - failed))
-        // A raised card is a question to the person, so it rides alongside the
-        // count rather than turning the line into a verdict (2026-09-14).
-        let asking = needsYou > 0 ? " · \(needsYou) needs you" : ""
-        guard failed > 0 else {
-            return "Looked something up · \(count) tool\(count == 1 ? "" : "s")" + asking
-        }
-        if failed == count {
-            return count == 1
-                ? "That didn't work · 1 tool"
-                : "That didn't work · all \(count) tools failed"
-        }
-        return "Looked something up · \(failed) of \(count) failed" + asking
-    }
-
-    /// What a call did, and what it would have done. One switch for both, so
-    /// the success sentence and the failure sentence can never end up
-    /// describing different tools (2026-09-06).
-    private static func phrases(_ toolName: String?) -> (did: String, attempted: String) {
-        let raw = (toolName ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        switch raw {
-        case "read_file", "file_excerpt": return ("Read a file", "read a file")
-        case "write_file": return ("Wrote a file", "write a file")
-        case "list_dir": return ("Looked through a folder", "look through a folder")
-        case "grep", "search_files": return ("Searched the files", "search the files")
-        case "bash", "run_command": return ("Ran a command", "run a command")
-        case "web_search", "web_fetch": return ("Looked it up on the web", "look it up on the web")
-        case "recall_memory", "memory_search":
-            return (
-                "Checked what \(AgentVoice.live.subject) \(AgentVoice.live.verb("remember"))",
-                "check what \(AgentVoice.live.subject) \(AgentVoice.live.verb("remember"))"
-            )
-        case "commit_memory": return ("Saved something to memory", "save something to memory")
-        case "tool_catalog", "tool_load", "list_tools": return ("Looking up tools", "look up tools")
-        case "desk_add_item": return ("Added it to the Desk", "add it to the Desk")
-        case "inner_state":
-            return (
-                "Checked in with \(AgentVoice.live.possessive) inner state",
-                "check in with \(AgentVoice.live.possessive) inner state"
-            )
-        case "": return ("Used a tool", "use a tool")
-        default:
-            let title = ToolActivityPresentation.title(raw)
-            let phrase = title.prefix(1).lowercased() + title.dropFirst()
-            return (String(title.prefix(48)), String(phrase.prefix(48)))
-        }
-    }
-
-    /// A tool name a person can read. Unknown names are de-snake-cased rather
-    /// than shown raw, and never interpolated with their arguments.
-    public static func plainName(_ toolName: String?) -> String {
-        phrases(toolName).did
-    }
-
-    /// The same call when it did not work. "Wrote a file" asserts the very
-    /// thing that did not happen, so a failed call gets its own sentence
-    /// rather than the success one (2026-09-06).
-    public static func failedName(_ toolName: String?) -> String {
-        "Couldn't \(phrases(toolName).attempted)"
+    public static func headlineInput(count: Int, failed: Int = 0, needsYou: Int = 0) -> JSONValue {
+        let failed = max(0,min(failed,count))
+        return .object(["kind":.string("headline"),"count":.int(Int64(count)),"failed":.int(Int64(failed)),
+            "needsYou":.int(Int64(max(0,min(needsYou,count-failed))))])
     }
 
     /// The file a tool call touched, when its input names one. Returns the last
@@ -1275,23 +1044,23 @@ public enum ChatShellToolSummary {
     /// One readable line per tool call: "Read a file · SidebarModels.swift".
     /// `ok` is the call's recorded outcome; only a recorded FALSE says the
     /// call failed, since most rows record nothing (2026-09-06).
-    public static func detailLine(
-        toolName: String?, inputJSON: String?, status: Status = .plain
-    ) -> String {
-        // An app call reads as the action it ran, over that action's args.
-        let call = toolName.map { ToolNameAliases.shown($0, inputJSON: inputJSON) }
-        let toolName = call?.name ?? toolName, inputJSON = call?.inputJSON ?? inputJSON
-        let name: String
-        switch status {
-        case .failed: name = failedName(toolName)
-        // Neither sentence is true of a parked call: it did not do the thing,
-        // and it did not fail either. It asked.
-        case .needsYou: name = "Waiting on you to \(phrases(toolName).attempted)"
-        case .asked: name = "Asked you first"
-        case .plain: name = plainName(toolName)
+    public static func detailInput(toolName: String?, inputJSON: String?, status: Status = .plain) -> JSONValue {
+        let call=toolName.map { ToolNameAliases.shown($0,inputJSON:inputJSON) }
+        let name=(call?.name ?? toolName ?? "").trimmingCharacters(in:.whitespacesAndNewlines).lowercased()
+        let state: String = switch status {
+        case .failed: "failed"
+        case .needsYou: "needsYou"
+        case .asked: "asked"
+        case .plain: "plain"
         }
-        guard let file = touchedFile(inputJSON: inputJSON) else { return name }
-        return "\(name) · \(file)"
+        let title=ToolActivityPresentation.title(name)
+        let lower=title.prefix(1).lowercased()+title.dropFirst()
+        return .object(["kind":.string("tool"),"tool":.string(name),"status":.string(state),
+            "nameCharacters":.array(title.map { .string(String($0)) }),
+            "lowerCharacters":.array(lower.map { .string(String($0)) }),
+            "file":touchedFile(inputJSON:call?.inputJSON ?? inputJSON).map(JSONValue.string) ?? .null,
+            "subject":.string(AgentVoice.live.subject),"remember":.string(AgentVoice.live.verb("remember")),
+            "possessive":.string(AgentVoice.live.possessive)])
     }
 
     /// A persona write reads as a RECEIPT, not as a line inside a collapsed
@@ -1413,54 +1182,32 @@ public struct MacChatMessageProvenance: Sendable, Equatable {
 extension InlineCardProjection {
     @MainActor
     public static func cardsByRow(
-        sessionID: String, dataRoot: URL, reclaim: Bool, isCurrent: () -> Bool
-    ) async -> [String: [InlineCardModel]]? {
-        // Once per conversation per launch: a continuation this process never
-        // claimed, but disk says is claimed, belongs to a process that died
-        // between the claim and the turn. Release it and run the turn the
-        // person already paid for with a tap.
-        if reclaim {
-            await InlineInteractionResolver.reclaimStrandedContinuations(
-                sessionID: sessionID, dataRoot: dataRoot
-            )
+        _ pairs: [(rowID: String, interaction: InlineInteraction)], messages: [ChatMessage],
+        sessionID: String, dataRoot: URL
+    ) async -> (cardsByRow: [String: [ChatTranscriptProjection.Card]], heading: String) {
+        var built: [String: [ChatTranscriptProjection.Card]] = [:]
+        var collapsed = InlineInteractionResolver.collapsedCards(pairs)
+        var origins = collapsed.pairs.map { (rowID: $0.rowID, interaction: $0.interaction, sessionID: sessionID) }
+        for message in messages {
+            if let mirror = message.metadata?.interactionMirror,
+               let interaction = await InlineInteractionResolver.interaction(
+                id: mirror.interactionID, sessionID: mirror.sessionID, dataRoot: dataRoot) {
+                origins.append((message.id, interaction, mirror.sessionID))
+            }
         }
-        // A transcript that could not be read is NOT a conversation with no
-        // cards. Keep what is already on screen rather than blanking every card
-        // the person is looking at; the resolver logged the error once.
-        let pairs: [(rowID: String, interaction: InlineInteraction)]
-        switch await InlineInteractionResolver.checkedInteractionsByRow(
-            sessionID: sessionID, dataRoot: dataRoot
-        ) {
-        case .success(let read): pairs = read
-        case .failure: return nil
-        }
-        // The read above is asynchronous and the person can switch
-        // conversations while it runs. Publishing a stale read would put one
-        // transcript's cards under another's rows, so a refresh that no longer
-        // describes the open conversation is dropped.
-        guard isCurrent() else { return nil }
-        var built: [String: [InlineCardModel]] = [:]
-        let collapsed = InlineInteractionResolver.collapsedCards(pairs)
-        var live: [(rowID: String, interaction: InlineInteraction)] = []
-        for pair in collapsed.pairs {
-            // Already done elsewhere → the receipt, not the ask.
-            live.append((pair.rowID, await InlineInteractionResolver.liveProjection(
-                pair.interaction, dataRoot: dataRoot
-            )))
-        }
-        guard isCurrent() else { return nil }
-        for pair in live {
-            let descriptor = InlineInteractionResolver.descriptor(
-                for: pair.interaction, dataRoot: dataRoot
-            )
+        for pair in origins {
+            let interaction = await InlineInteractionResolver.liveProjection(pair.interaction, dataRoot: dataRoot)
+            let descriptor = InlineInteractionResolver.descriptor(for: interaction, dataRoot: dataRoot)
+            var model = InlineCardProjection.model(interaction, descriptor: descriptor,
+                repeatCount: collapsed.counts[interaction.id] ?? 1)
+            model.sessionID = pair.sessionID
             built[pair.rowID, default: []].append(
-                InlineCardProjection.model(
-                    pair.interaction, descriptor: descriptor,
-                    repeatCount: collapsed.counts[pair.interaction.id] ?? 1
-                )
+                .init(interaction: interaction, descriptor: descriptor, sessionID: pair.sessionID,
+                       model: model, repeatCount: collapsed.counts[interaction.id] ?? 1)
             )
         }
-        return built
+        collapsed.pairs = origins.map { ($0.rowID, $0.interaction) }
+        return (built, collapsed.heading)
     }
 }
 
@@ -1498,15 +1245,6 @@ public struct AgentVoice: Equatable {
     /// "Agent's"
     public var possessive: String { name + "'s" }
     public var Possessive: String { possessive }
-    /// Reads in "an hour on \(reflexive)" — a name has no reflexive form, so
-    /// the possessive stands in.
-    public var reflexive: String { name + "'s own" }
-
-    /// A name is third-person singular. Always.
-    public var isVerb: String { "is" }
-    public var hasVerb: String { "has" }
-    public var doesVerb: String { "does" }
-
     /// Third-person present for a base verb: feel → feels, carry → carries,
     /// go → goes, watch → watches.
     public func verb(_ base: String) -> String {
@@ -1560,6 +1298,7 @@ public enum InlineCardState: String, Sendable, Equatable, CaseIterable {
     case settled
     case declined
     case failed
+    case stopped
     /// Terminal and honest about not knowing: neither done nor declined.
     case unknown
     /// A newer, identical ask replaced this one before anybody answered it.
@@ -1569,7 +1308,7 @@ public enum InlineCardState: String, Sendable, Equatable, CaseIterable {
     public var isTerminal: Bool {
         switch self {
         case .pending, .running: return false
-        case .settled, .declined, .failed, .unknown, .superseded: return true
+        case .settled, .declined, .failed, .stopped, .unknown, .superseded: return true
         }
     }
 }
@@ -1622,6 +1361,7 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
     /// Bound to the originating request, not to the last message: a second
     /// observation of the same blocked request updates this card.
     public let id: String
+    public var sessionID = ""
     public var kind: InlineCardKind
     /// What the interaction is about: "GitHub", "Desktop", "Work".
     public var target: String
@@ -1770,6 +1510,7 @@ public enum InlineCardProjection {
         case .settled: return .settled
         case .declined: return .declined
         case .failed: return .failed
+        case .stopped: return .stopped
         case .unknown: return .unknown
         case .superseded: return .superseded
         }
@@ -1802,17 +1543,15 @@ public enum InlineCardProjection {
             secondaryLabel: "Not now",
             // Something to connect says what skipping costs in one plain line,
             // whatever words the ask arrived with.
-            consequence: [.connector, .apiKey].contains(interaction.kind)
+            consequence: [.connector, .apiKey].contains(interaction.kind) && interaction.secret?.remove != true
                 ? "If you skip, \(descriptor.displayName) stays off."
                 : interaction.declineConsequence,
             state: cardState,
             persistenceNote: interaction.persistenceNote,
-            fields: fields(descriptor),
+            fields: fields(interaction, descriptor),
             signInLabel: InlineInteractionRegistry.providerSignIn(for: descriptor.target)
                 .flatMap { descriptor.control == .providerAPIKey ? "Sign in with \($0.displayShort)" : nil }
-                // GitHub signs in by device flow in Connectors' sheet; the
-                // token field stays as the alternative.
-                ?? (isGitHubSignIn(descriptor) ? "Connect with GitHub" : nil),
+                ?? (interaction.secret?.signIn == nil ? nil : "Sign in"),
             // Slack's mention rule, Telegram's users list and the like live on
             // the full page; the card never pretends to hold them.
             fullSetupLabel: descriptor.control == .connectorManualToken ? "Open full setup" : nil,
@@ -1839,7 +1578,7 @@ public enum InlineCardProjection {
             detailsBody: rendersAsReceipt(cardState)
                 ? nil : details(interaction, descriptor)?.body,
             busyLabel: busyLabel(interaction.kind),
-            busyNote: busyNote(descriptor.control),
+            busyNote: busyNote(interaction, descriptor.control),
             outcome: outcome(interaction, deadControl: deadControl, repeatCount: repeatCount, name: descriptor.displayName).text,
             outcomeMeta: outcome(interaction, deadControl: deadControl, repeatCount: repeatCount, name: descriptor.displayName).meta
                 ?? (deadControl ? descriptor.unavailableReason : nil),
@@ -1856,7 +1595,7 @@ public enum InlineCardProjection {
     private static func rendersAsReceipt(_ state: InlineCardState) -> Bool {
         switch state {
         case .settled, .declined, .unknown, .superseded: return true
-        case .pending, .running, .failed: return false
+        case .pending, .running, .failed, .stopped: return false
         }
     }
 
@@ -1885,6 +1624,8 @@ public enum InlineCardProjection {
         // ones raised from here on. Derived from the descriptor, so it stays
         // free of per-service copy.
         switch interaction.kind {
+        case .apiKey where interaction.secret?.remove == true:
+            return interaction.primaryActionLabel
         case .connector, .apiKey:
             return "Connect \(descriptor.displayName)"
         case .permission:
@@ -1904,8 +1645,20 @@ public enum InlineCardProjection {
     /// token), and a manual-token connector's own setup fields. Each is
     /// written through its owner's own save and then VERIFIED with that owner,
     /// so a field is a real control, not a decoration.
-    private static func fields(_ descriptor: InlineInteractionDescriptor) -> [InlineCardField] {
+    private static func fields(_ interaction: InlineInteraction, _ descriptor: InlineInteractionDescriptor) -> [InlineCardField] {
         switch descriptor.control {
+        case .keyring:
+            // A removal takes nothing; a sign-in fetches the value itself and
+            // the card holds only the client secret a service may have issued.
+            if interaction.secret?.remove == true { return [] }
+            guard interaction.secret?.signIn == nil else {
+                let basic = interaction.secret?.signIn?.clientAuth == "basic"
+                return [InlineCardField(label: "Client secret", placeholder: basic ? "The secret the service issued" : "Only if the service issued one",
+                                        helper: "Kept in this Mac's Keychain with the sign-in. The chat and the agent never see it.",
+                                        isSecret: true, isOptional: !basic)]
+            }
+            return [InlineCardField(label: "\(descriptor.displayName) key", placeholder: "Paste the key",
+                                    helper: "Kept in this Mac's Keychain. The chat and the agent never see it.", isSecret: true)]
         case .connectorManualToken:
             return connectorFields(for: descriptor.target)
         case .providerAPIKey:
@@ -1948,6 +1701,17 @@ public enum InlineCardProjection {
 
         if [.permission, .capability].contains(interaction.kind) {
             lines += SystemPermissionPreflight.cardSettingsInstructions(interaction.allTargets)
+        }
+
+        // A secret's grant is where it may go, and nowhere else.
+        if let ask = interaction.secret, ask.remove != true {
+            lines.append("Goes only to \(ask.line)")
+            if let stops = ask.stops { lines.append("Stops going to \(stops.joined(separator: ", "))") }
+            // Where the sign-in, and a client secret typed here, go: the hosts the flow uses.
+            if let signIn = ask.signIn {
+                let host = { (address: String?) in address.flatMap(URL.init(string:))?.host ?? "" }
+                lines.append("Signs in at \(host(signIn.authorize ?? signIn.device)); token from \(host(signIn.token))")
+            }
         }
 
         // How far the resolution reaches — said only where it is TRUE. A
@@ -2021,21 +1785,16 @@ public enum InlineCardProjection {
             return ("What happens",
                     "The pairing page opens. Open NativeAgent on your iPhone, then choose Pair "
                     + "here when the codes match.")
-        case .connectorManualToken where isGitHubSignIn(descriptor):
-            return ("What happens",
-                    "GitHub opens in your browser with a code to approve; nothing is connected "
-                    + "until GitHub says so. A pasted token works too. The chat never sees either.")
         case .connectorManualToken:
             return ("What happens",
                     "What you paste is checked with \(name) and saved by Connectors, the same "
                     + "as its setup page does. The chat never sees it.")
-        case .connectorOAuth:
-            return ("What happens",
-                    "Your browser opens to sign in to \(name). "
-                    + "Nothing is connected until \(name) says so.")
         case .macPermissionGrant where interaction.allTargets.contains(where: { $0.hasPrefix("applescript:") }):
             return ("What happens",
                     "macOS asks for Automation consent for each requested app; the card reports whether you allowed it.")
+        case .macPermissionGrant where interaction.allTargets.contains(where: { SystemPermissionPreflight.cardSettingsCapability($0) != nil }):
+            return ("What happens",
+                    "macOS controls this permission. You can turn it off in System Settings.")
         case .macPermissionGrant:
             return ("What happens",
                     "The permission is turned on here and listed in Trust, "
@@ -2059,22 +1818,25 @@ public enum InlineCardProjection {
         case .capabilityFlag:
             return ("What happens",
                     "\(name) is switched on in Trust, the same switch as the one on that page.")
+        case .keyring where interaction.secret?.remove == true:
+            return ("What happens", "\(name) is deleted from this Mac's Keychain. Abilities that use it stop until you grant it again.")
+        case .keyring:
+            return ("What happens",
+                    (interaction.secret?.signIn == nil ? "What you paste is kept in this Mac's Keychain. "
+                        : "Your browser opens to sign in; what the service returns is kept in this Mac's Keychain. ")
+                    + "It goes only to \(interaction.secret?.line ?? "where this card says"), and the agent uses it by name without ever seeing it.")
         case .inlineChoice, .unavailable, .unknown:
             return nil
         }
-    }
-
-    private static func isGitHubSignIn(_ descriptor: InlineInteractionDescriptor) -> Bool {
-        descriptor.control == .connectorManualToken
-            && InlineInteractionRegistry.canonicalConnectorID(descriptor.target) == "github"
     }
 
     /// The one thing to click, for a card that waits on the person
     /// somewhere else and settles by itself when the owner says done.
     public static let chromeSteps = "I'll load my extension in Chrome and check the connection. Allow Mac access if asked."
 
-    private static func busyNote(_ control: InlineInteractionDescriptor.Control) -> String? {
+    private static func busyNote(_ interaction: InlineInteraction, _ control: InlineInteractionDescriptor.Control) -> String? {
         switch control {
+        case .keyring: return Keyring.signInNote(String(interaction.target.dropFirst("secret:".count)))
         case .internetAccounts: return "Add and turn on a Mail account in Internet Accounts."
         case .chromeSetup: return chromeSteps
         case .pairDevice: return "Open NativeAgent on your iPhone, then choose Pair when the codes match."
@@ -2113,6 +1875,8 @@ public enum InlineCardProjection {
         }
         if deadControl { return (counted(interaction.title), nil) }
         switch interaction.state {
+        case .stopped(let reason):
+            return ("Stopped", reason)
         case .settled(let settled):
             return (counted(settled.summary.isEmpty ? interaction.title : settled.summary),
                     settled.scope == .thisRequestOnly ? "This request only" : nil)
@@ -2156,24 +1920,11 @@ public enum InlineCardProjection {
                                 helper: "Send your bot a message, then open Telegram setup and use Check sender to find your ID. Only a recipient you admit can reach the agent.",
                                 isSecret: false, id: "allowed_chat_id"),
             ]
-        case "notion":
-            return [
-                InlineCardField(label: "Notion integration token", placeholder: "ntn_... or secret_...",
-                                helper: "Share the pages it should see with the integration. " + stays,
-                                id: "token"),
-            ]
-        case "github":
-            return [
-                InlineCardField(label: "Or use a personal access token",
-                                placeholder: "ghp_... or github_pat_...",
-                                helper: "Saved in your Mac's Keychain, never in this conversation.",
-                                id: "token"),
-            ]
         case "slack":
             return [
                 InlineCardField(label: "Slack bot token", placeholder: "xoxb-...", helper: stays, id: "token"),
                 InlineCardField(label: "Socket Mode app token (optional)", placeholder: "xapp-...",
-                                helper: "Only needed for inbound Slack chat.",
+                                helper: "Slack chat needs it; it can be added later.",
                                 id: "app_token", isOptional: true),
                 InlineCardField(label: "Allowed channel IDs", placeholder: "C0123, C0456",
                                 isSecret: false, id: "allowed_channels", isOptional: true),

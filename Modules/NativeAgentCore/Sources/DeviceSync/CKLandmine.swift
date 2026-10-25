@@ -7,6 +7,7 @@ import Foundation
 import NativeAgentShared
 #if canImport(Security)
 import Security
+// Blueprint: | `CKLandmine.swift` | CloudKit entitlement probes, guarded account-status projection and `withCKTimeout` |
 #endif
 
 // 2026-06-07 task #88 follow-up: the old wording ("unavailable — provisioning

@@ -1,6 +1,8 @@
 import AppKit
 import SwiftUI
 
+// Blueprint: | `ShellWindowChrome.swift` | `ShellWindowChrome` and `ShellFrame`: native window/titlebar integration, split shell layout and explicit keyboard target order |
+
 /// User, 2026-09-02: "that top corner looks bolted together." Two causes, one
 /// fix each. The standard title bar was an opaque strip laid over glass
 /// columns, so the rail and the room met it at a hard seam: in the new shell

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceDesktopNavigation.swift` | `AgentWorkspaceNavigation`: `restoredSession`, `canEvict`, `draftAttemptIsDurable` |
 
 extension AgentWorkspaceNavigation {
     package func currentPlace(dataRoot: URL, scope: String) -> String? {

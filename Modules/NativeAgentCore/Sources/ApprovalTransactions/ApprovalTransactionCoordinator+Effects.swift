@@ -4,20 +4,20 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import ApprovalInbox
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import MemoryV2
 import TrustCenter
 import WorkshopExecution
+// Blueprint: | `ApprovalTransactionCoordinator+Effects.swift` | `ApprovalTransactionEffects` port; `ApprovalTransactionCoordinator.decideBlockedWorkshopStep`; workshop-step decision/approval transaction |
 
 /// Effect adapters supplied by the host; transaction ordering and replay fences
 /// remain in ApprovalTransactionCoordinator.
 public protocol ApprovalTransactionEffects: Sendable {
     func disableSkill(name: String) async throws
-    /// `reviewedDigest` nil turns on only what needs no admission; a digest
+    /// `reviewedDigest` nil restores only Markdown guidance; a digest
     /// admits exactly that script as User's, as the Skills page's Install does.
-    func enableSkill(name: String, reviewedDigest: String?, admitScript: Bool) async throws
-    var externalSendDependencies: ExternalSendExecutionDependencies { get }
-    func observeMotorActionState(_ state: MotorActionReadModel) async
+    func enableSkill(name: String, reviewedDigest: String?) async throws
     func runConnectorAction(descriptor: ConnectorActionDescriptor, dryRun: Bool, input: [String: JSONValue], approvedReplayApprovalID: String, dataRoot: URL) async throws -> ApprovalConnectorActionResult
     func toolDispatchClient(enforceAppAutonomy: Bool) -> any ToolDispatchClient
     func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String, fileAccess: String) async throws
@@ -36,17 +36,6 @@ public struct ApprovalConnectorActionResult: Sendable {
     public init(id: String, status: String) {
         self.id = id
         self.status = status
-    }
-}
-
-extension ApprovalTransactionCoordinator {
-    func applyResolvedExternalSend(from record: ApprovalRecord) async -> Bool {
-        await ExternalSendApprovalTransactions.applyResolvedExternalSend(
-            from: record,
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-            dependencies: effects.externalSendDependencies,
-            observeMotorActionState: { [effects] in await effects.observeMotorActionState($0) }
-        ).shouldArchiveVisibleCard
     }
 }
 

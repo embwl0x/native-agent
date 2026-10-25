@@ -1,9 +1,12 @@
 import Foundation
 import Experiences
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrateContracts.swift` | `CognitiveSubstrateDependencies` struct; injected frozen growth projection, explicit unavailable when unbound |
 
 public struct CognitiveSubstrateDependencies: Sendable {
+    public var growthProjection: @Sendable (JSONValue) async -> PartFaceSnapshot
     public var now: @Sendable () -> Date
     public var makeUUID: @Sendable () -> UUID
     public var decisions: @Sendable () async -> [String: Experience]
@@ -52,6 +55,10 @@ public struct CognitiveSubstrateDependencies: Sendable {
     /// Phase 5 D1: whether a peer (`peer:<id>`, `claude`, …) is one the owner
     /// elevated in Trust. Unbound, no peer is.
     public var peerTrusted: @Sendable (_ peer: String) -> Bool
+    /// Whether a surface is in the local-private disclosure tier (the memory
+    /// disclosure law, `MemoryRecordDisclosurePolicy`). Her words from one
+    /// conversation reach another only on such a surface. Unbound, none is.
+    public var surfaceIsPrivate: @Sendable (_ surface: String) -> Bool
     /// Phase 5 B2. What actually happened between User's last turn and this
     /// one — a few short items with real content, [] when nothing did. Local
     /// reads only; the surface is the disclosure boundary for moments.
@@ -72,10 +79,15 @@ public struct CognitiveSubstrateDependencies: Sendable {
             = { _, _ in CognitiveCueRead([]) },
         embedTexts: @escaping @Sendable ([String]) async -> [[Float]]? = { _ in nil },
         peerTrusted: @escaping @Sendable (String) -> Bool = { _ in false },
+        surfaceIsPrivate: @escaping @Sendable (String) -> Bool = { _ in false },
         sinceGap: @escaping @Sendable (Date, Date, String) async -> CognitiveCueRead<[String]>
             = { _, _, _ in CognitiveCueRead([]) },
         feltCause: @escaping @Sendable (Double, Double) async -> Void = { _, _ in },
-        decisions: @escaping @Sendable () async -> [String: Experience] = { [:] }
+        decisions: @escaping @Sendable () async -> [String: Experience] = { [:] },
+        growthProjection: @escaping @Sendable (JSONValue) async -> PartFaceSnapshot = { _ in
+            .init(part: "growth-week", version: nil, sourceEpoch: 0, status: .unavailable, face: nil,
+                error: .init(code: "unavailable", message: "The growth projection is not bound."), owed: false)
+        }
     ) {
         self.now = now
         self.makeUUID = makeUUID
@@ -87,8 +99,10 @@ public struct CognitiveSubstrateDependencies: Sendable {
         self.dreamThemes = dreamThemes
         self.embedTexts = embedTexts
         self.peerTrusted = peerTrusted
+        self.surfaceIsPrivate = surfaceIsPrivate
         self.sinceGap = sinceGap
         self.feltCause = feltCause
+        self.growthProjection = growthProjection
     }
 
     public static let live = CognitiveSubstrateDependencies()

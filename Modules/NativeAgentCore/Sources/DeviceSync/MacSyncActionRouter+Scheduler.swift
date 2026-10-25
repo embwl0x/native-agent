@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import TriggerScheduler
+// Blueprint: | `MacSyncActionRouter+Scheduler.swift` | `MacSyncActionRouter`: `schedulerAction` |
 
 extension MacSyncActionRouter {
     func schedulerAction(_ action: String, payload: [String: String]) async throws -> [String: String] {
@@ -28,17 +29,27 @@ extension MacSyncActionRouter {
                 }
                 body["message"] = .string(message)
             }
-            let created = try await writer.createJob(body: .object(body))
+            let result = try await sync.host.schedulerCreateJob(input: body)
+            guard case .object(let receipt) = result, let created = receipt["job"] else {
+                return ["status": "error", "message": "The Mac did not return a saved scheduler job."]
+            }
+            // The nightly reflection exists but is paused: nothing was armed, and the phone says why.
+            if receipt["operation"] == .string("paused"), case .string(let detail)? = receipt["detail"] {
+                return ["status": "error", "message": detail]
+            }
             jobID = try ScheduledJob(row: created).id
         } else {
             guard let id = payload["id"], !id.isEmpty else {
                 return ["status": "error", "message": "A scheduler job ID is required."]
             }
-            jobID = id
-            if action == "cancel_scheduler_job" {
-                _ = try await writer.cancelJob(jobId: id)
+            let changed = action == "cancel_scheduler_job"
+                ? try await writer.cancelJob(jobId: id)
+                : try await writer.setJobEnabled(jobId: id, enabled: action == "resume_scheduler_job")
+            // The job the change landed on: a unique start of an id resolves to the whole id.
+            if case .object(let answer) = changed, case .object(let job)? = answer["job"], case .string(let whole)? = job["id"] {
+                jobID = whole
             } else {
-                _ = try await writer.setJobEnabled(jobId: id, enabled: action == "resume_scheduler_job")
+                jobID = id
             }
         }
         let recovered = try await MobileSchedulerProjection.read(using: writer, jobID: jobID)

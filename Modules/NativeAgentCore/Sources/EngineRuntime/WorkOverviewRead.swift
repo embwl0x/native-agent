@@ -7,11 +7,13 @@ import NotificationInbox
 import PersistenceCore
 import Privacy
 import WorkshopExecution
+// Blueprint: | `WorkOverviewRead.swift` | `WorkOverviewRead` enum; `project`, execution/Desk-item `row`, `text`, `requiresApproval`; overview and phone task rows share the execution approval predicate; ID-based details use the same status projection; complete owner-attention counts by reference kind before mobile list bounds |
 
 /// One surface-neutral projection over the canonical owners. Only explicit
 /// approval/execution links collapse rows; a shared Desk parent is not proof
 /// that two questions are the same question.
 public enum WorkOverviewRead {
+    public static func requiresApproval(status: String) -> Bool { status == "blocked_on_approval" }
     /// Needs-you rows open their canonical record, so their copies stay short
     /// and few: the overview rides in a phone snapshot group.
     static let needsYouLimit = 12
@@ -39,23 +41,13 @@ public enum WorkOverviewRead {
                 } == execution.id
             }.map(\.id))
         }
-        func bounded(_ text: String, _ limit: Int = 4_000) -> String {
-            MobileDeskProjectionBounds.clipped(text, to: limit)
-        }
-        func row(_ kind: WorkOverviewReference.Kind, _ id: String, _ title: String,
-                 _ text: String, _ state: String, _ updated: String,
-                 location: String? = nil, movement: String? = nil, detail: Int = 4_000) -> WorkOverviewRow {
-            .init(reference: .init(kind: kind, id: id), title: bounded(title, 240),
-                  summary: bounded(text, 360), detail: bounded(text, detail), state: state,
-                  updatedAt: updated, location: location, movementAt: movement)
-        }
         var needs = pending.map {
             // Redacted before it leaves for the phone: a lesson can quote anything.
             row(.approval, $0.id, $0.title,
                 TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText($0.readableAsk)), "Decision needed",
                 $0.lastRequestedAt ?? $0.createdAt, detail: 1_000)
         }
-        let approvalExecutions = executions.filter { $0.status == "blocked_on_approval" }
+        let approvalExecutions = executions.filter { requiresApproval(status: $0.status) }
         let linkedExecutionIDs = Set(approvalExecutions.filter { !executionApprovalIDs($0).isEmpty }.map(\.id))
         for execution in approvalExecutions where !linkedExecutionIDs.contains(execution.id) {
             needs.append(row(.execution, execution.id, execution.title, execution.objective,
@@ -71,8 +63,7 @@ public enum WorkOverviewRead {
                     && request == $0.reason.trimmingCharacters(in: .whitespacesAndNewlines)
             }
             if mirrorsApproval { mirroredDeskIDs.insert(item.handle); continue }
-            needs.append(row(.desk, item.handle, item.title, item.blockedReason ?? item.summary ?? "",
-                             "Needs you", item.updatedAt, location: item.project, detail: 1_000))
+            needs.append(Self.row(for: item, now: now))
         }
         for item in inbox where item.requiresOwnerInput {
             // The approval owns both its wait and its settlement. Its old
@@ -92,33 +83,15 @@ public enum WorkOverviewRead {
                 || ($0.result != .null && $0.deskHandle.map(terminalDeskIDs.contains) == true)
         }.compactMap(\.deskHandle))
         for execution in executions {
-            if execution.status == "blocked_on_approval" { continue }
+            if requiresApproval(status: execution.status) { continue }
             let terminal = ["completed", "failed", "cancelled"].contains(execution.status)
-            let text = Self.text(for: execution)
-            var state = execution.status == "running" ? "running"
-                : DeskActivityState.execution(.init(deskHandle: execution.deskHandle,
-                    status: execution.status, updatedAt: execution.updatedAt,
-                    lastMovementAt: execution.lastMovementAt), now: now).label
-            if ["corrupt", "unavailable"].contains(execution.status) {
-                state = execution.status.capitalized
-            } else if terminal {
-                state = execution.status.capitalized
-                state += execution.verification.map { " · verification: \($0.status.rawValue)" }
-                    ?? " · no verification record"
-            }
-            let result = row(.execution, execution.id, execution.title, text, state,
-                             execution.updatedAt, location: execution.receiptsDir.isEmpty ? nil : "Receipts: \(execution.receiptsDir)",
-                             movement: execution.lastMovementAt)
+            let result = Self.row(for: execution, now: now)
             if terminal { recent.append(result) } else { current.append(result) }
         }
         for item in board.items {
             guard !executionDeskIDs.contains(item.handle), !needsDeskIDs.contains(item.handle),
                   !mirroredDeskIDs.contains(item.handle) else { continue }
-            let state = DeskActivityState.item(status: item.status.rawValue, kind: item.kind.rawValue,
-                deferred: item.deferUntil != nil, updatedAt: item.updatedAt, evidence: nil, now: now)
-            let result = row(.desk, item.handle, item.title,
-                item.summary ?? item.notes.last?.text ?? "No summary was recorded.",
-                state.label, item.closedAt ?? item.updatedAt, location: item.project)
+            let result = Self.row(for: item, now: now)
             if item.status.isTerminal { recent.append(result) } else { current.append(result) }
         }
         func sorted(_ rows: [WorkOverviewRow]) -> [WorkOverviewRow] {
@@ -134,6 +107,50 @@ public enum WorkOverviewRead {
         overview.experiences = experiences.map(\.mobile)
         overview.needsYouCounts = Dictionary(grouping: needs, by: \.reference.kind).mapValues(\.count)
         return overview
+    }
+
+    private static func bounded(_ text: String, _ limit: Int = 4_000) -> String {
+        MobileDeskProjectionBounds.clipped(text, to: limit)
+    }
+    private static func row(_ kind: WorkOverviewReference.Kind, _ id: String, _ title: String,
+             _ text: String, _ state: String, _ updated: String,
+             location: String? = nil, movement: String? = nil, detail: Int = 4_000) -> WorkOverviewRow {
+        .init(reference: .init(kind: kind, id: id), title: bounded(title, 240),
+              summary: bounded(text, 360), detail: bounded(text, detail), state: state,
+              updatedAt: updated, location: location, movementAt: movement)
+    }
+
+    /// The overview and ID-based details describe the same execution revision.
+    public static func row(for execution: WorkshopExecutionRecord, now: Date) -> WorkOverviewRow {
+        let terminal = ["completed", "failed", "cancelled"].contains(execution.status)
+        let text = Self.text(for: execution)
+        var state = execution.status == "running" ? "running"
+            : DeskActivityState.execution(.init(deskHandle: execution.deskHandle,
+                status: execution.status, updatedAt: execution.updatedAt,
+                lastMovementAt: execution.lastMovementAt), now: now).label
+        if execution.status == "blocked_on_approval" { state = "Decision needed" }
+        else if ["corrupt", "unavailable"].contains(execution.status) {
+            state = execution.status.capitalized
+        } else if terminal {
+            state = execution.status.capitalized
+            state += execution.verification.map { " · verification: \($0.status.rawValue)" }
+                ?? " · no verification record"
+        }
+        return row(.execution, execution.id, execution.title, text, state, execution.updatedAt,
+            location: execution.receiptsDir.isEmpty ? nil : "Receipts: \(execution.receiptsDir)",
+            movement: execution.lastMovementAt)
+    }
+
+    public static func row(for item: DeskItem, now: Date) -> WorkOverviewRow {
+        if item.requiresOwnerInput {
+            return row(.desk, item.handle, item.title, item.blockedReason ?? item.summary ?? "",
+                       "Needs you", item.updatedAt, location: item.project, detail: 1_000)
+        }
+        let state = DeskActivityState.item(status: item.status.rawValue, kind: item.kind.rawValue,
+            deferred: item.deferUntil != nil, updatedAt: item.updatedAt, evidence: nil, now: now)
+        return row(.desk, item.handle, item.title,
+            item.summary ?? item.notes.last?.text ?? "No summary was recorded.",
+            state.label, item.closedAt ?? item.updatedAt, location: item.project)
     }
 
     /// Progress and the next step while an execution runs, its full result and

@@ -9,20 +9,15 @@ import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
+import MemoryV2
 import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
 import ToolExecution
 import PersonaEngine
-import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
 import Research
 import MultimodalTTS
 import TriggerScheduler
@@ -34,14 +29,14 @@ import TelegramBot
 import Dispatcher
 import MacControl
 import Onboarding
-import MacAssistantStatus
+import MacIntegration
 import WorkflowOrchestration
-import Skills
 import Connectors
 import Browser
 import Cognition
 import Context
 import ContextFlow
+// Blueprint: | `AppModel+PersonalitySelfImprovement.swift` | Mac personality editor outcomes delegate profile/document publication and writes to `engine.persona`; support diagnostics and proposal actions |
 
 /// The identity field is one of the few profile fields with immediate live UI
 /// effect.  Its save outcome must be derived from the persisted profile the
@@ -62,22 +57,13 @@ enum PersonalityDocumentsReloadOutcome: Equatable {
 
 @MainActor
 extension AppModel {
-    /// The persona owner for this model's data root. An injected root reads
-    /// only its own persona, never the process's seed roots.
-    var personaEngine: SwiftNativePersonaEngine {
-        dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? SwiftNativePersonaEngine()
-    }
-
     /// The same save, with the persistence error left intact.
     @MainActor
     func savePersonalityChecked(_ profile: PersonalityProfile) async throws {
         do {
-            personality = try await personaEngine.savePersonality(profile).sharedProfile
-            teachMemoryHygieneName()
-            compiledPersonality = try? await PersonaCompiler(engine: personaEngine).compiledPacket(surface: "chat")
-            if let listing = try? await personaEngine.listPersonaDocSpecs() {
-                personalityDocs = listing.docs
-            }
+            let previousName = engine.persona.profile?.name
+            try await engine.persona.saveProfile(profile)
+            teachMemoryHygieneName(previousName: previousName)
             statusText = "Personality saved"
             await refreshAll()
         } catch {
@@ -89,9 +75,9 @@ extension AppModel {
     @discardableResult
     func savePersonalityName(_ rawName: String) async -> PersonalityNameSaveOutcome {
         do {
-            let saved = try await personaEngine.saveName(rawName)
-            personality = saved
-            teachMemoryHygieneName()
+            let previousName = engine.persona.profile?.name
+            let saved = try await engine.persona.saveName(rawName)
+            teachMemoryHygieneName(previousName: previousName)
             statusText = "Name saved as \(saved.name)"
             return .saved(saved)
         } catch PersonaWriteError.invalidInput(let detail) {
@@ -152,27 +138,21 @@ extension AppModel {
     @discardableResult
     func reloadPersonalityDocuments() async -> PersonalityDocumentsReloadOutcome {
         do {
-            personalityDocs = try await personaEngine.listPersonaDocSpecs().docs
+            let documents = try await engine.persona.loadDocuments()
             statusText = "Personality documents reloaded"
-            return .loaded(documentCount: personalityDocs.count)
+            return .loaded(documentCount: documents.count)
         } catch {
             let detail = UserFacingError.cause(error, action: "load the personality docs")
             setFailureStatus("Couldn't load the personality docs. " + detail, cause: error)
-            return .failed(detail: detail, retainedDocumentCount: personalityDocs.count)
+            return .failed(detail: detail, retainedDocumentCount: engine.persona.documents.count)
         }
     }
 
     @MainActor
     @discardableResult
-    func savePersonalityDoc(id: String, content: String) async -> Bool {
+    func savePersonalityDoc(id: String, content: String, appending: Bool = false) async -> Bool {
         do {
-            let saved = try await personaEngine.savePersonalityDoc(id: id, content: content)
-            if let index = personalityDocs.firstIndex(where: { $0.id == saved.id }) {
-                personalityDocs[index] = saved
-            } else {
-                personalityDocs.append(saved)
-            }
-            compiledPersonality = try? await PersonaCompiler(engine: personaEngine).compiledPacket(surface: "chat")
+            let saved = try await engine.persona.saveDocument(id: id, content: content, appending: appending)
             statusText = "\(saved.filename) saved"
             return true
         } catch {
@@ -181,34 +161,33 @@ extension AppModel {
         }
     }
 
-    // PATCH-2026-05-07: living-memory AppModel methods for memory proposals
-    // U5 W-A item 1 (2026-06-11): these five loaders previously swallowed
-    // failures with bare `try? ... ?? []`, so a read/decode error rendered
-    // as a healthy-EMPTY panel — indistinguishable from "no data". They now
-    // ride decodeLogged, which logs the endpoint + error and records it in
-    // lastRefreshError instead of fabricating an empty success.
+    // MemoryFacade publishes checked pending rows and failure together;
+    // the Mac supplies only its decision animation transaction.
     @MainActor
     func loadMemoryProposals(animateDecision: Bool = false) async {
-        let proposals = await decodeLogged("getMemoryProposals", default: []) {
-            try await engine.memory.proposals(status: "pending")
-        }
-        withAnimation(animateDecision ? NativeAgentMotion.arrive : nil) {
-            engine.memory.proposals = proposals
+        _ = await decodeLogged("getMemoryProposals") {
+            try await engine.memory.proposals(status: "pending", publish: { change in
+                withAnimation(animateDecision ? NativeAgentMotion.arrive : nil, change)
+            })
         }
     }
 
     @MainActor
     func approveMemoryProposal(id: String) async throws {
-        _ = try await engine.memory.accept(proposalID: id)
+        _ = try await engine.memory.accept(proposalID: id, publish: { change in
+            withAnimation(NativeAgentMotion.arrive, change)
+        })
         await loadMemoryProposals(animateDecision: true)
-        engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
+        await engine.approvals.refresh()
     }
 
     @MainActor
     func rejectMemoryProposal(id: String, reason: String = "") async throws {
-        try await engine.memory.reject(proposalID: id, reason: reason)
+        try await engine.memory.reject(proposalID: id, reason: reason, publish: { change in
+            withAnimation(NativeAgentMotion.arrive, change)
+        })
         await loadMemoryProposals(animateDecision: true)
-        engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
+        await engine.approvals.refresh()
     }
 
     // PATCH-2026-05-29: dreams-tab — Dreams tab data + control methods.
@@ -268,7 +247,7 @@ extension AppModel {
         dreamError = nil
         do {
             let saved = try await engine.cognitionView.setDreamCycleEnabled(enabled)
-            engine.trust.policy = saved
+            engine.trust.publishPolicy(saved)
             statusText = enabled ? "Dream cycle enabled" : "Dream cycle disabled"
             return true
         } catch {
@@ -284,7 +263,7 @@ extension AppModel {
         dreamError = nil
         do {
             let saved = try await engine.cognitionView.setRemCycleEnabled(enabled)
-            engine.trust.policy = saved
+            engine.trust.publishPolicy(saved)
             statusText = enabled ? "REM cycle enabled" : "REM cycle disabled"
             return true
         } catch {

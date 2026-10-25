@@ -14,6 +14,7 @@ import AppKit
 import Carbon
 import OSAKit
 import os
+// Blueprint: | `MacControl+Adapters.swift` | System adapters, bundle-specific AppleScript/JXA Automation targets and permission status; authored app calls support `launch:false` with URL-bound running-process resolution and explicit `not_running`/no effects, and `read_only:true` enforced by the native per-event send callback; execution-boundary translation of shared process-pipe setup errors |
 #endif
 
 // MARK: - Adapter results
@@ -155,8 +156,10 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
     public static func checkAppScript(_ args: [String: JSONValue]) throws {
         guard let script = args["script"] else { return }
         guard case .string(let source) = script, !source.isEmpty,
-              Set(args.keys).isSubset(of: ["bundle_id", "script"]) else {
-            throw SenseFailure(code: "bad_input", message: "Pass {bundle_id,script} with an AppleScript body for the declared app.")
+              Set(args.keys).isSubset(of: ["bundle_id", "script", "launch", "read_only"]),
+              args["launch"] == nil || args["launch"] == .bool(true) || args["launch"] == .bool(false),
+              args["read_only"] == nil || args["read_only"] == .bool(true) || args["read_only"] == .bool(false) else {
+            throw SenseFailure(code: "bad_input", message: "Pass {bundle_id,script,launch?,read_only?} with an AppleScript body for the declared app; launch:false never opens it; read_only:true refuses every modifying event.")
         }
         // Validate syntax that can change the execution environment, not app
         // commands. Strings/comments are data; quoted identifiers remain code.
@@ -307,7 +310,17 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
                 return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path), "read_only": .bool(true), "sdef": .string(text)])
             }
         }
-        let pid = try await Self.appProcess(at: url)
+        let pid: pid_t
+        if args["launch"] == .bool(false) {
+            try Task.checkCancellation()
+            guard let running = await MainActor.run(body: { Self.runningApp(at: url)?.processIdentifier }) else {
+                return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path),
+                                "state": .string("not_running"), "effects": .string("none")])
+            }
+            pid = running
+        } else {
+            pid = try await Self.appProcess(at: url)
+        }
         return try await Self.onAppleScriptQueue { cancelled in
             let permission = Self.permission(bundleID: bundleID, url: url, pid: pid)
             guard case .object(let consent) = permission, consent["state"] == .string("allowed") else { return permission }
@@ -317,7 +330,7 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
                 if case .string(let source)? = args["script"] {
                     let target = bundleID.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
                     let program = "use AppleScript version \"2.4\"\ntell application id \"\(target)\"\n\(source)\nend tell"
-                    value = try Self.scriptValue(program, pid: pid, authored: true, cancelled: cancelled, effects: &effects)
+                    value = try Self.scriptValue(program, pid: pid, authored: true, readOnly: read, cancelled: cancelled, effects: &effects)
                 } else {
                     let event = NSAppleEventDescriptor.appleEvent(withEventClass: try Self.fourCode(args["event_class"]),
                         eventID: try Self.fourCode(args["event_id"]), targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid),
@@ -428,14 +441,14 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
 
     /// `effects` is what the script's events did: none when it sent only reads,
     /// occurred when the app accepted another event, unknown when the app answered one with an error.
-    private static func scriptValue(_ source: String, pid: pid_t, authored: Bool, cancelled: OSAllocatedUnfairLock<Bool>,
+    private static func scriptValue(_ source: String, pid: pid_t, authored: Bool, readOnly: Bool = false, cancelled: OSAllocatedUnfairLock<Bool>,
                                     effects: inout String?) throws -> NSAppleEventDescriptor {
         guard let language = OSALanguage(forName: "AppleScript") else {
             throw SenseFailure(code: "unavailable", message: "AppleScript language is unavailable.")
         }
         let instance = OSALanguageInstance(language: language)
-        typealias Target = (pid: pid_t, authored: Bool, refused: Bool, wrote: Bool, attempted: Bool, cancelled: OSAllocatedUnfairLock<Bool>)
-        var target: Target = (pid, authored, false, false, false, cancelled)
+        typealias Target = (pid: pid_t, authored: Bool, readOnly: Bool, refused: Bool, refusedRead: Bool, wrote: Bool, attempted: Bool, cancelled: OSAllocatedUnfairLock<Bool>)
+        var target: Target = (pid, authored, readOnly, false, false, false, false, cancelled)
         return try withUnsafeMutablePointer(to: &target) { pointer in
             // A private component confines even computed targets and nested tells;
             // every send keeps the raw primitive's consent, interaction and reply policy,
@@ -459,6 +472,10 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
                 AEGetAttributePtr(event, keyEventIDAttr, typeType, nil, &eventID, MemoryLayout<OSType>.size, &size)
                 let read = AuthoredToolEffects.appReadOnly(["event_class": .string(SystemAppleScriptAdapter.codeText(eventClass)),
                                                             "event_id": .string(SystemAppleScriptAdapter.codeText(eventID))])
+                if target.pointee.readOnly && !read {
+                    target.pointee.refusedRead = true
+                    return OSErr(-1743)
+                }
                 let sent = OSErr(AESendMessage(event, reply, AESendMode(kAEWaitReply | kAENeverInteract | kAEDoNotPromptForUserConsent),
                                                Int(timeout)))
                 // Another event wrote only when the app accepted it; an error reply or failed send leaves it
@@ -489,6 +506,10 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
             let script = OSAScript(source: source, from: nil, languageInstance: instance, using: [])
             var error: NSDictionary?
             let value = script.compileAndReturnError(&error) ? script.executeAndReturnError(&error) : nil
+            if pointer.pointee.refusedRead {
+                throw NSError(domain: "NativeAgentAppleEvent", code: -1743, userInfo: ["state": "read_only",
+                    NSLocalizedDescriptionKey: "This script declared read-only access; a modifying or unclassified event was refused before dispatch."])
+            }
             if pointer.pointee.refused {
                 throw NSError(domain: "NativeAgentAppleEvent", code: -1743, userInfo: ["state": "undeclared_target",
                     NSLocalizedDescriptionKey: "The script must target only the declared app process \(pid)."])
@@ -1084,7 +1105,8 @@ public final class SystemAppControlAdapter: Sendable {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
         #if canImport(AppKit)
-        return try await Self.openAppOnMain(named: query, front: true)
+        let indexedURL = await Self.indexedApplicationURL(named: query)
+        return try await Self.openAppOnMain(named: query, front: true, indexedURL: indexedURL)
         #else
         throw MacControlError.appControlFailed("AppKit unavailable on this platform")
         #endif
@@ -1094,7 +1116,8 @@ public final class SystemAppControlAdapter: Sendable {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
         #if canImport(AppKit)
-        return try await Self.openAppOnMain(named: query, front: false)
+        let indexedURL = await Self.indexedApplicationURL(named: query)
+        return try await Self.openAppOnMain(named: query, front: false, indexedURL: indexedURL)
         #else
         throw MacControlError.appControlFailed("AppKit unavailable on this platform")
         #endif
@@ -1104,7 +1127,8 @@ public final class SystemAppControlAdapter: Sendable {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
         #if canImport(AppKit)
-        return try await Self.quitAppOnMain(named: query)
+        let indexedURL = await Self.indexedApplicationURL(named: query)
+        return try await Self.quitAppOnMain(named: query, indexedURL: indexedURL)
         #else
         throw MacControlError.appControlFailed("AppKit unavailable on this platform")
         #endif
@@ -1114,7 +1138,8 @@ public final class SystemAppControlAdapter: Sendable {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { return false }
         #if canImport(AppKit)
-        return await Self.isApplicationRunningOnMain(matching: query)
+        let indexedURL = await Self.indexedApplicationURL(named: query)
+        return await Self.isApplicationRunningOnMain(matching: query, indexedURL: indexedURL)
         #else
         return false
         #endif
@@ -1126,15 +1151,15 @@ public final class SystemAppControlAdapter: Sendable {
 
     #if canImport(AppKit)
     @MainActor
-    private static func isApplicationRunningOnMain(matching query: String) -> Bool {
-        (try? runningApplications(matching: query).isEmpty) == false
+    private static func isApplicationRunningOnMain(matching query: String, indexedURL: Result<URL?, Error>) -> Bool {
+        (try? runningApplications(matching: query, indexedURL: indexedURL).isEmpty) == false
     }
 
     @MainActor
-    private static func openAppOnMain(named query: String, front: Bool) async throws -> AppControlRunResult {
+    private static func openAppOnMain(named query: String, front: Bool, indexedURL: Result<URL?, Error>) async throws -> AppControlRunResult {
         try Task.checkCancellation()
-        let running = try runningApp(matching: query)
-        guard let url = try running?.bundleURL ?? applicationURL(matching: query) else {
+        let running = try runningApp(matching: query, indexedURL: indexedURL)
+        guard let url = try running?.bundleURL ?? applicationURL(matching: query, indexedURL: indexedURL) else {
             throw ToolFailureError("app_not_found: \(query)", argumentPath: "name",
                 accepted: "An installed app's exact name, bundle identifier or .app path.", effects: .none)
         }
@@ -1178,10 +1203,10 @@ public final class SystemAppControlAdapter: Sendable {
     }
 
     @MainActor
-    private static func quitAppOnMain(named query: String) async throws -> AppControlRunResult {
-        let running = try runningApplications(matching: query)
+    private static func quitAppOnMain(named query: String, indexedURL: Result<URL?, Error>) async throws -> AppControlRunResult {
+        let running = try runningApplications(matching: query, indexedURL: indexedURL)
         guard !running.isEmpty else {
-            if let url = try applicationURL(matching: query) {
+            if let url = try applicationURL(matching: query, indexedURL: indexedURL) {
                 return AppControlRunResult(
                     requestedName: query,
                     matchedName: url.deletingPathExtension().lastPathComponent,
@@ -1247,8 +1272,8 @@ public final class SystemAppControlAdapter: Sendable {
     }
 
     @MainActor
-    private static func runningApp(matching query: String) throws -> NSRunningApplication? {
-        let running = try runningApplications(matching: query)
+    private static func runningApp(matching query: String, indexedURL: Result<URL?, Error>) throws -> NSRunningApplication? {
+        let running = try runningApplications(matching: query, indexedURL: indexedURL)
         let identities = Set(running.map {
             $0.bundleURL?.standardizedFileURL.path ?? $0.bundleIdentifier ?? "pid:\($0.processIdentifier)"
         })
@@ -1261,7 +1286,7 @@ public final class SystemAppControlAdapter: Sendable {
     }
 
     @MainActor
-    private static func runningApplications(matching query: String) throws -> [NSRunningApplication] {
+    private static func runningApplications(matching query: String, indexedURL: Result<URL?, Error>) throws -> [NSRunningApplication] {
         let running = NSWorkspace.shared.runningApplications
         let lower = query.lowercased()
         // A person means the app with a Dock icon, not a helper or service
@@ -1280,7 +1305,7 @@ public final class SystemAppControlAdapter: Sendable {
         if !exactBundle.isEmpty { return preferRegular(exactBundle) }
         // "Mail" with Mail stopped and MailMate running means Mail: a partial
         // name only when no app by that exact name is installed either.
-        guard try applicationURL(matching: query) == nil else { return [] }
+        guard try applicationURL(matching: query, indexedURL: indexedURL) == nil else { return [] }
         let partial = running.filter { app in
             let name = (app.localizedName ?? "").lowercased()
             let bundle = (app.bundleIdentifier ?? "").lowercased()
@@ -1290,8 +1315,8 @@ public final class SystemAppControlAdapter: Sendable {
     }
 
     @MainActor
-    private static func applicationURL(matching query: String) throws -> URL? {
-        if let url = try installedApplicationURL(named: query) { return url }
+    private static func applicationURL(matching query: String, indexedURL: Result<URL?, Error>) throws -> URL? {
+        if let url = try indexedURL.get() { return url }
         if looksLikeBundleIdentifier(query), let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: query) {
             nativeLog("SystemAppControlAdapter: Launch Services resolved %@ to %@", query, url.path)
             return url
@@ -1306,14 +1331,45 @@ public final class SystemAppControlAdapter: Sendable {
 
     /// Exact name, bundle id or bundle path from the Mac's own app index.
     public static func installedApplicationURL(named query: String) throws -> URL? {
+        try installedApplicationURL(named: query, apps: { try MacAppIndex.shared.apps() })
+    }
+
+    /// Gather before the MainActor application transaction. Keep a failure as
+    /// data until lookup is needed: an exact running app still wins as before.
+    private static func indexedApplicationURL(named query: String) async -> Result<URL?, Error> {
+        // An app already running under its exact name or bundle id needs no
+        // index: its own bundle answers, so a stalled Spotlight never holds it.
+        let runningExactly = await MainActor.run {
+            NSWorkspace.shared.runningApplications.contains {
+                ($0.localizedName ?? "").caseInsensitiveCompare(query) == .orderedSame
+                    || ($0.bundleIdentifier ?? "").caseInsensitiveCompare(query) == .orderedSame
+            }
+        }
+        if runningExactly { return .success(nil) }
+        do {
+            if let url = explicitApplicationURL(named: query) { return .success(url) }
+            let apps = try await MacAppIndex.shared.apps()
+            return .success(try installedApplicationURL(named: query, apps: { apps }))
+        } catch {
+            return .failure(ToolFailureError(error.localizedDescription, effects: .none,
+                owner: "macOS Spotlight app index", tap: "System Settings > Spotlight"))
+        }
+    }
+
+    private static func explicitApplicationURL(named query: String) -> URL? {
         let expandedQuery = (query as NSString).expandingTildeInPath
         if expandedQuery.hasPrefix("/"), expandedQuery.hasSuffix(".app") {
             let url = URL(fileURLWithPath: expandedQuery)
             if isApplicationBundle(url) { return url }
         }
+        return nil
+    }
+
+    private static func installedApplicationURL(named query: String, apps readApps: () throws -> [MacAppIndex.App]) throws -> URL? {
+        if let url = explicitApplicationURL(named: query) { return url }
         let name = query.hasSuffix(".app") ? String(query.dropLast(4)) : query
         let apps: [MacAppIndex.App]
-        do { apps = try MacAppIndex.shared.apps() }
+        do { apps = try readApps() }
         catch {
             throw ToolFailureError(error.localizedDescription, effects: .none,
                 owner: "macOS Spotlight app index", tap: "System Settings > Spotlight")

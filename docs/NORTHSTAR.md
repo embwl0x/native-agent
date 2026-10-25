@@ -22,7 +22,8 @@ changes a law changes every doc that states it in the same commit, names what
 comes out, and never adds a rule on its own beside an older one. A
 contradiction between two docs, or between a doc and the code, is a defect to
 fix at once, not a note to keep. `script/check_architecture_blueprint.swift`
-is the proof that the blueprint and the code agree; the rest is read.
+checks table filenames, enforced coverage and explicit marker/import rules;
+member names and behavioral prose still require source review.
 
 ## AX north star — natural agency throughout NativeAgent
 
@@ -81,6 +82,12 @@ does exactly what it says.
   that actually ran. Every failure is loud. Every button works or doesn't
   exist. No silent stubs, no fallback masking, no lifecycle furniture
   around empty systems.
+- No fallbacks, no rollbacks (User, 2026-10-22: "We fix it. We make it right.
+  It's supposed to work right. If we count on fallbacks, rollbacks, guess what?
+  Next thing you know, we aren't fixing nothing or making anything right").
+  A failure is shown plainly and fixed at its cause; a good change with a bug
+  is fixed forward in its new design, never reverted to the old way. Only what
+  should not exist at all is cut.
 - Canonical: 2026-07-03 removed ~1,000 lines of theater in a day — dead
   Panels layers (both platforms), preset knobs wired to nothing, disabled
   placeholder buttons — and the system got MORE alive, not smaller.
@@ -182,15 +189,16 @@ User, 2026-09-08: "One of our guiding principles is always to make this as
 simple as possible for people." A living system a person cannot install,
 understand, or recover is not alive for them. Simplicity is measured at the
 user's end, never at ours.
-- One download with everything in it. The embedding model ships inside the
-  DMG so nobody has to go get it or suffer a failed download on their own
-  network. Never a second step that can fail on the user's side.
+- Public releases ship the embedding model inside the DMG: one download,
+  with no second download that can fail on the user's network. Release tooling
+  still supports an explicit `separate-download` override; that packaging
+  mode does not satisfy this public-release law (see [release setup](release_setup.md)).
 - When a change trades a bigger file, a longer build, or more work for us
   against one fewer step for a person, take the bigger file.
-- A fresh install starts with everything on; people switch off what they do
-  not want. The one exception is what records the person (activity recording,
-  their hour), which is opt-in. Settings explain the cause and offer one recovery
-  action.
+- Fresh-install defaults belong to their permission stores: Mac Integration
+  reads start on where supported; writes start off except notifications and
+  scheduler. OpenAI TTS, activity recording and their hour are opt-in. Settings
+  explain the cause and offer one recovery action.
 - Canonical: 0.4.7 split the model out of the DMG to shrink it after a slow
   download that turned out to be a router, not the artifact. It added a
   first-launch download every person could lose. 0.4.8 put the model back;

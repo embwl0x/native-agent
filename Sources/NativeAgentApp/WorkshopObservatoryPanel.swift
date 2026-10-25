@@ -3,6 +3,7 @@ import PersistenceCore
 import Desk
 import SwiftUI
 import WorkshopExecution
+// Blueprint: | `WorkshopObservatoryPanel.swift` | `WorkshopObservatoryPanel` struct |
 
 // MARK: - Workshop Observatory
 //

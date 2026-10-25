@@ -2,6 +2,7 @@ import AgentWorkspace
 import Privacy
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentConversationLive.swift` | `AgentConversationLive` struct; `projection`; the live hub flushes pending text when the resident owner stops, and already accepted sends publish later text immediately until they settle; flush identities reject superseded coalescing tasks |
 
 /// What the other agent is doing right now on one send: working since when,
 /// its last sign of life, the reply text streamed so far and its latest tool
@@ -77,10 +78,21 @@ public actor AgentConversationLiveHub {
     private var entries: [String: (live: AgentConversationLive, root: URL)] = [:]
     private var dirty: Set<String> = []
     private var pendingFlush: Task<Void, Never>?
+    private var pendingFlushID: UUID?
+    private var coalescing = true
     private var publisher: (@Sendable (AgentConversationLive) -> Void)?
 
     public func setPublisher(_ publisher: @escaping @Sendable (AgentConversationLive) -> Void) {
         self.publisher = publisher
+    }
+
+    public func start() { if !Task.isCancelled { coalescing = true } }
+
+    /// Accepted sends may still finish after resident admission closes. Flush
+    /// their current words now and publish later words without arming a timer.
+    public func shutdown() {
+        coalescing = false
+        flush()
     }
 
     public func begin(_ target: AgentConversationLiveTarget, lane: String, streams: Bool = false,
@@ -154,19 +166,27 @@ public actor AgentConversationLiveHub {
 
     private func schedule(_ key: String, now: Bool) {
         dirty.insert(key)
-        if now { flush(); return }
+        if now || !coalescing { flush(); return }
         guard pendingFlush == nil else { return }
+        let id = UUID()
+        pendingFlushID = id
         pendingFlush = Task { [weak self] in
             // Cancelled means a flush already ran; flushing again here could
             // cancel the one scheduled after it.
             do { try await Task.sleep(for: Self.interval) } catch { return }
-            await self?.flush()
+            await self?.flush(ifCurrent: id)
         }
+    }
+
+    private func flush(ifCurrent id: UUID) {
+        guard pendingFlushID == id else { return }
+        flush()
     }
 
     private func flush() {
         pendingFlush?.cancel()
         pendingFlush = nil
+        pendingFlushID = nil
         let keys = dirty
         dirty.removeAll()
         // Redacted once here, so the file, agent_read and the event stream all

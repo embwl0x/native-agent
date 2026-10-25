@@ -8,6 +8,8 @@ import PersistenceCore
 import ProviderRouting
 import Senses
 import Transcripts
+import TurnTrace
+// Blueprint: | `TurnPart.swift` | `TurnPart`: their turn as a part (`abilities/turn.js` `step(state, event)`) in one held helper per turn (a helper short of resources is an observation retried on the helper backoff until Stop; any other start failure ends the turn with its fix), version choice (prior shipped bodies come from generated `shipped`) and seed install (write failures name the person and storage repair), the effect queue, the turn's event log and reconstruction for resume and heal; `provider_failure` carries the repair's callable input, permits explicit `app` repair calls through the ordinary dispatcher or a re-issued `model.call`, and can end incomplete without healing an authored part; compare-and-swap heal in one store transaction |
 
 /// Her turn as a part (docs/AGENT_IS_THE_APP.md, contract 1). `abilities/turn.js`
 /// exports `step(state, event) → {state, do: [effects]}` and runs no loop of its
@@ -71,10 +73,8 @@ struct TurnPart {
             var metadata = chosen.metadata
             metadata["version"] = seed.metadata["version"]
             // Upgrade only an unchanged shipped version, never an authored part.
-            let shipped: [Int64: String] = [1: "f9eecf7ec5040bb1ec7bf56f5fdf27b10b21d6c01304dd88ef015f9cb9e2ff40",
-                                            2: "faedb551d5d16a20d7a474c8926841d8d42c6995b1e4b196660d54c452cb412e"]
             if current.unread == nil, case .int(let version)? = chosen.metadata["version"], metadata == seed.metadata,
-               shipped[version] == chosen.bodyDigest {
+               Self.shipped[version]?.contains(chosen.bodyDigest) == true {
                 file = await Self.install(seed, over: chosen, store: store, dataRoot: dataRoot)
             }
         } else {
@@ -110,9 +110,7 @@ struct TurnPart {
             let words = "The shipped turn part was not written to \(owner): \(error.localizedDescription). Turns run the shipped part meanwhile; repair is owed until a turn installs it."
             RepairOwed.owe(dataRoot, id: "turn-part-install:" + UUID().uuidString, kind: .run,
                 operation: "turn.part.install", owner: owner, words: words,
-                nextCall: ToolFailureError.call("app", ["action": .string("codex.message"), "args": .object([
-                    "conversation_mode": .string("new"),
-                    "text": .string("Make \(store.root.path) accept the shipped turn part (turn.js). The write failed: \(error.localizedDescription). Preserve every ability file and its .prev version; never remove or rewrite an authored part. Repair is proved only when a turn installs the shipped part, not by a restart.")])]))
+                tap: "Tell the person: repair NativeAgent's turn-part installation/storage failure at \(owner). Restore write access there, preserving every ability file and its .prev version; repair is proved only when a turn installs the shipped part.")
             return seed
         }
     }
@@ -154,12 +152,24 @@ struct TurnPart {
         }
         let item = queue.removeFirst()
         log.append(.object(["start": .object(["id": .string(item.identity), "digest": .string(item.digest)])]))
+        if case .object(let entry) = log[item.step], case .object(let event)? = entry["event"],
+           event["type"] == .string("provider_failure") {
+            if item.effect["effect"] == .string("model.call") {
+                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L22"), "site": .string("TurnPart.swift:next")]))
+            } else if item.effect["effect"] == .string("reply.stream"), item.effect["text"] == event["text"] {
+                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L23"), "site": .string("TurnPart.swift:next")]))
+            }
+        }
         if item.effect["effect"] == .string("reply.end") { finished = true }
         if item.effect["effect"] == .string("after") { afterTurn = true }
         return item.effect
     }
 
     var nextIsApp: Bool { queue.first?.effect["effect"] == .string("app") }
+    /// The person's turn is over: reply.end started, and the after-turn work
+    /// her part asked for with it. What it queued after that is hers alone.
+    var replied: Bool { finished && queue.first?.effect["effect"] != .string("after") }
+    var continues: Bool { !queue.isEmpty }
 
     /// A reply.stream chunk the stem sent; a resumed turn restores it.
     mutating func sent(_ text: String) {
@@ -167,12 +177,14 @@ struct TurnPart {
         log.append(.object(["streamed": .string(text)]))
     }
 
-    /// Told when the turn ends, never into the turn it happened in.
-    func tellHer() {
+    /// Told when the turn ends, never into the turn it happened in, and again
+    /// for what her keep moment queued after the reply: each arrival once.
+    mutating func tellHer() {
         guard !arrivals.isEmpty else { return }
         if !ResidentWake.shared.request(dataRoot: dataRoot, reason: "her turn part was swapped back", items: arrivals) {
             nativeLog("Her turn part: the arrival telling her about the swap was not kept")
         }
+        arrivals = []
     }
 
     private struct Fault: Error { let code: String; let why: String }
@@ -267,14 +279,7 @@ struct TurnPart {
             guard case .object(var effect) = item, case .string(let name)? = effect["effect"], Self.effects.contains(name) else {
                 throw Fault(code: "malformed", why: "Its step returned an effect the stem does not run: \((try? item.serialize(pretty: false)) ?? "?").")
             }
-            var digest = Self.digest(item)
-            var identity: String
-            if case .string(let own)? = effect["id"], !own.isEmpty { identity = name + ":" + own }
-            else {
-                identity = name + ":" + digest
-                seen[identity, default: 0] += 1
-                identity += "#\(seen[identity] ?? 1)"
-            }
+            var admittedCall: (identity: String, digest: String)?
             switch name {
             case "app":
                 if event["type"] == .string("provider_failure"), var current = round,
@@ -286,8 +291,7 @@ struct TurnPart {
                     current.ids.append(id); current.digests.append(Self.digest(.object(call))); current.used.insert(position)
                     round = current
                     effect = ["effect": .string("app"), "index": .int(Int64(position)), "call": .object(call)]
-                    identity = Self.callIdentity(current, position)
-                    digest = current.digests[position]
+                    admittedCall = (Self.callIdentity(current, position), current.digests[position])
                     break
                 }
                 // A call of this model round, by id (index when id-less), each once.
@@ -302,24 +306,47 @@ struct TurnPart {
                 }
                 round = current
                 effect = ["effect": .string("app"), "index": .int(Int64(position))]
-                identity = Self.callIdentity(current, position)
-                digest = current.digests[position]
+                admittedCall = (Self.callIdentity(current, position), current.digests[position])
             case "reply.end":
                 let repairResult = event["type"] == .string("result") && round?.repair == true
                 guard (event["type"] == .string("model") && calls.isEmpty) || event["type"] == .string("provider_failure") || repairResult else {
                     throw Fault(code: "malformed", why: "Its reply.end did not follow a model reply without calls or an owned provider failure.")
                 }
-            case "model.call" where system == nil && opened == nil:
+            case "model.call":
+                let opening = system == nil && opened == nil
+                let supported: Set<String> = opening
+                    ? ["effect", "id", "purpose", "note", "system", "tools"]
+                    : ["effect", "id", "purpose", "note"]
+                let unsupported = effect.keys.filter { !supported.contains($0) }.sorted()
+                guard unsupported.isEmpty else {
+                    throw Fault(code: "malformed", why: "Its model.call has unsupported fields: \(unsupported.joined(separator: ", ")). The stem owns messages and streaming; system and tools belong only on the first call.")
+                }
+                guard opening else { break }
                 guard case .object(let named)? = effect["system"], case .string(let stable)? = named["stable"],
                       case .string(let dynamic)? = named["dynamic"] else {
                     throw Fault(code: "malformed", why: "Its first model.call names no system {stable, dynamic}.")
                 }
                 var tools: [String]?
-                if case .array(let names)? = effect["tools"] {
+                if let offered = effect["tools"] {
+                    guard case .array(let names) = offered,
+                          names.allSatisfy({ if case .string = $0 { true } else { false } }) else {
+                        throw Fault(code: "malformed", why: "Its first model.call tools must be an array of names.")
+                    }
                     tools = names.compactMap { if case .string(let name) = $0 { name } else { nil } }
                 }
                 opened = (SystemPromptSegments(stable: stable, dynamic: dynamic), tools)
             default: break
+            }
+            // App effects already have the model call's identity and digest.
+            // Hash only effects whose own payload supplies their digest.
+            let digest = admittedCall?.digest ?? Self.digest(item)
+            var identity: String
+            if let admittedCall { identity = admittedCall.identity }
+            else if case .string(let own)? = effect["id"], !own.isEmpty { identity = name + ":" + own }
+            else {
+                identity = name + ":" + digest
+                seen[identity, default: 0] += 1
+                identity += "#\(seen[identity] ?? 1)"
             }
             effects.append((effect, identity, digest, index))
         }
@@ -348,7 +375,8 @@ struct TurnPart {
             if Task.isCancelled || ChatCancelFlag.isRaised(stop) { return nil }
             do { helper = try runner.hold() } catch {
                 guard (error as? SenseFailure)?.code == "spawn_busy" else {
-                    throw TurnEngineError.turnHelperUnavailable(error.localizedDescription)
+                    let code = (error as? SenseFailure)?.code ?? "helper_start_failed"
+                    throw TurnEngineError.turnHelperUnavailable("\(code): \(error.localizedDescription) Tell the person: this copy of NativeAgent could not start its turn helper at \(helperURL.path).")
                 }
                 attempt += 1
                 let delay = ProviderRecoveryPolicy.backoffSeconds(forRetry: attempt)
@@ -480,13 +508,14 @@ struct TurnPart {
             if let known = lock.withLock({ logged[name] }) { return known }
             let value: JSONValue
             switch name {
-            case "persona": value = .object(["prompt": .string(gathered.persona), "guidance": .string(gathered.guidance)])
+            case "persona": value = .object(["prompt": .string(gathered.persona), "guidance": .string(gathered.guidance),
+                                            "expression": gathered.expression])
             case "pins": value = .array(gathered.pins.map(JSONValue.string))
             case "recall": value = .string(gathered.recall)
             case "context":
                 value = .object(["digest": .string(gathered.digest), "packet": .string(gathered.packet),
                                  "history": .string(gathered.history), "facts": .array(gathered.facts.map(JSONValue.string)),
-                                 "tools": .array(tools.map(JSONValue.string))])
+                                 "tools": .array(tools.map(JSONValue.string)), "runtime": gathered.runtime])
             default: throw SenseFailure(code: "unknown_reach", message: "turn.\(name)() is not her reach; she has persona, pins, recall and context.")
             }
             lock.withLock { logged[name] = value }

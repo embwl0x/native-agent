@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `MailReadLocator.swift` | `MailReadLocator` |
 
 /// Exact inbox locator for reads. An RFC ID is required for mutations.
 public struct MailReadLocator {

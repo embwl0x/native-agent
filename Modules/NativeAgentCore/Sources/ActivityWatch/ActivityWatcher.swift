@@ -5,6 +5,7 @@ import CoreGraphics
 import Foundation
 import MacControl
 import PersistenceCore
+// Blueprint: | `ActivityWatcher.swift` | `ActivityWatcher`; capture-thread sources and ordered store pump; presence reads `MacPersonInput.presence`, capture idle-close remains separate and idle-resume reads `MacPersonInput.sessionIdleAfterAgentMotor` in every permission state without asserting presence; unexpected run-loop return degrades and retires capture; only the drained pump releases installation and pending restart ownership |
 
 /// Platform notifications translated before they enter the capture thread.
 public enum ActivityWorkspaceEvent: Sendable {
@@ -41,12 +42,6 @@ public final class ActivityWatcher: @unchecked Sendable {
     public static let defaultIdleThreshold: TimeInterval = 300
     static let tickInterval: TimeInterval = 60
 
-    /// How much newer than the agent's OWN last motor event the system's last
-    /// input has to be before the idle-resume watch reads it as a person coming
-    /// back. Same span the motor epoch's yes/no fence uses, applied as a
-    /// separation so it survives a tick that is far longer than the window.
-    static let agentMotorSeparation: TimeInterval = NativeAgentMotorEpoch.defaultWindow
-
     /// A frontmost reading of loginwindow is a LOCK SIGNAL, never a span.
     /// While locked, AX still answers and returns the bare app name — data that
     /// looks completely real (P0 blocker finding).
@@ -73,7 +68,8 @@ public final class ActivityWatcher: @unchecked Sendable {
     private let lock = NSLock()
     private var _runLoop: CFRunLoop?
     private var _captureCommandSource: CFRunLoopSource?
-    private var _captureBlocks: [@Sendable () -> Void] = []
+    /// Non-nil from installation reservation until capture-thread exit.
+    private var _captureBlocks: [@Sendable () -> Void]?
     private var _stopping = false
     private var _stopRequested = false
     private var _restartAfterStop = false
@@ -87,9 +83,11 @@ public final class ActivityWatcher: @unchecked Sendable {
     private var _lastKnownPolicy: ActivityPolicy
     /// Whether the observers/thread/pump are currently installed.
     private var _installed = false
-    private var _workspaceObserverTokens: [NSObjectProtocol] = []
+    private var _generation: UInt64 = 0
 
     // Capture-thread-only. Never touched off the capture thread.
+    private var workspaceObserverTokens: [NSObjectProtocol] = []
+    private var presenceObserver: NSObjectProtocol?
     /// The span state machine.
     private var engine: ActivitySpanEngine
     private var observer: AXObserver?
@@ -118,11 +116,20 @@ public final class ActivityWatcher: @unchecked Sendable {
     private var spanStartWall: Double = 0
     private var spanStartMono: Double = 0
 
-    private var continuation: AsyncStream<ActivityStoreCommand>.Continuation?
+    private enum StoreRequest: Sendable {
+        case write(ActivityStoreCommand)
+        case purge(bundleID: String, completion: CheckedContinuation<Int, Error>)
+    }
+
+    private var continuation: AsyncStream<StoreRequest>.Continuation?
     private var pumpTask: Task<Void, Never>?
+    // Retained until the thread's exit notification and the store drain settle.
+    private var captureThread: Thread?
+    private var threadExitToken: NSObjectProtocol?
     private let started = NSCondition()
     private var isThreadReady = false
     private var isThreadExited = true
+    private var retiredGeneration: UInt64 = 0
 
     public init(
         store: ActivitySpanStore,
@@ -200,42 +207,61 @@ public final class ActivityWatcher: @unchecked Sendable {
             return true
         }
         guard enabled else { return !isCaptureEnabled }
-        guard beginStartInstalled() else {
+        guard let generation = beginStartInstalled() else {
             return lifecycleState == .running || lifecycleState == .starting
         }
         guard await waitForThreadReady(timeout: timeout) else {
-            guard !Task.isCancelled else { return false }
-            transitionLifecycle(to: .degraded)
-            await stop()
+            guard !Task.isCancelled else {
+                await stopInstalled(generation: generation)
+                return false
+            }
+            let current = withLock { () -> Bool in
+                guard _generation == generation, _installed else { return false }
+                _lifecycleState = .degraded
+                return true
+            }
+            guard current else { return false }
+            lifecycleChanged?(.degraded)
+            await stopInstalled(generation: generation)
             return false
         }
-        guard !Task.isCancelled else { return false }
-        transitionLifecycle(to: .running)
-        return true
+        guard !Task.isCancelled else {
+            await stopInstalled(generation: generation)
+            return false
+        }
+        let running = withLock { () -> Bool in
+            guard _generation == generation, _installed, !_stopping, !_stopRequested,
+                  _lifecycleState == .starting else { return false }
+            _lifecycleState = .running
+            return true
+        }
+        if running { lifecycleChanged?(.running) }
+        return running
     }
 
     /// The real installer. Private on purpose: every path into it goes through
     /// the `_captureEnabled` check above, so there is exactly one gate.
     @discardableResult
-    private func beginStartInstalled() -> Bool {
+    private func beginStartInstalled() -> UInt64? {
         lock.lock()
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled, _captureEnabled else {
             lock.unlock()
-            return false
+            return nil
         }
         if _installed || _stopping || _stopRequested {
             if _captureEnabled { _restartAfterStop = true }
             lock.unlock()
-            return false
+            return nil
         }
         _installed = true
+        _generation &+= 1
+        let generation = _generation
         _lifecycleState = .starting
-        lock.unlock()
+        _captureBlocks = []
         started.lock()
         isThreadReady = false
         isThreadExited = false
         started.unlock()
-        lifecycleChanged?(.starting)
         // UNBOUNDED, deliberately (gpt-5.5 BLOCKING, 2026-08-14). These are
         // span *control* commands (open/touch/close), not a high-rate event
         // firehose: they arrive at human app-switch rate. `bufferingNewest`
@@ -243,55 +269,76 @@ public final class ActivityWatcher: @unchecked Sendable {
         // dropping an `.open` turns every later touch/close into a no-op —
         // which breaks the every-open-has-a-close invariant AND corrupts the
         // one number the probe exists to produce.
-        let (stream, continuation) = AsyncStream<ActivityStoreCommand>.makeStream(
+        let (stream, continuation) = AsyncStream<StoreRequest>.makeStream(
             bufferingPolicy: .unbounded
         )
         self.continuation = continuation
         let store = self.store
         pumpTask = Task.detached(priority: .utility) { [weak self] in
-            for await command in stream {
-                do {
-                    try await store.apply(command)
-                } catch {
-                    FileHandle.standardError.write(
-                        Data("activity-watch: store write failed: \(error)\n".utf8)
-                    )
-                    self?.handleStoreFailure()
-                    break
+            var writeFailure: Error?
+            for await request in stream {
+                switch request {
+                case .write(let command):
+                    guard writeFailure == nil else { continue }
+                    do {
+                        try await store.apply(command)
+                    } catch {
+                        writeFailure = error
+                        FileHandle.standardError.write(
+                            Data("activity-watch: store write failed: \(error)\n".utf8)
+                        )
+                        self?.handleStoreFailure()
+                    }
+                case .purge(let bundleID, let completion):
+                    do {
+                        if let writeFailure { throw writeFailure }
+                        completion.resume(returning: try await store.purge(bundleID: bundleID))
+                    } catch {
+                        completion.resume(throwing: error)
+                    }
                 }
             }
+            self?.finishStoppedThread()
         }
-
-        installWorkspaceObservers()
-        installLockNotificationObservers()
 
         let thread = Thread { [weak self] in self?.captureThreadMain() }
         thread.name = "com.nativeagent.activity-watch"
         thread.stackSize = 512 * 1024
+        captureThread = thread
+        threadExitToken = NotificationCenter.default.addObserver(
+            forName: .NSThreadWillExit, object: thread, queue: nil
+        ) { [self] _ in
+            // The capture body has returned: no source can enqueue another
+            // write. Closing its stream lets the owned pump retire everything.
+            withLock { continuation.finish() }
+        }
         thread.start()
-        return true
+        lock.unlock()
+        lifecycleChanged?(.starting)
+        return generation
     }
 
     /// Closes the open span cleanly, tears the observer down, stops the run
     /// loop, and drains the pump. Never called from the capture thread.
     public func stop() async {
-        withLock {
+        let generation = withLock {
             _stopRequested = true
             _restartAfterStop = false
+            return _generation
         }
-        await stopInstalled()
+        await stopInstalled(generation: generation)
     }
 
-    private func stopForPolicyDisable() async {
-        await stopInstalled()
+    private func stopForPolicyDisable(generation: UInt64) async {
+        await stopInstalled(generation: generation)
     }
 
-    private func stopInstalled() async {
+    private func stopInstalled(generation: UInt64) async {
         let (proceed, announceStopping) = withLock { () -> (Bool, Bool) in
             // Nothing installed → nothing to tear down. This is the ordinary
             // case when capture was never enabled, and it must not block on a
             // run-loop hop that will never be serviced (there is no run loop).
-            guard _installed, !_stopping else { return (false, false) }
+            guard _generation == generation, _installed, !_stopping else { return (false, false) }
             _stopping = true
             let announce = _lifecycleState != .stopping
             _lifecycleState = .stopping
@@ -300,51 +347,49 @@ public final class ActivityWatcher: @unchecked Sendable {
         guard proceed else { return }
         if announceStopping { lifecycleChanged?(.stopping) }
 
-        removeWorkspaceObservers()
-
         // Bounded handoff: a wedged run loop must not hang shutdown forever, and
         // the continuation must resume exactly once whichever path wins.
         let gate = OneShotGate()
+        var watchdog: Task<Void, Never>?
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            onCaptureThread { [weak self] in
-                if let self {
-                    self.feed(.terminate(at: self.safeNow()))
-                    self.detachObserver()
-                    self.stopTickTimer()
-                }
-                CFRunLoopStop(CFRunLoopGetCurrent())
+            watchdog = Task {
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) }
+                catch { return }
                 if gate.claim() { continuation.resume() }
             }
-            Task {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            onCaptureThread {
+                if self.withLock({ self._generation == generation }) {
+                    CFRunLoopStop(CFRunLoopGetCurrent())
+                }
                 if gate.claim() { continuation.resume() }
             }
         }
+        watchdog?.cancel()
 
-        // The run-loop block acknowledging CFRunLoopStop is not the same thing
-        // as the capture thread having exited. Do not clear installed state or
-        // permit a restart until the old thread confirms its actual exit.
-        guard await waitForThreadExit(timeout: 5) else {
-            transitionLifecycle(to: .degraded)
-            Task { [weak self] in
-                guard let self else { return }
-                _ = await self.waitForThreadExit(timeout: nil)
-                await self.finishStoppedThread()
+        // Acknowledgment is not exit. The exit notification closes the stream;
+        // only the pump's actual drain releases installation/restart ownership.
+        // A timeout returns degraded without creating an indefinite waiter.
+        guard await waitForThreadExit(generation: generation, timeout: 5) else {
+            let timedOut = withLock { () -> Bool in
+                guard _generation == generation, _installed, _stopping else { return false }
+                _lifecycleState = .degraded
+                return true
             }
+            if timedOut { lifecycleChanged?(.degraded) }
             return
         }
-        await finishStoppedThread()
     }
 
-    private func finishStoppedThread() async {
-        self.continuation?.finish()
-        self.continuation = nil
-        await pumpTask?.value
-        pumpTask = nil
-
+    /// Called only by the pump after thread exit and its last accepted write.
+    private func finishStoppedThread() {
         // Back to the uninstalled state, so a later off→on policy flip can
         // re-install cleanly instead of finding `_installed` stuck true.
         let restart = withLock { () -> Bool in
+            if let threadExitToken { NotificationCenter.default.removeObserver(threadExitToken) }
+            threadExitToken = nil
+            captureThread = nil
+            continuation = nil
+            pumpTask = nil
             _installed = false
             _runLoop = nil
             _stopping = false
@@ -352,6 +397,12 @@ public final class ActivityWatcher: @unchecked Sendable {
             _lifecycleState = .stopped
             let shouldRestart = _restartAfterStop && _captureEnabled
             _restartAfterStop = false
+            started.lock()
+            isThreadReady = false
+            isThreadExited = true
+            retiredGeneration = _generation
+            started.broadcast()
+            started.unlock()
             return shouldRestart
         }
         lifecycleChanged?(.stopped)
@@ -381,7 +432,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         }
     }
 
-    private func waitForThreadExit(timeout: TimeInterval?) async -> Bool {
+    private func waitForThreadExit(generation: UInt64, timeout: TimeInterval) async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 guard let self else {
@@ -390,16 +441,12 @@ public final class ActivityWatcher: @unchecked Sendable {
                 }
                 self.started.lock()
                 defer { self.started.unlock() }
-                if let timeout {
-                    let deadline = Date().addingTimeInterval(timeout)
-                    while !self.isThreadExited {
-                        if !self.started.wait(until: deadline) {
-                            continuation.resume(returning: false)
-                            return
-                        }
+                let deadline = Date().addingTimeInterval(timeout)
+                while self.retiredGeneration < generation {
+                    if !self.started.wait(until: deadline) {
+                        continuation.resume(returning: false)
+                        return
                     }
-                } else {
-                    while !self.isThreadExited { self.started.wait() }
                 }
                 continuation.resume(returning: true)
             }
@@ -422,14 +469,16 @@ public final class ActivityWatcher: @unchecked Sendable {
     }
 
     private func handleStoreFailure() {
-        let shouldStop = withLock { () -> Bool in
-            guard !_stopping, _lifecycleState != .degraded else { return false }
+        let generation = withLock { () -> UInt64? in
+            guard _installed, !_stopping, _lifecycleState != .degraded else { return nil }
+            _stopRequested = true
+            _restartAfterStop = false
             _lifecycleState = .degraded
-            return true
+            return _generation
         }
-        guard shouldStop else { return }
+        guard let generation else { return }
         lifecycleChanged?(.degraded)
-        Task { [weak self] in await self?.stop() }
+        Task { [weak self] in await self?.stopInstalled(generation: generation) }
     }
 
     /// Swap the privacy policy while running (the user edited exclusions, or
@@ -456,6 +505,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         _captureEnabled = policy.captureEnabled
         _lastKnownPolicy = policy
         let installed = _installed
+        let generation = _generation
         var announceStopping = false
         if policy.captureEnabled {
             if _stopping || _stopRequested { _restartAfterStop = true }
@@ -478,24 +528,20 @@ public final class ActivityWatcher: @unchecked Sendable {
             // updatePolicy emits the close), then remove every event source.
             if installed {
                 applyPolicyOnCaptureThread()
-                Task { [weak self] in await self?.stopForPolicyDisable() }
-            } else {
-                applyPolicyToEngineDirectly(policy)
+                Task { [weak self] in await self?.stopForPolicyDisable(generation: generation) }
             }
         case (false, true):
-            // ON, from cold. Seed the engine before the observers exist so the
-            // first activation is evaluated against the new policy.
+            // ON, from cold. Startup reads the latest policy on its own thread
+            // before the first activation.
             if stopPending {
                 applyPolicyOnCaptureThread()
             } else {
-                applyPolicyToEngineDirectly(policy)
                 Task { [weak self] in _ = await self?.startBounded() }
             }
         case (true, true):
             if installed {
                 applyPolicyOnCaptureThread()
             } else {
-                applyPolicyToEngineDirectly(policy)
                 Task { [weak self] in _ = await self?.startBounded() }
             }
         }
@@ -528,14 +574,6 @@ public final class ActivityWatcher: @unchecked Sendable {
         return safe
     }
 
-    /// Policy swap with no capture thread to hop onto. Safe because in this
-    /// state nothing else touches the engine: there are no observers, no timer
-    /// and no run loop, which is precisely the condition for taking this path.
-    private func applyPolicyToEngineDirectly(_ policy: ActivityPolicy) {
-        let commands = engine.updatePolicy(policy, at: clock.wallNow())
-        emit(commands)
-    }
-
     private func applyPolicyOnCaptureThread() {
         let apply: @Sendable () -> Void = { [weak self] in
             guard let self else { return }
@@ -546,6 +584,27 @@ public final class ActivityWatcher: @unchecked Sendable {
         let runLoop = withLock { _runLoop }
         if let runLoop, CFRunLoopGetCurrent() === runLoop { apply() }
         else { onCaptureThread(apply) }
+    }
+
+    /// Apply the exclusion before placing its purge behind every older write.
+    /// The controller holds its policy-mutation slot until this completes.
+    public func purgeExcluded(bundleID: String) async throws -> Int {
+        try await withCheckedThrowingContinuation { completion in
+            let handoff = onCaptureThread {
+                let policy = self.withLock { self._lastKnownPolicy }
+                self.emit(self.engine.updatePolicy(policy, at: self.safeNow()))
+                self.continuation?.yield(.purge(bundleID: bundleID, completion: completion))
+            }
+            if handoff.accepted { return }
+
+            // No capture thread can enqueue more writes. Join any old pump
+            // before purging directly, including during shutdown's drain.
+            Task {
+                await handoff.drainingPump?.value
+                do { completion.resume(returning: try await store.purge(bundleID: bundleID)) }
+                catch { completion.resume(throwing: error) }
+            }
+        }
     }
 
     // MARK: - Capture thread
@@ -589,59 +648,75 @@ public final class ActivityWatcher: @unchecked Sendable {
         lock.unlock()
         CFRunLoopAddSource(CFRunLoopGetCurrent(), commandSource, .defaultMode)
 
+        // Installation and removal share the capture thread. A stop requested
+        // during startup cannot remove tokens while they are still being added.
+        installWorkspaceObservers()
+        installLockNotificationObservers()
+
+        let policy = withLock { _lastKnownPolicy }
+        emit(engine.updatePolicy(policy, at: safeNow()))
         // Startup reconciliation: spans a prior process left open are closed at
         // their own last_seen_at and marked abandoned.
         emit(engine.startupReconcile())
         seedFromFrontmostApplication()
+        drainCaptureBlocks()
 
         started.lock()
         isThreadReady = true
         started.signal()
         started.unlock()
 
-        // `CFRunLoopRun()` may return `.finished` when AX observation is
-        // unavailable (permission missing or a transient process). The watcher
-        // still owns workspace, sleep, and policy events in that state, so a
-        // missing AX source must not silently kill the capture thread while
-        // lifecycle state continues to report `.running`.
-        while !isStopping {
-            let result = CFRunLoopRunInMode(.defaultMode, .greatestFiniteMagnitude, false)
-            if result == .finished {
-                Thread.sleep(forTimeInterval: 0.01)
-            }
+        // The command source keeps this loop alive even without AX. Returning
+        // without an owned stop means that spine is lost: degrade and retire,
+        // rather than re-entering a sourceless loop every 10 ms forever.
+        if !isStopping {
+            CFRunLoopRunInMode(.defaultMode, .greatestFiniteMagnitude, false)
+            if !isStopping { transitionLifecycle(to: .degraded) }
         }
 
-        detachObserver()
-        stopTickTimer()
         lock.lock()
+        let blocks = _captureBlocks ?? []
+        _captureBlocks = nil
         _captureCommandSource = nil
-        _captureBlocks.removeAll(keepingCapacity: false)
         _runLoop = nil
         lock.unlock()
-        started.lock()
-        isThreadReady = false
-        isThreadExited = true
-        started.broadcast()
-        started.unlock()
+        // Finish accepted policy/purge work even when Stop skipped the loop.
+        for block in blocks { block() }
+        // Close before exit is acknowledged and the pump drains.
+        feed(.terminate(at: safeNow()))
+        removeWorkspaceObservers()
+        detachObserver()
+        stopTickTimer()
+        // NSThreadWillExit closes the pump after this body returns.
     }
 
-    private func onCaptureThread(_ block: @escaping @Sendable () -> Void) {
+    @discardableResult
+    private func onCaptureThread(
+        _ block: @escaping @Sendable () -> Void
+    ) -> (accepted: Bool, drainingPump: Task<Void, Never>?) {
         lock.lock()
+        guard _captureBlocks != nil else {
+            // Decide and capture the old pump together; a restart must not
+            // make a rejected request join the new, still-running pump.
+            let pump = pumpTask
+            lock.unlock()
+            return (false, pump)
+        }
+        _captureBlocks?.append(block)
         let runLoop = _runLoop
         let source = _captureCommandSource
-        if runLoop != nil, source != nil {
-            _captureBlocks.append(block)
-        }
         lock.unlock()
-        guard let runLoop, let source else { return }
-        CFRunLoopSourceSignal(source)
-        CFRunLoopWakeUp(runLoop)
+        if let runLoop, let source {
+            CFRunLoopSourceSignal(source)
+            CFRunLoopWakeUp(runLoop)
+        }
+        return (true, nil)
     }
 
     private func drainCaptureBlocks() {
         lock.lock()
-        let blocks = _captureBlocks
-        _captureBlocks.removeAll(keepingCapacity: true)
+        let blocks = _captureBlocks ?? []
+        _captureBlocks?.removeAll(keepingCapacity: true)
         lock.unlock()
         for block in blocks { block() }
     }
@@ -649,7 +724,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     // MARK: - Engine plumbing (capture thread only)
 
     /// Push one event into the shared state machine and forward what it wants
-    /// written. THE ONLY WAY this class writes anything.
+    /// written. Span writes and live exclusion purges share the same pump.
     private func feed(_ event: ActivityInputEvent) {
         emit(engine.process(event))
     }
@@ -660,13 +735,18 @@ public final class ActivityWatcher: @unchecked Sendable {
                 spanStartWall = span.startedAt
                 spanStartMono = clock.monotonicNow()
             }
-            continuation?.yield(command)
+            continuation?.yield(.write(command))
         }
     }
 
     // MARK: - Workspace notifications
 
     private func installWorkspaceObservers() {
+        presenceObserver = NotificationCenter.default.addObserver(
+            forName: MacPersonInput.presenceChanged, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.onCaptureThread { [weak self] in self?.publishPresence() }
+        }
         let handler: @Sendable (ActivityWorkspaceEvent) -> Void = { [weak self] event in
             self?.onCaptureThread { [weak self] in self?.handleWorkspaceEvent(event) }
         }
@@ -697,7 +777,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         tokens.append(center.addObserver(
             forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: nil
         ) { _ in handler(.sessionBecameActive) })
-        withLock { _workspaceObserverTokens = tokens }
+        workspaceObserverTokens = tokens
     }
 
     private func handleWorkspaceEvent(_ event: ActivityWorkspaceEvent) {
@@ -710,21 +790,21 @@ public final class ActivityWatcher: @unchecked Sendable {
             guard !screensAsleep else { return }
             screensAsleep = true
             feed(.sleep(at: safeNow()))
-            standDownAway()
+            standDownCapture()
         case .wake:
             guard screensAsleep else { return }
             screensAsleep = false
             feed(.wake(at: safeNow()))
-            standUpPresent()
+            publishPresence()
             seedFromFrontmostApplication()
         case .sessionResignedActive:
             sessionInactive = true
             feed(.lock(at: safeNow()))
-            standDownAway()
+            standDownCapture()
         case .sessionBecameActive:
             sessionInactive = false
             feed(.unlock(at: safeNow()))
-            standUpPresent()
+            publishPresence()
             seedFromFrontmostApplication()
         }
     }
@@ -747,7 +827,7 @@ public final class ActivityWatcher: @unchecked Sendable {
                 guard let self else { return }
                 self.screenLockedByNotification = true
                 self.feed(.lock(at: self.safeNow()))
-                self.standDownAway()
+                self.standDownCapture()
             }
         })
         lockTokens.append(center.addObserver(
@@ -757,10 +837,7 @@ public final class ActivityWatcher: @unchecked Sendable {
                 guard let self else { return }
                 self.screenLockedByNotification = false
                 self.feed(.unlock(at: self.safeNow()))
-                // Publish FIRST, then re-seed: if the re-read concludes we are
-                // still locked it calls `standDownAway`, which overwrites this
-                // with away — the right precedence.
-                self.standUpPresent()
+                self.publishPresence()
                 // Re-read; never assume unlocked just because a note said so.
                 self.seedFromFrontmostApplication()
             }
@@ -768,12 +845,11 @@ public final class ActivityWatcher: @unchecked Sendable {
     }
 
     private func removeWorkspaceObservers() {
-        let tokens = withLock { () -> [NSObjectProtocol] in
-            defer { _workspaceObserverTokens = [] }
-            return _workspaceObserverTokens
-        }
+        if let presenceObserver { NotificationCenter.default.removeObserver(presenceObserver) }
+        presenceObserver = nil
         let center = NSWorkspace.shared.notificationCenter
-        for token in tokens { center.removeObserver(token) }
+        for token in workspaceObserverTokens { center.removeObserver(token) }
+        workspaceObserverTokens = []
         let distributed = DistributedNotificationCenter.default()
         for token in lockTokens { distributed.removeObserver(token) }
         lockTokens = []
@@ -804,7 +880,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     }
 
     private var isStopping: Bool {
-        withLock { _stopping || _stopRequested }
+        withLock { _stopping || _stopRequested || _lifecycleState == .degraded }
     }
 
     // MARK: - Span handling (capture thread)
@@ -812,7 +888,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     private func seedFromFrontmostApplication() {
         if reconcileLocked() {
             feed(.lock(at: safeNow()))
-            standDownAway()
+            standDownCapture()
             return
         }
         let front = NSWorkspace.shared.frontmostApplication
@@ -862,7 +938,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         let locked = Self.isLockSignal(bundleId: bundleId, localizedName: appName) || reconcileLocked()
         if locked {
             feed(.lock(at: safeNow()))
-            standDownAway()
+            standDownCapture()
             return
         }
 
@@ -1061,13 +1137,13 @@ public final class ActivityWatcher: @unchecked Sendable {
         // (3) reconcile lock state — a missed notification self-heals in <= 60 s.
         if reconcileLocked() {
             feed(.lock(at: safeNow()))
-            standDownAway()
+            standDownCapture()
             return
         }
         // (2.5) publish presence crossings. Deliberately BEFORE the
         // open-span branch: while the person is away the span is closed, and
         // that is exactly the state the trigger scheduler most needs described.
-        standUpPresent()
+        publishPresence()
 
         guard let span = engine.openSpan else {
             // 2026-09-06: the idle close used to take the AX observer AND this
@@ -1086,18 +1162,11 @@ public final class ActivityWatcher: @unchecked Sendable {
             // seed a span — the frontmost app is one this watcher is not
             // allowed to record, and re-seeding would only re-derive that.
             guard !presenceOnlyWatch else { return }
-            // Motor-driven synthetic input is not the human coming back.
-            // 2026-09-06: the AX callback's fence (a 3 s epoch window) cannot
-            // carry this decision — this timer fires once a MINUTE, so an agent
-            // click 30 s ago has reset the system idle clock and is already out
-            // of the window, and the watch reopened the span on the agent's own
-            // input. The two AGES are compared instead: the system's last input
-            // has to be newer than the agent's last motor event by a margin
-            // before anyone but the human could have produced it.
-            let systemIdle = idleSecondsSinceLastInput()
-            let motorAge = NativeAgentMotorEpoch.secondsSinceLastAgentMotorEvent()
-            guard systemIdle.isFinite, systemIdle <= idleThreshold,
-                  systemIdle + Self.agentMotorSeparation < motorAge else { return }
+            // Capture starts without Input Monitoring and must resume without
+            // it too. Session activity after our motor output reopens capture;
+            // only publishPresence() carries the canonical presence fact.
+            guard let idle = MacPersonInput.sessionIdleAfterAgentMotor(),
+                  idle <= idleThreshold else { return }
             idleResumeWatch = false
             seedFromFrontmostApplication()
             return
@@ -1149,23 +1218,18 @@ public final class ActivityWatcher: @unchecked Sendable {
         lastPublishedPresence = present
     }
 
-    /// Lock and sleep publish away before capture stands down.
-    private func standDownAway() {
-        let now = clock.wallNow()
-        if now.isFinite { publish(present: false, at: now) }
+    /// Capture boundaries do not decide whether the person is here.
+    private func standDownCapture() {
+        publishPresence()
         detachObserver()
         stopTickTimer()
     }
 
-    /// Tick, unlock and wake share the same human-input provenance fence.
-    private func standUpPresent() {
+    /// Publish the person fact; unknown leaves the last known transition alone.
+    private func publishPresence() {
         let now = clock.wallNow()
-        guard now.isFinite else { return }
-        let systemIdle = idleSecondsSinceLastInput()
-        let motorAge = NativeAgentMotorEpoch.secondsSinceLastAgentMotorEvent()
-        guard systemIdle.isFinite, systemIdle >= 0,
-              systemIdle + Self.agentMotorSeparation < motorAge else { return }
-        publish(present: systemIdle <= idleThreshold, at: now)
+        guard now.isFinite, let fact = MacPersonInput.presence() else { return }
+        publish(present: fact.here, at: now)
     }
 
     /// Excluded apps still need present/away crossings, without app metadata.

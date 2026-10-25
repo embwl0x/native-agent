@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `NotificationChannelPreference.swift` | `NotificationChannelPreference` enum; `push`, `telegram` |
 
 /// Which ways out the app is allowed to use when it reaches for a person.
 ///

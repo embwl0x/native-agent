@@ -3,6 +3,7 @@ import ApprovalInbox
 import Foundation
 import PersistenceCore
 import TurnTrace
+// Blueprint: | `AgentACPApproval.swift` | `AgentACPApproval` enum; `connect`, `request` |
 
 /// A permission belongs to this live request only. Resolution uses the existing
 /// inbox and lifecycle edges; cancellation retires the card, never replays a turn.

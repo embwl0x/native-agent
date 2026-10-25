@@ -5,6 +5,7 @@ import PersistenceCore
 import TurnTrace
 import Transcripts
 import ProviderRouting
+// Blueprint: | `ChatSessionAutocompactor.swift` | `ChatSessionAutocompactor` struct; `compactIfNeeded`, `pruneCompactBackups`; ContactThread writes transcript and original-history bytes; `ChatSessionAutocompactionConfig` owns `effectiveWindowTokens` and the read-only `contextWindowReadout` used by page reads and runtime introspection. |
 
 public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
     /// Settings › Context window › Custom size (N tokens). The key keeps its
@@ -269,7 +270,7 @@ public struct ChatSessionAutocompactor: Sendable {
             if let below = belowFileThreshold(pass, trigger: trigger, force: force) {
                 return below.carrying(transcript)
             }
-            switch select(pass, rows: rows, trigger: trigger, force: force, keepTailFixed: false) {
+            switch try select(pass, rows: rows, trigger: trigger, force: force, keepTailFixed: false) {
             case .skip(let outcome):
                 return outcome.carrying(transcript)
             case .fold(let fold):
@@ -331,7 +332,7 @@ public struct ChatSessionAutocompactor: Sendable {
             if let below = belowFileThreshold(pass, trigger: trigger, force: false) {
                 return .nothing(below)
             }
-            switch select(pass, rows: rows, trigger: trigger, force: false, keepTailFixed: true) {
+            switch try select(pass, rows: rows, trigger: trigger, force: false, keepTailFixed: true) {
             case .skip(let outcome):
                 return .nothing(outcome)
             case .fold(let fold):
@@ -351,7 +352,7 @@ public struct ChatSessionAutocompactor: Sendable {
         let path = messagesPath(sessionId: fold.sessionId)
         return try await persistence.withFileLock(path) {
             let (rows, _) = try await readJSONLHonest(path)
-            return isCurrent(fold, rows: rows)
+            return try isCurrent(fold, rows: rows)
         }
     }
 
@@ -380,7 +381,7 @@ public struct ChatSessionAutocompactor: Sendable {
         )
         return try await persistence.withFileLock(path) {
             let (rows, _) = try await readJSONLHonest(path)
-            guard isCurrent(fold, rows: rows) else {
+            guard try isCurrent(fold, rows: rows) else {
                 return skipped(
                     sessionId: fold.sessionId,
                     reason: "source changed while distilling",
@@ -399,9 +400,9 @@ public struct ChatSessionAutocompactor: Sendable {
         }
     }
 
-    private func isCurrent(_ fold: AgingFold, rows: [JSONValue]) -> Bool {
+    private func isCurrent(_ fold: AgingFold, rows: [JSONValue]) throws -> Bool {
         let count = fold.source.count
-        return count > 0 && rows.count > count
+        return try count > 0 && rows.count > count
             && Array(rows.prefix(count)) == fold.source
             && Self.markSafeReplacementCount(
                 rows: rows,
@@ -525,7 +526,7 @@ public struct ChatSessionAutocompactor: Sendable {
         trigger: String,
         force: Bool,
         keepTailFixed: Bool
-    ) -> Selection {
+    ) throws -> Selection {
         let sessionId = pass.sessionId
         let effectiveThresholdTokens = pass.thresholdTokens
         let divisor = pass.divisor
@@ -578,7 +579,7 @@ public struct ChatSessionAutocompactor: Sendable {
             replaceCount: Self.markSafeReplacementCount(
                 rows: rows,
                 replaceCount: candidateReplaceCount,
-                mark: ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot)
+                mark: try ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot)
             )
         )
         // Clamped to a prefix with no raw turn left in it → this pass would
@@ -680,7 +681,7 @@ public struct ChatSessionAutocompactor: Sendable {
         let nextRows = fold.pendingRecollections + [summaryRow] + fold.pendingResults
             + fold.preservedCards + fold.kept
         try Task.checkCancellation()
-        let transcript = try writeRows(nextRows, to: messagesPath)
+        let transcript = try ContactThread.replace(nextRows, to: messagesPath)
         let sourceBytesAfter = Self.fileSize(messagesPath)
         let outcome = ChatSessionCompactionOutcome(
             sessionId: sessionId,
@@ -748,7 +749,7 @@ public struct ChatSessionAutocompactor: Sendable {
                     segments[index] = try JSONValue.object(object).serialize(pretty: false)
                     try Task.checkCancellation()
                     let rewritten = Data(segments.joined(separator: "\n").utf8)
-                    try SwiftNativePersistenceCore.writeDataAtomicDurable(rewritten, to: messagesPath)
+                    try ContactThread.replace(rewritten, to: messagesPath)
                     transcript = rewritten
                     if let rowIndex = rows.firstIndex(where: { row in
                         guard case .object(let fields) = row else { return false }
@@ -903,6 +904,8 @@ public struct ChatSessionAutocompactor: Sendable {
 
     /// Copies the live transcript aside and verifies it byte-for-byte before
     /// permitting the destructive rewrite.
+    /// Storage: compaction copies are excluded from local backup, data export
+    /// and raw phone sync; included in off-disk backup and PrivacyMap/chat.
     @discardableResult
     private func backupCurrentMessages(sessionId: String, messagesPath: URL) throws -> URL {
         guard FileManager.default.fileExists(atPath: messagesPath.path) else {
@@ -1047,27 +1050,12 @@ public struct ChatSessionAutocompactor: Sendable {
         }
         if output != existing {
             try FileManager.default.createDirectory(at: archive.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(output, to: archive)
+            try ContactThread.replace(output, to: archive)
         }
         let verified = Set(try lines(Data(contentsOf: archive)).map(\.line))
         guard source.allSatisfy({ verified.contains($0.line) }) else {
             throw NSError(domain: "NativeAgent.ChatCompactionArchive", code: 2)
         }
-    }
-
-    private func writeRows(_ rows: [JSONValue], to path: URL) throws -> Data {
-        var payload = Data()
-        for row in rows {
-            payload.append(Data((try row.serialize(pretty: false)).utf8))
-            payload.append(0x0A)
-        }
-        // Transcript REPLACEMENT is the one write that destroys its own source.
-        // `Data.write(.atomic)` renames without fsync, so a power loss between
-        // rename and writeback can leave the transcript truncated with the raw
-        // turns already gone. The durable writer fsyncs the temp file AND the
-        // parent directory before returning, and chmods 0600 exactly as before.
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(payload, to: path)
-        return payload
     }
 
     private func emitCompactionTrace(
@@ -1492,7 +1480,7 @@ enum ChatCompactionRowRendering {
         return ChatTranscriptEvidenceRendering.displayContent(
             body,
             originLabel: role == "user" && !isCompactionSummary
-                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(metadata?["origin"]) : nil,
+                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(obj, role: role) : nil,
             incompleteReplyLabel: role == "assistant" && !isCompactionSummary
                 ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: obj, metadata: metadata) : nil)
     }

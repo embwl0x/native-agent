@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `NativeAgentWidgetSnapshot.swift` | Shared widget wire and stale-activity interpretation; compiled directly into the widget extension |
 
 /// A display-only projection; the extension never opens the resident stores.
 @available(macOS 27, *)

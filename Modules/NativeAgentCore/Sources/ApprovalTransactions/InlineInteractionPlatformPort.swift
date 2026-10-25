@@ -2,7 +2,8 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
-import ChatOrchestration
+import ChatToolRuntime
+// Blueprint: | `InlineInteractionPlatformPort.swift` | `InlineInteractionPlatformPort` protocol; platform probes/acquisition and activation/System Settings quit events for non-polling card settlement; GrantWatch consumes them in BackgroundLoops' resident body, coalescing taps and retiring each card's refresher |
 
 /// App/platform facts and effects; card authority stays with the resolver.
 @MainActor

@@ -4,6 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import Transcripts
+// Blueprint: | `ChatCompactionDistiller.swift` | `ChatCompactionDistiller` struct; `maxSummaryChars`, `thirdPersonSubjectCount`; transcript replacements and index commits use Transcripts' storage owners |
 
 /// Recollection from the preserved source, with a repair owed on failure.
 /// A turn waits on a pending one a foreground compaction wrote; the aging lane
@@ -360,7 +361,7 @@ public struct ChatCompactionDistiller: Sendable {
                 // Rejoining the untouched segments reproduces the original
                 // bytes exactly — blank lines and final-newline state included.
                 try Task.checkCancellation()
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                try ContactThread.replace(
                     Data(segments.joined(separator: "\n").utf8), to: messagesPath)
                 return "ok"
             }
@@ -739,14 +740,11 @@ public struct ChatCompactionDistiller: Sendable {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions.json")
         do {
-            try await persistence.withFileLock(sessionsPath) {
-                var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+            try await ChatSessionIndexFile.mutate(at: sessionsPath, using: persistence) { rows in
                 guard let index = rows.firstIndex(where: {
                     $0["id"] == .string(sessionId)
                 }) else { return }
                 ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index])
-                let out = try ChatSessionIndexFile.serializedData(for: rows)
-                try await persistence.writeDataAtomicDurable(out, to: sessionsPath)
             }
         } catch {
             nativeLog("Chat transcript generation bump failed: \(error)")

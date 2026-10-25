@@ -4,6 +4,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+// Blueprint: | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`: `impl_tool_result_page`; retained-response search coverage and source-positioned matching records |
 
 /// Lossless, turn-scoped spill storage for provider results that are too large
 /// to inject in one model message. Files live under the user's private temp
@@ -93,6 +94,8 @@ package actor ProviderToolResultRecoveryStore {
         var sectionPages: (query: String, pages: [[JSONValue]])?
     }
 
+    // Turn-scoped UTF-8 envelopes in OS temporary storage, excluded from
+    // backup/export/phone sync and the data-root PrivacyMap; expiry owns removal.
     private let root: URL
     private var entries: [String: Entry] = [:]
     private var totalBytes = 0

@@ -5,6 +5,8 @@ import PersistenceCore
 import CryptoKit
 #endif
 
+// Blueprint: | `MacControlOperationStore.swift` | `MacControlOperationStore`: canonical payload-free operation lifecycle, request digests, cancellation settlement and motor projection |
+
 /// Canonical, payload-free lifecycle state for one Mac Control operation.
 ///
 /// The action body, shell text, file contents, and application content never
@@ -97,13 +99,13 @@ public enum MacControlOperationStoreError: Error, Sendable, Equatable, Localized
 
     public var errorDescription: String? {
         switch self {
-        case .invalidOperationId: return "invalid Mac Control operation identity"
-        case .corruptStore: return "Mac Control operation store is corrupt"
-        case .operationNotFound: return "Mac Control operation was not found"
-        case .actionMismatch: return "Mac Control operation identity belongs to another action"
-        case .requestMismatch: return "Mac Control operation identity belongs to another request"
+        case .invalidOperationId: return "invalid_operation_id: Use operation_id with 1–128 UTF-8 bytes: letters, numbers, dot, underscore, colon or hyphen."
+        case .corruptStore: return "mac_operation_store_corrupt: Repair mac_control/operations.json under the app data root, preserving the original bytes. Inspect affected apps with mac.look before any further action; prior effects are not established by this error."
+        case .operationNotFound: return "mac_operation_not_found: No record exists for this operation_id. Check the identity from its original receipt; inspect the affected app with mac.look before creating new work."
+        case .actionMismatch: return "operation_action_mismatch: This operation_id belongs to another action. Use the original receipt to reconcile that action before assigning a new operation_id to different work."
+        case .requestMismatch: return "operation_request_mismatch: This operation_id belongs to another request. Reconcile the original receipt before assigning a new operation_id to changed args."
         case .illegalTransition(let from, let to):
-            return "illegal Mac Control transition: \(from.rawValue) -> \(to.rawValue)"
+            return "illegal_mac_operation_transition: \(from.rawValue) -> \(to.rawValue). Preserve the existing record in mac_control/operations.json and inspect the affected app with mac.look; do not replay the action to repair its lifecycle."
         }
     }
 }
@@ -261,6 +263,31 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
     public func record(operationId: String) async throws -> MacControlOperationRecord? {
         let snapshot = try await load()
         return snapshot.operations.first { $0.operationId == operationId }
+    }
+
+    /// Register before reading: every durable writer, including another store
+    /// instance or process, wakes settlement. The caller owns the grace, not
+    /// the lifetime of the still-running execution.
+    func waitForCancellationSettlement(operationId: String, until deadline: ContinuousClock.Instant) async throws -> MacControlOperationRecord? {
+        let changes = FileChangeEvents(paths: [path])
+        defer { changes.cancel() }
+        return try await withThrowingTaskGroup(of: MacControlOperationRecord?.self) { group in
+            defer { group.cancelAll() }
+            group.addTask { [self] in
+                for await _ in changes.stream {
+                    try Task.checkCancellation()
+                    let current = try await record(operationId: operationId)
+                    if current?.state != .cancelRequested { return current }
+                }
+                try Task.checkCancellation()
+                return nil
+            }
+            group.addTask {
+                try await Task.sleep(until: deadline, clock: .continuous)
+                return nil
+            }
+            return try await group.next() ?? nil
+        }
     }
 
     /// On restart no process can still be owned by the prior app instance.

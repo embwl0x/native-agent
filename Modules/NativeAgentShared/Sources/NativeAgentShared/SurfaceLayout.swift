@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `SurfaceLayout.swift` | `SurfaceLayout` struct: the layout document's shape, vocabulary and seed; `addMissing`, `shown`, `arranged` for the Mac and the phone; `QuietToolPage` owns the shared page definitions including inbox/unindexed reads; `AppDoorNames` shares page/item aliases and derives accepted part face pages from those definitions |
 
 public struct QuietToolPage: Sendable, Equatable {
     public let id: String
@@ -10,7 +11,7 @@ public struct QuietToolPage: Sendable, Equatable {
 
     public static let all: [QuietToolPage] = [
         QuietToolPage(id: "chat", title: "Chat",
-                  summary: "Conversations, attachments, voice, sessions, and the agent's name and status. Screen controls are separate from background history: page:chat + item:<conversation id> reads 8 messages or args {limit} up to 16. Resolve with chat.list; chat.search {session_id, sort:newest, limit:12} without query reads older history through next_call; chat.message reads full truncated bodies."),
+                  summary: "Conversations, attachments, voice, agent name and status. Background read: page:chat, item:<conversation id>, 8 messages (args {limit}: max 16). Resolve with chat.list; older history: chat.search {session_id, sort:newest, limit:12}, no query; follow next_call. chat.message expands clipped bodies. Screen controls are separate actions."),
         QuietToolPage(id: "today", title: "Today",
                   summary: "Notifications, approvals, proposals, recent work, and what is waiting."),
         QuietToolPage(id: "memories", title: "Memories",
@@ -28,11 +29,9 @@ public struct QuietToolPage: Sendable, Equatable {
         QuietToolPage(id: "trust", title: "Trust",
                   summary: "Presets, feature permissions, approvals, and Mac integration access."),
         QuietToolPage(id: "connectors", title: "Connectors",
-                  summary: "Service connections, with MCP, Telegram and iPhone tabs."),
+                  summary: "Service connections, with Agents, Telegram and iPhone tabs."),
         QuietToolPage(id: "telegram", title: "Telegram",
                   summary: "Telegram on or off, who may reach the agent, mention-only, its model, test reply and logs."),
-        QuietToolPage(id: "mcp", title: "MCP",
-                  summary: "MCP servers with Warm, Restart and Refresh, the consents granted, and each server's tools as mcp.<server>.<tool> actions."),
         QuietToolPage(id: "mac_integration", title: "Mac Integration",
                   summary: "Read and write access per Mac app: Calendar, Mail, Messages, Notes and the rest."),
         QuietToolPage(id: "pairing", title: "iPhone pairing",
@@ -43,31 +42,24 @@ public struct QuietToolPage: Sendable, Equatable {
         // its access or connection, and its actions. A Mac app's page is
         // where User sets its access (Trust → Mac integration).
         QuietToolPage(id: "mail", title: "Mail",
-                  summary: "Apple Mail (every account added to Mail, Gmail included), the separate Gmail API connector and AgentMail: read, search, triage, send and reply."),
+                  summary: "Apple Mail (every account added to Mail, Gmail included): read, search, triage, send and reply."),
         QuietToolPage(id: "calendar", title: "Calendar",
-                  summary: "Calendar and Google Calendar: events, free/busy, create, change, delete and invitations."),
+                  summary: "Calendar: events, free/busy, create, change and delete."),
         QuietToolPage(id: "reminders", title: "Reminders",
                   summary: "Reminders: due today, search, read, create, update, complete and delete."),
         QuietToolPage(id: "notes", title: "Notes", summary: "Apple Notes: search, create and update."),
         QuietToolPage(id: "contacts", title: "Contacts",
                   summary: "Contacts: search, create or update, and delete."),
         QuietToolPage(id: "messages", title: "Messages", summary: "Messages: recent threads, and send."),
-        QuietToolPage(id: "github", title: "GitHub",
-                  summary: "Repositories, issues, pull requests, notifications and project tracking."),
-        QuietToolPage(id: "slack", title: "Slack", summary: "Slack channels, search and posting."),
-        QuietToolPage(id: "notion", title: "Notion", summary: "Notion search and pages."),
-        QuietToolPage(id: "x", title: "X",
-                  summary: "X (Twitter): your account, search, timeline and a user's posts."),
-        QuietToolPage(id: "markets", title: "Markets",
-                  summary: "Quotes and watchlists, TradingView's among them."),
+        QuietToolPage(id: "slack", title: "Slack", summary: "Slack's connection and the model the agent answers Slack with."),
         // Her hands on the Mac and the web. Files, the shell and the browser
-        // are Trust's to allow; the web's search is the SearXNG MCP server.
+        // are Trust's to allow.
         QuietToolPage(id: "files", title: "Files",
                   summary: "Read, list, search, excerpt and write files; apply a patch; Spotlight."),
         QuietToolPage(id: "shell", title: "Shell",
                   summary: "Shell commands, git, Swift builds and tests, remote nodes, and restarting or installing the app."),
         QuietToolPage(id: "web", title: "Web",
-                  summary: "Read a public page privately, and search or fetch the web with SearXNG."),
+                  summary: "Read a public page privately, and search the web."),
         QuietToolPage(id: "browser", title: "Browser",
                   summary: "The NativeAgent browser and your own Chrome tab: open, read, links, screenshots, clicks and forms."),
         // Her hands on the Mac itself: Full Mac's accessibility category is
@@ -81,9 +73,9 @@ public struct QuietToolPage: Sendable, Equatable {
         QuietToolPage(id: "diagnostics", title: "Diagnostics",
                   summary: "Doctor, Status, Runs log, Cognition and Inspector."),
         QuietToolPage(id: "skills", title: "Skills",
-                  summary: "Installed skills: read, run, write and manage them."),
+                  summary: "Built-in guidance from the persona, to read."),
         QuietToolPage(id: "tools", title: "Tools",
-                  summary: "Available tools, their access, and tools the agent wrote."),
+                  summary: "Available tools and their access, and the abilities the agent grew: read, save, keep and manage them."),
         QuietToolPage(id: "settings", title: "Settings",
                   summary: "Appearance, shortcuts, updates, and the switches for an inner life, dreams and memory."),
     ]
@@ -116,16 +108,16 @@ public enum AppDoorNames {
         "trust center": "trust", "trust_center": "trust", "permissions": "trust",
         "setup": "settings", "preferences": "settings", "iphone": "pairing", "phone": "pairing",
         "pair": "pairing", "pairing devices": "pairing", "iphone pairing": "pairing", "chrome": "browser",
-        "ongoing": "desk", "computer": "mac", "skill": "skills", "agent": "agents",
+        "ongoing": "desk", "computer": "mac", "skill": "skills", "agent": "agents", "abilities": "tools", "ability": "tools",
         "bot": "bots", "helpers": "bots", "connector": "connectors", "mac integration": "mac_integration",
         "skills & tools": "skills",
-        "twitter": "x", "stocks": "markets", "health": "status", "doctor": "diagnostics/doctor",
+        "health": "status", "doctor": "diagnostics/doctor",
     ]
 
     /// Places without a rail page keep their own room and all of its capabilities.
     public static let homeItems: Set<String> = [
         "research", "replies", "create", "connections", "crews", "delegations", "code",
-        "gmail", "agentmail", "gcal", "notify", "status", "activity",
+        "notify", "status", "activity",
     ]
 
     public static func resolve(_ raw: String) -> String {
@@ -134,16 +126,16 @@ public enum AppDoorNames {
     }
 
     public static let items: [String: [String: String]] = [
-        "chat": ["<conversation id>": "background read with page:chat and item:<conversation id>: the composer and latest messages, 8 or args {limit} up to 16 messages, with whether app chat.reply can answer it. "
-                 + "For older history, resolve with chat.list, then chat.search {session_id, sort:newest, limit:12} without query; follow next_call and use chat.message for full truncated bodies. Screen controls are separate actions."],
+        "chat": ["<conversation id>": "background read: page:chat, item:<conversation id>; composer, latest 8 messages (args {limit}: max 16), and chat.reply eligibility. "
+                 + "Resolve with chat.list; older history: chat.search {session_id, sort:newest, limit:12}, no query; follow next_call. chat.message expands clipped bodies. Screen controls are separate actions."],
         "inbox": ["all": "compact notes newest first, archived and dismissed too, up to 200; read a note id for details and actions"],
         "desk": ["<exact title or handle>": "the matching Desk record; duplicate titles require the exact desk number"],
         "diagnostics": ["doctor": "Doctor's last report; run doctor.run for fresh checks"],
         "telegram": ["status": "the poller's health, config and log freshness; never tokens or ids"],
-        "skills": ["<skill name>": "the routine's description, signature, status, selected version and admission",
+        "skills": ["<skill name>": "the built-in guidance, as ability.read reads it",
                    "census": "conversion progress and blockers, including preserved historical originals"],
-        "tools": ["<tool id>": "the selected digest, retained versions and validation results, and what rollback or drop would do",
-                  "census": "Your ability census: what tools, skills and senses you have, and what you built yourself. Lists authored tools, skill routines and persona procedures, senses, active and retired statuses, retained versions, orphan proposals, conversion counterparts and cutover blockers."],
+        "tools": ["<ability id or name>": "what the ability declares, its status, versions and validation, and its code in pages",
+                  "census": "Abilities, persona procedures, senses and built-in guidance: what you grew, active/retired status, retained/waiting versions, conversion counterparts and cutover blockers."],
     ]
 }
 
@@ -191,8 +183,8 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
     /// Home's PLACES rows: the places seed, and where a row breaks.
     public static let placeRows: [[String]] = [
         ["mail", "calendar", "desk", "files", "browser"],
-        ["memory", "skills", "research", "messages", "reminders", "today", "replies", "create", "connections", "crews", "delegations", "code", "github"],
-        ["gmail", "agentmail", "notes", "contacts", "music", "markets", "x", "slack", "notion", "gcal", "notify", "status", "activity", "app"],
+        ["memory", "skills", "research", "messages", "reminders", "today", "replies", "create", "connections", "crews", "delegations", "code"],
+        ["notes", "contacts", "music", "slack", "notify", "status", "activity", "app"],
     ]
 
     /// Every surface, what it is, and its blocks in seed order with what each
@@ -222,7 +214,7 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
         ("tabs.memories", "Memories' tabs, left to right", [("memories", ""), ("knowledge", "Knowledge graph")]),
         ("tabs.personality", "Personality's tabs, left to right", [("personality", ""), ("minds", "My minds"), ("dreams", "")]),
         ("tabs.trust", "Trust's tabs, left to right", [("trust", "Access"), ("features", ""), ("mac", ""), ("advanced", "")]),
-        ("tabs.connectors", "Connectors' tabs, left to right", [("connectors", ""), ("agents", ""), ("mcp", ""), ("telegram", ""), ("iphone", "")]),
+        ("tabs.connectors", "Connectors' tabs, left to right", [("connectors", ""), ("agents", ""), ("telegram", ""), ("iphone", "")]),
         ("tabs.capabilities", "Capabilities' tabs, left to right", [("capabilities", "What I can do"), ("installed", "What's installed"), ("senses", "")]),
         ("tabs.diagnostics", "Diagnostics' tabs, left to right", [
             ("Doctor", "Health checks"), ("Status", ""), ("Runs Log", "Run history"), ("Cognition", ""),

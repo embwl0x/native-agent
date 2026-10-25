@@ -1,6 +1,6 @@
 import ApprovalInbox
 import Transcripts
-import ChatOrchestration
+import ChatTurnRuntime
 import ApprovalTransactions
 import Foundation
 import Observation
@@ -9,6 +9,7 @@ import AgentWorkspace
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `TranscriptReadProjection.swift` | transcript/read caches; `ChatShellConversationRow`: `isWorking`, `preview`, `isBridgeRouted`; conversation and running-session routes, turn card/trouble projection and native title-source classification. Stored human titles stay native; automated title prose is removed to the batched `presentation-copy.js` face before TranscriptsFacade publishes. No render-triggered naming or view-owned anchor reader |
 
 /// A conversation row's two lines. The list must never show a machine id: a
 /// Telegram chat id or an iOS session hash tells a person nothing, and the
@@ -122,42 +123,16 @@ public enum ChatShellConversationRow {
     ///  3. "New conversation".
     ///
     /// The last message is never a source. No summarizer, no model call.
-    public static func title(for session: NativeAgentShared.ChatSession, openingLine: String?) -> String {
-        let stored = stripBridgePrefix(session.title)
-        if !isMachineTitle(stored, session: session) { return startedTitle(stored) ?? clamp(plainText(stored)) }
-        let opening = stripBridgePrefix(openingLine ?? "")
-        if !opening.isEmpty { return startedTitle(opening) ?? clamp(plainText(opening)) }
-        return "New conversation"
-    }
-
-    /// A conversation the app started for me opens with its own plumbing (a
-    /// wake note, a Codex completion, a helper's brief), and the stored title
-    /// is cut from that. Name it for what it is. Sessions carry no "titled by
-    /// the person" mark, so only the exact machine openings match, case and
-    /// punctuation included: a title the person chose ("Codex turn stalled
-    /// investigation") is never touched.
-    public static func startedTitle(_ opening: String) -> String? {
-        let text = opening.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.hasPrefix("[Woken by ") {
-            let reason = text.dropFirst("[Woken by ".count)
-            if reason.hasPrefix("my queue") { return "Woke up for my queue" }
-            if reason.hasPrefix("what resolved") { return "Woke up when something finished" }
-            if reason.hasPrefix("something worth sharing") { return "Woke up with something to share" }
-            return "Woke up on my own"
-        }
-        // The first line of `script/wake_reply_delivery.js`'s envelope, and
-        // only that: a full sentence with its full stop.
-        if text.contains(/^Codex (replied to (your message|\d+ queued messages)|(wakeup failed|turn stalled|wakeup produced no reply)( for \d+ queued messages)?)\.(\s|$)/) {
-            return "Codex check-in"
-        }
-        let standing = "Current standing instructions for "
-        if text.hasPrefix(standing) {
-            let rest = text.dropFirst(standing.count)
-            let name = rest.prefix { $0 != ":" && $0 != "\n" }.trimmingCharacters(in: .whitespaces)
-            guard !name.isEmpty else { return "A helper's run" }
-            return clamp(name.lowercased().hasSuffix("helper") ? name : "Helper: \(name)")
-        }
-        return nil
+    public static func titleSource(for session: NativeAgentShared.ChatSession, openingLine: String?) -> (text: String, automated: Bool) {
+        let stored=stripBridgePrefix(session.title), opening=stripBridgePrefix(openingLine ?? "")
+        let candidate = !isMachineTitle(stored,session:session) ? stored : opening
+        if candidate.isEmpty { return ("New conversation",false) }
+        let text=candidate.trimmingCharacters(in:.whitespacesAndNewlines)
+        // Exact historical machine envelopes classify source identity. Human
+        // titles keep the native title path; editable copy cannot rename them.
+        let automated=text.hasPrefix("[Woken by ") || text.hasPrefix("Current standing instructions for ")
+            || text.contains(/^Codex (replied to (your message|\d+ queued messages)|(wakeup failed|turn stalled|wakeup produced no reply)( for \d+ queued messages)?)\.(\s|$)/)
+        return automated ? (text,true) : (clamp(plainText(candidate)),false)
     }
 
     public static func preview(for session: NativeAgentShared.ChatSession) -> String {
@@ -222,7 +197,7 @@ public enum ChatShellConversationRow {
     public static let localSurface = "Mac"
 
     /// Cut at a word boundary, never mid-word.
-    private static func clamp(_ value: String, limit: Int = titleLimit) -> String {
+    static func clamp(_ value: String, limit: Int = titleLimit) -> String {
         let flat = value.replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard flat.count > limit else { return flat }
@@ -348,7 +323,7 @@ public final class ChatShellOpeningLine {
         var lastTurn: String? = nil
     }
     @ObservationIgnored private var cache: [String: Projection] = [:]
-    @ObservationIgnored private var warmGate = LatestAsyncRequestGate()
+    @ObservationIgnored private let warmRead = LatestRead()
     public private(set) var revision: UInt64 = 0
 
     private init() {}
@@ -368,22 +343,19 @@ public final class ChatShellOpeningLine {
     }
 
     public func prepare(_ sessions: [NativeAgentShared.ChatSession], dataRoot: URL) async throws {
-        let request = beginWarm()
-        let projections = try await ChatTranscriptCache.shared.shellProjections(
-            for: sessions, dataRoot: dataRoot, cached: request.cached
-        )
-        try Task.checkCancellation()
-        settleWarm(request.generation, projections: projections)
+        _ = try await prepareProjections(sessions, dataRoot: dataRoot)
     }
 
-    func beginWarm() -> (generation: UInt64, cached: [String: Projection]) {
-        (warmGate.begin(), cache)
-    }
-
-    func settleWarm(_ generation: UInt64, projections: [String: Projection]) {
-        guard warmGate.accepts(generation), cache != projections else { return }
-        cache = projections
-        revision &+= 1
+    func prepareProjections(_ sessions: [NativeAgentShared.ChatSession], dataRoot: URL) async throws -> [String: Projection] {
+        try await warmRead.read({
+            let projections = try await ChatTranscriptCache.shared.shellProjections(for: sessions, dataRoot: dataRoot, cached: cache)
+            try Task.checkCancellation()
+            return projections
+        }, publish: { projections in
+            guard cache != projections else { return }
+            cache = projections
+            revision &+= 1
+        })
     }
 
     nonisolated static func revision(for session: NativeAgentShared.ChatSession) -> String {
@@ -502,30 +474,6 @@ public final class ChatShellOpeningLine {
     }
 }
 
-/// Writes a resolved opening line back as the session's title, once per
-/// session per process, through the same rename path the row's context menu
-/// uses. Nothing is written for a session that already has a real title.
-@MainActor
-public enum ChatShellNaming {
-    private static var settled = Set<String>()
-
-    public static func settle(_ session: NativeAgentShared.ChatSession, transcripts: TranscriptsFacade, rename: @escaping @MainActor (String, String) async -> Void) {
-        guard !settled.contains(session.id),
-              ChatShellConversationRow.isMachineTitle(
-                ChatShellConversationRow.stripBridgePrefix(session.title), session: session),
-              let line = ChatShellOpeningLine.shared.line(for: session)
-        else { return }
-        settled.insert(session.id)
-        let title = ChatShellConversationRow.plainText(
-            ChatShellConversationRow.stripBridgePrefix(line))
-        guard !title.isEmpty else { return }
-        Task {
-            guard transcripts.sessions.first(where: { $0.id == session.id })?.title == session.title else { return }
-            await rename(session.id, title)
-        }
-    }
-}
-
 extension ChatShellConversationRow {
     /// A session with messages where no person ever spoke: her morning briefs
     /// and other things she started on her own.
@@ -537,13 +485,10 @@ extension ChatShellConversationRow {
         return ChatShellOpeningLine.shared.line(for: session) == nil
     }
 
-    /// The view-side entry point: resolves the opening line only for the rows
-    /// that need one, and leaves every other row on its stored title.
+    /// Render the title already resolved by TranscriptsFacade.
     @MainActor
     public static func title(for session: NativeAgentShared.ChatSession) -> String {
-        let stored = stripBridgePrefix(session.title)
-        guard isMachineTitle(stored, session: session) else { return title(for: session, openingLine: nil) }
-        return title(for: session, openingLine: ChatShellOpeningLine.shared.line(for: session))
+        session.displayTitle
     }
 }
 
@@ -677,20 +622,10 @@ public struct MacChatRunningSessionRoute: Sendable, Equatable {
         return fallbackTitle(sessionId: sessionId)
     }
 
-    /// Preserve `ChatSession.displayTitle` semantics without calling its
-    /// unbounded trim/prefix implementation on attacker-influenced text.
+    /// Bound the engine's resolved display title for a single menu line.
     private static func displayTitle(session: NativeAgentShared.ChatSession?, sessionId: String) -> String {
         guard let session else { return fallbackTitle(sessionId: sessionId) }
-        let storedTitle = sanitize(session.title)
-        if let storedTitle,
-           !storedTitle.isEmpty,
-           storedTitle != NativeAgentShared.ChatSession.placeholderTitle {
-            return storedTitle
-        }
-        if let preview = sanitize(session.lastMessagePreview), !preview.isEmpty {
-            return preview
-        }
-        return storedTitle ?? fallbackTitle(sessionId: sessionId)
+        return sanitize(session.displayTitle) ?? ""
     }
 
     /// Strip everything that could break out of a single menu line, collapse
@@ -851,8 +786,6 @@ public final class ChatContentCache<Value>: @unchecked Sendable {
         }
     }
 }
-
-
 /// Display-only projection of one accepted turn. Every field is derived; none
 /// is stored, mutated, or remembered by the view layer.
 public struct MacChatTurnCardModel: Sendable, Equatable {
@@ -907,7 +840,7 @@ public struct MacChatTurnCardModel: Sendable, Equatable {
     public var thinkingSince: Date? = nil
     /// Her reply text is arriving and nothing else is going on: the line
     /// that said "Thinking…" says how long she thought.
-    public var isReplying = false
+    public var thoughtFor: TimeInterval? = nil
 
     /// Raw inputs for the trailing readout. Deliberately the same three
     /// timestamps the projection uses, so the self-advancing readout and a
@@ -1099,7 +1032,8 @@ public enum MacChatTurnCardProjection {
                 isTerminal: isTerminal
             ),
             thinkingSince: plain && presentation.streamedTextLength == 0 ? presentation.startedAt : nil,
-            isReplying: plain && presentation.streamedTextLength > 0
+            thoughtFor: plain && presentation.streamedTextLength > 0
+                ? presentation.firstReplyAt.map { $0.timeIntervalSince(presentation.startedAt) } : nil
         )
     }
 
@@ -1424,34 +1358,5 @@ extension ChatShellConversationRow {
         guard !relative.isEmpty else { return place }
         guard place != localSurface else { return relative }
         return "\(place) · \(relative)"
-    }
-
-}
-
-
-/// The anchor as the pin strip reads it.
-///
-/// The anchor is whichever remote conversation is currently live — User's phone
-/// chat today, any surface he connects tomorrow — and the strip merges it in
-/// front of his own pins without ever writing it into them.
-///
-@MainActor
-@Observable
-public final class MacConversationAnchorReading {
-    public private(set) var sessionId: String?
-
-    public init() {}
-
-    public func watch(root: URL) async {
-        let events = FileChangeEvents(paths: [ConversationAnchor.path(dataRoot: root)], emitInitial: true)
-        await withTaskCancellationHandler {
-            for await _ in events.stream {
-                let id = await Task.detached(priority: .userInitiated) {
-                    ConversationAnchor.currentSessionId(dataRoot: root)
-                }.value
-                guard !Task.isCancelled else { break }
-                if sessionId != id { sessionId = id }
-            }
-        } onCancel: { events.cancel() }
     }
 }

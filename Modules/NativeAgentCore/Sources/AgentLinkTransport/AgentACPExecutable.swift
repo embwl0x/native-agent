@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import os
+// Blueprint: | `AgentACPExecutable.swift` | `AgentACPExecutable` struct; `capture`, `verify` |
 
 /// The executable the person saw. Never resolve PATH again when sending.
 public struct AgentACPExecutable: Codable, Sendable, Equatable {

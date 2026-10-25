@@ -6,6 +6,8 @@
 import Foundation
 import CryptoKit
 
+// Blueprint: | `BridgeMessage.swift` | `BridgeMessage`: shared signed device envelope, canonical HMAC body, exact reply correlation and inner approval signature validation |
+
 // MARK: - Message model (shared wire format for outbox JSON files)
 
 public struct BridgeMessage: Codable, Identifiable, Sendable {
@@ -97,6 +99,47 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         return Data(mac).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Equal-length UTF-8 comparison without short-circuiting on differing bytes.
+    public static func constantTimeEqual(_ a: String, _ b: String) -> Bool {
+        let aBytes = Array(a.utf8), bBytes = Array(b.utf8)
+        guard aBytes.count == bBytes.count else { return false }
+        var diff: UInt8 = 0
+        for i in aBytes.indices { diff |= aBytes[i] ^ bBytes[i] }
+        return diff == 0
+    }
+
+    /// The inner action envelope signs sorted JSON with its signature removed.
+    /// Its case-insensitive hex rule is distinct from the outer message's wire rule.
+    public static func innerActionSignatureError(data: Data, signature sig: String, secret: () throws -> Data) -> String? {
+        // S.11: reject obviously wrong-format signatures before computing HMAC.
+        let hexChars = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
+        if sig.count != 64 || sig.unicodeScalars.contains(where: { !hexChars.contains($0) }) {
+            return "signature wrong format (expected 64 hex chars, got \(sig.count) chars)"
+        }
+
+        // Reconstruct canonical body: re-encode with sorted keys, signature excluded.
+        guard let original = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "cannot re-parse JSON for HMAC"
+        }
+        var withoutSig = original
+        withoutSig.removeValue(forKey: "signature")
+        guard let canonical = try? JSONSerialization.data(withJSONObject: withoutSig, options: [.sortedKeys]) else {
+            return "cannot re-serialize for HMAC"
+        }
+        let expected: String
+        do {
+            expected = BridgeMessage.hmacHex(of: canonical, secret: try secret())
+        } catch {
+            return "pairing secret unavailable: \(error.localizedDescription)"
+        }
+        // Inner action signatures accept uppercase hex; outer messages remain exact.
+        let sigLower = sig.lowercased()
+        if !constantTimeEqual(sigLower, expected) {
+            return "HMAC mismatch — possible tampering or wrong pairing secret"
+        }
+        return nil // valid
+    }
+
     /// Returns a copy of self with `signature` populated.
     public func signed(with secret: Data) throws -> BridgeMessage {
         let canonical = try canonicalBodyForSigning()
@@ -113,11 +156,7 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         do {
             let canonical = try canonicalBodyForSigning()
             let expected = Self.hmacHex(of: canonical, secret: secret)
-            let a = Array(sig.utf8), b = Array(expected.utf8)
-            guard a.count == b.count else { return false }
-            var diff: UInt8 = 0
-            for i in 0..<a.count { diff |= a[i] ^ b[i] }
-            return diff == 0
+            return Self.constantTimeEqual(sig, expected)
         } catch {
             return false
         }

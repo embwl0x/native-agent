@@ -5,6 +5,8 @@ import CognitiveSubstrate
 import Context
 import PersistenceCore
 
+// Blueprint: | `CognitionObservatoryView+Shared.swift` | Observatory shared rows/count badges: explicit zero stays visible; unavailable or malformed counts never become fabricated badges |
+
 /// The collapsed Observatory header has two materially different no-number
 /// states: an explicit empty count and a count that was not available from its
 /// producer. Keep that distinction at the presentation boundary so every

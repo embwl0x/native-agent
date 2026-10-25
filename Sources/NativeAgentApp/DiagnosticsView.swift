@@ -1,11 +1,11 @@
 import DoctorChecks
+
+// Blueprint: | `DiagnosticsView.swift` | `DiagnosticsView` and refresh coalescer: one sequential shared snapshot across status/runs segments, with legacy tab routing |
 // Move-only extraction (tightness Wave C) from SidebarFlattenViews.swift
 
 import SwiftUI
 import Context
-import NativeAgentShared
 import NativeAgentCore
-import TurnTrace
 
 // MARK: - Diagnostics (Advanced tab)
 
@@ -48,7 +48,6 @@ struct DiagnosticsView: View {
     @State private var refreshCoalescer = DiagnosticsRefreshCoalescer()
     @State private var isRefreshingSnapshot = false
     @State private var showsModelCalls = false
-    @State private var modelCalls = ""
 
     /// Landing segment. The retired Cognition and Inspector tabs alias into
     /// Diagnostics (fence-A routing) by opening on their own segment:
@@ -133,16 +132,16 @@ struct DiagnosticsView: View {
                     } else {
                         Text("Unavailable").foregroundStyle(.secondary)
                     }
-                case .inspector: InspectorView()
+                case .inspector: InspectorView(feed: appModel.engine.trace)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
             DisclosureGroup("Model calls", isExpanded: $showsModelCalls) {
-                Text(modelCalls).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                Button("Refresh") { Task { await readModelCalls() } }
+                Text(appModel.engine.cognitionView.modelCalls).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                Button("Refresh") { Task { await appModel.engine.cognitionView.refreshModelCalls() } }
             }
             .onChange(of: showsModelCalls) { _, expanded in
-                if expanded { Task { await readModelCalls() } }
+                if expanded { Task { await appModel.engine.cognitionView.refreshModelCalls() } }
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -156,12 +155,6 @@ struct DiagnosticsView: View {
             guard nextMode == .status || nextMode == .runs else { return }
             Task { await refreshSnapshot() }
         }
-    }
-
-    private func readModelCalls() async {
-        let firstOutputs = await appModel.engine.cognitionView.runtime?.providerFirstOutputs() ?? "First outputs: cognition is not running."
-        do { modelCalls = firstOutputs + "\n\n" + (try await TurnTraceRecentReader(dataRootOverride: appModel.dataRootOverride).modelCalls().serialize(pretty: true)) }
-        catch { modelCalls = UserFacingError.cause(error, action: "read model calls") }
     }
 
     /// The header's one sentence, from the last health check. Nil before one

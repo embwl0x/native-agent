@@ -5,6 +5,7 @@ import ChromeControl
 import PersistenceCore
 import NativeAgentCore
 import TrustCenter
+// Blueprint: | `ChromeExtensionFolder.swift` | `ChromeExtensionFolder` alias to `ChromeControl.ChromeExtensionFolder`; app-bound `setUp`, `setupMessage` |
 
 typealias ChromeExtensionFolder = ChromeControl.ChromeExtensionFolder
 

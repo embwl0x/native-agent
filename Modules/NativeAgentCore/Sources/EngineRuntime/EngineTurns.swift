@@ -1,7 +1,10 @@
 import Transcripts
 import Foundation
 import Observation
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatToolRuntime
+import ChatSessionWork
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -9,6 +12,10 @@ import ProviderRouting
 import WorkshopExecution
 import TrustCenter
 import Dispatcher
+import Cognition
+import AppToolRuntime
+import Senses
+// Blueprint: | `EngineTurns.swift` | TurnsFacade owns turn lifecycle/Stop/queue/screen-preview presentation, one Capabilities trace feed without an extracted copy, and read-only Agent View pane text/subscriptions keyed by conversation and room; LatestRead orders trace publication and each pane independently. The preview binds L0's pure helper face to its native root without effects and preserves last-seen semantics |
 
 /// `NativeAgentEngine.turns` (S10): the Mac's running chat turns for one data
 /// root — which sessions are thinking, streaming and replying, each session's
@@ -20,8 +27,36 @@ import Dispatcher
 @MainActor
 @Observable
 public final class TurnsFacade {
+    public private(set) var capabilityTraceTimeline: CapabilityTraceFeed.State = .sourceAbsent
+    @ObservationIgnored private let tracesRead = LatestRead()
+    @ObservationIgnored private var paneReads: [String: [String: LatestRead]] = [:]
+
+    public func refreshCapabilityTraces() async {
+        _ = await tracesRead.read({ await CapabilityTraceFeed.read(dataRoot: dataRoot) },
+            publish: { capabilityTraceTimeline = $0 })
+    }
+
     public nonisolated let dataRoot: URL
     public nonisolated let runtime: MacChatTurnRuntime
+    public private(set) var agentScreenPanes: [String: [String: String]] = [:]
+
+    @discardableResult
+    public func readAgentScreen(room: String, scope: String) async -> String {
+        let latest = paneReads[scope]?[room] ?? LatestRead()
+        paneReads[scope, default: [:]][room] = latest
+        let host=AppToolExecutor.authoredProgramHost(dataRoot:dataRoot) { _,_ in nil }
+        return await OwnedProgramInvocation.$host.withValue(host) {
+            await latest.read({ await HerScreenPreview.paneText(room, root: dataRoot, scope: scope) },
+                publish: { agentScreenPanes[scope, default: [:]][room] = $0 })
+        }
+    }
+
+    public func observeAgentScreen(room: String, scope: String) async {
+        await EventDeadlinePhysiology.refreshOnChanges(paths: HerScreenPreview.watchedPaths.map { dataRoot.appendingPathComponent($0) },
+            notifications: [HerScreenPreview.didChange]) {
+            _ = await self.readAgentScreen(room: room, scope: scope)
+        }
+    }
 
     // PATCH-2026-05-13: parallel-sessions — per-session chat state so the user
     // can work in multiple sessions concurrently.
@@ -67,13 +102,6 @@ public final class TurnsFacade {
         get { runtime.activeTurnIDsBySession }
         set { runtime.activeTurnIDsBySession = newValue }
     }
-    /// When this session's turn last applied a pure stream-progress bump, and
-    /// to which turn. 2026-09-14 (snappiness): see
-    /// `AppModel.recordChatTurnStreamProgress`.
-    public var streamProgressAppliedAt: [String: (turnId: String, at: Date)] {
-        get { runtime.streamProgressAppliedAt }
-        set { runtime.streamProgressAppliedAt = newValue }
-    }
     /// The durable record of each session's open turn lifecycle.
     public var lifecycleStore: MacChatTurnLifecycleStore {
         get { runtime.lifecycleStore }
@@ -99,25 +127,6 @@ public final class TurnsFacade {
         get { runtime.queuePauseReasons }
         set { runtime.queuePauseReasons = newValue }
     }
-    public var drainingQueueSessions: Set<String> {
-        get { runtime.drainingQueueSessions }
-        set { runtime.drainingQueueSessions = newValue }
-    }
-    // 2026-06-10 audit FIX 4: Stop's cancelled.flag write used to be
-    // fire-and-forget — Stop then a quick re-Send raced the new turn's
-    // flag-clear, so the stale write could land mid-turn and kill the NEW
-    // turn. Track the in-flight write per session; turn starts await it via
-    // awaitPendingCancelFlagWrite(for:) so the write is ordered BEFORE the
-    // turn-start clear. Entries self-remove when the latest write completes
-    // (generation-guarded, all on MainActor).
-    public var pendingStopWrites: [String: Task<Void, Never>] {
-        get { runtime.pendingStopWrites }
-        set { runtime.pendingStopWrites = newValue }
-    }
-    public var pendingStopWriteGenerations: [String: Int] {
-        get { runtime.pendingStopWriteGenerations }
-        set { runtime.pendingStopWriteGenerations = newValue }
-    }
     // PATCH-2026-05-13: parallel-sessions — when a session is streaming but
     // not active, we still need to know (a) the live delta-buffer and (b)
     // the in-flight bubble id so that switching back to the session can
@@ -130,11 +139,8 @@ public final class TurnsFacade {
     // `updateChatMessageContent` below it.
     @ObservationIgnored public var streamingTexts: [String: String] = [:]
     public var streamingBubbleIds: [String: String] = [:]
-    // PATCH-2026-05-13: parallel-sessions — also stash the optimistic user
-    // turn (id + content) for each in-flight session. If the user switches
-    // away/back before the daemon has persisted the user message, we
-    // re-inject it so the visible session shows both the prompt and the
-    // streaming reply, not just the reply.
+    // Keep the optimistic user turn while switching between in-flight sessions,
+    // until the Swift turn runtime's durable transcript supplies it.
     public var streamingUserTurnIds: [String: String] = [:]
     public var streamingUserTurnTexts: [String: String] = [:]
     /// First instant each `streamingSessions` id was observed. Not observed,
@@ -321,13 +327,5 @@ extension NativeAgentEngine {
             NotificationCenter.default.post(name: .chatTurnCompleted, object: outcome.sessionId)
         }
         return outcome
-    }
-
-    public nonisolated func dispatchToolData(tool: String, inputData: Data, sessionId: String?) async throws -> DispatchResult {
-        guard case .object(let input)? = try? JSONValue.parse(inputData) else {
-            throw NSError(domain: "NativeAgent", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Could not deserialize inputData"])
-        }
-        return try await dispatchSlashCommand(tool: tool, input: input, sessionId: sessionId, dataRoot: dataRoot)
     }
 }

@@ -7,6 +7,7 @@ import CryptoKit
 #if canImport(AppKit)
 import AppKit
 import IOKit.hidsystem
+// Blueprint: | `MacControl+SystemActions.swift` | `SwiftNativeMacControl`: `handleFileRead`, `handleFileWrite`, `handleFileList`, `handleMedia` (Now Playing system keys and running-player observations) |
 #endif
 
 extension SwiftNativeMacControl {

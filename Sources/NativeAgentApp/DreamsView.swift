@@ -1,10 +1,11 @@
 import TrustCenter
 import Foundation
 import NativeAgentCore
+
+// Blueprint: | `DreamsView.swift` | `DreamsView`: shared diary reads, selection, dream/REM controls and unavailable/error presentation |
 // PATCH-2026-05-29: dreams-tab DreamsView — surfaces + controls the dream diary
 // and REM consolidation cycle. Backend: Swift-native DreamREMCycle runtime.
 //   engine.cognitionView.dreamDiary(limit:) -> core DreamEntry rows + gate
-//   engine.cognitionView.dreamEntry(date:)  -> one night (not-found if missing)
 //   POST /v1/dream/run           -> run a dream pass now
 //   POST /v1/rem/run             -> run a REM consolidation pass now
 // The two kill switches (personalityPolicy.dream_cycle_enabled with
@@ -49,8 +50,8 @@ enum DreamRunAvailability: Equatable {
     }
 }
 
-/// The Dreams surface owns several independent operations (diary reads,
-/// manual Dream/REM runs, and gate writes).  A non-nil operation error is
+/// The Dreams surface displays failures from diary reads, manual Dream/REM
+/// runs, and gate writes. A non-nil operation error is
 /// evidence of failure even when a producer supplied no usable diagnostic;
 /// never erase that state into an empty red strip or a success-shaped surface.
 enum DreamErrorBannerPresentation {
@@ -120,62 +121,6 @@ enum DreamDiaryListPresentation: Equatable {
     }
 }
 
-/// Serializes diary-read visibility. The newest request owns the spinner and
-/// is the only request whose response may reach the diary reconciliation code.
-/// Older reads can still finish, but their result is explicitly superseded.
-struct DreamDiaryLoadGeneration: Equatable {
-    enum Settlement: Equatable {
-        case superseded
-        case current(DreamDiary?)
-    }
-
-    private(set) var latestRequest = 0
-    private(set) var isLoading = false
-
-    mutating func begin() -> Int {
-        latestRequest &+= 1
-        isLoading = true
-        return latestRequest
-    }
-
-    mutating func settle(request: Int, response: DreamDiary?) -> Settlement {
-        guard request == latestRequest else { return .superseded }
-        isLoading = false
-        return .current(response)
-    }
-}
-
-/// The detail pane has a separate request stream from the diary list. A newer
-/// date selection owns both the result and the loading indicator; a cancelled
-/// older request must not make the newer selection look idle or overwrite its
-/// failure state.
-struct DreamEntryLoadGeneration: Equatable {
-    enum Settlement: Equatable {
-        case superseded
-        case current(DreamEntry?)
-    }
-
-    private(set) var latestRequest = 0
-    private(set) var isLoading = false
-
-    mutating func begin() -> Int {
-        latestRequest &+= 1
-        isLoading = true
-        return latestRequest
-    }
-
-    mutating func settle(request: Int, entry: DreamEntry?) -> Settlement {
-        guard request == latestRequest else { return .superseded }
-        isLoading = false
-        return .current(entry)
-    }
-
-    mutating func cancelPending() {
-        latestRequest &+= 1
-        isLoading = false
-    }
-}
-
 /// The detail pane must distinguish an unselected diary from a selected date
 /// whose fetch did not yield an entry. The latter is an unavailable read, never
 /// an instruction to select a dream again.
@@ -203,48 +148,35 @@ enum DreamEntryDetailPresentation: Equatable {
 struct DreamsView: View {
     @Environment(AppModel.self) private var appModel
 
-    // ── Diary state (owned by the view; the diary is fetched here, not in AppModel) ──
-    @State private var entries: [DreamEntry] = []
-    @State private var dreamEnabledFromDiary = false   // composite gate from /v1/dream/diary
     @State private var selectedDate: String?
-    @State private var selectedEntry: DreamEntry?
-
-    @State private var diaryLoadGeneration = DreamDiaryLoadGeneration()
-    @State private var entryLoadGeneration = DreamEntryLoadGeneration()
     @State private var isRunningDream = false
     @State private var isRunningRem = false
     @State private var remPolicyLoadFailed = false
     @State private var remRunFeedback: DreamsREMActionFeedback?
-    @State private var didInitialLoad = false
-
-    // Cancellable task for diary refresh so it doesn't outlive the view.
     @State private var refreshTask: Task<Void, Never>?
-    @State private var entryTask: Task<Void, Never>?
-    // A failed read is neither an empty diary nor proof the scheduler is off.
-    // Keep that distinction in the mounted surface, including when a refresh
-    // fails after entries were already rendered.
-    @State private var diaryLoadFailed = false
-    // Set only by a successful diary read. `didInitialLoad` merely means a
-    // task was started, which is not evidence that the composite gate was read.
-    @State private var hasReadDiaryGate = false
-    @State private var entryLoadError: String?
-    @State private var diaryTotalEntries: Int?
-    @State private var diaryUnreadableEntries = 0
+
+    private var diaryOwner: CognitionViewFacade { appModel.engine.cognitionView }
+    private var entries: [DreamEntry] { Array((diaryOwner.diary?.entries ?? []).prefix(diaryLimit)) }
+    private var selectedEntry: DreamEntry? { entries.first { $0.date == selectedDate } }
+    private var diaryLoadFailed: Bool { diaryOwner.diaryError != nil }
+    private var hasReadDiaryGate: Bool { diaryOwner.diaryGate != nil }
+    private var dreamEnabledFromDiary: Bool { diaryOwner.diaryGate?.dreamEnabled == true }
+    private var diaryTotalEntries: Int? { diaryOwner.diary?.totalEntries }
+    private var diaryUnreadableEntries: Int { diaryOwner.diary?.unreadableEntries ?? 0 }
 
     /// One page of the diary; "Show older dreams" adds another page, so every
     /// entry, archived ones included, is reachable from the list.
     private static let diaryPage = 60
     @State private var diaryLimit = DreamsView.diaryPage
 
-    private var isLoadingDiary: Bool { diaryLoadGeneration.isLoading }
-    private var isLoadingEntry: Bool { entryLoadGeneration.isLoading }
+    private var isLoadingDiary: Bool { diaryOwner.diaryLoading }
 
     private var entryDetailPresentation: DreamEntryDetailPresentation {
         DreamEntryDetailPresentation.resolve(
             selectedDate: selectedDate,
             hasSelectedEntry: selectedEntry != nil,
-            isLoading: isLoadingEntry,
-            error: entryLoadError
+            isLoading: isLoadingDiary,
+            error: diaryOwner.diaryError
         )
     }
 
@@ -275,17 +207,13 @@ struct DreamsView: View {
         // ("NativeAgent") because no title was set on the body root.
         .navigationTitle("Dreams")
         .task {
-            // One-shot initial load. .task is cancelled automatically on disappear.
-            guard !didInitialLoad else { return }
-            didInitialLoad = true
             await loadREMPolicy()
             await loadDiary(selectLatest: true)
         }
+        .onChange(of: diaryOwner.diary) { _, _ in reconcileSelection(selectLatest: false) }
         .onDisappear {
             refreshTask?.cancel()
             refreshTask = nil
-            entryTask?.cancel()
-            entryTask = nil
         }
     }
 
@@ -389,20 +317,7 @@ struct DreamsView: View {
             AliveEyebrow("My diary")
             HSplitView {
                 // Left: diary dates, newest first.
-                List(selection: Binding(
-                    get: { selectedDate },
-                    set: { newValue in
-                        selectedDate = newValue
-                        if let date = newValue {
-                            loadEntry(date: date)
-                        } else {
-                            entryTask?.cancel()
-                            entryLoadGeneration.cancelPending()
-                            selectedEntry = nil
-                            entryLoadError = nil
-                        }
-                    }
-                )) {
+                List(selection: $selectedDate) {
                     // Week titles are plain rows: a plain List pins section
                     // headers, and over the clear background they stacked.
                     ForEach(DreamDiaryWeeks.weeks(entries)) { week in
@@ -494,7 +409,7 @@ struct DreamsView: View {
                 detail: entryLoadError,
                 actionTitle: "Retry",
                 action: {
-                    if let selectedDate { loadEntry(date: selectedDate) }
+                    refresh()
                 }
             )
             .padding(.horizontal, 16)
@@ -562,8 +477,6 @@ struct DreamsView: View {
         Task {
             let ok = await appModel.runDreamPassForDreams()
             isRunningDream = false
-            // Reload ONLY on success — loadDiary clears dreamError, which would
-            // otherwise erase the failure message before the user reads it.
             if ok { await loadDiary(selectLatest: true) }
         }
     }
@@ -584,44 +497,15 @@ struct DreamsView: View {
     // ── Loaders ───────────────────────────────────────────────────────────────
     @MainActor
     private func loadDiary(selectLatest: Bool) async {
-        let request = diaryLoadGeneration.begin()
-        let result = await appModel.fetchDreamDiary(limit: diaryLimit)
-        guard case let .current(response) = diaryLoadGeneration.settle(
-            request: request,
-            response: result
-        ) else {
-            return
-        }
-        // A current cancellation clears its spinner but must not repaint the
-        // visible diary as a reader failure or a fresh response.
-        guard !Task.isCancelled else { return }
-        guard let response else {
-            diaryLoadFailed = true
-            return
-        }
-        diaryLoadFailed = false
-        hasReadDiaryGate = true
-        entries = response.entries
-        diaryTotalEntries = response.totalEntries
-        diaryUnreadableEntries = response.unreadableEntries ?? 0
-        dreamEnabledFromDiary = response.enabled
+        appModel.dreamError = nil
+        await diaryOwner.refreshDiary(limit: diaryLimit)
+        guard !Task.isCancelled, !diaryLoadFailed else { return }
+        reconcileSelection(selectLatest: selectLatest)
+    }
 
-        // Re-derive the selection against the freshly loaded entries.
-        if entries.isEmpty {
-            selectedDate = nil
-            selectedEntry = nil
-            return
-        }
-        let currentStillValid = selectedDate.map { d in entries.contains { $0.date == d } } ?? false
-        if selectLatest || !currentStillValid {
-            // Jump to the newest entry (initial load / after a dream run / prior
-            // selection no longer exists). Diary entries carry full content.
-            let first = entries[0]
-            selectedDate = first.date
-            selectedEntry = first
-        } else if let current = selectedDate {
-            // A force run can replace the content without changing its date.
-            loadEntry(date: current)
+    private func reconcileSelection(selectLatest: Bool) {
+        if selectLatest || !entries.contains(where: { $0.date == selectedDate }) {
+            selectedDate = entries.first?.date
         }
     }
 
@@ -629,43 +513,10 @@ struct DreamsView: View {
     private func loadREMPolicy() async {
         guard appModel.engine.trust.policy == nil || remPolicyLoadFailed else { return }
         do {
-            appModel.engine.trust.policy = try await appModel.engine.trust.load()
+            _ = try await appModel.engine.trust.load()
             remPolicyLoadFailed = false
         } catch {
             remPolicyLoadFailed = true
-        }
-    }
-
-    @MainActor
-    private func loadEntry(date: String) {
-        // Register the replacement request before cancelling the older task so
-        // its deferred completion cannot clear the newer request's spinner.
-        let request = entryLoadGeneration.begin()
-        entryTask?.cancel()
-        entryLoadError = nil
-        // Prefer the already-fetched diary entry (it carries full content).
-        if let cached = entries.first(where: { $0.date == date }),
-           !cached.text.isEmpty {
-            selectedEntry = cached
-            _ = entryLoadGeneration.settle(request: request, entry: cached)
-            return
-        }
-        // Switching to an uncached date — clear stale detail so the previous entry
-        // isn't shown under the new selection while the fetch is in flight.
-        selectedEntry = nil
-        entryTask = Task {
-            let fetched = await appModel.fetchDreamEntry(date: date)
-            guard case let .current(currentEntry) = entryLoadGeneration.settle(
-                request: request,
-                entry: fetched
-            ) else { return }
-            // Apply only if this is still the selected date and we weren't cancelled.
-            if Task.isCancelled || selectedDate != date { return }
-            if let currentEntry {
-                selectedEntry = currentEntry
-            } else {
-                entryLoadError = appModel.dreamError ?? DreamEntryDetailPresentation.missingEntryDetail
-            }
         }
     }
 
@@ -734,6 +585,9 @@ enum DreamReaderText {
         else { return (nil, content) }
         lines = lines.dropFirst()
         dropBlank()
+        // A night dreamt again holds several dreams, each under its own title:
+        // the night leads, and every dream keeps its title in the body.
+        guard DreamNight(content).dreams.count <= 1 else { return (nil, lines.joined(separator: "\n")) }
         var title: String?
         if let line = lines.first?.trimmingCharacters(in: .whitespaces),
            line.count > 4, line.hasPrefix("**"), line.hasSuffix("**") {
@@ -750,7 +604,7 @@ enum DreamReaderText {
     /// `2026-09-22` → "Tue, Sep 22" (with the year only when it isn't this
     /// one). Anything that isn't a plain date stays as written.
     static func friendlyDate(_ key: String, now: Date = Date(),
-                             calendar: Calendar = DisplayTimeZone.calendar) -> String {
+                             calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
         let parser = ISO8601DateFormatter()
         parser.formatOptions = [.withFullDate]
         parser.timeZone = calendar.timeZone
@@ -764,65 +618,15 @@ enum DreamReaderText {
     }
 }
 
-// ── Weeks ──────────────────────────────────────────────────────────────────────
-
-/// The diary read as history: this week, last week, then the weeks behind them.
-/// Archived dreams arrive in the same list (the reader merges `archive/<year>`),
-/// so an older week recedes into its own group rather than off the page.
-enum DreamDiaryWeeks {
-    struct Week: Identifiable {
-        let id: String
-        let title: String
-        let entries: [DreamEntry]
-    }
-
-    static func weeks(_ entries: [DreamEntry], now: Date = Date(),
-                      calendar: Calendar = DisplayTimeZone.calendar) -> [Week] {
-        let parser = ISO8601DateFormatter()
-        parser.formatOptions = [.withFullDate]
-        parser.timeZone = calendar.timeZone
-        var order: [String] = []
-        var grouped: [String: [DreamEntry]] = [:]
-        var titles: [String: String] = [:]
-        for entry in entries {
-            let start = parser.date(from: String(entry.date.prefix(10))).map {
-                calendar.dateInterval(of: .weekOfYear, for: $0)?.start ?? $0
-            }
-            let key = start.map { parser.string(from: $0) } ?? "undated"
-            if grouped[key] == nil {
-                order.append(key)
-                titles[key] = start.map { title(weekStart: $0, now: now, calendar: calendar) } ?? "Undated"
-            }
-            grouped[key, default: []].append(entry)
-        }
-        return order.map { Week(id: $0, title: titles[$0] ?? "", entries: grouped[$0] ?? []) }
-    }
-
-    private static func title(weekStart: Date, now: Date, calendar: Calendar) -> String {
-        let thisWeek = calendar.dateInterval(of: .weekOfYear, for: now)?.start
-        if let thisWeek {
-            if calendar.isDate(weekStart, inSameDayAs: thisWeek) { return "This week" }
-            if let lastWeek = calendar.date(byAdding: .weekOfYear, value: -1, to: thisWeek),
-               calendar.isDate(weekStart, inSameDayAs: lastWeek) { return "Last week" }
-        }
-        return "Week of " + weekStart.formatted(.dateTime.day().month(.abbreviated))
-    }
-}
-
 // ── Date row ───────────────────────────────────────────────────────────────────
 private struct DreamDateRow: View {
     let entry: DreamEntry
 
-    /// The first real line of the dream. A byte count tells a reader nothing
-    /// about which night this was; my own opening words do.
+    /// The night's dream (the latest, as Today and `dream_diary_read` name
+    /// it): its title, or my own opening words. A byte count tells a reader
+    /// nothing about which night this was.
     private var excerpt: String {
-        let lines = entry.text.split(whereSeparator: \.isNewline)
-        let first = lines.lazy
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .first { line in
-                !line.isEmpty && !line.hasPrefix("#") && line != "---"
-            } ?? ""
-        return TodayWords.line(first, limit: 90)
+        TodayWords.line(entry.night.latest.map { $0.title ?? $0.firstLine } ?? "", limit: 90)
     }
 
     var body: some View {
@@ -904,13 +708,6 @@ enum DreamsREMActionFeedback: Equatable {
             return "REM consolidation completed — nothing to consolidate yet."
         case .failed(let detail):
             return detail
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .completed, .nothingToConsolidate: return "checkmark.circle"
-        case .failed: return "exclamationmark.triangle"
         }
     }
 

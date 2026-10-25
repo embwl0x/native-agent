@@ -1,7 +1,9 @@
 import AuthoredCapabilities
 import Experiences
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatToolRuntime
 import MacIntegration
 import NativeAgentCore
 import NativeAgentShared
@@ -11,6 +13,8 @@ import ProviderRouting
 import TrustCenter
 import ToolRegistry
 import MacControl
+import Transcripts
+// Blueprint: | `InlineInteractionResolver.swift` | Control/continuation resolution uses the chat owner's transcript CAS and stopped projection; same-life stranded claims alone may reclaim/replay. The person's Resume replaces stopped continuations with fresh work without captured blocked calls. Existing setup admission, Stop settlement and slot ownership remain canonical |
 
 /// The one place an inline card settles and the one place a suspended request
 /// resumes.
@@ -21,7 +25,7 @@ import MacControl
 /// that matter:
 ///
 ///  * **It verifies with the owner, never with the card.** A tap on "Connect
-///    GitHub" does not settle anything. Connectors is asked whether GitHub is
+///    Slack" does not settle anything. Connectors is asked whether Slack is
 ///    connected; Trust is re-read for a grant; the routing snapshot is asked
 ///    which model a group now runs. The transcript holds interaction state, it
 ///    holds no authority, and a transcript that says "connected" over a store
@@ -96,7 +100,7 @@ public enum InlineInteractionResolver {
     /// Interactions whose resume is in flight in THIS process. A relaunch has
     /// none, which is what makes a leftover `.claimed` on disk provably
     /// stranded rather than possibly live.
-    private static var resumesInFlight: Set<String> = []
+    private static var resumesInFlight: [String: Task<JSONValue?, Never>] = [:]
     private static var waitingHosts: Set<String> = []
     /// Continuations whose blocked call this PROCESS has already replayed,
     /// keyed on `resumeRunId`. The durable checkpoint on the row is the
@@ -118,35 +122,7 @@ public enum InlineInteractionResolver {
 
     // MARK: - Errors
 
-    public enum ResolveError: LocalizedError {
-        case notFound
-        case staleRevision(expected: Int, actual: Int)
-        case alreadySettled(String)
-        case alreadyClaimed
-        case notVerified(String)
-        case noControl(String)
-        case usersCard
-
-        public var errorDescription: String? {
-            switch self {
-            case .notFound:
-                return "That request is no longer in this conversation."
-            case .staleRevision(let expected, let actual):
-                return "This card moved on (expected \(expected), found \(actual)). Reopen it."
-            case .alreadySettled(let state):
-                return "That was already \(state)."
-            case .alreadyClaimed:
-                return "Already continuing — a second tap does nothing."
-            case .usersCard:
-                return "That card is in the owner's conversation waiting for them, so answering it is theirs. "
-                    + "Nothing was changed; Not now still withdraws your ask."
-            case .notVerified(let detail):
-                return detail
-            case .noControl(let detail):
-                return detail
-            }
-        }
-    }
+    public typealias ResolveError = SwiftNativeChatOrchestrationClient.InlineInteractionResolveError
 
     // MARK: - Reading
 
@@ -170,7 +146,15 @@ public enum InlineInteractionResolver {
 
     private static func checkedRows(_ sessionID: String, _ dataRoot: URL) async throws -> [JSONValue] {
         do {
-            let rows = try await SwiftNativePersistenceCore().readJSONL(path(sessionID, dataRoot))
+            let lifeID = try DataRootLife.current(in: dataRoot)
+            let rows = try await SwiftNativePersistenceCore().readJSONL(path(sessionID, dataRoot)).map { row in
+                guard let card = SwiftNativeChatOrchestrationClient.inlineInteraction(in: row, lifeID: lifeID),
+                      case .object(var object) = row, case .object(var metadata)? = object["metadata"] else { return row }
+                let encoder = InlineInteractionWire.encoder()
+                metadata[InlineInteractionWire.metadataKey] = try JSONValue.parse(encoder.encode(card))
+                object["metadata"] = .object(metadata)
+                return JSONValue.object(object)
+            }
             loggedReadFailures.remove(sessionID)
             return rows
         } catch {
@@ -220,7 +204,7 @@ public enum InlineInteractionResolver {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> Result<[(rowID: String, interaction: InlineInteraction)], any Error> {
         do {
-            return .success(project(try await checkedRows(sessionID, dataRoot)))
+            return .success(interactionsByRow(in: try await checkedRows(sessionID, dataRoot)))
         } catch {
             return .failure(error)
         }
@@ -230,16 +214,16 @@ public enum InlineInteractionResolver {
         sessionID: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> [(rowID: String, interaction: InlineInteraction)] {
-        (try? await checkedRows(sessionID, dataRoot)).map(project) ?? []
+        (try? await checkedRows(sessionID, dataRoot)).map { interactionsByRow(in: $0) } ?? []
     }
 
-    private nonisolated static func project(
-        _ rows: [JSONValue]
+    public nonisolated static func interactionsByRow(
+        in rows: [JSONValue], lifeID: String? = nil
     ) -> [(rowID: String, interaction: InlineInteraction)] {
         rows.compactMap { row in
             guard case .object(let object) = row,
                   case .string(let rowID)? = object["id"],
-                  let interaction = interaction(in: row)
+                  let interaction = SwiftNativeChatOrchestrationClient.inlineInteraction(in: row, lifeID: lifeID)
             else { return nil }
             return (rowID, interaction)
         }
@@ -266,7 +250,15 @@ public enum InlineInteractionResolver {
     public static func waitForAnswer(_ interaction: InlineInteraction, tool: String, input: [String: JSONValue],
                                      sessionID: String, dataRoot: URL) async -> JSONValue {
         waitingHosts.insert(interaction.id)
-        defer { waitingHosts.remove(interaction.id) }
+        let result = await waitForAnswerBody(interaction, tool: tool, input: input,
+                                             sessionID: sessionID, dataRoot: dataRoot)
+        await settle { @MainActor in _ = waitingHosts.remove(interaction.id) }
+        return result
+    }
+
+    private static func waitForAnswerBody(
+        _ interaction: InlineInteraction, tool: String, input: [String: JSONValue], sessionID: String, dataRoot: URL
+    ) async -> JSONValue {
         let changes = NotificationCenter.default.notifications(named: InlineInteractionWire.changedNotification)
             .compactMap { $0.object as? String }
         var card = interaction
@@ -367,6 +359,8 @@ public enum InlineInteractionResolver {
             peerSources: steer.sources,
             elevatedPeerSources: steer.elevated
         )
+        do { continuation.lifeID = try DataRootLife.current(in: dataRoot) }
+        catch { nativeLog("[interaction] life identity is unavailable: \(error)"); return nil }
         // Same reason as the tool-raised card: a signed turn's card resumes as
         // a signed turn only through a receipt re-verified against the live
         // pairing material — and bound to this row, so it cannot be moved to
@@ -408,31 +402,8 @@ public enum InlineInteractionResolver {
         let persistence = SwiftNativePersistenceCore()
         let file = path(sessionID, dataRoot)
         do {
-            // One live card per ask, on THIS path too. The tool-receipt writer
-            // supersedes the older identical asks under the transcript's own
-            // lock before it appends; a direct raise that only appended left a
-            // durable stack of "Add an API key" cards, one per message sent
-            // with no provider connected. Same key, same lock, same rule — and
-            // the same exception: a card already RUNNING keeps its tap, and the
-            // duplicate is the one that goes quiet.
-            // Immutable binding: a @Sendable closure cannot capture `stamped`.
-            let raised = stamped
-            let key = SwiftNativeChatOrchestrationClient.SupersedeKey(
-                kind: raised.kind, target: raised.target, mode: raised.mode, id: raised.id
-            )
-            try await persistence.withFileLock(file) {
-                // Same rule as the tool-receipt writer: supersession has to
-                // SUCCEED before a new pending row is appended, or a swallowed
-                // read failure stacks a second live card on the same ask.
-                let running = try await SwiftNativeChatOrchestrationClient
-                    .supersedeOlderPending(
-                        matching: key, in: file, persistence: persistence
-                    )
-                let rowToAppend = running
-                    ? SwiftNativeChatOrchestrationClient.supersededRow(row, as: raised)
-                    : row
-                try await persistence.appendJSONLDurable(rowToAppend, to: file)
-            }
+            try await SwiftNativeChatOrchestrationClient.appendTranscriptRow(
+                row, to: file, persistence: persistence, interaction: stamped)
         } catch {
             nativeLog("[interaction] raise failed for \(stamped.id): \(error)")
             return nil
@@ -457,8 +428,16 @@ public enum InlineInteractionResolver {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> InlineInteraction {
         try await refuseAgentOnUsersCard(id, byAgent: byAgent, dataRoot: dataRoot)
-        let current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
+        var current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
         try checkRevision(current, expectedRevision)
+        if current.continuation?.state == .stopped {
+            guard !byAgent else { throw ResolveError.alreadySettled("stopped") }
+            let previous = current.continuation
+            current.continuation = .init(mode: .continueTurn, resumeRunId: UUID().uuidString,
+                resumeText: previous?.resumeText, peerSources: previous?.peerSources,
+                elevatedPeerSources: previous?.elevatedPeerSources)
+            current.continuation?.lifeID = try DataRootLife.current(in: dataRoot)
+        }
         // `failed` is retryable BY DESIGN: the card keeps its control and its
         // "Try again", and a failure settled nothing. Treating it as closed
         // here is what made that button a silent no-op.
@@ -470,7 +449,7 @@ public enum InlineInteractionResolver {
         // caller is told so, and the revision this call acquired is what the
         // settle is compared against.
         switch current.state {
-        case .pending, .failed:
+        case .pending, .failed, .stopped:
             break
         default:
             throw ResolveError.alreadySettled(current.state.name)
@@ -481,6 +460,7 @@ public enum InlineInteractionResolver {
                 descriptor.unavailableReason ?? "No control for \(current.target)."
             )
         }
+        // Same-life retries keep admission and landed replay; a new life starts fresh.
         let running = current.running()
         try await persist(
             running, sessionID: sessionID, ifRevision: current.revision, dataRoot: dataRoot
@@ -537,6 +517,14 @@ public enum InlineInteractionResolver {
             outcome.summary += " \u{00B7} \(note)"
             verification = .success(outcome)
         }
+        return try await finish(current, verification: verification, sessionID: sessionID,
+                                attribution: attribution, dataRoot: dataRoot)
+    }
+
+    private static func finish(
+        _ current: InlineInteraction, verification: Verification, sessionID: String,
+        attribution: String? = nil, dataRoot: URL
+    ) async throws -> InlineInteraction {
         switch verification {
         case .failure(let reason):
             // Not verified is NOT settled. The card keeps its control, the
@@ -592,11 +580,11 @@ public enum InlineInteractionResolver {
     ) async throws -> InlineInteraction {
         let current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
         try checkRevision(current, expectedRevision)
-        guard current.state.isOpen else {
+        guard current.state.isOpen || current.continuation?.state == .stopped else {
             throw ResolveError.alreadySettled(current.state.name)
         }
         var declined = current.declined()
-        if !resume { declined.continuation?.state = .invalidated }
+        if !resume || current.continuation?.state == .stopped { declined.continuation?.state = .invalidated }
         try await persist(
             declined, sessionID: sessionID, ifRevision: current.revision, dataRoot: dataRoot
         )
@@ -652,14 +640,32 @@ public enum InlineInteractionResolver {
         sessionID: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async {
-        guard var current = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot)
-        else { return }
-        let readRevision = current.revision
-        current.continuation?.state = .invalidated
-        current.revision += 1
-        try? await persist(
-            current, sessionID: sessionID, ifRevision: readRevision, dataRoot: dataRoot
-        )
+        if let owner = resumesInFlight[id] {
+            owner.cancel()
+            await settle { _ = await owner.value }
+            return
+        }
+        // Reserve ownership before the read: a resume cannot acquire the same
+        // waiting row while its dismissal is suspended on storage.
+        let owner = Task<JSONValue?, Never> {
+            await settle { @MainActor in
+                defer { resumesInFlight[id] = nil }
+                guard var current = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
+                      let state = current.continuation?.state,
+                      state != .resumed, state != .invalidated else { return nil }
+                let revision = current.revision
+                current.continuation?.state = .invalidated
+                current.revision += 1
+                do {
+                    try await persist(current, sessionID: sessionID, dataRoot: dataRoot, expecting: {
+                        $0.revision == revision && $0.continuation?.state == state
+                    })
+                } catch { nativeLog("[interaction] stop settlement failed for \(id): \(error)") }
+                return nil
+            }
+        }
+        resumesInFlight[id] = owner
+        await settle { _ = await owner.value }
     }
 
     // MARK: - Verification
@@ -686,11 +692,12 @@ public enum InlineInteractionResolver {
         guard let current = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
               current.state.isOpen
         else { return true }
-        guard case .success = await verify(
+        guard !Task.isCancelled else { return false }
+        guard case .success(let outcome) = await verify(
             current, selection: current.target, scope: nil, dataRoot: dataRoot
         ) else { return false }
-        return (try? await complete(
-            id: id, sessionID: sessionID, selection: current.target, dataRoot: dataRoot
+        return (try? await finish(
+            current, verification: .success(outcome), sessionID: sessionID, dataRoot: dataRoot
         ))?.state.outcome != nil
     }
 
@@ -728,15 +735,6 @@ public enum InlineInteractionResolver {
         return interaction.settled(outcome, at: interaction.settledAt ?? interaction.createdAt)
     }
 
-    private static func githubLogin(dataRoot: URL) -> String? {
-        let path = dataRoot.appendingPathComponent("connectors/github/auth.json")
-        guard let data = try? Data(contentsOf: path),
-              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let login = object["login"] as? String, !login.isEmpty
-        else { return nil }
-        return login
-    }
-
     private static func verify(
         _ interaction: InlineInteraction,
         selection: String?,
@@ -748,7 +746,7 @@ public enum InlineInteractionResolver {
             if interaction.target == "mail" {
                 let store = MacIntegrationPermissionStore(dataRoot: dataRoot)
                 guard await store.allows(MacIntegrationID.mail, mode: .read) else {
-                    return .failure("Mail read access is off or unavailable in Settings → Mac Integration.")
+                    return .failure("Mail read access is off or unavailable in Trust → Mac → Mail.")
                 }
                 let result = try? await platform.mailListRecent(input: ["limit": .int(1)])
                 guard case .object(let object) = result, object["status"] == .string("completed") else {
@@ -782,18 +780,18 @@ public enum InlineInteractionResolver {
             }
             // Telegram's row says `configured` (a saved, enabled bot) rather
             // than `connected`; with health ok that is its connected.
+            // Telegram's row says `configured` (a saved, enabled bot); its health is a
+            // separate reading that only a successful poll proves.
             guard record.authState == "connected"
-                || (record.authState == "configured" && record.healthStatus == "ok")
+                || (target == "telegram" && record.authState == "configured" && record.healthStatus != "disabled")
             else {
                 return .failure(
                     "\(InlineInteractionRegistry.connectorDisplayName(target, dataRoot: dataRoot)) still isn't connected."
                 )
             }
-            let account = target == "github" ? githubLogin(dataRoot: dataRoot).map { " \u{00B7} @\($0)" } : nil
             return .success(.init(
                 selection: target,
                 summary: "\(InlineInteractionRegistry.connectorDisplayName(target, dataRoot: dataRoot)) connected"
-                    + (account ?? "")
             ))
 
         case .permission:
@@ -926,6 +924,25 @@ public enum InlineInteractionResolver {
                 scope: .persistent
             ))
 
+        case .apiKey where interaction.secret != nil:
+            // The keyring's own answer: removed; or a value kept since this
+            // card was raised that may go everywhere asked.
+            let name = String(interaction.target.dropFirst("secret:".count))
+            let kept: Keyring.Entry?
+            do { kept = try Keyring.entry(name) } catch {
+                return .failure("The keyring could not be read, so whether \(name) is kept is unknown. Try again.")
+            }
+            if interaction.secret?.remove == true {
+                return kept == nil ? .success(.init(selection: interaction.target, summary: "\(name) removed"))
+                    : .failure("\(name) is still kept.")
+            }
+            guard let ask = interaction.secret, Keyring.granted(name, hosts: ask.hosts, programs: ask.programs),
+                  let kept, kept.at >= interaction.createdAt else {
+                return .failure("\(name) isn't kept yet.")
+            }
+            return .success(.init(selection: interaction.target,
+                                  summary: "\(name) kept \u{00B7} for \(ask.line)" + (kept.account.map { " \u{00B7} account \($0)" } ?? "")))
+
         case .apiKey:
             // The provider's own readiness, as Providers reports it. A key
             // that was typed but rejected is not ready, and does not settle.
@@ -997,7 +1014,7 @@ public enum InlineInteractionResolver {
         guard !waitingHosts.contains(interaction.id),
               interaction.continuation?.state == .waiting,
               interaction.continuation?.resumedByTurnId == nil,
-              !resumesInFlight.contains(interaction.id) else { return }
+              resumesInFlight[interaction.id] == nil else { return }
         let sources = interaction.continuation?.peerSources ?? [PeerDataTaint.unrecorded]
         let elevated = interaction.continuation?.elevatedPeerSources ?? []
         let taint = PeerDataTaint.current
@@ -1005,449 +1022,210 @@ public enum InlineInteractionResolver {
         // A turn already carrying this card must keep its provenance too.
         // Historical steering cannot be cleared by a later trust change.
         for source in sources { taint.mark(peer: source) }
-        for source in elevated { taint.markElevated(peer: source) }
+        for source in elevated { taint.elevate(peer: source) }
         await PeerDataTaint.$current.withValue(taint) {
             _ = await resumeUnderPeerProvenance(interaction, sessionID: sessionID, dataRoot: dataRoot)
         }
     }
 
+    /// This owner holds the continuation until its effect ends, then writes
+    /// its one terminal record and releases the slot, even after Stop.
     private static func resumeUnderPeerProvenance(
-        _ interaction: InlineInteraction,
-        sessionID: String,
-        dataRoot: URL
+        _ interaction: InlineInteraction, sessionID: String, dataRoot: URL
     ) async -> JSONValue? {
-        guard var continuation = interaction.continuation else { return nil }
-        // One continuation, one resume — whichever half of the fork took it.
-        // `.waiting` is the durable claim; `resumedByTurnId` is the hand-back's
-        // own mark (a turn already carries this card, so nothing may start a
-        // second one); `resumesInFlight` covers the in-process race two callers
-        // holding the same stale row would otherwise win together.
-        guard continuation.state == .waiting,
-              continuation.resumedByTurnId == nil,
-              !resumesInFlight.contains(interaction.id)
-        else { return nil }
-
-        // Reserved BEFORE the first await. The check above and this insert ran
-        // in one main-actor step, so a second caller holding the same stale row
-        // cannot slip in while the claim below is being written — which is
-        // exactly what reserving after the persist allowed.
-        resumesInFlight.insert(interaction.id)
-        defer { resumesInFlight.remove(interaction.id) }
-
-        continuation.state = .claimed
-        var claimed = interaction
-        claimed.continuation = continuation
+        guard interaction.continuation?.state == .waiting,
+              interaction.continuation?.resumedByTurnId == nil,
+              resumesInFlight[interaction.id] == nil else { return nil }
         do {
-            // Compare-and-swap under the transcript lock: the row on disk must
-            // still be the unclaimed revision this caller read. Another
-            // process that claimed it in between loses here instead of both
-            // sides resuming the same card.
-            try await persist(
-                claimed, sessionID: sessionID, dataRoot: dataRoot,
-                expecting: { current in
-                    current.revision == interaction.revision
-                        && current.continuation?.state == .waiting
-                        && current.continuation?.resumedByTurnId == nil
-                }
-            )
+            guard try DataRootLife.isCurrent(interaction.continuation?.lifeID, in: dataRoot) else { return nil }
+        } catch { nativeLog("[interaction] life identity is unavailable: \(error)"); return nil }
+        let owner = Task { await runContinuation(interaction, sessionID: sessionID, dataRoot: dataRoot) }
+        resumesInFlight[interaction.id] = owner
+        return await withTaskCancellationHandler {
+            await owner.value
+        } onCancel: {
+            owner.cancel()
+        }
+    }
+
+    private static func runContinuation(
+        _ interaction: InlineInteraction, sessionID: String, dataRoot: URL
+    ) async -> JSONValue? {
+        var record = interaction
+        record.continuation?.state = .claimed
+        do {
+            try await persist(record, sessionID: sessionID, dataRoot: dataRoot, expecting: {
+                $0.revision == interaction.revision && $0.continuation?.state == .waiting
+                    && $0.continuation?.resumedByTurnId == nil
+            })
         } catch {
+            await settle { @MainActor in resumesInFlight[interaction.id] = nil }
             nativeLog("[interaction] resume claim failed for \(interaction.id): \(error)")
             return nil
         }
 
-        // The envelope of the turn that raised the card. Both halves of the
-        // resume — the blocked call's replay and the continuation turn — run
-        // under it, so neither is laundered into a trusted local Mac call.
-        var origin = await originEnvelope(
-            of: interaction.id, sessionID: sessionID, dataRoot: dataRoot
-        )
-
-        // A card raised by a SIGNED turn — an iPhone turn whose HMAC the
-        // inbound path checked — has to replay as one, or the iOS trust gate
-        // refuses its own request back. The persisted envelope deliberately
-        // does not carry that verdict, so the continuation carries a RECEIPT
-        // instead and it is re-checked HERE, against the live pairing
-        // material. The transcript never becomes the authority: it holds a
-        // token the pairing secret has to still agree with.
-        if let record = claimed.continuation, record.signatureReceipt?.isEmpty == false {
-            // Rebuilt from THIS row: a receipt minted for another card, another
-            // session, or the same card before its tool or arguments were
-            // edited produces a different witness and does not verify.
-            let witness = InlineInteractionSignatureWitness.Witness(
-                sessionID: sessionID,
-                interactionID: claimed.id,
-                continuation: record,
-                originEnvelope: origin,
-                interaction: claimed
-            )
-            guard InlineInteractionSignatureWitness.isStillSigned(witness) else {
-                // The pairing changed (or this Mac lost the secret). Replaying
-                // unsigned would either be refused by the gate or, worse, run
-                // as something it is not. Say the repair instead.
-                await failAfterLostTransition(
-                    id: interaction.id, sessionID: sessionID,
-                    reason: "This came from your iPhone and I can't verify that phone any more. "
-                        + "Sign in from the phone again, then Try again.",
-                    dataRoot: dataRoot
-                )
+        var result: JSONValue?
+        var handBack: String?
+        do {
+            (result, handBack) = try await continueRequest(&record, sessionID: sessionID, dataRoot: dataRoot)
+            record.continuation?.state = .resumed
+        } catch is CancellationError {
+            record.continuation?.state = .invalidated
+            if case .settled(var outcome) = record.state {
+                outcome.summary += record.continuation?.replayedAt != nil
+                    ? " The blocked call ran; its result is saved. Stopped before continuing."
+                    : " Stopped before continuing."
+                record.state = .settled(outcome)
+            }
+        } catch {
+            record = record.failed(reason: error.localizedDescription)
+            // A recoverable failure waits for an explicit retry; only Stop or
+            // deliberate invalidation permanently retires the continuation.
+            record.continuation?.state = .waiting
+        }
+        let terminal = record
+        let landedResult = result
+        let landedHandBack = handBack
+        return await settle { @MainActor in
+            defer { resumesInFlight[interaction.id] = nil }
+            do {
+                try await persist(terminal, sessionID: sessionID, dataRoot: dataRoot, expecting: {
+                    $0.revision == interaction.revision
+                        && ($0.continuation?.state == .claimed || $0.continuation?.state == .replaying)
+                })
+                if let landedHandBack { handBacks[interaction.id] = landedHandBack }
+                return landedResult
+            } catch {
+                nativeLog("[interaction] continuation settlement failed for \(interaction.id): \(error)")
                 return nil
             }
+        }
+    }
+
+    private static func continueRequest(
+        _ record: inout InlineInteraction, sessionID: String, dataRoot: URL
+    ) async throws -> (JSONValue?, String?) {
+        func failure(_ reason: String) -> NSError {
+            NSError(domain: "InteractionCard", code: 2, userInfo: [NSLocalizedDescriptionKey: reason])
+        }
+        var origin = await originEnvelope(of: record.id, sessionID: sessionID, dataRoot: dataRoot)
+        // A persisted envelope is not authority: recheck the signed phone's
+        // witness against the current pairing before either world effect.
+        if let continuation = record.continuation, continuation.signatureReceipt?.isEmpty == false {
+            let witness = InlineInteractionSignatureWitness.Witness(
+                sessionID: sessionID, interactionID: record.id, continuation: continuation,
+                originEnvelope: origin, interaction: record)
+            guard InlineInteractionSignatureWitness.isStillSigned(witness) else {
+                throw failure("This came from your iPhone and I can't verify that phone any more. "
+                    + "Sign in from the phone again, then Try again.")
+            }
             origin = origin.map {
-                TurnEnvelope(
-                    surface: $0.surface,
-                    agent: $0.agent,
-                    verifiedChatId: $0.verifiedChatId,
-                    verifiedUserId: $0.verifiedUserId,
-                    commandSignatureVerified: true,
-                    deliveryRoute: $0.deliveryRoute,
-                    declaredRemote: $0.declaredRemote,
-                    answerExperienceID: $0.answerExperienceID
-                )
+                TurnEnvelope(surface: $0.surface, agent: $0.agent, verifiedChatId: $0.verifiedChatId,
+                    verifiedUserId: $0.verifiedUserId, commandSignatureVerified: true,
+                    deliveryRoute: $0.deliveryRoute, declaredRemote: $0.declaredRemote,
+                    answerExperienceID: $0.answerExperienceID)
             }
         }
 
-        // The blocked call, replayed verbatim, behind the ordinary gate.
-        //
-        // This runs BEFORE the continuation turn and its result is handed to
-        // that turn as data, so the model carries on from what actually
-        // happened instead of being told to make a call it would have to
-        // rebuild from memory. Only a settled card replays; a decline or a
-        // failure has nothing to run.
-        //
-        // A replay that ran is CHECKPOINTED on the row before admission. Turn
-        // admission can still be refused, and a refusal releases the claim back
-        // to `waiting` so the person can tap again — without the checkpoint,
-        // that second tap would make the same call to the world a second time.
-        var replayedResult: String? = claimed.continuation?.replayedResult
         var hostResult: JSONValue?
-        var replayed = claimed.continuation?.replayedAt != nil
-        if !replayed,
-           claimed.state.outcome != nil,
-           claimed.continuation?.mode == .retryBlockedTool,
-           let toolName = claimed.continuation?.toolName,
-           let arguments = claimed.continuation?.toolArgumentsJSON,
-           let replayBlockedTool {
-            // The checkpoint is MANDATORY, not best-effort. It is the only
-            // thing standing between a refused admission and the same effect
-            // being replayed on the world a second time, so a replay whose
-            // checkpoint cannot be written must stop the continuation here
-            // rather than carry on with the claim unrecorded.
-            //
-            // In-process idempotency is keyed on `resumeRunId` — the stable id
-            // of THIS continuation — so even a checkpoint that never reached
-            // disk cannot be replayed twice by this process.
-            let resumeRunId = claimed.continuation?.resumeRunId
-            if let resumeRunId, replayedResumeRunIds.contains(resumeRunId) {
-                replayed = true
-            } else {
-            // The pre-dispatch marker, written DURABLY before the call is
-            // made. The in-process guard above dies with the process, and the
-            // checkpoint below is written after the effect — so a crash, or a
-            // failed checkpoint write, between those two left disk holding an
-            // ordinary `.claimed` row that relaunch happily released back to
-            // `waiting` and replayed, making the same real call twice.
-            //
-            // `.replaying` is the honest third answer: this call MAY have run.
-            // Reclaim never auto-replays a row in it (see
-            // `reclaimStrandedContinuations`). If the marker itself cannot be
-            // written, nothing is dispatched at all — an unrecorded call is
-            // exactly what this state exists to prevent.
-            claimed.continuation?.state = .replaying
-            do {
-                try await persistTransition(
-                    claimed, from: .claimed, sessionID: sessionID, dataRoot: dataRoot
-                )
-            } catch {
-                nativeLog("[interaction] pre-dispatch marker failed for \(interaction.id): \(error)")
-                await failAfterLostTransition(
-                    id: interaction.id, sessionID: sessionID,
-                    reason: "Couldn't record that the \(toolName) call was about to run, so it wasn't made. Try again.",
-                    dataRoot: dataRoot
-                )
-                return nil
+        if record.continuation?.replayedAt == nil, record.state.outcome != nil,
+           record.continuation?.mode == .retryBlockedTool,
+           let toolName = record.continuation?.toolName,
+           let arguments = record.continuation?.toolArgumentsJSON, let replayBlockedTool {
+            try Task.checkCancellation()
+            // Keep the crash witness before dispatch; a lost process cannot
+            // turn an uncertain send back into permission to send it twice.
+            record.continuation?.state = .replaying
+            try await persistTransition(record, from: .claimed, sessionID: sessionID, dataRoot: dataRoot)
+            try Task.checkCancellation()
+            let runID = record.continuation!.resumeRunId
+            guard replayedResumeRunIds.insert(runID).inserted else {
+                throw failure("The \(toolName) call already ran, but its saved result is unavailable.")
             }
-            if let resumeRunId { replayedResumeRunIds.insert(resumeRunId) }
             switch await replayBlockedTool(toolName, arguments, sessionID, origin) {
             case .dispatched(let result):
                 hostResult = result.flatMap { try? JSONValue.parse(Data($0.utf8)) }
-                // The SAME redaction and bound the transcript's own tool
-                // receipt gets. This result is persisted on the card's
-                // continuation and fed to the resumed turn's prompt, and a
-                // replayed `read_file` returns the file — credentials
-                // included. Redacted before either, never after.
-                let safeResult = result.map {
+                record.continuation?.replayedAt = Date()
+                record.continuation?.replayedResult = result.map {
                     SwiftNativeChatOrchestrationClient.redactedPersistedToolResult(
                         tool: ToolNameAliases.shown(toolName, inputJSON: arguments).name, json: $0)
                 }
-                replayed = true
-                replayedResult = safeResult
-                claimed.continuation?.state = .claimed
-                claimed.continuation?.replayedAt = Date()
-                claimed.continuation?.replayedResult = safeResult
-                do {
-                    try await persistTransition(
-                        claimed, from: .replaying, sessionID: sessionID, dataRoot: dataRoot
-                    )
-                } catch {
-                    // The call already happened. Without a durable record of
-                    // it, admitting the turn would leave a card that can be
-                    // tapped again into a second real effect — so the card is
-                    // failed RETRYABLY and the turn is not started. The person
-                    // sees what happened instead of a silent double-send.
-                    nativeLog("[interaction] replay checkpoint failed for \(interaction.id): \(error)")
-                    await failAfterLostTransition(
-                        id: interaction.id, sessionID: sessionID,
-                        reason: "The \(toolName) call ran, but recording it failed. Try again.",
-                        dataRoot: dataRoot
-                    )
-                    return nil
-                }
             case .failed(let reason):
-                // Nothing ran, so the in-process guard is released too, and
-                // the pre-dispatch marker is cleared: this is the one case
-                // that KNOWS the world was not touched, so the row goes back
-                // to an ordinary claim and a retry is free to run the call for
-                // real. A clear that does not land leaves `.replaying` on
-                // disk, which errs toward asking the person rather than
-                // replaying behind their back.
-                if let resumeRunId { replayedResumeRunIds.remove(resumeRunId) }
-                claimed.continuation?.state = .claimed
-                do {
-                    try await persistTransition(
-                        claimed, from: .replaying, sessionID: sessionID, dataRoot: dataRoot
-                    )
-                } catch {
-                    nativeLog("[interaction] clearing the pre-dispatch marker failed for \(interaction.id): \(error)")
-                }
-                // Nothing happened, so nothing is recorded. The prompt falls
-                // back to telling the model the call may now run, and a retry
-                // is free to replay it for real.
-                nativeLog("[interaction] replay of \(toolName) did not run for \(interaction.id): \(reason)")
+                replayedResumeRunIds.remove(runID)
+                try Task.checkCancellation()
+                throw failure(reason)
             }
-            }
+            // Saving a landed result is settlement, never a cancellable write.
+            record.continuation?.state = .claimed
+            try await persistTransition(record, from: .replaying, sessionID: sessionID, dataRoot: dataRoot)
         }
 
-        if waitingHosts.contains(claimed.id) {
-            guard replayed, let hostResult else { return nil }
-            var handed = claimed
-            handed.continuation?.state = .resumed
-            handed.continuation?.resumedByTurnId = TurnTraceContext.turnId
-            do {
-                try await persistTransition(handed, from: .claimed, sessionID: sessionID, dataRoot: dataRoot)
-                return hostResult
-            } catch {
-                nativeLog("[interaction] host reply record failed for \(interaction.id): \(error)")
-                return nil
-            }
+        try Task.checkCancellation()
+        if waitingHosts.contains(record.id) {
+            guard let hostResult else { throw failure("The blocked call could not resume.") }
+            record.continuation?.resumedByTurnId = TurnTraceContext.turnId
+            return (hostResult, nil)
         }
-
-        // A card raised before any turn existed resumes by re-asking the
-        // person's own question: there is no interrupted turn to continue,
-        // because there was never one to interrupt.
-        let prompt: String = {
-            if claimed.continuation?.mode == .continueTurn,
-               claimed.state.outcome != nil,
-               let text = claimed.continuation?.resumeText,
-               !text.isEmpty {
-                return text
-            }
-            return continuationPrompt(
-                for: claimed, replayed: replayed, replayedResult: replayedResult
-            )
-        }()
-        // The model choice scoped to THIS request is bound around the resumed
-        // turn and dies with it. A permanent choice was already written by
-        // Providers, so nothing is bound here.
-        let binding: InlineInteractionModelOverride.Binding? = {
-            guard claimed.kind == .modelChoice,
-                  let outcome = claimed.state.outcome,
-                  outcome.scope == .thisRequestOnly,
-                  let model = outcome.selection
-            else { return nil }
-            // The account the person picked, read off the option id. S12a: a
-            // card written before options carried one binds no account (the
-            // override requires one) rather than one guessed from the name.
-            let qualified = InlineInteractionRegistry.splitModelOptionID(model)
-            let providerID = qualified?.providerID ?? ""
-            return .init(
-                group: claimed.target,
-                providerID: providerID,
-                model: qualified?.modelID ?? model
-            )
-        }()
-
-        // A turn is ALREADY narrating this session, and this card was settled
-        // from inside it. Starting a continuation turn here is exactly what put
-        // two turns on one transcript: the declined card's resume wrote its own
-        // reply while the turn that raised the card was still writing, and that
-        // ghost turn's fold read as "1 of 2 failed".
-        //
-        // The running turn IS the continuation. The settled card, the
-        // consequence, and anything the replay above returned are handed back
-        // to it as the answer to the call it just made, so it carries on in the
-        // same reply. A tap on the glass while a turn runs is NOT this case —
-        // there is no tool call waiting to be answered — so it falls through to
-        // ordinary admission below, which queues it behind the running turn
-        // rather than racing it.
-        if let carryingTurnId = TurnTraceContext.turnId,
+        let replayed = record.continuation?.replayedAt != nil
+        let prompt: String
+        if record.continuation?.mode == .continueTurn, record.state.outcome != nil,
+           let text = record.continuation?.resumeText, !text.isEmpty {
+            prompt = text
+        } else {
+            prompt = continuationPrompt(for: record, replayed: replayed,
+                                        replayedResult: record.continuation?.replayedResult)
+        }
+        if let turnID = TurnTraceContext.turnId,
            await ChatTurnSteering.shared.isTurnOpen(sessionId: sessionID) {
-            var handed = claimed
-            handed.continuation?.state = .resumed
-            handed.continuation?.resumedByTurnId = carryingTurnId
-            do {
-                try await persistTransition(
-                    handed, from: .claimed, sessionID: sessionID, dataRoot: dataRoot
-                )
-            } catch {
-                // The hand-back is only safe once disk agrees a turn took this
-                // card. Publishing it first left a consumable answer while the
-                // row still read `.claimed` — the turn swallowed the card and
-                // nothing on disk said so. A write that did not land publishes
-                // nothing and fails the card retryably instead.
-                nativeLog("[interaction] hand-back record failed for \(interaction.id): \(error)")
-                await failAfterLostTransition(
-                    id: interaction.id, sessionID: sessionID,
-                    reason: "Couldn't record that this was handed back to the turn already "
-                        + "running, so it wasn't. Try again.",
-                    dataRoot: dataRoot
-                )
-                return nil
-            }
-            handBacks[interaction.id] = prompt
-            return nil
+            try Task.checkCancellation()
+            record.continuation?.resumedByTurnId = turnID
+            return (nil, prompt)
         }
-
-        guard let startTurn else {
-            nativeLog("[interaction] no turn starter installed; \(interaction.id) settled without resuming")
-            return nil
-        }
-        // The pre-admission marker, written DURABLY before the turn starts —
-        // the SAME `.replaying` marker used before a dispatch, and for the
-        // same reason. Admission used to start the turn first and record it
-        // after, so a lost CAS on the `resumed` write left disk reading
-        // `.claimed`: reclaim released it back to `waiting` and the card
-        // resumed a SECOND time. A row in `.replaying` is never auto-replayed;
-        // if the marker itself cannot be written, no turn is started at all.
-        // It shares the dispatch marker's wire value on purpose — a new one
-        // would read as `.waiting` to an older build, which is the duplicate
-        // resume this marker exists to prevent.
-        var admittingClaim = claimed
-        admittingClaim.continuation?.state = .replaying
-        do {
-            try await persistTransition(
-                admittingClaim, from: .claimed, sessionID: sessionID, dataRoot: dataRoot
-            )
-        } catch {
-            nativeLog("[interaction] pre-admission marker failed for \(interaction.id): \(error)")
-            await failAfterLostTransition(
-                id: interaction.id, sessionID: sessionID,
-                reason: "Couldn't record that this was about to continue, so it wasn't started. "
-                    + "Try again.",
-                dataRoot: dataRoot
-            )
-            return nil
-        }
+        guard let startTurn else { throw failure("The request could not continue: no turn starter is available.") }
+        let binding: InlineInteractionModelOverride.Binding? = {
+            guard record.kind == .modelChoice, let outcome = record.state.outcome,
+                  outcome.scope == .thisRequestOnly, let model = outcome.selection else { return nil }
+            let qualified = InlineInteractionRegistry.splitModelOptionID(model)
+            return .init(group: record.target, providerID: qualified?.providerID ?? "",
+                         model: qualified?.modelID ?? model)
+        }()
+        record.continuation?.state = .replaying
+        try await persistTransition(record, from: .claimed, sessionID: sessionID, dataRoot: dataRoot)
+        try Task.checkCancellation()
+        let synthetic = prompt != record.continuation?.resumeText
         let admitted = await InlineInteractionModelOverride.$current.withValue(binding) {
-            // Ordinary turn admission, ordinary gate. Nothing about having
-            // resolved a card grants the resumed turn any autonomy it did not
-            // already have — and the turn runs under the ORIGIN's envelope, so
-            // its reply goes back where the request came from and its tools are
-            // judged on the identities the first attempt was judged on.
             await ChatToolSessionContext.$envelope.withValue(origin) {
-                // The gate reads this task-local directly in places that never
-                // see the envelope (Full Mac admission, turn planning), so the
-                // re-verified signature is bound on BOTH, exactly as the tool
-                // replay binds it.
-                await ChatToolSessionContext.$commandSignatureVerified
-                    .withValue(origin?.commandSignatureVerified) {
-                    await ChatToolSessionContext.$replyRoute
-                        .withValue(origin?.deliveryRoute) {
-                            await startTurn(
-                                prompt, sessionID,
-                                prompt != claimed.continuation?.resumeText
-                            )
-                        }
+                await ChatToolSessionContext.$commandSignatureVerified.withValue(origin?.commandSignatureVerified) {
+                    await ChatToolSessionContext.$replyRoute.withValue(origin?.deliveryRoute) {
+                        await startTurn(prompt, sessionID, synthetic)
+                    }
                 }
             }
         }
-
-        // A REFUSED admission is a dead end unless it is said out loud. Putting
-        // the continuation back to `waiting` under a card still reading
-        // `settled` left nothing that could restart it: the card has no retry
-        // control in a settled state, `begin` refuses a settled card, and
-        // reclaim only releases `claimed` rows. The card is failed RETRYABLY
-        // instead — which is exactly what keeps its control and its "Try
-        // again" — against the row as it stands on disk, so the replay
-        // checkpoint written above (`replayedAt` / `replayedResult`) survives
-        // and a retry tells the model what the call already returned rather
-        // than making it a second time.
         guard admitted else {
-            nativeLog("[interaction] resume was not admitted for \(interaction.id); claim released")
-            await failAfterLostTransition(
-                id: interaction.id, sessionID: sessionID,
-                reason: "That couldn't be continued just now. Try again.",
-                dataRoot: dataRoot
-            )
-            return nil
+            try Task.checkCancellation()
+            throw failure("That couldn't be continued just now. Try again.")
         }
-        // `resumed` is a claim about the world, so it is written only when the
-        // world agrees.
-        var settledClaim = admittingClaim
-        settledClaim.continuation?.state = .resumed
-        do {
-            try await persistTransition(
-                settledClaim, from: .replaying, sessionID: sessionID, dataRoot: dataRoot
-            )
-        } catch {
-            // The turn may already be running, so the row must not be left in
-            // `.replaying` for reclaim to guess about later in this same
-            // launch. It is failed retryably against the state we know, and
-            // the person is told the resume is unverifiable.
-            nativeLog("[interaction] recording the resume of \(interaction.id) failed: \(error)")
-            await failAfterLostTransition(
-                id: interaction.id, sessionID: sessionID,
-                reason: "I can't tell whether that resumed. Try again.",
-                dataRoot: dataRoot
-            )
-        }
-        return nil
+        return (nil, nil)
     }
 
-    /// A `.claimed` continuation that never reached `.resumed` is stranded: the
-    /// claim is durable, the turn that was supposed to follow it is not, and a
-    /// process that died between the two leaves a card nothing can restart.
-    ///
-    /// A relaunch has no resumes in flight, so any claim still on disk when
-    /// this session first reads the conversation belongs to a process that is
-    /// gone. Put it back to `waiting` and it becomes retryable again. Settled
-    /// or declined rows still waiting lost the process before its claim.
+    /// Reclaim only same-life work stranded by process exit. Cross-life reads
+    /// are stopped, so conversation open cannot replay a restored card.
     public static func reclaimStrandedContinuations(
         sessionID: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async {
         guard !reclaimedSessions.contains(sessionID) else { return }
-        // The CHECKED read first, and the once-per-session mark only after the
-        // pass actually reconciled. Marking up front meant a transcript read
-        // that FAILED — a locked file, a transient I/O error — burned the one
-        // attempt this launch gets, and every stranded claim in the
-        // conversation stayed stranded until relaunch with nothing on screen
-        // saying so.
         let rows: [JSONValue]
         do {
             rows = try await checkedRows(sessionID, dataRoot)
         } catch {
             return
         }
-        // Any mutation below that fails leaves the session UNMARKED, so the
-        // next read of this conversation retries it.
+        // Mark the session only after its checked read and mutations succeed.
         var reconciled = true
         for interaction in rows.compactMap({ interaction(in: $0) }) {
-            // A `running` card means "a control is open on this Mac right
-            // now". This is the FIRST read of the conversation this launch, so
-            // no control in this process can have opened yet: anything still
-            // running belongs to a process that is gone, and left the card with
-            // no action at all — not open enough to act on, not failed enough
-            // to retry. Demote it to the retryable failure it actually is.
+            // A same-life control held by the departed process needs a new tap.
             if case .running = interaction.state {
                 let orphaned = interaction.failed(
                     reason: "The app closed before this finished."
@@ -1463,20 +1241,12 @@ public enum InlineInteractionResolver {
                 }
                 continue
             }
-            // A row caught mid-dispatch or mid-admission. The call may have reached the world
-            // and may not have; nothing readable from here can tell, so this
-            // is the one continuation that is NEVER restarted automatically.
-            // The person is told exactly that, and the retry is theirs to tap.
+            // Mid-dispatch/admission has an unknown outcome; only the person retries.
             if interaction.continuation?.state == .replaying,
-               !resumesInFlight.contains(interaction.id) {
+               resumesInFlight[interaction.id] == nil {
                 var released = interaction
                 released.continuation?.state = .waiting
                 released.revision += 1
-                // Which of the two markers this was is readable from the row
-                // itself: a call is only still in doubt when one was dispatched
-                // and never checkpointed. A checkpointed replay (or a card with
-                // no call to replay at all) was caught on the way into the
-                // turn, so the doubt is about the resume, not about the world.
                 let continuation = interaction.continuation
                 let pendingCall: String? =
                     continuation?.mode == .retryBlockedTool && continuation?.replayedAt == nil
@@ -1509,7 +1279,7 @@ public enum InlineInteractionResolver {
                 continue
             }
             guard interaction.continuation?.state == .claimed,
-                  !resumesInFlight.contains(interaction.id)
+                  resumesInFlight[interaction.id] == nil
             else { continue }
             var released = interaction
             released.continuation?.state = .waiting
@@ -1521,14 +1291,10 @@ public enum InlineInteractionResolver {
                     expecting: { $0.continuation?.state == interaction.continuation?.state }
                 )
             } catch {
-                // The claim is still on disk, so this card is still stranded.
-                // Leave the session retryable and do NOT resume from a release
-                // that did not land.
+                // A release that did not land cannot resume.
                 reconciled = false
                 continue
             }
-            // The card settled; only the continuation was lost. Run it now,
-            // which is what the person asked for when they resolved the card.
             await resumeOnce(released, sessionID: sessionID, dataRoot: dataRoot)
         }
         if reconciled { reclaimedSessions.insert(sessionID) }
@@ -1629,12 +1395,7 @@ public enum InlineInteractionResolver {
     }
 
     private nonisolated static func interaction(in row: JSONValue) -> InlineInteraction? {
-        guard case .object(let object) = row,
-              case .object(let metadata)? = object["metadata"],
-              case .string(InlineInteractionWire.transcriptKind)? = metadata["kind"],
-              let raw = metadata[InlineInteractionWire.metadataKey]
-        else { return nil }
-        return InlineInteractionNeed.decode(raw)
+        SwiftNativeChatOrchestrationClient.inlineInteraction(in: row)
     }
 
     private static func require(
@@ -1678,39 +1439,6 @@ public enum InlineInteractionResolver {
         )
     }
 
-    /// The recovery write after a post-claim transition did not land.
-    ///
-    /// The in-memory row this caller holds is exactly the thing that just
-    /// lost, so writing it back stamps a stale continuation over whatever
-    /// actually won. The authoritative row is re-read instead and THAT is
-    /// failed retryably — and a row that already moved on to `resumed` or was
-    /// invalidated is left alone, because a retry means nothing on it.
-    private static func failAfterLostTransition(
-        id: String,
-        sessionID: String,
-        reason: String,
-        dataRoot: URL
-    ) async {
-        guard var onDisk = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot)
-        else { return }
-        let found = onDisk.revision
-        let foundState = onDisk.continuation?.state
-        guard foundState != .resumed, foundState != .invalidated else {
-            nativeLog("[interaction] \(id) already moved on; not failing it")
-            return
-        }
-        onDisk.continuation?.state = .waiting
-        let failed = onDisk.failed(reason: reason)
-        // Revision ALONE is not identity here: a continuation-only transition
-        // (`.claimed` -> `.resumed`) does not bump it, so a row that moved
-        // between the read above and this write still matched the compare and
-        // was stamped back to a failed `waiting`. The exact continuation state
-        // this decision was made on is part of the compare.
-        try? await persist(
-            failed, sessionID: sessionID, dataRoot: dataRoot,
-            expecting: { $0.revision == found && $0.continuation?.state == foundState }
-        )
-    }
 
     /// `ifRevision` is the revision the caller READ before deciding on this
     /// transition; `expecting` is a predicate evaluated on the row as it exists
@@ -1724,65 +1452,25 @@ public enum InlineInteractionResolver {
         dataRoot: URL,
         expecting: (@Sendable (InlineInteraction) -> Bool)? = nil
     ) async throws {
-        let persistence = SwiftNativePersistenceCore()
-        let file = path(sessionID, dataRoot)
-        try await persistence.withFileLock(file) {
-            let read = try await persistence.readJSONLReporting(file)
-            guard read.report.isClean else {
-                throw PersistenceCoreError.ioFailure(
-                    "This conversation has damaged rows. Nothing was changed."
-                )
-            }
-            var rows = read.rows
-            guard let index = rows.firstIndex(where: {
-                Self.interaction(in: $0)?.id == interaction.id
-            }) else { throw ResolveError.notFound }
-            if let expected, let persisted = Self.interaction(in: rows[index]) {
-                guard persisted.revision == expected else {
-                    throw ResolveError.staleRevision(
-                        expected: expected, actual: persisted.revision
-                    )
-                }
-            }
-            if let expecting {
-                guard let onDisk = Self.interaction(in: rows[index]) else {
-                    throw ResolveError.notFound
-                }
-                guard expecting(onDisk) else {
-                    throw ResolveError.staleRevision(
-                        expected: interaction.revision, actual: onDisk.revision
-                    )
-                }
-            }
-            guard case .object(var object) = rows[index],
-                  case .object(var metadata)? = object["metadata"]
-            else { throw ResolveError.notFound }
-            if let encoded = InlineInteractionNeed.encode(interaction) {
-                metadata[InlineInteractionWire.metadataKey] = encoded
-            }
-            // The receipt the rest of the app reads. The pill and the history
-            // renderer both parse `resultSummary` as a dispatch envelope, so a
-            // settled card must write an ENVELOPE here, not prose — prose
-            // parses to nothing and renders as "completion not confirmed".
-            let envelope = receiptEnvelope(interaction)
-            metadata["resultSummary"] = .string(
-                (try? envelope.serialize(pretty: false)) ?? ""
-            )
-            metadata["resultStatus"] = .string(interaction.state.name)
-            metadata["resultClass"] = .string(
-                ChatToolOutcome.exactResultClass(envelope).rawValue
-            )
-            // Read by SessionHistoryPromptRenderer exactly like an ordinary
-            // tool result, so the settled outcome reaches Agent's next turn
-            // instead of being clipped out of the head projection.
-            if let summary = interaction.state.outcome?.summary, !summary.isEmpty {
-                metadata["resultBody"] = .string(summary)
-            }
-            metadata["ok"] = .bool(interaction.state.outcome != nil)
-            object["metadata"] = .object(metadata)
-            rows[index] = .object(object)
-            try await persistence.replaceJSONL(rows, to: file)
-        }
+        try await settle { @MainActor in
+            do {
+                try await write(interaction, sessionID: sessionID, ifRevision: expected,
+                                dataRoot: dataRoot, expecting: expecting)
+                return Result<Void, Error>.success(())
+            } catch { return .failure(error) }
+        }.get()
+    }
+
+    private static func write(
+        _ interaction: InlineInteraction,
+        sessionID: String,
+        ifRevision expected: Int? = nil,
+        dataRoot: URL,
+        expecting: (@Sendable (InlineInteraction) -> Bool)? = nil
+    ) async throws {
+        try await SwiftNativeChatOrchestrationClient.persistInlineInteraction(
+            interaction, at: path(sessionID, dataRoot), ifRevision: expected,
+            persistence: SwiftNativePersistenceCore(), expecting: expecting)
         await ApprovalChatCards.publishInteractionChange(id: interaction.id, sessionID: sessionID, dataRoot: dataRoot)
         // Nothing re-reads the transcript on its own; the open conversation
         // still shows the pending card until told. Same signal a remote turn
@@ -1792,36 +1480,6 @@ public enum InlineInteractionResolver {
     }
 
     public nonisolated static func receiptEnvelope(_ interaction: InlineInteraction) -> JSONValue {
-        switch interaction.state {
-        case .settled(let outcome):
-            return .object([
-                "status": .string("succeeded"),
-                "ok": .bool(true),
-                "detail": .string(outcome.summary),
-            ])
-        case .declined:
-            return .object([
-                "status": .string("cancelled"),
-                "detail": .string(interaction.declineConsequence),
-            ])
-        // Replaced by a newer identical ask. Terminal and nobody's fault — and
-        // NOT still waiting, which is what the `default` below used to call it.
-        case .superseded:
-            return .object([
-                "status": .string("cancelled"),
-                "detail": .string("A newer identical request replaced this one."),
-            ])
-        case .failed(let reason):
-            return .object([
-                "status": .string("failed"),
-                "ok": .bool(false),
-                "error": .string(reason),
-            ])
-        default:
-            return .object([
-                "status": .string(InlineInteractionWire.waitingStatus),
-                "detail": .string(interaction.why),
-            ])
-        }
+        SwiftNativeChatOrchestrationClient.inlineInteractionReceiptEnvelope(interaction)
     }
 }

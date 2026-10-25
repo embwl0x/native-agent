@@ -16,6 +16,8 @@ import PersistenceCore
 import CoreSpotlight
 #endif
 
+// Blueprint: | `TelegramView.swift` | `TelegramView`: credential-free settings/status projections and save/test/log controls; outbound success never proves inbound poller health |
+
 enum TelegramPanelPresentation {
     enum ReadState: Equatable {
         case loading
@@ -205,10 +207,12 @@ struct TelegramView: View {
         ProvidersFacade.modelOptions(from: appModel.engine.providers.catalog, current: appModel.telegramModel, limit: 40)
     }
 
+    private var tokenConfigured: Bool { appModel.engine.telegram.status?.tokenConfigured == true }
+
     private var botTokenFieldState: TelegramBotTokenPresentation.FieldState {
         TelegramBotTokenPresentation.fieldState(
             draft: appModel.telegramToken,
-            tokenConfigured: appModel.telegramTokenConfigured
+            tokenConfigured: tokenConfigured
         )
     }
 
@@ -217,7 +221,7 @@ struct TelegramView: View {
     }
 
     private var tokenStatusPresentation: TelegramSettingsPresentation.TokenStatus {
-        TelegramSettingsPresentation.tokenStatus(tokenConfigured: appModel.telegramTokenConfigured)
+        TelegramSettingsPresentation.tokenStatus(tokenConfigured: tokenConfigured)
     }
 
     var body: some View {
@@ -297,6 +301,10 @@ struct TelegramView: View {
 
     @ViewBuilder
     private var connectionSection: some View {
+        let savedAllowlist = appModel.engine.telegram.status.map { telegramAllowlistPresentation(
+            chats: $0.configuration.allowedChatIds.joined(separator: ","),
+            users: $0.configuration.allowedUserIds.joined(separator: ",")) }
+        let configured = savedAllowlist?.isValidAndConfigured == true
         TelegramSection(label: "Connection") {
             TelegramCard {
                 VStack(alignment: .leading, spacing: 12) {
@@ -306,11 +314,11 @@ struct TelegramView: View {
                         tone: tokenStatusPresentation.isConfigured ? .calm : .trouble
                     )
                     TelegramStatusLine(
-                        text: allowlistPresentation.statusLabel,
-                        systemImage: allowlistConfigured
+                        text: savedAllowlist?.statusLabel ?? "Allowlist unavailable",
+                        systemImage: configured
                             ? "person.crop.circle.badge.checkmark"
                             : "person.crop.circle.badge.exclamationmark",
-                        tone: allowlistConfigured ? .calm : .trouble
+                        tone: configured ? .calm : .trouble
                     )
 
                     if let status = appModel.engine.telegram.status {
@@ -388,11 +396,11 @@ struct TelegramView: View {
                     TelegramNote(text: botTokenFieldState.helperText, tone: .quiet)
                     if let validationMessage = botTokenFieldState.validationMessage {
                         TelegramNote(text: validationMessage, tone: .trouble)
-                    } else if !appModel.telegramTokenConfigured
+                    } else if !tokenConfigured
                                 && appModel.telegramToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         TelegramNote(text: "A bot token is needed before Telegram settings can be saved.", tone: .trouble)
                     }
-                    if appModel.telegramTokenConfigured {
+                    if tokenConfigured {
                         Button("Disconnect Telegram") {
                             showDisconnectConfirm = true
                         }
@@ -545,7 +553,7 @@ struct TelegramView: View {
                     }
                     .disabled(
                         appModel.isTestingTelegram
-                            || !appModel.telegramTokenConfigured
+                            || !tokenConfigured
                             || !allowlistConfigured
                             || !invalidAllowlistTokens.isEmpty
                     )

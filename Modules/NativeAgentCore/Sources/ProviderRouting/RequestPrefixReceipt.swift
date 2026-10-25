@@ -2,6 +2,8 @@ import Foundation
 import CryptoKit
 import PersistenceCore
 
+// Blueprint: | `RequestPrefixReceipt.swift` | `RequestPrefixReceipt`: hashes exact encoded request byte slices without reserializing tools or exposing request text |
+
 /// Hash slices of the encoded request, never a second serialization of its tools.
 /// No request text leaves this value. Turn/history facts stay in the turn receipt.
 enum RequestPrefixReceipt {

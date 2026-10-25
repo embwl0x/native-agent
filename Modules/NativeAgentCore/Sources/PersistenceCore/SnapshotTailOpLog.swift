@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `SnapshotTailOpLog.swift` | `SnapshotTailOpLog`: shared base-plus-tail replay, feed integrity and bounded compaction bookkeeping |
+
 // MARK: - SnapshotTailOpLog — shared snapshot+tail op-log engine
 //
 // Three append-only op-log stores (DeskStore, GitHubCommandStore, and — as of
@@ -38,7 +40,10 @@ public enum SnapshotTailOpLog {
     // unreadable identities return nil and must never authorize a cache hit.
     public enum FileStamp: Sendable, Equatable {
         case absent
-        case present(device: Int32, inode: UInt64, size: Int64, seconds: Int, nanoseconds: Int)
+        /// `changeSeconds`/`changeNanoseconds` are the status-change time, so
+        /// a permission or ownership change counts as a change too.
+        case present(device: Int32, inode: UInt64, size: Int64, seconds: Int, nanoseconds: Int,
+                     changeSeconds: Int, changeNanoseconds: Int)
     }
 
     public struct FeedStamp: Sendable, Equatable {
@@ -59,7 +64,9 @@ public enum SnapshotTailOpLog {
                 inode: info.st_ino,
                 size: Int64(info.st_size),
                 seconds: info.st_mtimespec.tv_sec,
-                nanoseconds: info.st_mtimespec.tv_nsec
+                nanoseconds: info.st_mtimespec.tv_nsec,
+                changeSeconds: info.st_ctimespec.tv_sec,
+                changeNanoseconds: info.st_ctimespec.tv_nsec
             )
         }
         return errno == ENOENT ? .absent : nil

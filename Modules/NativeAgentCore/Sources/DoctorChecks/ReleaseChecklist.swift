@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ReleaseChecklist.swift` | `ReleaseChecklist` struct |
 
 public struct ReleaseChecklistItem: Identifiable, Codable, Hashable {
     public var id: String

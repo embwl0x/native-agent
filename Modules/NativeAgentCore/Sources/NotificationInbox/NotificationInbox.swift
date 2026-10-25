@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `NotificationInbox.swift` | `NotificationInboxClock` |
 
 public enum NotificationInboxClock {
     /// UTC offset timestamp, with six fractional digits unless microseconds are zero.

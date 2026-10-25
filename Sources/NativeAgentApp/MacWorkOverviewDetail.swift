@@ -4,29 +4,48 @@ import NativeAgentShared
 import NotificationInbox
 import WorkshopExecution
 
+// Blueprint: | `MacWorkOverviewDetail.swift` | `MacWorkOverviewDetail`: canonical work detail and decision actions, never the clipped overview copy |
+
 struct MacWorkOverviewDetail: View {
     @Environment(AppModel.self) private var appModel
-    let row: WorkOverviewRow
-    let capturedAt: String
+    let reference: WorkOverviewReference
     let onDone: () -> Void
-    @State private var inboxItem: InboxItemRecord?
-    @State private var execution: WorkshopExecutionRecord?
     @State private var loaded = false
     @State private var error: String?
     @State private var deciding = false
     @State private var actionFlight = InboxRowActionFlight()
     @State private var group: InboxRelatedGroup?
 
+    private var inboxItem: InboxItemRecord? {
+        appModel.engine.inbox.items.first { $0.id == reference.id }
+    }
+    private var execution: WorkshopExecutionRecord? {
+        appModel.engine.desk.board.executions.items.first { $0.id == reference.id }
+    }
+
+    private var deskRow: WorkOverviewRow? {
+        appModel.engine.desk.board.items.first { $0.handle == reference.id }
+            .map { WorkOverviewRead.row(for: $0, now: Date()) }
+    }
+    private var title: String? {
+        if reference.kind == .approval {
+            return appModel.engine.approvals.records.first { $0.id == reference.id }?.title
+        }
+        if reference.kind == .inbox { return inboxItem?.title }
+        if reference.kind == .desk { return deskRow?.title }
+        return execution?.title
+    }
+
     var body: some View {
-        PageSheetHost(title: row.title, onDone: onDone) {
-            if row.reference.kind == .approval {
-                ApprovalsView(focusedID: row.reference.id)
-            } else if row.reference.kind == .inbox {
+        PageSheetHost(title: title, onDone: onDone) {
+            if reference.kind == .approval {
+                ApprovalsView(focusedID: reference.id)
+            } else if reference.kind == .inbox {
                 if let item = inboxItem {
                     InboxItemDetailSheet(item: item, onAction: { action in
                         await actionFlight.perform {
                             try await InboxCardActions.perform(item.id, action: action,
-                                dataRootOverride: appModel.dataRootOverride, effects: AppInboxCardActionEffects())
+                                dataRootOverride: appModel.dataRootOverride, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
                         }
                     }, onOpenGroup: { group = $0 }, closesOnGroupSelection: false, onClose: onDone)
                 } else {
@@ -35,29 +54,32 @@ struct MacWorkOverviewDetail: View {
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text(row.stateLabel(at: Date())).font(.headline)
-                        if let location = row.location { Text(location).font(.caption) }
                         if let execution {
+                            let row = WorkOverviewRead.row(for: execution, now: Date())
+                            Text(row.stateLabel(at: Date())).font(.headline)
+                            if let location = row.location { Text(location).font(.caption) }
                             // The canonical record, never the clipped copy.
                             Text(WorkOverviewRead.text(for: execution)).textSelection(.enabled)
-                        } else {
+                            if execution.status == "blocked_on_approval" {
+                                HStack {
+                                    Button("Deny") { decide(execution, approve: false) }
+                                    Button("Approve") { decide(execution, approve: true) }
+                                }
+                                .disabled(deciding || execution.currentStepId.isEmpty)
+                            }
+                        } else if reference.kind == .desk, let row = deskRow {
+                            Text(row.stateLabel(at: Date())).font(.headline)
+                            if let location = row.location { Text(location).font(.caption) }
                             Text(row.detail).textSelection(.enabled)
                             if MobileDeskProjectionBounds.isClipped(row.detail) {
                                 Text("This reading copy is cut off.").font(.caption)
                             }
-                            if !capturedAt.isEmpty {
+                            if let capturedAt = appModel.engine.desk.board.overview?.capturedAt, !capturedAt.isEmpty {
                                 Text("Reading copy captured \(capturedAt)").font(.caption).foregroundStyle(.secondary)
                             }
-                        }
-                        if loaded, execution == nil, row.state == "Decision needed" {
-                            Text("This decision is no longer available.").foregroundStyle(.secondary)
-                        }
-                        if let execution, execution.status == "blocked_on_approval" {
-                            HStack {
-                                Button("Deny") { decide(execution, approve: false) }
-                                Button("Approve") { decide(execution, approve: true) }
-                            }
-                            .disabled(deciding || execution.currentStepId.isEmpty)
+                        } else {
+                            Text(appModel.engine.desk.board.executions.unavailableReason
+                                ?? "This decision is no longer available.").foregroundStyle(.secondary)
                         }
                         if let error { Text(error).foregroundStyle(.red) }
                     }
@@ -65,22 +87,17 @@ struct MacWorkOverviewDetail: View {
                 }
             }
         }
+        .task(id: reference) {
+            if reference.kind == .inbox {
+                loaded = false
+                await appModel.refreshForSidebarItem(.activity)
+                loaded = true
+            }
+        }
         .sheet(item: $group) { group in
             PageSheetHost(title: group.title, onDone: { self.group = nil }) {
                 InboxView(initialGroup: group)
             }
-        }
-        .task {
-            do {
-                if row.reference.kind == .inbox {
-                    inboxItem = try await appModel.engine.inbox.list().first { $0.id == row.reference.id }
-                } else if row.reference.kind == .execution {
-                    let board = await appModel.engine.desk.loadBoard()
-                    if let reason = board.executions.unavailableReason { error = reason }
-                    execution = board.executions.items.first { $0.id == row.reference.id }
-                }
-            } catch { self.error = UserFacingError.message(error, action: "load this item") }
-            loaded = true
         }
     }
 
@@ -89,15 +106,9 @@ struct MacWorkOverviewDetail: View {
         Task {
             defer { deciding = false }
             do {
-                if approve {
-                    self.execution = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
-                        executionId: execution.id, stepId: execution.currentStepId, decision: "approve",
-                        dataRootOverride: appModel.dataRootOverride)
-                } else {
-                    self.execution = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
-                        executionId: execution.id, stepId: execution.currentStepId, decision: "reject",
-                        dataRootOverride: appModel.dataRootOverride)
-                }
+                _ = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
+                    executionId: execution.id, stepId: execution.currentStepId,
+                    decision: approve ? "approve" : "reject", dataRootOverride: appModel.dataRootOverride)
                 onDone()
             } catch { self.error = UserFacingError.message(error, action: "\(approve ? "approve" : "reject") that step") }
         }

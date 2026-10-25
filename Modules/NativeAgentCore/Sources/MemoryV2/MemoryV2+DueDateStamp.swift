@@ -36,6 +36,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `MemoryV2+DueDateStamp.swift` | `MemoryDueDateStamp`: conservative spoken-plan date/time resolution and metadata stamping for forward expectations |
+
 public enum MemoryDueDateStamp {
 
     /// ISO-8601 instant the memory's text points at.

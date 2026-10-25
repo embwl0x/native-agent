@@ -2,6 +2,8 @@ import CryptoKit
 import Foundation
 import NativeAgentShared
 
+// Blueprint: | `InlineInteractionSignatureWitness.swift` | `InlineInteractionSignatureWitness`: cryptographic witness for signed card continuation; persisted transcript claims confer no signing authority |
+
 /// The seam that lets a card raised by a SIGNED turn resume as one, without
 /// ever writing "this was signed" into the transcript as a fact.
 ///
@@ -76,6 +78,7 @@ public enum InlineInteractionSignatureWitness {
                 sessionID,
                 interactionID,
                 continuation.resumeRunId,
+                continuation.lifeID ?? "",
                 envelope?.surface ?? "",
                 envelope?.agent ?? "",
                 envelope?.verifiedChatId ?? "",

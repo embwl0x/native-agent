@@ -1,6 +1,7 @@
 import ChatTurnContracts
 import Foundation
 import PersistenceCore
+// Blueprint: | `MemoryDataProvenance.swift` | `MemoryDataProvenance`: stamp, retain and consume untrusted memory sources across writes and readbacks |
 
 /// Stored untrusted content keeps its steer through duplicate saves and edits.
 /// Reading remains allowed; only subsequent effects use the turn's usual gates.

@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `REMPinsReader.swift` | `REMPinsReader` enum; `read`, `latest` |
 
 // MARK: - REMPin (chat-turn injection shape)
 
@@ -20,7 +21,7 @@ public struct REMPin: Sendable, Codable, Equatable {
 // MARK: - REMPinsReader
 
 /// Mtime-cached reader for the rem_pins.json index emitted by REMConsolidator.
-/// Lives in DreamREMCycle so ChatOrchestration can depend on it without
+/// Lives in DreamREMCycle so ChatTurnRuntime can depend on it without
 /// pulling the whole consolidation pipeline.
 public enum REMPinsReader {
     /// Read the per-target pins index. Empty file / missing file / parse

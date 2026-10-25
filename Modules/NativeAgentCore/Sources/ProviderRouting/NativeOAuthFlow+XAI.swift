@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `NativeOAuthFlow+XAI.swift` | `NativeOAuthFlow`: `startXAIOAuthFlow` |
 
 private struct XAIOIDCDiscovery: Sendable {
     public let authorizationEndpoint: URL
@@ -73,18 +74,12 @@ extension NativeOAuthFlow {
                 error: "xAI sign-in failed: \(NativeOAuthSupport.redact(error.localizedDescription))")
         }
 
-        let (code, returnedState, providerError) = parseCallback(callbackURL)
-        if let providerError = providerError {
-            return OAuthFlowResult(ok: false,
-                error: "xAI returned error: \(NativeOAuthSupport.redact(providerError))")
-        }
-        guard let code = code, !code.isEmpty else {
-            return OAuthFlowResult(ok: false,
-                error: "xAI did not return an authorization code.")
-        }
-        guard returnedState == state else {
-            return OAuthFlowResult(ok: false,
-                error: "OAuth state mismatch — possible CSRF; aborting.")
+        let code: String
+        switch validateCallback(callbackURL, expectedState: state,
+            providerErrorMessage: { "xAI returned error: \(NativeOAuthSupport.redact($0))" },
+            missingCodeMessage: "xAI did not return an authorization code.") {
+        case .code(let value): code = value
+        case .failure(let message): return OAuthFlowResult(ok: false, error: message)
         }
 
         let tokens: [String: Any]
@@ -159,12 +154,7 @@ extension NativeOAuthFlow {
                 NSLocalizedDescriptionKey: "xAI token endpoint is not trusted.",
             ])
         }
-        var req = URLRequest(url: tokenEndpoint)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 30
-        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.httpBody = NativeOAuthSupport.formEncode([
+        let (data, response) = try await NativeOAuthSupport.post(tokenEndpoint, [
             "grant_type": "authorization_code",
             "client_id": XAIOAuthDirectAdapter.clientID,
             "code": code,
@@ -172,9 +162,7 @@ extension NativeOAuthFlow {
             "code_verifier": verifier,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-        ]).data(using: .utf8)
-
-        let (data, response) = try await URLSession.shared.data(for: req)
+        ], timeout: 30, session: .shared)
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
             let snippet = String(data: data.prefix(600), encoding: .utf8) ?? ""
             throw NSError(domain: "NativeOAuthFlow.xAI", code: http.statusCode, userInfo: [
@@ -202,7 +190,7 @@ extension NativeOAuthFlow {
                 NSLocalizedDescriptionKey: "xAI token response did not include access_token.",
             ])
         }
-        let path = OAuthCredentialDestinations.xAIProvider(dataRoot: dataRoot)
+        let path = XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot)
         try ProviderStateValidation.credential(tokens)
         try NativeOAuthSupport.updateProviderCredential(at: path, replacingXAIGrant: true) { existing in
             // 2026-09-06: optional identity and expiry fields belong to this sign-in.

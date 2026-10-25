@@ -2,6 +2,7 @@ import Foundation
 import ImageIO
 import CryptoKit
 import NativeAgentCore
+// Blueprint: | `CodexImageGenerationControls.swift` | `CodexImageGenerationRequest`: `normalizedForBuiltIn`, `normalized` |
 
 /// Prepared only after the dispatcher's ordinary file authorization. No remote URLs.
 struct CodexImageReference: Sendable, Equatable {

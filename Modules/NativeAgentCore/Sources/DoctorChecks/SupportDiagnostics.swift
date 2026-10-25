@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `SupportDiagnostics.swift` | support diagnostics read model |
 
 public struct SupportDiagnostics: Codable, Hashable, Sendable {
     public var app: String
@@ -18,7 +19,7 @@ public struct SupportDiagnostics: Codable, Hashable, Sendable {
             doctorStatus = DoctorStatusProjection.supportSnapshotOfflineRollup(checks)
         } else {
             let statuses = try await makeDoctorChecks().runAll().map(\.status)
-            doctorStatus = DoctorStatusProjection.supportSnapshotRollup(statuses)
+            doctorStatus = DoctorStatusProjection.doctorRollup(statuses)
         }
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
         return SupportDiagnostics(

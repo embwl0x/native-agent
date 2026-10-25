@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `ChatTranscriptToolMessageKind.swift` | `ChatTranscriptToolMessageKind` enum; `pendingApprovalID`, `pendingApprovalReason` |
 
 /// Wire vocabulary for tool receipts that have a special transcript
 /// presentation. The writer classifies a non-blocking approval result here;

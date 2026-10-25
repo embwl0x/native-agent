@@ -4,6 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import CognitiveSubstrate
+// Blueprint: | `ChatTurnExecution.swift` | `ChatTurnExecution` class; `bindHistoryRunID`, `keepCapabilityNote` |
 
 package final class ChatTurnExecution: @unchecked Sendable {
     @TaskLocal package static var current: ChatTurnExecution?
@@ -49,16 +50,24 @@ package final class ChatTurnExecution: @unchecked Sendable {
     }
     /// Her-screen Phase 6 — the source-frame fingerprint of the last image
     /// `screen` attached per window this turn. A match means the window has
-    /// not changed, so the picture already in her context stands.
-    private var attachedPixels: [String: (fingerprint: String, frameID: String)] = [:]
+    /// not changed, so the picture already in her context stands, while that
+    /// picture's pixels are still there (`keepPixels`).
+    private var attachedPixels: [String: (fingerprint: String, frameID: String, image: String)] = [:]
     package func attachedPixelFrame(window: String, fingerprint: String) -> String? {
         lock.lock(); defer { lock.unlock() }
         guard let attached = attachedPixels[window], attached.fingerprint == fingerprint else { return nil }
         return attached.frameID
     }
-    package func notePixelsAttached(window: String, fingerprint: String, frameID: String) {
+    /// `image` names the attached picture; nil keeps the one already attached.
+    package func notePixelsAttached(window: String, fingerprint: String, frameID: String, image: String? = nil) {
         lock.lock(); defer { lock.unlock() }
-        attachedPixels[window] = (fingerprint, frameID)
+        guard let image = image ?? attachedPixels[window]?.image else { return }
+        attachedPixels[window] = (fingerprint, frameID, image)
+    }
+    /// A picture replaced or released from her context no longer stands for its window.
+    package func keepPixels(_ images: Set<String>) {
+        lock.lock(); defer { lock.unlock() }
+        attachedPixels = attachedPixels.filter { images.contains($0.value.image) }
     }
     private var records: [ToolDispatchRecord] = []
     package var toolRecords: [ToolDispatchRecord] { lock.lock(); defer { lock.unlock() }; return records }

@@ -1,16 +1,18 @@
 import SwiftUI
 import StandingBots
 import ProviderRouting
-import ChatOrchestration
-import PersistenceCore
+// Blueprint: | `BotsEditorSheet.swift` | facade provider accounts and checked settings, shelf next-run projection, engine-owned fresh definition merge |
 
 struct BotsEditorSheet: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.dismiss) private var dismiss
     let definition: BotDefinition?
+    let nextRun: Date?
     let save: (BotDefinition) async throws -> Void
     private struct Draft: Codable, Equatable {
         var name = ""
+        /// Optional so drafts saved before the field still decode.
+        var personality: String?
         var brief = ""
         var provider = ""
         var model = ""
@@ -26,11 +28,10 @@ struct BotsEditorSheet: View {
         /// The When section as it opened; saved untouched, the bot keeps its exact timing.
         var loadedTiming: [String]?
         var cron = ""
-        var zone = ""
         var tokens = ""
         var seconds = ""
         var daily = ""
-        var eventSource = BotEventSource.github
+        var eventSource = BotEventSource.slack
         var eventFilter = ""
         var eventKeyword = ""
         var tell = false
@@ -39,7 +40,7 @@ struct BotsEditorSheet: View {
             let clock = Calendar.current.dateComponents([.hour, .minute], from: time)
             return String(format: "%02d:%02d", clock.hour ?? 9, clock.minute ?? 0)
         }
-        var timingKey: [String] { [when, hours, cron, zone, String(weekday), clockText] }
+        var timingKey: [String] { [when, hours, cron, String(weekday), clockText] }
     }
 
     private var draftSubject: String { "bot/\(definition?.id.uuidString ?? "new")" }
@@ -49,13 +50,22 @@ struct BotsEditorSheet: View {
         nonmutating set { appModel.setEditDraft(newValue, for: draftSubject, baseline: seed ?? Draft()) }
     }
     private var draftBinding: Binding<Draft> { Binding(get: { draft }, set: { draft = $0 }) }
-    @State private var followingModel: String?
-    @State private var providers: [ProviderThenModelPicker.Provider] = []
+    private var followingModel: String? { appModel.engine.providers.settings?.preferences["chat"]?.model }
+    private var providers: [ProviderThenModelPicker.Provider] {
+        appModel.engine.providers.connections.map { account in
+            ProviderThenModelPicker.Provider(id: account.provider_id, name: account.provider_id == "codex" ? "OpenAI (subscription)" : account.display_name,
+                ready: account.auth_status.eligible, models: account.models.map {
+                    ProviderThenModelPicker.Model(id: $0.id, name: $0.name,
+                        supportedEfforts: $0.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"], supportsFast: $0.supports_fast)
+                })
+        }
+    }
     @State private var error: String?
     @State private var saving = false
 
-    init(definition: BotDefinition?, save: @escaping (BotDefinition) async throws -> Void) {
+    init(definition: BotDefinition?, nextRun: Date?, save: @escaping (BotDefinition) async throws -> Void) {
         self.definition = definition
+        self.nextRun = nextRun
         self.save = save
     }
 
@@ -80,13 +90,12 @@ struct BotsEditorSheet: View {
                     saving = true
                     let subject = draftSubject
                     let submitted = draft
-                    let submission = Result { try makeDefinition() }
                     Task {
                         defer { saving = false }
                         do {
-                            let saved = try submission.get()
+                            let saved = try await makeDefinition(submitted)
                             try await save(saved)
-                            appModel.acceptEditDraft(subject, submitted: submitted, saved: initialDraft(saved))
+                            appModel.acceptEditDraft(subject, submitted: submitted, saved: initialDraft(saved, nextRun: nextRun))
                             dismiss()
                         }
                         catch { self.error = BotsShelfView.problem(error, action: "save that helper") }
@@ -98,18 +107,10 @@ struct BotsEditorSheet: View {
         .padding(24).frame(width: 570)
         .houseSheet()
         .interactiveDismissDisabled(saving)
-        .onAppear { if seed == nil { seed = initialDraft(definition) } }
+        .onAppear { if seed == nil { seed = initialDraft(definition, nextRun: nextRun) } }
         .task {
             switch await appModel.engine.providers.refreshSettings(refreshCatalog: false, cause: UserFacingError.cause) {
-            case .loaded(let snapshot):
-                providers = snapshot.providers.map { account in
-                    ProviderThenModelPicker.Provider(id: account.provider_id, name: account.provider_id == "codex" ? "OpenAI (subscription)" : account.display_name,
-                        ready: account.auth_status.eligible, models: account.models.map {
-                            ProviderThenModelPicker.Model(id: $0.id, name: $0.name,
-                                supportedEfforts: $0.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"], supportsFast: $0.supports_fast)
-                        })
-                }
-                followingModel = try? await SwiftNativeProviderRouting(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()).modelForSurface("chat").model
+            case .loaded: break
             case .failed(let message): error = message
             }
         }
@@ -118,6 +119,8 @@ struct BotsEditorSheet: View {
     private var fields: some View {
                 VStack(alignment: .leading, spacing: 14) {
                     field("Name", text: draftBinding.name)
+                    editor("Personality", text: Binding(get: { draft.personality ?? "" },
+                                                        set: { draft.personality = $0.isEmpty ? nil : $0 }), height: 70)
                     editor("What to do", text: draftBinding.brief, height: 110)
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Model").font(.subheadline)
@@ -186,18 +189,11 @@ struct BotsEditorSheet: View {
                         if draft.when == "Every N hours" { field("Hours between runs", text: draftBinding.hours) }
                         if draft.when == "Custom" {
                             field("Schedule (cron)", text: draftBinding.cron)
-                            field("Time zone", text: draftBinding.zone)
                         }
                         if draft.when == "On an event" {
-                            Picker("Event", selection: draftBinding.eventSource) {
-                                Text("GitHub issue or pull request").tag(BotEventSource.github)
-                                Text("Slack message").tag(BotEventSource.slack)
-                            }
-                            field(draft.eventSource == .github ? "Repository (owner/repo)" : "Channel ID", text: draftBinding.eventFilter)
+                            field("Slack channel ID", text: draftBinding.eventFilter)
                             field("Keyword (optional)", text: draftBinding.eventKeyword)
-                            Text(draft.eventSource == .github
-                                ? "A new issue or pull request on that repository wakes the bot. GitHub events arrive with the connector's refresh."
-                                : "A message in that channel wakes the bot. Slack delivers a channel ID, so paste the ID rather than the name: in Slack, open the channel, choose View channel details, and copy the ID at the bottom. Events arrive on the channels the Slack connector already receives.")
+                            Text("A message in that channel wakes the bot. Slack delivers a channel ID, so paste the ID rather than the name: in Slack, open the channel, choose View channel details, and copy the ID at the bottom. Events arrive on the channels the Slack connector already receives.")
                                 .font(.caption).foregroundStyle(.secondary)
                             Text("Autonomy off holds the event instead of running it.")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -232,13 +228,14 @@ struct BotsEditorSheet: View {
                 .accessibilityLabel(label)
         }
     }
-    private func initialDraft(_ definition: BotDefinition?) -> Draft {
+    private func initialDraft(_ definition: BotDefinition?, nextRun: Date?) -> Draft {
         var draft = Draft()
         guard let bot = definition else { return draft }
         // One place describes the job. A definition written when "Desired
         // output" was its own field still reads: its output instructions are
         // shown after the brief and are stored back as one brief on save.
         draft.name = bot.name
+        draft.personality = bot.personality
         draft.brief = [bot.brief, bot.outputFormat ?? ""]
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .joined(separator: "\n\n")
@@ -257,11 +254,11 @@ struct BotsEditorSheet: View {
             draft.when = value == 86400 ? "Daily" : value == 604800 ? "Weekly" : "Every N hours"
             draft.hours = String(value / 3600)
             if draft.when != "Every N hours",
-               let next = try? BotRunnerScheduler.scheduledDates(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())[bot.id] {
+               let next = nextRun {
                 draft.time = next; draft.weekday = Calendar.current.component(.weekday, from: next) - 1
             }
-        case .cron(let expression, let timeZone):
-            draft.when = "Custom"; draft.cron = expression; draft.zone = timeZone ?? ""
+        case .cron(let expression):
+            draft.when = "Custom"; draft.cron = expression
             let parts = expression.split(separator: " ").map(String.init)
             if parts.count == 5, parts[2] == "*", parts[3] == "*",
                let minute = Int(parts[0]), let hour = Int(parts[1]), (0...59).contains(minute), (0...23).contains(hour),
@@ -274,18 +271,17 @@ struct BotsEditorSheet: View {
         draft.loadedTiming = draft.timingKey
         return draft
     }
-    private func makeDefinition() throws -> BotDefinition {
-        let current = try definition.map {
-            try BotDefinitionStore(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()).get($0.id)
+    private func makeDefinition(_ submitted: Draft) async throws -> BotDefinition {
+        try await appModel.engine.editBotDefinition(definition?.id) { current, nextRun in
+            let draft = try appModel.mergingEditDraft(draftSubject, edited: submitted, into: initialDraft(current, nextRun: nextRun))
+            let selectedModel = providers.first { $0.id == draft.provider }?.models.first { $0.id == draft.model }
+            return try BotDefinitionStore.editorDefinition(current, name: draft.name, personality: draft.personality ?? "", brief: draft.brief,
+                provider: draft.provider, model: draft.model, think: draft.think, modelPinned: draft.modelPinned,
+                providerReady: providers.first(where: { $0.id == draft.provider })?.ready == true,
+                supportedEfforts: selectedModel?.supportedEfforts, supportsFast: selectedModel?.supportsFast == true,
+                fast: draft.fast, tokens: draft.tokens, seconds: draft.seconds, daily: draft.daily, when: draft.when, hours: draft.hours,
+                cron: draft.cron, weekday: draft.weekday, clockText: draft.clockText, timingUnchanged: draft.timingKey == draft.loadedTiming,
+                eventSource: draft.eventSource, eventFilter: draft.eventFilter, eventKeyword: draft.eventKeyword, tell: draft.tell, condition: draft.condition)
         }
-        let draft = try appModel.mergingEditDraft(draftSubject, edited: draft, into: initialDraft(current))
-        let selectedModel = providers.first { $0.id == draft.provider }?.models.first { $0.id == draft.model }
-        return try BotDefinitionStore.editorDefinition(current, name: draft.name, brief: draft.brief,
-            provider: draft.provider, model: draft.model, think: draft.think, modelPinned: draft.modelPinned,
-            providerReady: providers.first(where: { $0.id == draft.provider })?.ready == true,
-            supportedEfforts: selectedModel?.supportedEfforts, supportsFast: selectedModel?.supportsFast == true,
-            fast: draft.fast, tokens: draft.tokens, seconds: draft.seconds, daily: draft.daily, when: draft.when, hours: draft.hours,
-            cron: draft.cron, zone: draft.zone, weekday: draft.weekday, clockText: draft.clockText, timingUnchanged: draft.timingKey == draft.loadedTiming,
-            eventSource: draft.eventSource, eventFilter: draft.eventFilter, eventKeyword: draft.eventKeyword, tell: draft.tell, condition: draft.condition)
     }
 }

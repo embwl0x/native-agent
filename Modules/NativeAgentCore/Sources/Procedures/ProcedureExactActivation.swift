@@ -1,6 +1,7 @@
 import NativeAgentCore
 import Foundation
 import PersistenceCore
+// Blueprint: | `ProcedureExactActivation.swift` | Exact activation manifests and active pointers; artifact revalidation and pointer publication share retention's invocation-ledger lock, acquired before the pointer lock |
 
 public enum ProcedureExactActivationError: String, Error, Sendable, Equatable {
     case invalidProposal = "invalid_proposal"
@@ -358,11 +359,19 @@ extension ProcedureArtifactStore {
 
         let pointer = ProcedureExactActivationPointer(manifest: manifest)
         let pointerPath = exactActivationPointerPath(proposal.procedureID)
-        try await persistence.withFileLock(pointerPath) {
-            try await persistence.writeJSON(
-                try JSONValue.parse(JSONEncoder().encode(pointer)),
-                to: pointerPath
-            )
+        let invocationPath = root.appendingPathComponent("invocations.jsonl")
+        try await persistence.withFileLock(invocationPath) {
+            // The earlier load may predate a retention pass. Revalidate while
+            // excluding deletion, then publish before releasing that exclusion.
+            guard try await loadForInvocation(proposal.artifactID) == artifact else {
+                throw ProcedureExactActivationError.artifactMismatch
+            }
+            try await persistence.withFileLock(pointerPath) {
+                try await persistence.writeJSON(
+                    try JSONValue.parse(JSONEncoder().encode(pointer)),
+                    to: pointerPath
+                )
+            }
         }
         return manifest
     }

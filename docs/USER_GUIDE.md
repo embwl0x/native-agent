@@ -29,6 +29,8 @@ Providers has three groups: **Chat**, **Work**, and **Memory and mind**.
 Work and Memory and mind inherit Chat unless you set a **Custom choice**.
 **Use Chat's choice** restores inheritance. The group determines the account
 and model used by its activities; an unusable saved choice is reported.
+Thinking can be set independently while the group keeps following Chat's
+model and account.
 
 ## Optional background and memory settings
 
@@ -74,7 +76,7 @@ the selected provider.
 | **Personality** | Identity, expression, about-you, growth and working guidelines; **My minds** and **Dreams** tabs. |
 | **Providers** | AI accounts and the model choices for Chat, Work, and Memory and mind. |
 | **Trust** | Access presets, feature permissions and approvals; **Mac integration** for individual Mac services. |
-| **Connectors** | Service setup and the **Agents**, **MCP**, **Telegram** and **iPhone** tabs. |
+| **Connectors** | Service setup and the **Agents**, **Telegram** and **iPhone** tabs. |
 | **Capabilities** | Capability inventory and **Show all actions**. |
 | **Diagnostics** | Health checks, Status, Run history, Cognition, Chat turn details, Skills and Tools. |
 | **Settings** | Appearance, shortcuts, updates, inner life and memory settings. |
@@ -123,26 +125,32 @@ in Today or Memories. Skills capture reusable procedures; dreams and REM
 consolidate experience. Neither a conversation nor a dream automatically makes
 a statement a canonical fact.
 
-## Skills, tools, MCP, and connectors
+## Skills, tools, and connectors
 
 Everything the agent calls goes through `app`. Pages and `find` expose
 actions when needed, without adding more tool schemas to each request.
 The old catalog, loading and per-area tool calls are refused with a translated
 `app` call. Work previously opened through the workspace tool is now in home.
 
-- Skills provide guidance and optional admitted scripts. `skill.list` and
-  `skill.read` find and read them; `skill.save`, `skill.enable`, `skill.run`,
-  `skill.resume` and `skill.rollback` manage scripted procedures. They grant
-  no new authority. See the [manifest spec](skill_manifest_spec.md).
-- To author a capability, use `tool.propose`, then `tool.approve`. An
-  activated tool appears as `authored.<id>`. Approval follows the current
+- Skills are built-in guidance: `ability.list` and `ability.read` find and read
+  them.
+- To author a capability, the agent grows an ability with `ability.save`. Under
+  Full Mac their own ability is kept and on at once; otherwise `ability.enable` asks
+  you with a card (or keep it on the Tools page). A kept ability appears as
+  `authored.<id>`; `ability.disable`, `ability.rollback` and `ability.drop` manage it.
+  Abilities grant no new authority. See the [manifest spec](skill_manifest_spec.md).
+  Keeping follows the current
   [Trust and peer-turn rules](#trust-modes-and-approvals), including the
   exemption for agents enabled in Trust.
-- Mounted MCP tools appear as `mcp.<server>.<tool>` actions on the MCP page.
-  Their availability depends on the server and its connection.
-- `web.search` uses Codex with direct web-tool access for general queries and SearXNG for other categories; a Codex failure falls back to SearXNG and the receipt keeps the route and the failure reason; a completed empty search stays on its route; a time range travels with either route.
-- Service connections live in **Connectors**. Authentication and service
-  permissions still apply when an action is available.
+- An MCP server is an ability the agent grows, a resident one keeping the
+  server running; NativeAgent has no MCP page of its own.
+- `web.search` searches SearXNG, every engine it has, and returns its results or its failure said plainly (no fallback; Doctor names a broken SearXNG); on a Mac without SearXNG the result hands their `browser_search`, the same search in a browser (Chrome through the extension when it is connected, else their own browser), which they runs and reads; a time range travels with either.
+- Service connections live in **Connectors**: the Slack and Telegram doors
+  are set up there. Any other service is an ability the agent grows; its secret is
+  granted once on a card the agent raises and kept in the keyring.
+  **Connectors → Secrets** lists each kept secret by name, where it may go,
+  its account and when it was granted; **Remove** deletes it.
+  Authentication and service permissions still apply when an action is available.
 
 In **Connectors → Share a folder**, enter a name, click **Choose folder…**,
 select the folder, choose whether to enable **Let me write to it**, then click
@@ -204,12 +212,14 @@ gates. Delegating work does not grant new authority.
 
 ## Helpers: standing bots
 
-A helper has a name, brief, model and persisted conversation. It runs with its
-saved model choice and the live Trust policy. A missing or invalid model
-choice prevents a run.
+A helper has a name, optional personality, brief, model and persisted conversation.
+Its own turn runner uses those instructions and its own conversation, with its
+saved model choice and the live Trust policy. It can talk to the resident by
+name through `agent.message`, receiving the reply in that call. A missing or
+invalid model choice prevents a run.
 
 Use **Run once** for an explicit request, or configure a schedule or a supported
-GitHub/Slack event. **Pause** stops the helper's scheduled work. A brief does
+Slack event. **Pause** stops the helper's scheduled work. A brief does
 not change permissions.
 
 Scheduled and event-triggered helpers use **Trust → Self-Improvement → Let me
@@ -270,7 +280,7 @@ files, receipts and any external service involved before claiming success.
 1. Start at `app {}` when resuming work; use returned names and references.
 2. Read pages or use `find` for the action and its arguments. Do not load
    tools or crawl private registries.
-3. Use `memory.commit` for durable facts and `skill.read` for relevant
+3. Use `memory.commit` for durable facts and `ability.read` for relevant
    procedures. Expand only the context pointers offered for the current turn.
 4. Put work products in the canonical workspace and durable work on Desk.
 5. Follow the originating session's Trust, approval and service checks.

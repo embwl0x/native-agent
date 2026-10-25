@@ -1,8 +1,10 @@
 import AppToolRuntime
 import SwiftUI
 
+// Blueprint: | `SimpleSetupPanel.swift` | `InlineCardSetupPresentation`: existing setup controls in a floating Simple panel or Advanced sheet/page |
+
 // Simple view has no pages, so the setup a card opens — "Open full setup",
-// the connectors that need their own sheet (Gmail, Google Calendar, X), and
+// the connector that needs its own sheet (Slack), and
 // the pages a card sends the person to (Telegram, Trust, Providers) — opens
 // in one floating glass panel over the chat, with the existing setup view
 // inside it. Advanced keeps the sheet and the pages it always had.
@@ -29,7 +31,7 @@ struct InlineCardSetupPresentation: ViewModifier {
                         Task { await cards.panelClosed() }
                     } content: {
                         if let request = cards.connectorSheet {
-                            ConnectorWizardView(provider: request.provider, startsSignIn: true) {
+                            ConnectorWizardView(provider: request.provider) {
                                 Task { await cards.panelClosed() }
                             }
                         } else if let page = cards.panelPage {
@@ -47,7 +49,7 @@ struct InlineCardSetupPresentation: ViewModifier {
                 get: { simple ? nil : cards.connectorSheet },
                 set: { if $0 == nil { Task { await cards.connectorSheetClosed() } } }
             )) { request in
-                ConnectorWizardView(provider: request.provider, startsSignIn: true) {
+                ConnectorWizardView(provider: request.provider) {
                     Task { await cards.connectorSheetClosed() }
                 }
                 .environment(appModel)

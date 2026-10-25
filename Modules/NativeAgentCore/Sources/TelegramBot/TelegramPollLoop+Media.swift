@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
+// Blueprint: | `TelegramPollLoop+Media.swift` | `TelegramPollLoop`: `chatAttachment`, `caption`, `unsupportedAttachmentKind` |
 
 extension TelegramPollLoop {
     // MARK: - Inbound chat attachments
@@ -182,12 +183,20 @@ extension TelegramPollLoop {
 
     /// Build a user-visible attachment refusal. The reason is
     /// token-redacted and trimmed; never echoes raw bytes or the token.
-    static func attachmentDroppedNotice(reason: String) -> String {
-        let redacted = _tgRedactToken(reason).trimmingCharacters(in: .whitespacesAndNewlines)
-        let short = redacted.count > 180 ? String(redacted.prefix(180)) + "..." : redacted
-        if short.isEmpty {
-            return "(I couldn't process that attachment — please try resending it.)"
+    static func attachmentDroppedNotice(for error: Error) -> String {
+        if let mediaError = error as? TelegramMediaDownloadError {
+            switch mediaError {
+            case .oversized(let reported, let cap):
+                return "attachment_oversized: Attachment is \(reported) bytes; limit \(cap). Send a smaller file."
+            case .missingFilePath:
+                return "attachment_path_missing: Telegram returned no file path. Upload the file as a new attachment."
+            case .httpError(let status):
+                return "attachment_http_failed: Telegram download returned HTTP \(status). Check file access in Telegram before sending it again."
+            case .malformedResponse:
+                return "attachment_response_malformed: Telegram's download response was malformed. Paste the relevant text in this conversation."
+            }
         }
-        return "(I couldn't process that attachment: \(short). Try resending it.)"
+        let redacted = _tgRedactToken(error.localizedDescription).trimmingCharacters(in: .whitespacesAndNewlines)
+        return "attachment_download_failed: \(redacted). Check Telegram setup and file access before sending it again."
     }
 }

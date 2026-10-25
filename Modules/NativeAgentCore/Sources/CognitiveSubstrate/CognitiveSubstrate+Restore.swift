@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+Restore.swift` | `CognitiveSubstrate`: `backupPersistentStateForDoctor`, `restorePersistentState`, `stringArrayValue` |
 
 extension CognitiveSubstrate {
     public func backupPersistentStateForDoctor() async throws -> URL {

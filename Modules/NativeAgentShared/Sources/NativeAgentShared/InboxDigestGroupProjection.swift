@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `InboxDigestGroupProjection.swift` | `InboxDigestGroupProjection`: read-only platform inbox adapter preferring structured groups over legacy prose |
+
 /// Read-only adapter to each platform's persisted inbox model.
 public protocol InboxDigestItem {
     associatedtype RelatedGroup: InboxDigestGroup

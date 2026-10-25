@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentShared
 import ProviderRouting
+// Blueprint: | `CodexSelectableModelCatalog.swift` | `CodexSelectableModelCatalog` typealias |
 
 public typealias CodexSelectableModelCatalog = CodexAccountModelCatalog
 

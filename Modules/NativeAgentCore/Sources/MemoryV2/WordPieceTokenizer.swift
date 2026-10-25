@@ -6,6 +6,8 @@
 
 import Foundation
 
+// Blueprint: | `WordPieceTokenizer.swift` | `WordPieceTokenizer`: BERT/MiniLM vocabulary tokenization, greedy subwords and encoded token IDs |
+
 public final class WordPieceTokenizer: @unchecked Sendable {
     public let vocab: [String: Int]
     private let unkToken = "[UNK]"

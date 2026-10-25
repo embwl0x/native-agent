@@ -1,5 +1,4 @@
 import Privacy
-import BackgroundWork
 import Foundation
 import Experiences
 import AttentionRouting
@@ -11,6 +10,7 @@ import TriggerScheduler
 import DeviceSync
 import AppToolRuntime
 import Synchronization
+// Blueprint: | `SchedulerDueJobRunner+Persistence.swift` | `SchedulerDueJobRunner`: execution-result adaptation to canonical scheduler settlement; `appendActivity` |
 
 extension SchedulerDueJobRunner {
     func update(job: DueJob, result: JobResult, at runDate: Date) async throws {
@@ -42,21 +42,18 @@ extension SchedulerDueJobRunner {
         var payloadObj: [String: JSONValue] = [:]
         if case .object(let obj) = payload { payloadObj = obj }
         if let jobId { payloadObj["jobId"] = .string(jobId) }
-        let event: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string("scheduler"),
-            "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "detail": .string(NativeAppSecretRedactor.redactText(String(detail.prefix(1000)))),
-            "status": .string(status),
-            "executionId": .null,
-            "payload": NativeAppSecretRedactor.redactValue(.object(payloadObj)),
-            "createdAt": .string(Self.iso(Date())),
-        ])
-        // U5 fix-round (2026-06-11, gpt-5.5 review): routed through the shared
-        // capped append (PersistenceCore.appendJSONLCapped) — same flock as
-        // before, plus the shared activity-feed line cap with rotation logging.
+        let event = SwiftNativePersistenceCore.activityEvent(
+            id: UUID().uuidString.lowercased(),
+            kind: "scheduler",
+            title: NativeAppSecretRedactor.redactText(title),
+            detail: NativeAppSecretRedactor.redactText(String(detail.prefix(1000))),
+            status: status,
+            executionId: nil,
+            payload: NativeAppSecretRedactor.redactValue(.object(payloadObj)),
+            createdAt: Self.iso(Date())
+        )
         do {
-            try await appendJSONLCapped(
+            try await SwiftNativePersistenceCore.appendActivityEvent(
                 event, to: activityPath, using: persistence,
                 logLabel: "SchedulerDueJobRunner"
             )
@@ -130,7 +127,7 @@ extension SchedulerDueJobRunner {
         return try await persistence.withFileLock(inboxPath) { () async throws -> Int in
             // 2026-08-11: raw-preserving read — a malformed line among valid
             // rows survives the rewrite verbatim instead of being dropped.
-            let lines = try InboxRewriteGuard.readLines(inboxPath)
+            let lines = try LiveNotificationInbox.readLines(inboxPath)
             let decoded = lines.compactMap(\.row)
             let result = NativeAgentDreamNotificationInboxPolicy.archiveOlderDreamRows(
                 decoded,
@@ -164,7 +161,7 @@ extension SchedulerDueJobRunner {
                     mutated.append(Data(try rewritten.serialize(pretty: false).utf8))
                 }
             }
-            try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
+            try LiveNotificationInbox.write(mutated, to: inboxPath)
             return result.archivedCount
         }
     }

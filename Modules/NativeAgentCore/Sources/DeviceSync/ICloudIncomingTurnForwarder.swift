@@ -4,13 +4,17 @@ import os
 import UniformTypeIdentifiers
 import NativeAgentShared
 import NativeAgentCore
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatToolParsing
 import MacControl
 import PersistenceCore
 import ToolRegistry
 import Transcripts
 import TurnTrace
 import ProviderRouting
+import Privacy
+// Blueprint: | `ICloudIncomingTurnForwarder.swift` | Signed incoming phone turns route helpers to their own runner and resident conversations to chat; iCloudChatFileAccess; checked session commits and Privacy-redacted error publication |
 
 struct ICloudChatReplacementIntent: Equatable, Sendable {
     let assistantMessageID: String
@@ -61,43 +65,6 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         self.port = port
     }
 
-    /// 2026-09-06: a runtime error can carry a Mac filesystem path (storage
-    /// errors name the file they failed on). Nothing leaving this Mac for the
-    /// phone may disclose one, so every absolute path in an exported detail is
-    /// reduced to its last component before it crosses the bridge.
-    static func redactedRemoteErrorDetail(_ value: String) -> String {
-        // 2026-09-06: match the SHAPE of an absolute path, not a list of roots.
-        // The old fixed root list let /data/..., /srv/... and /mnt/... through
-        // untouched. Any absolute path of two or more segments is reduced to
-        // its leaf; the lookbehind keeps the rule off relative paths ("a/b/c").
-        // 2026-09-06: a colon is NOT in that lookbehind. It was, and it let
-        // "path:/data/private/file.json" through whole — the leading slash was
-        // preceded by a colon, and every later slash by a letter. A URL scheme
-        // is still excluded without it: "https://host/x" cannot match at the
-        // first slash (a segment needs one non-slash character and the next
-        // character is "/"), nor at the second (preceded by "/"), nor at
-        // "/x" (preceded by a letter).
-        guard let regex = try? NSRegularExpression(
-            pattern: "(?<![A-Za-z0-9_.~%/-])(?:/[^\\s\"'<>)\\]},;/]+){2,}",
-            options: []
-        ) else { return value }
-        var text = value
-        let matches = regex.matches(
-            in: text,
-            options: [],
-            range: NSRange(location: 0, length: (text as NSString).length)
-        )
-        for match in matches.reversed() {
-            let path = (text as NSString).substring(with: match.range)
-            let leaf = (path as NSString).lastPathComponent
-            text = (text as NSString).replacingCharacters(
-                in: match.range,
-                with: leaf.isEmpty ? "[redacted path]" : ".../\(leaf)"
-            )
-        }
-        return text
-    }
-
     /// The only file-access IDs the signed iPhone chat route admits. This is
     /// intentionally shared with the mobile pill rather than treating its
     /// persisted label as authority.
@@ -122,7 +89,6 @@ public struct ICloudIncomingTurnForwarder: Sendable {
     // (or is absent), so repeated calls on every launch are cheap no-ops.
     //
     // Concurrency: nonisolated — called from Task.detached; touches no @MainActor state.
-    // PATCH-2026-05-07: icloud-bridge forward iOS→Mac message to daemon and write reply to Drive
     /// The typed needs-input envelope (cards spec, `request_interaction`), as a
     /// compact JSON string. The inline-card work owns the rendering; this side
     /// only has to emit the shape, and a reader without that renderer loses
@@ -267,7 +233,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 port.completed(sessionID: resolvedSessionID)
                 return true
             } catch {
-                return await writeErrorReply("Control handoff could not be confirmed: \(Self.redactedRemoteErrorDetail(error.localizedDescription))",
+                return await writeErrorReply("Control handoff could not be confirmed: \(NativeAppSecretRedactor.redactedRemoteErrorDetail(error.localizedDescription))",
                     sessionID: resolvedSessionID, turnReachedTerminalState: true)
             }
         }
@@ -344,9 +310,10 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         let chatFileAccess = Self.iCloudChatFileAccess(from: remoteMetadata)
 
         // F7 P0 #3: cancellable stream task. We run the stream consumer in a
-        // child Task and register it with MacSyncEngine by sessionID so the
+        // retained operation Task and register it with MacSyncEngine by sessionID so the
         // iOS "cancelChat" inbox action can `.cancel()` it (in addition to
-        // the cancelled.flag the streaming chat path also polls).
+        // the cancelled.flag the streaming chat path also polls). Passive sync
+        // stop leaves an accepted turn to settle; only explicit Stop cancels it.
         let generatedAttachmentBox = ICloudGeneratedAttachmentBox()
         let replyMetadata = [
             "transport": "icloud",
@@ -375,6 +342,33 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             return await TurnTraceContext.$turnId.withValue(turnID) {
             await ChatPersistenceContext.$pinnedTurnRunID.withValue(msg.id) {
             await ChatToolSessionContext.$commandSignatureVerified.withValue(commandSignatureVerified) {
+            if resolvedSessionID.hasPrefix("bot-") {
+                do {
+                    let textProgress = OSAllocatedUnfairLock(initialState: (text: "", coalescer: ICloudTextDeltaCoalescer()))
+                    let request = TurnRequest(message: msg.text, sessionID: resolvedSessionID, fileAccess: chatFileAccess,
+                        surface: "ios", envelope: TurnEnvelope(surface: "ios", commandSignatureVerified: commandSignatureVerified), replyRoute: replyRoute,
+                        replacementAssistantMessageID: .some(replacementAssistantMessageID))
+                    let reply = try await request.bind {
+                        try await port.helperReply(message: msg.text, sessionID: resolvedSessionID,
+                            attachments: msg.attachments ?? [], fileAccess: chatFileAccess, progress: { event in
+                                guard case .delta(let text) = event else { return }
+                                let flush = textProgress.withLock { state in
+                                    state.text += text
+                                    return state.coalescer.push(snapshot: state.text, nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds)
+                                }
+                                if let flush {
+                                    await sendICloudTextDelta(flush, sessionID: resolvedSessionID, correlationID: msg.id,
+                                        replyTo: remoteMetadata["clientSurface"] ?? "iphone", targetSourceKey: routeKey)
+                                }
+                            })
+                    }
+                    generatedAttachmentBox.set(try Self.bridgeAttachments(from: reply.attachments ?? [],
+                        text: reply.output, sessionID: resolvedSessionID, correlationID: msg.id, metadata: replyMetadata))
+                    if reply.terminalState == .stopped { caughtError.withLock { $0 = CancellationError() } }
+                    return (reply.output, textProgress.withLock { $0.coalescer.sequence },
+                        reply.terminalState == .failed || reply.terminalState == .interrupted ? reply.statusDetail : nil, 0)
+                } catch { return ("", 0, error.localizedDescription, 0) }
+            }
             var accumulated = ""
             var sawError: String? = nil
             var toolEventCounter = 0
@@ -425,7 +419,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                         // the durable reply once tool-loop synthesis finishes.
                         // The phone saw her working as it streamed; the final
                         // reply is the answer without that commentary.
-                        accumulated = ChatOrchestration.ChatResponse.answerOnly(
+                        accumulated = ChatTurnRuntime.ChatResponse.answerOnly(
                             r.reply,
                             workingCommentaryCharacters: r.workingCommentaryCharacters
                         )
@@ -580,7 +574,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             await execution.waitForProducerTermination()
             } onCancel: {
                 // Stop is the turn's one cancel link: the run's flag, not the stream.
-                Task { try? await MacChatTurnRuntime(dataRoot: PersistenceCore.defaultDataRoot()).stop(sessionId: resolvedSessionID) }
+                Task { try? await MacChatTurnRuntime(dataRoot: PersistenceCore.defaultDataRoot()).stop(sessionId: resolvedSessionID, runId: msg.id) }
             }
             return (accumulated, deltaCoalescer.sequence, sawError, toolEventCounter)
             }
@@ -598,6 +592,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         let outcome = await streamTask.value
         port.unregisterActiveChatTask(for: resolvedSessionID, expecting: streamTask)
         let wasCancelled = streamTask.isCancelled
+            || (resolvedSessionID.hasPrefix("bot-") && caughtError.withLock { $0 is CancellationError })
         let outcomeAttachments = generatedAttachmentBox.value()
 
         if wasCancelled {
@@ -651,7 +646,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             return await writeErrorReply(
                 "NativeAgent hit an error answering that message.",
                 detail: error.flatMap { ProviderRecoveryPolicy.personMessage($0) } ?? ChatStreamErrorText.normalize(
-                    Self.redactedRemoteErrorDetail(errMsg), retryAction: "Retry"),
+                    NativeAppSecretRedactor.redactedRemoteErrorDetail(errMsg), retryAction: "Retry"),
                 sessionID: resolvedSessionID, turnReachedTerminalState: true
             )
         }
@@ -696,7 +691,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
     }
 
     nonisolated static func bridgeAttachments(
-        from attachments: [ChatOrchestration.MultimodalAttachment],
+        from attachments: [ChatTurnRuntime.MultimodalAttachment],
         text: String,
         sessionID: String,
         correlationID: String,
@@ -818,8 +813,6 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         ]
         let persistence = SwiftNativePersistenceCore()
         let changed = try await persistence.withFileLock(sessionsPath) { () async throws -> Bool in
-            let parent = sessionsPath.deletingLastPathComponent()
-            try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
             var sessions = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
             if let index = sessions.firstIndex(where: { row in
                 guard case .string(let id)? = row["id"] else { return false }
@@ -838,13 +831,11 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 // Compatibility migration for sessions authored by older iOS
                 // builds, which wrote only `source: ios`.
                 sessions[index]["sourceKey"] = .string(NativeAgentICloudBridgeConstants.mobileSourceKey)
-                let out = try ChatSessionIndexFile.serializedData(for: sessions)
-                try out.write(to: sessionsPath, options: .atomic)
+                try ChatSessionIndexFile.write(sessions, to: sessionsPath)
                 return true
             }
             sessions.insert(entry, at: 0)
-            let out = try ChatSessionIndexFile.serializedData(for: sessions)
-            try out.write(to: sessionsPath, options: .atomic)
+            try ChatSessionIndexFile.write(sessions, to: sessionsPath)
             ChatSessionRetention.enforceBestEffort(
                 dataRoot: root,
                 now: Date(),

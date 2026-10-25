@@ -1,5 +1,6 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
+// Blueprint: | `SlackTurnContracts.swift` | `SlackInboundFile` struct |
 
 struct SlackInboundFile: Sendable, Equatable {
     let downloadURL: String
@@ -21,7 +22,7 @@ struct SlackInboundMessage: Sendable, Equatable {
     let channelType: String?
     let isDirectMessage: Bool
     let files: [SlackInboundFile]
-    let attachments: [ChatOrchestration.MultimodalAttachment]
+    let attachments: [ChatTurnRuntime.MultimodalAttachment]
     let opensReplyThread: Bool
 
     init(
@@ -36,7 +37,7 @@ struct SlackInboundMessage: Sendable, Equatable {
         channelType: String?,
         isDirectMessage: Bool,
         files: [SlackInboundFile] = [],
-        attachments: [ChatOrchestration.MultimodalAttachment] = [],
+        attachments: [ChatTurnRuntime.MultimodalAttachment] = [],
         opensReplyThread: Bool = true
     ) {
         self.eventId = eventId
@@ -81,11 +82,11 @@ struct SlackInboundMessage: Sendable, Equatable {
 
 struct SlackSocketModeReply: Sendable, Equatable {
     var text: String
-    var attachments: [ChatOrchestration.MultimodalAttachment]
+    var attachments: [ChatTurnRuntime.MultimodalAttachment]
 
     init(
         text: String,
-        attachments: [ChatOrchestration.MultimodalAttachment] = []
+        attachments: [ChatTurnRuntime.MultimodalAttachment] = []
     ) {
         self.text = text
         self.attachments = attachments

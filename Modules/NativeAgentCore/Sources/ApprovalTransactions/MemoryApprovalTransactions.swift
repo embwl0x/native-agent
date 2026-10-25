@@ -5,22 +5,12 @@ import ApprovalInbox
 import MemoryV2
 import ProviderRouting
 import TrustCenter
+// Blueprint: | `MemoryApprovalTransactions.swift` | `MemoryApprovalTransactions` enum; `applyResolvedKindBackfill`, `reconcileUnappliedMemoryRepairs` |
 
 public enum MemoryApprovalTransactions {
-    /// REVIEW BLOCKER FIX (gpt-5.5, 2026-06-10): resolve→apply crash-window
-    /// reconciliation for memory.repair. resolveApproval persists the
-    /// approval terminal BEFORE the executor runs; a crash between the two
-    /// leaves a resolved record whose repair never applied — and because
-    /// the staging stamp survives, MemoryRepairOneShot.stageIfNeeded
-    /// early-returns forever (approved-but-never-applied dead-end).
-    ///
-    /// Called on every launch BEFORE stageIfNeeded: scan resolved
-    /// memory.repair records that lack an execution annotation
-    /// (`executedAction` is only ever written AFTER the executor ran) and
-    /// run the idempotent executor for them. Approved records apply (or
-    /// stale-skip when already applied); denied records just gain their
-    /// annotation; canceled records clear the stamp so the following
-    /// stageIfNeeded re-stages.
+    /// Settle resolved memory.repair records missing their execution annotation.
+    /// Canonical truncated-row repairs stale-skip already applied rows;
+    /// retired kinds receive the executor's unknown-kind terminal outcome.
     @discardableResult
     public static func reconcileUnappliedMemoryRepairs(
         dataRoot: URL, records: [ApprovalRecord]
@@ -184,20 +174,10 @@ public enum MemoryApprovalTransactions {
                 + ". Reply with ONLY the kind word, lowercase, nothing else."
             let raw = try await llm.complete(
                 prompt: content, system: system, model: model, surface: surface, purpose: "kind_backfill")
-            // EXACT match only (gpt-5.5 review blocker): a substring branch
-            // fabricates kinds from noncompliant replies ("not a preference"
-            // → preference). Trim trailing punctuation, then exact-or-drop —
-            // the no-fabrication contract: an unparseable reply drops the
-            // row from the card, never invents a kind.
-            let cleaned = raw
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: ".\"'`"))
-                .lowercased()
-            if let exact = taxonomy.first(where: { $0.lowercased() == cleaned }) {
-                return exact
-            }
+            // Classification never repairs a reply into a taxonomy member.
+            if taxonomy.contains(raw) { return raw }
             throw NSError(domain: "NativeAgentKindBackfill", code: 422, userInfo: [
-                NSLocalizedDescriptionKey: "classifier reply not in taxonomy: \(cleaned.prefix(80))"
+                NSLocalizedDescriptionKey: "classifier reply not in taxonomy: \(raw.prefix(80))"
             ])
         }
         _ = await MemoryKindBackfill.stageIfNeeded(
@@ -205,37 +185,47 @@ public enum MemoryApprovalTransactions {
             storage: storage,
             classifier: classifier,
             createApproval: { body in
-                if yolo.admitted {
-                    guard case .object(let object) = body,
-                          let payload = object["payload"] else {
-                        throw NSError(domain: "MemoryKindBackfill", code: 422, userInfo: [
-                            NSLocalizedDescriptionKey: "kind-backfill staging body carries no payload"
-                        ])
+                // Classification may outlive a Trust change. Admission and the
+                // canonical writes share Trust's existing policy-file lock.
+                try await SwiftNativePersistenceCore().withFileLock(SavedTrustPolicyAuthority.policyURL(dataRoot: dataRoot)) {
+                    let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
+                        .fullMacYoloAuthority(tool: MemoryKindBackfill.action, origin: SecurityOriginContext(
+                            surface: "desk", source: "memory_kind_backfill_stager", isRemote: false))
+                    if yolo.admitted {
+                        guard case .object(let object) = body,
+                              let payload = object["payload"] else {
+                            throw NSError(domain: "MemoryKindBackfill", code: 422, userInfo: [
+                                NSLocalizedDescriptionKey: "kind-backfill staging body carries no payload"
+                            ])
+                        }
+                        let timestamp = ISO8601DateFormatter().string(from: Date())
+                        let id = "full-mac-yolo-\(UUID().uuidString.lowercased())"
+                        let admitted = ApprovalRecord(
+                            id: id,
+                            title: "Full Mac admitted memory kind backfill",
+                            action: MemoryKindBackfill.action,
+                            risk: "medium",
+                            reason: "Admitted by active Full Mac authority",
+                            status: "resolved",
+                            payload: payload,
+                            payloadPreview: "",
+                            createdAt: timestamp,
+                            resolvedAt: timestamp,
+                            decision: "approved",
+                            decidedBy: "full_mac_yolo",
+                            remoteResolvable: false,
+                            localOnly: true
+                        )
+                        await applyResolvedKindBackfill(from: admitted, dataRoot: dataRoot)
+                        return id
                     }
-                    let timestamp = ISO8601DateFormatter().string(from: Date())
-                    let id = "full-mac-yolo-\(UUID().uuidString.lowercased())"
-                    let admitted = ApprovalRecord(
-                        id: id,
-                        title: "Full Mac admitted memory kind backfill",
-                        action: MemoryKindBackfill.action,
-                        risk: "medium",
-                        reason: "Admitted by active Full Mac authority",
-                        status: "resolved",
-                        payload: payload,
-                        payloadPreview: "",
-                        createdAt: timestamp,
-                        resolvedAt: timestamp,
-                        decision: "approved",
-                        decidedBy: "full_mac_yolo",
-                        remoteResolvable: false,
-                        localOnly: true
-                    )
-                    await applyResolvedKindBackfill(from: admitted, dataRoot: dataRoot)
-                    return id
+                    return try await inbox.create(body).id
                 }
-                return try await inbox.create(body).id
             },
             listPendingBackfills: {
+                let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
+                    .fullMacYoloAuthority(tool: MemoryKindBackfill.action, origin: SecurityOriginContext(
+                        surface: "desk", source: "memory_kind_backfill_stager", isRemote: false))
                 if yolo.admitted { return [] }
                 return try await inbox.list(
                     filter: ApprovalFilter(status: "pending", action: MemoryKindBackfill.action)

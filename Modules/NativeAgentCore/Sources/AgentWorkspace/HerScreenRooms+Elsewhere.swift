@@ -2,6 +2,10 @@ import ChatSessionWork
 import Foundation
 import MemoryV2
 import NativeAgentCore
+import PersistenceCore
+import Transcripts
+import NativeAgentShared
+// Blueprint: | `HerScreenRooms+Elsewhere.swift` | HerScreen door lines own completed other-room exchanges for the person's Mac/phone timeline and bounded words in home-turn context; peer turns never carry the person's words |
 
 /// One timeline across doors (Wave 2 #10, 2026-10-02): what User said on each
 /// of his doors (Mac chat, Telegram, iPhone, Slack) and what agents said over
@@ -14,19 +18,18 @@ extension HerScreen {
     /// One thing said to her on a door, and her last answer after it there.
     /// A wake's is when her answer landed: that is when it concluded.
     struct DoorLine: Sendable {
+        var id: String = ""
         let session: String
         var at: Date
-        /// On a bridge, the attested source (`source`), named by `who(_:)`.
-        let door: String, who: String, text: String, user: Bool
+        let door: String, text: String, user: Bool
         var reply: String?
         /// Who said it as its own row's stamp says (a wake's: "self", or the
         /// agent whose words it carried), and the peers that steered it.
-        var agent: String? = nil
-        var steeredBy: [String] = []
-        /// What she did answering it, by name: actions that went through, and
-        /// the ones she only filed for User's approval.
-        var did: [String] = [], filed: [String] = []
-        /// Her last reply or action on it, or when it arrived.
+        var stamp: TranscriptRowStamp
+        var agent: String? { stamp.source }
+        var steeredBy: [String] { stamp.steeredBy }
+        var byPerson = false
+        /// Her last reply on it, or when it arrived.
         var active: Date
     }
 
@@ -40,28 +43,29 @@ extension HerScreen {
         userDoors[surface.lowercased()] ?? (surface.hasSuffix("-bridge") ? "bridge" : nil)
     }
 
-    /// Newest first, from the 12 most recently written transcripts of the
-    /// last week (helpers' own sessions left out).
-    static func doorFiles(dataRoot: URL, now: Date) -> [URL] {
+    /// Newest first: the 12 most recently written transcripts of the last week
+    /// (no earlier than `since` when given); helpers' own sessions stay out.
+    static func doorFiles(dataRoot: URL, now: Date, since: Date? = nil) -> [URL] {
         let dir = dataRoot.appendingPathComponent("chat/messages", isDirectory: true).path
         return ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
             .filter { $0.hasSuffix(".jsonl") && !$0.hasPrefix("bot-") }
             .compactMap { name -> (path: String, at: Int)? in
                 var info = stat()
-                guard lstat(dir + "/" + name, &info) == 0, now.timeIntervalSince1970 - Double(info.st_mtimespec.tv_sec) < 7 * 86_400 else { return nil }
+                guard lstat(dir + "/" + name, &info) == 0,
+                      Double(info.st_mtimespec.tv_sec) + 1 >= max(since ?? .distantPast, now.addingTimeInterval(-7 * 86_400)).timeIntervalSince1970 else { return nil }
                 return (dir + "/" + name, info.st_mtimespec.tv_sec)
             }
             .sorted { ($0.at, $0.path) > ($1.at, $1.path) }.prefix(12).map { URL(fileURLWithPath: $0.path) }
     }
 
-    static func doorLines(dataRoot: URL, now: Date) -> [DoorLine] {
-        let files = doorFiles(dataRoot: dataRoot, now: now)
+    static func doorLines(dataRoot: URL, now: Date, since: Date? = nil) -> [DoorLine] {
+        let files = doorFiles(dataRoot: dataRoot, now: now, since: since)
         let dir = dataRoot.appendingPathComponent("chat/messages", isDirectory: true).path
-        DoorIndex.shared.keep(only: Set(files.map(\.path)), in: dir + "/")
+        DoorIndex.shared.keep(only: Set(doorFiles(dataRoot: dataRoot, now: now).map(\.path)), in: dir + "/")
         return files.flatMap { transcript($0).lines }.sorted { $0.at > $1.at }
     }
 
-    /// Each transcript's door lines (its last 30) and when she last answered
+    /// Each transcript's door lines and when she last answered
     /// in it, read on from where the previous read stopped: a turn parses
     /// only what was appended since. A new file, a rewrite (another inode)
     /// or a shrink starts again from its last 128 KB.
@@ -71,11 +75,12 @@ extension HerScreen {
             var inode: UInt64 = 0, offset: UInt64 = 0
             var lines: [DoorLine] = [], open = false
             var mine: Date?
+            var personSends: Set<String> = []
         }
         let lock = NSLock()
         var entries: [String: Entry] = [:]
 
-        /// Only this week's newest transcripts (and the chat she is in) stay indexed.
+        /// Only this week's newest transcripts stay indexed.
         func keep(only paths: Set<String>, in dir: String) {
             lock.withLock { entries = entries.filter { !$0.key.hasPrefix(dir) || paths.contains($0.key) } }
         }
@@ -91,20 +96,22 @@ extension HerScreen {
             defer { try? handle.close() }
             let size = UInt64(info.st_size), inode = UInt64(info.st_ino)
             var entry = DoorIndex.shared.entries[url.path] ?? .init()
+            // Bounded on purpose: each turn reads this, so a transcript is indexed
+            // from its last 128 KB and keeps its newest 30 lines.
             var partial = false
             if entry.inode != inode || size < entry.offset {
                 entry = .init(inode: inode, offset: size > 131_072 ? size - 131_072 : 0)
                 partial = entry.offset > 0
             }
             if size > entry.offset {
-                try? handle.seek(toOffset: entry.offset)
-                if let data = try? handle.read(upToCount: Int(size - entry.offset)),
+                if let data = ContactThread.read(handle, from: entry.offset, bytes: Int(size - entry.offset)),
                    let end = data.lastIndex(of: UInt8(ascii: "\n")) {
                     // Whole rows only: a row still being written is read next time.
                     var rows = data[data.startIndex..<end].split(separator: UInt8(ascii: "\n"))
                     if partial, !rows.isEmpty { rows.removeFirst() }
                     entry.offset += UInt64(end - data.startIndex + 1)
                     read(rows, session: url.deletingPathExtension().lastPathComponent, into: &entry)
+                    if entry.lines.count > 30 { entry.lines.removeFirst(entry.lines.count - 30) }
                 }
             }
             DoorIndex.shared.entries[url.path] = entry
@@ -113,16 +120,21 @@ extension HerScreen {
     }
 
     /// Rows onto a transcript's index: the things said to her with a known
-    /// door, her answer to each, and what she ran answering it. Wake notices
+    /// door and her answer to each. Wake notices
     /// and other mechanical rows are not anyone speaking.
     private static func read(_ rows: [Data.SubSequence], session: String, into entry: inout DoorIndex.Entry) {
         let wake = session == ResidentWake.session
         for raw in rows {
-            guard let row = try? JSONSerialization.jsonObject(with: Data(raw)) as? [String: Any],
-                  let content = row["content"] as? String, let at = (row["createdAt"] as? String).flatMap(date) else { continue }
-            let metadata = row["metadata"] as? [String: Any]
-            switch row["role"] as? String {
+            guard let speech = ContactThread.Line(jsonl: Data(raw)) else { continue }
+            let metadata = speech.metadata
+            guard let at = speech.date else { continue }
+            let content = speech.text
+            switch speech.role {
             case "assistant":
+                if let sent = speech.sendID {
+                    if speech.byPerson { entry.personSends.insert(sent) }
+                    continue
+                }
                 guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
                 entry.mine = at
                 if entry.open {
@@ -130,62 +142,58 @@ extension HerScreen {
                     entry.lines[entry.lines.count - 1].active = at
                     if wake { entry.lines[entry.lines.count - 1].at = at }
                 }
-            case "tool":
-                // Her own act, by its name only: never its arguments or result.
-                // A home `<agent>.say` is a message she sent, as agent.message is.
-                guard entry.open, metadata?["ok"] as? Bool == true, let tool = metadata?["toolName"] as? String else { continue }
-                let input = (metadata?["inputJSON"] as? String).flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
-                let say = (input?["item"] as? String).flatMap { $0.lowercased().hasSuffix(".say") ? $0 : nil }
-                guard let name = tool == "app" ? input?["action"] as? String ?? say : tool, !name.isEmpty else { continue }
-                // Filed is not done: an approval card waits on User (the row
-                // is rewritten as a plain receipt once he decides).
-                let filed = metadata?["kind"] as? String == ChatTranscriptToolMessageKind.approvalPending
-                    || ["waiting_approval", "pending_approval"].contains(metadata?["resultStatus"] as? String ?? "")
-                if filed { entry.lines[entry.lines.count - 1].filed.append(clip(name.lowercased(), 40)) }
-                else { entry.lines[entry.lines.count - 1].did.append(clip(name.lowercased(), 40)) }
-                entry.lines[entry.lines.count - 1].active = at
             case "user":
                 entry.open = false
-                guard metadata?["mechanicalKind"] == nil else { continue }
+                guard metadata["mechanicalKind"] == nil else { continue }
                 // A wake is her speaking; what it says to her is the arrival list.
-                let stamp = ContactThread.stamp(id: row["id"] as? String ?? "", metadata: metadata)
                 if wake {
-                    entry.lines.append(.init(session: session, at: at, door: wakeDoor, who: "me",
+                    entry.lines.append(.init(session: session, at: at, door: wakeDoor,
                                              text: ChatSecretRedactor.redactText(content), user: false,
-                                             agent: stamp.source, steeredBy: stamp.steeredBy, active: at))
+                                             stamp: speech.stamp, active: at))
                     entry.open = true
                     continue
                 }
-                guard let surface = (metadata?["envelope"] as? [String: Any])?["surface"] as? String, let door = door(surface) else { continue }
-                let agent = (metadata?["origin"] as? [String: Any])?["agent"] as? String
+                let surface = HumanConversationIndex.string(HumanConversationIndex.object(metadata["origin"])["surface"])
+                    ?? HumanConversationIndex.string(HumanConversationIndex.object(metadata["envelope"])["surface"])
+                guard let door = speech.contact ? "bridge" : surface.flatMap({ HerScreen.door($0) }) else { continue }
                 var text: String
                 if door == "bridge" {
-                    text = ContactThread.bridgedText(content)
+                    text = ContactThread.project([speech], style: .thread).first!.text
                 } else {
-                    guard agent == nil else { continue }
+                    guard speech.human else { continue }
                     // "[Telegram voice message] Transcript: …": the words, not the note.
                     text = content.replacingOccurrences(of: #"^\[[^\]\n]{1,80}\]\s*(Transcript:\s*)?"#, with: "", options: .regularExpression)
                 }
                 // A token he pasted never rides into a prompt.
                 text = ChatSecretRedactor.redactText(text.trimmingCharacters(in: .whitespacesAndNewlines))
-                let bridged = door == "bridge" ? stamp.source ?? "another agent" : nil
-                entry.lines.append(.init(session: session, at: at, door: door, who: bridged ?? "",
+                entry.lines.append(.init(id: speech.id, session: session, at: at, door: door,
                                          text: text.isEmpty ? "(no text: an image or file)" : text, user: door != "bridge",
-                                         agent: bridged, steeredBy: stamp.steeredBy, active: at))
+                                         stamp: speech.stamp,
+                                         byPerson: speech.human || speech.byPerson || speech.answers.map { entry.personSends.contains($0) } == true, active: at))
                 entry.open = true
             default: continue
             }
         }
-        if entry.lines.count > 30 { entry.lines.removeFirst(entry.lines.count - 30) }
+    }
+
+    /// A reading copy only: never appended to the person's session or fed as chat.
+    package static func otherRoomExchanges(dataRoot: URL, since: Date, now: Date = Date()) -> [OtherRoomExchange] {
+        let named = peerNames(dataRoot), identity = names(dataRoot)
+        return doorLines(dataRoot: dataRoot, now: now, since: since).compactMap { line in
+            guard line.door == "bridge", !line.byPerson, let reply = line.reply,
+                  line.active >= since, line.active <= now else { return nil }
+            return OtherRoomExchange(id: line.session + ":" + line.id, sessionID: line.session,
+                contactID: line.agent ?? "another agent", contact: clip(who(line, person: identity.person, peers: named), 80),
+                agent: identity.agent, at: line.active, message: String(line.text.prefix(600)), reply: String(reply.prefix(600)))
+        }.sorted { ($0.at, $0.id) < ($1.at, $1.id) }
     }
 
     /// Who spoke: User on his doors; on a bridge, the lane the bridge attested
     /// or the name User gave that peer in his contacts (agents/peers.json),
     /// never anything the message itself says.
     static func who(_ line: DoorLine, person: String, peers: [String: String]) -> String {
-        if line.user { return person }
-        guard line.door == "bridge", line.who.hasPrefix("peer:") else { return line.who }
-        return peers[line.who] ?? "an agent"
+        if line.door == wakeDoor { return "me" }
+        return ContactThread.project([.init(text: line.text, stamp: line.stamp)], person: person, names: peers, unlistedPeer: "an agent").first!.speaker
     }
 
     /// "peer:<id>" → the contact name User gave it.
@@ -230,29 +238,31 @@ extension HerScreen {
     /// (kept per chat). Closed when "Remember across conversations" is off.
     static func elsewhereRoom(dataRoot: URL, scope: String, now: Date = Date()) -> String {
         guard MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else {
-            return screen(["ELSEWHERE", "closed"], [["Remember across conversations is off, so other chats stay closed."]], verbs: [])
+            return screen(["ELSEWHERE", "closed"], [[failureFace(.object(["status": .string("refused"),
+                "reason": .string("cross_session_recall_disabled"), "effects": .string("none"),
+                "detail": .string("Remember across conversations is off; other conversations stay closed."),
+                "remedy": Repair.why(owner: "Remember across conversations", tap: "Settings → Remember across conversations",
+                    instruction: "Only the owner can enable Remember across conversations in Settings.")]))]], verbs: [])
         }
         let person = names(dataRoot).person
         let lines = Array(doorLines(dataRoot: dataRoot, now: now).filter { $0.session != scope }.prefix(12))
-        var pages: [String: String] = [:], peers: [String: [String]] = [:]
+        var pages: [String: String] = [:], speech: [String: [ContactThread.Line]] = [:]
         let named = peerNames(dataRoot)
         let rows = lines.enumerated().map { index, line -> String in
             let name = "elsewhere.\(index + 1)", who = HerScreen.who(line, person: person, peers: named)
             let exchange = exchangePages(name, line, who: who, dataRoot: dataRoot, now: now)
             for (item, page) in exchange { pages[scope + "\u{0}" + item] = page }
-            // Each line is read under its own row's stamp, here and when its
-            // page opens: the one ordered list, each principal once.
-            let speakers = ContactThread.consume(mine: line.agent == nil || line.agent == "self", source: line.agent,
-                                                 steeredBy: line.steeredBy, text: line.text) { peer, _ in
-                if !previewing { AgentWorkspacePorts.current.tools.markConsumed(peer: peer) }
-            }
-            for item in exchange.keys where !speakers.isEmpty { peers[scope + "\u{0}" + item] = speakers }
+            let shown = ContactThread.Line(text: line.text, stamp: line.stamp)
+            ContactThread.consume(shown, mark: { peer, _ in
+                if !previewing { AgentWorkspacePorts.binding?.tools.markConsumed(peer: peer) }
+            })
+            for item in exchange.keys { speech[scope + "\u{0}" + item] = [shown] }
             return pad(name, 13) + pad(line.door, 10) + pad(clip(who, 16), 10) + pad(age(now.timeIntervalSince(line.at)), 5)
                 + quoted(line.door == wakeDoor ? line.reply ?? line.text : line.text, 60)
         }
-        if !previewing { HerItemPages.shared.keep(dataRoot, pages, room: scope + "\u{0}elsewhere", peers: peers) }
+        if !previewing { HerItemPages.shared.keep(dataRoot, pages, room: scope + "\u{0}elsewhere", speech: speech) }
         return screen(["ELSEWHERE", person + "'s doors, the bridges and my wakes", "newest first"],
-                      [rows.isEmpty ? ["nothing said on another door this week"] : rows],
+                      [rows.isEmpty ? ["no exchanges found in the recent transcript window"] : rows],
                       verbs: rows.isEmpty ? [] : [("elsewhere.N", "read that exchange and my reply; continue if needed")])
     }
 
@@ -288,7 +298,7 @@ extension HerScreen {
     /// Since her last reply in this chat (or within the hour, in a chat she
     /// has not answered yet): one line when User said something on another of
     /// his doors, one when one of her own wakes concluded, and on a turn he
-    /// started, one per bridge conversation with what she did there. Nil when
+    /// started, the newest five completed bridge exchanges with bounded words. Nil when
     /// nothing is new, when "Remember across conversations" is off, or on an
     /// unknown door. On a turn another agent steers (`peer`), User's door,
     /// count and time only: his words do not ride where she could relay them,
@@ -322,42 +332,16 @@ extension HerScreen {
                     : "") + ". app {item:\"elsewhere\"}")
         }
         if !peer {
-            // By her own activity there: a request that came before her last
-            // reply here still counts when she answered or acted on it after.
-            let bridged = known
-                .filter { $0.door == "bridge" && $0.session != scope && $0.active > since && $0.at <= now }
-                .sorted { $0.active > $1.active }
-            let peers = peerNames(dataRoot)
-            var sessions: Set<String> = []
-            for latest in bridged where sessions.insert(latest.session).inserted {
-                lines.append(bridgeLine(bridged.filter { $0.session == latest.session }, who: who(latest, person: "", peers: peers), now: now))
+            for exchange in otherRoomExchanges(dataRoot: dataRoot, since: since, now: now).reversed()
+                .filter({ $0.sessionID != scope && $0.at > since }).prefix(5) {
+                // Context assembly runs outside the app door: mark read where it is bound.
+                AgentWorkspacePorts.binding?.tools.markConsumed(peer: exchange.contactID)
+                lines.append(exchange.contact + " over the bridge since your last reply here:\n"
+                    + "They said: \"" + clip(exchange.message, 600).replacingOccurrences(of: "\"", with: "'")
+                    + "\"\nYou replied: \"" + clip(exchange.reply, 600).replacingOccurrences(of: "\"", with: "'") + "\"")
             }
         }
         return lines.isEmpty ? nil : lines.joined(separator: "\n")
-    }
-
-    /// One bridge conversation since her last reply here: who, how many
-    /// messages, what she did (replied, the actions she ran by name, the ones
-    /// she only filed for User's approval) and when she last did anything.
-    /// Never the agent's words, nor hers to it: those open in the room, where
-    /// reading them marks the turn as the taint requires.
-    private static func bridgeLine(_ fresh: [DoorLine], who: String, now: Date) -> String {
-        func names(_ all: [String]) -> String {
-            var counted: [(name: String, count: Int)] = []
-            for name in all {
-                if let i = counted.firstIndex(where: { $0.name == name }) { counted[i].count += 1 } else { counted.append((name, 1)) }
-            }
-            return counted.prefix(6).map { $0.name + ($0.count > 1 ? " ×\($0.count)" : "") }.joined(separator: ", ")
-                + (counted.count > 6 ? ", +\(counted.count - 6) more" : "")
-        }
-        let ordered = Array(fresh.reversed())
-        let ran = names(ordered.flatMap(\.did)), filed = names(ordered.flatMap(\.filed))
-        var did = [fresh.contains { $0.reply != nil } ? "you replied" : "no reply from you yet"]
-        if !ran.isEmpty { did.append("ran " + ran) }
-        if !filed.isEmpty { did.append("filed for approval " + filed) }
-        return clip(who, 20) + " over the bridge since your last reply here: "
-            + (fresh.count == 1 ? "1 message; " : "\(fresh.count) messages; ") + did.joined(separator: "; ")
-            + "; last " + age(now.timeIntervalSince(fresh[0].active)) + " ago. app {item:\"elsewhere\"}"
     }
 
     private static func userLine(_ fresh: [DoorLine], dataRoot: URL, peer: Bool, now: Date) -> String? {

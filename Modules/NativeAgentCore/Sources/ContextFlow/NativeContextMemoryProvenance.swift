@@ -1,6 +1,8 @@
 import Context
 import Foundation
 
+// Blueprint: | `NativeContextMemoryProvenance.swift` | `NativeContextMemoryProvenance.attach`: advisory reverse lookup on the exact prepared-turn lease; misses never invent record identity |
+
 /// Turn-local accounting for the reverse lookup from selected packet atoms to
 /// canonical MemoryV2 record identities. This is advisory diagnostics only:
 /// the packet stays identity-free and an index miss never invents provenance.
@@ -31,16 +33,19 @@ enum NativeContextMemoryProvenance {
                 return nil
             }
         }
+        // The why receipt names every scored candidate's record; only the
+        // selected ones count as use.
         let mapping = index.recordMap(
-            for: memoryAtomIDs, generationID: packet.generationID
+            for: memoryAtomIDs + packet.receipt.candidateScores.map(\.atomID),
+            generationID: packet.generationID
         )
-        let recordIDs = Array(mapping.values)
-        if !recordIDs.isEmpty {
-            prepared.attachMemoryRecordProvenance(recordIDs, atomRecords: mapping)
+        let selected = mapping.filter { memoryAtomIDs.contains($0.key) }
+        if !mapping.isEmpty {
+            prepared.attachMemoryRecordProvenance(Array(selected.values), atomRecords: mapping)
         }
         return NativeContextMemoryProvenanceResolution(
             requestedMemoryAtomCount: memoryAtomIDs.count,
-            resolvedMemoryAtomCount: recordIDs.count
+            resolvedMemoryAtomCount: selected.count
         )
     }
 }

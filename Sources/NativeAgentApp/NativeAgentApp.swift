@@ -1,4 +1,5 @@
 import Agents
+import ChatToolRuntime
 import ApprovalInbox
 import MacIntegration
 import Transcripts
@@ -32,12 +33,12 @@ import NativeAgentShared
 import NativeAgentCore
 import StandingBots
 import WorkshopExecution
-import SelfImprovement
-import ChatOrchestration
-import MCPDispatcher
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatSessionWork
+import AgentConversations
 import BackgroundLoops
 import BackgroundWork
-import KnowledgeGraph
 import DreamREMCycle
 import PersistenceCore
 import PersonaEngine
@@ -46,10 +47,10 @@ import OSLog
 @_exported import EngineRuntime
 import Connectors
 import DoctorChecks
-import GitHubConnector
 import TelegramBot
 #if canImport(BackgroundTasks)
 import BackgroundTasks
+// Blueprint: | `NativeAgentApp.swift` | SwiftUI app and scene declarations; coordinator-gated async restore/recovery before model and ingress, off-main engine/layout preparation; `NativeAgentEngine.installRuntimeObservationsAtLaunch` through `EngineLaunch` to `BackgroundWork.BodyReport` Swift crash/exit logging |
 #endif
 
 @MainActor
@@ -148,6 +149,8 @@ private final class NativeAgentHotkeyBootstrap {
 enum NativeAgentAppMain {
     @MainActor
     static func main() {
+        if AppRestartCoordinator.runRelaunchHelperIfRequested() { return }
+        if SwiftToolDispatcher.runScheduledInstallerHelperIfRequestedBlocking() { return }
         NativeAgentEngine.prepareProcessFileLimit()
         guard !NativeAgentLaunchPreflight.shouldSuppressGUIStart() else {
             NativeAgentLaunchPreflight.writeSuppressedLaunchReceipt()
@@ -158,10 +161,8 @@ enum NativeAgentAppMain {
 
         // Mark public first launch in place before state owners initialize.
         InlineInteractionResolver.platform = AppInlineInteractionPlatformPort()
-        // Every open permission card settles by itself from here on, from launch.
         // What macOS granted this process at launch, read before anything can change it.
         _ = SystemPermissionPreflight.grantedAtLaunch
-        Task { @MainActor in InlineInteractionResolver.GrantWatch.shared.start() }
         _ = NSApplication.shared
         guard AppDelegate.claimSingleAppInstance() else { return }
         let dataRoot = PersistenceCore.defaultDataRoot()
@@ -187,6 +188,7 @@ private enum NativeAgentLaunchPreflight {
 }
 
 struct AppBackgroundWorkHost: EngineBackgroundWorkHost {
+    @MainActor var activityWatch: ActivityWatchController { .shared }
     var attention: AttentionRouter { .shared }
     var backupHost: TrustBackupHost { .app }
     var approvals: ApprovalTransactionCoordinator { .app() }
@@ -206,11 +208,10 @@ struct AppBackgroundWorkHost: EngineBackgroundWorkHost {
             repair: true, repairScope: .automatic, checks: checks)
     }
 
-    func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue], externalSendIdempotencyKey: String) async throws -> (id: String, status: String) {
-        let receipt = try await ConnectorActions(
-            platform: AppConnectorActionPlatform(dataRoot: PersistenceCore.defaultDataRoot())
-        ).runConnectorAction(id: id, dryRun: dryRun, input: input,
-            externalSendIdempotencyKey: externalSendIdempotencyKey)
+    func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue]) async throws -> (id: String, status: String) {
+        let engine = NativeAgentEngine.live
+        let receipt = try await engine.runConnectorAction(id: id, dryRun: dryRun, input: input,
+            origin: "scheduler:connector_action:" + id, platform: AppConnectorActionPlatform(engine: engine))
         return (receipt.id, receipt.status)
     }
 
@@ -236,14 +237,6 @@ struct AppBackgroundWorkHost: EngineBackgroundWorkHost {
 
     var voiceName: String { AgentVoice.live.name }
     var agentSubject: String { AgentVoice.live.subject }
-
-    func githubRuntime(dataRoot: URL, shared: Bool) -> GitHubCommandRuntime {
-        shared ? .shared : .live(dataRoot: dataRoot)
-    }
-
-    func evaluateGitHubApprovals(dataRoot: URL) async {
-        await GitHubApprovalEdgeNotifier.shared.evaluateSnapshot(dataRoot: dataRoot)
-    }
 
     var triggerNotifier: TriggerNotifier {
         { @Sendable note in
@@ -335,7 +328,6 @@ struct NativeAgentApp: App {
                 requireActiveSession: false, origin: origin
             )
             if !hideUserBubble { appModel.publishConversationAnchor(for: started.acceptance) }
-            await started.task?.value
             switch started.acceptance {
             case .accepted, .queued: return true
             case .rejected: return false
@@ -459,13 +451,15 @@ struct NativeAgentApp: App {
                 Divider()
                 // D7: derived from the rail's own order so ⌘N is whatever the
                 // rail shows in position N. Do not hand-add entries here.
-                ForEach(NavigateMenuPresentation.entries(SurfaceLayoutLive.shared.layout)) { entry in
-                    Button(entry.title) {
-                        NativeAgentAppCoordinator.shared.request(.sidebar(entry.item))
+                if let appModel = coordinator.appModel {
+                    ForEach(NavigateMenuPresentation.entries(appModel.engine.layout.layout)) { entry in
+                        Button(entry.title) {
+                            NativeAgentAppCoordinator.shared.request(.sidebar(entry.item))
+                        }
+                        .keyboardShortcut(entry.shortcut.map {
+                            KeyboardShortcut(KeyEquivalent($0), modifiers: .command)
+                        })
                     }
-                    .keyboardShortcut(entry.shortcut.map {
-                        KeyboardShortcut(KeyEquivalent($0), modifiers: .command)
-                    })
                 }
                 // Knowledge graph carries no digit: the digits belong to the
                 // rail's order.
@@ -554,7 +548,7 @@ struct NativeAgentApp: App {
     /// which is precisely the failure this control exists to prevent.
     private var activityCaptureIndicatorBinding: Binding<Bool> {
         Binding(
-            get: { coordinator.appModel != nil && ActivityWatchController.shared.isCapturing },
+            get: { coordinator.appModel?.engine.activityWatch.isCapturing == true },
             set: { _ in }
         )
     }
@@ -564,7 +558,7 @@ struct NativeAgentApp: App {
 /// one line and offers the one action a person reaching for this actually wants
 /// — stop.
 private struct ActivityCaptureMenuBarContent: View {
-    @State private var controller = ActivityWatchController.shared
+    private var controller: ActivityWatchController { NativeAgentEngine.live.activityWatch }
 
     var body: some View {
         Text("Recording which apps you use — app name and duration"
@@ -674,8 +668,6 @@ private struct AppDeviceSyncPlatform: EngineDeviceSyncPlatform {
     }
     @MainActor var oauthPlatform: any NativeOAuthPlatformPort.Type { NativeOAuthPlatform.self }
     @MainActor func adoptProvider(_ id: String) async { await NativeAgentAppCoordinator.shared.appModel?.adoptProviderForBlankSurfaces(id) }
-    @MainActor func pinnedChatSessionIDs() -> [String] { ChatSessionRetention.load() }
-    @MainActor func savePinnedChatSessionIDs(_ ids: [String]) throws { try ChatSessionRetention.save(ids) }
     func submitDeskTask(title: String, objective: String) async throws -> WorkshopDirectedTaskResult {
         try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
     }
@@ -689,7 +681,7 @@ private struct AppDeviceSyncPlatform: EngineDeviceSyncPlatform {
     }
     func inboxAction(_ id: String, action: String) async throws {
         try await InboxCardActions.perform(id, action: action,
-            dataRootOverride: nil, effects: AppInboxCardActionEffects())
+            dataRootOverride: nil, effects: AppInboxCardActionEffects(inbox: NativeAgentEngine.live.inbox))
     }
     @MainActor func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String] {
         try await InteractionCardDelivery.answer(payload: payload, actionID: actionID, clientID: clientID,
@@ -703,7 +695,7 @@ private struct AppDeviceSyncPlatform: EngineDeviceSyncPlatform {
 
 extension ClaudeBridgeRuntime {
     static let shared: ClaudeBridgeRuntime = NativeAgentEngine.makeAgentBridge(engine: { .live },
-        grpcPort: { Agents.NativeAgentA2AGRPCListener.shared.port }, gitHubCommand: { .shared })
+        grpcPort: { Agents.NativeAgentA2AGRPCListener.shared.port })
 }
 extension Agents.NativeAgentA2AGRPCListener {
     static let shared: Agents.NativeAgentA2AGRPCListener = NativeAgentEngine.makeA2AListener(engine: { .live }, bridge: { .shared })

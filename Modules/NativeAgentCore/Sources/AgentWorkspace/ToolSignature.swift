@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ToolSignature.swift` | `ToolSignature` enum; `call`, `doorArgs` |
 
 /// A tool's arguments as one line a caller can copy from:
 /// `act(target*, verb*=click|open, app, front:bool, steps:[str|{verb*,target*,text}])`.

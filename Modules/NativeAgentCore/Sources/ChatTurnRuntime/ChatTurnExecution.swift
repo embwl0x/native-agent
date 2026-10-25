@@ -1,11 +1,10 @@
-import ChatToolParsing
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import ProviderRouting
 import PersistenceCore
 import CognitiveSubstrate
-import StandingBots
+// Blueprint: | `ChatTurnExecution.swift` | `SwiftNativeChatOrchestrationClient`: `chat` supplies explicit provider choice, aggregate token budget and mechanical-row provenance; ordinary turns settle without requiring a token budget |
 
 extension SwiftNativeChatOrchestrationClient {
     /// Explicit picker and one aggregate output allowance, scoped to this turn.
@@ -25,42 +24,11 @@ extension SwiftNativeChatOrchestrationClient {
         try await LLMCallContext.$turnTokenBudget.withValue(budget) {
         try await ChatTurnExecution.$current.withValue(execution) {
         try await LLMCallContext.$toolCapabilityNote.withValue({ execution.keepCapabilityNote($0) }) {
-            do {
-                var response = try await chat(message: message, sessionId: sessionId, model: choice?.model ?? "",
-                    reasoningEffort: choice?.reasoningEffort ?? "", fileAccess: fileAccess, attachments: [], persona: nil,
-                    surface: surface, suppressUserAppend: suppressUserAppend, progress: progress)
-                response.runtimeStatus = execution.waitingForApproval ? "waiting for approval"
-                    : execution.waitingForInteraction ? "waiting on you"
-                    : budget.exhausted || response.runtimeStatus == "interrupted" ? "interrupted" : "completed"
-                response.statusDetail = execution.waitingForApproval ? "Answer the approval card in this conversation."
-                    : execution.waitingForInteraction
-                        ? (execution.waitingInteraction?.title).map { "\($0) — answer it in the conversation." }
-                            ?? "Waiting on your answer in the conversation."
-                    : budget.exhausted ? "Stopped at the per-run token limit." : nil
-                response.statusDetail = execution.statusDetail(response.statusDetail)
-                response.pendingApprovalID = execution.pendingApprovalID
-                return response
-            } catch {
-                let partial = BotRunner.conditionReply(
-                    ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(budget.partialReply)),
-                    sessionID: sessionId)
-                let artifacts = ChatGeneratedImageArtifacts.attachments(from: execution.toolRecords, dataRoot: dataRoot)
-                // Preserve already-produced work even when the provider throws.
-                // The ordinary transcript and index remain the sole chat owners.
-                if !partial.isEmpty {
-                    try await appendMessage(sessionId: sessionId, role: "assistant", content: partial,
-                        runId: UUID().uuidString, attachments: artifacts, source: surface,
-                        responseOutcomeStatus: "incomplete")
-                }
-                var response = ChatResponse(runId: UUID().uuidString, model: choice?.model ?? "",
-                    reasoningEffort: choice?.reasoningEffort, output: partial, sessionId: sessionId, attachments: artifacts.isEmpty ? nil : artifacts)
-                response.terminalState = error is CancellationError || budget.exhausted ? .interrupted : .failed
-                response.runtimeStatus = response.terminalState?.rawValue
-                response.statusDetail = budget.exhausted ? "Stopped at the per-run token limit."
-                    : error is CancellationError ? "Stopped at the time limit or cancelled." : String(describing: error)
-                response.statusDetail = execution.statusDetail(response.statusDetail)
-                return response
-            }
+            var response = try await chatExecution(message: message, sessionId: sessionId, model: choice?.model ?? "",
+                reasoningEffort: choice?.reasoningEffort ?? "", fileAccess: fileAccess, attachments: [], persona: nil,
+                surface: surface, suppressUserAppend: suppressUserAppend, progress: progress).response
+            response.runtimeStatus = response.runtimeStatus ?? response.terminalState?.rawValue
+            return response
         }
         }
         }

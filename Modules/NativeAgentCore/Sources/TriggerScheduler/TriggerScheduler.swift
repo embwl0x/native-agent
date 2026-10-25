@@ -7,36 +7,10 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 import WorkshopExecution
+// Blueprint: | `TriggerScheduler.swift` | `SwiftNativeTriggerScheduler` actor; daily trigger admission uses one parser and the shared job normalizer's civil-minute math; retains catch-up and claims; morning brief content, card and defaults come from `Resources/abilities/native-morning-brief.js` through the engine's read-only originating part door; one config loader requests seed rows only for missing files, with native supported inbox kinds keeping saved controls and Workshop triggers independent of the brief part; native consent forces proposed default schedules off and preserves saved rows, occurrence identity and publication/delivery settlement; legacy inbox trigger inputs copy only to absent canonical files under the destination lock, leaving legacy files and their folder untouched; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
 
-// CAVEAT — SUBSYSTEM #17 WAVE 4 + WAVE 12 + WAVE 21 (2026-06-01): FLAG-FLIPPABLE.
-// Wave 4 closed both prereqs that made the list/enable/disable/configure
-// surface flippable (daemon mtime-based lazy reload + flock symmetry on
-// trigger config writes — see proactive_triggers.py `_maybe_reload` /
-// `_save_config`, missions.py `_maybe_reload` / `_write_json`, plus
-// the retired daemon paired with PersistenceCore+FileLock.swift).
-//
-// Wave 12 (2026-05-31) NARROWED the previously-permanent `/fire_now`
-// carve-out — but kept it SPLIT between the inbox and executions sides.
-// Wave 21 (2026-06-01) closes the execution side of the carve once
-// SwiftNativeWorkshopRunner landed:
-//
-//   - Inbox fire_now builds the evidence-backed morning brief natively. A5.2
-//     (2026-07-24): the built card lands in `notifications/inbox.jsonl`
-//     via the app-side mirror seam; TriggerNotificationInbox also runs the
-//     active-duplicate check (the legacy `<root>/inbox/` silo is retired).
-//     Unknown kinds
-//     return `not_found` instead of falling through to a generic stub.
-//   - Workshop fire_now is Swift-native. SwiftNativeTriggerScheduler resolves the
-//     execution trigger row from
-//     <root>/missions/triggers.json, builds the execution spec via the
-//     ProactiveTrigger.build_mission() shape (title/objective/trigger_source/
-//     trust_required — the retired daemon), and calls
-//     SwiftNativeWorkshopRunner.submit() which writes timeline.jsonl FIRST
-//     then mission.json natively (wave-21 inverted-write fix; see
-//     WorkshopExecution.swift submit() ordering note).
-//
-// TriggerScheduler is the sole Swift owner for list/enable/disable/configure,
-// the canonical stub-inbox fire path, and the Workshop fire_now path.
+// TriggerScheduler is the sole Swift owner for list/enable/disable,
+// the native inbox fire path, and the Workshop fire_now path.
 
 // MARK: - Errors
 
@@ -51,8 +25,8 @@ public enum TriggerSchedulerError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .invalidRequest(let msg): return "invalid request: \(msg)"
-        case .persistenceFailure(let m): return "persistence failure: \(m)"
+        case .invalidRequest(let msg): return "schedule_input_invalid: \(msg). Correct the named input in the scheduled Desk task request."
+        case .persistenceFailure(let m): return "schedule_store_unavailable: \(m). Inspect the named scheduler file and repair its contents or access before changing scheduled Desk tasks."
         }
     }
 }
@@ -66,7 +40,7 @@ public enum TriggerSchedulerError: Error, LocalizedError {
 // everything else through `extras` so a write never drops daemon-written keys.
 //
 // `extras` is JSONValue.object(...) when non-empty, nil otherwise — same
-// shape used by ToolRegistry/MCPDispatcher records.
+// shape used by ToolRegistry records.
 
 public struct TriggerConfig: Sendable, Equatable {
     // Required.
@@ -153,19 +127,17 @@ extension TriggerConfig {
 
 // MARK: - Result envelopes
 
-/// Status envelope returned by enable/disable/configure. Mirrors the daemon's
+/// Status envelope returned by enable/disable. Mirrors the daemon's
 /// `{name, enabled?, status, ...}` dict shape from both schedulers.
 public struct TriggerStatus: Sendable, Equatable {
     public var name: String
     public var enabled: Bool?
     public var status: String     // "updated" | "not_found"
-    public var config: JSONValue? // populated by configure()
 
-    public init(name: String, enabled: Bool?, status: String, config: JSONValue? = nil) {
+    public init(name: String, enabled: Bool?, status: String) {
         self.name = name
         self.enabled = enabled
         self.status = status
-        self.config = config
     }
 }
 
@@ -270,7 +242,6 @@ public protocol TriggerSchedulerClient: Sendable {
     func listInboxTriggers() async throws -> [TriggerConfig]
     func enableInboxTrigger(name: String) async throws -> TriggerStatus
     func disableInboxTrigger(name: String) async throws -> TriggerStatus
-    func configureInboxTrigger(name: String, config: JSONValue) async throws -> TriggerStatus
     func fireInboxTrigger(name: String) async throws -> TriggerFireResult
 
     // Workshop triggers — backed by <root>/missions/triggers.json
@@ -307,6 +278,10 @@ public protocol TriggerSchedulerClient: Sendable {
 /// Both are JSON arrays of trigger dicts. Atomic write + cross-process flock
 /// serialize persisted mutations and claims across overlapping native callers.
 public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
+    /// A bounded pass left runnable work. The BackgroundLoops listener
+    /// coalesces this edge with source changes before admitting the next pass.
+    public static let dueWorkRemaining = Notification.Name("NativeAgent.scheduler.dueWorkRemaining")
+
     let root: URL
     let persistence: any PersistenceCoreProtocol
     private let workshopRunner: SwiftNativeWorkshopRunner
@@ -314,19 +289,17 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     let uuid: @Sendable () -> String
     let connectorActionIDs: Set<String>?
     /// Injected push sender. nil at every non-firing call site (list / enable /
-    /// disable / configure never push). When a trigger resolves `notify: true`
+    /// disable never push). When a trigger resolves `notify: true`
     /// and this is nil, the fire still lands and the receipt event is written
     /// with `status: "warn"` — LOUD, never silently absent.
     let notifier: TriggerNotifier?
-    /// Injection seam for `TriggerContentBuilder`'s worklog source, which lives
+    /// Injection seam for the native brief source reader's worklog, which lives
     /// OUTSIDE the data root (~/.claude/state/claude-worklog.jsonl). nil keeps
     /// the production default; tests point it at a temp file so a brief built
     /// under a bare temp root is genuinely empty. Same role as `now` / `uuid`.
     let worklogPath: URL?
-    /// L5 G3/G1 seam: the tool-capable turn that supplies the morning brief's
-    /// synthesized lead. Missing synthesis is an owned failure, never a
-    /// substituted counts brief.
-    let morningBriefSynthesizer: MorningBriefSynthesizer?
+    /// The originating door runs her part; absent/disabled code stays unavailable.
+    let morningBriefPart: MorningBriefPart?
     private var mutationTail: Task<Void, Never>? = nil
 
     /// `workshopRunner` is the wave-21 execution-fire seam. Defaults to a
@@ -343,7 +316,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         connectorActionIDs: Set<String>? = nil,
         notifier: TriggerNotifier? = nil,
         worklogPath: URL? = nil,
-        morningBriefSynthesizer: MorningBriefSynthesizer? = nil
+        morningBriefPart: MorningBriefPart? = nil
     ) {
         let resolvedPersistence = persistence ?? SwiftNativePersistenceCore()
         self.root = root
@@ -359,7 +332,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         self.connectorActionIDs = connectorActionIDs
         self.notifier = notifier
         self.worklogPath = worklogPath
-        self.morningBriefSynthesizer = morningBriefSynthesizer
+        self.morningBriefPart = morningBriefPart
     }
 
     /// `<root>/triggers/trigger_config.json`. Relocated 2026-08-13 out of the
@@ -380,14 +353,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
 
     // MARK: periodic-fire liveness state (W3c)
     //
-    // Per-surface `{ "<trigger name>": { "last_fired_at": "<iso8601>" } }` maps
-    // that record when a trigger last SELF-fired on the periodic tick. These
-    // are LIVENESS state, not config — kept in a sibling file so a write never
-    // touches the daemon-shaped config array. Persisting them is what stops a
-    // restart from re-firing a storm: after a crash+relaunch the scheduler
-    // reads last_fired_at and sees a time trigger already fired today.
-    // Inbox and execution trigger names can collide ("morning_brief" exists in
-    // both surfaces), so each surface gets its own state file.
+    // Each surface keeps its own last-fired stamp and life-stamped unfinished
+    // claims, separate from configuration; inbox/workshop names can collide.
     /// `<root>/triggers/trigger_state.json` (same 2026-08-13 relocation and lazy
     /// migration as `inboxPath`).
     public nonisolated var inboxStatePath: URL {
@@ -403,16 +370,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
 
     /// The shared activity feed every fire writes its receipt into.
     public nonisolated var activityFeedPath: URL {
-        root
-            .appendingPathComponent("activity", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
+        SwiftNativePersistenceCore.activityEventsPath(dataRoot: root)
     }
 
     /// Max triggers the due-work pass may fire in a single pass. A liveness
     /// backstop (NOT a policy gate): if a config edit or clock jump makes many
     /// triggers due at once, we fire at most this many and log loudly; the
-    /// remainder stay due and receive one legacy-cadence recovery deadline
-    /// (their state isn't advanced, so no occurrence is lost).
+    /// remainder stay due and request one coalesced continuation (their state
+    /// isn't advanced, so no occurrence is lost).
     static let periodicFireCapPerTick = 3
 
     private static let logger = Logger(subsystem: "com.nativeagent.core", category: "trigger-scheduler")
@@ -435,18 +400,9 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// already fired today; see the W3c note above). The legacy files are left
     /// in place, frozen — nothing reads them once the new files exist.
     ///
-    /// Failure is LOUD, FAIL-CLOSED, and non-latching (gpt-5.5 review BLOCKING,
-    /// 2026-08-13): when a legacy file exists but its copy-forward fails, this
-    /// THROWS and the guarded entry point aborts. Proceeding would let a
-    /// mutation seed built-in DEFAULTS at the new home — after which the
-    /// exists-check here would skip the legacy file forever, silently losing
-    /// the user's config or `last_fired_at` (whose loss re-fires time triggers).
-    /// The surface stays dormant-until-repaired — same posture as corrupt
-    /// state — and the unset done-flag retries on the next access.
-    /// The copy runs under the LEGACY file's flock so it cannot snapshot a
-    /// mid-write file, and re-checks the destination inside the lock so a
-    /// concurrent interleaved call (actor methods yield at await) cannot
-    /// double-copy.
+    /// Copy failure throws before defaults or mutations can replace the old
+    /// decision. The canonical destination's flock serializes the import and
+    /// live writers; no lock sidecar is created in the frozen legacy folder.
     private func migrateLegacyInboxTriggerFilesIfNeeded() async throws {
         if legacyInboxTriggerMigrationDone { return }
         let legacyDir = root.appendingPathComponent("inbox", isDirectory: true)
@@ -461,7 +417,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 try FileManager.default.createDirectory(
                     at: new.deletingLastPathComponent(), withIntermediateDirectories: true
                 )
-                try await persistence.withFileLock(legacy) {
+                try await persistence.withFileLock(new) {
                     if !FileManager.default.fileExists(atPath: new.path) {
                         try FileManager.default.copyItem(at: legacy, to: new)
                     }
@@ -479,24 +435,25 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
 
     // MARK: list
 
+    private static let supportedInboxKinds: Set<String> = ["time"]
+
     public func listInboxTriggers() async throws -> [TriggerConfig] {
         try await migrateLegacyInboxTriggerFilesIfNeeded()
-        return try await Self._readList(path: inboxPath, defaultValue: Self._defaultInboxConfigs)
+        return try await Self._readList(path: inboxPath, defaultValue: try await defaults().inbox, inbox: true)
     }
 
     public func listWorkshopTriggers() async throws -> [TriggerConfig] {
-        try await Self._readList(path: workshopExecutionsPath, defaultValue: Self._defaultWorkshopExecutionConfigs)
+        try await Self._readList(path: workshopExecutionsPath, defaultValue: try await defaults().workshop)
     }
 
     private static func _readList(
         path: URL,
-        defaultValue: [JSONValue]
+        defaultValue: @autoclosure @Sendable () async throws -> [JSONValue], inbox: Bool = false
     ) async throws -> [TriggerConfig] {
-        let items = try loadConfigsForMutation(path: path, defaultValue: defaultValue)
+        let items = try await loadConfigs(path: path, defaultValue: try await defaultValue())
         // Old inbox rows stay on disk; only kinds with a current owner are exposed.
-        let kinds = Set(defaultValue.compactMap(TriggerConfig.init(json:)).compactMap(\.kind))
         return items.compactMap(TriggerConfig.init(json:)).filter { cfg in
-            defaultValue != Self._defaultInboxConfigs || cfg.kind.map(kinds.contains) == true
+            !inbox || cfg.kind.map(supportedInboxKinds.contains) == true
         }
     }
 
@@ -514,11 +471,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw TriggerSchedulerError.invalidRequest("empty name") }
         try await migrateLegacyInboxTriggerFilesIfNeeded()
+        let seed: [JSONValue] = if case .missing = Self.readConfigsRaw(inboxPath) { try await defaults().inbox } else { [] }
         return try await runSerialized { [persistence, inboxPath] in
             let work: @Sendable () async throws -> TriggerStatus = {
                 try await Self._setEnabledImpl(
                     name: name, enabled: enabled,
-                    path: inboxPath, defaultValue: Self._defaultInboxConfigs,
+                    path: inboxPath, defaultValue: seed,
                     persistence: persistence
                 )
             }
@@ -550,13 +508,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         // M4 (2026-07-09): this used to resurrect defaults on a corrupt file
         // "for daemon parity" — and then WRITE them back, permanently destroying
         // the user's triggers. There is no daemon to be in parity with. Corrupt
-        // now quarantines the bytes and throws.
-        var items: [JSONValue] = try Self.loadConfigsForMutation(path: path, defaultValue: defaultValue)
-        let kinds = Set(defaultValue.compactMap(TriggerConfig.init(json:)).compactMap(\.kind))
+        // now preserves the bytes and throws.
+        var items = try await Self.loadConfigs(path: path, defaultValue: defaultValue)
         var found = false
         for (idx, item) in items.enumerated() {
             guard case .object(var obj) = item,
-                  defaultValue != Self._defaultInboxConfigs || TriggerConfig(json: item)?.kind.map(kinds.contains) == true,
+                  TriggerConfig(json: item)?.kind.map(supportedInboxKinds.contains) == true,
                   case .string(let nm) = obj["name"] ?? .null,
                   ExecutionEventVocabulary.matches(nm, name) else { continue }
             obj["enabled"] = .bool(enabled)
@@ -575,108 +532,63 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         return TriggerStatus(name: name, enabled: enabled, status: "updated")
     }
 
-    // MARK: configure — inbox
-
-    /// Mirrors daemon proactive_triggers.update_config: shallow-merge the new
-    /// config dict into the existing trigger's `config` dict. Returns
-    /// {"name", "status": "updated", "config": <new_config>} on hit,
-    /// or {"status": "not_found"} on miss (mirrors the daemon's
-    /// "{"error":"not_found", "name": name}" failure envelope, normalized).
-    public func configureInboxTrigger(name: String, config: JSONValue) async throws -> TriggerStatus {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { throw TriggerSchedulerError.invalidRequest("empty name") }
-        // Accept .object only — daemon does `dict(c.get("config") or {});
-        // existing.update(new_config)` which requires a dict.
-        guard case .object(let newCfg) = config else {
-            throw TriggerSchedulerError.invalidRequest("config must be a JSON object")
-        }
-        try await migrateLegacyInboxTriggerFilesIfNeeded()
-        return try await runSerialized { [persistence, inboxPath] in
-            let work: @Sendable () async throws -> TriggerStatus = {
-                // M4: same read-then-write destruction as _setEnabledImpl — a
-                // corrupt file yielded the default array, whose rows then got
-                // merged and written over the user's config.
-                var items: [JSONValue] = try Self.loadConfigsForMutation(
-                    path: inboxPath, defaultValue: Self._defaultInboxConfigs
-                )
-                let kinds = Set(Self._defaultInboxConfigs.compactMap(TriggerConfig.init(json:)).compactMap(\.kind))
-                var found = false
-                for (idx, item) in items.enumerated() {
-                    guard case .object(var obj) = item,
-                          TriggerConfig(json: item)?.kind.map(kinds.contains) == true,
-                          case .string(let nm) = obj["name"] ?? .null,
-                          ExecutionEventVocabulary.matches(nm, name) else { continue }
-                    var existing: [String: JSONValue] = [:]
-                    if case .object(let cur) = obj["config"] ?? .null { existing = cur }
-                    // Python: existing.update(new_config) — shallow merge.
-                    for (k, v) in newCfg { existing[k] = v }
-                    obj["config"] = .object(existing)
-                    items[idx] = .object(obj)
-                    found = true
-                    break
-                }
-                if !found {
-                    return TriggerStatus(name: name, enabled: nil, status: "not_found", config: .object(newCfg))
-                }
-                do {
-                    try await persistence.writeJSON(.array(items), to: inboxPath)
-                } catch {
-                    throw TriggerSchedulerError.persistenceFailure(String(describing: error))
-                }
-                return TriggerStatus(name: name, enabled: nil, status: "updated", config: .object(newCfg))
-            }
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            return try await persistence.withFileLock(inboxPath, work)
-        }
-    }
-
     // MARK: fire_now — Swift-native
 
     /// Mirrors daemon proactive_triggers.py::ProactiveTriggerScheduler.fire_now.
     public func fireInboxTrigger(name: String) async throws -> TriggerFireResult {
-        try await fireInboxTrigger(name: name, occurrence: nil)
+        let prepared = try await prepareInboxTrigger(name: name)
+        return await publishInboxTrigger(name: name, occurrence: nil, prepared: prepared)
     }
 
-    private func fireInboxTrigger(name: String, occurrence: String?) async throws -> TriggerFireResult {
+    private enum InboxPreparation: Sendable {
+        case ready(row: TriggerConfig, notify: [String: Bool], item: JSONValue)
+        case refused(TriggerFireResult)
+    }
+
+    /// JavaScript and its model run before taking any publication/state lock.
+    private func prepareInboxTrigger(name: String) async throws -> InboxPreparation {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw TriggerSchedulerError.invalidRequest("empty name") }
         guard inboxMasterOn else {
-            return TriggerFireResult(
+            return .refused(TriggerFireResult(
                 status: "disabled", name: name, stub: true,
                 error: "Raising things unasked is off (Notifications), so no trigger fires."
-            )
+            ))
         }
         try await migrateLegacyInboxTriggerFilesIfNeeded()
 
         // Look up the trigger row.
         let configs: [TriggerConfig]
+        let seed: MorningBriefDefaults
         do {
+            seed = try await defaults()
             configs = try await Self._readList(
                 path: inboxPath,
-                defaultValue: Self._defaultInboxConfigs
+                defaultValue: seed.inbox, inbox: true
             )
         } catch {
-            return TriggerFireResult(status: "error", name: name, stub: true,
-                                     error: String(describing: error))
+            return .refused(TriggerFireResult(status: "error", name: name, stub: true,
+                                     error: String(describing: error)))
         }
         guard let row = configs.first(where: { ExecutionEventVocabulary.matches($0.name, name) }) else {
-            return TriggerFireResult(status: "not_found", name: name, stub: true)
+            return .refused(TriggerFireResult(status: "not_found", name: name, stub: true))
         }
 
-        // Canonical-kind guard: unknown kinds return not_found (matches Python
-        // which would have no per-kind trigger class to fire). Don't fall
-        // through to a generic stub.
-        guard let rowKind = row.kind, rowKind == "time" else {
-            return TriggerFireResult(status: "not_found", name: name, stub: true)
-        }
+        do { return .ready(row: row, notify: seed.notify, item: try await _buildMorningBriefItem()) }
+        catch { return .refused(TriggerFireResult(status: "error", name: name, stub: true, error: String(describing: error))) }
+    }
 
-        // Swift-native fire path for the morning brief.
+    /// Native publication rechecks authority and owns the one delivery record.
+    private func publishInboxTrigger(name: String, occurrence: String?, prepared: InboxPreparation) async -> TriggerFireResult {
+        let row: TriggerConfig, notify: [String: Bool]
+        var item: JSONValue
+        switch prepared {
+        case .refused(let result): return result
+        case .ready(let selected, let defaults, let proposal): row = selected; notify = defaults; item = proposal
+        }
+        let rowKind = "time"
         do {
-            var item = try await _buildMorningBriefItem()
+            try Task.checkCancellation()
             if let occurrence, case .object(var fields) = item {
                 fields["trigger_occurrence"] = .string(occurrence)
                 item = .object(fields)
@@ -707,7 +619,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
 
             if deduped {
                 detail += "; suppressed as a duplicate of an active inbox item — no push"
-            } else if Self.resolveNotify(row) {
+            } else if Self.resolveNotify(row, defaults: notify) {
                 if let notifier {
                     delivery = await notifier(Self.notification(for: item, name: name, kind: rowKind))
                     // `notified` tracks the notifier's RETURN, not its invocation
@@ -774,22 +686,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
 
     // MARK: notify resolution
 
-    /// Per-name fallback used when a trigger's `config` carries no `notify` key.
-    /// LOAD-BEARING: `_defaultInboxConfigs` seeding alone only reaches FRESH
-    /// installs — every existing user already has `inbox/trigger_config.json`
-    /// on disk and would never see a push. Seed the defaults AND keep this
-    /// table. Both, not either.
-    nonisolated static let notifyDefaultsByName: [String: Bool] = [
-        "morning_brief": true,
-    ]
-
-    /// 1. `config.notify` when present and a bool. 2. else the per-name table.
-    /// 3. else false — a trigger nobody opted in stays quiet.
-    nonisolated static func resolveNotify(_ cfg: TriggerConfig) -> Bool {
+    /// Saved consent overrides the part's proposed notification preference.
+    nonisolated static func resolveNotify(_ cfg: TriggerConfig, defaults: [String: Bool]) -> Bool {
         if case .object(let o)? = cfg.config, case .bool(let b)? = o["notify"] {
             return b
         }
-        return notifyDefaultsByName[cfg.name] ?? false
+        return defaults[cfg.name] ?? false
     }
 
     private nonisolated static func itemId(of item: JSONValue) -> String? {
@@ -850,18 +752,18 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         if deduped { payload["deduped"] = .bool(true) }
         if delivery != .null { payload["delivery"] = delivery }
 
-        let event: JSONValue = .object([
-            "id": .string(uuid()),
-            "kind": .string("trigger"),
-            "title": .string(title),
-            "detail": .string(detail),
-            "status": .string(status),
-            "executionId": .null,
-            "payload": .object(payload),
-            "createdAt": .string(Self.isoTimestamp(now())),
-        ])
+        let event = SwiftNativePersistenceCore.activityEvent(
+            id: uuid(),
+            kind: "trigger",
+            title: title,
+            detail: detail,
+            status: status,
+            executionId: nil,
+            payload: .object(payload),
+            createdAt: Self.isoTimestamp(now())
+        )
         do {
-            try await appendJSONLCapped(
+            try await SwiftNativePersistenceCore.appendActivityEvent(
                 event, to: activityFeedPath, using: persistence,
                 logLabel: "TriggerScheduler"
             )
@@ -877,10 +779,11 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// failure envelopes: not_found, missing_objective, and any WorkshopExecutionError
     /// throw maps to {status:"error", name, error:<description>}.
     public func fireWorkshopTrigger(name: String) async throws -> TriggerFireResult {
-        try await fireWorkshopTrigger(name: name, occurrence: nil)
+        let seed: [JSONValue] = if case .missing = Self.readConfigsRaw(workshopExecutionsPath) { try await defaults().workshop } else { [] }
+        return try await fireWorkshopTrigger(name: name, occurrence: nil, seed: seed)
     }
 
-    private func fireWorkshopTrigger(name: String, occurrence: String?) async throws -> TriggerFireResult {
+    private func fireWorkshopTrigger(name: String, occurrence: String?, seed: [JSONValue]) async throws -> TriggerFireResult {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw TriggerSchedulerError.invalidRequest("empty name") }
 
@@ -889,7 +792,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         do {
             configs = try await Self._readList(
                 path: workshopExecutionsPath,
-                defaultValue: Self._defaultWorkshopExecutionConfigs
+                defaultValue: seed
             )
         } catch {
             return TriggerFireResult(status: "error", name: name,
@@ -956,14 +859,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
 
     // MARK: evaluate-and-fire
 
-    /// Evaluate every persisted trigger and fire each enabled one through the
-    /// matching Swift-native fire path. Returns the names of triggers that
-    /// actually fired (status == "fired"). Mirrors what the daemon's
-    /// `_proactive_triggers_loop` does on each periodic tick: enumerate, gate
-    /// on `enabled`, and dispatch. Disabled triggers, unknown kinds, and
-    /// missing-objective execution triggers are skipped without being reported as
-    /// fired. Inbox triggers fire as stubs (the only fully Swift-native path).
-    /// Errors from a single trigger do not block evaluation of the others.
     /// Notifications ▸ "Let her raise things unasked", read fresh off saved
     /// authority. Off, no inbox trigger fires — not on the tick, not by hand —
     /// whatever each trigger's own switch says. It was written and shown and
@@ -983,7 +878,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         for (surface, path) in [("inbox", inboxStatePath), ("workshop", workshopExecutionStatePath)] {
             guard case .parsed(let state) = Self.readStateRaw(path) else { continue }
             for (name, value) in state {
-                guard case .object(let entry) = value, case .array(let pending)? = entry["unfinished_occurrences"] else { continue }
+                guard case .object(let entry) = value, entry["state"] != .string("stopped"),
+                      case .array(let pending)? = entry["unfinished_occurrences"] else { continue }
                 for case .string(let occurrence) in pending {
                     await oweTrigger(surface: surface, name: name, occurrence: occurrence).value
                 }
@@ -1012,8 +908,21 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 continue
             }
             for cfg in configs where cfg.enabled {
-                guard scheduledInstantIfDue(cfg) != nil else { continue }
-                if fired.count >= Self.periodicFireCapPerTick { deferredDueToCap = true; break }
+                guard let scheduled = scheduledInstantIfDue(cfg) else { continue }
+                if fired.count >= Self.periodicFireCapPerTick {
+                    // A clock-due trigger may already have fired. Only an
+                    // unclaimed remainder earns another pass; failed/corrupt
+                    // state waits for its repair or source-change event.
+                    let state: [String: JSONValue]
+                    switch Self.readStateRaw(statePath) {
+                    case .corrupt: continue
+                    case .missing: state = [:]
+                    case .parsed(let saved): state = saved
+                    }
+                    guard !Self.hasFired(cfg, state: state, scheduled: scheduled) else { continue }
+                    deferredDueToCap = true
+                    break
+                }
                 do {
                     guard try await claimIfDue(cfg, statePath: statePath) else { continue }
                 } catch {
@@ -1026,24 +935,52 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         }
         if deferredDueToCap {
             Self.logger.error(
-                "periodic trigger fire cap (\(Self.periodicFireCapPerTick, privacy: .public)) hit this tick — fired \(fired.count, privacy: .public), remaining due triggers deferred to next tick"
+                "periodic trigger fire cap (\(Self.periodicFireCapPerTick, privacy: .public)) hit this tick — fired \(fired.count, privacy: .public), remaining due triggers request a continuation"
             )
+            if !Task.isCancelled {
+                NotificationCenter.default.post(name: Self.dueWorkRemaining, object: nil)
+            }
         }
         return fired + unavailable
     }
 
     public func repairTrigger(surface: String, name: String, occurrence: String? = nil) async -> TriggerFireResult {
-        await runClaimedTrigger(surface: surface, name: name, occurrence: occurrence)
+        let path = surface == "inbox" ? inboxStatePath : workshopExecutionStatePath
+        if case .parsed(let state) = Self.readStateRaw(path), state[name]?.objectValue?["state"] == .string("stopped") {
+            do { return try await surface == "inbox" ? fireInboxTrigger(name: name) : fireWorkshopTrigger(name: name) }
+            catch { return TriggerFireResult(status: "error", name: name, error: error.localizedDescription) }
+        }
+        return await runClaimedTrigger(surface: surface, name: name, occurrence: occurrence)
     }
 
     private func runClaimedTrigger(surface: String, name: String, occurrence: String? = nil) async -> TriggerFireResult {
         let statePath = surface == "inbox" ? inboxStatePath : workshopExecutionStatePath
+        if case .parsed(let state) = Self.readStateRaw(statePath), state[name]?.objectValue?["state"] == .string("stopped") {
+            return TriggerFireResult(status: "stopped", name: name, error: DataRootLife.stoppedReason)
+        }
         let claimed: String? = if case .parsed(let state) = Self.readStateRaw(statePath),
             let at = Self.lastFiredFromState(state, name: name) { Self.isoTimestamp(at) } else { nil }
         let occurrence = occurrence ?? claimed ?? uuid()
         let operation = "trigger:\(surface):\(name):\(occurrence)"
         var result: TriggerFireResult
         do {
+            // A competing repair can finish while the part thinks; the locked
+            // read below still decides whether anything may be published.
+            let prepared: InboxPreparation
+            let workshopSeed: [JSONValue]
+            switch surface {
+            case "inbox":
+                let rows = try await LiveNotificationInbox.live(dataRoot: root).rows()
+                if let prior = rows.first(where: { $0.objectValue?["source"] == .string("trigger:" + name)
+                    && $0.objectValue?["trigger_occurrence"] == .string(occurrence) }), let id = Self.itemId(of: prior) {
+                    prepared = .refused(TriggerFireResult(status: "fired", name: name, itemId: id))
+                } else { prepared = try await prepareInboxTrigger(name: name) }
+                workshopSeed = []
+            case "workshop":
+                prepared = .refused(TriggerFireResult(status: "not_found", name: name))
+                workshopSeed = if case .missing = Self.readConfigsRaw(workshopExecutionsPath) { try await defaults().workshop } else { [] }
+            default: throw TriggerSchedulerError.invalidRequest("surface must be inbox or workshop")
+            }
             result = try await persistence.withFileLock(statePath) { [self] in
                 var result: TriggerFireResult
                 switch surface {
@@ -1055,7 +992,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                     }), let id = Self.itemId(of: prior) {
                         result = TriggerFireResult(status: "fired", name: name, itemId: id)
                     } else {
-                        result = try await fireInboxTrigger(name: name, occurrence: occurrence)
+                        result = await publishInboxTrigger(name: name, occurrence: occurrence, prepared: prepared)
                     }
                     if result.status == "fired", let item = result.item {
                         if case .failed = await TriggerNotificationInbox.mirrorCardIntoRealInbox(item, triggerName: name, dataRoot: root) {
@@ -1063,7 +1000,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                         }
                     }
                 case "workshop":
-                    let rows = try await workshopRunner.listWorkshopExecutionsMerged()
+                    let rows = try await workshopRunner.listWorkshopExecutions()
                     let source = "trigger:\(name):occurrence:\(occurrence)"
                     if let prior = rows.first(where: {
                         guard case .object(let row) = $0 else { return false }
@@ -1071,7 +1008,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                     }), case .object(let row) = prior, case .string(let id)? = row["id"] {
                         result = TriggerFireResult(status: "fired", name: name, executionId: id)
                     } else {
-                        result = try await fireWorkshopTrigger(name: name, occurrence: occurrence)
+                        result = try await fireWorkshopTrigger(name: name, occurrence: occurrence, seed: workshopSeed)
                     }
                 default: throw TriggerSchedulerError.invalidRequest("surface must be inbox or workshop")
                 }
@@ -1108,16 +1045,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 "surface": .string(surface), "name": .string(name), "occurrence": .string(occurrence)])]))
     }
 
-    /// Earliest clock crossing for an enabled, self-firing trigger. This is a
-    /// read-only scheduling projection over canonical config, liveness state,
-    /// and (for idle triggers) the persisted chat activity signal. It never
-    /// claims or fires an occurrence.
+    /// Earliest clock crossing for an enabled `time` trigger; other kinds have
+    /// no deadline. This is a read-only projection over canonical config and liveness
+    /// state. It never claims or fires an occurrence.
     ///
-    /// Future time/idle instants remain exact. An already-due unclaimed
-    /// occurrence receives one 60-second recovery crossing, preserving the old
-    /// retry cadence only while due work remains after a capped or failed pass.
-    /// A claimed idle episode has no next clock crossing until chat activity
-    /// changes; the app-owned file invalidation supplies that edge.
+    /// Future time instants remain exact. A capped pass requests a coalesced
+    /// continuation; an unavailable or failed occurrence waits for source or
+    /// repair invalidation, with the slow integrity sweep as a missed-event
+    /// backstop. Overdue work never manufactures a retry deadline.
     public func nextMeaningfulDeadline(after reference: Date) async -> Date? {
         var candidates: [Date] = []
         if inboxMasterOn, let inbox = try? await listInboxTriggers() {
@@ -1155,38 +1090,15 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             guard cfg.enabled else { return nil }
             switch cfg.kind {
             case "time":
-                guard let hour = Self.intField(cfg.config, "hour"), (0...23).contains(hour)
-                else { return nil }
-                let minute: Int
-                if case .object(let obj)? = cfg.config, obj["minute"] != nil {
-                    guard let parsed = Self.intField(cfg.config, "minute") else { return nil }
-                    minute = parsed
-                } else {
-                    minute = 0
+                guard let schedule = Self.dailySchedule(cfg) else { return nil }
+                guard let today = SchedulerJobRuntime.dailyOccurrence(schedule, on: reference) else {
+                    return Self.nextDailyOccurrence(schedule, after: reference)
                 }
-                guard (0...59).contains(minute),
-                      let today = Self.scheduledInstantToday(
-                        hour: hour,
-                        minute: minute,
-                        on: reference
-                      ) else { return nil }
                 if Self.hasFired(cfg, state: state, scheduled: today) {
-                    var calendar = Calendar(identifier: .gregorian)
-                    calendar.timeZone = .autoupdatingCurrent
-                    var components = DateComponents()
-                    components.hour = hour
-                    components.minute = minute
-                    components.second = 0
-                    return calendar.nextDate(
-                        after: max(reference, today),
-                        matching: components,
-                        matchingPolicy: .nextTime,
-                        repeatedTimePolicy: .first,
-                        direction: .forward
-                    )
+                    return Self.nextDailyOccurrence(schedule, after: max(reference, today))
                 }
                 if today > reference { return today }
-                return reference.addingTimeInterval(60)
+                return nil
             default:
                 return nil
             }
@@ -1212,37 +1124,28 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// can recompute it INSIDE the flock — it touches only the immutable
     /// Sendable `now` closure + static helpers, no actor state.
     private nonisolated func scheduledInstantIfDue(_ cfg: TriggerConfig) -> Date? {
-        switch cfg.kind {
-        case "time":
-            // Schedule must parse to a valid hour (0...23); an unparseable /
-            // absent / fractional schedule keeps the trigger dormant rather
-            // than firing at an arbitrary time.
-            guard let hour = Self.intField(cfg.config, "hour"), (0...23).contains(hour) else {
-                return nil
-            }
-            // minute: ABSENT → default 0 (many configs specify only an hour).
-            // But a PRESENT-but-invalid minute (fractional like 8.9, a string,
-            // etc.) must make the trigger DORMANT — same rule as an invalid
-            // hour (Finding 4). Silently snapping `minute: 8.9` to :00 would
-            // fire at the wrong time, which is exactly the truncation bug.
-            let minute: Int
-            if case .object(let cfgObj)? = cfg.config, cfgObj["minute"] != nil {
-                guard let m = Self.intField(cfg.config, "minute") else { return nil }
-                minute = m
-            } else {
-                minute = 0
-            }
-            guard (0...59).contains(minute) else { return nil }
+        let current = now()
+        guard let schedule = Self.dailySchedule(cfg),
+              let scheduled = SchedulerJobRuntime.dailyOccurrence(schedule, on: current),
+              current >= scheduled else { return nil }
+        return scheduled
+    }
 
-            let current = now()
-            guard let scheduled = Self.scheduledInstantToday(hour: hour, minute: minute, on: current),
-                  current >= scheduled else {
-                return nil
-            }
-            return scheduled
-        default:
-            return nil
-        }
+    /// Trigger admission stays strict: absent minute means zero; invalid fields are dormant.
+    private nonisolated static func dailySchedule(_ cfg: TriggerConfig) -> [String: JSONValue]? {
+        guard cfg.kind == "time", let hour = intField(cfg.config, "hour"), (0...23).contains(hour) else { return nil }
+        let minute: Int
+        if case .object(let object)? = cfg.config, object["minute"] != nil {
+            guard let parsed = intField(cfg.config, "minute") else { return nil }
+            minute = parsed
+        } else { minute = 0 }
+        guard (0...59).contains(minute) else { return nil }
+        return ["type": .string("daily"), "hour": .int(Int64(hour)), "minute": .int(Int64(minute))]
+    }
+
+    private nonisolated static func nextDailyOccurrence(_ schedule: [String: JSONValue], after date: Date) -> Date? {
+        (try? SchedulerJobNormalizer.nextFromSchedule(schedule, afterEpoch: date.timeIntervalSince1970, now: { date }))
+            .map { Date(timeIntervalSince1970: $0) }
     }
 
     // MARK: periodic-fire helpers (W3c)
@@ -1286,18 +1189,17 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         return .parsed(items)
     }
 
-    /// Corrupt-safe load of a trigger config array for a MUTATION (enable /
-    /// disable / configure). Missing → defaults (a legitimately fresh install,
-    /// where writing defaults is correct). Parsed → the user's rows. Corrupt →
-    /// the canonical bytes stay in place and the mutation THROWS. This
-    /// must never do is resurrect defaults on top of user data (M4).
-    nonisolated static func loadConfigsForMutation(
+    /// One config loader for reads and mutations. Only a missing file asks the
+    /// part for defaults, before any lock; locked mutations supply prepared defaults.
+    /// Parsed → the user's rows. Corrupt → the canonical bytes stay in place
+    /// and the operation throws, never resurrecting defaults over user data.
+    nonisolated static func loadConfigs(
         path: URL,
-        defaultValue: [JSONValue]
-    ) throws -> [JSONValue] {
+        defaultValue: @autoclosure @Sendable () async throws -> [JSONValue]
+    ) async throws -> [JSONValue] {
         switch readConfigsRaw(path) {
         case .missing:
-            return defaultValue
+            return try await defaultValue()
         case .parsed(let items):
             return items
         case .corrupt:
@@ -1308,21 +1210,16 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         }
     }
 
-    /// Raw read of a state file that distinguishes missing from corrupt —
-    /// `persistence.readJSON` collapses both to its default, which is exactly
-    /// the fail-open bug Finding 2 closes. Reads bytes directly; writes are
-    /// atomic (rename), so a reader never sees a torn intermediate.
+    /// Missing is empty; damaged state is unavailable; another life's work is stopped.
     nonisolated static func readStateRaw(_ statePath: URL) -> StateRead {
         guard FileManager.default.fileExists(atPath: statePath.path) else {
             return .missing
         }
         guard let data = try? Data(contentsOf: statePath) else {
-            // Exists but unreadable — treat as corrupt (fail safe: don't fire).
             return .corrupt
         }
         if data.isEmpty { return .corrupt }
         guard case .object(let o)? = try? JSONValue.parse(data) else {
-            // Non-empty but not a JSON object (garbage, or a JSON array/scalar).
             return .corrupt
         }
         guard o.values.allSatisfy({ value in
@@ -1340,7 +1237,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             }
             return true
         }) else { return .corrupt }
-        return .parsed(o)
+        guard let life = try? DataRootLife.current(in: statePath.deletingLastPathComponent().deletingLastPathComponent()) else { return .corrupt }
+        return .parsed(o.mapValues { value in
+            guard case .object(var entry) = value, DataRootLife.life(of: entry["lifeID"]) != life,
+                  case .array(let pending)? = entry["unfinished_occurrences"], !pending.isEmpty else { return value }
+            entry["state"] = .string("stopped")
+            entry["reason"] = .string(DataRootLife.stoppedReason)
+            return .object(entry)
+        })
     }
 
     /// Pull a trigger's persisted `last_fired_at` out of an already-read state
@@ -1370,32 +1274,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         return date + String(format: " %02d:%02d", intField(cfg.config, "hour")!, intField(cfg.config, "minute") ?? 0)
     }
 
-    /// Atomic CLAIM of a trigger's current scheduled occurrence (Finding 1).
-    /// Under the state-file flock — the SAME cross-process lock the daemon uses
-    /// — this re-reads state, re-evaluates dueness against the freshly-read
-    /// `last_fired_at`, and if still due stamps `last_fired_at = the SCHEDULED
-    /// INSTANT` (not now(); this also closes the clock-backwards refire hazard,
-    /// Finding 3). Returns true IFF this caller won the claim and should fire.
-    /// Two overlapping schedulers therefore serialize here: the first stamps
-    /// and wins, the second re-reads the fresh stamp and loses. A corrupt state
-    /// file makes the claim fail safe (returns false, no stamp). A persistence
-    /// failure is logged and returns false — no fire, no torn state.
-    /// False: not due, or already claimed. A claim that cannot be read or
-    /// written throws: a due occurrence is owed, never "nothing due".
+    /// Recheck dueness and claim the scheduled instant under the state-file lock.
+    /// False means not due or already claimed; unavailable claims throw.
     private func claimIfDue(_ cfg: TriggerConfig, statePath: URL) async throws -> Bool {
-        // Cheap unlocked PRE-GATE only — skip taking the lock when the trigger
-        // isn't even clock-due. NOT the authoritative decision: the clock may
-        // move (even backward, e.g. an NTP step) between here and lock
-        // acquisition, so full dueness is RE-EVALUATED inside the lock below.
+        // The locked check remains authoritative when the clock moves.
         guard scheduledInstantIfDue(cfg) != nil else { return false }
         let name = cfg.name
 
         let work: @Sendable () async throws -> Bool = { [self, persistence] in
-            // Re-evaluate the FULL dueness INSIDE the lock (Finding 1: dueness
-            // AND the fired-stamp are one atomic step). Recompute the scheduled
-            // instant here — a clock rewind since the pre-gate could have made
-            // `current >= scheduled` false, and trusting a value captured
-            // outside the lock would fire before the scheduled time.
             guard let scheduled = self.scheduledInstantIfDue(cfg) else { return false }
             let stamp = Self.isoTimestamp(scheduled)
             var state: [String: JSONValue]
@@ -1413,10 +1299,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 return false
             }
             let surface = statePath == inboxStatePath ? "inbox" : "workshop"
-            // Win the claim: stamp THIS occurrence's scheduled instant.
+            // `last_fired_at` stamps the scheduled instant at claim, not successful completion.
             var entry: [String: JSONValue] = if case .object(let saved)? = state[name] { saved } else { [:] }
-            let unfinished: [JSONValue] = if case .array(let saved)? = entry["unfinished_occurrences"] { saved } else { [] }
+            let life = try DataRootLife.current(in: root)
+            let unfinished: [JSONValue] = if DataRootLife.life(of: entry["lifeID"]) == life, case .array(let saved)? = entry["unfinished_occurrences"] { saved } else { [] }
             entry["unfinished_occurrences"] = .array(unfinished + [.string(stamp)])
+            entry["lifeID"] = .string(life)
+            entry["state"] = .string("running")
+            entry.removeValue(forKey: "reason")
             entry["last_fired_at"] = .string(stamp)
             if cfg.kind == "time" {
                 entry["last_fired_occurrence"] = .string(Self.timeOccurrence(cfg, scheduled: scheduled))
@@ -1426,9 +1316,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             await oweTrigger(surface: surface, name: name, occurrence: stamp).value
             return true
         }
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it.
         return try await persistence.withFileLock(statePath, work)
     }
 
@@ -1450,22 +1337,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         }
     }
 
-    /// Today's local wall-clock instant at hour:minute, relative to `reference`.
-    /// nil only if the components can't form a valid date.
-    static func scheduledInstantToday(hour: Int, minute: Int, on reference: Date) -> Date? {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = .autoupdatingCurrent
-        let day = cal.dateComponents([.year, .month, .day], from: reference)
-        var dc = DateComponents()
-        dc.year = day.year
-        dc.month = day.month
-        dc.day = day.day
-        dc.hour = hour
-        dc.minute = minute
-        dc.second = 0
-        return cal.date(from: dc)
-    }
-
     /// Parse an ISO8601 timestamp (with or without fractional seconds), matching
     /// the shape `isoTimestamp` writes.
     static func parseISOTimestamp(_ value: String) -> Date? {
@@ -1478,26 +1349,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         let id = uuid()
         let createdAt = Self.isoTimestamp(now())
 
-        let content = TriggerContentBuilder(
-            root: root, persistence: persistence, now: now, worklogPath: worklogPath
-        )
-
-        let built = try await content.morningBrief(synthesizer: morningBriefSynthesizer)
-
-        // Match _STANDARD_ACTIONS shape.
-        let actions: JSONValue = .array([
-            .object(["id": .string("view"),    "label": .string("View"),    "description": .string("See full detail")]),
-            .object(["id": .string("act"),     "label": .string("Act"),     "description": .string("Take primary action")]),
-            .object(["id": .string("archive"), "label": .string("Archive"), "description": .string("Archive this item")]),
-            .object(["id": .string("dismiss"), "label": .string("Dismiss"), "description": .string("Dismiss this item")]),
-        ])
+        let packet = await MorningBriefSources(root: root, persistence: persistence, now: now(), worklogPath: worklogPath).packet()
+        let built = try await callBrief(packet, as: MorningBriefProposal.self)
 
         let item: JSONValue = .object([
             "id": .string(id),
             "created_at": .string(createdAt),
             "source": .string("trigger:morning_brief"),
-            "presentation": .object(["icon": .string("sun.horizon.fill"), "badge": .string("MORNING-BRIEF"),
-                                     "words": .string("Your morning brief"), "act_label": .string("Go ahead")]),
+            "presentation": built.presentation,
             "severity": .string("important"),
             "title": .string(built.title),
             "summary": .string(built.summary),
@@ -1506,14 +1365,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             "related_approval_id": .null,
             "related_paths": .null,
             "related_groups": .null,
-            "actions": actions,
+            "actions": built.actions,
             "status": .string("unread"),
             "read_at": .null,
         ])
         return item
     }
 
-    /// Same shape as MCPDispatcher.isoTimestamp / ApprovalInbox stamps.
+    /// Same shape as ApprovalInbox stamps.
     nonisolated static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
@@ -1532,83 +1391,29 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         return try await task.value
     }
 
-    // MARK: defaults
+    // MARK: Authored brief and inactive defaults
 
-    /// Every proactive lane ships OFF. Existing installs' `trigger_config.json`
-    /// is merged against this list by name, so an install that already wrote
-    /// the file keeps whatever the user chose — flipping a seed value here only
-    /// ever changes what a FRESH root starts with.
-    nonisolated static let _defaultInboxConfigs: [JSONValue] = [
-        .object([
-            "name": .string("morning_brief"),
-            "kind": .string("time"),
-            // Ships OFF, like every other proactive lane. A fresh root should
-            // not start speaking on a schedule nobody asked for; the person
-            // turns this on in Settings → Inbox Policy. An install that already
-            // enabled it is untouched — the merge is by name.
-            "enabled": .bool(false),
-            "config": .object([
-                "hour": .int(8),
-                "minute": .int(0),
-                // The one trigger whose whole point is to reach the person when
-                // they aren't looking at the app — it only applies once they
-                // enable it. Mirrored in `notifyDefaultsByName`
-                // so EXISTING installs (whose trigger_config.json predates this
-                // key) get the push too.
-                "notify": .bool(true),
-            ]),
-            "description": .string("Daily morning brief at configured hour."),
-        ]),
-    ]
+    private func callBrief<Value: Decodable>(_ input: JSONValue, as: Value.Type) async throws -> Value {
+        guard let morningBriefPart else {
+            throw TriggerSchedulerError.persistenceFailure("The native-morning-brief part has no originating app door.")
+        }
+        let value = try await morningBriefPart(input)
+        return try JSONDecoder().decode(Value.self, from: value.serializedData(pretty: false))
+    }
 
-    /// Mirrors the retired daemon::TriggerScheduler.DEFAULT_TRIGGERS (L1824-L1834).
-    nonisolated static let _defaultWorkshopExecutionConfigs: [JSONValue] = [
-        .object([
-            "name": .string("morning_brief"),
-            "kind": .string("time"),
-            "config": .object([
-                "hour": .int(8),
-                "minute": .int(0),
-            ]),
-            "objective": .string("Read calendar + email summary, draft a morning brief"),
-            "title": .string("Morning Brief"),
-            "trust_required": .string("send_approval"),
-            "enabled": .bool(false),
-        ]),
-    ]
-
-}
-
-// MARK: - Factory
-
-/// Returns SwiftNative. The daemon route is retired for production runtime.
-///
-/// Wave 24-amendment (2026-06-01): when `.executions` is ON we MUST inject a
-/// execution runner whose planner is `HTTPCodexMissionPlannerLLM` (the
-/// production planner that actually drives an LLM). The default
-/// `SwiftNativeWorkshopRunner.init` planner is `StubWorkshopPlannerLLM`, which
-/// would silently ship 2-step stub plans for every fired trigger — the bug
-/// that wave 24's retirement assumed away. We thread the runner through
-/// `makeWorkshopRunner(runtime:)` so the factory wiring + the standalone
-/// execution-runner factory share one source of truth.
-///
-/// `notifier` is nil by default: the list / enable / disable / configure call
-/// sites never fire, so they must never carry a push sender. ONLY the two fire
-/// sites (the event/deadline due-work runner and manual "fire now") pass one in.
-///
-/// `morningBriefSynthesizer` follows the same rule for the same reason: only
-/// the fire sites can produce a brief, so only they carry the seam that gives
-/// the brief its synthesized lead (L5 G3/G1).
-public func makeTriggerScheduler(
-    notifier: TriggerNotifier? = nil,
-    dataRoot: URL = PersistenceCore.defaultDataRoot(),
-    morningBriefSynthesizer: MorningBriefSynthesizer? = nil
-) -> any TriggerSchedulerClient {
-    let runner = makeWorkshopRunner(dataRoot: dataRoot)
-    return SwiftNativeTriggerScheduler(
-        root: dataRoot,
-        workshopRunner: runner,
-        notifier: notifier,
-        morningBriefSynthesizer: morningBriefSynthesizer
-    )
+    private func defaults() async throws -> MorningBriefDefaults {
+        var value = try await callBrief(.object(["operation": .string("defaults")]), as: MorningBriefDefaults.self)
+        // A seed is behaviour, never consent. Only an explicit enable mutation
+        // can activate a schedule; existing saved rows remain untouched.
+        func inactive(_ rows: [JSONValue]) -> [JSONValue] {
+            rows.map { row in
+                guard case .object(var fields) = row else { return row }
+                fields["enabled"] = .bool(false)
+                return .object(fields)
+            }
+        }
+        value.inbox = inactive(value.inbox)
+        value.workshop = inactive(value.workshop)
+        return value
+    }
 }

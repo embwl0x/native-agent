@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `OrganismKernel.swift` | `OrganismKernel` actor; `configure`, `admitAfterTurnReaction` |
 
 public struct OrganismDependencies: Sendable {
     public var now: @Sendable () -> Date
@@ -22,25 +23,26 @@ public struct OrganismDependencies: Sendable {
 }
 
 public actor OrganismKernel {
-    private var configuration: OrganismConfiguration
+    private var mutationRevision: UInt64 = 0
+    private var configuration: OrganismConfiguration { didSet { mutationRevision &+= 1 } }
     private let dependencies: OrganismDependencies
-    private var chemicalState: ChemicalState
-    private var bodySchema: BodySchema
-    private var field: OrganismField
-    private var predictionLedger: OrganismPredictionLedger
-    private var dreamRepairState: OrganismDreamRepairState
-    private var signalCount: Int = 0
+    private var chemicalState: ChemicalState { didSet { mutationRevision &+= 1 } }
+    private var bodySchema: BodySchema { didSet { mutationRevision &+= 1 } }
+    private var field: OrganismField { didSet { mutationRevision &+= 1 } }
+    private var predictionLedger: OrganismPredictionLedger { didSet { mutationRevision &+= 1 } }
+    private var dreamRepairState: OrganismDreamRepairState { didSet { mutationRevision &+= 1 } }
+    private var signalCount: Int = 0 { didSet { mutationRevision &+= 1 } }
     /// Round 3 Wave A2 — felt resolutions awaiting the runtime's drain.
     /// Capped (drop-oldest); the drain is the remove for every add.
     private static let pendingResolutionFeltCap = 8
-    private var pendingResolutionFelt: [OrganismResolutionFeltEvent] = []
-    private var lastSignalAt: Date?
-    private var lastSettledAt: Date
+    private var pendingResolutionFelt: [OrganismResolutionFeltEvent] = [] { didSet { mutationRevision &+= 1 } }
+    private var lastSignalAt: Date? { didSet { mutationRevision &+= 1 } }
+    private var lastSettledAt: Date { didSet { mutationRevision &+= 1 } }
     /// When the canonical relational crossing last integrated tenderness.
     /// In-memory: a gap the process did not observe is missing evidence, so a
     /// restart resumes integrating from the next crossing rather than claiming
     /// the whole downtime as sustained warmth.
-    private var tendernessAnchorAt: Date?
+    private var tendernessAnchorAt: Date? { didSet { mutationRevision &+= 1 } }
     /// When the app layer last pushed the user's quiet-hours preference into
     /// `configuration.diurnalClock`. In-memory only: a clock is a read of a
     /// preference file, never state the body owns.
@@ -53,7 +55,7 @@ public actor OrganismKernel {
     /// equally not proof she was awake — and a process that was not running
     /// cannot attest to hours. Resuming from zero is the conservative read, and
     /// the dream resets it anyway.
-    private var wakefulnessFatigue: Double = 0
+    private var wakefulnessFatigue: Double = 0 { didSet { mutationRevision &+= 1 } }
     /// Caring moments already SEEN, by originating conversational event
     /// (`OrganismCaringEvent.key`). Seen, not dosed: a moment coalesced into an
     /// encounter already running is in here too, because the question this ring
@@ -61,12 +63,12 @@ public actor OrganismKernel {
     /// whichever way it was counted. A bounded insertion-ordered ring — see
     /// `OrganismCaringEvent.maximumRememberedKeys` for why it is bounded, small,
     /// and deliberately not persisted.
-    private var countedCaringEventKeys: Set<String> = []
-    private var countedCaringEventKeyOrder: [String] = []
+    private var countedCaringEventKeys: Set<String> = [] { didSet { mutationRevision &+= 1 } }
+    private var countedCaringEventKeyOrder: [String] = [] { didSet { mutationRevision &+= 1 } }
     /// ONE ENCOUNTER, ONE DOSE (2026-09-11). The rolling window the caring
     /// coalescing measures against. Unlike the ring above this IS persisted, in
     /// `OrganismPersistentState.caringEncounter` — see `OrganismCaringEvent.Encounter`.
-    private var caringEncounter: OrganismCaringEvent.Encounter = .empty
+    private var caringEncounter: OrganismCaringEvent.Encounter = .empty { didSet { mutationRevision &+= 1 } }
     private static let minimumRuntimeDecayInterval: TimeInterval = 1
 
     public init(
@@ -344,19 +346,18 @@ public actor OrganismKernel {
 
     /// Item 4's one door for the body's clock. The app layer pushes the user's
     /// ALREADY-DECLARED quiet hours (`data/user_prefs.json` → `quiet_hours`, the
-    /// same source the turn engine's clock line reads) plus their time zone; the
+    /// same source the turn engine's clock line reads), read on the Mac's clock; the
     /// kernel never reads a file and owns no config of its own.
     ///
-    /// Paired with `diurnalClockIsStale(at:)` so the caller can re-read the
-    /// preference on a slow cadence instead of on every body sample.
+    /// The runtime pushes preference/clock invalidations before body reads;
+    /// the kernel never schedules a preference rescan.
     public func configureDiurnalClock(_ clock: OrganismDiurnalClock?, at now: Date? = nil) {
         configuration.diurnalClock = clock
         diurnalClockReadAt = now ?? dependencies.now()
     }
 
-    /// Whether the pushed clock is older than `ttl`. Quiet hours change roughly
-    /// never; re-reading the preference file on every tool result would be a
-    /// stat storm for a value with a five-minute-stale tolerance of infinity.
+    /// Diagnostic age query for the last pushed clock; it does not schedule
+    /// source reads. Production preference updates follow invalidations.
     public func diurnalClockIsStale(at now: Date, ttl: TimeInterval = 300) -> Bool {
         guard configuration.enabled else { return false }
         guard let readAt = diurnalClockReadAt else { return true }
@@ -557,8 +558,7 @@ public actor OrganismKernel {
                     field: frozen.field,
                     repairState: frozen.dreamRepairState,
                     lastSignalAt: frozen.lastSignalAt,
-                    at: fixedAt,
-                    resourcePressure: frozen.bodySchema.resourcePressure
+                    at: fixedAt
                 ),
                 capabilityBeliefs: OrganismCapabilitySelfModel.beliefs(
                     ledger: frozen.predictionLedger,
@@ -587,7 +587,7 @@ public actor OrganismKernel {
         )
     }
 
-    public func exportPersistentState() async -> OrganismPersistentState? {
+    public func exportPersistentState() -> OrganismPersistentState? {
         guard configuration.enabled else { return nil }
         let now = dependencies.now()
         settleElapsedTime(at: now)
@@ -618,7 +618,7 @@ public actor OrganismKernel {
         )
     }
 
-    public func restorePersistentState(_ state: OrganismPersistentState) async {
+    public func restorePersistentState(_ state: OrganismPersistentState) {
         guard configuration.enabled else { return }
         let now = dependencies.now()
         let restored = withFatigueClock(
@@ -654,7 +654,7 @@ public actor OrganismKernel {
         publishPredictedToolGroups(at: now)
     }
 
-    public func settleContinuity() async {
+    public func settleContinuity() {
         guard configuration.enabled else { return }
         let now = dependencies.now()
         settleElapsedTime(at: now)
@@ -692,7 +692,7 @@ public actor OrganismKernel {
         publishPredictedToolGroups(at: now)
     }
 
-    public func clearTransientState() async {
+    public func clearTransientState() {
         chemicalState = .neutral
         bodySchema = .neutral
         field = .empty
@@ -711,6 +711,24 @@ public actor OrganismKernel {
         countedCaringEventKeyOrder.removeAll(keepingCapacity: false)
         lastSettledAt = dependencies.now()
         publishPredictedToolGroups(at: lastSettledAt)
+    }
+
+    public struct ContinuityMutation: Sendable {
+        fileprivate let before: OrganismPersistentState
+        fileprivate let revision: UInt64
+    }
+
+    /// Capture, mutate and claim the resulting revision in one actor turn.
+    public func beginContinuityMutation(reset: Bool) -> ContinuityMutation? {
+        guard let before = exportPersistentState() else { return nil }
+        if reset { clearTransientState() } else { settleContinuity() }
+        return ContinuityMutation(before: before, revision: mutationRevision)
+    }
+
+    public func rollbackContinuityMutation(_ mutation: ContinuityMutation) -> Bool {
+        guard mutationRevision == mutation.revision else { return false }
+        restorePersistentState(mutation.before)
+        return true
     }
 
     /// Keep a running organism alive in wall time. Persistence restore already
@@ -849,8 +867,7 @@ public actor OrganismKernel {
             field: field,
             repairState: dreamRepairState,
             lastSignalAt: lastSignalAt,
-            at: now,
-            resourcePressure: bodySchema.resourcePressure
+            at: now
         )
     }
 }

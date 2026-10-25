@@ -8,11 +8,8 @@ import Transcripts
 import PersonaEngine
 import MemoryV2
 import NativeAgentShared
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
@@ -20,6 +17,7 @@ import MacIntegration
 import CognitiveSubstrate
 import ChatToolRuntime
 import ToolRegistry
+// Blueprint: | `ChatOrchestrationClient+MessagePersistence.swift` | `SwiftNativeChatOrchestrationClient`; attachment path/byte writer for transcripts and queues; shared tool/approval/card append, supersession, dedupe and card CAS/receipt schema. Inline continuations retain DataRootLife and read stopped/restored across lives; session index maintenance delegates to ChatSessionIndexFile |
 
 /// Process-wide, stat-validated line count for chat transcript JSONL files.
 ///
@@ -275,8 +273,19 @@ public enum CodexCompletionTranscriptEvidence {
 }
 
 extension SwiftNativeChatOrchestrationClient {
-    nonisolated static func attachmentURL(dataRoot: URL, runId: String, index: Int) -> URL {
-        dataRoot.appendingPathComponent("chat/attachments/\(runId)/\(index)")
+    nonisolated static func attachmentURL(chatRoot: URL, runId: String, index: Int) -> URL {
+        chatRoot.appendingPathComponent("attachments/\(runId)/\(index)")
+    }
+
+    nonisolated static func persistAttachment(_ bytes: Data, chatRoot: URL, runId: String, index: Int) async throws -> URL {
+        let path = attachmentURL(chatRoot: chatRoot, runId: runId, index: index)
+        try await SwiftNativePersistenceCore().writeDataAtomicDurable(bytes, to: path)
+        return path
+    }
+
+    /// Pre-owner restore already selected the exact referenced attachment path.
+    nonisolated static func persistAttachment(_ bytes: Data, to path: URL) throws {
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: path)
     }
 
     /// Tool results are live-turn data, not durable context. Persist only a
@@ -324,7 +333,7 @@ extension SwiftNativeChatOrchestrationClient {
         outcomeContext: TurnContext? = nil,
         outcomeInterventionAssignment: CausalInterventionAssignment? = nil,
         onNotice: @escaping @Sendable (String, String) async -> Void
-    ) async -> String? {
+    ) async throws -> String? {
         guard !text.isEmpty || !attachments.isEmpty else { return nil }
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return nil }
         let messageSource = Self.messageSource(for: source)
@@ -400,17 +409,7 @@ extension SwiftNativeChatOrchestrationClient {
         ChatSessionIndexFile.beginTranscriptIndexSync(at: path)
         defer { ChatSessionIndexFile.endTranscriptIndexSync(at: path) }
         do {
-            try await persistence.withFileLock(path) {
-                // FAST PATH, deliberately (sweep R4 item 4). This row is a
-                // STREAMING PARTIAL: superseded by the terminal assistant row
-                // the moment the turn finishes, and written often enough that a
-                // per-row F_FULLFSYNC would be felt on every turn. Losing the
-                // newest partial to a power cut costs a fragment of a reply
-                // that never committed; losing a user row or a tool receipt
-                // costs a turn that did. Those go durable — see appendMessage
-                // and appendToolMessage below.
-                try await persistence.appendJSONL(record, to: path)
-            }
+            try await ContactThread.append(record, to: path, using: persistence)
         } catch {
             await Self.reportTranscriptWriteFailure(
                 label: "persistPartialIfNeeded",
@@ -419,7 +418,7 @@ extension SwiftNativeChatOrchestrationClient {
                 userText: "Couldn't save this turn's partial reply - it may be missing when the conversation reloads.",
                 onNotice: onNotice
             )
-            return nil
+            throw error
         }
         do {
             try await syncSessionIndex(
@@ -565,9 +564,11 @@ extension SwiftNativeChatOrchestrationClient {
                 "input": (try? JSONValue.parse(Data(safe.utf8))) ?? .object([:])])
         }
         if let originalResult {
-            if ranTool == "image_generate", case .object(let result) = originalResult, let images = result["images"] {
-                metadata["generatedImages"] = images
-            }
+            // What its generations made, a list's and a script's included, kept before the body is bounded.
+            let generated = ChatGeneratedImageArtifacts.generatedImages(ranTool, ranCall?.input ?? canonicalRiskInput, originalResult)
+            if !generated.isEmpty { metadata["generatedImages"] = .array(generated) }
+            // What it landed, kept before the body is bounded: a resumed turn still knows her hand.
+            if let landed = SwiftNativeTurnEngine.landedEffect(originalResult) { metadata["landedEffect"] = .string(landed) }
             if let id = SessionHistoryPromptRenderer.returnedIdentifier(originalResult) {
                 metadata["resultReturnedID"] = .string(ChatSecretRedactor.redactText(id))
             }
@@ -647,6 +648,7 @@ extension SwiftNativeChatOrchestrationClient {
                     peerSources: steer.sources,
                     elevatedPeerSources: steer.elevated
                 )
+                continuation.lifeID = try DataRootLife.current(in: dataRoot)
                 // A signed turn's card has to be able to replay AS a signed
                 // turn. The envelope cannot carry that (a persisted trust
                 // verdict is authority from history), so what is kept is a
@@ -694,48 +696,9 @@ extension SwiftNativeChatOrchestrationClient {
             metadata["resultStatus"] = .string(recordedStatus)
         }
         record["metadata"] = .object(metadata)
-        // Locked: see appendPartial — protects against the compactor/distiller
-        // locked rewrite dropping a concurrent append. (Immutable binding: a
-        // @Sendable closure cannot capture the mutable `record`.)
         let toolRow: JSONValue = .object(record)
-        // One live card per ask (Agent, 2026-09-13). A newer, identical need —
-        // same kind, same target, same access mode — replaces every older one
-        // still waiting in this conversation, AT THE RAISE, under the same file
-        // lock that appends it. Four "Connect Notion" cards stacked up because
-        // four tool calls each hit the same missing connector; the person is
-        // being asked one question, so one card is live and the rest go quiet.
-        let supersedeKey = stampedInteraction.map {
-            SupersedeKey(kind: $0.kind, target: $0.target, mode: $0.mode, id: $0.id)
-        }
-        // Immutable binding, same reason as `toolRow` above.
-        let stampedNeed = stampedInteraction
-        try await persistence.withFileLock(path) {
-            var rowToAppend = toolRow
-            if let supersedeKey {
-                // Not `try?`: the new pending row is appended only after the
-                // older copies are provably quiet. A swallowed failure here
-                // left two live cards asking the same question.
-                let running = try await Self.supersedeOlderPending(
-                    matching: supersedeKey, in: path, persistence: persistence
-                )
-                // A card whose action is ALREADY RUNNING is not a stale copy:
-                // the person tapped it and a control is open on it. Superseding
-                // it invalidates the continuation the running action is going to
-                // resume, and the tap is lost. So the older card keeps running
-                // and the DUPLICATE goes quiet instead — still exactly one live
-                // card, and it is the one the person is looking at.
-                if running, let stampedNeed {
-                    rowToAppend = Self.supersededRow(rowToAppend, as: stampedNeed)
-                }
-            }
-            // DURABLE (sweep R4 item 4). A tool receipt is the transcript's
-            // only record that an EXTERNAL EFFECT happened — a file written, a
-            // message sent, a command run. If a power cut drops it, the effect
-            // still happened in the world but the conversation no longer says
-            // so, and the next turn can redo it. That asymmetry is what buys
-            // the flush; partial rows (above) have no such counterpart.
-            try await persistence.appendJSONLDurable(rowToAppend, to: path)
-        }
+        try await Self.appendTranscriptRow(
+            toolRow, to: path, persistence: persistence, interaction: stampedInteraction)
         if stampedInteraction != nil {
             NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: sessionId)
         }
@@ -756,27 +719,186 @@ extension SwiftNativeChatOrchestrationClient {
 
     // MARK: helpers
 
+    public enum InlineInteractionResolveError: LocalizedError {
+        case notFound
+        case staleRevision(expected: Int, actual: Int)
+        case alreadySettled(String)
+        case noControl(String)
+        case usersCard
+
+        public var errorDescription: String? {
+            switch self {
+            case .notFound:
+                return "That request is no longer in this conversation."
+            case .staleRevision(let expected, let actual):
+                return "This card moved on (expected \(expected), found \(actual)). Reopen it."
+            case .alreadySettled(let state):
+                return "That was already \(state)."
+            case .usersCard:
+                return "That card is in the owner's conversation waiting for them, so answering it is theirs. "
+                    + "Nothing was changed; Not now still withdraws your ask."
+            case .noControl(let detail):
+                return detail
+            }
+        }
+    }
+
+    package static func inlineInteraction(in row: JSONValue, lifeID: String? = nil) -> InlineInteraction? {
+        guard case .object(let object) = row,
+              case .object(let metadata)? = object["metadata"],
+              case .string(InlineInteractionWire.transcriptKind)? = metadata["kind"],
+              let raw = metadata[InlineInteractionWire.metadataKey]
+        else { return nil }
+        guard var card = InlineInteractionNeed.decode(raw) else { return nil }
+        if let lifeID, let continuation = card.continuation,
+           DataRootLife.life(of: continuation.lifeID) != lifeID,
+           [.waiting, .claimed, .replaying, .stopped].contains(continuation.state) {
+            card.continuation?.state = .stopped
+            card.continuation?.reason = DataRootLife.stoppedReason
+            card.state = .stopped(reason: DataRootLife.stoppedReason)
+        }
+        return card
+    }
+
+    /// The same-row card CAS: compare the persisted revision and continuation
+    /// under the transcript lock, preserving the row's identity and provenance.
+    package static func persistInlineInteraction(
+        _ interaction: InlineInteraction, at file: URL,
+        ifRevision expected: Int? = nil, persistence: any PersistenceCoreProtocol,
+        expecting: (@Sendable (InlineInteraction) -> Bool)? = nil
+    ) async throws {
+        let lifeID = try DataRootLife.current(in: file.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent())
+        try await persistence.withFileLock(file) {
+            let read = try await persistence.readJSONLReporting(file)
+            guard read.report.isClean else {
+                throw PersistenceCoreError.ioFailure(
+                    "This conversation has damaged rows. Nothing was changed."
+                )
+            }
+            var rows = read.rows
+            guard let index = rows.firstIndex(where: {
+                inlineInteraction(in: $0)?.id == interaction.id
+            }) else { throw InlineInteractionResolveError.notFound }
+            if let expected, let persisted = inlineInteraction(in: rows[index]) {
+                guard persisted.revision == expected else {
+                    throw InlineInteractionResolveError.staleRevision(
+                        expected: expected, actual: persisted.revision
+                    )
+                }
+            }
+            if let expecting {
+                guard let onDisk = inlineInteraction(in: rows[index], lifeID: lifeID) else {
+                    throw InlineInteractionResolveError.notFound
+                }
+                guard expecting(onDisk) else {
+                    throw InlineInteractionResolveError.staleRevision(
+                        expected: interaction.revision, actual: onDisk.revision
+                    )
+                }
+            }
+            guard case .object(var object) = rows[index],
+                  case .object(var metadata)? = object["metadata"]
+            else { throw InlineInteractionResolveError.notFound }
+            if let encoded = InlineInteractionNeed.encode(interaction) {
+                metadata[InlineInteractionWire.metadataKey] = encoded
+            }
+            let envelope = inlineInteractionReceiptEnvelope(interaction)
+            metadata["resultSummary"] = .string(
+                (try? envelope.serialize(pretty: false)) ?? ""
+            )
+            metadata["resultStatus"] = .string(interaction.state.name)
+            metadata["resultClass"] = .string(
+                ChatToolOutcome.exactResultClass(envelope).rawValue
+            )
+            if let summary = interaction.state.outcome?.summary, !summary.isEmpty {
+                metadata["resultBody"] = .string(summary)
+            }
+            metadata["ok"] = .bool(interaction.state.outcome != nil)
+            object["metadata"] = .object(metadata)
+            rows[index] = .object(object)
+            try ContactThread.replace(rows, to: file)
+        }
+    }
+
+    package static func inlineInteractionReceiptEnvelope(_ interaction: InlineInteraction) -> JSONValue {
+        switch interaction.state {
+        case .stopped(let reason):
+            return .object(["status": .string("stopped"), "reason": .string(reason)])
+        case .settled(let outcome):
+            return .object([
+                "status": .string("succeeded"),
+                "ok": .bool(true),
+                "detail": .string(outcome.summary),
+            ])
+        case .declined:
+            return .object([
+                "status": .string("cancelled"),
+                "detail": .string(interaction.declineConsequence),
+            ])
+        // Replaced by a newer identical ask. Terminal and nobody's fault — and
+        // NOT still waiting, which is what the `default` below used to call it.
+        case .superseded:
+            return .object([
+                "status": .string("cancelled"),
+                "detail": .string("A newer identical request replaced this one."),
+            ])
+        case .failed(let reason):
+            return .object([
+                "status": .string("failed"),
+                "ok": .bool(false),
+                "error": .string(reason),
+            ])
+        default:
+            return .object([
+                "status": .string(InlineInteractionWire.waitingStatus),
+                "detail": .string(interaction.why),
+            ])
+        }
+    }
+
+    /// One append transaction and transcript message-object JSONL schema for
+    /// tool, approval and directly raised card rows.
+    /// Transcript JSONL is locally backed up, excluded from production export,
+    /// projected to the phone and listed by PrivacyMap's chat category.
+    package static func appendTranscriptRow(
+        _ row: JSONValue,
+        to path: URL,
+        persistence: any PersistenceCoreProtocol,
+        interaction: InlineInteraction? = nil,
+        uniqueRunID: String? = nil
+    ) async throws {
+        try await persistence.withFileLock(path) {
+            if let uniqueRunID {
+                let rows = try await persistence.readJSONL(path)
+                guard !rows.contains(where: {
+                    guard case .object(let existing) = $0 else { return false }
+                    return existing["runId"] == .string(uniqueRunID)
+                }) else { return }
+            }
+            var appended = row
+            if let interaction {
+                // Supersession must succeed before the append. A running card
+                // keeps its continuation; the new duplicate goes quiet instead.
+                let running = try await supersedeOlderPending(
+                    matching: SupersedeKey(kind: interaction.kind, target: interaction.target,
+                                          mode: interaction.mode, id: interaction.id),
+                    in: path, persistence: persistence)
+                if running { appended = supersededRow(row, as: interaction) }
+            }
+            // Durable receipts retain the evidence of already executed effects.
+            try await ContactThread.append(appended, to: path, using: persistence)
+        }
+    }
+
     /// What makes two asks the SAME ask: the kind of thing needed, the thing
     /// it is needed for, and the axis asked for. Not the wording, and not the
     /// tool that happened to hit it.
-    public struct SupersedeKey: Sendable {
-        public let kind: InlineInteraction.Kind
-        public let target: String
-        public let mode: InlineInteraction.AccessMode?
+    private struct SupersedeKey: Sendable {
+        let kind: InlineInteraction.Kind
+        let target: String
+        let mode: InlineInteraction.AccessMode?
         /// The new card's own id, so a re-persist can never supersede itself.
-        public let id: String
-
-        public init(
-            kind: InlineInteraction.Kind,
-            target: String,
-            mode: InlineInteraction.AccessMode?,
-            id: String
-        ) {
-            self.kind = kind
-            self.target = target
-            self.mode = mode
-            self.id = id
-        }
+        let id: String
     }
 
     /// Mark every older still-PENDING copy of this ask superseded, in place.
@@ -787,7 +909,7 @@ extension SwiftNativeChatOrchestrationClient {
     /// — a control is open on it and its continuation is live. The caller's own
     /// new row is the one that goes quiet in that case.
     @discardableResult
-    public static func supersedeOlderPending(
+    private static func supersedeOlderPending(
         matching key: SupersedeKey,
         in path: URL,
         persistence: any PersistenceCoreProtocol
@@ -837,14 +959,14 @@ extension SwiftNativeChatOrchestrationClient {
             changed = true
         }
         if changed {
-            try await persistence.replaceJSONL(rows, to: path)
+            try ContactThread.replace(rows, to: path)
         }
         return sawRunning
     }
 
     /// The same row, carrying the interaction already superseded — used for a
     /// duplicate raised while an identical card is running.
-    public static func supersededRow(
+    private static func supersededRow(
         _ row: JSONValue, as interaction: InlineInteraction
     ) -> JSONValue {
         guard case .object(var object) = row,
@@ -931,7 +1053,7 @@ extension SwiftNativeChatOrchestrationClient {
                 metadata["sendState"] = .string(status)
                 row["metadata"] = .object(metadata)
                 rows[index] = .object(row)
-                try Self.writeJSONLAtomically(rows, to: path)
+                try ContactThread.replace(rows, to: path)
                 return true
             }
             if found { return true }
@@ -1004,7 +1126,7 @@ extension SwiftNativeChatOrchestrationClient {
                 count += 1
             }
             guard count > 0 else { return (0, nil) }
-            try Self.writeJSONLAtomically(rows, to: path)
+            try ContactThread.replace(rows, to: path)
             ChatTranscriptLineCountCache.shared.record(count: rows.count, at: path)
             return (count, rows.last)
         }
@@ -1053,7 +1175,7 @@ extension SwiftNativeChatOrchestrationClient {
                 row["metadata"] = .object(metadata)
                 rows[index] = .object(row)
             }
-            if changed { try Self.writeJSONLAtomically(rows, to: path) }
+            if changed { try ContactThread.replace(rows, to: path) }
             return changed
         }
         if changed {
@@ -1110,7 +1232,7 @@ extension SwiftNativeChatOrchestrationClient {
                       metadata.removeValue(forKey: "awaitingConsumption") == .bool(true) else { continue }
                 row["metadata"] = .object(metadata)
                 rows[index] = .object(row)
-                try Self.writeJSONLAtomically(rows, to: path)
+                try ContactThread.replace(rows, to: path)
                 break
             }
             return try Self.afterTurnOrigin(in: rows, sessionId: sessionId, runId: runId)
@@ -1281,9 +1403,7 @@ extension SwiftNativeChatOrchestrationClient {
         if let failureWork, role == "assistant" { metadata["failureWork"] = .string(failureWork) }
         if let requestedResultIntent { metadata["resultDelivery"] = requestedResultIntent }
         if !attachments.isEmpty {
-            // Stash attachment metadata (not bytes) so a future consolidation
-            // pass can correlate. Including base64 inline would explode the
-            // JSONL — daemon practice is to keep blobs out of this file.
+            // The transcript holds metadata and references; attachment bytes stay separate.
             var arr: [JSONValue] = []
             for (index, a) in attachments.enumerated() {
                 var item: [String: JSONValue] = [
@@ -1304,8 +1424,8 @@ extension SwiftNativeChatOrchestrationClient {
                           let bytes = Data(base64Encoded: a.base64) else {
                         throw ChatOrchestrationError.underlying("Couldn't save this turn's attachment for restart recovery.")
                     }
-                    let path = Self.attachmentURL(dataRoot: dataRoot, runId: runId, index: index)
-                    try await SwiftNativePersistenceCore().writeDataAtomicDurable(bytes, to: path)
+                    let path = try await Self.persistAttachment(bytes,
+                        chatRoot: dataRoot.appendingPathComponent("chat"), runId: runId, index: index)
                     item["path"] = .string(path.path)
                 }
                 arr.append(.object(item))
@@ -1554,9 +1674,9 @@ extension SwiftNativeChatOrchestrationClient {
                 var replaced = rows
                 replaced.remove(at: index)
                 replaced.append(messageRow)
-                try Self.writeJSONLAtomically(replaced, to: path)
+                try ContactThread.replace(replaced, to: path)
                 // A replacement is row-count neutral by construction: one row
-                // replaces exactly one match, after its receipts. `writeJSONLAtomically`
+                // replaces exactly one match, after its receipts. `ContactThread.replace`
                 // emits one non-blank line per row, which is precisely what
                 // `countJSONLLines` counts.
                 ChatTranscriptLineCountCache.shared.record(count: replaced.count, at: path)
@@ -1570,15 +1690,14 @@ extension SwiftNativeChatOrchestrationClient {
                 // function is a COMMITTED turn boundary: `role` is "user" at
                 // three call sites and "assistant" at four, and the assistant
                 // ones are terminal completions or the terminal failure row —
-                // streaming partials never come here (persistPartialIfNeeded
-                // owns those and stays on the fast path). A user row lost to
+                // partials use their own durable settlement writer. A user row lost to
                 // power loss is a question the user watched land and then
                 // vanish; a terminal assistant row lost is the answer to it.
                 // Cost is one F_FULLFSYNC per committed turn boundary (~2 per
                 // turn), which is the budget PersistenceCore's own note on
                 // appendJSONLDurable reserves for "feeds that ARE the state of
                 // record".
-                try await persistence.appendJSONLDurable(messageRow, to: path)
+                try await ContactThread.append(messageRow, to: path, using: persistence)
                 // `appendJSONLDurable` writes exactly one serialized line plus "\n".
                 ChatTranscriptLineCountCache.shared.record(count: priorCount + 1, at: path)
                 return (true, nil)
@@ -1622,16 +1741,24 @@ extension SwiftNativeChatOrchestrationClient {
                 ])
             ), on: turnTraceBus)
         }
-        try await syncSessionIndex(
-            sessionId: sessionId,
-            role: role,
-            content: content,
-            timestamp: createdAt,
-            messagesPath: path,
-            source: messageSource,
-            metadata: metadata,
-            stamp: TranscriptRowStamp.of(id: messageId, role: role, metadata: metadata ?? [:], rowSource: messageSource)
-        )
+        // The transcript is committed. Index projection cannot turn that saved
+        // row back into an unsaved reply or prevent its turn from settling.
+        do {
+            try await syncSessionIndex(
+                sessionId: sessionId,
+                role: role,
+                content: content,
+                timestamp: createdAt,
+                messagesPath: path,
+                source: messageSource,
+                metadata: metadata,
+                stamp: TranscriptRowStamp.of(id: messageId, role: role, metadata: metadata ?? [:], rowSource: messageSource)
+            )
+        } catch {
+            await Self.reportTranscriptWriteFailure(label: "appendMessage session index", path: sessionsPath,
+                error: error, userText: "Saved the message, but couldn't update the conversation list.",
+                onNotice: ToolNoticeBus.emit)
+        }
         // One signal for every row any door writes: an open chat and the phone
         // see Telegram, phone and agent turns as they land, not on the next turn.
         NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: sessionId)
@@ -1703,26 +1830,6 @@ extension SwiftNativeChatOrchestrationClient {
               case .string(let raw)? = metadata["turnTraceId"]
         else { return nil }
         return OutcomeTraceIdentity.normalized(raw)
-    }
-
-    private static func writeJSONLAtomically(_ rows: [JSONValue], to path: URL) throws {
-        var payload = Data()
-        for row in rows {
-            payload.append(contentsOf: try row.serialize(pretty: false).utf8)
-            payload.append(0x0A)
-        }
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        // Durable replacement, not bare .atomic: this writer's one production
-        // caller swaps a terminal assistant row in place (regenerate). Losing
-        // that rewrite to power loss while the session index already durably
-        // recorded it would roll the transcript back behind its own index
-        // (gpt-5.5 review 2026-08-06, blocking #2). Same temp-fsync + rename
-        // + parent-dir-fsync contract as every other state-of-record write.
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(payload, to: path)
-        _ = chmod(path.path, 0o600)
     }
 
     func appendFailureMessageIfNeeded(
@@ -2500,9 +2607,6 @@ extension SwiftNativeChatOrchestrationClient {
         stamp: TranscriptRowStamp
     ) async throws {
         let dataRoot = self.dataRoot
-        let sessionsPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
         let normalizedRole = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let preview = Self.previewText(content)
         let envelope = ChatToolSessionContext.envelope
@@ -2527,178 +2631,13 @@ extension SwiftNativeChatOrchestrationClient {
         }()
         let continuityParticipant: String? = if case .string(let value)? = continuity?["participant"] { value } else { nil }
         let continuityScope: String? = if case .string(let value)? = continuity?["scope"] { value } else { nil }
-        // Same value, same moment, same definition as the old
-        // `countJSONLLines(at: messagesPath)` that stood here — this count is
-        // NOT advisory bookkeeping. `SessionDigestProvider.swift:243` renders
-        // it into the next session's prompt ("Previous session "X" (N
-        // messages) ended ..."), so it has to stay byte-exact. The cache only
-        // removes the full byte scan when a stat proves the transcript is
-        // still the one the count was measured against; anything else — an
-        // external writer, a compaction rewrite, a truncation — recounts and
-        // returns exactly what the scan would have.
-        let persistence = self.persistence
-        let retentionClock = self.clock
-        // 2026-09-06: `timestamp` is the MESSAGE's createdAt, captured before
-        // the transcript append. Stamping the index row's `updatedAt` with it
-        // left every synced row permanently behind its own transcript's mtime,
-        // and retention reads exactly that comparison as "this session has a
-        // pending index sync" — so `.activeCap` archiving could never fire for
-        // any ordinary session. The row's `updatedAt` says when the row was
-        // last brought level with its transcript, so it is read HERE, after the
-        // bytes are down. A new row's `createdAt` keeps the message stamp.
-        let syncedAt = Self.iso8601(retentionClock())
-        try await persistence.withFileLock(sessionsPath) {
-            // 2026-09-06: READ UNDER THE INDEX LOCK. Taken before the lock, two
-            // concurrent appenders could each measure the transcript, then
-            // commit in the opposite order — the later writer stamping the
-            // EARLIER count over the index. Measured here, the last writer to
-            // hold this lock always measures a transcript that already contains
-            // every row committed before it, so the index cannot go backwards.
-            let snapshot = try await persistence.withFileLock(messagesPath) {
-                (count: ChatTranscriptLineCountCache.shared.count(
-                    at: messagesPath, recount: Self.countJSONLLines(at:)),
-                 version: ChatSessionIndexFile.transcriptVersion(at: messagesPath))
-            }
-            let messageCount = snapshot.count
-            let parent = sessionsPath.deletingLastPathComponent()
-            try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
-
-            var updated: [String: JSONValue]? = nil
-            var remaining: [[String: JSONValue]] = []
-            for var row in rows {
-                guard case .string(let id)? = row["id"], id == sessionId else {
-                    remaining.append(row)
-                    continue
-                }
-                row["updatedAt"] = .string(syncedAt)
-                // 2026-09-06: a transcript write advances the session's
-                // transcript version. The phone reads it to order published
-                // transcripts; without a bump here, an empty snapshot built
-                // before this append still looks as new as the rebuilt
-                // transcript and would clear it on the phone.
-                ChatSessionIndexFile.bumpTranscriptGeneration(in: &row)
-                row["messageCount"] = .int(Int64(messageCount))
-                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview); row[TranscriptRowStamp.previewKey] = stamp.json }
-                if let title,
-                   Self.shouldReplaceSessionTitle(row["title"]) {
-                    row["title"] = .string(title)
-                }
-                // §1.3, FIXED. This block used to read:
-                //
-                //     if source != "app" { row["source"] = .string(source) ... }
-                //
-                // i.e. the session index row's `source` was overwritten by
-                // WHICHEVER SURFACE APPENDED MOST RECENTLY. `source` is
-                // supposed to say what a conversation IS; last-writer-wins
-                // made it say who touched it last, and every downstream reader
-                // keyed on it (snapshot projection, iOS tab adoption, Doctor,
-                // retention diagnostics) flapped with it.
-                //
-                // A row's `source` is now written ONCE, at creation, and never
-                // restamped. What a later surface DOES contribute is the
-                // per-message `source` on its own transcript row, which is
-                // where per-turn provenance has always belonged and which the
-                // envelope now makes complete.
-                //
-                // `sourceKey` keeps its backfill-only behavior (set when
-                // absent, never overwritten) — it was already additive.
-                if row["source"] == nil {
-                    row["source"] = .string(source)
-                }
-                if row["sourceKey"] == nil, let sourceKey {
-                    row["sourceKey"] = .string(sourceKey)
-                }
-                if normalizedRole == "user" {
-                    ChatSessionIndexFile.recordContinuityParticipant(
-                        in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount)
-                }
-                // Additive classification so readers stop having to infer a
-                // conversation's nature from a field that describes traffic.
-                // Backfill-only: a kind assigned once is not re-decided by a
-                // later append, or we would have rebuilt the bug above.
-                if row["threadKind"] == nil {
-                    let existingSource: String = {
-                        if case .string(let value)? = row["source"] { return value }
-                        return source
-                    }()
-                    row["threadKind"] = .string(
-                        ChatThreadKind.inferred(fromSource: existingSource).rawValue
-                    )
-                }
-                updated = row
-            }
-
-            if updated == nil {
-                var row: [String: JSONValue] = [
-                    "id": .string(sessionId),
-                    "title": .string(title ?? "New Chat"),
-                    "source": .string(source),
-                    "threadKind": .string(ChatThreadKind.inferred(fromSource: source).rawValue),
-                    "createdAt": .string(timestamp),
-                    "updatedAt": .string(syncedAt),
-                    "archived": .bool(false),
-                    "messageCount": .int(Int64(messageCount)),
-                    "summary": .string(""),
-                    ChatSessionIndexFile.transcriptGenerationKey: .int(1),
-                ]
-                if let sourceKey { row["sourceKey"] = .string(sourceKey) }
-                if normalizedRole == "user" {
-                    ChatSessionIndexFile.recordContinuityParticipant(
-                        in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount)
-                }
-                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview); row[TranscriptRowStamp.previewKey] = stamp.json }
-                updated = row
-            }
-
-            if var updated {
-                if messageCount == 1 || updated["createdAt"] == .string(timestamp) {
-                    updated["firstMessageAt"] = .string(timestamp)
-                }
-                let previous = updated["lastMessageAt"].flatMap { value -> Date? in
-                    if case .string(let stamp) = value { return Self.dateFromISO8601(stamp) }
-                    return nil
-                } ?? .distantPast
-                if (Self.dateFromISO8601(timestamp) ?? .distantPast) >= previous {
-                    updated["lastMessageAt"] = .string(timestamp)
-                }
-                updated[ChatSessionIndexFile.acknowledgedTranscriptKey] = snapshot.version
-                ChatSessionIndexFile.recordConversationChange(in: &updated, role: normalizedRole)
-                remaining.insert(updated, at: 0)
-            }
-            let out = try ChatSessionIndexFile.serializedData(for: remaining)
-            // Sweep R4 item 5: was `out.write(to:options:.atomic)`. Atomic
-            // replacement survives an app crash, but not power loss — the temp
-            // file's bytes and the rename both sit unflushed. The transcript
-            // rows this index describes are now durable (item 4), so the index
-            // must be too, or a power cut leaves messages on disk that the
-            // sidebar no longer lists. Same bytes, same lock, durable tail.
-            try await persistence.writeDataAtomicDurable(out, to: sessionsPath)
-            // Retention stays here, inside the lock and on every message, and
-            // the perf audit's proposal to move or debounce it is REJECTED.
-            // Two independent reasons:
-            //
-            // 1. Lock: it does its own read-modify-rewrite of this exact file,
-            //    and its documented contract (ChatSessionRetention.swift:47)
-            //    is that the caller holds the sessions lock. Outside it, it
-            //    races the write two lines above.
-            // 2. Prompt bytes: archiving REMOVES a row from `sessions.json`,
-            //    and `SessionDigestProvider.latestPriorSession` (:293) picks
-            //    the newest remaining row to render into the next session's
-            //    prompt. Delaying an archive delays a row's disappearance from
-            //    that candidate set, so a throttle is not byte-identical — it
-            //    is a (small, self-healing) change in what the model sees.
-            //
-            // The waste the audit measured is real but lives one level down:
-            // `pruneArchive` stats the whole archive tier on every pass, and
-            // that part IS invisible to the prompt. Throttling belongs there,
-            // in PersistenceCore, not at this call site.
-            ChatSessionRetention.enforceBestEffort(
-                dataRoot: dataRoot,
-                now: retentionClock(),
-                context: "ChatOrchestrationClient.syncSessionIndex"
-            )
-        }
+        try await ChatSessionIndexFile.recordMessage(
+            sessionId: sessionId, role: normalizedRole, source: source, sourceKey: sourceKey,
+            timestamp: timestamp, syncedAt: Self.iso8601(clock()), preview: preview, stamp: stamp,
+            title: title, continuityParticipant: continuityParticipant, continuityScope: continuityScope,
+            dataRoot: dataRoot, messagesPath: messagesPath, persistence: persistence,
+            countMessages: { ChatTranscriptLineCountCache.shared.count(at: $0, recount: Self.countJSONLLines(at:)) },
+            clock: clock)
     }
 
     /// 2026-09-06: advance a session's transcript version without touching any
@@ -2708,28 +2647,10 @@ extension SwiftNativeChatOrchestrationClient {
     /// wrote durable bytes.
     private func bumpSessionTranscriptGeneration(sessionId: String) async {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return }
-        let sessionsPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
-        let persistence = self.persistence
-        let dataRoot = self.dataRoot
         do {
-            try await persistence.withFileLock(sessionsPath) {
-                var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
-                guard let index = rows.firstIndex(where: {
-                    $0["id"] == .string(safeSessionId)
-                }) else { return }
-                ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index])
-                let messagesPath = dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl")
-                let snapshot = try await persistence.withFileLock(messagesPath) {
-                    (count: Self.countJSONLLines(at: messagesPath),
-                     version: ChatSessionIndexFile.transcriptVersion(at: messagesPath))
-                }
-                rows[index]["messageCount"] = .int(Int64(snapshot.count))
-                rows[index][ChatSessionIndexFile.acknowledgedTranscriptKey] = snapshot.version
-                let out = try ChatSessionIndexFile.serializedData(for: rows)
-                try await persistence.writeDataAtomicDurable(out, to: sessionsPath)
-            }
+            try await ChatSessionIndexFile.recordTranscriptRewrite(
+                sessionID: safeSessionId, dataRoot: dataRoot, persistence: persistence,
+                countMessages: Self.countJSONLLines(at:))
         } catch {
             nativeLog("ChatOrchestrationClient: transcript generation bump failed: \(error)")
         }
@@ -2810,11 +2731,6 @@ extension SwiftNativeChatOrchestrationClient {
         return String(preview.prefix(60))
     }
 
-    private nonisolated static func shouldReplaceSessionTitle(_ value: JSONValue?) -> Bool {
-        guard case .string(let raw)? = value else { return true }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty || trimmed == "New Chat"
-    }
 
     private nonisolated static func messageSource(for surface: String) -> String {
         let normalized = surface

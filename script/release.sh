@@ -863,6 +863,7 @@ if ! command -v xcodegen >/dev/null 2>&1; then
   echo "ERROR: xcodegen is required; install it with: brew install xcodegen" >&2
   exit 1
 fi
+ruby "$ROOT/script/sync_build_declarations.rb"
 xcodegen --spec "$ROOT/project.yml"
 DERIVED_DATA="$ROOT/DerivedData/ReleaseBundle"
 xcodebuild -quiet -jobs 6 \

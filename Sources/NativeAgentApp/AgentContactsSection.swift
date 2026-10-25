@@ -3,8 +3,10 @@ import AppKit
 import EngineRuntime
 import SwiftUI
 import NativeAgentCore
-import ChatOrchestration
+import AgentConversations
 import PersistenceCore
+
+// Blueprint: | `AgentContactsSection.swift` | `AgentContactsSection`: contact rows/actions from discovery state; offscreen capture reads never initiate discovery |
 
 typealias AgentContactRow = EngineRuntime.AgentContactRow
 
@@ -12,20 +14,19 @@ struct AgentContactsSection: View {
     var refresh = 0
     var fixtureRows: [AgentContactRow]? = nil
     @Environment(AppModel.self) private var appModel
-    @State private var rows: [AgentContactRow] = []
-    @State private var loadError: String?
-    @State private var loading = true
+    private var contacts: ContactListFacade { appModel.engine.contacts }
+    private var rows: [AgentContactRow] { contacts.rows }
+    private var loadError: String? { contacts.loadError }
+    private var loading: Bool { !contacts.loaded }
     @State private var busy = false
     @State private var refreshGeneration = 0
-    /// Reads can finish out of order; only the newest one applies.
-    @State private var reloadGeneration = 0
-    private var root: URL { appModel.firstRunDataRoot }
+    private var root: URL { appModel.engine.dataRoot }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
             if let loadError {
-                AgentContactReadFailure(message: loadError, dataRoot: root) { Task { await reload() } }
+                AgentContactReadFailure(message: loadError, dataRoot: root) { Task { _ = try? await contacts.refresh() } }
             }
             if loading && fixtureRows == nil { ProgressView("Looking for agents…") }
             if !loading && (fixtureRows ?? rows).isEmpty && loadError == nil {
@@ -52,7 +53,7 @@ struct AgentContactsSection: View {
                             ConnectorsNote(text: "Trusted switch: \(contact.elevationAllowed ? "on" : "off")")
                         }
                         if let contact = row.contact, contact.transport == .grokBot, contact.grokSetup != "set up" {
-                            GrokSecureSetupCard(dataRoot: root)
+                            GrokSecureSetupCard(dataRoot: root, contact: contact)
                         }
                         if let last = row.lastExchange {
                             ConnectorsNote(text: "Last exchange · " + last)
@@ -102,48 +103,15 @@ struct AgentContactsSection: View {
         // last discovery, and is counted so the capture waits for it.
         .quietReadTask(live: false) {
             guard fixtureRows == nil else { return }
-            await reload()
+            _ = try? await contacts.refresh()
         }
         // A refresh offers what it finds (discovery.json, her wake), so the
         // offscreen copy never runs it.
         .liveTask(id: refresh + refreshGeneration) {
             guard fixtureRows == nil else { return }
             _ = await AgentDiscoverySession.shared.candidates(refresh: true, dataRoot: root)
-            // Any chat append rewrites the chat index, so a contact's session moving shows here.
-            let events = FileChangeEvents(paths: [root.appendingPathComponent("agents/peers.json"),
-                                                  root.appendingPathComponent("agents/conversations.json"),
-                                                  AgentLocalHealth.url(root),
-                                                  InstallPaths.current.bridgeConfigRoot(dataRoot: root).appendingPathComponent("claude-bridge/claude-live"),
-                                                  root.appendingPathComponent("chat/sessions.json")], emitInitial: true)
-            await withTaskCancellationHandler {
-                for await _ in events.stream {
-                    guard !Task.isCancelled else { break }
-                    await reload()
-                }
-            } onCancel: { events.cancel() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: ChatGPTDotIPCTransport.didChange)) { _ in
-            Task { await reload() }
-        }
-    }
-
-    @MainActor private func reload() async {
-        reloadGeneration += 1
-        let generation = reloadGeneration
-        // Peers (under their lock), the lanes, Keychain and the conversations
-        // file: all read off the main actor, once.
-        let root = root
-        let read = await Task.detached(priority: .utility) {
-            await AgentContactRow.read(dataRoot: root)
-        }.value
-        guard generation == reloadGeneration else { return }
-        loading = false
-        switch read {
-        case .success(let next):
-            rows = next
-            loadError = nil
-        case .failure(let error):
-            loadError = error.localizedDescription
+            contacts.watch()
+            _ = try? await contacts.refresh()
         }
     }
 

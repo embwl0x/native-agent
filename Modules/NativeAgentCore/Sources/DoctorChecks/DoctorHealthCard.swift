@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `DoctorHealthCard.swift` | `HealthCardSubsystem` struct |
 
 public struct HealthCardSubsystem: Codable, Hashable, Identifiable, Sendable {
     public var id: String

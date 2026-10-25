@@ -1,10 +1,9 @@
-import Cognition
+import EngineRuntime
 import Foundation
-import Observation
 import SwiftUI
 import TrustCenter
 
-typealias SecurityCenterStatusReader = @Sendable (Int) async throws -> SecurityCenterStatus
+// Blueprint: | `SecurityCenterPanel.swift` | `NativeSecurityCenterPanel`: checked posture, kill-switch, flags and receipt presentation; local pending state lasts only through saved-policy reread |
 
 enum SecurityCenterRefreshPresentation {
     enum State: Equatable {
@@ -27,10 +26,6 @@ enum SecurityCenterRefreshPresentation {
         return hasStatus ? .current : .loading
     }
 
-    static func boundedDetail(_ error: any Error) -> String {
-        UserFacingError.cause(error, action: "read security status")
-    }
-
     static func message(for state: State) -> String? {
         switch state {
         case .loading, .current:
@@ -45,116 +40,31 @@ enum SecurityCenterRefreshPresentation {
     }
 }
 
-/// The root-scoped state behind Security Center's one refresh affordance. The
-/// previous readable snapshot deliberately survives a failed refresh, while a
-/// failed first read remains unavailable rather than being presented as empty.
-@MainActor @Observable
-final class SecurityCenterRefreshState {
-    private(set) var status: SecurityCenterStatus?
-    private(set) var isRefreshing = false
-    private(set) var lastRefreshError: String?
-    private let statusReader: SecurityCenterStatusReader
-    private var appearanceRead = false
-    private var readGate = LatestAsyncRequestGate()
-    private var refreshTask: Task<Void, Never>?
-    private var refreshRequested = false
-
-    init(statusReader: @escaping SecurityCenterStatusReader) {
-        self.statusReader = statusReader
-    }
-
-    var presentation: SecurityCenterRefreshPresentation.State {
-        SecurityCenterRefreshPresentation.state(
-            hasStatus: status != nil,
-            isRefreshing: isRefreshing,
-            lastError: lastRefreshError
-        )
-    }
-
-    func refresh() async {
-        await refresh(isAppearanceRead: false)
-    }
-
-    func loadOnAppearance() async {
-        await refresh(isAppearanceRead: true)
-    }
-
-    func cancelAppearanceRead() {
-        guard appearanceRead else { return }
-        _ = readGate.begin()
-        refreshTask?.cancel()
-        refreshTask = nil
-        refreshRequested = false
-        appearanceRead = false
-        isRefreshing = false
-    }
-
-    private func refresh(isAppearanceRead: Bool) async {
-        guard !Task.isCancelled else { return }
-        if let refreshTask {
-            refreshRequested = true
-            appearanceRead = appearanceRead && isAppearanceRead
-            await refreshTask.value
-            return
-        }
-        let request = readGate.begin()
-        appearanceRead = isAppearanceRead
-        isRefreshing = true
-        let task = Task { @MainActor in
-            defer {
-                if readGate.accepts(request) {
-                    isRefreshing = false
-                    appearanceRead = false
-                    refreshTask = nil
-                }
-            }
-            repeat {
-                guard !Task.isCancelled, readGate.accepts(request) else { return }
-                refreshRequested = false
-                lastRefreshError = nil
-                do {
-                    let loaded = try await statusReader(10)
-                    guard !Task.isCancelled, readGate.accepts(request) else { return }
-                    status = loaded
-                } catch {
-                    guard !Task.isCancelled, readGate.accepts(request) else { return }
-                    lastRefreshError = SecurityCenterRefreshPresentation.boundedDetail(error)
-                }
-            } while refreshRequested
-        }
-        refreshTask = task
-        await task.value
-    }
-}
-
 struct NativeSecurityCenterPanel: View {
     @Environment(AppModel.self) private var appModel
-    @State private var refreshModel: SecurityCenterRefreshState
+    private var trust: TrustFacade { appModel.engine.trust }
     /// The kill switch as just flipped, held until the saved policy is re-read
     /// so the switch doesn't snap back mid-save.
     @State private var pendingKillSwitch: Bool?
-    private let loadsOnAppear: Bool
     /// The Trust preset name for the live posture ("Full Mac"), so this panel
     /// never shows a second name for it ("Full mac os" was the raw level).
     private let modeTitle: String?
 
-    init(
-        statusReader: @escaping SecurityCenterStatusReader,
-        loadsOnAppear: Bool = true,
-        modeTitle: String? = nil
-    ) {
-        _refreshModel = State(initialValue: SecurityCenterRefreshState(statusReader: statusReader))
-        self.loadsOnAppear = loadsOnAppear
+    init(modeTitle: String? = nil) {
         self.modeTitle = modeTitle
     }
 
     private var refreshState: SecurityCenterRefreshPresentation.State {
-        refreshModel.presentation
+        SecurityCenterRefreshPresentation.state(
+            hasStatus: trust.securityStatus != nil,
+            isRefreshing: trust.isRefreshingSecurity,
+            lastError: trust.securityRefreshError
+        )
     }
 
     var body: some View {
         NativePanel(title: "Security Center", systemImage: "shield.lefthalf.filled") {
-            if let status = refreshModel.status {
+            if let status = trust.securityStatus {
                 // The four counts were tinted tiles in a grid — a plate each,
                 // inside the card. They are bare stat rows now.
                 HStack(alignment: .top, spacing: NativeAgentSpacing.xl) {
@@ -258,28 +168,19 @@ struct NativeSecurityCenterPanel: View {
             }
 
             HStack(spacing: NativeAgentSpacing.sm) {
-                Button(refreshModel.isRefreshing ? "Refreshing…" : "Refresh") {
-                    Task { await refreshModel.refresh() }
+                Button(trust.isRefreshingSecurity ? "Refreshing…" : "Refresh") {
+                    Task { await trust.refreshSecurity() }
                 }
                 .buttonStyle(.bordered)
-                .disabled(refreshModel.isRefreshing)
+                .disabled(trust.isRefreshingSecurity)
                 .accessibilityIdentifier("security.center.refresh")
-                if refreshModel.isRefreshing {
+                if trust.isRefreshingSecurity {
                     ProgressView()
                         .controlSize(.small)
                 }
                 Spacer()
             }
         }
-        .task {
-            guard loadsOnAppear else { return }
-            await EventDeadlinePhysiology.refreshOnChanges(paths: [
-                appModel.engine.trust.dataRoot.appendingPathComponent("trust/policy.json")
-            ]) {
-                await refreshModel.loadOnAppearance()
-            }
-        }
-        .onDisappear { refreshModel.cancelAppearanceRead() }
     }
 
     private func setKillSwitch(_ on: Bool) {
@@ -287,7 +188,7 @@ struct NativeSecurityCenterPanel: View {
         pendingKillSwitch = on
         Task {
             if await appModel.saveKillSwitchEnabled(on) {
-                await refreshModel.refresh()
+                await trust.refreshSecurity()
             }
             pendingKillSwitch = nil
         }

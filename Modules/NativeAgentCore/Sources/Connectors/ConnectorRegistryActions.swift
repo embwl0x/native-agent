@@ -1,7 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import SlackBot
 import TrustCenter
+// Blueprint: | `ConnectorRegistryActions.swift` | connector/workspace registry operations and ordered workspace readback verification; Slack socket-mode metadata writes delegate to SlackCredentials |
 
 /// Checked status projection supplied by the higher-level status owner.
 public struct ConnectorRegistryProjectionPort: Sendable {
@@ -35,9 +37,7 @@ public enum ConnectorRegistryActions {
                 NSLocalizedDescriptionKey: "Connector \(normalizedID) is not registered."
             ])
         }
-        let registryToggleOwners: Set<String> = [
-            "local_files", "github", "slack", "notion", "gmail", "gcal", "x",
-        ]
+        let registryToggleOwners: Set<String> = ["local_files", "slack"]
         guard registryToggleOwners.contains(normalizedID) else {
             throw NSError(domain: "NativeAgentConnectorMutation", code: -409, userInfo: [
                 NSLocalizedDescriptionKey:
@@ -46,12 +46,8 @@ public enum ConnectorRegistryActions {
         }
         if enabled {
             let runtime = projection.overlay(currentEntry, root)
-            let auth = ConnectorOAuthRegistry.connectorString(runtime["authState"])?.lowercased()
             let health = ConnectorOAuthRegistry.connectorString(runtime["healthStatus"])?.lowercased()
-            let hasVerifiedReadiness = auth == "connected"
-                || auth == "configured"
-                || health == "ok"
-                || normalizedID == "local_files"
+            let hasVerifiedReadiness = normalizedID == "local_files" || health == "ok"
             guard hasVerifiedReadiness else {
                 throw NSError(domain: "NativeAgentConnectorMutation", code: -409, userInfo: [
                     NSLocalizedDescriptionKey:
@@ -62,7 +58,14 @@ public enum ConnectorRegistryActions {
         let resultEntry = try await ConnectorOAuthRegistry.mutateConnectorRegistryEntry(
             root: root,
             provider: normalizedID,
-            createIfMissing: false
+            createIfMissing: false,
+            publish: { _, write in
+                if normalizedID == "slack" {
+                    try await SlackCredentials.setSocketModeEnabled(enabled, dataRoot: root, publishRegistry: write)
+                } else {
+                    try await write()
+                }
+            }
         ) { entry in
             entry["enabled"] = .bool(enabled)
             entry["updatedAt"] = .string(SwiftNativeManifestSigner.isoTimestamp(Date()))
@@ -97,8 +100,7 @@ public enum ConnectorRegistryActions {
             name: cleanedName,
             path: requestedURL.path,
             permissions: permissions,
-            createdAt: now,
-            lastUsedAt: nil
+            createdAt: now
         )
         let added = try await core.withFileLock(wsPath) {
             let fm = FileManager.default
@@ -181,9 +183,8 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
     public var path: String
     public var permissions: [String]
     public var createdAt: String
-    public var lastUsedAt: String?
-    public init(id: String, name: String, path: String, permissions: [String], createdAt: String, lastUsedAt: String?) {
+    public init(id: String, name: String, path: String, permissions: [String], createdAt: String) {
         self.id = id; self.name = name; self.path = path; self.permissions = permissions
-        self.createdAt = createdAt; self.lastUsedAt = lastUsedAt
+        self.createdAt = createdAt
     }
 }

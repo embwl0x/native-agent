@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `LLMClient+OpenAIAdapter.swift` | `OpenAIAdapter`: API-key Responses/Chat Completions selection, message/tool encoding and bounded completion/stream transport |
+
 /// OpenAI API-key adapter: GPT-6 uses Responses; older models use Chat Completions.
 public final class OpenAIAdapter: LLMAdapter {
     public static let toolWire = ProviderToolWire.native
@@ -293,9 +295,7 @@ public final class OpenAIAdapter: LLMAdapter {
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
                     do {
-                        if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-                        (bytes, response) = try await session.bytes(for: req)
-                        if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
+                        (bytes, response) = try await ProviderWire.open(session, req)
                     } catch {
                         throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")"))
                     }
@@ -403,7 +403,6 @@ public final class OpenAIAdapter: LLMAdapter {
         req.httpMethod = "POST"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         applyStreamingLLMHeaders(to: &req)
-        req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : Self.requestTimeoutSeconds
         // Public schemas must encode successfully; do not substitute empty parameters.
         for tool in tools ?? [] {
             _ = try JSONSerialization.jsonObject(with: tool.parametersJSON)
@@ -427,10 +426,8 @@ public final class OpenAIAdapter: LLMAdapter {
                 do {
                     try Task.checkCancellation()
                     var req = try responsesRequest(messages: messages, system: system, model: model, tools: tools)
-                    if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                     let requestStartNs = DispatchTime.now().uptimeNanoseconds
-                    let (bytes, response) = try await session.bytes(for: req)
-                    if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
+                    let (bytes, response) = try await ProviderWire.open(session, req)
                     defer { bytes.task.cancel() }
                     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                     if !(200..<300).contains(status) {

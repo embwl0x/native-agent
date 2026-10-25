@@ -1,5 +1,4 @@
 import AgentWorkspace
-import FeedPolicy
 import Foundation
 import Darwin
 import CryptoKit
@@ -7,16 +6,13 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import TrustCenter
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
+// Blueprint: | `SwiftToolDispatcher+ClaudeBridgeTools.swift` | `SwiftToolDispatcher`: `runClaudeMessage`, `claudeReceiptStatus`, `markWakeStartedNothing` |
 
 extension SwiftToolDispatcher {
     // A carried inbox door is read by its live session; it never starts a headless run.

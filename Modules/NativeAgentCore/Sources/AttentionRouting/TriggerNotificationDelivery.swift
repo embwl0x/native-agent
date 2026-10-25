@@ -2,6 +2,7 @@ import Foundation
 import PersistenceCore
 import TriggerScheduler
 import DeviceSync
+// Blueprint: | `TriggerNotificationDelivery.swift` | `TriggerNotificationDelivery` enum; `importance`, `notify` |
 
 /// Trigger delivery policy; the inbox owns the card and host ports carry it.
 public enum TriggerNotificationDelivery {

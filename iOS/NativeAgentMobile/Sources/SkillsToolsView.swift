@@ -1,4 +1,5 @@
 import SwiftUI
+// Blueprint: | `SkillsToolsView.swift` | Shared tool catalog presentation and local page/search/loading state |
 
 enum ToolCatalogPresentation {
     enum ContentState: Equatable {
@@ -52,8 +53,8 @@ private enum MobileSkillsToolsSection: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-/// One combined destination matching the Mac app. Each page retains its own
-/// read/refresh owner; this wrapper owns only the visible page selection and
+/// One combined destination matching the Mac app. Both pages read the shared
+/// sync catalog; this wrapper owns only the visible page selection and
 /// can either host its own navigation stack or live inside More's stack.
 struct SkillsToolsView: View {
     @AppStorage("NativeAgentMobile.skillsToolsSection") private var selectedRawValue = MobileSkillsToolsSection.skills.rawValue
@@ -102,17 +103,16 @@ struct SkillsToolsView: View {
 
 @MainActor
 private final class MobileToolCatalogStore: ObservableObject {
-    @Published var tools: [ToolRecord] = []
+    var tools: [ToolRecord] {
+        #if DEBUG
+        if MobileDesignSamples.screen != nil { return MobileToolDesignSample.tools }
+        #endif
+        return iCloudSyncEngine.shared.tools.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
     @Published var isLoading = false
     @Published var error: String?
 
     func refresh(pairingStore: PairingStore, pollIncoming: Bool = true) async {
-        #if DEBUG
-        if MobileDesignSamples.screen != nil {
-            tools = MobileToolDesignSample.tools
-            return
-        }
-        #endif
         guard pairingStore.isPaired else {
             error = "Pair iPhone with the Mac to see tools."
             return
@@ -122,12 +122,8 @@ private final class MobileToolCatalogStore: ObservableObject {
         defer { isLoading = false }
 
         if pollIncoming { await iCloudBridge.shared.pollIncomingNow() }
-        if let rows: [ToolRecord] = await iCloudSyncEngine.shared.loadSnapshotArrayAsync(
-            named: "tools_snapshot.json"
-        ) {
-            guard !Task.isCancelled else { return }
-            tools = rows.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        } else if tools.isEmpty {
+        let refreshed = await iCloudSyncEngine.shared.refreshCatalogSnapshot()
+        if !refreshed && tools.isEmpty {
             error = "No tool catalog has synced yet — Mac is publishing."
         }
     }
@@ -136,8 +132,6 @@ private final class MobileToolCatalogStore: ObservableObject {
 #if DEBUG
 private enum MobileToolDesignSample {
     static let tools: [ToolRecord] = [
-        ToolRecord(id: "t1", name: "calendar_read", kind: "connector", status: "available",
-                   description: "Look up upcoming events across your calendars.", autoRun: true),
         ToolRecord(id: "t2", name: "web_search", kind: "builtin", status: "available",
                    description: "Search the web and read the pages that answer the question.", autoRun: true),
         ToolRecord(id: "t3", name: "shell_exec", kind: "builtin", status: "policy_locked",

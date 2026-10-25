@@ -5,6 +5,7 @@ import PersistenceCore
 import ChatTurnContracts
 import MacControl
 import NativeAgentCore
+// Blueprint: | `MacChatTurnAdmission.swift` | `MacChatTurnPresentationPort`: `rejectMacChatTurn`, `startChatTurn`, `stopChatStream` |
 
 public struct QueuedChatTurn: Identifiable, Equatable, Sendable, Codable {
     public static let maxPerSession = 20
@@ -25,9 +26,12 @@ public struct QueuedChatTurn: Identifiable, Equatable, Sendable, Codable {
     /// later still says so.
     public let origin: ChatMessageOrigin?
     public var startedTurnID: String? = nil
+    public var lifeID: String?
+    /// Read projection; the persisted life is never adopted by opening a queue.
+    public var stoppedReason: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case id, text, attachments, createdAt, hideUserBubble, enqueuedRunID, origin, startedTurnID, hadMacContinuation
+        case id, text, attachments, createdAt, hideUserBubble, enqueuedRunID, origin, startedTurnID, hadMacContinuation, lifeID
     }
 
     public init(
@@ -57,13 +61,15 @@ public struct QueuedChatTurn: Identifiable, Equatable, Sendable, Codable {
         return attachments.count == 1 ? "One attachment" : "\(attachments.count) attachments"
     }
 
-    public var shouldDisplayInSendNextQueue: Bool { !hideUserBubble && startedTurnID == nil }
+    public var shouldDisplayInSendNextQueue: Bool {
+        (!hideUserBubble || stoppedReason != nil) && startedTurnID == nil
+    }
 
     /// Whether Steer can hand this to a running turn. Attachments need a turn
     /// of their own; the agent's own send would land there as User's words; a
     /// saved steering row (run id) is replayed, never offered twice.
     public var canSteerRunningTurn: Bool {
-        startedTurnID == nil && attachments.isEmpty && origin == nil && macContinuation == nil && !hideUserBubble
+        stoppedReason == nil && startedTurnID == nil && attachments.isEmpty && origin == nil && macContinuation == nil && !hideUserBubble
             && enqueuedRunID == nil && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
@@ -141,6 +147,15 @@ public extension MacChatTurnPresentationPort {
             }
             return MacChatStartedTurn(acceptance: .accepted(sessionId: targetSessionId), task: task)
         }
+        let reservation = macChatTurns.reserveTurn(sessionId: targetSessionId)
+        var transferredReservation = false
+        defer {
+            // A released reservation may have held back a queued send: drain it now.
+            if !transferredReservation, let reservation,
+               macChatTurns.finishRuntime(sessionId: targetSessionId, generation: reservation) {
+                Task { @MainActor in await drainNextQueuedChatTurnIfPossible(sessionId: targetSessionId) }
+            }
+        }
         // A queue storage failure refuses only queueing (below); an idle chat still sends.
         await macChatTurns.loadQueuedTurnsIfNeeded()
         let requestTurnID = queuedTurnID ?? TurnTraceContext.mintTurnId()
@@ -175,13 +190,17 @@ public extension MacChatTurnPresentationPort {
             )
             return MacChatStartedTurn(acceptance: rejection, task: nil)
         }
-        let sessionIsRunning = macChatTurns.tasks[targetSessionId] != nil || macChatTurns.busySessions.contains(targetSessionId)
+        if let reservation, macChatTurns.taskGenerations[targetSessionId] != reservation {
+            return MacChatStartedTurn(acceptance: .rejected(message: "Chat admission was superseded"), task: nil)
+        }
+        let sessionIsRunning = macChatTurns.tasks[targetSessionId] != nil
+            || (macChatTurns.busySessions.contains(targetSessionId) && reservation == nil)
         let queueDrainIsStarting = macChatTurns.drainingQueueSessions.contains(targetSessionId)
         let existingQueue = macChatTurns.queuedBySession[targetSessionId] ?? []
         // 2026-09-18: the welcome's eligibility read precedes suspension.
         // Recheck at admission so a competing turn cannot queue the greeting
         // behind itself; its task would not prove the greeting's delivery.
-        if requireIdleAndEmpty && (sessionIsRunning || queueDrainIsStarting
+        if requireIdleAndEmpty && (reservation == nil || sessionIsRunning || queueDrainIsStarting
             || !existingQueue.isEmpty || chatHasConversationRows(sessionId: targetSessionId)) {
             return MacChatStartedTurn(
                 acceptance: .rejected(message: "The greeting's conversation is no longer idle and empty"),
@@ -191,7 +210,7 @@ public extension MacChatTurnPresentationPort {
         // A paused backlog (Stop) never swallows what the person types next:
         // idle, a fresh send runs now and the backlog stays paused behind it.
         let queuePaused = macChatTurns.pausedQueueSessions.contains(targetSessionId)
-        if !fromQueue && (sessionIsRunning || queueDrainIsStarting || (!existingQueue.isEmpty && !queuePaused)) {
+        if !fromQueue && (reservation == nil || sessionIsRunning || queueDrainIsStarting || (!existingQueue.isEmpty && !queuePaused)) {
             guard existingQueue.filter({ $0.startedTurnID == nil }).count < QueuedChatTurn.maxPerSession else {
                 let rejection = rejectMacChatTurn("Send-next queue is full (20 messages)")
                 return MacChatStartedTurn(acceptance: rejection, task: nil)
@@ -227,7 +246,7 @@ public extension MacChatTurnPresentationPort {
                 task: nil
             )
         }
-        guard !sessionIsRunning else {
+        guard !sessionIsRunning, let generation = reservation else {
             let rejection = rejectMacChatTurn("Chat is already running in that session")
             return MacChatStartedTurn(acceptance: rejection, task: nil)
         }
@@ -238,8 +257,6 @@ public extension MacChatTurnPresentationPort {
             )
         }
         if existingQueue.isEmpty { macChatTurns.pausedQueueSessions.remove(targetSessionId) }
-        let generation = (macChatTurns.taskGenerations[targetSessionId] ?? 0) + 1
-        macChatTurns.taskGenerations[targetSessionId] = generation
         let activityIdentity = MacChatTurnIdentity(
             sessionId: targetSessionId,
             turnId: requestTurnID
@@ -249,17 +266,16 @@ public extension MacChatTurnPresentationPort {
             turnId: activityIdentity.turnId,
             at: Date()
         )
-        macChatTurns.busySessions.insert(targetSessionId)
         let lifecyclePersisted = await persistChatTurnLifecycleBegin(
             identity: activityIdentity
         )
         let admissionStillCurrent = macChatTurns.lifecycle(for: targetSessionId)?.identity
             == activityIdentity
             && macChatTurns.lifecycle(for: targetSessionId)?.cancellationRequestedAt == nil
+            && macChatTurns.taskGenerations[targetSessionId] == generation
             && !Task.isCancelled
         guard lifecyclePersisted, admissionStillCurrent else {
-            macChatTurns.busySessions.remove(targetSessionId)
-            macChatTurns.taskGenerations[targetSessionId] = nil
+            _ = macChatTurns.finishRuntime(sessionId: targetSessionId, generation: generation)
             await abandonChatTurnLifecycleBeforeAdmission(identity: activityIdentity)
             let rejection = rejectMacChatTurn(
                 "Chat could not start safely because its lifecycle receipt was not persisted"
@@ -276,7 +292,7 @@ public extension MacChatTurnPresentationPort {
         // its final effective session id.
         let bodyCtx = MacChatTurnBodyContext(initial: targetSessionId)
         let task = Task { @MainActor in
-            if !Task.isCancelled {
+            if !Task.isCancelled, macChatTurns.taskGenerations[targetSessionId] == generation {
                 _ = applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
                     identity: activityIdentity,
                     kind: .working(action: nil),
@@ -321,6 +337,7 @@ public extension MacChatTurnPresentationPort {
         }
         macChatTurns.tasks[targetSessionId] = task
         macChatTurns.streamingSessions.insert(targetSessionId)
+        transferredReservation = true
         return MacChatStartedTurn(
             acceptance: .accepted(sessionId: targetSessionId),
             task: task
@@ -330,12 +347,12 @@ public extension MacChatTurnPresentationPort {
     /// Cancel the chat task for `sessionId` (defaults to the active session).
     /// Other sessions' in-flight tasks are unaffected.
     ///
-    /// NOTE: we deliberately do NOT bump `chatTaskGenerations[sid]` here.
+    /// An executing task retains its generation through cancellation cleanup.
     /// The cancel-path cleanup in `_sendChatBody`'s catch block re-checks the
     /// generation before removing the optimistic streaming bubble; bumping
     /// would skip that cleanup and leave a stale empty bubble until the next
     /// manual reload. The generation guard is for "another sendChat replaced
-    /// me" races, not for cancellation. `Task.cancel()` is sufficient.
+    /// me" races. Admission still reading with no task is revoked by requestStop.
     @MainActor
     func stopChatStream(sessionId: String? = nil, pauseQueuedTurns: Bool = true,
                         revokeDriverControl: (@MainActor @Sendable () async -> Void)? = nil) {
@@ -459,7 +476,9 @@ public extension MacChatTurnPresentationPort {
     func sendQueuedChatTurnNow(_ turnId: String, sessionId: String) {
         Task { @MainActor in
             guard await promoteQueuedChatTurn(turnId, sessionId: sessionId) else { return }
+            guard await macChatTurns.restartStoppedQueuedTurns(sessionId: sessionId) else { return }
             macChatTurns.pausedQueueSessions.remove(sessionId)
+            macChatTurns.queuePauseReasons.removeValue(forKey: sessionId)
             if macChatTurns.tasks[sessionId] != nil || macChatTurns.busySessions.contains(sessionId) || macChatTurns.streamingSessions.contains(sessionId) {
                 stopChatStream(sessionId: sessionId, pauseQueuedTurns: false)
             } else {
@@ -473,7 +492,9 @@ public extension MacChatTurnPresentationPort {
         Task { @MainActor in
             await macChatTurns.loadQueuedTurnsIfNeeded()
             if let turnId, await promoteQueuedChatTurn(turnId, sessionId: sessionId) == false { return }
+            guard await macChatTurns.restartStoppedQueuedTurns(sessionId: sessionId) else { return }
             macChatTurns.pausedQueueSessions.remove(sessionId)
+            macChatTurns.queuePauseReasons.removeValue(forKey: sessionId)
             await drainNextQueuedChatTurnIfPossible(sessionId: sessionId)
         }
     }
@@ -497,7 +518,8 @@ public extension MacChatTurnPresentationPort {
               !macChatTurns.drainingQueueSessions.contains(sessionId),
               macChatTurns.tasks[sessionId] == nil,
               !macChatTurns.busySessions.contains(sessionId),
-              let candidate = macChatTurns.queuedBySession[sessionId]?.first
+              let candidate = macChatTurns.queuedBySession[sessionId]?.first,
+              candidate.stoppedReason == nil
         else { return }
 
         macChatTurns.drainingQueueSessions.insert(sessionId)

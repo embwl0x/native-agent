@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `QuietTrustPolicyPreset+Action.swift` | trust preset action receipts |
 
 extension TrustPolicyPreset {
     public enum Outcome: Sendable {

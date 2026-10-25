@@ -1,15 +1,21 @@
 import Foundation
-import ChatOrchestration
+import AgentConversations
+import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ClaudeBridgeMessageRuntime+AgentLive.swift` | `ClaudeBridgeMessageRuntime`: `agentLiveJobActive`, `handleAgentLive` |
 
 extension ClaudeBridgeMessageRuntime {
     /// OMP: `omp-bridge/wake-jobs/<safe id>.json` not yet settled (a
     /// `finished` may race the settlement write, so it needs the job only).
     /// Codex: a reply job still in `reply-jobs/` naming the message.
     static func agentLiveJobActive(agent: String, messageID: String, finishing: Bool) -> Bool {
-        let root = InstallPaths.current.bridgeConfigRoot(dataRoot: PersistenceCore.defaultDataRoot())
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        let root = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
         func json(_ url: URL) -> [String: Any]? {
-            (try? Data(contentsOf: url)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            guard let data = try? Data(contentsOf: url),
+                  let job = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (try? DataRootLife.isCurrent(job["lifeID"] as? String, in: dataRoot)) == true else { return nil }
+            return job
         }
         // The helpers' safeFilePart: anything outside [A-Za-z0-9._-] becomes "_".
         func safe(_ limit: Int) -> String {

@@ -3,6 +3,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
+// Blueprint: | `OutcomeTissueV2.swift` | `OutcomeEvidenceState` enum |
 
 /// Closed evidence vocabulary used by Outcome Tissue V2. The distinctions are
 /// intentional: an absent receipt is never silently converted to failure or

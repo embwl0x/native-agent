@@ -35,6 +35,8 @@ import PersistenceCore
 import AppKit
 #endif
 
+// Blueprint: | `MacWaitSignals.swift` | `MacWaitSignals` and activation observation ports: cancellable event-driven waits that consume existing app/AX signals |
+
 /// The signal an AX observer cannot carry. An `AXObserver` is installed on ONE
 /// process; when macOS brings a different app forward, nothing fires on the old
 /// one, and a `wait until "Mail is in front"` would sit blind until the

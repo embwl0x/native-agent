@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `SessionContextStatus.swift` | `SessionContextStatus` struct |
 
 public struct SessionContextStatus: Codable, Hashable {
     public var session_id: String

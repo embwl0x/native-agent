@@ -1,12 +1,13 @@
 import PersistenceCore
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
 import NativeAgentShared
 import AppKit
 import MacControl
 import NativeAgentCore
 import TrustCenter
 import TurnTrace
+// Blueprint: | `AppModel+MacChatTurnPort.swift` | `AppModel`: `resumeMacChatTurn` reconnects checkpoint progress to the existing stream adapter and lifecycle; `captureMacWorkContinuation`, `chatHasConversationRows`, `cancelICloudChatTurnForControlHandoff` |
 
 extension AppModel: MacChatTurnPresentationPort {
     var macChatTurns: MacChatTurnRuntime { engine.turns.runtime }
@@ -57,7 +58,7 @@ extension AppModel: MacChatTurnPresentationPort {
             text, attachments: attachments, sessionId: sessionId,
             generation: generation, ctx: ctx, hideUserBubble: hideUserBubble,
             activityIdentity: activityIdentity, port: self, client: macChatClient,
-            persona: personaEngine, missingProviderGuidance: missingProviderChatGuidance(),
+            missingProviderGuidance: missingProviderChatGuidance(),
             errorAdvice: UserFacingError.advice,
             finishReplyPresentation: {
                 try? await Task.sleep(for: .seconds(NativeAgentMotion.standardDuration))
@@ -70,21 +71,17 @@ extension AppModel: MacChatTurnPresentationPort {
         case .status(let message):
             statusText = message
         case .dropDraft(let sessionId):
-            chatDrafts.removeValue(forKey: sessionId)
-            chatDraftLastEdited.removeValue(forKey: sessionId)
+            composerDraft(for: sessionId).edit("")
         case .moveDraft(let from, let to):
-            if let draft = chatDrafts.removeValue(forKey: from) {
-                chatDrafts[to] = draft
-                chatDraftLastTouched[to] = chatDraftLastTouched.removeValue(forKey: from) ?? Date()
+            if let draft = chatComposerDrafts[from] {
+                composerDraft(for: to).edit(draft.text)
+                draft.edit("")
             }
-            if let editedAt = chatDraftLastEdited.removeValue(forKey: from) { chatDraftLastEdited[to] = editedAt }
         case .selectMigratedSession(let sessionId):
             activeChatSessionId = sessionId
             UserDefaults.standard.set(activeChatSessionId, forKey: "activeChatSessionId")
         case .workingCommentary(let sessionId, let bubbleId, let characters):
             setChatMessageWorkingCommentary(characters, id: bubbleId, in: sessionId)
-        case .profileCompiled(let packet):
-            compiledPersonality = packet
         case .clearPreview(let sessionId):
             engine.turns.screenPreviewBySession.removeValue(forKey: sessionId)
         case .movePreview(let oldSessionId, let newSessionId):

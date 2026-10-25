@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `FileSenseRegistry+Sharing.swift` | Approval-gated portable code/record export |
 
 extension FileSenseRegistry {
     /// A single portable JSON bundle: metadata plus explicitly manifested source,

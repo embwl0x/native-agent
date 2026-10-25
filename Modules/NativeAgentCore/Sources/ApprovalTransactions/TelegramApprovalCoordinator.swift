@@ -1,7 +1,11 @@
+import AuthoredCapabilities
 import Foundation
 import ApprovalInbox
-import ChatOrchestration
+import ChatTurnContracts
+import AgentConversations
+import ChatToolParsing
 import MacControl
+import NotificationInbox
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -10,6 +14,7 @@ import Privacy
 import TurnTrace
 import TelegramBot
 import TrustCenter
+// Blueprint: | `TelegramApprovalCoordinator.swift` | `TelegramApprovalFiler` actor; Stop closes prompt admission and drains accepted units through `settle`; approval and inline sends own their response and receipt, independently of transcript mirrors and cancelled callers; recovery covers pending prompts and delivered inline cards missing settlement receipts, honoring resident-wake quiet holds for new inline prompts; per-card edits retain their receipts; resolution waits subscribe before reading and release/join resolution events, file observation and the 15-second missed-event backstop through `settle`; expiry guidance names from PersonaEngine |
 
 public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling {
     /// Telegram prompt deliveries by this process, per approval and chat. Row
@@ -17,9 +22,84 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     /// whose prompt never went out (send threw, or the process restarted between
     /// the two) is prompted again, while a true duplicate is not. (Agent's
     /// review, 2026-09-07.) A duplicate caller awaits the delivery in flight
-    /// and gets its result; a failed one is dropped so the next call retries.
+    /// and gets its result; durable receipts replace completed delivery tasks.
     private var promptDeliveries: [String: Task<Void, Error>] = [:]
     private var promptFlights: [(id: UUID, metadata: JSONValue, task: Task<String, Error>)] = []
+    private var acceptingPassiveDelivery = true
+    private var recoveryStarted = false
+    private var recoveryID: UUID?
+    private var recoveryTask: Task<Void, Never>?
+
+    public func startApprovalDelivery() {
+        // A stopped tick carries cancellation across this actor hop and can
+        // never reopen admission; a new scheduler lifecycle can start again.
+        guard !recoveryStarted, !Task.isCancelled else { return }
+        recoveryStarted = true
+        acceptingPassiveDelivery = true
+        ApprovalChatCards.useTelegram(self)
+        let previous = recoveryTask
+        let identity = UUID()
+        recoveryID = identity
+        recoveryTask = Task {
+            await previous?.value
+            if !Task.isCancelled { await ApprovalChatCards.promptPending(dataRoot: dataRoot, telegram: self) }
+            await settle { [self] in await retireRecovery(identity) }
+        }
+    }
+
+    private func retireRecovery(_ id: UUID) {
+        if recoveryID == id { recoveryTask = nil; recoveryID = nil }
+    }
+
+    public func stopApprovalDelivery() async {
+        acceptingPassiveDelivery = false
+        recoveryStarted = false
+        recoveryTask?.cancel()
+        ApprovalChatCards.stopTelegram(self)
+        let recovery = recoveryTask
+        let flights = promptFlights.map(\.task)
+        let deliveries = Array(promptDeliveries.values)
+        await settle { [self] in
+            await recovery?.value
+            for flight in flights { _ = await flight.result }
+            for delivery in deliveries { _ = await delivery.result }
+            await drainInteractionSettlements()
+        }
+    }
+
+    private func drainInteractionSettlements() async {
+        for delivery in interactionSettlements.values { await delivery.value }
+    }
+    private var interactionSettlements: [String: Task<Void, Never>] = [:]
+    private var changedInteractionSettlements: Set<String> = []
+
+    /// Admission precedes the note read and edit. The filer retains accepted
+    /// delivery through its receipt; callers publishing a card never join it.
+    func enqueueInteractionSettlement(id: String, sessionID: String, dataRoot: URL) -> Task<Void, Never> {
+        let key = dataRoot.standardizedFileURL.path + ":" + id
+        if let delivery = interactionSettlements[key] {
+            changedInteractionSettlements.insert(key)
+            return delivery
+        }
+        let delivery = Task {
+            await settle { [self] in
+                await finishInteractionSettlement(key: key, id: id, sessionID: sessionID, dataRoot: dataRoot)
+            }
+        }
+        interactionSettlements[key] = delivery
+        return delivery
+    }
+
+    private func finishInteractionSettlement(key: String, id: String, sessionID: String, dataRoot: URL) async {
+        defer {
+            interactionSettlements[key] = nil
+            changedInteractionSettlements.remove(key)
+        }
+        repeat {
+            changedInteractionSettlements.remove(key)
+            await ApprovalChatCards.settleTelegramCopy(id: id, sessionID: sessionID, dataRoot: dataRoot, filer: self)
+        } while changedInteractionSettlements.contains(key)
+    }
 
     public typealias PromptSender = @Sendable (
         _ token: String,
@@ -59,10 +139,42 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         self.cardSender = cardSender
     }
 
-    /// Send a mirrored inline card to User's DM (`ApprovalChatCards`); returns its message id.
-    @discardableResult
-    public func sendChatCard(text: String, chatId: Int, markup: JSONValue) async throws -> Int {
-        try await cardSender(token, TelegramDestination(chatId: chatId, threadId: nil), text, markup)
+    /// One admitted send owns its response and durable receipt independently
+    /// of the observer that requested it. Transcript delivery is a separate unit.
+    func deliverChatCard(id: String, sessionID: String, dataRoot: URL,
+                         text: String, title: String, chatId: Int, markup: JSONValue) async throws {
+        guard acceptingPassiveDelivery else { throw CancellationError() }
+        try Task.checkCancellation()
+        let key = "interaction:" + id
+        if let delivery = promptDeliveries[key] { return try await delivery.value }
+        let delivery = Task {
+            try await settle { [self] in
+                await sendInteraction(id: id, sessionID: sessionID, dataRoot: dataRoot,
+                                      text: text, title: title, chatId: chatId, markup: markup)
+            }.get()
+        }
+        promptDeliveries[key] = delivery
+        try await delivery.value
+    }
+
+    private func sendInteraction(id: String, sessionID: String, dataRoot: URL,
+                                 text: String, title: String, chatId: Int, markup: JSONValue) async -> Result<Void, Error> {
+        defer { promptDeliveries["interaction:" + id] = nil }
+        do {
+            guard let note = await ApprovalChatCards.mirrorNote(id, dataRoot: dataRoot),
+                  note["telegram_message_id"] == nil,
+                  let card = await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
+                  card.state.isOpen else { return .success(()) }
+            guard acceptingPassiveDelivery else { return .success(()) }
+            let messageID = try await cardSender(token, TelegramDestination(chatId: chatId, threadId: nil), text, markup)
+            let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+            _ = try await inbox.patch(id: "interaction:" + id, unlessPresent: "telegram_message_id", [
+                "telegram_chat_id": .string(String(chatId)), "telegram_message_id": .string(String(messageID)),
+                "telegram_card_title": .string(title),
+            ])
+            await enqueueInteractionSettlement(id: id, sessionID: sessionID, dataRoot: dataRoot).value
+            return .success(())
+        } catch { return .failure(error) }
     }
 
     /// A mirrored card answered anywhere: its Telegram copy loses its buttons and says so.
@@ -77,6 +189,8 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         payload: JSONValue,
         reason: String
     ) async throws -> String {
+        guard acceptingPassiveDelivery else { throw CancellationError() }
+        try Task.checkCancellation()
         // W2/W3-FIX 4 (defense in depth): redact secret-bearing injection
         // arguments HERE too, not only in AutonomyGatedDispatcher. This record
         // is `remoteResolvable` — it syncs to iOS and is echoed into chat — so
@@ -132,6 +246,7 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         // Wave 2 #8: who steered this turn rides the card to its follow-up.
         request["peer"] = PeerDataTaint.carriedRecord(peerBridge: false, peerID: userId)
         request["fileAccess"] = ChatToolSessionContext.fileAccess.map(JSONValue.string) ?? .null
+        request["hostCallID"] = SkillRunContext.hostCallID.map { .string($0.uuidString) }
         let metadata: JSONValue = .object(request)
         // Reserve the complete request before the first suspension, including
         // inbox creation. Every duplicate awaits the same delivery or failure.
@@ -140,49 +255,54 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         }
         let flightID = UUID()
         let task = Task {
-            try await self.createAndPrompt(metadata: metadata, toolName: toolName,
-                                           payload: payload, reason: reason, chatId: chatId)
+            let result: Result<String, Error>
+            do {
+                result = .success(try await createAndPrompt(metadata: metadata, toolName: toolName,
+                                                           payload: payload, reason: reason, chatId: chatId))
+            } catch { result = .failure(error) }
+            await settle { [self] in await retireFlight(flightID) }
+            return try result.get()
         }
         promptFlights.append((flightID, metadata, task))
-        defer { promptFlights.removeAll { $0.id == flightID } }
-        return try await task.value
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
+
+    private func retireFlight(_ id: UUID) { promptFlights.removeAll { $0.id == id } }
 
     private func createAndPrompt(metadata: JSONValue, toolName: String, payload: JSONValue,
                                  reason: String, chatId: Int) async throws -> String {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let outcome = try await inbox.createOrTouchPending(
-            .object([
-                "title": .string("Approve \(toolName)"),
-                "action": .string(toolName),
-                "risk": .string("confirm"),
-                "reason": .string(reason),
-                "payload": metadata,
-                "remoteResolvable": .bool(true),
-                "localOnly": .bool(false),
-            ]),
-            matchesPending: { pending in Self.isSameTelegramRequest(pending, metadata) }
-        )
+        let outcome = try await settle {
+            do {
+                let outcome = try await inbox.createOrTouchPending(
+                    .object([
+                        "title": .string("Approve \(toolName)"),
+                        "action": .string(toolName),
+                        "risk": .string("confirm"),
+                        "reason": .string(reason),
+                        "payload": metadata,
+                        "remoteResolvable": .bool(true),
+                        "localOnly": .bool(false),
+                    ]),
+                    matchesPending: { pending in Self.isSameTelegramRequest(pending, metadata) }
+                )
+                return Result<(record: ApprovalRecord, created: Bool), Error>.success(outcome)
+            } catch { return .failure(error) }
+        }.get()
         do {
             try await deliverPrompt(outcome.record, chatId: chatId, toolName: toolName, payload: payload)
         } catch {
             throw AutonomyGateError.notRun(.approvalDeliveryFailed)
         }
-        // Raised in User's own DM: it is there, so his DM needs no second one.
-        if chatId == ApprovalChatCards.ownerDM(dataRoot: dataRoot) {
-            do {
-                try await inbox.markChatCard(outcome.record.id, [
-                    "telegramPromptedAt": .string(ISO8601DateFormatter().string(from: Date())),
-                ])
-            } catch {
-                nativeLog("[telegram-approval] prompt mark failed: %@", error.localizedDescription)
-            }
-        }
         return outcome.record.id
     }
 
     /// Same request: the generic chat-tool identity (tool, surface, input) from
-    /// the same requester in the same chat, topic and session. The resolve path
+    /// the same requester and waiting host call in the same chat, topic and session. The resolve path
     /// resumes the RECORDED session and topic, so a request from another topic
     /// or after /new must file its own row rather than inherit old provenance.
     private static func isSameTelegramRequest(_ lhs: JSONValue, _ rhs: JSONValue) -> Bool {
@@ -196,6 +316,7 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
             && left["toolName"] == right["toolName"]
             && left["surface"] == right["surface"]
             && left["input"] == right["input"]
+            && left["hostCallID"] == right["hostCallID"]
             && left["agentExactProtocol"] == right["agentExactProtocol"]
             && left["peer"] == right["peer"]
             // A card filed with other hands is another request (an old card has none).
@@ -206,7 +327,8 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
             && leftOrigin["userId"] == rightOrigin["userId"]
     }
 
-    /// Missed-event repair only. The kqueue watcher below is the reaction path;
+    /// Missed-event repair only. Durable resolution edges and the retained
+    /// external-file watcher below are the reaction paths;
     /// this interval bounds how long a resolution could hide behind an edge the
     /// watcher never saw (a filesystem that dropped it, an armed-on-parent
     /// window). It is not the reaction latency.
@@ -218,11 +340,9 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     /// and validates the whole 300-row `requests.json`, and sorts it, just to
     /// pull one record out. A 60-second think meant 60 of those.
     ///
-    /// It now waits on a `FileChangeWatcher` over the approvals file, with the
-    /// repair poll above as the only remaining timer. Reaction is STRICTLY
-    /// FASTER, never slower: the resolver writes `requests.json`, the kqueue
-    /// edge lands in milliseconds, and the loop re-reads immediately — where
-    /// before it waited out the remainder of a 1s tick.
+    /// It subscribes to durable resolution events and retains a file watcher
+    /// for external writes. The 15-second missed-event backstop stays; it is
+    /// not the reaction latency. All three sources retire with this wait.
     ///
     /// No missed-event window at the seam: the watcher is armed BEFORE the
     /// first read. The buffer retains the newest pending edge because every
@@ -232,13 +352,19 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     public func awaitResolution(id: String) async throws -> ApprovalDecision {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let approvalsPath = await inbox.approvalsPath
+        try Task.checkCancellation()
+        let events = await ApprovalLifecycleBus.shared.events()
 
         let (wakes, wake) = AsyncStream<Void>.makeStream(
             bufferingPolicy: .bufferingNewest(1)
         )
-        let watcher = FileChangeWatcher(paths: [approvalsPath]) { _ in
-            wake.yield(())
+        let resolutions = Task {
+            for await event in events {
+                guard !Task.isCancelled else { return }
+                if event.phase == .resolved, event.record.id == id { wake.yield(()) }
+            }
         }
+        let watcher = FileChangeWatcher(paths: [approvalsPath]) { _ in wake.yield(()) }
         let repairTicker = Task { [interval = Self.resolutionRepairPollSeconds] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
@@ -246,27 +372,39 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
                 wake.yield(())
             }
         }
-        defer {
+        let result: Result<ApprovalDecision, Error>
+        do {
+            let decision: ApprovalDecision = try await withTaskCancellationHandler {
+                var edges = wakes.makeAsyncIterator()
+                while !Task.isCancelled {
+                    let record = try await inbox.get(id)
+                    try Task.checkCancellation()
+                    if record.status == "resolved" {
+                        switch record.decision {
+                        case "approved": return .approved
+                        case "denied": return .denied
+                        case "canceled": return .canceled
+                        default: return .denied
+                        }
+                    }
+                    // Returns nil on cancellation; no new work is admitted.
+                    guard await edges.next() != nil else { break }
+                }
+                throw CancellationError()
+            } onCancel: {
+                wake.finish()
+            }
+            result = .success(decision)
+        } catch { result = .failure(error) }
+        await settle {
+            resolutions.cancel()
             repairTicker.cancel()
             watcher.cancel()
             wake.finish()
+            await resolutions.value
+            await repairTicker.value
         }
-
-        var edges = wakes.makeAsyncIterator()
-        while !Task.isCancelled {
-            let record = try await inbox.get(id)
-            if record.status == "resolved" {
-                switch record.decision {
-                case "approved": return .approved
-                case "denied": return .denied
-                case "canceled": return .canceled
-                default: return .denied
-                }
-            }
-            // Returns nil when this task is cancelled, which exits the loop.
-            guard await edges.next() != nil else { break }
-        }
-        throw CancellationError()
+        return try result.get()
     }
 
     public func pendingApprovalResult(
@@ -458,6 +596,7 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         guard record.status == "pending" else {
             throw TelegramApprovalError.notPending(record.status)
         }
+        guard !record.requiresExecutableReview else { throw TelegramApprovalError.notRemoteResolvable }
         // User's own DM (its chat card's) decides local-only too, as the signed
         // phone does (User, 10-07). Any other chat, remote-safe requests only.
         guard Self.cardChat(record) == String(chatId) || (record.remoteResolvable && !record.localOnly) else {
@@ -480,24 +619,49 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     }
 
     /// Post the Approve/Deny prompt for an approval raised outside this chat
-    /// into User's DM. Once per approval in this process.
+    /// into User's DM. A durable per-destination receipt retires its delivery task.
     public func promptChatCard(_ approval: ApprovalRecord, chatId: Int, payload: JSONValue) async throws {
+        guard acceptingPassiveDelivery else { throw CancellationError() }
+        try Task.checkCancellation()
         try await deliverPrompt(approval, chatId: chatId, toolName: approval.action, payload: payload)
     }
 
     private func deliverPrompt(_ approval: ApprovalRecord, chatId: Int, toolName: String, payload: JSONValue) async throws {
+        try Task.checkCancellation()
         let key = "\(approval.id):\(chatId)"
         if let delivery = promptDeliveries[key] { return try await delivery.value }
-        let delivery = Task { [token, promptSender] in
-            try await promptSender(token, chatId, approval, toolName, payload)
+        let delivery = Task {
+            try await settle { [self] in
+                await sendPrompt(approval, chatId: chatId, toolName: toolName, payload: payload)
+            }.get()
         }
         promptDeliveries[key] = delivery
+        try await delivery.value
+    }
+
+    private func sendPrompt(_ approval: ApprovalRecord, chatId: Int, toolName: String,
+                            payload: JSONValue) async -> Result<Void, Error> {
+        defer { promptDeliveries["\(approval.id):\(chatId)"] = nil }
         do {
-            try await delivery.value
-        } catch {
-            promptDeliveries[key] = nil
-            throw error
-        }
+            let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+            let current = try await inbox.get(approval.id)
+            let receipt = "telegram_prompt_delivered:\(chatId)"
+            guard current.status == "pending" else { return .success(()) }
+            if case .object(let card)? = current.chatCard,
+               card[receipt] == .bool(true) || (card["telegramPromptedAt"] != nil
+                    && chatId == ApprovalChatCards.ownerDM(dataRoot: dataRoot)) { return .success(()) }
+            guard acceptingPassiveDelivery else { return .success(()) }
+            // Once dispatched, Stop ends further admission, never this send's
+            // response or receipt.
+            try await promptSender(token, chatId, approval, toolName, payload)
+            var mark: [String: JSONValue] = [receipt: .bool(true)]
+            if chatId == ApprovalChatCards.ownerDM(dataRoot: dataRoot) {
+                mark["telegramPromptedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
+                if !approval.requiresExecutableReview { mark["telegramChatId"] = .string(String(chatId)) }
+            }
+            try await inbox.markChatCard(approval.id, mark)
+            return .success(())
+        } catch { return .failure(error) }
     }
 
     /// 2026-09-06: the chat session recorded on the approval, in the same two
@@ -603,8 +767,8 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         payload: JSONValue,
         send: @Sendable (String, TelegramDestination, String, JSONValue) async throws -> Void
     ) async throws {
-        // A script install is decided where the whole script shows.
-        if approval.action == SwiftNativeApprovalInbox.skillScriptInstallAction {
+        // Executable code is decided where the whole saved review shows.
+        if approval.requiresExecutableReview {
             try await send(token, TelegramDestination(chatId: chatId, threadId: nil),
                            "\(TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText(approval.title))) Review and approve it on the Mac or phone, where the whole script shows.",
                            .object(["inline_keyboard": .array([])]))

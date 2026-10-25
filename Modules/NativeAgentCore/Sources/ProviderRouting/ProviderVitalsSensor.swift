@@ -1,8 +1,9 @@
-import FeedPolicy
 import TurnTrace
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+
+// Blueprint: | `ProviderVitalsSensor.swift` | `ProviderVitalsSensor`: passive lifecycle-derived latency/error bands, first-output evidence and persisted bounded health state |
 
 // MARK: - INTEROCEPTION: provider vitals sensor
 //
@@ -182,7 +183,7 @@ public actor ProviderVitalsSensor {
     /// The trace is their durable record: read once at launch, then each live
     /// call's `ttftMs` joins here under the same definition. Nothing is written.
     private struct FirstOutputKey: Hashable { let provider, model: String; let streamKind: String? }
-    private var firstOutputs: [FirstOutputKey: [Double]] = [:]
+    private var firstOutputs: [FirstOutputKey: [(seconds: Double, bytes: Int?)]] = [:]
     /// Rows the retained trace sources could not decode at launch: their first
     /// outputs are missing from the sample, and Diagnostics says how many.
     private var unreadableTraceRows = 0
@@ -212,7 +213,8 @@ public actor ProviderVitalsSensor {
             let duration = started.map { max(0, event.occurredAt.timeIntervalSince($0) * 1000) }
             let ttft = event.firstOutputMs.map(Double.init)
             if event.streaming, let ttft {
-                joinFirstOutput(firstOutputKey(event.providerId, event.model, event.streamKind), seconds: ttft / 1000)
+                joinFirstOutput(firstOutputKey(event.providerId, event.model, event.streamKind), seconds: ttft / 1000,
+                                bytes: event.requestBytes)
             }
             if event.noReply { noReplyCuts[normalizedProviderId(event.providerId), default: 0] += 1 }
             let sample = ProviderVitalsSample(
@@ -338,16 +340,19 @@ public actor ProviderVitalsSensor {
             } else if row["kind"] == .string("llm.call"), payload["streaming"] == .bool(true),
                       case .int(let ms)? = payload["ttftMs"], case .string(let model)? = payload["model"] {
                 let kind: String? = if case .string(let kind)? = payload["streamKind"] { kind } else { nil }
-                joinFirstOutput(firstOutputKey(provider, model, kind), seconds: Double(ms) / 1000)
+                let bytes: Int? = if case .int(let bytes)? = payload["requestBytes"] { Int(bytes) } else { nil }
+                joinFirstOutput(firstOutputKey(provider, model, kind), seconds: Double(ms) / 1000, bytes: bytes)
             }
         }
-        for (key, seconds) in live { seconds.forEach { joinFirstOutput(key, seconds: $0) } }
+        for (key, samples) in live { samples.forEach { joinFirstOutput(key, seconds: $0.seconds, bytes: $0.bytes) } }
     }
 
-    /// The stream guard's question at stream start.
-    public func firstOutputDeadline(provider: String, model: String, streamKind: String?) -> FirstOutputDeadline {
-        let seconds = firstOutputs[firstOutputKey(provider, model, streamKind)] ?? []
-        return FirstOutputDeadline(calls: seconds.count, slowest: seconds.max())
+    /// The stream guard's question at stream start, for a request of `requestBytes`.
+    public func firstOutputDeadline(provider: String, model: String, streamKind: String?, requestBytes: Int) -> FirstOutputDeadline {
+        let samples = firstOutputs[firstOutputKey(provider, model, streamKind)] ?? []
+        let perByte = samples.compactMap { sample in sample.bytes.flatMap { $0 > 0 ? sample.seconds / Double($0) : nil } }.max()
+        return FirstOutputDeadline(calls: samples.count, slowest: samples.map(\.seconds).max(),
+                                   slowestPerByte: perByte, requestBytes: requestBytes)
     }
 
     /// Diagnostics: each provider's first outputs beside its cuts.
@@ -358,7 +363,7 @@ public actor ProviderVitalsSensor {
                 .filter { $0.provider == provider }
                 .sorted { ($0.model, $0.streamKind ?? "") < ($1.model, $1.streamKind ?? "") }
                 .map { key in
-                    let sorted = (firstOutputs[key] ?? []).sorted()
+                    let sorted = (firstOutputs[key] ?? []).map(\.seconds).sorted()
                     func rank(_ q: Double) -> String {
                         sorted.isEmpty ? "-" : String(format: "%.1f s", sorted[Int((q * Double(sorted.count)).rounded(.up)) - 1])
                     }
@@ -381,8 +386,8 @@ public actor ProviderVitalsSensor {
     /// `JSONLLineCaps.traceEvents` rows, so a key keeps at most that many first
     /// outputs and one leaves only when a newer one pushes it out. (The trace
     /// is shared with other rows, so after a relaunch a key may hold fewer.)
-    private func joinFirstOutput(_ key: FirstOutputKey, seconds: Double) {
-        firstOutputs[key, default: []].append(seconds)
+    private func joinFirstOutput(_ key: FirstOutputKey, seconds: Double, bytes: Int?) {
+        firstOutputs[key, default: []].append((seconds, bytes))
         let over = firstOutputs[key, default: []].count - JSONLLineCaps.traceEvents
         if over > 0 { firstOutputs[key]?.removeFirst(over) }
     }

@@ -6,6 +6,7 @@ import PersistenceCore
 import TurnTrace
 // v2Prefix delivery ladder: supportsMidConversationSystem / …ClearAt.
 import ProviderRouting
+// Blueprint: | `SessionHistoryReader.swift` | `SessionHistoryReader` actor; `messages`, `messagesWithStats`; initialization leaves retired middle-index files untouched |
 
 // MARK: - ChatMessage / ChatSession
 
@@ -141,28 +142,6 @@ public actor SessionHistoryReader {
 
     public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         self.dataRoot = dataRoot
-        Self.cleanupRetiredMiddleIndex(dataRoot: dataRoot)
-    }
-
-    /// One-shot removal of the retired session_middle_index sqlite (W3a,
-    /// 2026-07-01): its only reader (shadowCompare) is gone, so the derived
-    /// index would otherwise sit orphaned on disk holding indexed transcript
-    /// text that chat clears/deletes never touch. Idempotent; per-process
-    /// once-gate keeps init cheap.
-    private static let middleIndexCleanupOnce = NSLock()
-    private nonisolated(unsafe) static var middleIndexCleanupRoots = Set<String>()
-    private static func cleanupRetiredMiddleIndex(dataRoot: URL) {
-        middleIndexCleanupOnce.lock()
-        defer { middleIndexCleanupOnce.unlock() }
-        let rootKey = dataRoot.standardizedFileURL.path
-        guard middleIndexCleanupRoots.insert(rootKey).inserted else { return }
-        let base = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("session_middle_index.sqlite")
-        for suffix in ["", "-wal", "-shm"] {
-            let path = URL(fileURLWithPath: base.path + suffix)
-            try? FileManager.default.removeItem(at: path)
-        }
     }
 
     /// Read messages for a session from `data/chat/messages/<id>.jsonl`.

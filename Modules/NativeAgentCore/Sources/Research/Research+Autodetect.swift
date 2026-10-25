@@ -1,11 +1,15 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `Research+Autodetect.swift` | `SwiftNativeResearchClient`: `autodetectSearXNG`, `checkSearXNG`, `normalizedSearXNGBaseURL`, `saveSearXNGBaseURL` |
 
 extension SwiftNativeResearchClient {
     // MARK: autodetect
 
     public func autodetectSearXNG() async throws -> SearXNGAutodetectResult {
+        let expectedConfiguration = try await persistence.withFileLock(configPath) { [persistence, configPath] in
+            try await persistence.readJSON(configPath, ifMissing: .object([:]))
+        }
         // Mirror Python: deterministic seed list, then docker candidates,
         // then dedup-by-rstripped-baseURL preserving first-seen order.
         var candidates: [SearXNGCandidate] = [
@@ -38,13 +42,13 @@ extension SwiftNativeResearchClient {
             return nil
         }
         if let seed {
-            try await persistSearXNGBaseURL(seed.baseURL)
+            try await persistSearXNGBaseURL(seed.baseURL, expectedConfiguration: expectedConfiguration)
             return SearXNGAutodetectResult(found: true, baseURL: seed.baseURL, source: seed.source, error: nil)
         }
         for cand in candidates.dropFirst(4) {
             let base = trimTrailingSlash(cand.baseURL)
             if await checkSearXNG(base: base) {
-                try await persistSearXNGBaseURL(base)
+                try await persistSearXNGBaseURL(base, expectedConfiguration: expectedConfiguration)
                 return SearXNGAutodetectResult(found: true, baseURL: base, source: cand.source, error: nil)
             }
         }
@@ -55,20 +59,24 @@ extension SwiftNativeResearchClient {
     }
 
     /// Probe one candidate via the same query the daemon uses
-    /// (`q=nativeagent&format=json`, 6s timeout, expect 200 + a JSON
+    /// (`q=nativeagent&format=json`, 16s timeout, expect 200 + a JSON
     /// object containing a `results` key). Mirrors
-    /// `Daemon.check_searxng`.
-    public func checkSearXNG(base: String) async -> Bool {
+    /// `Daemon.check_searxng`. `answering` (Doctor) also fails a reply whose
+    /// engines all failed, the same reply web.search reports as a failure.
+    public func checkSearXNG(base: String, answering: Bool = false) async -> Bool {
         let trimmed = trimTrailingSlash(base)
         guard let url = makeURL(base: trimmed, path: "/search", query: [("q", "nativeagent"), ("format", "json")]) else {
             return false
         }
         do {
-            let response = try await http.getBounded(url: url, timeout: 6, maxBytes: 512_000)
+            // SearXNG itself may wait up to its max_request_timeout (15 s on a slow
+            // network) before answering; a shorter probe reports a working instance as down.
+            let response = try await http.getBounded(url: url, timeout: 16, maxBytes: 512_000)
             guard response.status == 200, !response.truncated else { return false }
             let parsed = try JSONValue.parse(response.body)
-            guard case .object(let obj) = parsed else { return false }
-            return obj["results"] != nil
+            guard case .object(let obj) = parsed, case .array(let results)? = obj["results"] else { return false }
+            guard answering, results.isEmpty, case .array(let failed)? = obj["unresponsive_engines"] else { return true }
+            return failed.isEmpty
         } catch {
             return false
         }
@@ -153,16 +161,16 @@ extension SwiftNativeResearchClient {
         return normalized
     }
 
-    /// Read `data/research/config.json`, overwrite `searxng_base_url`, write
-    /// atomically. Mirrors Python: `self.config[...] = base; self.save_config()`.
-    ///
-    /// Wave-3 (2026-05-31) — wrapped in `withFileLock(configPath)` so the
-    /// R-M-W is serialized against the daemon's `save_config()`
-    ///. Both sides share the `.lock`
-    /// sibling convention from PersistenceCore+FileLock.swift.
-    private func persistSearXNGBaseURL(_ base: String) async throws {
+    /// Manual saves and discovery share the config lock. Discovery commits
+    /// only while the configuration it probed from is still current.
+    private func persistSearXNGBaseURL(_ base: String, expectedConfiguration: JSONValue? = nil) async throws {
         let work: @Sendable () async throws -> Void = { [persistence, configPath] in
             let raw = try await persistence.readJSON(configPath, ifMissing: .object([:]))
+            if let expectedConfiguration, raw != expectedConfiguration {
+                throw NSError(domain: "NativeAgent.Research", code: -409, userInfo: [
+                    NSLocalizedDescriptionKey: "Search settings changed during discovery. Your saved settings were kept."
+                ])
+            }
             var obj: [String: JSONValue]
             if case .object(let existing) = raw {
                 obj = existing

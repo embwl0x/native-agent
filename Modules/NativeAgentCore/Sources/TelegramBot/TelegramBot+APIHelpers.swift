@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `TelegramBot+APIHelpers.swift` | `_tgBuildBotURL`: canonical path-segment and query encoding for Telegram Bot API URLs |
+
 func _tgEncodeBotToken(_ token: String) -> String {
     var allowed = CharacterSet.alphanumerics
     allowed.insert(charactersIn: "-._~")

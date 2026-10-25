@@ -8,6 +8,7 @@ import ProviderRouting
 import Research
 import TrustCenter
 import TriggerScheduler
+// Blueprint: | `AppQuietSettingsHost.swift` | `AppQuietSettingsHost` class; `saveChatBrainDefaultsFailure`, `saveMacControlPolicy` |
 
 /// Adapts the settings catalog to the same observed model actions as the UI.
 @MainActor
@@ -18,8 +19,9 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
 
     var dataRootOverride: URL? { appModel.dataRootOverride }
     var trustPolicy: TrustPolicy? { appModel.engine.trust.policy }
-    var personality: PersonalityProfile? { appModel.personality }
+    var personality: PersonalityProfile? { appModel.engine.persona.profile }
     var dreamError: String? { appModel.dreamError }
+    var makeShelfFault: String? { appModel.engine.make.fault }
     var chatModel: String {
         get { appModel.chatModel }
         set { appModel.chatModel = newValue }
@@ -46,9 +48,10 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
 
     func saveMacControlPolicy(
         _ policy: TrustMacControlPolicy,
+        comparedTo baseline: TrustMacControlPolicy,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)?
     ) async throws -> TrustPolicy {
-        try await appModel.saveMacControlPolicy(policy, guardedByLockedPolicy: guardedByLockedPolicy)
+        try await appModel.saveMacControlPolicy(policy, comparedTo: baseline, guardedByLockedPolicy: guardedByLockedPolicy)
     }
 
     func applySavedTrustPolicy(_ policy: TrustPolicy, status: String) {
@@ -99,7 +102,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                 dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
                 guardedByLockedPolicy: guardedByLockedPolicy)
         } catch {
-            appModel.engine.trust.policy = nil
+            appModel.engine.trust.publishPolicy(nil)
             appModel.recordTrustActionFailure("Multimodal policy save failed: \(error.localizedDescription)")
             throw error
         }
@@ -153,8 +156,9 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     }
 
     func saveSearchServiceURL(_ url: String) async throws {
-        appModel.searxngBaseURL = try await SwiftNativeResearchClient(dataRoot: appModel.engine.dataRoot)
+        _ = try await SwiftNativeResearchClient(dataRoot: appModel.engine.dataRoot)
             .saveSearXNGBaseURL(url)
+        try await appModel.engine.configuration.readSearXNG(dataRoot: appModel.engine.dataRoot)
     }
     func findSearchService() async throws -> String {
         switch await appModel.autodetectSearXNG() {

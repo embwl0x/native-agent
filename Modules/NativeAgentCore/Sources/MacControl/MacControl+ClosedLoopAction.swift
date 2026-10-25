@@ -10,6 +10,7 @@ import CoreGraphics
 #endif
 #if canImport(UserNotifications)
 import UserNotifications
+// Blueprint: | `MacControl+ClosedLoopAction.swift` | `SwiftNativeMacControl`: `handleAct`, `pointerRestoredJSON` |
 #endif
 
 extension SwiftNativeMacControl {
@@ -28,6 +29,7 @@ extension SwiftNativeMacControl {
         var postState: MacAXActTarget?
         var actedHandle: String
         var extra: [String: JSONValue] = [:]
+        var expectedText: String? = nil
     }
 
     /// `act` — perceive-act-verify in ONE call.
@@ -73,7 +75,7 @@ extension SwiftNativeMacControl {
               !handle.isEmpty else {
             return injectionRefusal(
                 action: "act",
-                error: "missing required field: handle (from the latest mac_look)",
+                error: "missing required field: handle (from the latest mac.look)",
                 status: 400
             )
         }
@@ -81,7 +83,7 @@ extension SwiftNativeMacControl {
               !frameId.isEmpty else {
             return injectionRefusal(
                 action: "act",
-                error: "missing required field: frame_id (the frame_id mac_look returned with that handle)",
+                error: "missing required field: frame_id (the frame_id mac.look returned with that handle)",
                 status: 400
             )
         }
@@ -180,8 +182,8 @@ extension SwiftNativeMacControl {
                     "handle": .string(handle),
                     "reason": .string("frame_recorded_no_pid"),
                     "guidance": .string(
-                        "this frame recorded no process id, so the act cannot be anchored to the app "
-                        + "you looked at — call mac_look again"
+                        "this frame recorded no process id, so the action cannot be anchored to the app "
+                        + "you looked at — call mac.look again"
                     ),
                 ]
             )
@@ -210,7 +212,7 @@ extension SwiftNativeMacControl {
                     "reason": .string("cannot_act_on_own_process"),
                     "guidance": .string(
                         "this frame points at NativeAgent's own window, which AX must never touch — "
-                        + "the frame is discarded; call mac_look at another app's window"
+                        + "the frame is discarded; call mac.look at another app's window"
                     ),
                 ]
             )
@@ -244,7 +246,7 @@ extension SwiftNativeMacControl {
                     "reason": .string("app_publishes_no_window"),
                     "guidance": .string(
                         "the app this frame was captured from publishes no window any more — nothing "
-                        + "was acted on; call mac_look again"
+                        + "was acted on; call mac.look again"
                     ),
                 ]
             )
@@ -269,7 +271,7 @@ extension SwiftNativeMacControl {
                         "windows_now": .int(Int64(actWindows.count)),
                         "guidance": .string(
                             "the window you looked at is not there any more (it closed, or the app "
-                            + "replaced it) — NOTHING was acted on; call mac_look at whatever is up now"
+                            + "replaced it) — NOTHING was acted on; call mac.look at whatever is up now"
                         ),
                     ]
                 )
@@ -287,7 +289,7 @@ extension SwiftNativeMacControl {
                         "guidance": .string(
                             "this app now has more than one window that could be the one you looked at, "
                             + "and acting on the wrong one is not recoverable — NOTHING was acted on; "
-                            + "call mac_look to re-anchor"
+                            + "call mac.look to re-anchor"
                         ),
                     ]
                 )
@@ -313,7 +315,7 @@ extension SwiftNativeMacControl {
                     "pid": .int(Int64(framePid)),
                     "guidance": .string(
                         "the window you looked at went away between matching it and resolving that "
-                        + "handle — NOTHING was acted on; call mac_look again"
+                        + "handle — NOTHING was acted on; call mac.look again"
                     ),
                 ]
             )
@@ -328,7 +330,7 @@ extension SwiftNativeMacControl {
                     "drifted_on": .string(reason),
                     "guidance": .string(
                         "that app's windows can no longer be told apart — NOTHING was acted on; call "
-                        + "mac_look to re-anchor"
+                        + "mac.look to re-anchor"
                     ),
                 ]
             )
@@ -343,7 +345,7 @@ extension SwiftNativeMacControl {
                     "app": frame.appName.map { .string($0) } ?? .null,
                     "guidance": .string(
                         "the app this frame was captured from is no longer running (or publishes no "
-                        + "window any more) — nothing was acted on; call mac_look again"
+                        + "window any more) — nothing was acted on; call mac.look again"
                     ),
                 ]
             )
@@ -356,7 +358,7 @@ extension SwiftNativeMacControl {
                     "handle": .string(handle),
                     "path": .array(entry.path.map { .int(Int64($0)) }),
                     "pid": .int(Int64(framePid)),
-                    "guidance": .string("the element that handle named is gone — call mac_look again"),
+                    "guidance": .string("the element that handle named is gone — call mac.look again"),
                 ]
             )
         }
@@ -390,7 +392,7 @@ extension SwiftNativeMacControl {
                         } ?? .null,
                     ]),
                     "guidance": .string(
-                        "that handle no longer names the control it did — the window changed; call mac_look again"
+                        "that handle no longer names the control it did — the window changed; call mac.look again"
                     ),
                 ]
             )
@@ -444,7 +446,7 @@ extension SwiftNativeMacControl {
                     "reason": .string(reason),
                     "guidance": .string(
                         "there is no window to re-check that handle against — NOTHING was acted on; "
-                        + "call mac_look again"
+                        + "call mac.look again"
                     ),
                 ]
             )
@@ -491,7 +493,7 @@ extension SwiftNativeMacControl {
                     "found": drift.found,
                     "guidance": .string(
                         "the control at that position is no longer the one that handle named — the "
-                        + "window changed under you; call mac_look again"
+                        + "window changed under you; call mac.look again"
                     ),
                 ]
             )
@@ -581,8 +583,8 @@ extension SwiftNativeMacControl {
                     "pid": .int(Int64(framePid)),
                     "guidance": .string(
                         "no accessibility notification could be subscribed on that app, so the effect "
-                        + "of this act could not be observed — NOTHING WAS ACTED ON. Check that the app "
-                        + "is still running and try mac_look again."
+                        + "of this action could not be observed — NOTHING WAS ACTED ON. Check that the app "
+                        + "is still running and try mac.look again."
                     ),
                 ]
             )
@@ -684,7 +686,7 @@ extension SwiftNativeMacControl {
                   case .bool(true)? = actedOn["redirected"] else { return false }
             return true
         }()
-var effect: [String: JSONValue] = [
+        var effect: [String: JSONValue] = [
             "observed": .bool(wait.observed),
             "observer_installed": .bool(observerInstalled),
             "wait_ms": .int(Int64(effectWaitMs)),
@@ -745,12 +747,7 @@ var effect: [String: JSONValue] = [
             // no-diff-yet answer (correct for the window-died early return
             // just past this point) and the post-diff recompute overrides it
             // once there is a percept to weigh.
-            "status": .string(MacActClosedLoop.classify(
-                performedOK: performed.ok,
-                verb: verb,
-                notificationObserved: wait.observed,
-                diff: nil
-            ).status),
+            "status": .string(performed.ok ? "acted_unobserved" : "failed"),
             "verb": .string(verb.rawValue),
             "handle": .string(handle),
             "performed": .bool(performed.ok),
@@ -785,6 +782,37 @@ var effect: [String: JSONValue] = [
             output["menu_left_open"] = .bool(menuLeftOpen)
         }
 
+        let declaration: MacActClosedLoop.DeclaredEffect
+        switch verb {
+        case .type: declaration = .text(performed.expectedText)
+        case .focus: declaration = .focus
+        case .select: declaration = .selected
+        case .toggle:
+            declaration = .state(["0": "1", "1": "0", "off": "on", "on": "off",
+                                  "true": "false", "false": "true"][performed.target.value ?? ""])
+        case .dismiss: declaration = .dismissed
+        case .scroll: declaration = .scroll
+        default: declaration = .surface(verb == .open ? entry.label : nil)
+        }
+        let windowsAfter = accessibilityActSource.windows(pid: framePid)
+        let surfaceCreated = windowsAfter.contains { window in !actWindows.contains { $0.handle == window.handle } }
+        func verdict(_ diff: MacActClosedLoop.EffectDiff?, selected: Bool? = nil) -> MacActClosedLoop.ActClassification {
+            MacActClosedLoop.verify(declaration,
+                value: accessibilityActSource.reread(performed.target)?.value,
+                selected: selected,
+                focused: accessibilityActSource.focusedElement(pid: framePid).flatMap { _ in
+                    accessibilityActSource.focusedWindow(pid: framePid).map {
+                        accessibilityActSource.isFocusedElement(performed.target, pid: framePid) && $0.handle == actWindow.handle
+                    }
+                },
+                surfaceChanged: surfaceCreated ? true : nil,
+                dismissed: accessibilityActSource.windowPresence(actWindow).map { !$0 },
+                processGone: accessibilitySource.appInfo(pid: framePid) == nil,
+                diff: diff, notifications: wait.notifications, redactingText: entry.secret,
+                press: verb == .click ? (frame, entry) : nil,
+                destinationJSON: entry.labelJSON ?? .null, windowTitleJSON: effect["window_title"])
+        }
+
         guard let read, seam["window_minimized"] != .bool(true) else {
             // A minimized window cannot supply a fresh frame either.
             // The window went away under the act (she closed it, or dismissed
@@ -804,45 +832,51 @@ var effect: [String: JSONValue] = [
                     return (
                         "window_minimized",
                         "\(name)'s window is minimized. go name:\"\(name)\" brings it back. "
-                        + "Its menu bar still works: act app:\"\(name)\" target:\"File > New\" makes a new window."
+                        + "Its menu bar still works: mac.act app:\"\(name)\" target:\"File > New\" makes a new window."
                     )
                 }
                 switch postAnchor {
                 case .appGone?:
                     return (
                         "frame_app_gone",
-                        "the act ran, but the app you looked at no longer publishes a window — the old "
-                        + "frame is discarded; call mac_look when it is back"
+                        "the action ran, but the app you looked at no longer publishes a window — the old "
+                        + "frame is discarded; call mac.look when it is back"
                     )
                 case .windowGone?:
                     return (
                         "frame_window_gone",
-                        "the act ran, and the window you looked at is gone (it closed, or the act closed "
-                        + "it) — the old frame is discarded; call mac_look at whatever is up now"
+                        "the action ran, and the window you looked at is gone (it closed, or the action closed "
+                        + "it) — the old frame is discarded; call mac.look at whatever is up now"
                     )
                 case .windowDrifted(let reason)?:
                     return (
                         "window_drifted:\(reason)",
-                        "the act ran, but that app now has more than one window that could be the one "
+                        "the action ran, but that app now has more than one window that could be the one "
                         + "you looked at, so nothing was re-read — the old frame is discarded; call "
-                        + "mac_look to re-anchor"
+                        + "mac.look to re-anchor"
                     )
                 case .selfProcess?:
                     return (
                         Self.selfInspectionError,
-                        "the act ran, but the target now resolves to NativeAgent's own process, which "
-                        + "AX must not re-read — the old frame is discarded; call mac_look at another "
+                        "the action ran, but the target now resolves to NativeAgent's own process, which "
+                        + "AX must not re-read — the old frame is discarded; call mac.look at another "
                         + "app's window"
                     )
                 case .read?, nil:
                     return (
                         "no_frontmost_window",
-                        "the act ran, but there is no window to look at afterwards — the old frame is "
-                        + "discarded; call mac_look when a window is up again"
+                        "the action ran, but there is no window to look at afterwards — the old frame is "
+                        + "discarded; call mac.look when a window is up again"
                     )
                 }
             }()
             effect["percept"] = .string(percept)
+            if performed.ok {
+                let classification = verdict(nil)
+                output.merge(classification.receipt) { _, new in new }
+                effect["observed"] = .bool(classification.status != "acted_unobserved")
+                effect["reason"] = classification.reason.map(JSONValue.string)
+            }
             output["effect"] = .object(effect)
             output["frame_id"] = .null
             output["frame_invalidated"] = .bool(true)
@@ -884,80 +918,12 @@ var effect: [String: JSONValue] = [
         for (key, value) in MacActReceiptRendering.effectDiffJSON(diff, valueChars: limits.valueChars) {
             effect[key] = value
         }
-        // THE VERDICT, now that there is evidence to weigh. A navigation verb
-        // whose window did not move is `acted_unobserved` even though the app
-        // published something — see `MacActClosedLoop.classify`.
-        let classification = MacActClosedLoop.classify(
-            performedOK: performed.ok,
-            verb: verb,
-            notificationObserved: wait.observed,
-            diff: diff,
-            // The label she NAMED — Finder retitles to the opened folder, so
-            // this is what the destination is checked against.
-            intendedTarget: entry.label,
-            intendedTargetJSON: entry.labelJSON ?? .null,
-            windowTitleJSON: effect["window_title"],
-            // VERB-SEMANTIC for `type`: the text we tried to land, the acted
-            // element's value BEFORE (from the pre-act resolve — without it, a
-            // pre-existing substring reads as a landed edit), and what the
-            // field reads back after. Compared in memory only — none of these
-            // are ever echoed into a payload, so a secret stays a secret.
-            // A secure field reads back a MASK — a non-empty string that can
-            // never contain the typed text — so comparing against it would
-            // call a landed edit "not in field". The SAME breadth the look
-            // lane uses to redact (role + label hints; subrole is not carried
-            // on MacAXActTarget) gates it to the honest `edit_unverifiable`
-            // branch instead.
-            typedText: verb == .type ? body.stringValue("text") : nil,
-            valueBefore: MacScreenViewBuilder.isSecretField(
-                role: performed.target.role, subrole: nil, label: entry.label
-            ) ? nil : performed.target.value,
-            valueAfter: MacScreenViewBuilder.isSecretField(
-                role: performed.target.role, subrole: nil, label: entry.label
-            ) ? nil : performed.postState?.value
-        )
-        output["status"] = .string(classification.status)
-        let observedReadout = MacActReceiptRendering.actedReadout(diff: diff, after: after)
-        let editVerified = verb == .type && classification.status == "acted"
-        // A press is certified by its CONSEQUENCE (`MacActClosedLoop.pressEvidence`),
-        // by the pointer or by AXPress alike. Its own state counts only for a
-        // verb that asks for that state.
-        let evidence = MacActClosedLoop.pressEvidence(diff, before: frame, pressed: entry, clicked: verb == .click)
-        func moved(_ before: String?, _ after: String?) -> Bool { before != nil && after != nil && before != after }
-        let ownState = evidence.own || performed.postState.map {
-            moved(performed.target.value, $0.value) || moved(performed.target.title, $0.title)
-        } == true
-        let consequence = evidence.consequence
-        let effectSeen = [MacActVerb.select, .toggle].contains(verb) ? consequence || ownState
-            : [MacActVerb.click, .dismiss].contains(verb) ? consequence
-            : diff.windowChanged || editVerified
-        if verb == .click, ownState, !consequence { output["verification_note"] = .string("own_state_only") }
-        if classification.status == "acted", effectSeen {
-            output["verified"] = .bool(true)
-            output["verification_scope"] = .string(editVerified ? "intended_field_edit" : "observed_screen_effect")
-            output["verification_evidence"] = observedReadout?.textJSON
-                ?? observedReadout.map { .string($0.text) }
-                ?? .array(diff.changeReasons.map(JSONValue.string))
-            effect.removeValue(forKey: "reason")
-        }
-        if let reason = classification.reason {
-            output["status_reason"] = .string(reason)
-            // Same value as the `none_observed` written above when nothing was
-            // published, so this is a no-op there rather than a clobber. A
-            // `failed` classification carries no reason and writes nothing —
-            // an earlier `none_observed` on a failed act is still TRUE (the app
-            // published nothing) and stays.
-            effect["reason"] = .string(reason)
-        }
-        if let note = classification.note { output["status_note"] = .string(note) }
-        if performed.ok, performed.extra["append_verified"] == .bool(true) {
-            // Full editor readback proves an append beyond the percept's value cap too.
-            output["status"] = .string("acted")
-            output["verified"] = .bool(true)
-            output.removeValue(forKey: "status_reason")
-            output.removeValue(forKey: "status_note")
-            effect.removeValue(forKey: "reason")
-        }
+        // One verdict from the declared effect and the target's own AX state.
+        let classification = verdict(diff, selected: read.snapshot.nodes.first { $0.path == entry.path }?.attributes.selected)
+        if performed.ok { output.merge(classification.receipt) { _, new in new } }
+        effect["observed"] = .bool(performed.ok && classification.status != "acted_unobserved")
+        if let reason = classification.reason { effect["reason"] = .string(reason) }
+        else { effect.removeValue(forKey: "reason") }
         // Agent round 2 — a Finder view switch dropped 222 notifications and
         // showed 10 of 44 additions. A truncated list of a bulk change is not a
         // description of it, so past the cap the payload also carries a
@@ -1008,8 +974,8 @@ var effect: [String: JSONValue] = [
             + "`readouts_changed` (the read-only values — a total, a display, a status line — that moved, "
             + "which is where the ANSWER to what you just did usually is), and "
             + "the affordances added/removed/changed by handle. `frame_id` is a FRESH frame compiled after "
-            + "the act — keep acting on handles from it. Handles from the previous frame are dead. You do "
-            + "NOT need to call mac_look to find out whether this landed."
+            + "the action — keep acting on handles from it. Handles from the previous frame are dead. You do "
+            + "NOT need to call mac.look to find out whether this landed."
         )
 
         return MacControlResult(
@@ -1275,12 +1241,7 @@ var effect: [String: JSONValue] = [
                 inputRefusal = MacActClosedLoop.KeyWindowRefusal(
                     reason: inputRefusal.reason,
                     note: inputRefusal.note
-                        + " This call also tried to RAISE that window itself (raise outcome: "
-                        + "\(outcome.rawValue)) and then WAITED up to half a second for the window "
-                        + "server to honour it; the window never became key and stayed key, so the "
-                        + "block is real rather than a matter of ordering. A raise that reports "
-                        + "success and does not move the front is what an activation request looks "
-                        + "like from a background process — the front app itself has to yield."
+                        + " Raising the window returned \(outcome.rawValue), but it did not remain key within 0.5s. Inspect the affected app with mac.look before continuing."
                         // The one raise failure with a fixable cause, when the
                         // source knows it: a missing Automation grant. Silence
                         // here would report "could not raise" for "you were
@@ -1328,12 +1289,7 @@ var effect: [String: JSONValue] = [
                         "actuations_attempted": .array(actuationsAttempted.map { .string($0) }),
                         "key_window_changed_after_actuation": .bool(true),
                         "guidance": .string(
-                            "an accessibility action was DELIVERED to the element and the key window "
-                            + "was not (or is no longer) the one this frame describes — which is also "
-                            + "what a successful open or launch looks like from here. No synthesized "
-                            + "event was posted (that would have gone to the key window). Read "
-                            + "`effect` for what was actually observed; this call does not claim the "
-                            + "result is what you asked for, only that something was delivered."
+                            "The Accessibility action was delivered, but this frame's window is no longer key or could not be confirmed key. No synthetic input was posted. Read effect for observed changes; the requested outcome remains unverified."
                         ),
                     ]
                 )
@@ -1369,7 +1325,8 @@ var effect: [String: JSONValue] = [
                 target: target,
                 postState: result.postState,
                 actedHandle: actedHandle,
-                extra: extra
+                extra: extra,
+                expectedText: result.method == "ax_set_value" ? text : nil
             )
         }
 
@@ -1423,6 +1380,7 @@ var effect: [String: JSONValue] = [
         func appendText(_ text: String) async -> MacActPerformed {
             var method = "none"
             var posted = 0
+            var expected: String?
             func result(_ error: String? = nil) -> MacActPerformed {
                 MacActPerformed(
                     ok: error == nil, method: method, requestedAction: "type",
@@ -1431,19 +1389,17 @@ var effect: [String: JSONValue] = [
                     extra: [
                         "mode": .string("append"),
                         "posted_events": .int(Int64(posted)),
-                        "text_value_verified": .bool(error == nil),
-                        "append_verified": .bool(error == nil),
                         "guidance": .string(error.map {
                             "Append stopped: \($0). The whole value was not replaced. Inspect the target before retrying; insertion may be partial if input was delivered."
-                        } ?? "Verified the complete prior text plus the appended text."),
-                    ]
+                        } ?? "Append input was delivered."),
+                    ], expectedText: expected
                 )
             }
             guard let before = accessibilityActSource.textInput(target) else {
                 return result("append_text_or_selection_unreadable")
             }
             let end = NSRange(location: before.value.utf16.count, length: 0)
-            let expected = before.value + text
+            expected = before.value + text
             func waitForValue(_ value: String, selection: NSRange? = nil) async -> Bool {
                 let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
                 repeat {
@@ -1471,7 +1427,7 @@ var effect: [String: JSONValue] = [
                     method = "ax_selected_text"
                     switch ledgeredSetSelectedText(target, text: text) {
                     case .performed:
-                        return await waitForValue(expected) ? result() : result("append_value_mismatch")
+                        return result()
                     case .unsupported:
                         guard atUnchangedEnd() else { return result("append_insertion_outcome_unknown") }
                         method = "none"
@@ -1523,7 +1479,7 @@ var effect: [String: JSONValue] = [
                 eventSink.post(key: event)
                 posted += 1
             }
-            return await waitForValue(expected) ? result() : result("append_value_mismatch")
+            return result()
         }
 
         /// Her-screen Phase 4 — typing into an app that stays in the back.
@@ -1533,6 +1489,7 @@ var effect: [String: JSONValue] = [
         /// keys addressed to THAT pid — only while the act window is the app's
         /// own focused window. Never a keystroke into whatever is key.
         func typeInBackground(_ text: String) -> MacActPerformed {
+            let expected = accessibilityActSource.textInput(target)?.inserting(text)
             func needsFront() -> MacActPerformed {
                 MacActPerformed(
                     ok: false, method: "none", requestedAction: "type",
@@ -1547,7 +1504,7 @@ var effect: [String: JSONValue] = [
             // A single-line field is replaced, as a person retyping it would.
             if ["AXTextField", "AXComboBox", "AXSearchField"].contains(target.role) {
                 guard case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target),
-                      result.ok, result.postState?.value == text else { return needsFront() }
+                      result.ok else { return needsFront() }
                 return summarize(result, target: target, actedHandle: handle,
                                  extra: ["background_route": .string("ax_value_replace")])
             }
@@ -1555,7 +1512,8 @@ var effect: [String: JSONValue] = [
                 return MacActPerformed(
                     ok: true, method: "ax_selected_text", requestedAction: "type",
                     fallbackReason: nil, error: nil, target: target,
-                    postState: accessibilityActSource.reread(target), actedHandle: handle
+                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    expectedText: expected
                 )
             }
             if case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target),
@@ -1627,7 +1585,8 @@ var effect: [String: JSONValue] = [
                 ok: true, method: "keystroke_to_pid", requestedAction: "type",
                 fallbackReason: "value_not_settable", error: nil, target: target,
                 postState: accessibilityActSource.reread(target), actedHandle: handle,
-                extra: ["posted_events": .int(Int64(posted)), "text_character_count": .int(Int64(text.count))]
+                extra: ["posted_events": .int(Int64(posted)), "text_character_count": .int(Int64(text.count))],
+                expectedText: expected
             )
         }
 
@@ -1639,12 +1598,10 @@ var effect: [String: JSONValue] = [
         switch verb {
         case .focus:
             let outcome = ledgeredSetFocused(target)
-            let focused = outcome == .performed && accessibilityActSource.isFocusedElement(target, pid: framePid)
-            return MacActPerformed(ok: focused, method: outcome == .performed ? "ax_focus" : "none",
+            return MacActPerformed(ok: outcome == .performed, method: outcome == .performed ? "ax_focus" : "none",
                 requestedAction: "AXFocused", fallbackReason: nil,
-                error: focused ? nil : "target_not_focused", target: target,
-                postState: accessibilityActSource.reread(target), actedHandle: handle,
-                extra: ["focus_verified": .bool(focused)])
+                error: outcome == .performed ? nil : "focus_refused", target: target,
+                postState: accessibilityActSource.reread(target), actedHandle: handle)
         case .click, .select, .toggle:
             // Background: pressing something whose job is to open a menu would
             // pop that menu over the person's screen. It needs the front.
@@ -1981,14 +1938,15 @@ var effect: [String: JSONValue] = [
             }
             if let continuation = MacWorkContinuation.current, continuation.isPending {
                 var typingMethod = "ax_selected_text"
+                var expected: String?
                 let inputStartCount = MacDriverContext.binding?.inputCount ?? 0
-                func continuationResult(_ error: String?, delivered: Bool = false, verified: Bool = false) -> MacActPerformed {
+                func continuationResult(_ error: String?, delivered: Bool = false) -> MacActPerformed {
                     let posted = (MacDriverContext.binding?.inputCount ?? inputStartCount) - inputStartCount
                     return MacActPerformed(ok: error == nil, method: delivered || posted > 0 ? typingMethod : "none",
                         requestedAction: "type", fallbackReason: nil, error: error, target: target,
                         postState: delivered || posted > 0 ? accessibilityActSource.reread(target) : nil, actedHandle: handle,
-                        extra: ["text_value_verified": .bool(verified), "ax_delivered": .bool(delivered),
-                                "posted_events": .int(Int64(posted))])
+                        extra: ["ax_delivered": .bool(delivered),
+                                "posted_events": .int(Int64(posted))], expectedText: expected)
                 }
                 guard continuation.app?.processIdentifier == framePid,
                       continuation.focusPath == entry.path,
@@ -1997,7 +1955,7 @@ var effect: [String: JSONValue] = [
                       continuation.refusal() == nil else {
                     return continuationResult("stale_continuation_target")
                 }
-                let expected = before.inserting(text)
+                expected = before.inserting(text)
                 guard !Task.isCancelled else { return continuationResult("cancelled") }
                 if keystrokes {
                     typingMethod = background ? "keystroke_to_pid" : "keystroke_injection"
@@ -2039,17 +1997,12 @@ var effect: [String: JSONValue] = [
                             noteActuation("type")
                         }
                     }
-                    let verified = await waitForTextInput(
-                        pid: framePid, target: target, value: expected, changedFrom: before,
-                        requiresFrontmost: !background
-                    ) != nil
-                    return continuationResult(verified ? nil : "typed_value_mismatch", verified: verified)
+                    return continuationResult(nil)
                 }
                 let outcome = ledgeredSetSelectedText(target, text: text)
                 switch outcome {
                 case .performed:
-                    let verified = accessibilityActSource.textInput(target)?.value == expected
-                    return continuationResult(verified ? nil : "continuation_insertion_unverified", delivered: true, verified: verified)
+                    return continuationResult(nil, delivered: true)
                 case .unsupported:
                     return continuationResult("selection_insertion_unsupported")
                 case .invalidTarget:
@@ -2211,16 +2164,14 @@ var effect: [String: JSONValue] = [
             }
             if let refusal = refuseInput("type") { return refusal }
             let replacesField = ["AXTextField", "AXComboBox", "AXSearchField"].contains(target.role)
-            var beforeTyping = input
             if replacesField, input.selection != NSRange(location: 0, length: input.value.utf16.count) {
                 noteActuation("select_all")
                 for event in MacEventPlanner.chord(MacKeyChord(modifiers: .command, keyCode: 0x00, source: "cmd+a")) {
                     eventSink.post(key: event)
                 }
-                guard let selectedInput = await waitForTextInput(pid: framePid, target: input.target, selectedAll: true) else {
+                guard await waitForTextInput(pid: framePid, target: input.target, selectedAll: true) != nil else {
                     return typingFailure("text_selection_not_ready")
                 }
-                beforeTyping = selectedInput
             }
             if let refusal = refuseInput("type") { return refusal }
             for event in MacEventPlanner.typeText(text) {
@@ -2234,11 +2185,6 @@ var effect: [String: JSONValue] = [
                 eventSink.post(key: event)
             }
             let expectedValue = replacesField ? text : input.inserting(text)
-            guard await waitForTextInput(
-                pid: framePid, target: input.target, value: expectedValue, changedFrom: beforeTyping
-            ) != nil else {
-                return typingFailure("typed_value_mismatch")
-            }
             return MacActPerformed(
                 ok: true,
                 method: "keystroke_injection",
@@ -2251,8 +2197,7 @@ var effect: [String: JSONValue] = [
                 extra: [
                     "focus_method": .string(focusMethod),
                     "text_character_count": .int(Int64(text.count)),
-                    "text_value_verified": .bool(true),
-                ]
+                ], expectedText: expectedValue
             )
 
         case .dismiss:

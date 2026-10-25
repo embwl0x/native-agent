@@ -1,8 +1,12 @@
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatToolRuntime
 import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+
+// Blueprint: | `HumanConversationReplyService.swift` | `HumanConversationReplyService.reply`: explicit assistant replies through transcript and delivery owners; claim before mutation and no automatic replay |
 
 /// Explicit replies reuse the established assistant transcript and completion delivery owners.
 /// No provider call and no synthetic human message is involved.
@@ -66,7 +70,7 @@ public actor HumanConversationReplyService {
         }
         do {
             try await append(id, expected, text, deliveryID)
-            let response = ChatOrchestration.ChatResponse(runId: deliveryID, model: "explicit-assistant-reply",
+            let response = ChatTurnRuntime.ChatResponse(runId: deliveryID, model: "explicit-assistant-reply",
                                                          output: text, sessionId: id)
             try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: requestDigest)
             let delivery = await AgentBridgeCompletionRouter.deliver(deliveryId: deliveryID,

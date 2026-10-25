@@ -1,13 +1,5 @@
-// E6 (upgrade-sweep 2026-08): one freshness badge for every screen that renders
-// a Mac-owned iCloud snapshot.
-//
-// `StatusConnectionPresentation` (AdvancedView.swift) already had the staleness
-// contract and the copy, but only AdvancedView and WorkshopView consumed it, so
-// Desk / Memory / Approvals / Inbox / Knowledge Graph / Autonomy rendered an
-// overnight-stale snapshot exactly like a measured-empty one. This lifts the
-// existing presentation into one shared note — no new staleness rules. Pages
-// mount it under their header with `AlivePage(freshnessGroup:)` or
-// `AliveFreshnessNote(group:)` (AliveKit.swift).
+// Pages share StatusConnectionPresentation's freshness policy through
+// AlivePage(freshnessGroup:) or AliveFreshnessNote(group:).
 import SwiftUI
 import NativeAgentShared
 
@@ -23,15 +15,8 @@ enum MacSnapshotGroupStaleness {
     }
 }
 
-/// The page note's words and patience: iCloud delivery is not instant, so a
-/// page only calls itself old after a few minutes, and says so plainly.
+/// The page note's words; StatusConnectionPresentation owns classification.
 enum MacSnapshotPageFreshness {
-    static let staleAfter: TimeInterval = 5 * 60
-
-    static func state(lastSyncedAt: Date?, now: Date = Date()) -> StatusConnectionPresentation.SyncState {
-        StatusConnectionPresentation.syncState(lastSyncedAt: lastSyncedAt, now: now, staleAfter: staleAfter)
-    }
-
     /// "12 minutes", "2 hours", "3 days".
     static func spokenAge(_ interval: TimeInterval) -> String {
         let seconds = max(0, Int(interval))
@@ -62,7 +47,7 @@ struct MacSnapshotFreshnessBadge: View {
 
     var body: some View {
         TimelineView(MacSnapshotFreshnessSchedule(lastSyncedAt: lastSyncedAt, fixed: staleGroupReason != nil)) { context in
-            let state = MacSnapshotPageFreshness.state(lastSyncedAt: lastSyncedAt, now: context.date)
+            let state = StatusConnectionPresentation.syncState(lastSyncedAt: lastSyncedAt, now: context.date)
             // A named group failure outranks age: a Mac that published five
             // seconds ago can still have failed to rebuild THIS group.
             let title = staleGroupReason ?? MacSnapshotPageFreshness.line(for: state)
@@ -98,10 +83,10 @@ struct MacSnapshotFreshnessSchedule: TimelineSchedule {
                         let unit: TimeInterval = showsFreshAge && age < 60 ? 15 : age < 3_600 ? 60 : age < 86_400 ? 3_600 : 86_400
                         if age < -60 { next = lastSyncedAt.addingTimeInterval(-60) }
                         else {
-                            let threshold = lastSyncedAt.addingTimeInterval(MacSnapshotPageFreshness.staleAfter)
+                            let threshold = lastSyncedAt.addingTimeInterval(StatusConnectionPresentation.staleAfter)
                             let stale = Date(timeIntervalSinceReferenceDate: threshold.timeIntervalSinceReferenceDate.nextUp)
                             let changedText = lastSyncedAt.addingTimeInterval(max(unit, (floor(age / unit) + 1) * unit))
-                            next = age <= MacSnapshotPageFreshness.staleAfter
+                            next = age <= StatusConnectionPresentation.staleAfter
                                 ? (showsFreshAge ? min(changedText, stale) : stale) : changedText
                         }
                     }

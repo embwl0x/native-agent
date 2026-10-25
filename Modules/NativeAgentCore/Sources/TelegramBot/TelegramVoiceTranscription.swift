@@ -6,6 +6,7 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import NativeAgentShared
+// Blueprint: | `TelegramVoiceTranscription.swift` | Telegram voice transcription and system-temp audio preparation/cleanup outside the data root; temporary audio is excluded from backup/export/phone sync and the PrivacyMap telegram tree |
 
 // MARK: - Telegram voice transcription
 
@@ -190,6 +191,8 @@ struct TelegramPreparedVoiceAudio: Sendable {
     }
 }
 
+/// Owns system-temp audio outside the data root; cleaned after use, never
+/// backed up, exported or synced. PrivacyMap's telegram tree does not count it.
 enum TelegramVoiceAudioPreparer {
     static let speechReadableExtensions: Set<String> = ["aif", "aiff", "caf", "m4a", "mp3", "mp4", "wav"]
 
@@ -423,11 +426,24 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
         // returning here makes the Telegram failure/card path immediate while
         // ensuring this headless surface never reaches a prompting API.
         try validateSpeechAuthorization()
-        let prepared = try await TelegramVoiceAudioPreparer.prepareSpeechURL(attachment)
-        defer { prepared.cleanup() }
-
         let started = Date()
-        let utterance = try await recognize(url: prepared.url)
+        // Conversion and recognition together have one real deadline: it
+        // answers on time without waiting for work that ignores cancellation,
+        // so one slow note never holds the Telegram line.
+        let utterance: SpeechUtterance
+        // The body's own error rides back typed (a permission denial keeps the note).
+        switch await raceAgainstTimeout(seconds: Double(timeoutNanoseconds) / 1_000_000_000, { [self] () async -> Result<SpeechUtterance, Error> in
+            do {
+                let prepared = try await TelegramVoiceAudioPreparer.prepareSpeechURL(attachment)
+                defer { prepared.cleanup() }
+                return .success(try await self.recognizeWithoutTimeout(url: prepared.url))
+            } catch { return .failure(error) }
+        }) {
+        case .value(let result): utterance = try result.get()
+        case .timedOut: throw TelegramVoiceTranscriptionError.speechRecognitionFailed("timed out")
+        case .failure(let message): throw TelegramVoiceTranscriptionError.speechRecognitionFailed(message)
+        case .cancelled: throw CancellationError()
+        }
         let elapsed = max(0, Int(Date().timeIntervalSince(started) * 1000))
         return TelegramVoiceTranscription(
             utterance: utterance,
@@ -435,23 +451,6 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
             model: TelegramVoiceTranscriptionBackends.appleSpeechModel,
             latencyMilliseconds: elapsed
         )
-    }
-
-    private func recognize(url: URL) async throws -> SpeechUtterance {
-        try await withThrowingTaskGroup(of: SpeechUtterance.self) { group in
-            group.addTask {
-                try await self.recognizeWithoutTimeout(url: url)
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: self.timeoutNanoseconds)
-                throw TelegramVoiceTranscriptionError.speechRecognitionFailed("timed out")
-            }
-            guard let text = try await group.next() else {
-                throw TelegramVoiceTranscriptionError.speechRecognitionFailed("no recognition result")
-            }
-            group.cancelAll()
-            return text
-        }
     }
 
     private func recognizeWithoutTimeout(url: URL) async throws -> SpeechUtterance {

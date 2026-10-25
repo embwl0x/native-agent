@@ -3,18 +3,15 @@ import Foundation
 import Cognition
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `MacSyncMobileNotificationRelay.swift` | Sole notifications/push_tokens.json mutation owner: alert registration/pruning, work-activity registration and locked delivery reservations/outcomes; APNs supplies only the send effect; no duplicate mobile_push/tokens.json writes |
 
 public struct MacSyncMobileNotificationRelay: Sendable {
     unowned let sync: DeviceSync
 
-    private enum PushTokenStoreError: LocalizedError {
-        case invalidTopLevel(path: URL, expected: String)
-
+    private struct PushTokenStoreError: LocalizedError {
+        let path: URL
         var errorDescription: String? {
-            switch self {
-            case .invalidTopLevel(let path, let expected):
-                return "Existing push-token store \(path.lastPathComponent) is not a \(expected); registration was not changed."
-            }
+            "Existing push-token store \(path.lastPathComponent) is not a JSON object; registration was not changed."
         }
     }
 
@@ -27,28 +24,14 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws {
         let now = ISO8601DateFormatter().string(from: Date())
-        let path = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("push_tokens.json")
+        let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
         let persistence = SwiftNativePersistenceCore()
-        let legacyPath = dataRoot
-            .appendingPathComponent("mobile_push", isDirectory: true)
-            .appendingPathComponent("tokens.json")
-        // One registration owns both projections. Separate per-file locks can
-        // interleave two rotations of the same APNs token and leave canonical
-        // and compatibility stores naming different devices. Reading both
-        // before either write also makes malformed existing authority
-        // fail-closed instead of silently replacing it with a one-row store.
-        let registrationLock = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("push-token-registration")
+        let registrationLock = dataRoot.appendingPathComponent("notifications/push-token-registration")
         try await persistence.withFileLock(registrationLock) {
             var root = try readObjectStore(path)
-            var rows = try readArrayStore(legacyPath)
             // A push token is one device credential. When APNs reassigns or a
             // restored phone presents an existing token under a new device id,
-            // retain only the newest owner in BOTH canonical and compatibility
-            // stores; otherwise fan-out can target a stale device identity.
+            // retain only the newest owner in the canonical map.
             root = root.filter { existingDeviceID, value in
                 guard existingDeviceID != deviceId,
                       case .object(let existing) = value else { return true }
@@ -64,26 +47,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             entry["bundleId"] = .string(bundleId)
             entry["lastSeen"] = .string(now)
             root[deviceId] = .object(entry)
-            let legacyEntry: [String: JSONValue] = [
-                "deviceId": .string(deviceId),
-                "pairedDeviceID": .string(pairedDeviceID),
-                "token": .string(token),
-                "environment": .string(environment),
-                "bundleId": .string(bundleId),
-                "updatedAt": .string(now),
-            ]
-            // Remove every stale match before appending the one current owner.
-            // Replacing rows in place preserved pre-existing duplicates.
-            rows.removeAll { value in
-                guard case .object(let row) = value else { return false }
-                let existingDeviceId = jsonString(row["deviceId"]) ?? jsonString(row["device_id"])
-                let existingToken = jsonString(row["token"])
-                return existingDeviceId == deviceId || existingToken == token
-            }
-            rows.append(.object(legacyEntry))
-
             try await persistence.writeJSON(.object(root), to: path)
-            try await persistence.writeJSON(.array(rows), to: legacyPath)
         }
     }
 
@@ -93,19 +57,14 @@ public struct MacSyncMobileNotificationRelay: Sendable {
     /// registered before that moment: a phone that re-registered the same
     /// token since keeps it. A live phone re-registers on launch.
     static func prunePushToken(_ token: String, unregisteredAt: Date, dataRoot: URL) async throws {
-        let notifications = dataRoot.appendingPathComponent("notifications", isDirectory: true)
-        let path = notifications.appendingPathComponent("push_tokens.json")
-        let legacyPath = dataRoot
-            .appendingPathComponent("mobile_push", isDirectory: true)
-            .appendingPathComponent("tokens.json")
+        let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
         let persistence = SwiftNativePersistenceCore()
         @Sendable func registeredBefore(_ stamp: JSONValue?) -> Bool {
             guard let text = jsonString(stamp), let date = ISO8601DateFormatter().date(from: text) else { return false }
             return date < unregisteredAt
         }
-        try await persistence.withFileLock(notifications.appendingPathComponent("push-token-registration")) {
+        try await persistence.withFileLock(dataRoot.appendingPathComponent("notifications/push-token-registration")) {
             var root = try readObjectStore(path)
-            let rows = try readArrayStore(legacyPath)
             var rootChanged = false
             for (deviceID, value) in root {
                 guard case .object(var entry) = value, jsonString(entry["token"]) == token,
@@ -114,15 +73,8 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                 root[deviceID] = .object(entry)
                 rootChanged = true
             }
-            let keptRows = rows.filter { value in
-                guard case .object(let row) = value else { return true }
-                return !(jsonString(row["token"]) == token && registeredBefore(row["updatedAt"]))
-            }
             if rootChanged {
                 try await persistence.writeJSON(.object(root), to: path)
-            }
-            if keptRows.count != rows.count {
-                try await persistence.writeJSON(.array(keptRows), to: legacyPath)
             }
         }
     }
@@ -131,7 +83,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         guard FileManager.default.fileExists(atPath: path.path) else { return [:] }
         let value = try JSONValue.parse(Data(contentsOf: path))
         guard case .object(let object) = value else {
-            throw PushTokenStoreError.invalidTopLevel(path: path, expected: "JSON object")
+            throw PushTokenStoreError(path: path)
         }
         return object
     }
@@ -189,13 +141,114 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         }
     }
 
-    private static func readArrayStore(_ path: URL) throws -> [JSONValue] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        let value = try JSONValue.parse(Data(contentsOf: path))
-        guard case .array(let array) = value else {
-            throw PushTokenStoreError.invalidTopLevel(path: path, expected: "JSON array")
-        }
-        return array
+    func sendWorkActivities(_ rows: [MobileWorkActivity], dataRoot: URL) async -> [String] {
+        do {
+            let config = try SwiftNativeAPNSSender.APNSConfig.load(from: dataRoot)
+            guard let pairing = try PairingSecretManager.existingSecretBase64() else { return [] }
+            let fingerprint = WorkActivityPushRegistration.fingerprint(pairing)
+            let persistence = SwiftNativePersistenceCore()
+            let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
+            let lock = dataRoot.appendingPathComponent("notifications/push-token-registration")
+            let value = try await persistence.readJSON(path, ifMissing: .object([:]))
+            guard case .object(let root) = value else { throw CocoaError(.propertyListReadCorrupt) }
+            let jwt = try await sync.apns.providerToken(keyId: config.keyId, teamId: config.teamId, keyPath: config.keyPath)
+            var errors: [String] = []
+            for (deviceID, value) in root.sorted(by: { $0.key < $1.key }) {
+                guard case .object(let entry) = value,
+                      let original = try WorkActivityPushRegistration.read(entry["workActivity"]),
+                      original.pairing == fingerprint else { continue }
+                let ids = Set(rows.map(\.id))
+                let eligibleStartIDs = Set(rows.filter { !$0.content.state.isTerminal && $0.staleDate > Date() }.map(\.id))
+                // Cleanup also runs with no current rows or with opt-in revoked.
+                try await persistence.withFileLock(lock) {
+                    let latest = try await persistence.readJSON(path, ifMissing: .object([:]))
+                    guard case .object(var root) = latest, case .object(var entry)? = root[deviceID],
+                          var registration = try WorkActivityPushRegistration.read(entry["workActivity"]),
+                          registration.pairing == fingerprint else { return }
+                    registration.retireInactiveStarts(activeIDs: eligibleStartIDs, now: Date())
+                    entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
+                    root[deviceID] = .object(entry)
+                    try await persistence.writeJSON(.object(root), to: path)
+                }
+                guard original.enabled else { continue }
+                let removed = original.activityTokens.keys.filter { !ids.contains($0) }.compactMap { id -> MobileWorkActivity? in
+                    guard var content = original.lastContents[id] else { return nil }
+                    content.state = .unknown
+                    content.status = "Tracking ended — open the app"
+                    content.updatedAt = Date()
+                    return MobileWorkActivity(id: id, sessionID: nil, startedAt: content.updatedAt, content: content)
+                }
+                for row in rows + removed {
+                    if Task.isCancelled { return errors }
+                    let failure: String? = try await persistence.withFileLock(lock) {
+                        let latest = try await persistence.readJSON(path, ifMissing: .object([:]))
+                        guard case .object(var root) = latest, case .object(var entry)? = root[deviceID],
+                              var registration = try WorkActivityPushRegistration.read(entry["workActivity"]),
+                              registration.enabled, registration.pairing == fingerprint,
+                              let currentPairing = try PairingSecretManager.existingSecretBase64(),
+                              WorkActivityPushRegistration.fingerprint(currentPairing) == fingerprint else { return nil }
+                        if registration.lastContents[row.id] == row.content { return nil }
+                        if let previous = registration.lastContents[row.id], previous.updatedAt > row.content.updatedAt { return nil }
+                        let token: String
+                        let event: String
+                        if let activityToken = registration.activityTokens[row.id] {
+                            token = activityToken
+                            event = row.content.state.isTerminal || !ids.contains(row.id) ? "end" : "update"
+                        } else {
+                            guard ids.contains(row.id), !row.content.state.isTerminal, row.staleDate > Date(),
+                                  !registration.startedIDs.contains(row.id), let startToken = registration.startToken else { return nil }
+                            token = startToken; event = "start"
+                        }
+                        if event == "start" {
+                            // Reserve before the external effect. A lost response or failed
+                            // final write leaves an unknown start that must not be replayed.
+                            registration.startedIDs.insert(row.id)
+                            if registration.startOutcomes == nil { registration.startOutcomes = [:] }
+                            registration.startOutcomes?[row.id] = .unknown
+                            if registration.startReservations == nil { registration.startReservations = [:] }
+                            registration.startReservations?[row.id] = .init(retainedAt: Date(), expiresAt: row.staleDate)
+                            entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
+                            root[deviceID] = .object(entry)
+                            try await persistence.writeJSON(.object(root), to: path)
+                        }
+                        let failure = try await sync.apns.sendWorkActivity(row, event: event, token: token, registration: registration, jwt: jwt)
+                        if let failure {
+                            if event == "start" {
+                                // Only an explicit provider rejection permits another start.
+                                registration.startedIDs.remove(row.id)
+                                registration.startOutcomes?.removeValue(forKey: row.id)
+                                registration.startReservations?.removeValue(forKey: row.id)
+                            } else if failure.tokenIsInvalid {
+                                registration.activityTokens.removeValue(forKey: row.id)
+                                // Keep the start reservation: an invalid update
+                                // token does not authorize a duplicate start.
+                            }
+                            if event == "start" || failure.tokenIsInvalid {
+                                entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
+                                root[deviceID] = .object(entry)
+                                try await persistence.writeJSON(.object(root), to: path)
+                            }
+                            return failure.message
+                        }
+                        registration.lastContents[row.id] = row.content
+                        if event == "start" { registration.startOutcomes?[row.id] = .accepted }
+                        if event == "end" { registration.activityTokens.removeValue(forKey: row.id) }
+                        registration.retireInactiveStarts(activeIDs: eligibleStartIDs, now: Date())
+                        entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
+                        root[deviceID] = .object(entry)
+                        try await persistence.writeJSON(.object(root), to: path)
+                        return nil
+                    }
+                    if let failure { errors.append(failure) }
+                }
+            }
+            return errors
+        } catch { return [error.localizedDescription] }
+    }
+
+    struct WorkActivityRejection: Sendable {
+        let message: String
+        let tokenIsInvalid: Bool
     }
 
     @discardableResult

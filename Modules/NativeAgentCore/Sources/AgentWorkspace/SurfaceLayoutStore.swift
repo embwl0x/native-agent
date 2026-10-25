@@ -5,6 +5,7 @@ import NativeAgentShared
 import Observation
 import os
 import PersistenceCore
+// Blueprint: | `SurfaceLayoutStore.swift` | Root-scoped layout store and `SurfaceLayoutLive`; the engine's one observed layout feeds Mac, DeviceSync, quiet Today, page index and live tour stops. `read`/`write` validate one shape/version and preserve replaced bytes; chat fold writes route through `setSurfaceExpanded`. Snapshot reads publish through `LatestRead`; PrivacyMap inventories the whole ui directory, including the previous revision. |
 
 /// HOW THE APP LAYS OUT ITS SURFACES, as one file she can read and rewrite:
 /// ui/layout.json (`SurfaceLayout`). The window's views, her home and the
@@ -14,6 +15,7 @@ import PersistenceCore
 /// build's seed when that changed. A block a newer build adds lands at its
 /// seed position. Cloned from `AgentRecipeStore`; every call names the
 /// host's data root, and what is cached is that root's.
+/// Current/previous layouts: off-disk backup only; phone projects the current ui_layout.json. PrivacyMap lists ui/.
 public enum SurfaceLayoutStore {
     private struct Loaded: Sendable {
         var root: URL
@@ -23,6 +25,7 @@ public enum SurfaceLayoutStore {
         var stamp: String
         /// Why the file doesn't read as a layout and how to fix it; nil when it does.
         var problem: String?
+        var hasValidatedFile = false
     }
 
     /// By data root: a test copy or presentation host never reads or seeds another's.
@@ -47,7 +50,10 @@ public enum SurfaceLayoutStore {
                 })),
             ]
             if let previous = try? JSONValue.parse(Data(contentsOf: previous(state.root))) { result["previous"] = previous }
-            if let problem = state.problem { result["problem"] = .string(problem) }
+            result["layout_source"] = .string(state.hasValidatedFile ? "validated_file" : "seed_in_memory")
+            if let problem = state.problem {
+                result.merge(invalidFile(state, detail: problem).objectValue ?? [:]) { _, failure in failure }
+            }
             return .object(result)
         }
     }
@@ -68,7 +74,7 @@ public enum SurfaceLayoutStore {
                 return try CredentialFileLock.withLock(file) {
                     refresh(&state)
                     // A file that does not read is fixed by hand, never written over.
-                    if let problem = state.problem { return refused("invalid_file", problem) }
+                    if let problem = state.problem { return invalidFile(state, detail: problem) }
                     if case .object(let receipt) = receipt, receipt["version"] != .string(version(state.layout)) {
                         return refused("stale_layout", "The layout changed after that receipt. Read it again with layout.read.")
                     }
@@ -103,27 +109,38 @@ public enum SurfaceLayoutStore {
                     if let restored { receipt["restored_version"] = .int(Int64(restored)) }
                     return .object(receipt)
                 }
-            } catch { return refused("write_failed", "\(file.path) could not be written: \(error.localizedDescription).") }
+            } catch {
+                let failure = error as? ToolFailureError
+                let call = failure?.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+                    ?? .object(["tool": .string("app"), "input": .object(["action": .string("layout.read")])])
+                return .object(["status": .string(failure?.status.rawValue ?? "failed"),
+                    "reason": .string(failure?.code ?? "layout_write_failed"),
+                    "detail": .string(failure?.message ?? "\(file.path) could not be written: \(error.localizedDescription)."),
+                    "effects": .string(failure?.effects.rawValue ?? "unknown"),
+                    "remedy": Repair.reconcile(instruction: failure?.instruction ?? "Read the layout and backup before another write; fix the reported storage error.", nextCall: call)])
+            }
         }
     }
 
     /// The person opened or closed a fold: written as a write is (version
     /// bumped, the replaced one kept), under source "person".
-    public static func setExpanded(_ open: Bool, surface: String, block: String, dataRoot: URL) {
+    @discardableResult
+    public static func setExpanded(_ open: Bool, surface: String, block: String, dataRoot: URL) -> SurfaceLayout? {
         withLoaded(dataRoot) { state in
             let file = file(state.root)
             do {
-                try CredentialFileLock.withLock(file) {
+                return try CredentialFileLock.withLock(file) {
                     refresh(&state)
                     guard state.problem == nil, var blocks = state.layout.surfaces[surface],
                           let index = blocks.firstIndex(where: { $0.name == block }), blocks[index].expanded != nil,
-                          blocks[index].expanded != open else { return }
+                          blocks[index].expanded != open else { return nil }
                     blocks[index].expanded = open
                     var next = state.layout
                     next.surfaces[surface] = blocks
-                    _ = try commit(next, over: &state, source: "person")
+                    return try commit(next, over: &state, source: "person")
                 }
             } catch { nativeLog("SurfaceLayoutStore: %@ could not be written: %@", file.path, error.localizedDescription) }
+            return nil
         }
     }
 
@@ -136,23 +153,62 @@ public enum SurfaceLayoutStore {
         saved.source = source
         saved.digest = content(saved).digest
         let file = file(state.root)
-        if let replaced = try? Data(contentsOf: file) { try SwiftNativePersistenceCore.writeDataAtomicDurable(replaced, to: previous(state.root)) }
-        try write(saved, to: file)
+        let replaced: Data
+        do { replaced = try Data(contentsOf: file) }
+        catch {
+            throw ToolFailureError("Cannot read \(file.path) for its backup: \(error.localizedDescription). No write was attempted.",
+                effects: .none, nextCall: ToolFailureError.call("app", ["action": .string("layout.read")]),
+                code: "layout_backup_read_failed", instruction: "Restore read access to the layout before changing it.", recovery: .reconcile)
+        }
+        let backup = previous(state.root)
+        do { try SwiftNativePersistenceCore.writeDataAtomicDurable(replaced, to: backup) }
+        catch {
+            throw ToolFailureError("Backup write failed at \(backup.path): \(error.localizedDescription). The backup may have changed; layout replacement was not attempted.",
+                effects: .unknown, nextCall: ToolFailureError.call("app", ["action": .string("layout.read")]),
+                code: "layout_backup_write_failed", instruction: "Inspect the backup and fix the reported storage error before another write.", recovery: .reconcile)
+        }
+        do { try write(saved, to: file) }
+        catch {
+            throw ToolFailureError("The previous layout was saved at \(backup.path); replacing \(file.path) failed: \(error.localizedDescription). The on-disk layout is unverified.",
+                effects: .partial, nextCall: ToolFailureError.call("app", ["action": .string("layout.read")]),
+                code: "layout_replacement_failed", instruction: "Read the layout and backup before another change; fix the reported storage error.", recovery: .reconcile)
+        }
         state.layout = saved
         state.stamp = stamp(file)
         state.problem = nil
+        state.hasValidatedFile = true
         return saved
     }
 
     private static func refused(_ reason: String, _ detail: String) -> JSONValue {
-        .object(["status": .string("failed"), "reason": .string(reason), "changed": .bool(false), "detail": .string(detail + " Nothing was written.")])
+        .object(["status": .string("refused"), "reason": .string(reason), "changed": .bool(false), "effects": .string("none"), "detail": .string(detail),
+            "remedy": .object(["kind": .string("correct_arguments"), "instruction": .string("Read the current layout and its shape; correct the requested change."),
+                "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("layout.read")])])])])
+    }
+
+    private static func invalidFile(_ state: Loaded, detail: String) -> JSONValue {
+        let file = file(state.root)
+        return .object(["status": .string("failed"), "reason": .string("invalid_file"), "effects": .string("none"), "detail": .string(detail),
+            "remedy": Repair.remedy(owner: file.path, nextCall: nil, tap: nil,
+                instruction: ToolFailureError.fileRepairInstruction(file,
+                    shape: "The file must be a valid SurfaceLayout JSON object; use layout.read's blocks and profiles as the vocabulary.")
+                    + " Repair the saved layout while preserving its original bytes; layout.write is blocked until it validates.")])
     }
 
     /// The shape check, then the vocabulary: every surface, block and profile
     /// one this build knows, each block once, `expanded` exactly on a fold.
-    private static func validated(_ document: JSONValue) throws -> SurfaceLayout {
+    /// A file an older build wrote may name a surface, block or hidden entry
+    /// this build no longer has: those are dropped on read (`fromFile`), never
+    /// fatal. A write still refuses a name it does not know.
+    private static func validated(_ document: JSONValue, fromFile: Bool = false) throws -> SurfaceLayout {
         var layout = try document.decodedExactly(as: SurfaceLayout.self)
         let known = Dictionary(uniqueKeysWithValues: SurfaceLayout.vocabulary.map { ($0.surface, $0.blocks.map(\.name)) })
+        if fromFile {
+            layout.surfaces = layout.surfaces.filter { known[$0.key] != nil }
+            for (surface, blocks) in layout.surfaces { layout.surfaces[surface] = blocks.filter { known[surface]!.contains($0.name) } }
+            let named = Set(known.flatMap { surface, names in names.map { surface + "." + $0 } })
+            for name in layout.profiles.keys { layout.profiles[name]?.hidden.removeAll { !named.contains($0) } }
+        }
         func shape(_ text: String) -> JSONValue.ShapeError { JSONValue.ShapeError(description: text) }
         for (surface, blocks) in layout.surfaces.sorted(by: { $0.key < $1.key }) {
             guard let names = known[surface] else {
@@ -183,9 +239,8 @@ public enum SurfaceLayoutStore {
     }
 
     private static func validated(file: URL) throws -> SurfaceLayout {
-        let document: JSONValue
-        do { document = try JSONValue.parse(Data(contentsOf: file)) } catch { throw JSONValue.ShapeError(description: "not JSON") }
-        return try validated(document)
+        let document = try JSONValue.parse(Data(contentsOf: file))
+        return try validated(document, fromFile: true)
     }
 
     /// What the person sees, without who wrote it when: what a version and the digest cover.
@@ -223,9 +278,11 @@ public enum SurfaceLayoutStore {
         do {
             state.layout = try validated(file: file)
             state.problem = nil
+            state.hasValidatedFile = true
         } catch {
-            state.problem = "\(SurfaceLayout.path) doesn't read as a layout: \(error). Fix the file, or delete it and relaunch to seed it again; "
-                + "until then the window keeps the layout it last read and layout.write is refused."
+            state.problem = "\(SurfaceLayout.path) is unavailable: \(error). "
+                + (state.hasValidatedFile ? "The window retains the last validated layout. " : "No valid layout file has been read; the window displays the in-memory seed. ")
+                + "The file is preserved and layout.write is blocked until it is repaired."
             nativeLog("SurfaceLayoutStore: %@", state.problem ?? "")
         }
     }
@@ -269,32 +326,46 @@ public enum SurfaceLayoutStore {
     }
 }
 
-/// The layout the window draws, re-read when ui/layout.json changes on disk
-/// (the `SimpleViewStore.watch` shape): her write, the person's fold or a
-/// hand edit re-renders every surface at once.
+/// One engine root's observed layout, shared by its windows and phone snapshot.
+/// Her write, the person's fold or a hand edit re-renders every surface at once.
 @MainActor @Observable
 public final class SurfaceLayoutLive {
-    public static let shared = SurfaceLayoutLive()
-    public private(set) var layout = SurfaceLayout.seed(from: "", at: "")
-    /// The host's data root, as the app resolved it (`attach`).
-    private var root: URL?
+    public private(set) var layout: SurfaceLayout
+    private let root: URL
+    @ObservationIgnored private var observation: Task<Void, Never>?
+    @ObservationIgnored private let snapshotRead = LatestRead()
 
-    private init() {}
-
-    /// At launch, before a window draws: the host's root and its layout.
-    public func attach(dataRoot: URL) async {
+    public nonisolated init(dataRoot: URL) {
         root = dataRoot
-        layout = await Task.detached { SurfaceLayoutStore.layout(dataRoot: dataRoot) }.value
+        _layout = SurfaceLayoutStore.layout(dataRoot: dataRoot)
     }
 
-    /// The window's one watch, for as long as it is up (`ContentView`).
-    public func watch() async {
-        guard let root else { return }
+    deinit { observation?.cancel() }
+
+    /// Each engine root starts its existing layout watch once, independent of windows.
+    public func start() {
+        let root = root
+        observation = Task { [weak self] in await Self.watch(root: root) { [weak self] in self } }
+    }
+
+    public func setExpanded(_ open: Bool, surface: String, block: String) async {
+        let root = root
+        let saved = await Task.detached { SurfaceLayoutStore.setExpanded(open, surface: surface, block: block, dataRoot: root) }.value
+        if let saved {
+            snapshotRead.write { layout = saved }
+        }
+    }
+
+    private static func watch(root: URL, projection: @MainActor () -> SurfaceLayoutLive?) async {
         let events = FileChangeEvents(paths: [SurfaceLayoutStore.file(root)], emitInitial: true)
         await withTaskCancellationHandler {
             for await _ in events.stream {
-                let next = await Task.detached { SurfaceLayoutStore.layout(dataRoot: root) }.value
-                if next != layout { layout = next }
+                guard let owner = projection() else { break }
+                await owner.snapshotRead.read {
+                    await Task.detached { SurfaceLayoutStore.layout(dataRoot: root) }.value
+                } publish: { next in
+                    if next != owner.layout { owner.layout = next }
+                }
             }
         } onCancel: { events.cancel() }
     }

@@ -49,13 +49,15 @@ func normalized(_ line: String) -> String {
         .replacingOccurrences(of: "\t", with: " ")
 }
 
-func productionFiles(repo: URL) -> [URL] {
-    let roots = [
-        "Sources/NativeAgentApp",
-        "Modules/NativeAgentCore/Sources",
-        "Modules/NativeAgentShared/Sources",
-        "iOS/NativeAgentMobile/Sources",
-    ]
+func productionFiles(repo: URL) throws -> [URL] {
+    struct Scope: Decodable { let sourceRoots: [String] }
+    let blueprint = try String(contentsOf: repo.appendingPathComponent("docs/ARCHITECTURE_BLUEPRINT.md"), encoding: .utf8)
+    let sections = blueprint.components(separatedBy: "```json architecture-policy\n")
+    guard sections.count == 2, let json = sections[1].components(separatedBy: "\n```").first,
+          sections[1].contains("\n```") else {
+        throw TimerInventoryError.invalidRule("blueprint must contain exactly one closed architecture-policy JSON block")
+    }
+    let roots = try JSONDecoder().decode(Scope.self, from: Data(json.utf8)).sourceRoots
     let fm = FileManager.default
     return roots.flatMap { relative -> [URL] in
         let root = repo.appendingPathComponent(relative, isDirectory: true)
@@ -71,12 +73,12 @@ func productionFiles(repo: URL) -> [URL] {
     }.sorted { $0.path < $1.path }
 }
 
-func occurrences(repo: URL) -> [(path: String, line: Int, source: String)] {
+func occurrences(repo: URL) throws -> [(path: String, line: Int, source: String)] {
     let canonicalRepo = repo.resolvingSymlinksInPath().standardizedFileURL
     let repoPrefix = canonicalRepo.path.hasSuffix("/")
         ? canonicalRepo.path
         : canonicalRepo.path + "/"
-    return productionFiles(repo: repo).flatMap { file -> [(String, Int, String)] in
+    return try productionFiles(repo: repo).flatMap { file -> [(String, Int, String)] in
         guard let body = try? String(contentsOf: file, encoding: .utf8) else { return [] }
         let canonicalFile = file.resolvingSymlinksInPath().standardizedFileURL.path
         guard canonicalFile.hasPrefix(repoPrefix) else { return [] }
@@ -126,7 +128,7 @@ while let argument = iterator.next() {
     }
 }
 
-let found = occurrences(repo: repo)
+let found = try occurrences(repo: repo)
 if printCandidates {
     for item in found {
         print("\(item.path):\(item.line)\t\(item.source)")

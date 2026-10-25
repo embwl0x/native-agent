@@ -2,12 +2,13 @@ import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import BackgroundLoops
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import PersistenceCore
 import ProviderRouting
-import SlackConnector
 import Transcripts
 import TurnTrace
+// Blueprint: | `SlackSocketModeLoop.swift` | `SlackSocketModeLoop` struct; `tick`, `tickOutcome`; session cancellation closes pending socket receives before draining passive work, while accepted human handlers continue under the journal. Reconnect gap fill, unhealthy-socket history polling and the healthy-socket missed-event backstop retain their existing intervals; history waits use the next poll deadline rather than sampling local state |
 
 /// One-way latch marking that a planned session recycle (not a failure)
 /// closed the socket. Same lock pattern as SlackPingContinuationGate below.
@@ -177,6 +178,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         // as a new one gets; the socket session never waits on or cancels it.
         do { try await reconcileSavedReplies() }
         catch { await recordError(context: "inbound_recovery", error: error) }
+        guard !Task.isCancelled else { return .skipped(reason: "Slack socket mode canceled") }
         return await socketTickOutcome()
     }
 
@@ -188,10 +190,13 @@ public struct SlackSocketModeLoop: LoopRunner {
                 "connectingAt": .string(Self.nowString()),
                 "lastError": .null,
             ])
+            try Task.checkCancellation()
             let socketURL = try await openSocketURL()
+            try Task.checkCancellation()
             await writeState([
                 "socketUrlOpenedAt": .string(Self.nowString()),
             ])
+            try Task.checkCancellation()
             let socket = session.webSocketTask(with: socketURL)
             socket.resume()
             // A4.8(a): planned session recycle. When the deadline fires it
@@ -262,6 +267,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                 }
             } catch {
                 socket.cancel(with: .goingAway, reason: nil)
+                try Task.checkCancellation()
                 if recycleFlag.didFire {
                     await writeState([
                         "connected": .bool(false),
@@ -273,7 +279,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                 }
                 throw error
             }
-        } catch is CancellationError {
+        } catch let error where error is CancellationError || Task.isCancelled {
             await writeState([
                 "connected": .bool(false),
                 "cancelledAt": .string(Self.nowString()),
@@ -300,7 +306,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                         "lastHistoryPollTrigger": .string("socket_open_failed"),
                         "lastHistoryPollError": .null,
                     ])
-                } catch is CancellationError {
+                } catch let error where error is CancellationError || Task.isCancelled {
                     // Loop is being stopped mid-fallback: report the
                     // cancellation, not a false loop failure (gpt-5.5 MED).
                     await writeState([
@@ -344,6 +350,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         socket: URLSessionWebSocketTask,
         recycleFlag: SlackSessionRecycleFlag
     ) async throws {
+        try Task.checkCancellation()
         let pingTask = Task {
             await pingUntilCancelled(socket: socket)
         }
@@ -353,7 +360,15 @@ public struct SlackSocketModeLoop: LoopRunner {
         // Every exit path drains the session's own children (ping, history);
         // accepted turns are not the session's and keep running.
         do {
-            try await receiveLoopBody(socket: socket)
+            try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                try await receiveLoopBody(socket: socket)
+            } onCancel: {
+                // Cancelling the Swift task must also wake a parked receive.
+                pingTask.cancel()
+                historyPollTask.cancel()
+                socket.cancel(with: .goingAway, reason: nil)
+            }
         } catch {
             await drainSessionWork(pingTask: pingTask, historyPollTask: historyPollTask)
             throw error
@@ -364,14 +379,15 @@ public struct SlackSocketModeLoop: LoopRunner {
     private func drainSessionWork(pingTask: Task<Void, Never>, historyPollTask: Task<Void, Never>) async {
         pingTask.cancel()
         historyPollTask.cancel()
-        await socketHealth.markDisconnected()
         await historyPollTask.value
         await pingTask.value
+        await socketHealth.markDisconnected()
     }
 
     private func receiveLoopBody(socket: URLSessionWebSocketTask) async throws {
         while !Task.isCancelled {
             let message = try await socket.receive()
+            try Task.checkCancellation()
             let json: JSONValue
             switch message {
             case .string(let string):
@@ -390,6 +406,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                 "lastWebSocketMessageAt": .string(Self.nowString()),
                 "lastWebSocketMessageType": .string(type.isEmpty ? "unknown" : type),
             ])
+            try Task.checkCancellation()
             switch type {
             case "hello":
                 await socketHealth.markConnected()
@@ -410,6 +427,7 @@ public struct SlackSocketModeLoop: LoopRunner {
             default:
                 let envelopeId = Self.string(obj["envelope_id"])
                 await recordEnvelope(envelope: obj, envelopeId: envelopeId)
+                try Task.checkCancellation()
                 guard let inbound = inboundMessage(fromEnvelope: obj) else {
                     if let envelopeId {
                         try await acknowledge(envelopeId: envelopeId, socket: socket)
@@ -446,13 +464,20 @@ public struct SlackSocketModeLoop: LoopRunner {
     /// a closing or recycled socket changes only the reply's delivery. It
     /// also never inherits the socket loop's utility priority.
     func spawnInboundHandling(_ inbound: SlackInboundMessage) async {
-        Task(priority: .userInitiated) { _ = await handleDurableInbound(inbound) }
+        _ = await startInboundHandling(inbound)
+    }
+
+    private func startInboundHandling(_ inbound: SlackInboundMessage) async -> AsyncStream<Bool> {
+        await deliveryJournal.startHandler(eventId: inbound.eventId) {
+            await handleClaimedInbound(inbound)
+        }
     }
 
     func claimInboundBeforeAcknowledging(
         _ inbound: SlackInboundMessage,
         acknowledge: @Sendable () async throws -> Void
     ) async throws -> SlackInboundClaimOutcome {
+        try Task.checkCancellation()
         let claim = try await deliveryJournal.claim(inbound)
         try await acknowledge()
         return claim
@@ -505,6 +530,7 @@ public struct SlackSocketModeLoop: LoopRunner {
             }
             do {
                 try await pollSlackHistoryOnce()
+                try Task.checkCancellation()
                 lastPollAt = Date()
                 await writeState([
                     "lastHistoryPollAt": .string(Self.nowString()),
@@ -792,10 +818,9 @@ public struct SlackSocketModeLoop: LoopRunner {
                 Self.string($1["ts"]) ?? "0"
             )
         }
-        // History delivery joins the session's tracked work so planned teardown
-        // gives accepted turns the same grace as socket delivery. Awaiting the
-        // result also lets the channel cursor advance only past messages the
-        // journal has settled. Active or failed delivery stops the watermark.
+        // The journal owns accepted turns across socket teardown. Awaiting its
+        // result lets the cursor advance only past settled messages; active or
+        // failed delivery stops the watermark.
         var watermark: String?
         var stalledOnFailure = false
         for message in ordered {
@@ -810,11 +835,8 @@ public struct SlackSocketModeLoop: LoopRunner {
                 "lastHistoryPollChannelId": .string(conversation.id),
                 "lastHistoryPollMessageTs": .string(inbound.ts),
             ])
-            let (results, completion) = AsyncStream<Bool>.makeStream()
-            Task(priority: .userInitiated) {
-                completion.yield(await handleDurableInbound(inbound))
-                completion.finish()
-            }
+            try Task.checkCancellation()
+            let results = await startInboundHandling(inbound)
             var delivered = false
             // Cancelling history collection stops this wait; the accepted turn
             // runs on under its own lifetime.
@@ -887,7 +909,9 @@ public struct SlackSocketModeLoop: LoopRunner {
             do {
                 try await Task.sleep(nanoseconds: 25_000_000_000)
                 try await sendPing(socket: socket)
+                try Task.checkCancellation()
                 await socketHealth.markAlive()
+                try Task.checkCancellation()
                 await writeState([
                     "connected": .bool(true),
                     "lastPingAt": .string(Self.nowString()),
@@ -964,19 +988,19 @@ public struct SlackSocketModeLoop: LoopRunner {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try JSONSerialization.data(withJSONObject: params)
         }
-        let (data, resp) = try await session.data(for: req)
-        let parsed = try JSONValue.parse(data)
-        guard case .object(let obj) = parsed else {
+        let parsed = try await SlackWebAPI.response(for: req, session: session)
+        guard parsed["error"] as? String != "non_json_response",
+              case .object(let obj) = JSONValue(fromFoundation: parsed) else {
             throw SlackSocketModeError.api("\(method) returned non-object JSON")
         }
-        if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
-            throw SlackSocketModeError.api("\(method) HTTP \(http.statusCode)")
+        if let status = parsed["httpStatus"] as? Int {
+            throw SlackSocketModeError.api("\(method) HTTP \(status)")
         }
         return obj
     }
 
     static func apiURL(_ method: String) -> URL {
-        SlackConnectorActions.apiURL(method)
+        SlackWebAPI.apiURL(method)
     }
 
     public func recoverReply(_ response: ChatResponse, originRunId: String,
@@ -1171,20 +1195,20 @@ public struct SlackSocketModeLoop: LoopRunner {
     /// deletion, visibility, and eventual consistency can all hide a post).
     @discardableResult
     func handleDurableInbound(_ inbound: SlackInboundMessage) async -> Bool {
+        guard await deliveryJournal.acquireHandler(eventId: inbound.eventId) else { return false }
+        let delivered = await handleClaimedInbound(inbound)
+        await deliveryJournal.releaseHandler(eventId: inbound.eventId)
+        return delivered
+    }
+
+    private func handleClaimedInbound(_ inbound: SlackInboundMessage) async -> Bool {
         let completion = SlackHandlingCompletion()
         let delivered = await Self.$deferAfterHandling.withValue({ operation in
             await completion.append(operation)
         }) {
-            await performDurableInbound(inbound)
+            await processDurableInbound(inbound)
         }
         await completion.finish()
-        return delivered
-    }
-
-    private func performDurableInbound(_ inbound: SlackInboundMessage) async -> Bool {
-        guard await deliveryJournal.acquireHandler(eventId: inbound.eventId) else { return false }
-        let delivered = await processDurableInbound(inbound)
-        await deliveryJournal.releaseHandler(eventId: inbound.eventId)
         return delivered
     }
 
@@ -1339,7 +1363,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                     dataRoot: dataRoot) else { return false }
                 let posted: JSONValue
                 do {
-                    posted = try await SlackConnectorActions.postMessage(input: input, dataRoot: dataRoot, tokenOverride: config.botToken)
+                    posted = try await SlackWebAPI.postMessage(input: input, dataRoot: dataRoot, tokenOverride: config.botToken)
                 } catch {
                     return await recordUnknownDelivery(inbound, detail: "Reply dispatch outcome is unknown: \(Self.redact(String(describing: error)))")
                 }
@@ -1373,7 +1397,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                     runId: record.assistantRunId, configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
                     dataRoot: dataRoot) else { return false }
                 do {
-                    guard Self.envelopeOK(try await SlackConnectorActions.uploadFile(input: uploadInput, dataRoot: dataRoot, tokenOverride: config.botToken)) else {
+                    guard Self.envelopeOK(try await SlackWebAPI.uploadFile(input: uploadInput, dataRoot: dataRoot, tokenOverride: config.botToken)) else {
                         return await recordUnknownDelivery(inbound, detail: "Text reply accepted; image completion is unconfirmed")
                     }
                 } catch {
@@ -1426,7 +1450,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                 "text": .string(trimmed),
             ]
             if let threadTs { input["thread_ts"] = .string(threadTs) }
-            let posted = (try? await SlackConnectorActions.postMessage(input: input, dataRoot: dataRoot, tokenOverride: botToken)).map(Self.envelopeOK) ?? false
+            let posted = (try? await SlackWebAPI.postMessage(input: input, dataRoot: dataRoot, tokenOverride: botToken)).map(Self.envelopeOK) ?? false
             if !posted { await memory.release(kind) }
         }
     }
@@ -1566,16 +1590,33 @@ public struct SlackSocketModeLoop: LoopRunner {
     }
 
     private enum AttachmentFailure: Error {
-        case unsupported, oversized, empty, limit, permanent, transient
+        case unsupported, oversized, empty, limit
+        case permanent(Int), transient(String)
+
+        var notice: String {
+            switch self {
+            case .unsupported:
+                return "attachment_unsupported: Expected an HTTPS JPEG, PNG, GIF or WebP image. Send a supported image or paste its text."
+            case .oversized:
+                return "attachment_oversized: Image exceeds the remaining byte limit (10 MB each, 20 MB total). Send a smaller image."
+            case .empty:
+                return "attachment_empty: Slack returned no bytes. Upload a nonempty image."
+            case .limit:
+                return "attachment_limit: At most four images and 20 MB total can be read. Send the remaining images in another message."
+            case .permanent(let status):
+                return "attachment_rejected: Slack download returned HTTP \(status). Check file access in Slack before sending it again."
+            case .transient(let detail):
+                return "attachment_download_failed: \(detail). Check the Slack connection before sending it again."
+            }
+        }
     }
 
     private struct AttachmentHydration {
-        static let noticeText = "Some attachments could not be read. Send JPEG, PNG, GIF, or WebP images up to 10 MB each, at most four images and 20 MB total, or paste the text."
         let inbound: SlackInboundMessage
-        let failures: [AttachmentFailure]
-        var hasTransientFailure: Bool { failures.contains { if case .transient = $0 { return true }; return false } }
+        let failures: [(index: Int, cause: AttachmentFailure)]
+        var hasTransientFailure: Bool { failures.contains { if case .transient = $0.cause { return true }; return false } }
         var notice: String? {
-            failures.isEmpty ? nil : Self.noticeText
+            failures.isEmpty ? nil : failures.map { "Attachment \($0.index + 1): \($0.cause.notice)" }.joined(separator: "\n")
         }
     }
 
@@ -1591,10 +1632,10 @@ public struct SlackSocketModeLoop: LoopRunner {
 
     private func hydratingAttachments(_ inbound: SlackInboundMessage) async -> AttachmentHydration {
         var attachments = inbound.attachments
-        var failures: [AttachmentFailure] = []
+        var failures: [(index: Int, cause: AttachmentFailure)] = []
         var remainingBytes = 20 * 1_024 * 1_024
         for (index, file) in inbound.files.enumerated() {
-            guard index < 4, remainingBytes > 0 else { failures.append(.limit); continue }
+            guard index < 4, remainingBytes > 0 else { failures.append((index, .limit)); continue }
             do {
                 let attachment = try await downloadInboundFile(
                     file,
@@ -1603,7 +1644,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                 remainingBytes -= attachment.byteSize
                 attachments.append(attachment)
             } catch {
-                failures.append((error as? AttachmentFailure) ?? .transient)
+                failures.append((index, (error as? AttachmentFailure) ?? .transient(Self.redact(error.localizedDescription))))
                 await writeState([
                     "lastInboundAttachmentErrorAt": .string(Self.nowString()),
                     "lastInboundAttachmentError": .string(String(describing: error)),
@@ -1611,7 +1652,7 @@ public struct SlackSocketModeLoop: LoopRunner {
             }
         }
         let text = !failures.isEmpty && (!inbound.text.isEmpty || !attachments.isEmpty)
-            ? inbound.text + "\n\n[Slack attachment notice: " + AttachmentHydration.noticeText + "]"
+            ? inbound.text + "\n\n[Slack attachment notice: " + failures.map { "Attachment \($0.index + 1): \($0.cause.notice)" }.joined(separator: "\n") + "]"
             : inbound.text
         let hydrated = SlackInboundMessage(
             eventId: inbound.eventId,
@@ -1634,7 +1675,7 @@ public struct SlackSocketModeLoop: LoopRunner {
     private func downloadInboundFile(
         _ file: SlackInboundFile,
         maximumBytes: Int
-    ) async throws -> ChatOrchestration.MultimodalAttachment {
+    ) async throws -> ChatTurnRuntime.MultimodalAttachment {
         let mime = file.mimeType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let supportedMIMEs: Set<String> = ["image/jpeg", "image/png", "image/gif", "image/webp"]
         guard supportedMIMEs.contains(mime),
@@ -1649,13 +1690,13 @@ public struct SlackSocketModeLoop: LoopRunner {
         request.setValue("Bearer \(config.botToken)", forHTTPHeaderField: "Authorization")
         let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
-            throw AttachmentFailure.transient
+            throw AttachmentFailure.transient("Slack returned a non-HTTP response")
         }
         if !(200..<300).contains(http.statusCode) {
             if (400..<500).contains(http.statusCode), ![408, 425, 429].contains(http.statusCode) {
-                throw AttachmentFailure.permanent
+                throw AttachmentFailure.permanent(http.statusCode)
             }
-            throw AttachmentFailure.transient
+            throw AttachmentFailure.transient("Slack download returned HTTP \(http.statusCode)")
         }
         if response.expectedContentLength > Int64(maximumBytes) {
             throw AttachmentFailure.oversized
@@ -1669,7 +1710,7 @@ public struct SlackSocketModeLoop: LoopRunner {
             data.append(byte)
         }
         guard !data.isEmpty else { throw AttachmentFailure.empty }
-        return ChatOrchestration.MultimodalAttachment(
+        return ChatTurnRuntime.MultimodalAttachment(
             type: "image",
             base64: data.base64EncodedString(),
             mime: mime,
@@ -1701,8 +1742,8 @@ public struct SlackSocketModeLoop: LoopRunner {
     }
 
     private static func uploadableImageAttachments(
-        _ attachments: [ChatOrchestration.MultimodalAttachment]
-    ) -> [ChatOrchestration.MultimodalAttachment] {
+        _ attachments: [ChatTurnRuntime.MultimodalAttachment]
+    ) -> [ChatTurnRuntime.MultimodalAttachment] {
         attachments.filter { attachment in
             attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
         }

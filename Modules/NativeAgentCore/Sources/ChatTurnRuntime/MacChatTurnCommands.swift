@@ -4,6 +4,9 @@ import NativeAgentCore
 import PersistenceCore
 import MemoryV2
 import TurnTrace
+import Transcripts
+
+// Blueprint: | `MacChatTurnCommands.swift` | `NativeChatTurnOptions` and `MacChatTurnRuntime`: shared Mac turn options, transcript commands and admission/Stop coordination |
 
 /// The two Mac chat entry points share their provider-facing tier setting.
 /// Core resolves the installation's persona for every door.
@@ -86,7 +89,8 @@ public extension MacChatTurnTranscriptPort {
     ) async throws -> Bool {
         guard try await archive(sessionId) != nil else { return false }
         let runningTask = macChatTurns.tasks[sessionId]
-        if runningTask != nil || macChatTurns.streamingSessions.contains(sessionId) {
+        // A reservation still reading admission (busy, no task yet) is stopped too.
+        if runningTask != nil || macChatTurns.streamingSessions.contains(sessionId) || macChatTurns.busySessions.contains(sessionId) {
             stopChatStream(sessionId: sessionId)
         }
         // Do not erase the reservation while its producer commits Stop proof.
@@ -236,18 +240,7 @@ public extension MacChatTurnRuntime {
         guard let safeSid = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             return (false, "Scratch write failed: invalid session id for scratch")
         }
-        let path = dataRoot.appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(safeSid, isDirectory: true)
-            .appendingPathComponent("scratch.json")
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            let current = try await persistence.readJSON(path, ifMissing: .object([:]))
-            var root: [String: JSONValue]
-            if case .object(let obj) = current { root = obj } else { root = [:] }
-            root[key] = .string(value)
-            try await persistence.writeJSON(.object(root), to: path)
-        }
+        try await ChatSessionScratch.write(dataRoot: dataRoot, sessionID: safeSid, key: key, value: value)
         return (true, "Scratch \(key) set")
     }
 

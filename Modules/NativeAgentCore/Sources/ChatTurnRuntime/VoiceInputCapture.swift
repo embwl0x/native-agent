@@ -3,6 +3,7 @@ import Observation
 import Speech
 import AVFoundation
 import NativeAgentShared
+// Blueprint: | `VoiceInputCapture.swift` | consent-driven native microphone lifecycle; shared SpeechUtterance recognition and original audio travel through existing chat attachments |
 
 /// Recognition events enter the capture lifecycle through the native driver.
 public enum VoiceInputRecognitionEvent: Equatable, Sendable {
@@ -23,11 +24,6 @@ public enum VoiceInputStopResult: Equatable, Sendable {
     public var transcriptForSubmission: String {
         guard case .final(let transcript) = self else { return "" }
         return transcript
-    }
-
-    public var isPartial: Bool {
-        if case .partial = self { return true }
-        return false
     }
 
     public var userFacingFailureMessage: String? {

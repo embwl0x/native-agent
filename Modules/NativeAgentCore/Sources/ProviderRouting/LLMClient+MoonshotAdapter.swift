@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `LLMClient+MoonshotAdapter.swift` | `MoonshotAdapter`: structured Chat Completions, vision/SSE and Kimi reasoning state across tool loops |
+
 /// First-class Moonshot/Kimi adapter over the provider's OpenAI-compatible
 /// Chat Completions surface. Unlike the generic API-key fallthrough, this
 /// preserves structured tool calls, vision inputs, SSE deltas, and Kimi's
@@ -135,7 +137,6 @@ public final class MoonshotAdapter: LLMAdapter {
                     let key = try self.apiKey()
                     var request = URLRequest(url: endpoint)
                     request.httpMethod = "POST"
-                    request.timeoutInterval = 300
                     request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
                     applyStreamingLLMHeaders(to: &request)
                     request.httpBody = try JSONSerialization.data(withJSONObject: await self.buildBody(
@@ -146,9 +147,7 @@ public final class MoonshotAdapter: LLMAdapter {
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
                     do {
-                        if ProviderStreamContext.stallOnly { request.timeoutInterval = .infinity }
-                        (bytes, response) = try await session.bytes(for: request)
-                        if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
+                        (bytes, response) = try await ProviderWire.open(session, request)
                     } catch {
                         throw mapTransportError(error, fallback: .transient(message: "connection failed: \(endpoint.host ?? "moonshot")"))
                     }
@@ -179,7 +178,7 @@ public final class MoonshotAdapter: LLMAdapter {
                     // and per tool-call delta (idle-clock liveness), ttft
                     // stamping on the first content delta, and the reasoning
                     // ledger.
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "Moonshot")
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "Moonshot", retainReasoning: true)
                     var sawContent = false
                     try await decoder.consume(SSEEventStream(bytes)) { frame in
                         if ttftMs == nil, frame.content != nil || frame.toolCallDeltaCount > 0 {

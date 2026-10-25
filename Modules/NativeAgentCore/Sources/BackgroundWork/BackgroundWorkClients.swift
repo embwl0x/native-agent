@@ -1,15 +1,17 @@
 import Foundation
 import NativeAgentCore
-import ChatOrchestration
+import ChatToolRuntime
 import PersonaEngine
 import MemoryV2
 import PersistenceCore
 import ProviderRouting
 import Cognition
+import DreamREMCycle
+// Blueprint: | `BackgroundWorkClients.swift` | `PersonaBackedBackgroundLLMClient` struct; `complete`, `completeMessages`; task-only context for `recall_judge`, `memory_interpret`, `memory_held`, and `kind_backfill`; other work honors caller-bound context assembly |
 
 // MARK: - Execution planner tool catalog injection
 //
-// The Executions module cannot import ChatOrchestration (it would create a
+// The Executions module cannot import ChatTurnRuntime (it would create a
 // dependency cycle / pull the whole tool stack into the planner), so the real
 // tool catalog that makes the planner TOOL-AWARE is injected from the app
 // layer here. Without this the planner's availableConnectorActions() returns
@@ -163,9 +165,10 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
         tools: [LLMToolSchema]?
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     let resolvedSystem = try await personaSystem(existing: system, surface: surface)
+                    try Task.checkCancellation()
                     for try await event in inner.streamMessages(
                         messages: messages,
                         system: resolvedSystem,
@@ -173,6 +176,7 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
                         surface: surface,
                         tools: tools
                     ) {
+                        try Task.checkCancellation()
                         continuation.yield(event)
                     }
                     continuation.finish()
@@ -180,13 +184,25 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
     private func personaSystem(existing: String?, surface: String) async throws -> String {
         let trimmedExisting = existing?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if Self.containsPersonaContext(trimmedExisting) {
+        // Memory judgment and classification are task-only by purpose. Reflection
+        // callers bind suppliedPersona where they actually assemble context.
+        let assembly: PrivateWorkContextAssembly = switch LLMCallContext.purpose {
+        case "recall_judge", "memory_interpret", "memory_held", "kind_backfill":
+            .taskOnly
+        default:
+            PrivateWorkContextAssembly.current
+        }
+        switch assembly {
+        case .suppliedPersona, .taskOnly:
             return trimmedExisting
+        case .compilePersona:
+            break
         }
 
         let persona = dataRoot.standardizedFileURL
@@ -206,8 +222,8 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
         let organismPosture = await cognitionRuntime.organismBehaviorPosture()?
             .privateRuntimeContext()
         let boundary = """
-        # Background Personality Context
-        You are doing app-owned NativeAgent background work for the user. Keep the same identity, voice, care, and boundaries as normal chat. Preserve each background loop's specific instructions below; do not dispatch actions or mutate identity unless that loop explicitly stages a reviewable proposal.
+        # Private background work
+        Work as yourself, with the same identity, voice, care and boundaries as in conversation. Follow the task below; this is not a message to the person. Do not dispatch actions or change identity; stage proposals only where the task permits.
         """
         var sections = [compiled, boundary]
         if let organismPosture, !organismPosture.isEmpty {
@@ -219,9 +235,6 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
         return sections.joined(separator: "\n\n")
     }
 
-    private static func containsPersonaContext(_ system: String) -> Bool {
-        system.contains("# SOUL") || system.contains("# Background Personality Context")
-    }
 }
 
 /// Secondary/test roots have no authority to borrow the process-global

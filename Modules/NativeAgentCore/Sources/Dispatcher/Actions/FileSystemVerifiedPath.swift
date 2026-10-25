@@ -7,6 +7,8 @@ import UniformTypeIdentifiers
 import Darwin
 #endif
 
+// Blueprint: | `FileSystemVerifiedPath.swift` | `VerifiedImageRead`: image delivery from already verified descriptor bytes; source dimensions and bounded-thumbnail receipts remain intact |
+
 // MARK: - Image pixels decoded from the verified descriptor
 
 /// Decode the bytes the verified descriptor already produced, avoiding the

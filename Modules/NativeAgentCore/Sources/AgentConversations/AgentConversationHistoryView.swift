@@ -2,6 +2,7 @@ import AgentWorkspace
 import ChatTurnContracts
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentConversationHistoryView.swift` | `AgentConversationHistoryView` enum; `adding` |
 
 /// On-demand scrollback over the conversation itself: the one session the
 /// contact owns (`ContactThread`), both directions, whichever door or chat
@@ -24,7 +25,7 @@ enum AgentConversationHistoryView {
         ]
         let owner = row.agent.hasPrefix("peer:") ? String(row.agent.dropFirst(5)) : row.agent
         let lines: [ContactThread.Line]
-        do { lines = try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner) }
+        do { lines = try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: AgentContactIdentity(dataRoot: dataRoot)) }
         catch {
             metadata["status"] = .string("unavailable")
             metadata["detail"] = .string("This conversation's session could not be read (\(error.localizedDescription)). The conversation is preserved; no message was repeated.")
@@ -65,21 +66,19 @@ enum AgentConversationHistoryView {
         }
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        // A contact line's speaker is the principal its own row attests, by the
-        // name the person gave that contact; another agent when it attests none.
         let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
-        func speaker(_ source: String?) -> String {
-            guard let source else { return "another agent" }
-            let principal = PeerTrust.principal(source, dataRoot: dataRoot)
-            return peers.first { "peer:" + $0.id == principal }?.name ?? source
+        var names = Dictionary(uniqueKeysWithValues: peers.map { ("peer:" + $0.id, $0.name) })
+        for line in selected {
+            if let source = line.source { names[source] = names[PeerTrust.principal(source, dataRoot: dataRoot)] ?? source }
         }
         var untrusted = false
-        let messages: [JSONValue] = selected.map { line in
+        let messages: [JSONValue] = ContactThread.project(selected, person: "the person, from the contact's thread", names: names,
+            mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) }).map { line in
             let full = exchange != nil
             var value: [String: JSONValue] = [
                 "message": .string(line.id), "at": .string(iso.string(from: line.at)),
                 // The person wrote it in the contact's thread; it isn't yours to answer.
-                "from": .string(line.byPerson ? "the person, from the contact's thread" : line.mine ? "you" : speaker(line.source)),
+                "from": .string(line.speaker),
                 "text": .string(full ? line.text : String(line.text.prefix(800)))
             ]
             if !full, line.text.count > 800 { value["text_truncated"] = .bool(true) }
@@ -96,11 +95,7 @@ enum AgentConversationHistoryView {
             }
             if let answers = line.answers { value["answers_send"] = .string(answers) }
             else if !line.mine { value["started_by"] = .string(row.name) }
-            // Each line is the words of the principal its own row attests, and of
-            // the peers that steered it, each under its own current grant: an
-            // elevated door's read never carries an associated door's lines.
-            // A contact line that attests no one is another agent's, trusted by none.
-            let speakers = ContactThread.consume(line) { PeerDataTaint.markConsumed(peer: $0, line: $1) }
+            let speakers = line.speakers
             if !speakers.isEmpty {
                 // A lane's name becomes the one contact it is, as its own turns' sources do.
                 let principals = speakers.map { PeerTrust.principal($0, dataRoot: dataRoot) }

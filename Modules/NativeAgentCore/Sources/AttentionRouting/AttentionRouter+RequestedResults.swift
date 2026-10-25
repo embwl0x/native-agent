@@ -2,8 +2,10 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Transcripts
 import DeviceSync
 import StandingBots
+// Blueprint: | `AttentionRouter+RequestedResults.swift` | `AttentionRouter`: `retryRequestedResults`, `deliverRequestedResult` |
 
 extension AttentionRouter {
     /// Publication edges and the existing sync integrity pass retry only the
@@ -140,8 +142,8 @@ extension AttentionRouter {
         return intent
     }
 
-    /// True once the result is delivered: a transport accepted it, or the
-    /// phone signed its arrival. A hand-off the phone has not confirmed stays
+    /// True once a conversation transport accepted it, or the phone signed
+    /// its arrival. A hand-off the phone has not confirmed stays
     /// owed; the router's ledger keeps a retry from sending it twice.
     private func deliverRequestedResult(row: JSONValue, intent: [String: JSONValue], opening: String? = nil,
                                         confirmed: Set<String>) async throws -> Bool {
@@ -172,8 +174,8 @@ extension AttentionRouter {
 
     private static func settled(_ outcome: AttentionOutcome, confirmed: Set<String>) -> Bool {
         switch outcome.deliveryProjection {
-        case .accepted: return true
-        case .queued, .previouslyHandled:
+        case .accepted where outcome.delivery != .phone: return true
+        case .accepted, .queued, .previouslyHandled:
             return outcome.knock.map(confirmed.contains) ?? false
         case .noChannel, .deferred, .failed: return false
         }
@@ -203,7 +205,7 @@ extension AttentionRouter {
                 changed = true
             }
             if changed {
-                try await persistence.writeDataAtomicDurable(Data(lines.joined(separator: "\n").utf8), to: path)
+                try ContactThread.replace(Data(lines.joined(separator: "\n").utf8), to: path)
             }
         }
     }

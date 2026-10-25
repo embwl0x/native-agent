@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `DoctorSafeRepairPolicy.swift` | `DoctorSafeRepairPolicy` enum; `checkIDs`, `appliedRepairCount` |
 
 public enum DoctorRepairScope: Sendable {
     case automatic
@@ -8,27 +9,14 @@ public enum DoctorRepairScope: Sendable {
 
 /// Safe repair admission and receipt interpretation shared by Doctor and its UI.
 public enum DoctorSafeRepairPolicy {
-    public static let oauthRefreshInstruction = "Run Repair Safe Issues to refresh expired OAuth access through each credential owner."
+    public static let oauthRefreshInstruction = "Press Repair in Diagnostics → Health checks to refresh expired OAuth access through each credential owner."
 
-    // Doctor fixes what it finds: automatic runs every core repair that backs
-    // up and revalidates under the writer's lock before it replaces, except
-    // authority stores (`createMissingOnlyIDs`). Onboarding only creates.
-    // OAuth refresh runs through its credential owners in every scope.
-    // Persona/identity writes always require the button, even for missing docs.
+    // Automatic repair delegates to registered owners. Doctor never seeds
+    // persona, resets runtime authority or rewrites transcripts.
     public static let automaticCoreIDs: Set<String> = [
-        "icloud_bridge_state", "runtime_json_stores", "chat_messages", "oauth_token_expiry",
+        "icloud_bridge_state", "oauth_token_expiry",
         "inspector.trace_integrity", "coreml_embedder",
     ]
-
-    /// Runtime JSON stores hold routing, consent and registry authority
-    /// (provider picks, MCP consent, connectors, tools); resetting one to `{}`
-    /// or `[]` drops User's choices. Automatic runs only create missing ones;
-    /// replacing a malformed one stays on the button.
-    public static let createMissingOnlyIDs: Set<String> = ["runtime_json_stores"]
-
-    /// Live repairs an unattended run must leave to the button: restoring
-    /// cognition from disk would drop in-memory state its blocked writes held.
-    public static let buttonOnlyLiveIDs: Set<String> = ["live.cognition.persistence"]
 
     public static func checkIDs(
         for checks: [CheckResult], executableLiveIDs: Set<String> = [],
@@ -42,28 +30,22 @@ public enum DoctorSafeRepairPolicy {
             case .automatic, .onboarding:
                 automaticCoreIDs.contains(check.checkID)
                     || (scope == .automatic && executableLiveIDs.contains(check.checkID)
-                        && !buttonOnlyLiveIDs.contains(check.checkID))
+                        && check.automaticRepairEligible != false)
                     || (check.checkID == "live.embedding_download"
                         && check.detail.hasPrefix("A resumable memory model transfer"))
             case .button: true
             }
             guard isAdverse(check.status) || isOAuthRefresh(check),
                   liveRepair || check.repair_available == true || isSafeCoreRepair(check),
-                  check.checkID != "persona_engine" || scope == .button,
                   scopeAllowsRepair else { return nil }
             let id = check.checkID.trimmingCharacters(in: .whitespacesAndNewlines)
             return !id.isEmpty && seen.insert(id).inserted ? id : nil
         }
     }
 
-    /// Completion receipts are separate from executable repair instructions.
-    /// These verbs are emitted only after app-owned state was changed.
+    /// Count the repair owner's outcome, independently of receipt wording.
     public static func appliedRepairCount(in checks: [CheckResult]) -> Int {
-        checks.filter { check in
-            let receipt = normalized(check.receipt)
-            return ["completed:", "created:", "created ", "repaired:", "backed up", "seeded ", "reset ", "wiped "]
-                .contains(where: { receipt.hasPrefix($0) })
-        }.count
+        checks.filter { $0.repairApplied == true }.count
     }
 
     /// Core checks still return legacy repair copy. Only an advertised,
@@ -75,22 +57,31 @@ public enum DoctorSafeRepairPolicy {
         return Set(checkIDs(for: checks)).intersection(handlers)
     }
 
-    /// Sign-ins and permissions are the only steps Doctor hands to User; they
-    /// are gathered into one inbox ask.
+    /// Only sign-ins and permissions join the consent inbox ask; app-defect
+    /// recovery instructions do not become consent requests.
     public static func isUserAsk(_ check: CheckResult) -> Bool {
         isAdverse(check.status) && check.ask != nil
     }
 
     public static func isAdverse(_ status: String) -> Bool {
-        ["warn", "warning", "fail", "failed", "error"].contains(normalized(status))
+        ["warning", "failing"].contains(DoctorPlainCopy.bucket(for: normalized(status)))
+    }
+
+    /// Recognize current instructions and older cached reports in both admission
+    /// and human-step projection.
+    static func isCoreRepairInstruction(_ instruction: String?) -> Bool {
+        let instruction = normalized(instruction)
+        return instruction.hasPrefix("run repair safe issues")
+            || instruction.hasPrefix("press repair in diagnostics → health checks")
     }
 
     private static func isSafeCoreRepair(_ check: CheckResult) -> Bool {
-        isOAuthRefresh(check) || normalized(check.repair).hasPrefix("run repair safe issues")
+        isOAuthRefresh(check) || isCoreRepairInstruction(check.repair)
     }
 
     private static func isOAuthRefresh(_ check: CheckResult) -> Bool {
-        check.checkID == "oauth_token_expiry" && check.repair == oauthRefreshInstruction
+        check.checkID == "oauth_token_expiry" && (check.repair == oauthRefreshInstruction
+            || check.repair == "Run Repair Safe Issues to refresh expired OAuth access through each credential owner.")
     }
 
     private static func normalized(_ value: String?) -> String {

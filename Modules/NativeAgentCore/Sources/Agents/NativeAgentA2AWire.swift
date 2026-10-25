@@ -2,8 +2,8 @@ import Foundation
 import CoreFoundation
 import PersonaEngine
 import PersistenceCore
-import ChatOrchestration
 import NativeAgentCore
+// Blueprint: | `NativeAgentA2AWire.swift` | A2A bindings use contact task workers and a dedicated gRPC listener; turns execute through shared chat |
 
 /// The name peers see for this agent: the persona's own name, or "the agent"
 /// when no persona name is set.
@@ -14,8 +14,8 @@ public enum PeerFacingIdentity {
     }
 }
 
-/// A bounded A2A 1.0/0.3 JSON-RPC projection over the bridge's existing turn/receipt owners.
-/// No protocol-specific session store, task runner, listener, or authority is created.
+/// A2A 1.0/0.3 bindings use contact task workers and a dedicated gRPC listener;
+/// turns execute through the shared chat runtime.
 public enum NativeAgentA2AWire {
     // rpcID is restricted by parse to immutable String/NSNumber values.
     public struct Send: @unchecked Sendable {

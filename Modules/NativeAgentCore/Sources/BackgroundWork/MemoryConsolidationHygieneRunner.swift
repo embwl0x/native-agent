@@ -3,6 +3,7 @@ import BackgroundLoops
 import MemoryV2
 import NativeAgentCore
 import TrustCenter
+// Blueprint: | `MemoryConsolidationHygieneRunner.swift` | `MemoryConsolidationHygieneRunner` struct; `tickOutcome` |
 
 // MARK: - LoopRunner
 

@@ -2,6 +2,7 @@ import Foundation
 import BackgroundLoops
 import Cognition
 import WorkshopExecution
+// Blueprint: | `WorkshopExecutorDrainRunner.swift` | `WorkshopExecutorDrainRunner` struct; `physiologyEvents`, `nextMeaningfulDeadline` |
 
 /// Event/deadline adapter for WorkshopExecutorLoop. Canonical execution-file
 /// mutations wake the queue immediately; configured approval timeouts own one

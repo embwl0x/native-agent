@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `DeskProjection.swift` | `DeskBoardLayout`, `DeskPaletteRow`, `DeskPaletteQuery`, `DeskFuzzy`, `DeskPaletteCommandApplication`, `DeskQuickAction`, `DeskRefAction`, `DeskRefAffordance`; attention, freshness and date interpretation |
 
 // MARK: - DeskProjection — pure DeskState -> compact text renderer
 //
@@ -501,9 +502,6 @@ public struct DeskPaletteRow: Identifiable, Equatable, Sendable {
     public let title: String
     public let project: String
     public let status: String
-    /// GitHub watcher rows are reveal-only: closing or deferring one would be
-    /// a fabricated Desk mutation instead of an action supported by its store.
-    public let isActionable: Bool
 
     public var id: String { handle }
 
@@ -516,15 +514,13 @@ public struct DeskPaletteRow: Identifiable, Equatable, Sendable {
         alias: String,
         title: String,
         project: String,
-        status: String,
-        isActionable: Bool = true
+        status: String
     ) {
         self.handle = handle
         self.alias = alias
         self.title = title
         self.project = project
         self.status = status
-        self.isActionable = isActionable
     }
 
     public init(item: DeskItem) {
@@ -533,8 +529,7 @@ public struct DeskPaletteRow: Identifiable, Equatable, Sendable {
             alias: item.alias,
             title: item.title,
             project: item.project,
-            status: item.status.rawValue,
-            isActionable: true)
+            status: item.status.rawValue)
     }
 }
 

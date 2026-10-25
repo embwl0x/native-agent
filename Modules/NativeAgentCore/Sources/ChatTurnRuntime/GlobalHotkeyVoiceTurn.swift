@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `GlobalHotkeyVoiceTurn.swift` | `GlobalHotkeyVoiceTurn`: push-to-talk authorization, capture and final speech result through the shared Mac send boundary |
+
 /// Owns one global-hotkey push-to-talk turn from authorization through the
 /// same `AppModel.sendChat` boundary used by the visible composer. The Carbon
 /// callbacks are intentionally thin: a second release, a release before TCC

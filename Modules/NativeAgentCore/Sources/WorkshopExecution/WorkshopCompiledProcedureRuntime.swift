@@ -4,6 +4,8 @@ import PersistenceCore
 import Desk
 import Procedures
 
+// Blueprint: | `WorkshopCompiledProcedureRuntime.swift` | `WorkshopCompiledLocalFileCopyInvocation`: reviewed exact artifact invocation through Workshop queue; existing Trust/file dispatch retain authority |
+
 public enum WorkshopCompiledProcedureRuntimeError: Error, LocalizedError, Sendable, Equatable {
     case policyDenied
     case unsupportedTool

@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import Procedures
 
+// Blueprint: | `ApprovalInbox+ProcedureReview.swift` | `SwiftNativeApprovalInbox.approvedProcedureReviewerDecision`: production reviewer decisions bound to candidate evidence digests |
+
 public enum ProcedureReviewApprovalError: String, Error, Sendable, Equatable {
     case invalidProposal = "invalid_proposal"
     case approvalNotApproved = "approval_not_approved"

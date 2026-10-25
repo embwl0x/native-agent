@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+// Blueprint: | `TelegramRichMessage.swift` | `TelegramInputRichBlock` enum |
 
 /// Typed subset of Bot API 10.2 rich blocks that improves ordinary assistant
 /// replies without exposing provider traces or requiring a second UI surface.
@@ -232,24 +233,9 @@ enum TelegramRichMessageRenderer {
         return result
     }
 
-    private static let sanitizingExpressions = [
-        #"(?is)<think(?:ing)?\b[^>]*>.*?</think(?:ing)?>"#,
-        #"(?is)<analysis\b[^>]*>.*?</analysis>"#,
-        #"(?im)^\s*(?:hidden[_ ]reasoning|internal[_ ]trace|raw[_ ]provider[_ ]payload|tool[_ ]arguments?)\s*:.*$"#,
-    ].compactMap { try? NSRegularExpression(pattern: $0) }
-
     static func sanitize(_ raw: String) -> String {
-        var value = raw
-        for regex in sanitizingExpressions {
-            value = regex.stringByReplacingMatches(
-                in: value,
-                range: NSRange(value.startIndex..., in: value),
-                withTemplate: ""
-            )
-        }
-        value = TelegramPollLoop._tgRedactToken(TurnTraceRedactor.redactText(value))
+        TelegramPollLoop._tgRedactToken(TurnTraceRedactor.redactText(raw))
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value
     }
 
     private static let boldExpression = try? NSRegularExpression(pattern: #"\*\*(?=\S)(.+?)(?<=\S)\*\*"#)

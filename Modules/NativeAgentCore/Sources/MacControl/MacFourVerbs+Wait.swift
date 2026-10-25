@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `MacFourVerbs+Wait.swift` | `MacFourVerbs`: `wait`; app-level signals prompt bounded screen re-reads; action verification uses its owning bounded polling waits without additional subscriptions |
 
 extension MacFourVerbs {
     // MARK: 4 — PATIENCE
@@ -17,7 +18,9 @@ extension MacFourVerbs {
 
         func elapsedNow() -> Double { clock.monotonicSeconds() - startedAt }
         func cancelled() -> MacFourVerbsReply {
-            MacFourVerbsReply(ok: false, text: "I stopped waiting.", detail: ["outcome": .string("cancelled")])
+            MacFourVerbsReply(ok: false, text: "Waiting was cancelled.", detail: ["outcome": .string("cancelled"), "status": .string("cancelled"),
+                "error": .string("cancelled"), "effects": .string("unknown"),
+                "remedy": Repair.terminal(instruction: "The wait was cancelled; no further observation runs for this request.")])
         }
         func refusal(_ reply: MacFourVerbsReply) async -> MacFourVerbsReply {
             guard reply.detail["status"] == .string("in_process_route") else { return reply }
@@ -31,8 +34,13 @@ extension MacFourVerbs {
             }
             return MacFourVerbsReply(
                 ok: false,
-                text: "wait watches the frontmost external Mac app until its screen settles or the requested text appears; it is not a general sleep. NativeAgent is in front, and screen waiting cannot observe its own app. Use app {page:\"current\"} to inspect NativeAgent, or pass agent: name to wait for a contact's in-flight reply.",
-                detail: reply.detail
+                text: "NativeAgent is in front, so wait cannot watch an external app. For a delay only, set seconds and omit until. Inspect NativeAgent with app {page:\"current\"}, or pass agent: name to wait for a contact's in-flight reply.",
+                detail: reply.detail.merging([
+                    "status": .string("refused"), "reason": .string("self_screen_wait_unavailable"),
+                    "error": .string("self_screen_wait_unavailable"), "effects": .string("none"),
+                    "remedy": Repair.reconcile(instruction: "Read NativeAgent's current page; screen waiting observes external apps.",
+                        nextCall: .object(["tool": .string("app"), "input": .object(["page": .string("current")])])),
+                ]) { _, new in new }
             )
         }
         guard !Task.isCancelled else { return cancelled() }

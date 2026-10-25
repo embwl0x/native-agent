@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
 
+// Blueprint: | `OrganismTypedBodyBeliefs.swift` | Typed body belief projections: secret-free evidence references, locally received freshness and bounded capability/integrity/presence metrics |
+
 /// Secret-free evidence classes shared by the narrow body-read projections.
 /// These are correlation references only; payloads, credentials, paths, user
 /// text, and provider output never enter the body belief layer.
@@ -19,6 +21,7 @@ public enum BodyEvidenceClass: String, Codable, Sendable, Equatable, CaseIterabl
     case liveToolCapability
     case approvalStore
     case processThermalState
+    /// Read only from body evidence saved before 10-24; Low Power Mode is no longer sensed.
     case lowPowerMode
 }
 
@@ -833,7 +836,6 @@ public struct ResourcePressureReading: Codable, Sendable, Equatable {
     public let category: OrganismResourcePressure
     public let metrics: BodyBeliefMetrics
     public let thermalPressure: OrganismResourcePressure
-    public let lowPowerMode: Bool
 
     public var estimate: Double { metrics.estimate }
     public var uncertainty: Double { metrics.uncertainty }
@@ -846,12 +848,12 @@ public struct ResourcePressureReading: Codable, Sendable, Equatable {
     public init(
         generatedAt: Date,
         thermalPressure: OrganismResourcePressure,
-        lowPowerMode: Bool,
         evidence: [BodyEvidenceReference]
     ) {
+        // Heat is her body's only resource pressure: Low Power Mode never
+        // changes what she does (User 10-24).
         self.thermalPressure = thermalPressure
-        self.lowPowerMode = lowPowerMode
-        self.category = Self.derive(thermalPressure: thermalPressure, lowPowerMode: lowPowerMode)
+        self.category = thermalPressure
         self.metrics = BodyBeliefMetrics(
             generatedAt: generatedAt,
             estimate: Self.estimate(category),
@@ -864,16 +866,14 @@ public struct ResourcePressureReading: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case category, metrics, thermalPressure, lowPowerMode
+        case category, metrics, thermalPressure
     }
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let thermal = try container.decode(OrganismResourcePressure.self, forKey: .thermalPressure)
-        let lowPower = try container.decode(Bool.self, forKey: .lowPowerMode)
         let decodedMetrics = try container.decode(BodyBeliefMetrics.self, forKey: .metrics)
         self.thermalPressure = thermal
-        self.lowPowerMode = lowPower
-        self.category = Self.derive(thermalPressure: thermal, lowPowerMode: lowPower)
+        self.category = thermal
         self.metrics = BodyBeliefMetrics(
             generatedAt: decodedMetrics.generatedAt,
             estimate: Self.estimate(category),
@@ -884,16 +884,6 @@ public struct ResourcePressureReading: Codable, Sendable, Equatable {
             receivedAt: decodedMetrics.receivedAt,
             nextMeaningfulExpiry: nil
         )
-    }
-
-    private static func derive(
-        thermalPressure: OrganismResourcePressure,
-        lowPowerMode: Bool
-    ) -> OrganismResourcePressure {
-        guard lowPowerMode, severity(thermalPressure) < severity(.elevated) else {
-            return thermalPressure
-        }
-        return .elevated
     }
 
     private static func estimate(_ pressure: OrganismResourcePressure) -> Double {

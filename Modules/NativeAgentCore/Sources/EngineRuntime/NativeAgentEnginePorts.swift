@@ -9,13 +9,19 @@ import Connectors
 import Browser
 import Agents
 import AppToolRuntime
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import AgentConversations
 import Cognition
 import CognitiveSubstrate
 import DeviceSync
 import PersistenceCore
 import StandingBots
 import TrustCenter
+import ToolExecution
+import Senses
+import NativeAgentShared
+// Blueprint: | `NativeAgentEnginePorts.swift` | Once-installed native host factories, body effects and shared EngineCognitionHost defaults; pure readout faces bind the selected Parts version through the no-effect authored host; read-part calls bind the existing ToolsFacade originating door and narrow the pinned candidate to native-permitted read actions/capabilities |
 
 /// The agent-bridge listener an A2A peer pushes task notifications to.
 public protocol EngineAgentBridgePort: Sendable {
@@ -90,6 +96,17 @@ extension BotRunQueue: EngineStandingBotQueuePort {
 }
 
 extension CognitionHost {
+    public func phoneNotificationTargetCount(dataRoot: URL) async throws -> Int {
+        try await SwiftNativeAPNSSender().deliverableTargetCount(dataRoot: dataRoot)
+    }
+
+    public func readoutFace(id: String, input: JSONValue, version: String, dataRoot: URL) async -> PartCallResult<PartFace> {
+        let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot) { _, _ in nil }
+        return await OwnedProgramInvocation.$host.withValue(host) {
+            await Parts(root: dataRoot).face(id: id, input: input, version: version)
+        }
+    }
+
     public func inQuietHours(at date: Date, dataRoot: URL) -> Bool {
         AttentionRouter.inQuietHours(at: date, dataRoot: dataRoot)
     }
@@ -172,6 +189,16 @@ public struct EngineCognitionHost: CognitionHost {
     private let attention: AttentionRouter
 
     public init(attention: AttentionRouter) { self.attention = attention }
+
+    public func callReadPart(id: String, input: JSONValue, actions: Set<String>, dataRoot: URL, origin: String) async throws -> JSONValue {
+        try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native(origin)) {
+            switch await Parts(root: dataRoot).call(id: id, input: input,
+                within: .init(actions: actions, capabilities: ["app_data_read"]), as: JSONValue.self) {
+            case .success(let value): return value
+            case .failure(let error): throw error
+            }
+        }
+    }
     public func deliverShoulderTap(
         eventId: String, title: String, body: String, reason: String,
         userInfo: [String: String], at date: Date

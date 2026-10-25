@@ -4,10 +4,111 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import TrustCenter
+import AuthoredCapabilities
+import Desk
+import ChatSessionWork
+import ProviderRouting
+// Blueprint: | `ChatOrchestrationClient+EphemeralToolTurn.swift` | `SwiftNativeChatOrchestrationClient`: `runEphemeralToolTurn`, `runPartToolTurn`; prepared part messages enter the same canonical loop and admitted routing with caller limits, restricted tools and taint, without persona/recall assembly, parent checkpoints or after-turn mind work; explicit part-thought surfaces admit their saved route without the parent's ProviderTurnChoice, omitted surfaces inherit; PartToolThinkingContext marks only that internal thought |
+
+/// An internal thought owns no reply or after-turn mind work. It uses the
+/// canonical loop and inherits its caller's gates, taint and remaining limits.
+enum PartToolThinkingContext {
+    @TaskLocal static var active = false
+}
 
 public typealias EphemeralToolTurnIncomplete = ChatTurnContracts.EphemeralToolTurnIncomplete
 
 extension SwiftNativeChatOrchestrationClient {
+    /// Prepared part input enters the existing tool-turn owner without persona,
+    /// recall, cognition preparation or another provider route. The dispatcher
+    /// supplied to this client is the part's own restricted host.
+    public func runPartToolTurn(messages: [LLMMessage], surface requestedSurface: String? = nil) async throws -> String {
+        guard let surface = requestedSurface ?? LLMCallContext.surface else {
+            throw ChatOrchestrationError.underlying("A part thought needs an existing admitted routing surface.")
+        }
+        if let requestedSurface, !MODEL_SURFACES.contains(canonicalRoutingSurface(requestedSurface)) {
+            throw ChatOrchestrationError.underlying("A part thought can select only an existing routing surface.")
+        }
+        guard let last = messages.last, last.role == .user else {
+            throw ChatOrchestrationError.underlying("A tool-capable thought ends its messages with a user prompt.")
+        }
+        @Sendable func text(_ message: LLMMessage) -> String {
+            message.content.compactMap { if case .text(let text) = $0 { text } else { nil } }.joined(separator: "\n")
+        }
+        var reach = TurnReach()
+        let system = messages.prefix { $0.role == .system }
+        reach.guidance = system.map(text).joined(separator: "\n\n")
+        let history = messages.dropFirst(system.count).dropLast()
+        let names = try await tools.listAvailableTools()
+        let schemas = try await tools.listAvailableToolSchemas(named: Set(names))
+        let run: @Sendable () async throws -> String = { [self, reach] in
+            guard let model = LLMCallContext.admittedModel, let client = LLMCallContext.client else {
+                throw ChatOrchestrationError.underlying("The part thought has no admitted model.")
+            }
+            let context = TurnContext(surface: surface, personaDocs: [:], personaFingerprint: "", recalled: [],
+                modelId: model, reasoningEffort: LLMCallContext.reasoningEffort ?? "",
+                providerId: LLMCallContext.providerId, serviceTier: LLMCallContext.serviceTier,
+                toolsAvailable: names, userMessage: text(last), toolSchemas: schemas,
+                historyMessages: Array(history), turnReach: reach)
+            // The canonical loop owns transient provider recovery, context and
+            // tool-contract evidence by turn id. A nested thought cannot borrow
+            // its caller's identity and overwrite those owners' parent records.
+            let thought = UUID().uuidString
+            let root = dataRoot
+            let cause = Experience.currentAct ?? TurnTraceContext.turnId
+            let heard = Experience(id: thought, kind: .heard, cause: cause.map { [$0] } ?? [],
+                face: Self.face(text(last), []), addressedTo: ["her"], owes: ["answer": .init(to: "caller")])
+            let began = ExperienceStore.record(root, thought) { try await $0.begin(heard) }
+            await began.value
+            var produced = ""
+            do {
+            let result = try await PartToolThinkingContext.$active.withValue(true) {
+            try await TurnTraceContext.$turnId.withValue(thought) {
+            try await LLMCallContext.$sessionId.withValue(thought) {
+            try await ConversationPrefixTelemetry.$sink.withValue(.unmeasuredRequestShape) {
+            try await LLMCallContext.$turnActiveTools.withValue(Set(names)) {
+            try await ReplyChoices.$current.withValue(nil) {
+            try await DeskContinuationScope.$current.withValue(nil) {
+            try await TurnCheckpointScope.$current.withValue(nil) {
+            try await ChatTurnExecution.$current.withValue(ChatTurnExecution()) {
+                try await engine.executeTurnWithStreamingToolLoop(surface: surface, userMessage: text(last),
+                    toolSessionId: ChatToolSessionContext.verifiedSessionId, llm: client,
+                    tools: tools, preBuiltContext: context, fileAccess: ChatToolSessionContext.fileAccess ?? "auto")
+            } } } } } } } } }
+            produced = result.reply
+            guard result.completionState == .completed else {
+                throw EphemeralToolTurnIncomplete(output: result.reply, reason: "The part thought did not complete.")
+            }
+            try Task.checkCancellation()
+            let answer = produced
+            await settle {
+                await Self.recordAnswer(id: Experience.answer(run: thought), heardID: thought,
+                    evidence: nil, state: .completed, dataRoot: root) {
+                    Experience(id: Experience.answer(run: thought), kind: .answer, cause: [thought], face: Self.face(answer, []))
+                }
+            }
+            return result.reply
+            } catch {
+                let answer = produced
+                let state: TurnEngineResult.TerminalState = Task.isCancelled || error is CancellationError ? .stopped : .failed
+                await settle {
+                    await Self.recordAnswer(id: Experience.answer(run: thought), heardID: thought,
+                        evidence: nil, state: state, dataRoot: root) {
+                        Experience(id: Experience.answer(run: thought), kind: .answer, cause: [thought], face: Self.face(answer, []))
+                    }
+                }
+                throw error
+            }
+        }
+        if requestedSurface == nil, LLMCallContext.admittedModel != nil { return try await run() }
+        // An explicit surface owns its saved route; a parent's per-turn pick
+        // applies only when this thought did not select a surface of its own.
+        let route = try await ProviderTurnChoice.$current.withValue(requestedSurface == nil ? ProviderTurnChoice.current : nil) {
+            try await engine.checkedRouteAdmission(for: surface)
+        }
+        return try await withModelContext(route, surface: surface, run)
+    }
+
     /// Executes a one-shot tool-capable turn without creating chat session state.
     /// The caller owns the tool scope; execution synthesis supplies its restricted
     /// read-only dispatcher. All configured schemas are request-scoped through
@@ -137,7 +238,10 @@ extension SwiftNativeChatOrchestrationClient {
         }
         let result: TurnEngineResult
         do {
-            result = try await PeerDataTaint.withScope {
+            // Images and pending tool state belong to this worker's context,
+            // never the parent turn or another worker that inherited it.
+            result = try await ChatTurnExecution.$current.withValue(ChatTurnExecution()) {
+            try await PeerDataTaint.withScope {
             try await TurnTraceContext.$bus.withValue(turnTraceBus) {
             try await TurnTraceContext.$turnId.withValue(runId) {
             // A worker answers its caller, never the parent's reply: nothing it attaches goes there.
@@ -155,6 +259,7 @@ extension SwiftNativeChatOrchestrationClient {
                     providerAdmission: providerAdmission,
                     fileAccess: fileAccess
                 )
+            }
             }
             }
             }
@@ -187,12 +292,13 @@ extension SwiftNativeChatOrchestrationClient {
         // starts here and runs on its own; the answer never waits for it. By
         // ticket, so a concurrent chat turn's pending capture is never adopted.
         await engine.startDeferredMemoryPromotion(ticket: result.memoryPromotionTicket)
+        result.afterReply?.start()
         let generatedAttachments = ChatGeneratedImageArtifacts.attachments(
             from: result.toolDispatches,
             dataRoot: dataRoot
         )
         // Its answer goes back to its caller; it has no transcript row to stand on.
-        Self.recordAnswer(id: Experience.answer(run: runId), heardID: runId, evidence: nil,
+        await Self.recordAnswer(id: Experience.answer(run: runId), heardID: runId, evidence: nil,
                           state: result.resolvedTerminalReason(dataRoot: dataRoot).state, dataRoot: dataRoot) { [reply = result.reply] in
             Experience(id: Experience.answer(run: runId), kind: .answer, cause: [runId], face: Self.face(reply, generatedAttachments))
         }

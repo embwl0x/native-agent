@@ -87,7 +87,7 @@ struct SettingsViewFull: View {
             }
 
             AliveSection("Mac") {
-                if let health = store.health {
+                if let health = store.sync.health {
                     AliveValueRow(label: "Health", value: health.ok ? "Reported healthy" : "Reported issue",
                                  valueColor: health.ok ? AlivePalette.secondary : NativeAgentMobileTheme.Colors.trouble)
                     AliveDivider()
@@ -159,13 +159,13 @@ struct SettingsViewFull: View {
         .macSyncErrorBanner()
         .task {
             pushReceipts = PushReceiptLedger.load()
-            async let macSettings: Void = MobileAppSettingsStore.shared.refresh()
+            async let macSettings: Void = iCloudSyncEngine.shared.refreshAppSettings()
             await store.refresh()
             await macSettings
         }
         .refreshable {
             pushReceipts = PushReceiptLedger.load()
-            async let macSettings: Void = MobileAppSettingsStore.shared.refresh()
+            async let macSettings: Void = iCloudSyncEngine.shared.refreshAppSettings()
             await store.refresh()
             await macSettings
         }
@@ -343,24 +343,14 @@ enum SettingsICloudRefreshPresentation {
 
 @MainActor
 final class SettingsStore: ObservableObject {
-    @Published var personality: PersonalityProfile?
-    @Published var personalitySnapshotSyncedAt: Date?
-    @Published var trustPolicy: TrustPolicy?
-    @Published var connectors: [ConnectorRecord] = []
-    @Published var health: RuntimeHealth?
+    let sync: iCloudSyncEngine
     @Published var isLoading = false
     @Published var error: String?
     @Published private(set) var availableFields: Set<SettingsSnapshotRefreshOutcome.Field> = []
     @Published private(set) var hasCompletedRefresh = false
     private var refreshTask: Task<SettingsSnapshotRefreshOutcome, Never>?
-    private let refreshSnapshot: @MainActor () async -> SettingsSnapshotRefreshOutcome
-
-    init(
-        refreshSnapshot: @escaping @MainActor () async -> SettingsSnapshotRefreshOutcome = {
-            await iCloudSyncEngine.shared.refreshSettingsSnapshot()
-        }
-    ) {
-        self.refreshSnapshot = refreshSnapshot
+    init(sync: iCloudSyncEngine = .shared) {
+        self.sync = sync
     }
 
     @discardableResult
@@ -368,19 +358,11 @@ final class SettingsStore: ObservableObject {
         if let refreshTask { return await refreshTask.value }
         isLoading = true
         let task = Task { @MainActor in
-            let outcome = await refreshSnapshot()
+            let outcome = await sync.refreshSettingsSnapshot()
             error = outcome.feedbackMessage
             hasCompletedRefresh = true
             guard outcome.state != .superseded else { return outcome }
-            let sync = iCloudSyncEngine.shared
             availableFields = outcome.availableFields
-            trustPolicy = sync.trustPolicy
-            personality = sync.personality
-            if outcome.availableFields.contains(.personality) {
-                personalitySnapshotSyncedAt = sync.transportDeliveryAt(screenGroup: "personality")
-            }
-            connectors = sync.connectors
-            health = sync.health
             return outcome
         }
         refreshTask = task
@@ -446,9 +428,9 @@ struct PersonalityDetailView: View {
 
     var body: some View {
         AlivePage(title: "Personality", line: "How I think and sound.") {
-            if let p = store.personality {
+            if let p = store.sync.personality {
                 let snapshotState = PersonalitySnapshotPresentation.state(
-                    lastSyncedAt: store.personalitySnapshotSyncedAt
+                    lastSyncedAt: store.sync.transportDeliveryAt(screenGroup: "personality")
                 )
                 AliveSection("Identity") {
                     if store.hasCompletedRefresh, !store.availableFields.contains(.personality) {
@@ -606,8 +588,8 @@ struct TrustPolicyView: View {
 
     var body: some View {
         AlivePage(title: "Trust", line: "What I may do on my own.") {
-            if let policy = store.trustPolicy {
-                MobileTrustEditor(policy: policy, store: store)
+            if let policy = store.sync.trustPolicy {
+                MobileTrustEditor(policy: policy)
             } else {
                 AliveCalmState(
                     title: "Not here yet",
@@ -704,7 +686,7 @@ struct ConnectorsView: View {
 
     private var presentation: SettingsSnapshotContentPresentation {
         .state(
-            hasContent: !store.connectors.isEmpty,
+            hasContent: !store.sync.connectors.isEmpty,
             fieldAvailable: store.availableFields.contains(.connectors),
             isLoading: store.isLoading,
             hasCompletedRefresh: store.hasCompletedRefresh
@@ -738,7 +720,7 @@ struct ConnectorsView: View {
                         AliveNote("Connectors could not be refreshed. Showing the last known rows.")
                         AliveDivider()
                     }
-                    ForEach(Array(store.connectors.enumerated()), id: \.element.id) { index, connector in
+                    ForEach(Array(store.sync.connectors.enumerated()), id: \.element.id) { index, connector in
                         if index > 0 { AliveDivider() }
                         MobileConnectorRow(connector: connector)
                     }

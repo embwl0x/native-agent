@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentShared
 import ProviderRouting
 
+// Blueprint: | `InlineInteractionResolver+MissingProvider.swift` | `InlineInteractionResolver.raiseMissingChatProvider`: setup card before provider dispatch; only text-only questions can resume |
+
 public extension InlineInteractionResolver {
     static func raiseMissingChatProvider(
         sessionID: String, userContent: String, hasAttachments: Bool, dataRoot: URL

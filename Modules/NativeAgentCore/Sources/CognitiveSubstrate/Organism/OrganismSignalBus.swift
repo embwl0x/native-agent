@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `OrganismSignalBus.swift` | `SomaticSignalBus` actor; `observe`, `configure` |
 
 public actor SomaticSignalBus {
     private var configuration: OrganismConfiguration

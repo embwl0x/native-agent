@@ -1,6 +1,8 @@
 import CognitiveSubstrate
 import Foundation
 
+// Blueprint: | `CognitiveAttentionResidentProjection.swift` | `CognitiveAttentionResidentProjection`: lock-backed immutable cognition/organism handoff for turn reads without actor, disk or provider work |
+
 /// Lock-backed immutable handoff from the canonical cognition/organism owners
 /// to turn preparation. Writers publish after state transitions; readers never
 /// enter an actor, touch disk, schedule work, or call a model.

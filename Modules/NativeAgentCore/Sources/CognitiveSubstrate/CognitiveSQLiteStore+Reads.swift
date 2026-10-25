@@ -1,6 +1,7 @@
 import Foundation
 import GRDB
 import PersistenceCore
+// Blueprint: | `CognitiveSQLiteStore+Reads.swift` | `CognitiveSQLiteStore`: `loadRestoreBundle`, `loadReceiptRecords` |
 
 extension CognitiveSQLiteStore {
     func loadRestoreBundle(

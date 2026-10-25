@@ -1,8 +1,9 @@
-import FeedPolicy
 import Darwin
 import Foundation
 import PersistenceCore
+import NativeAgentCore
 import Synchronization
+// Blueprint: | `DeskStore.swift` | `SwiftNativeDeskStore` struct; process-wide `currentRevision` advances before and after each awaited canonical append under the ops lock; `continuation`, `setContinuation`, `heldBy` (nonacquiring hold read); keyed system findings persist findingKey through create, compaction and archive, preserve closure and person ownership under their filing lock; explicit reopening refreshes evidence in that transaction or files anew after archive, with opt-in ref replacement on the same `updateTitle` op; terminalParentsWithNonTerminalDescendants is the pure Doctor/repair selection, with mutation-time revalidation under the ops lock; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
 
 // MARK: - SwiftNativeDeskStore — append-under-flock event store for Agent Desk
 //
@@ -37,6 +38,10 @@ import Synchronization
 //      generatedTs once the tail is truncated, or a second writer process
 //      could stamp behind compacted ops.
 
+/// Owns desk_ops JSONL/base v1, ArchiveRecord JSONL and DeskHold JSON.
+/// Coverage: excluded from local backups and production export; off-disk includes
+/// desk/. Phone sync projects items/bounds/details, not archive or holds;
+/// PrivacyMap lists the tree.
 public struct SwiftNativeDeskStore: Sendable {
     public struct CreateResult: Sendable, Equatable {
         public let item: DeskItem
@@ -95,7 +100,7 @@ public struct SwiftNativeDeskStore: Sendable {
         try await persistence.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             guard feed.integrity.isClean else { throw DeskContinuationError.unsafe }
-            return Self.compact(base: feed.base, feed.ops).items.first { $0.handle == handle }?.continuation
+            return try inCurrentLife(Self.compact(base: feed.base, feed.ops)).items.first { $0.handle == handle }?.continuation
         }
     }
 
@@ -150,24 +155,46 @@ public struct SwiftNativeDeskStore: Sendable {
         return op
     }
 
-    /// Append an op that targets an EXISTING LIVE item — validates the handle
-    /// under the flock and throws `unknownHandle` if it is missing or archived,
-    /// so a mutation on a bad handle can't silently no-op (gpt-5.5 review HIGH).
-    /// The op's ts is RE-STAMPED here, inside the flock, with a commit stamp
-    /// past the newest committed ts — a ts minted at op construction can stall
-    /// before the lock and commit BEHIND a notify CAS stamp, so the evaluator
-    /// would see updatedAt <= lastNotifiedAt and swallow the change
-    /// (gpt-5.5 review HIGH).
+    /// Validate a live item's mutation and stamp it under the ops lock.
+    /// Explicit todo starts another life's stopped continuation fresh.
     @discardableResult
     private func appendValidated(_ op: DeskOp) async throws -> DeskOp {
         try await persistence.withFileLock(opsPath) {
-            let feed = try await readFeedUnlocked()
+            var feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
             guard state.items.contains(where: { $0.handle == op.handle }) else {
                 throw DeskError.unknownHandle(op.handle)
             }
             try Self.validateHierarchyTransition(op, in: state, allowArchive: false)
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
+            if case .setStatus(.todo, _, _, _, _, _) = op.body,
+               let item = state.items.first(where: { $0.handle == op.handle }) {
+                if var record = item.continuation, ![.complete, .canceled].contains(record.state),
+                   try !DataRootLife.isCurrent(record.lifeID, in: dataRoot) {
+                    record.lifeID = try DataRootLife.current(in: dataRoot)
+                    record.state = .ready
+                    record.reason = nil
+                    record.runID = UUID().uuidString
+                    record.revision = UUID().uuidString
+                    record.originRunID = record.runID
+                    record.pending = []
+                    record.settled = []
+                    record.response = nil
+                    record.resumeCount = 0
+                    record.nextRunAt = Date()
+                    let fresh = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: op.handle,
+                                       body: .setContinuation(record: record))
+                    feed = try await appendAndRecompactUnlocked(fresh, feed: feed).feed
+                }
+                if var step = item.step, try !DataRootLife.isCurrent(step.lifeID, in: dataRoot) {
+                    step.lifeID = try DataRootLife.current(in: dataRoot)
+                    step.status = nil
+                    step.reason = nil
+                    let fresh = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: op.handle,
+                                       body: .addRef(ref: DeskRef(kind: .step(step))))
+                    feed = try await appendAndRecompactUnlocked(fresh, feed: feed).feed
+                }
+            }
             var stamped = op
             stamped.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
             _ = try await appendAndRecompactUnlocked(stamped, feed: feed)
@@ -404,7 +431,7 @@ public struct SwiftNativeDeskStore: Sendable {
         return records
     }
 
-    // MARK: - High-level mutations (each appends exactly one op)
+    // MARK: - High-level mutations
 
     /// Create an item. Generates a stable handle and assigns the next monotonic
     /// alias among the parent's siblings — done UNDER THE FLOCK so two
@@ -467,6 +494,7 @@ public struct SwiftNativeDeskStore: Sendable {
         title: String,
         summary: String?,
         assignee: String?,
+        waitingOn: String? = nil,
         findingKey: String,
         note: String,
         refs: [DeskRef],
@@ -477,7 +505,7 @@ public struct SwiftNativeDeskStore: Sendable {
             kind: kind, project: project, title: title, parent: nil, summary: summary,
             assignee: assignee, laneOf: nil, reuseEquivalent: false,
             origin: .system, keyNote: note, findingKey: findingKey, refs: refs, reopenKeyed: reopen,
-            refreshRefs: refreshRefs
+            refreshRefs: refreshRefs, waitingOn: waitingOn
         )
     }
 
@@ -490,6 +518,7 @@ public struct SwiftNativeDeskStore: Sendable {
             let words = Self.equivalentDeskText(incoming.words)
             let same = open.first { Self.equivalentDeskText($0.step.words) == words }
             var step = incoming
+            step.lifeID = try DataRootLife.current(in: dataRoot)
             if let same {
                 if incoming.source != nil { step = same.step }
                 step.peers = incoming.peers
@@ -551,11 +580,13 @@ public struct SwiftNativeDeskStore: Sendable {
         findingKey: String? = nil,
         refs: [DeskRef] = [],
         reopenKeyed: Bool = false,
-        refreshRefs: Bool = false
+        refreshRefs: Bool = false,
+        waitingOn: String? = nil
     ) async throws -> CreateResult {
         guard Self.equivalentDeskText(project) != MyQueue.project else {
             throw DeskError.queueCreationRequiresQueuePath
         }
+        let refs = try refs.map(beginStep)
         return try await persistence.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             let priorState = Self.compact(base: feed.base, feed.ops)
@@ -604,7 +635,10 @@ public struct SwiftNativeDeskStore: Sendable {
                 var incomingRefs = refs
                 if let index = incomingRefs.lastIndex(where: { $0.kind.token == "step" }),
                    case .step(var step) = incomingRefs[index].kind {
-                    if let previous = existing.step { step.preserveOrigin(of: previous) }
+                    if let previous = existing.step {
+                        step.preserveOrigin(of: previous)
+                        step.lifeID = previous.lifeID
+                    }
                     incomingRefs[index].kind = .step(step)
                     if !refreshRefs && step != existing.step {
                         bodies.append(.addRef(ref: DeskRef(kind: .step(step))))
@@ -645,6 +679,14 @@ public struct SwiftNativeDeskStore: Sendable {
             try Self.validateHierarchyTransition(create, in: priorState, allowArchive: false)
             try Self.validatePursuitInvariants(create, in: priorState, viaGenericPath: true)
             var (committedState, committedFeed) = try await appendAndRecompactUnlocked(create, feed: feed)
+            // Initial ownership belongs to the filing transaction, before a
+            // caller can close or reassign the newly created item.
+            if let waitingOn, let created = committedState.items.first(where: { $0.handle == handle }) {
+                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: committedFeed.maxCommittedTs), handle: handle,
+                    body: .setStatus(status: created.status, blockedReason: nil, waitingOn: waitingOn,
+                        progress: nil, assignee: assignee, laneOf: laneOf))
+                (committedState, committedFeed) = try await appendAndRecompactUnlocked(op, feed: committedFeed)
+            }
             for body in (keyNote.map { [DeskOpBody.appendNote(text: $0)] } ?? []) + refs.map({ .addRef(ref: $0) }) {
                 let op = DeskOp(ts: DeskClock.commitStamp(notBefore: committedFeed.maxCommittedTs), handle: handle, body: body)
                 (committedState, committedFeed) = try await appendAndRecompactUnlocked(op, feed: committedFeed)
@@ -668,24 +710,6 @@ public struct SwiftNativeDeskStore: Sendable {
         return wordsOnly
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
-    }
-
-    /// add_child(parentHandle, kind?, title) = create_item with the parent set.
-    /// Child kind defaults to the parent's kind; project is inherited.
-    @discardableResult
-    public func addChild(parentHandle: String, kind: DeskKind? = nil, title: String) async throws -> DeskItem {
-        // Locked read (liveState) so the kind/project inheritance can't come
-        // from a compaction-racing stale snapshot; createItem re-validates the
-        // parent under its own lock before committing.
-        guard let parent = try await liveState().items.first(where: { $0.handle == parentHandle }) else {
-            throw DeskError.unknownHandle(parentHandle)
-        }
-        return try await createItem(
-            kind: kind ?? parent.kind,
-            project: parent.project,
-            title: title,
-            parent: parentHandle
-        )
     }
 
     /// openPursuit — the ONLY path to an origin=agent item (H2). Creates a
@@ -864,6 +888,65 @@ public struct SwiftNativeDeskStore: Sendable {
         }
     }
 
+    /// Settle the receipt and its status under one Desk lock. Recovery may
+    /// finish a receipt-only commit, but only while that exact revision is
+    /// current. A newer reservation or terminal decision keeps its status.
+    public func settleWorkshopSession(
+        _ handle: String,
+        reservationId: String,
+        receipt: String,
+        disposition: DeskWorkDisposition,
+        artifactRefs: [String],
+        outcomeSummary: String,
+        blockedReason: String?
+    ) async throws {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            let completedAt: String?
+            let isLatest: Bool
+            if let pursuit = item.pursuit {
+                guard let reservation = pursuit.reservations.first(where: { $0.reservationId == reservationId }) else {
+                    throw DeskError.unknownReservation(reservationId: reservationId, handle: handle)
+                }
+                completedAt = reservation.completedAt
+                isLatest = pursuit.reservations.last?.reservationId == reservationId
+            } else {
+                guard let attempt = item.workAttempts.first(where: { $0.attemptId == reservationId }) else {
+                    throw DeskError.unknownReservation(reservationId: reservationId, handle: handle)
+                }
+                completedAt = attempt.completedAt
+                isLatest = item.workAttempts.last?.attemptId == reservationId
+            }
+            let revision: String
+            if let completedAt {
+                revision = completedAt
+            } else if item.isPursuit {
+                revision = try await completeWorkSession(handle, reservationId: reservationId, receipt: receipt,
+                    disposition: disposition, artifactRefs: artifactRefs).ts
+            } else {
+                guard let op = try await completeWorkAttempt(handle, attemptId: reservationId,
+                    receipt: receipt, disposition: disposition) else { return }
+                revision = op.ts
+            }
+            guard !item.status.isTerminal, isLatest,
+                  completedAt == nil || item.updatedAt == revision else { return }
+            if let blockedReason {
+                _ = try await setStatusIfUnchanged(handle, expectedUpdatedAt: revision,
+                    status: .blocked, blockedReason: blockedReason)
+            } else if item.isPursuit, disposition == .abandon {
+                _ = try await closeItemIfUnchanged(handle, expectedUpdatedAt: revision,
+                    outcomeSummary: outcomeSummary, canceled: true)
+            } else if item.isPursuit, disposition == .goalSatisfied {
+                _ = try await closePursuitIfGoalSatisfied(handle, reservationId: reservationId,
+                    expectedUpdatedAt: revision, outcomeSummary: outcomeSummary)
+            }
+        }
+    }
+
     @discardableResult
     public func handOffWorkReceipt(_ handle: String, reservationId: String) async throws -> DeskOp? {
         try await persistence.withFileLock(opsPath) {
@@ -943,13 +1026,45 @@ public struct SwiftNativeDeskStore: Sendable {
     }
 
     @discardableResult
+    /// Admit a status change only for the caller's still-open revision. An
+    /// optional best-effort note commits under the same lock; its stamp is the new revision.
+    public func setStatusIfUnchanged(
+        _ handle: String,
+        expectedUpdatedAt: String,
+        status: DeskStatus,
+        blockedReason: String? = nil,
+        note: String? = nil
+    ) async throws -> DeskOp? {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            guard !item.status.isTerminal, item.updatedAt == expectedUpdatedAt else { return nil }
+            let op = try await setStatus(handle, status: status, blockedReason: blockedReason)
+            if let note, let noted = try? await appendNote(handle, text: note) { return noted }
+            return op
+        }
+    }
+
+    @discardableResult
     public func updateTitle(_ handle: String, title: String? = nil, summary: String? = nil) async throws -> DeskOp {
         try await appendValidated(DeskOp(handle: handle, body: .updateTitle(title: title, summary: summary)))
     }
 
     @discardableResult
     public func addRef(_ handle: String, ref: DeskRef) async throws -> DeskOp {
-        try await appendValidated(DeskOp(handle: handle, body: .addRef(ref: ref)))
+        try await appendValidated(DeskOp(handle: handle, body: .addRef(ref: beginStep(ref))))
+    }
+
+    private func beginStep(_ incoming: DeskRef) throws -> DeskRef {
+        var ref = incoming
+        if case .step(var step) = ref.kind, step.lifeID == nil {
+            step.lifeID = try DataRootLife.current(in: dataRoot)
+            ref.kind = .step(step)
+        }
+        return ref
     }
 
     @discardableResult
@@ -1368,10 +1483,7 @@ public struct SwiftNativeDeskStore: Sendable {
             // DeskState is parent-before-descendant. Reopen outer terminal
             // parents first so a nested repair never sits beneath a terminal
             // ancestor while its compensating event is appended.
-            let candidates = state.items.filter { item in
-                item.status.isTerminal
-                    && Self.descendants(of: item.handle, in: state).contains(where: { !$0.status.isTerminal })
-            }
+            let candidates = Self.terminalParentsWithNonTerminalDescendants(in: state)
 
             var repairs: [DeskOp] = []
             for candidate in candidates {
@@ -1581,7 +1693,7 @@ public struct SwiftNativeDeskStore: Sendable {
             let key = Self.memoKey(opsPath)
             let before = Self.feedStamp(opsPath: opsPath, basePath: basePath)
             if let cached = await Self.sharedLiveStateMemo.lookup(key: key, stamp: before) {
-                return cached
+                return try inCurrentLife(cached)
             }
             let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
@@ -1589,7 +1701,7 @@ public struct SwiftNativeDeskStore: Sendable {
             if let before, after == before {
                 await Self.sharedLiveStateMemo.store(key: key, stamp: before, state: state)
             }
-            return state
+            return try inCurrentLife(state)
         }
     }
 
@@ -1599,11 +1711,39 @@ public struct SwiftNativeDeskStore: Sendable {
     public func liveStateUnlocked() async throws -> DeskState {
         let key = Self.memoKey(opsPath)
         let before = Self.feedStamp(opsPath: opsPath, basePath: basePath)
-        if let cached = await Self.sharedLiveStateMemo.lookup(key: key, stamp: before) { return cached }
+        if let cached = await Self.sharedLiveStateMemo.lookup(key: key, stamp: before) { return try inCurrentLife(cached) }
         let feed = try await readFeedUnlocked()
         let state = Self.compact(base: feed.base, feed.ops)
         guard let before, Self.feedStamp(opsPath: opsPath, basePath: basePath) == before else {
             throw CocoaError(.fileReadCorruptFile)
+        }
+        return try inCurrentLife(state)
+    }
+
+    private func inCurrentLife(_ saved: DeskState) throws -> DeskState {
+        let life = try DataRootLife.current(in: dataRoot)
+        var state = saved
+        for index in state.items.indices where !state.items[index].status.isTerminal {
+            var stopped = false
+            if var record = state.items[index].continuation,
+               ![.complete, .canceled].contains(record.state), DataRootLife.life(of: record.lifeID) != life {
+                record.state = .stopped
+                record.reason = DataRootLife.stoppedReason
+                state.items[index].continuation = record
+                stopped = true
+            }
+            if let last = state.items[index].refs.lastIndex(where: { if case .step = $0.kind { return true }; return false }),
+               case .step(var step) = state.items[index].refs[last].kind, DataRootLife.life(of: step.lifeID) != life {
+                step.status = "stopped"
+                step.reason = DataRootLife.stoppedReason
+                state.items[index].refs[last].kind = .step(step)
+                stopped = true
+            }
+            if stopped {
+                state.items[index].status = .blocked
+                state.items[index].blockedReason = DataRootLife.stoppedReason
+                state.items[index].waitingOn = "owner"
+            }
         }
         return state
     }
@@ -1646,6 +1786,11 @@ public struct SwiftNativeDeskStore: Sendable {
             frontier = frontier.flatMap { state.children(of: $0.handle) }.filter { seen.insert($0.handle).inserted }
         }
         return out
+    }
+
+    public static func terminalParentsWithNonTerminalDescendants(in state: DeskState) -> [DeskItem] {
+        state.items.filter { $0.status.isTerminal
+            && descendants(of: $0.handle, in: state).contains(where: { !$0.status.isTerminal }) }
     }
 
 
@@ -1984,11 +2129,6 @@ extension SwiftNativeDeskStore {
 
     var holdsPath: URL { deskDir.appendingPathComponent("holds.json") }
 
-    /// A stopped skill run's checkpoint (`SkillRunStore`); the run holds its items while it exists.
-    public static func skillRunFile(_ id: String, dataRoot: URL) -> URL {
-        dataRoot.appendingPathComponent("skills/runs/\(id).json")
-    }
-
     /// Whether a hold still binds. A run's binds while a resume step queued
     /// since the hold is open in MY QUEUE (or, before any is queued, for
     /// `holdLease` while the turn that stopped it queues one), its checkpoint
@@ -1997,7 +2137,7 @@ extension SwiftNativeDeskStore {
     /// path has to remember the hold.
     func isLive(_ hold: DeskHold, now: Date, state: DeskState) -> Bool {
         guard hold.by.hasPrefix("run ") else { return now.timeIntervalSince(hold.at) < Self.holdLease }
-        let run = String(hold.by.dropFirst(4)), file = Self.skillRunFile(run, dataRoot: dataRoot)
+        let run = String(hold.by.dropFirst(4))
         let age = now.timeIntervalSince(hold.at)
         // Only its steps queued since this hold count: a run resumed and stopped
         // again keeps its id, and the step its first stop queued is closed.
@@ -2006,8 +2146,8 @@ extension SwiftNativeDeskStore {
                 && item.refs.contains { if case .step(let step) = $0.kind { MyQueue.skillRun(in: step.words) == run } else { false } }
         }
         let bound = steps.isEmpty ? age < Self.holdLease : steps.contains { !$0.status.isTerminal }
-        guard FileManager.default.fileExists(atPath: file.path), age < Self.runHoldLimit, bound else {
-            try? FileManager.default.removeItem(at: file)
+        guard PartRunStore.exists(run, root: dataRoot), age < Self.runHoldLimit, bound else {
+            PartRunStore.discard(run, root: dataRoot)
             return false
         }
         return true
@@ -2062,11 +2202,24 @@ extension SwiftNativeDeskStore {
     }
 
     /// A resumed run's holds pass to the conversation resuming it.
-    public func passHolds(run: String, to session: String, now: Date = Date()) async throws {
+    /// The holds passed, as the run held them.
+    @discardableResult
+    public func passHolds(run: String, to session: String, now: Date = Date()) async throws -> [String: DeskHold] {
         try await editHolds(now: now) { holds, _ in
+            var passed: [String: DeskHold] = [:]
             for (handle, held) in holds where held.by == "run " + run {
+                passed[handle] = held
                 holds[handle] = DeskHold(by: "conversation " + session, session: session, at: now)
             }
+            return passed
+        }
+    }
+
+    /// Holds a resume passed and could not use go back to their run, each one
+    /// the conversation still holds as it was passed.
+    public func returnHolds(_ passed: [String: DeskHold], from session: String, now: Date = Date()) async throws {
+        try await editHolds(now: now) { holds, _ in
+            for (handle, held) in passed where holds[handle]?.by == "conversation " + session { holds[handle] = held }
         }
     }
 

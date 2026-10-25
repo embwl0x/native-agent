@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `LivingStatusRefreshCoalescer.swift` | `LivingStatusRefreshCoalescer` struct; `requestRefresh`, `completePass` |
 
 /// Bounded refresh ownership for the mounted Living Status card. File watching,
 /// cognition events, and the manual button may all request while one snapshot

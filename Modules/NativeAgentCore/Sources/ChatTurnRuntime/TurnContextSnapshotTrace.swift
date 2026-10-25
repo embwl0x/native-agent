@@ -3,6 +3,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+
+// Blueprint: | `TurnContextSnapshotTrace.swift` | `SwiftNativeTurnEngine.fireContextSnapshotEvent`: local bounded, redacted context snapshots and prompt/schema fingerprints tied to the current turn trace |
 // v2Prefix receipts (ConversationPrefixTelemetry).
 import ProviderRouting
 // ContextFlow packet provenance, for the memory-recall outcome on packet turns.

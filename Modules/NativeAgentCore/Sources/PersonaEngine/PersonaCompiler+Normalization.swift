@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `PersonaCompiler+Normalization.swift` | `PersonaCompiler`: `normalize` |
 
 extension PersonaCompiler {
     // MARK: - normalize_personality mirror

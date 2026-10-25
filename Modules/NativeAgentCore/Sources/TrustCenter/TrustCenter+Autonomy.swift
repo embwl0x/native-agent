@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
+// Blueprint: | `TrustCenter+Autonomy.swift` | `PermissionLaw` enum: `posture`, `answer` (the one effective level), `judge`, `toolClass` (the one class resolution per call, read by authorization and scheduling), `reachesUser`, `reach(ofPermissions:)` (a part's declared permissions → theirs or their); `SwiftNativeTrustCenter.autonomyLevel` delegates to `PermissionLaw.answer` |
 
 // MARK: - The permission law (User, 2026-10-17)
 
@@ -29,7 +30,7 @@ public enum PermissionPosture: Sendable {
 /// shared remote. Destructive is what cannot be undone on his side of it, and
 /// always asks a person; Safe changes nothing on his side.
 public enum PermissionLaw {
-    public static let fullMacContract = "Under Full Mac I make changes without asking. Permanent deletion still asks you every time, and a request an untrusted agent steered is held to Work mode. macOS permissions and account setup still ask."
+    public static let fullMacContract = "Under Full Mac I make changes without asking. Permanent deletion still asks, and an untrusted agent's initiating turn asks once at its first effect, quoting its ask; your answer covers that turn and lifts its Work-mode cap. macOS privacy resets still ask."
 
     public static func posture(_ policy: [String: JSONValue]) -> PermissionPosture {
         posture(permissionLevel: SwiftNativeSecurityCenter.string(policy["permissionLevel"]) ?? "",
@@ -116,7 +117,8 @@ public enum PermissionLaw {
     /// its declaration's class (a registered tool's schema, a door action's
     /// row, a part's reach, a host primitive's effect). A command line's text
     /// is never read: a shell or git call is the write its tool declares.
-    static func toolClass(_ tool: String, input: [String: JSONValue]) -> ToolClass {
+    /// The one class resolution: authorization and scheduling read the same answer for the same call.
+    public static func toolClass(_ tool: String, input: [String: JSONValue]) -> ToolClass {
         let name = ToolNameAliases.canonical(tool)
         if name == "app" {
             let named = ["action", "script"].contains { key in
@@ -133,9 +135,8 @@ public enum PermissionLaw {
         if AuthoredToolEffects.primitiveCapabilities[name] != nil || name.hasPrefix("fetch.") {
             return effectClass(AuthoredToolEffects.primitiveEffect(name, arguments: .object(input)).capabilities)
         }
-        // A part's or an MCP tool's declaration is the app action that folds it.
+        // A part's declaration is the app action that folds it.
         let action = AppActionBinding.action(tool: name, input: input) ?? AppActionBinding.binding(ToolNameAliases.authoredAction(name))
-            ?? (name.hasPrefix("mcp__") ? AppActionBinding.binding(name) : nil)
         if action?.read == true { return .read }
         let declared = AppActionBinding.declaredClass(name) ?? action?.toolClass ?? .write
         // A send's dry run reaches no one.
@@ -152,18 +153,13 @@ public enum PermissionLaw {
     /// re-enters under its tool's name.
     static func reachesUser(_ tool: String, input: [String: JSONValue]?, capabilities: Set<String>) -> Bool {
         let name = ToolNameAliases.canonical(tool)
-        if SwiftNativeSecurityCenter.commandLineTools.contains(name.lowercased()) { return true }
         if input != nil, !capabilities.isDisjoint(with: [
             "outside_app_data_write", "other_app_settings_write", "system_control", "system_permission_reset",
             "ax_injection", "mac_control", "clipboard_write", "remote_effect",
         ]) { return true }
-        if name == "app" || SwiftNativeSecurityCenter.notificationToolNames.contains(SwiftNativeSecurityCenter.policyToolName(name)) {
-            return false
-        }
-        // One of her parts reaches what its own manifest declares.
-        if let him = AppActionBinding.binding(ToolNameAliases.authoredAction(name))?.reachesHim { return him }
-        guard let bucket = AppActionBinding.declaredBucket(name) else { return true }
-        return [.macIntegration, .macControl, .system].contains(bucket)
+        if name == "app" { return false }
+        if let schema = AppActionBinding.declaredSchema(name) { return schema.reach == .his }
+        return AppActionBinding.binding(ToolNameAliases.authoredAction(name))?.reach != .hers
     }
 
     /// Whether a card is a person's even under Full Mac: the call it carries
@@ -182,6 +178,12 @@ public enum PermissionLaw {
     }
 
     /// A part's declared permission, as the primitive it names reaches.
+    /// What a part's declared permissions reach: her own data, model and localhost are hers; anything else is his.
+    public static let herReach: Set<String> = ["app_data_read", "app_data_write", "model", "network_localhost"]
+    public static func reach(ofPermissions permissions: [String]) -> ToolReach {
+        permissions.contains { !herReach.contains($0) && !$0.hasPrefix("app_read:") } ? .his : .hers
+    }
+
     public static func permissionClass(_ permission: String) -> ToolClass {
         guard AuthoredToolEffects.primitiveCapabilities[permission] != nil || permission.hasPrefix("fetch") else { return .write }
         return effectClass(AuthoredToolEffects.primitiveEffect(permission, arguments: nil).capabilities)
@@ -195,8 +197,8 @@ public enum PermissionLaw {
 }
 
 extension SwiftNativeTrustCenter {
-    /// The effective answer for a tool by name (catalog, planner).
-    public func autonomyLevel(forTool toolName: String, surface: String) async throws -> String {
+    /// Surface-independent by-name judgment. Origin admission is SecurityCenter's.
+    public func autonomyLevel(forTool toolName: String, surface _: String) async throws -> String {
         try await autonomyLevel(forTool: toolName, input: nil)
     }
 

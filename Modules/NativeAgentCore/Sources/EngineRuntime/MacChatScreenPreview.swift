@@ -1,6 +1,8 @@
 import Foundation
 import CoreGraphics
-import ChatOrchestration
+import ChatTurnRuntime
+import AgentWorkspace
+// Blueprint: | `MacChatScreenPreview.swift` | `MacChatScreenPreview` struct; `merged`; `TurnsFacade.receiveScreenPreview` |
 
 /// What the agent is looking at, as the chat's working card shows it.
 ///

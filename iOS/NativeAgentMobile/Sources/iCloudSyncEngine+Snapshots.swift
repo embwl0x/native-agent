@@ -6,10 +6,10 @@
 //          MacSyncEngine validates it, dispatches into the in-process Swift runtime,
 //          writes `responses/<msg_id>.json`, then pings `inbox_response_<msg_id>`.
 
-import CryptoKit
 import Foundation
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `iCloudSyncEngine+Snapshots.swift` | `iCloudSyncEngine`: `applyHelpersSnapshot` owns both file and action receipt adoption, retaining newer Mac helper revisions; `refreshHelpersSnapshot`, `applySchedulerSnapshot`, `refreshSchedulerSnapshot`, `applyProviderState`; Mac revisions order approvals, inbox and memory snapshots against per-record readbacks/removals until acknowledged; provider snapshots and action receipts use the checked routing revision in the same shared surface-model projection; one typed skill/tool/graph decode owner through full, catalog and graph refreshes; Advanced group delivery refreshes that graph projection for its open list/detail; matched fuller transcript text survives compatible truncation across history membership and generation changes; connector and Telegram receipts share snapshot ordering |
 
 /// Outcome of the provider snapshot read that powers the chat model menu.
 /// Keeping an explicit result lets an on-demand refresh distinguish a catalog
@@ -135,6 +135,60 @@ struct SettingsSnapshotRefreshOutcome: Equatable, Sendable {
 }
 
 extension iCloudSyncEngine {
+    /// Retain newer canonical rows (including absent rows) in this one shared
+    /// projection until a Mac snapshot's revision acknowledges their readbacks.
+    func orderedSnapshot<Row: Decodable & Identifiable & Sendable>(
+        _ read: MacSnapshotRead<[Row]>, file: String, current: [Row]
+    ) -> [Row] where Row.ID == String {
+        if read.revision < (snapshotReadRevisions[file] ?? 0) { return current }
+        snapshotReadRevisions[file] = read.revision
+        let newer = (recordReadbackRevisions[file] ?? [:]).filter { $0.value > read.revision }
+        recordReadbackRevisions[file] = newer
+        let currentByID = Dictionary(current.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        let incomingIDs = Set(read.value.map(\.id))
+        return read.value.compactMap { newer[$0.id] == nil ? $0 : currentByID[$0.id] }
+            + current.filter { newer[$0.id] != nil && !incomingIDs.contains($0.id) }
+    }
+
+    func installReadback(revision: Double, file: String, id: String) -> Bool {
+        let applied = max(snapshotReadRevisions[file] ?? 0, recordReadbackRevisions[file]?[id] ?? 0)
+        if revision < applied { return false }
+        recordReadbackRevisions[file, default: [:]][id] = revision
+        return true
+    }
+
+    func applyConnectorSnapshot(_ rows: [ConnectorRecord]) {
+        connectors = rows.map { row in
+            guard let current = connectors.first(where: { $0.id == row.id }),
+                  (current.updatedAt ?? "") > (row.updatedAt ?? "") else { return row }
+            return current
+        }
+    }
+
+    func applyTelegramSnapshot(_ snapshot: MobileTelegramSnapshot) {
+        if snapshot.observedAt >= (telegram?.observedAt ?? 0) { telegram = snapshot }
+    }
+
+    func refreshTelegramSnapshot() async -> Bool {
+        let lifecycle = lifecycleGeneration
+        let snapshot: MobileTelegramSnapshot? = await loadSnapshotObjectAsync(named: "telegram.json")
+        guard lifecycle == lifecycleGeneration, let snapshot else { return false }
+        applyTelegramSnapshot(snapshot)
+        return true
+    }
+
+    func applyHelpersSnapshot(_ incoming: MobileHelpersSnapshot) {
+        var snapshot = incoming
+        snapshot.helpers = snapshot.helpers.map { row in
+            if let current = helpersSnapshot?.helpers.first(where: { $0.id == row.id }),
+               (current.revision ?? 0) > (row.revision ?? 0) { return current }
+            return row
+        }
+        helpersSnapshot = snapshot
+        helperDetails = helperDetails.filter { id, detail in snapshot.helpers.contains { $0.id == id && $0.revision == detail.revision } }
+        agentThreads = agentThreads.filter { id, thread in snapshot.agents.contains { $0.id == id && $0 == thread.agent.summary } }
+    }
+
     @discardableResult
     func refreshHelpersSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
@@ -142,7 +196,7 @@ extension iCloudSyncEngine {
         await refreshSnapshotStaleness()
         guard let snapshot: MobileHelpersSnapshot = await Self.loadSnapshotObjectOnly(named: "helpers_agents.json", in: snapshotDir),
               lifecycle == lifecycleGeneration else { return false }
-        helpersSnapshot = snapshot
+        applyHelpersSnapshot(snapshot)
         return staleSnapshotGroups["helpers_agents"] == nil
     }
 
@@ -150,6 +204,9 @@ extension iCloudSyncEngine {
         guard snapshot.capturedAt >= (schedulerSnapshot?.capturedAt ?? 0) else { return }
         var merged = snapshot
         schedulerJobReceiptTimes = schedulerJobReceiptTimes.filter { $0.value > snapshot.capturedAt }
+        if !schedulerJobReceiptTimes.isEmpty {
+            merged.mac_time_zone = schedulerSnapshot?.mac_time_zone
+        }
         // Preserve newer action readbacks without discarding other jobs in this full snapshot.
         for job in schedulerSnapshot?.jobs ?? [] where schedulerJobReceiptTimes[job.id] != nil {
             if let index = merged.jobs.firstIndex(where: { $0.id == job.id }) {
@@ -192,30 +249,6 @@ extension iCloudSyncEngine {
         lastSyncAt = Date()
         syncError = SnapshotHealthLog.damageSentence(for: files)
         PhoneRequestCoordinator.shared.syncDidSucceed()
-        if !prefersCloudKitSnapshotCache { refreshLegacyPageVersions() }
-    }
-
-    private func refreshLegacyPageVersions() {
-        guard let snapshotDir else { return }
-        pageVersionQueued = true
-        guard pageVersionTask == nil else { return }
-        let generation = lifecycleGeneration
-        pageVersionTask = Task {
-            defer { if generation == lifecycleGeneration { pageVersionTask = nil } }
-            while pageVersionQueued {
-                pageVersionQueued = false
-                let versions = await Task.detached(priority: .utility) {
-                    Dictionary(uniqueKeysWithValues: ["knowledge_graph.json", "telegram.json"].map { filename in
-                        let digest = Self.loadSnapshotData(named: filename, in: snapshotDir).map { Data(SHA256.hash(data: $0)) } ?? Data()
-                        return (filename, digest)
-                    })
-                }.value
-                guard !Task.isCancelled, generation == lifecycleGeneration else { return }
-                for (filename, version) in versions where pageSnapshotVersions[filename] != version {
-                    pageSnapshotVersions[filename] = version
-                }
-            }
-        }
     }
 
     /// Apply the credential-free CloudKit projection published by the Mac.
@@ -225,7 +258,7 @@ extension iCloudSyncEngine {
     func applyProviderCatalogStatus(_ value: String, isCurrent: @MainActor () -> Bool) async -> Bool {
         let lifecycle = lifecycleGeneration
         let pairing = pairingStore?.iCloudPairingSecret
-        let result = await Task.detached(priority: .userInitiated) { () throws -> ([ProviderInfo], [String: SurfaceModelPref]) in
+        let result = await Task.detached(priority: .userInitiated) { () throws -> ([ProviderInfo], MacSnapshotRead<[String: SurfaceModelPref]>) in
             let catalog = try NAProviderCatalogStatusCodec.decode(value)
             let providers = catalog.providers.map { provider in
                 ProviderInfo(
@@ -266,7 +299,7 @@ extension iCloudSyncEngine {
                     providerId: selection.providerID
                 )
             }
-            return (providers, surfaceModels)
+            return (providers, MacSnapshotRead(revision: catalog.routingRevision, value: surfaceModels))
         }.result
         guard !Task.isCancelled, isCurrent(), lifecycle == lifecycleGeneration,
               pairing == pairingStore?.iCloudPairingSecret else { return false }
@@ -281,25 +314,19 @@ extension iCloudSyncEngine {
         }
     }
 
-    // Phone selections return through the same Mac-owned snapshot as remote
-    // changes. A matching pending selection is an acknowledgement, not a toast.
-    private func applyProviderState(providers nextProviders: [ProviderInfo]?, surfaceModels next: [String: SurfaceModelPref]?) {
+    // Snapshots and readbacks carry the routing owner's revision. There is no
+    // pending acknowledgment fence to reinstall after an acknowledgment arrived.
+    private func applyProviderState(providers nextProviders: [ProviderInfo]?, surfaceModels incoming: MacSnapshotRead<[String: SurfaceModelPref]>?) {
         if let nextProviders, providers != nextProviders { providers = nextProviders }
-        guard let next, surfaceModels != next || !pendingPhoneSurfaceModels.isEmpty else { return }
-        let previous = surfaceModels
+        guard let incoming else { return }
+        var next = surfaceModels
+        for surface in Set(next.keys).union(incoming.value.keys)
+        where incoming.revision >= (surfaceModelRevisions[surface] ?? 0) {
+            surfaceModelRevisions[surface] = incoming.revision
+            next[surface] = incoming.value[surface]
+        }
         for (surface, newPref) in next {
-            let acknowledged = pendingPhoneSurfaceModels.filter { _, selection in
-                let pending = selection.preference
-                return selection.surface == surface && pending.model == newPref.model
-                    && (pending.providerId == nil || newPref.providerId == nil || pending.providerId == newPref.providerId)
-                    && (pending.reasoningEffort == nil || newPref.reasoningEffort == nil || pending.reasoningEffort == newPref.reasoningEffort)
-                    && (pending.serviceTier == nil || newPref.serviceTier == nil || pending.serviceTier == newPref.serviceTier)
-            }
-            if !acknowledged.isEmpty {
-                for id in acknowledged.keys { pendingPhoneSurfaceModels.removeValue(forKey: id) }
-                continue
-            }
-            guard let prev = previous[surface], prev.model != newPref.model else { continue }
+            guard let prev = surfaceModels[surface], prev.model != newPref.model else { continue }
             let changeMessage = switch MobileProviderSurfaceLabelPresentation.presentation(for: surface) {
             case .named(let surfaceName): "Mac changed the model for \(surfaceName)"
             default: "Mac changed a model"
@@ -380,8 +407,9 @@ extension iCloudSyncEngine {
         defer { finishSnapshotRefresh(lifecycle: lifecycle) }
         let schedulerLoaded = await refreshSchedulerSnapshot()
         let bundle = await Self.loadAllSnapshots(snapshotDir: snapshotDir)
+        _ = await refreshTelegramSnapshot()
         let workActivity: MobileWorkActivitySnapshot? = await Self.loadSnapshotObjectOnly(named: "work_activity.json", in: snapshotDir)
-        let layout: SurfaceLayout? = await Self.loadSnapshotObjectOnly(named: "ui_layout.json", in: snapshotDir)
+        var layout: SurfaceLayout? = await Self.loadSnapshotObjectOnly(named: "ui_layout.json", in: snapshotDir)
         let projectedTranscripts: [String: PublishedTranscript]?
         if let rows = bundle.chatTranscripts { projectedTranscripts = await Self.transcriptMap(rows) }
         else { projectedTranscripts = nil }
@@ -390,13 +418,14 @@ extension iCloudSyncEngine {
         let transcriptsCurrent = transcriptsGeneration == chatTranscriptsRefreshGeneration
         let sessionsCurrent = sessionsGeneration == chatSessionListRefreshGeneration
         if let workActivity { PhoneTurnActivity.shared.receive(workActivity) }
-        if var layout { layout.addMissing(); surfaceLayout = layout }
+        layout?.addMissing()
+        surfaceLayout = layout
         if activityGeneration == targetedRefreshGeneration {
             if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
-            if let v = bundle.memories, memories != v { memories = v }
+            if let v = bundle.memories { memories = orderedSnapshot(v, file: "memories.json", current: memories) }
             if let v = bundle.memoryProposals {
                 memoryProposalsSnapshotLoaded = true
-                memoryProposals = v.filter(\.isPending)
+                memoryProposals = orderedSnapshot(v, file: "memory_proposals.json", current: memoryProposals).filter(\.isPending)
             }
             if let v = bundle.trainingProposals {
                 trainingProposals = v
@@ -404,7 +433,7 @@ extension iCloudSyncEngine {
             }
             if let v = bundle.inboxItems {
                 inboxSnapshotLoaded = true
-                inboxItems = v
+                inboxItems = orderedSnapshot(v, file: "inbox.json", current: inboxItems)
             }
         }
         if deskGeneration == deskRefreshGeneration {
@@ -416,6 +445,8 @@ extension iCloudSyncEngine {
             }
         }
         if let v = bundle.skills, skills != v { skills = v }
+        if let v = bundle.tools { tools = v }
+        knowledgeGraph = bundle.knowledgeGraph
         if let v = bundle.trustPolicy { trustPolicy = v }
         if let v = bundle.personality { applyPersonality(v, pairing: personalityPairing) }
         if let v = bundle.health { health = v }
@@ -425,16 +456,15 @@ extension iCloudSyncEngine {
         organismLivingStatus = bundle.organismLivingStatus
         if sessionsCurrent {
             if let v = bundle.sessions, sessions != v { sessions = v }
-            if let v = bundle.pinnedChatSessions, pinnedChatSessions != v { pinnedChatSessions = v }
-            if let v = bundle.chatAnchor { chatAnchor = v }
+            if let v = bundle.pinnedChatSessions { sessionNavigation = v }
         }
-        if transcriptsCurrent, let projectedTranscripts, chatTranscripts != projectedTranscripts { chatTranscripts = projectedTranscripts }
-        if let v = bundle.connectors { connectors = v }
+        if transcriptsCurrent, let projectedTranscripts { adoptChatTranscripts(projectedTranscripts) }
+        if let v = bundle.connectors { applyConnectorSnapshot(v) }
         applyProviderState(providers: bundle.providers, surfaceModels: bundle.surfaceModels)
         if let v = bundle.providerSignIns, providerSignIns != v { providerSignIns = v }
         if approvalsGeneration == approvalsRefreshGeneration, let v = bundle.approvals {
             approvalsSnapshotLoaded = true
-            approvals = v
+            approvals = orderedSnapshot(v, file: "approvals.json", current: approvals)
         }
         if let v = bundle.turnSummaries { turnSummaries = v }
         await refreshSnapshotStaleness()
@@ -509,29 +539,30 @@ extension iCloudSyncEngine {
         await settleUnobservedActionResponses()
         async let latestOverview: WorkOverview? = Self.loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
         let bundle = await Self.loadLightweightSnapshots(snapshotDir: snapshotDir)
+        _ = await refreshTelegramSnapshot()
         let overview = await latestOverview
         let workActivity: MobileWorkActivitySnapshot? = await Self.loadSnapshotObjectOnly(named: "work_activity.json", in: snapshotDir)
-        let layout: SurfaceLayout? = await Self.loadSnapshotObjectOnly(named: "ui_layout.json", in: snapshotDir)
+        var layout: SurfaceLayout? = await Self.loadSnapshotObjectOnly(named: "ui_layout.json", in: snapshotDir)
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
         applyWorkOverview(overview)
         if let v = bundle.trustPolicy { trustPolicy = v }
         if let workActivity { PhoneTurnActivity.shared.receive(workActivity) }
-        if var layout { layout.addMissing(); surfaceLayout = layout }
+        layout?.addMissing()
+        surfaceLayout = layout
         if let v = bundle.personality { applyPersonality(v, pairing: personalityPairing) }
         if let v = bundle.health { health = v }
         organismLivingStatus = bundle.organismLivingStatus
         if sessionsGeneration == chatSessionListRefreshGeneration {
             if let v = bundle.sessions, sessions != v { sessions = v }
-            if let v = bundle.pinnedChatSessions, pinnedChatSessions != v { pinnedChatSessions = v }
-            if let v = bundle.chatAnchor { chatAnchor = v }
+            if let v = bundle.pinnedChatSessions { sessionNavigation = v }
         }
-        if let v = bundle.connectors { connectors = v }
+        if let v = bundle.connectors { applyConnectorSnapshot(v) }
         applyProviderState(providers: bundle.providers, surfaceModels: bundle.surfaceModels)
         if let v = bundle.providerSignIns, providerSignIns != v { providerSignIns = v }
         if approvalsGeneration == approvalsRefreshGeneration, let v = bundle.approvals {
             approvalsSnapshotLoaded = true
-            approvals = v
+            approvals = orderedSnapshot(v, file: "approvals.json", current: approvals)
         }
         if bundle.loadedAllSnapshots {
             noteRefreshSucceeded()
@@ -582,14 +613,14 @@ extension iCloudSyncEngine {
         approvalsRefreshGeneration &+= 1
         let generation = approvalsRefreshGeneration
         async let latestOverview: WorkOverview? = Self.loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
-        let latest: [ApprovalRequest]? = await Self.loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir)
+        let latest: MacSnapshotRead<[ApprovalRequest]>? = await Self.loadSnapshotObjectOnly(named: "approvals.json", in: snapshotDir)
         let overview = await latestOverview
         guard generation == approvalsRefreshGeneration,
               lifecycle == lifecycleGeneration else { return }
         applyWorkOverview(overview)
         if let latest {
             approvalsSnapshotLoaded = true
-            approvals = latest
+            approvals = orderedSnapshot(latest, file: "approvals.json", current: approvals)
             noteRefreshSucceeded()
         }
     }
@@ -610,14 +641,14 @@ extension iCloudSyncEngine {
               lifecycle == lifecycleGeneration else { return false }
         applyWorkOverview(overview)
         if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
-        if let v = bundle.memories, memories != v { memories = v }
+        if let v = bundle.memories { memories = orderedSnapshot(v, file: "memories.json", current: memories) }
         if let v = bundle.inboxItems {
             inboxSnapshotLoaded = true
-            inboxItems = v
+            inboxItems = orderedSnapshot(v, file: "inbox.json", current: inboxItems)
         }
         if let v = bundle.memoryProposals {
             memoryProposalsSnapshotLoaded = true
-            memoryProposals = v.filter(\.isPending)
+            memoryProposals = orderedSnapshot(v, file: "memory_proposals.json", current: memoryProposals).filter(\.isPending)
         }
         if let v = bundle.trainingProposals {
             trainingProposals = v
@@ -645,29 +676,37 @@ extension iCloudSyncEngine {
     func refreshCatalogSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
-        if let latest: [SkillRecord] = await Self.loadSnapshotArrayOnly(
-            named: "skills_snapshot.json",
-            in: snapshotDir
-        ) {
-            guard lifecycle == lifecycleGeneration else { return false }
-            skills = latest
+        async let skillRows: [SkillManifestEntry]? = Self.loadSnapshotArrayOnly(named: "skills_snapshot.json", in: snapshotDir)
+        async let toolRows: [ToolRecord]? = Self.loadSnapshotArrayOnly(named: "tools_snapshot.json", in: snapshotDir)
+        let (skillRowsValue, toolRowsValue) = await (skillRows, toolRows)
+        guard lifecycle == lifecycleGeneration else { return false }
+        if let skillRowsValue { skills = skillRowsValue }
+        if let toolRowsValue { tools = toolRowsValue }
+        if skillRowsValue != nil && toolRowsValue != nil {
             noteRefreshSucceeded()
             return true
         }
         return false
     }
 
+    func refreshKnowledgeGraphSnapshot() async {
+        let lifecycle = lifecycleGeneration
+        let snapshot: KGEntityResponse? = await loadSnapshotObjectAsync(named: "knowledge_graph.json")
+        guard lifecycle == lifecycleGeneration else { return }
+        knowledgeGraph = snapshot
+    }
+
     func refreshMemorySnapshot() async {
         guard let snapshotDir else { return }
         let lifecycle = lifecycleGeneration
-        async let latestMemories: [MemoryRecord]? = Self.loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
-        async let latestProposals: [MemoryProposalRecord]? = Self.loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
+        async let latestMemories: MacSnapshotRead<[MemoryRecord]>? = Self.loadSnapshotObjectOnly(named: "memories.json", in: snapshotDir)
+        async let latestProposals: MacSnapshotRead<[MemoryProposalRecord]>? = Self.loadSnapshotObjectOnly(named: "memory_proposals.json", in: snapshotDir)
         let (memoryRows, proposalRows) = await (latestMemories, latestProposals)
         guard lifecycle == lifecycleGeneration else { return }
-        if let memoryRows { memories = memoryRows }
+        if let memoryRows { memories = orderedSnapshot(memoryRows, file: "memories.json", current: memories) }
         if let proposalRows {
             memoryProposalsSnapshotLoaded = true
-            memoryProposals = proposalRows.filter(\.isPending)
+            memoryProposals = orderedSnapshot(proposalRows, file: "memory_proposals.json", current: memoryProposals).filter(\.isPending)
         }
         // Memory is the screen sweep item 2 was filed against: its own pull
         // must re-read whether the Mac could rebuild this group at all.
@@ -742,7 +781,7 @@ extension iCloudSyncEngine {
 
     /// A missing or unreadable file is a failed read, not an empty overview:
     /// it never replaces a newer copy another group already delivered.
-    private func applyWorkOverview(_ overview: WorkOverview?) {
+    func applyWorkOverview(_ overview: WorkOverview?) {
         guard let overview, let incomingDate = DeskActivityState.movementDate(overview.capturedAt) else { return }
         if let currentDate = DeskActivityState.movementDate(workOverview?.capturedAt),
            incomingDate <= currentDate { return }
@@ -773,7 +812,7 @@ extension iCloudSyncEngine {
         let outcome = SettingsSnapshotRefreshOutcome(availableFields: availableFields)
         if let trustRow { trustPolicy = trustRow }
         if let personalityRow { applyPersonality(personalityRow, pairing: personalityPairing) }
-        if let connectorRows { connectors = connectorRows }
+        if let connectorRows { applyConnectorSnapshot(connectorRows) }
         if let healthRow { health = healthRow }
         if outcome.state == .refreshed {
             noteRefreshSucceeded(files: SettingsSnapshotRefreshOutcome.filenames)
@@ -833,7 +872,7 @@ extension iCloudSyncEngine {
 
     @discardableResult
     func refreshTrustSnapshot() async -> Bool {
-        guard let snapshotDir else { return false }
+        guard let snapshotDir else { trustPolicy = nil; return false }
         let lifecycle = lifecycleGeneration
         if let latest: TrustPolicy = await Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir) {
             guard lifecycle == lifecycleGeneration else { return false }
@@ -842,6 +881,7 @@ extension iCloudSyncEngine {
             return true
         } else {
             guard lifecycle == lifecycleGeneration else { return false }
+            trustPolicy = nil
             syncError = SnapshotHealthLog.damageSentence() ?? "Trust snapshot is still downloading from iCloud. Try again in a moment."
             return false
         }
@@ -853,7 +893,7 @@ extension iCloudSyncEngine {
         let lifecycle = lifecycleGeneration
         async let latestProviders: [ProviderInfo]? = Self.loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
         async let latestTrust: TrustPolicy? = Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir)
-        async let latestSurfaceModels: [String: SurfaceModelPref]? = Self.loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
+        async let latestSurfaceModels: MacSnapshotRead<[String: SurfaceModelPref]>? = Self.loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
         let (providerRows, trustRow, surfaceModelRows) = await (latestProviders, latestTrust, latestSurfaceModels)
         guard lifecycle == lifecycleGeneration else { return .superseded }
         applyProviderState(providers: providerRows, surfaceModels: surfaceModelRows)
@@ -879,19 +919,12 @@ extension iCloudSyncEngine {
         chatSessionListRefreshGeneration &+= 1
         let generation = chatSessionListRefreshGeneration
         async let latestSessions: [ChatSession]? = Self.loadSnapshotArrayOnly(named: "sessions.json", in: snapshotDir)
-        async let latestPinned: [ChatSession]? = Self.loadSnapshotArrayOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
-        // The anchor rides in the same `.core` group as the two above, so it
-        // arrives on the same edge as the sessions it names. Its absence is
-        // normal (no surface has published one yet, or the file has not landed)
-        // and must leave the last proven anchor alone — same retain-last-good
-        // discipline as every other snapshot read here.
-        async let latestAnchor: ConversationAnchorPin? = Self.loadSnapshotObjectOnly(named: "chat_anchor.json", in: snapshotDir)
-        let (sessionRows, pinnedRows, anchorRow) = await (latestSessions, latestPinned, latestAnchor)
+        async let latestPinned: ChatSessionNavigation? = Self.loadSnapshotObjectOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
+        let (sessionRows, pinnedRows) = await (latestSessions, latestPinned)
         guard generation == chatSessionListRefreshGeneration,
               lifecycle == lifecycleGeneration else { return }
         if let sessionRows { sessions = sessionRows }
-        if let pinnedRows { pinnedChatSessions = pinnedRows }
-        if let anchorRow { chatAnchor = anchorRow }
+        if let pinnedRows { sessionNavigation = pinnedRows }
         if sessionRows != nil && pinnedRows != nil {
             noteRefreshSucceeded()
         } else if sessionRows != nil || pinnedRows != nil {
@@ -917,7 +950,7 @@ extension iCloudSyncEngine {
             let projected = await Self.transcriptMap(latestTranscripts)
             guard generation == chatTranscriptsRefreshGeneration,
                   lifecycle == lifecycleGeneration else { return false }
-            if chatTranscripts != projected { chatTranscripts = projected }
+            adoptChatTranscripts(projected)
             noteRefreshSucceeded()
             return true
         }
@@ -929,8 +962,85 @@ extension iCloudSyncEngine {
     /// it published an empty one. That collapse was the bottom of the chain
     /// that left a chat cleared on the Mac showing its old messages on the
     /// phone: no layer above could tell the two apart. Empty stays empty here.
+    /// Transcript versions and row/run identity own reconciliation for every reader.
+    /// Unfinished handoffs remain separate durable requests; settled rows are not cached.
+    func adoptChatTranscripts(_ incoming: [String: PublishedTranscript], completeSnapshot: Bool = true) {
+        for (session, var published) in incoming {
+            guard !published.messages.isEmpty || published.generation != nil else { continue }
+            if let current = chatTranscripts[session] {
+                if let applied = current.generation {
+                    guard let generation = published.generation, generation >= applied else { continue }
+                    if published.messages.isEmpty && generation == applied { continue }
+                }
+                published.regeneratedAwayIDs = current.regeneratedAwayIDs
+                published.messages.removeAll { current.regeneratedAwayIDs.contains($0.id) }
+                let canonicalIDs = Set(published.messages.map(\.id))
+                let canonicalUsers = Set(published.messages.filter { $0.role == .user }.compactMap(\.runId))
+                let terminalRuns = Set(published.messages.filter {
+                    $0.isTerminalReply || $0.completionState == "failed"
+                }.compactMap(\.runId))
+                let unfinished = ChatStore.shared.pendingExchanges.values.filter {
+                    $0.sessionID == session && !$0.isExpired
+                }
+                let unfinishedIDs = Set(unfinished.flatMap {
+                    [$0.placeholderID, $0.request?.appendedUserId].compactMap { $0 }
+                }).union(ChatStore.shared.queuedSends.filter { $0.sessionID == session }.flatMap {
+                    [$0.id, $0.placeholderID, $0.userMessageID].compactMap { $0 }
+                })
+                let kept = current.messages.filter { row in
+                    guard !canonicalIDs.contains(row.id) else { return false }
+                    if published.messages.isEmpty {
+                        return unfinishedIDs.contains(row.id) || row.isStreaming || row.awaitingMacTranscript
+                    }
+                    if let run = row.runId {
+                        if row.role == .user, canonicalUsers.contains(run) { return false }
+                        if terminalRuns.contains(run) { return false }
+                    }
+                    return unfinishedIDs.contains(row.id) || row.isStreaming || row.awaitingMacTranscript
+                }
+                let overlaps = !Set(current.records.compactMap { UUID(uuidString: $0.id) }).isDisjoint(with: canonicalIDs)
+                let history = published.messages.isEmpty || !overlaps ? [] : current.messages.filter {
+                    current.historyIDs.contains($0.id) && !canonicalIDs.contains($0.id)
+                }
+                // A matched full read survives compatible snapshot truncation;
+                // unrelated transcript writes and history membership do not age it.
+                // Phone-local non-image bytes carry over; Mac previews own images.
+                let truncationSuffix = "\n" + ChatStore.snapshotTruncationMarker
+                for index in published.messages.indices {
+                    let row = published.messages[index]
+                    let local = current.messages.first {
+                        $0.id == row.id || (row.runId != nil && $0.runId == row.runId && $0.role == row.role)
+                    }
+                    if let local, row.text.hasSuffix(truncationSuffix) {
+                        let prefix = String(row.text.dropLast(truncationSuffix.count))
+                        if local.text.count > prefix.count, local.text.hasPrefix(prefix) {
+                            published.messages[index].text = local.text
+                        }
+                    }
+                    for attachment in published.messages[index].attachments.indices
+                    where published.messages[index].attachments[attachment].type != "image"
+                        && published.messages[index].attachments[attachment].base64 == nil {
+                        let id = published.messages[index].attachments[attachment].id
+                        published.messages[index].attachments[attachment].base64 =
+                            local?.attachments.first { $0.id == id }?.base64
+                    }
+                }
+                published.historyIDs = current.historyIDs.intersection(Set((history + published.messages).map(\.id)))
+                published.messages = history + published.messages + kept
+            }
+            if chatTranscripts[session] != published { chatTranscripts[session] = published }
+        }
+        if completeSnapshot {
+            let active = Set([ChatStore.shared.transcriptSessionKey]
+                + ChatStore.shared.pendingExchanges.values.map { $0.sessionID ?? ChatStore.nilQueueSessionKey }
+                + ChatStore.shared.queuedSends.map { $0.sessionID ?? ChatStore.nilQueueSessionKey })
+            chatTranscripts = chatTranscripts.filter { incoming[$0.key] != nil || active.contains($0.key) }
+        }
+    }
+
     func transcriptRead(for sessionID: String?) -> MacTranscriptRead {
         guard let sessionID, let published = chatTranscripts[sessionID] else { return .unavailable }
+        if published.readError != nil { return .unavailable }
         return .published(
             published.messages,
             generation: published.generation
@@ -947,14 +1057,14 @@ extension iCloudSyncEngine {
         targetedRefreshGeneration &+= 1
         let generation = targetedRefreshGeneration
         async let latestOverview: WorkOverview? = Self.loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
-        let latest: [InboxItemRecord]? = await Self.loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir)
+        let latest: MacSnapshotRead<[InboxItemRecord]>? = await Self.loadSnapshotObjectOnly(named: "inbox.json", in: snapshotDir)
         let overview = await latestOverview
         guard generation == targetedRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
         applyWorkOverview(overview)
         if let latest {
             inboxSnapshotLoaded = true
-            inboxItems = latest
+            inboxItems = orderedSnapshot(latest, file: "inbox.json", current: inboxItems)
             noteRefreshSucceeded()
             return true
         } else {
@@ -972,28 +1082,25 @@ extension iCloudSyncEngine {
         var deskBounds: MobileDeskProjectionReport?
         /// Additive for the same reason as `deskBounds`.
         var deskReadingCopies: [MobileDeskItemReadingCopy]?
-        var skills: [SkillRecord]?
-        var memories: [MemoryRecord]?
-        var memoryProposals: [MemoryProposalRecord]?
+        var skills: [SkillManifestEntry]?
+        var tools: [ToolRecord]?
+        var knowledgeGraph: KGEntityResponse?
+        var memories: MacSnapshotRead<[MemoryRecord]>?
+        var memoryProposals: MacSnapshotRead<[MemoryProposalRecord]>?
         var trainingProposals: [TrainingProposalSummary]?
         var trustPolicy: TrustPolicy?
         var personality: PersonalityProfile?
         var health: RuntimeHealth?
         var organismLivingStatus: OrganismLivingStatusFile?
         var sessions: [ChatSession]?
-        var pinnedChatSessions: [ChatSession]?
-        // Deliberately absent from `loadedAnySnapshot` / `loadedAllSnapshots`:
-        // there may legitimately be no anchor to publish, and counting its
-        // absence as an incomplete read would pin a permanent
-        // "still downloading" banner on a perfectly healthy sync.
-        var chatAnchor: ConversationAnchorPin?
+        var pinnedChatSessions: ChatSessionNavigation?
         var chatTranscripts: [ChatTranscriptSnapshot]?
         var connectors: [ConnectorRecord]?
         var providers: [ProviderInfo]?
         var providerSignIns: [String: [String: String]]?
-        var surfaceModels: [String: SurfaceModelPref]?
-        var approvals: [ApprovalRequest]?
-        var inboxItems: [InboxItemRecord]?
+        var surfaceModels: MacSnapshotRead<[String: SurfaceModelPref]>?
+        var approvals: MacSnapshotRead<[ApprovalRequest]>?
+        var inboxItems: MacSnapshotRead<[InboxItemRecord]>?
         var turnSummaries: TurnSummaryFile?
 
         var loadedAnySnapshot: Bool {
@@ -1030,9 +1137,9 @@ extension iCloudSyncEngine {
 
     private struct ActivitySnapshotBundle: Sendable {
         var workshopTasks: [WorkshopTaskRecord]?
-        var memories: [MemoryRecord]?
-        var inboxItems: [InboxItemRecord]?
-        var memoryProposals: [MemoryProposalRecord]?
+        var memories: MacSnapshotRead<[MemoryRecord]>?
+        var inboxItems: MacSnapshotRead<[InboxItemRecord]>?
+        var memoryProposals: MacSnapshotRead<[MemoryProposalRecord]>?
         var trainingProposals: [TrainingProposalSummary]?
 
         var loadedAnySnapshot: Bool {
@@ -1055,14 +1162,12 @@ extension iCloudSyncEngine {
         var health: RuntimeHealth?
         var organismLivingStatus: OrganismLivingStatusFile?
         var sessions: [ChatSession]?
-        var pinnedChatSessions: [ChatSession]?
-        // Excluded from the completeness checks below — see SnapshotBundle.
-        var chatAnchor: ConversationAnchorPin?
+        var pinnedChatSessions: ChatSessionNavigation?
         var connectors: [ConnectorRecord]?
         var providers: [ProviderInfo]?
         var providerSignIns: [String: [String: String]]?
-        var surfaceModels: [String: SurfaceModelPref]?
-        var approvals: [ApprovalRequest]?
+        var surfaceModels: MacSnapshotRead<[String: SurfaceModelPref]>?
+        var approvals: MacSnapshotRead<[ApprovalRequest]>?
 
         var loadedAnySnapshot: Bool {
             trustPolicy != nil ||
@@ -1091,24 +1196,25 @@ extension iCloudSyncEngine {
         async let workOverview: WorkOverview? = loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
         async let deskBounds: MobileDeskProjectionReport? = loadSnapshotObjectOnly(named: "desk_bounds.json", in: snapshotDir)
         async let deskReadingCopies: [MobileDeskItemReadingCopy]? = loadSnapshotArrayOnly(named: "desk_details.json", in: snapshotDir)
-        async let skills: [SkillRecord]? = loadSnapshotArrayOnly(named: "skills_snapshot.json", in: snapshotDir)
-        async let memories: [MemoryRecord]? = loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
-        async let memoryProposals: [MemoryProposalRecord]? = loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
+        async let skills: [SkillManifestEntry]? = loadSnapshotArrayOnly(named: "skills_snapshot.json", in: snapshotDir)
+        async let tools: [ToolRecord]? = loadSnapshotArrayOnly(named: "tools_snapshot.json", in: snapshotDir)
+        async let knowledgeGraph: KGEntityResponse? = loadSnapshotObjectOnly(named: "knowledge_graph.json", in: snapshotDir)
+        async let memories: MacSnapshotRead<[MemoryRecord]>? = loadSnapshotObjectOnly(named: "memories.json", in: snapshotDir)
+        async let memoryProposals: MacSnapshotRead<[MemoryProposalRecord]>? = loadSnapshotObjectOnly(named: "memory_proposals.json", in: snapshotDir)
         async let trainingProposals: [TrainingProposalSummary]? = loadSnapshotArrayOnly(named: "training_proposals.json", in: snapshotDir)
         async let trustPolicy: TrustPolicy? = loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir)
         async let personality: PersonalityProfile? = loadSnapshotObjectOnly(named: "personality.json", in: snapshotDir)
         async let health: RuntimeHealth? = loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
         async let organismLivingStatus: OrganismLivingStatusFile? = loadSnapshotObjectOnly(named: "organism_living_status.json", in: snapshotDir)
         async let sessions: [ChatSession]? = loadSnapshotArrayOnly(named: "sessions.json", in: snapshotDir)
-        async let pinnedChatSessions: [ChatSession]? = loadSnapshotArrayOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
-        async let chatAnchor: ConversationAnchorPin? = loadSnapshotObjectOnly(named: "chat_anchor.json", in: snapshotDir)
+        async let pinnedChatSessions: ChatSessionNavigation? = loadSnapshotObjectOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
         async let chatTranscripts: [ChatTranscriptSnapshot]? = loadSnapshotArrayOnly(named: "chat_transcripts.json", in: snapshotDir)
         async let connectors: [ConnectorRecord]? = loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let providers: [ProviderInfo]? = loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
         async let providerSignIns: [String: [String: String]]? = loadSnapshotObjectOnly(named: "provider_sign_ins.json", in: snapshotDir)
-        async let surfaceModels: [String: SurfaceModelPref]? = loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
-        async let approvals: [ApprovalRequest]? = loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir)
-        async let inboxItems: [InboxItemRecord]? = loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir)
+        async let surfaceModels: MacSnapshotRead<[String: SurfaceModelPref]>? = loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
+        async let approvals: MacSnapshotRead<[ApprovalRequest]>? = loadSnapshotObjectOnly(named: "approvals.json", in: snapshotDir)
+        async let inboxItems: MacSnapshotRead<[InboxItemRecord]>? = loadSnapshotObjectOnly(named: "inbox.json", in: snapshotDir)
         async let turnSummaries: TurnSummaryFile? = loadSnapshotObjectOnly(named: "turn_summaries.json", in: snapshotDir)
         return await SnapshotBundle(
             workshopTasks: workshopTasks,
@@ -1117,6 +1223,8 @@ extension iCloudSyncEngine {
             deskBounds: deskBounds,
             deskReadingCopies: deskReadingCopies,
             skills: skills,
+            tools: tools,
+            knowledgeGraph: knowledgeGraph,
             memories: memories,
             memoryProposals: memoryProposals,
             trainingProposals: trainingProposals,
@@ -1126,7 +1234,6 @@ extension iCloudSyncEngine {
             organismLivingStatus: organismLivingStatus,
             sessions: sessions,
             pinnedChatSessions: pinnedChatSessions,
-            chatAnchor: chatAnchor,
             chatTranscripts: chatTranscripts,
             connectors: connectors,
             providers: providers,
@@ -1144,13 +1251,12 @@ extension iCloudSyncEngine {
         async let health: RuntimeHealth? = loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
         async let organismLivingStatus: OrganismLivingStatusFile? = loadSnapshotObjectOnly(named: "organism_living_status.json", in: snapshotDir)
         async let sessions: [ChatSession]? = loadSnapshotArrayOnly(named: "sessions.json", in: snapshotDir)
-        async let pinnedChatSessions: [ChatSession]? = loadSnapshotArrayOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
-        async let chatAnchor: ConversationAnchorPin? = loadSnapshotObjectOnly(named: "chat_anchor.json", in: snapshotDir)
+        async let pinnedChatSessions: ChatSessionNavigation? = loadSnapshotObjectOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
         async let connectors: [ConnectorRecord]? = loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let providers: [ProviderInfo]? = loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
         async let providerSignIns: [String: [String: String]]? = loadSnapshotObjectOnly(named: "provider_sign_ins.json", in: snapshotDir)
-        async let surfaceModels: [String: SurfaceModelPref]? = loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
-        async let approvals: [ApprovalRequest]? = loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir)
+        async let surfaceModels: MacSnapshotRead<[String: SurfaceModelPref]>? = loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
+        async let approvals: MacSnapshotRead<[ApprovalRequest]>? = loadSnapshotObjectOnly(named: "approvals.json", in: snapshotDir)
         return await LightweightSnapshotBundle(
             trustPolicy: trustPolicy,
             personality: personality,
@@ -1158,7 +1264,6 @@ extension iCloudSyncEngine {
             organismLivingStatus: organismLivingStatus,
             sessions: sessions,
             pinnedChatSessions: pinnedChatSessions,
-            chatAnchor: chatAnchor,
             connectors: connectors,
             providers: providers,
             providerSignIns: providerSignIns,
@@ -1184,8 +1289,10 @@ extension iCloudSyncEngine {
                 out[clean] = PublishedTranscript(
                     records: row.messages,
                     messages: MacBridgeClient.projectChatRecords(row.messages),
+                    otherRooms: row.otherRooms ?? [],
                     generation: row.transcriptGeneration,
-                    hasOlder: row.hasOlder ?? false
+                    hasOlder: row.hasOlder ?? false,
+                    readError: row.readError
                 )
             }
             return out
@@ -1194,9 +1301,9 @@ extension iCloudSyncEngine {
 
     private nonisolated static func loadActivitySnapshots(snapshotDir: URL) async -> ActivitySnapshotBundle {
         async let workshopTasks: [WorkshopTaskRecord]? = loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir)
-        async let memories: [MemoryRecord]? = loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
-        async let inboxItems: [InboxItemRecord]? = loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir)
-        async let memoryProposals: [MemoryProposalRecord]? = loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
+        async let memories: MacSnapshotRead<[MemoryRecord]>? = loadSnapshotObjectOnly(named: "memories.json", in: snapshotDir)
+        async let inboxItems: MacSnapshotRead<[InboxItemRecord]>? = loadSnapshotObjectOnly(named: "inbox.json", in: snapshotDir)
+        async let memoryProposals: MacSnapshotRead<[MemoryProposalRecord]>? = loadSnapshotObjectOnly(named: "memory_proposals.json", in: snapshotDir)
         async let trainingProposals: [TrainingProposalSummary]? = loadSnapshotArrayOnly(named: "training_proposals.json", in: snapshotDir)
         return await ActivitySnapshotBundle(
             workshopTasks: workshopTasks,

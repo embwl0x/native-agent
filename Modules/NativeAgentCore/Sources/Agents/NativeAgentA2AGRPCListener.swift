@@ -1,8 +1,9 @@
 import Foundation
-import ChatOrchestration
+import AgentConversations
 import GRPCCore
 import GRPCNIOTransportHTTP2TransportServices
 import NativeAgentCore
+// Blueprint: | `NativeAgentA2AGRPCListener.swift` | gRPC loopback listener generation and endpoint publication; stop closes publication and retains the serving worker through graceful drain, excluding restart until actual exit |
 
 /// The third A2A wire listener. All task ownership and execution stays in AgentContactTasks.
 public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
@@ -20,6 +21,7 @@ public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
     private let lock = NSLock()
     private var worker: Task<Void, Never>?
     private var generation: UUID?
+    private var stopping = false
     private var boundPort: UInt16?
     private var server: GRPCServer<HTTP2ServerTransport.TransportServices>?
     public var port: UInt16? { lock.withLock { boundPort } }
@@ -33,6 +35,7 @@ public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
         lock.withLock {
             guard worker == nil else { return }
             let id = UUID()
+            stopping = false
             generation = id
             worker = Task { [self] in
                 defer { finished(id) }
@@ -46,13 +49,14 @@ public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
                 })
                 let server = GRPCServer(transport: transport, services: [service])
                 let shouldServe = lock.withLock {
-                    guard generation == id else { return false }
+                    guard generation == id, !stopping else { return false }
                     self.server = server
                     return true
                 }
                 guard shouldServe else { return }
                 do {
                     try await withThrowingTaskGroup(of: Void.self) { group in
+                        defer { group.cancelAll() }
                         group.addTask { try await server.serve() }
                         group.addTask {
                             let address = try await transport.listeningAddress
@@ -61,7 +65,8 @@ public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
                             }
                             try self.publish(port: port, generation: id)
                         }
-                        try await group.waitForAll()
+                        // Observe publication failure before waiting for the serving child.
+                        while try await group.next() != nil {}
                     }
                 } catch {
                     if !Task.isCancelled { nativeLog("[A2A gRPC] listener ended: %@", String(describing: error)) }
@@ -72,11 +77,11 @@ public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
 
     public func stop() {
         lock.withLock {
-            generation = nil
+            stopping = true
             if let server { server.beginGracefulShutdown() }
             else { worker?.cancel() }
-            server = nil
-            worker = nil
+            // Keep the worker and server owned until serve() has actually
+            // drained. start() cannot admit another listener in the meantime.
             boundPort = nil
             try? FileManager.default.removeItem(at: descriptorURL)
         }
@@ -84,7 +89,7 @@ public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
 
     private func publish(port: UInt16, generation id: UUID) throws {
         try lock.withLock {
-            guard generation == id, !Task.isCancelled else { throw CancellationError() }
+            guard generation == id, !stopping, !Task.isCancelled else { throw CancellationError() }
             let directory = descriptorURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700])
@@ -101,6 +106,7 @@ public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
             guard generation == id else { return }
             boundPort = nil
             generation = nil
+            stopping = false
             worker = nil
             server = nil
             try? FileManager.default.removeItem(at: descriptorURL)

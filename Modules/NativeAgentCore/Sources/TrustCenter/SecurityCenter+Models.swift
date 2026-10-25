@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `SecurityCenter+Models.swift` | `SecurityToolDecision` enum; `PairedPhoneAuthority` checked pairing reader |
 
 /// Checked paired-phone authority shared by pairing and security status.
 public enum PairedPhoneAuthority {

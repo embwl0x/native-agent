@@ -1,43 +1,14 @@
 import Foundation
 import Darwin
+import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `WorkflowOrchestration.swift` | Saved workflow records: one checked registry schema and stable timestamp sorting for read-only list/projection and pack admission/install/removal; list and Capabilities share exact legacy-seed normalization without changing customized rows or saved bytes; `WorkflowStep`, `WorkflowRecord`; no default seeding or read-side writes; backup/export inclusion, no raw phone sync and workflows privacy coverage are declared here |
 
-// MARK: - WorkflowOrchestration — registry half
-//
-// RETIRED 2026-09-01: User authorized retiring the workflow RUN engine.
-//
-// Evidence at retirement: data/workflows/runs.jsonl held 42 runs, all frozen
-// since 2026-05-08 (17 of them permanently `waiting_approval`);
-// workflows/registry.json held 5 records, none of which had ever been
-// instantiated by a user; the module's own create/cancel/rollback paths were
-// labelled PORTED-DORMANT (default OFF) across 16 markers in 8 files; and
-// `getWorkflowRuns()` was polled on every AppModel refresh purely to render a
-// list that could not change. The live successor for "do a piece of work" is
-// workshop/executions.
-//
-// What went: runWorkflow / resumeWorkflowRun / cancelWorkflowRun /
-// rollbackWorkflowRun / listWorkflowRuns, the v1 and v2 step executors, the
-// per-run state machine (workflows/run_state), the run ledger append, the run
-// ledger feed family, the run-control preflight, the execution preflight, the
-// motor-action projection over runs, and every Mac-UI control that drove them.
-//
-// What stayed and why:
-//   • The workflow REGISTRY (this file's protocol) still backs the Capabilities
-//     panel's workflow list. The unused creation path has been removed.
-//   • The APPROVALS half is a different module (ApprovalInbox) writing
-//     data/workflows/approvals/requests.json. It is LIVE — written today — and
-//     was never part of the run engine. Nothing here touches it.
-//   • data/workflows/runs.jsonl and run_state/*.json stay on disk as history
-//     (User's keep-history rule). Nothing in the app reads them any more.
-//
-// The list path:
-//   1. read workflows/registry.json (default []),
-//   2. merge each built-in default with its saved override (saved keys win),
-//   3. append saved-only items not present in defaults,
-//   4. WRITE BACK the merged (unsorted) list to registry.json when it changed,
-//   5. RETURN the merged list sorted by (updatedAt | createdAt | "") DESC.
-//
-// Registry write-back shares the Swift persistence lock with external writers.
+// Owns workflows/registry.json: a JSON object array of saved planning templates.
+// Pack mutations share this owner and the registry lock. Reads never seed defaults.
+// Local backup/export include workflows; phone sync has no raw registry, and
+// PrivacyMap lists workflows. ApprovalInbox owns the separate approvals subtree.
+// The retired run engine's runs.jsonl and run_state files remain untouched.
 
 extension SwiftNativeWorkflowOrchestrationClient {
     /// The same list as records, for the Capabilities panel; a malformed row
@@ -89,28 +60,25 @@ extension WorkflowStep {
     }
 }
 
-// MARK: - SwiftNative impl (registry listing only)
+// MARK: - SwiftNative registry owner
 
 public final class SwiftNativeWorkflowOrchestrationClient: Sendable {
     private let root: URL
     private let persistence: SwiftNativePersistenceCore
-    private let now: @Sendable () -> String
 
     public init(
         root: URL,
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
-        now: @escaping @Sendable () -> String = { WorkflowOrchestrationClock.nowISO() }
+        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()
     ) {
         self.root = root
         self.persistence = persistence
-        self.now = now
     }
 
     private var registryPath: URL { root.appendingPathComponent("workflows/registry.json") }
 
-    /// Only an absent directory entry bootstraps defaults; damaged or unreadable
+    /// Only an absent directory entry means empty; damaged or unreadable
     /// saved workflows must survive a list attempt, including a dangling symlink.
-    private static func readWorkflowRegistry(_ path: URL) throws -> [JSONValue] {
+    private static func readWorkflowRegistry(_ path: URL, pack: Bool = false) throws -> [[String: JSONValue]] {
         let data: Data
         do {
             data = try Data(contentsOf: path)
@@ -120,217 +88,125 @@ public final class SwiftNativeWorkflowOrchestrationClient: Sendable {
             throw error
         }
         guard case .array(let rows) = try JSONValue.parse(data) else {
-            throw NSError(domain: "WorkflowOrchestration", code: -422, userInfo: [
-                NSLocalizedDescriptionKey: "Workflow registry is unavailable: expected a JSON array at \(path.path). Saved bytes were preserved."
+            throw NSError(domain: pack ? "NativeAgentSwiftOnly" : "WorkflowOrchestration", code: -422, userInfo: [
+                NSLocalizedDescriptionKey: pack ? "Capability pack registry must be an array: \(path.path)"
+                    : "Workflow registry is unavailable: expected a JSON array at \(path.path). Saved bytes were preserved."
             ])
         }
-        return rows
+        var seenIDs: Set<String> = []
+        return try rows.map {
+            guard case .object(let object) = $0, case .string(let id)? = object["id"],
+                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  seenIDs.insert(id).inserted else {
+                throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
+                    NSLocalizedDescriptionKey: "Capability pack registry contains an invalid entry: \(path.path)"
+                ])
+            }
+            return object
+        }
     }
 
     public func listWorkflows() async throws -> [JSONValue] {
-        // The entire read -> merge -> write-back shares the registry lock.
-        let body: @Sendable () async throws -> [JSONValue] = { [persistence, registryPath, now] in
-            let saved = try Self.readWorkflowRegistry(registryPath)
-            let defaults = WorkflowDefaults.defaults(now: now())
-            let (mergedUnsorted, sorted) = WorkflowMerge.mergeRegistry(defaults: defaults, saved: saved)
-            // Persist newly introduced defaults/fields, but an ordinary list
-            // read must not fsync identical bytes and wake registry observers.
-            let merged = JSONValue.array(mergedUnsorted)
-            if merged != .array(saved) {
-                try await persistence.writeJSON(merged, to: registryPath)
-            }
-            return sorted
+        let body: @Sendable () async throws -> [JSONValue] = { [registryPath] in
+            Self.projectedRegistry(try Self.readWorkflowRegistry(registryPath))
         }
         return try await persistence.withFileLock(registryPath, body)
     }
-}
 
-// MARK: - ISO clock (mirror now_iso)
-
-public enum WorkflowOrchestrationClock {
-    /// Mirrors Python's `now_iso()` = `datetime.now(timezone.utc).isoformat()`,
-    /// which emits SIX fractional digits (microseconds) and a `+00:00` suffix,
-    /// e.g. `2026-06-01T12:34:56.789012+00:00`. ISO8601DateFormatter only gives
-    /// millisecond precision, so we build the string with a microsecond
-    /// component derived from the Date's sub-second fraction (gpt-5.5 review
-    /// finding #2, 2026-06-01).
-    public static func nowISO() -> String {
-        nowISO(from: Date())
+    /// Capability aggregation shares the list's read-only legacy normalization.
+    package static func readProjection(dataRoot: URL, nowISO _: String) throws -> [JSONValue] {
+        projectedRegistry(try readWorkflowRegistry(dataRoot.appendingPathComponent("workflows/registry.json")))
     }
 
-    /// Testable seam: format a specific Date the Python `isoformat()` way.
-    public static func nowISO(from date: Date) -> String {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
-        let comps = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
-        // Microseconds from the fractional second of the timestamp.
-        let frac = date.timeIntervalSince1970 - floor(date.timeIntervalSince1970)
-        let micros = min(999_999, Int((frac * 1_000_000).rounded(.toNearestOrEven)))
-        return String(
-            format: "%04d-%02d-%02dT%02d:%02d:%02d.%06d+00:00",
-            comps.year ?? 1970, comps.month ?? 1, comps.day ?? 1,
-            comps.hour ?? 0, comps.minute ?? 0, comps.second ?? 0,
-            micros
-        )
+    private static func projectedRegistry(_ saved: [[String: JSONValue]]) -> [JSONValue] {
+        saved.map(projectLegacySeed).enumerated().sorted { lhs, rhs in
+            let left = RegistryTimestampSortKey.sortKey(lhs.element)
+            let right = RegistryTimestampSortKey.sortKey(rhs.element)
+            return left == right ? lhs.offset < rhs.offset : left > right
+        }.map(\.element)
     }
-}
 
-// MARK: - Saved workflow templates
-
-/// Saved planning templates. The workflow registry does not execute them.
-public enum WorkflowDefaults {
-    public static func defaults(now: String) -> [JSONValue] {
-        func step(_ id: String, _ title: String, _ kind: String, requiresApproval: Bool, layer: String? = nil) -> JSONValue {
-            var obj: [String: JSONValue] = [
-                "id": .string(id),
-                "title": .string(title),
-                "kind": .string(kind),
-                "requiresApproval": .bool(requiresApproval),
-            ]
-            if let layer { obj["layer"] = .string(layer) }
-            return .object(obj)
-        }
-        return [
-            .object([
-                "id": .string("research-to-brief"),
-                "name": .string("Research to Brief"),
-                "description": .string("Saved template for research, source capture, a memory note, and a summary. Workflow execution is unavailable."),
-                "status": .string("template"),
-                "trigger": .string("research brief"),
-                "steps": .array([
-                    step("route", "Plan intent route", "router", requiresApproval: false),
-                    step("search", "Search private web connector", "research", requiresApproval: false),
-                    step("capture", "Capture source receipts", "receipt", requiresApproval: false),
-                    step("brief", "Draft concise brief", "llm", requiresApproval: false),
-                ]),
-                "createdAt": .string(now),
-                "updatedAt": .string(now),
-            ]),
-            .object([
-                "id": .string("safe-tool-forge"),
-                "name": .string("Safe Tool Forge"),
-                "description": .string("Saved template for proposing and validating an app-owned JSON tool with permission-gated promotion. Workflow execution is unavailable."),
-                "status": .string("template"),
-                "trigger": .string("make a tool"),
-                "steps": .array([
-                    step("scope", "Define reusable boundary", "analysis", requiresApproval: false),
-                    step("proposal", "Create tool proposal", "tool_proposal", requiresApproval: false),
-                    step("validate", "Run safety scan and tests", "validation", requiresApproval: false),
-                    step("promote", "Promote only safe app-data tool", "approval", requiresApproval: true),
-                ]),
-                "createdAt": .string(now),
-                "updatedAt": .string(now),
-            ]),
-            .object([
-                "id": .string("memory-capture"),
-                "name": .string("Memory Capture"),
-                "description": .string("Saved template for capturing an objective as a semantic memory with a trace receipt. Workflow execution is unavailable."),
-                "status": .string("template"),
-                "trigger": .string("remember this"),
-                "steps": .array([
-                    step("route", "Route objective", "router", requiresApproval: false),
-                    step("memory", "Write semantic memory", "memory", requiresApproval: false, layer: "semantic"),
-                    step("trace", "Record trace receipt", "trace", requiresApproval: false),
-                ]),
-                "createdAt": .string(now),
-                "updatedAt": .string(now),
+    /// Only the exact original seed (apart from its stamps) claimed execution.
+    /// Normalize its read projection, preserving customized rows and saved bytes.
+    private static func projectLegacySeed(_ saved: [String: JSONValue]) -> JSONValue {
+        guard saved["id"] == .string("memory-capture") else { return .object(saved) }
+        let legacy: [String: JSONValue] = [
+            "id": .string("memory-capture"),
+            "name": .string("Memory Capture"),
+            "description": .string("Execute a safe app-owned workflow that routes an objective, writes a memory, and records a trace receipt."),
+            "status": .string("active"),
+            "trigger": .string("remember this"),
+            "steps": .array([
+                .object(["id": .string("route"), "title": .string("Route objective"), "kind": .string("router"), "requiresApproval": .bool(false)]),
+                .object(["id": .string("memory"), "title": .string("Write semantic memory"), "kind": .string("memory"), "requiresApproval": .bool(false), "layer": .string("semantic")]),
+                .object(["id": .string("trace"), "title": .string("Record trace receipt"), "kind": .string("trace"), "requiresApproval": .bool(false)]),
             ]),
         ]
+        let candidate = saved.filter { !["createdAt", "updatedAt"].contains($0.key) }
+        guard candidate == legacy else { return .object(saved) }
+        var projected = saved
+        projected["description"] = .string("Saved template for capturing an objective as a semantic memory with a trace receipt. Workflow execution is unavailable.")
+        projected["status"] = .string("template")
+        return .object(projected)
     }
 
-    /// Only migrate original seeds; preserve customized rows and their stamps.
-    static func migrateUnchangedSeed(_ saved: JSONValue, to current: JSONValue) -> JSONValue {
-        guard case .object(var original) = current,
-              case .object(var candidate) = saved else { return saved }
-        switch WorkflowMerge.idKey(current) {
-        case "research-to-brief":
-            original["description"] = .string("Route a research objective through search, source capture, memory note, and summary receipt.")
-        case "safe-tool-forge":
-            original["description"] = .string("Turn repeated work into a proposed app-owned JSON tool, validate it, and leave promotion gated by permissions.")
-        case "memory-capture":
-            original["description"] = .string("Execute a safe app-owned workflow that routes an objective, writes a memory, and records a trace receipt.")
-            original["status"] = .string("active")
-        default:
-            return saved
-        }
-        for key in ["createdAt", "updatedAt"] {
-            original.removeValue(forKey: key)
-            candidate.removeValue(forKey: key)
-        }
-        guard candidate == original, case .object(var migrated) = saved,
-              case .object(let template) = current else { return saved }
-        migrated["description"] = template["description"]
-        migrated["status"] = template["status"]
-        return .object(migrated)
-    }
-}
-
-// MARK: - Merge helpers (shared, pure)
-
-public enum WorkflowMerge {
-    /// Reads the `id` field of a workflow object as a string (mirrors
-    /// `str(item.get("id"))`, so a missing/non-string id becomes "" / "None"-ish).
-    /// Python's `str(None)` == "None"; we mirror that for missing ids so two
-    /// id-less records collide the same way they would in Python.
-    static func idKey(_ value: JSONValue) -> String {
-        guard case .object(let obj) = value else { return "None" }
-        guard let idv = obj["id"] else { return "None" }
-        switch idv {
-        case .string(let s): return s
-        case .int(let i): return String(i)
-        case .double(let d): return String(d)
-        case .bool(let b): return b ? "True" : "False"
-        case .null: return "None"
-        default: return "None"
+    /// The enclosing pack transaction holds the registry lock through admission
+    /// and replacement, before any of its catalog or part writes.
+    package func preflightPackItems(_ items: [[String: JSONValue]], installID: String) throws {
+        let rows = try Self.readWorkflowRegistry(registryPath, pack: true)
+        let ids = Set(items.map { Self.scalarString($0, "id") })
+        guard items.allSatisfy({
+                  if case .string(let id)? = $0["id"] {
+                      return !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  }
+                  return false
+              }), ids.count == items.count,
+              !rows.contains(where: {
+                  ids.contains(Self.scalarString($0, "id")) && Self.scalarString($0, "capabilityPackInstallId") != installID
+              }) else {
+            throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
+                NSLocalizedDescriptionKey: "Capability pack items collide with existing entries or have invalid IDs in \(registryPath.lastPathComponent)."
+            ])
         }
     }
 
-    /// Sort key: `str(updatedAt or createdAt or "")`. Empty string sorts last
-    /// in DESC order. Mirrors Python `key=lambda item: str(item.get("updatedAt")
-    /// or item.get("createdAt") or "")` — including Python's `or` truthiness
-    /// across non-string scalars (a truthy numeric/bool timestamp sorts under
-    /// its `str(...)` form, not "").
-    static func sortKey(_ value: JSONValue) -> String {
-        RegistryTimestampSortKey.sortKey(value)
-    }
-
-    /// dict.update merge: overlay `override` keys onto a copy of `base`.
-    static func merge(base: JSONValue, override: JSONValue) -> JSONValue {
-        guard case .object(var baseObj) = base else { return base }
-        guard case .object(let ovObj) = override else { return base }
-        for (k, v) in ovObj { baseObj[k] = v }
-        return .object(baseObj)
-    }
-
-    /// Full mirror of Runtime.list_workflows merge logic. Returns
-    /// (mergedUnsorted, sortedDescending). The caller persists `mergedUnsorted`
-    /// and returns `sortedDescending`.
-    public static func mergeRegistry(defaults: [JSONValue], saved: [JSONValue]) -> (mergedUnsorted: [JSONValue], sorted: [JSONValue]) {
-        // by_id = {str(item.get("id")): item for item in saved}  — last write wins
-        var byId: [String: JSONValue] = [:]
-        for item in saved { byId[idKey(item)] = item }
-
-        var merged: [JSONValue] = []
-        for def in defaults {
-            let override = byId[idKey(def)].map {
-                WorkflowDefaults.migrateUnchangedSeed($0, to: def)
-            } ?? .object([:])
-            merged.append(merge(base: def, override: override))
-        }
-        let savedIds = Set(merged.map { idKey($0) })
-        for item in saved where !savedIds.contains(idKey(item)) {
-            merged.append(item)
-        }
-        // Stable descending sort by sortKey. Swift's sort is not guaranteed
-        // stable, but Python's sorted() IS stable; emulate by tagging index.
-        let sorted = merged.enumerated()
-            .sorted { lhs, rhs in
-                let lk = sortKey(lhs.element)
-                let rk = sortKey(rhs.element)
-                if lk != rk { return lk > rk }      // DESC
-                return lhs.offset < rhs.offset       // stable tie-break
+    package func installPackItems(_ items: [[String: JSONValue]], installID: String, packID: String, nowISO: String) async throws {
+        guard !items.isEmpty else { return }
+        try await persistence.withFileLock(registryPath) { [self] in
+            var rows = try Self.readWorkflowRegistry(registryPath, pack: true)
+            let ids = Set(items.map { Self.scalarString($0, "id") }.filter { !$0.isEmpty })
+            rows.removeAll { ids.contains(Self.scalarString($0, "id")) }
+            for item in items {
+                var row = item
+                row["status"] = .string(Self.scalarString(row, "status").isEmpty ? "active" : Self.scalarString(row, "status"))
+                row["createdAt"] = row["createdAt"] ?? .string(nowISO)
+                row["updatedAt"] = .string(nowISO)
+                row["installedByPack"] = .string(packID)
+                row["capabilityPackInstallId"] = .string(installID)
+                rows.append(row)
             }
-            .map { $0.element }
-        return (merged, sorted)
+            try await persistence.writeJSON(.array(rows.map { .object($0) }), to: registryPath)
+        }
+    }
+
+    package func removePackItems(_ ids: [String], installID: String, packID: String) async throws {
+        try await persistence.withFileLock(registryPath) { [self] in
+            var rows = try Self.readWorkflowRegistry(registryPath, pack: true)
+            rows.removeAll { row in
+                let marked = Self.scalarString(row, "capabilityPackInstallId") == installID || Self.scalarString(row, "installedByPack") == packID
+                return marked && (ids.isEmpty || ids.contains(Self.scalarString(row, "id")))
+            }
+            try await persistence.writeJSON(.array(rows.map { .object($0) }), to: registryPath)
+        }
+    }
+
+    private static func scalarString(_ object: [String: JSONValue], _ key: String) -> String {
+        switch object[key] {
+        case .string(let value): return value
+        case .int(let value): return String(value)
+        case .double(let value): return String(value)
+        case .bool(let value): return value ? "true" : "false"
+        default: return ""
+        }
     }
 }

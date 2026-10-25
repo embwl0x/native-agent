@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `OAuthCredentialDecoding.swift` | Shared JWT payload and OAuth expiry decoding; `OAuthRefreshBinding`: account identity and refresh continuity |
 
 public func jwtPayload(_ token: String, omittingEmptySubsequences: Bool = true) -> [String: Any]? {
     let parts = token.split(separator: ".", omittingEmptySubsequences: omittingEmptySubsequences)

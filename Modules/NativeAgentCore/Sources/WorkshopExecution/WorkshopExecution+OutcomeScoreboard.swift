@@ -1,33 +1,14 @@
 import Foundation
 import NativeAgentCore
-import PersistenceCore   // SwiftNativePersistenceCore + readJSONL (timeline scan)
+import PersistenceCore
+// Blueprint: | `WorkshopExecution+OutcomeScoreboard.swift` | Native canonical receipt/record decoding, verification classification, timestamp interpretation and complete `weeklyOutcomeInput` evidence; missing stores are available empty, unreadable/incomplete sources throw. Editable `Resources/abilities/weekly-outcomes.js` owns local ISO-week grouping, statistics, trend thresholds and digest text; EngineLaunch invokes it through `ToolsFacade.withPartDoor` for maintenance, without activating schedules or a Swift policy substitute |
 
-// MARK: - Execution outcome scoreboard (MEASURE leg of the north-star, 2026-06-15)
-//
-// The north star is "Agent runs a real multi-step job unattended and gets
-// MEASURABLY better week over week." Nothing in the system produced that
-// number: historical improvement records carried only the
-// compile/test/promote LIFECYCLE of a code change, never the OUTCOME of the
-// real jobs Agent actually runs. So there was no scoreboard — no way to say
-// "her completion rate went up" or "she's solving jobs in fewer steps."
-//
-// This is that scoreboard, built the simplest way that produces the number: a
-// PURE READ-SIDE aggregator over the execution records ALREADY persisted to
-// mission.json (read via SwiftNativeWorkshopRunner.listAll()). Completed
-// executions persist (only the submit-error path deletes an execution dir; there is
-// no terminal cleanup), so the full history is on disk. Zero write-path, zero
-// executor change, zero per-turn latency — it just reads what's there and
-// buckets it by ISO week.
-//
-// v1 metrics come entirely from WorkshopExecutionRecord (status, createdAt, updatedAt,
-// plan, stepsCompleted, rerunCount). `fromStub` (planner-fallback / plan
-// quality) lives in timeline.jsonl, not the record, so stub-rate is a
-// documented v2 follow-up. The retired synthetic-job runner is deliberately
-// absent; this read side continues to score real persisted work.
+// Native outcome evidence only. weekly-outcomes.js owns week bucketing,
+// statistics, trend thresholds and prompt text. Receipts, verification status,
+// timestamp decoding and source availability remain native.
 
 /// One Workshop execution distilled to the fields the scoreboard scores. Dates are
-/// pre-parsed so the aggregator core stays PURE and timezone-deterministic
-/// (string parsing is confined to the scanner below).
+/// pre-parsed natively; only normalized outcome facts cross into the digest part.
 public struct WorkshopOutcomeSample: Sendable, Equatable {
     public var id: String
     /// Stable Workshop identity. New directed-task samples are keyed by their
@@ -73,64 +54,16 @@ public struct WorkshopOutcomeSample: Sendable, Equatable {
     public var isTerminal: Bool { WorkshopOutcomeScoreboard.terminalStatuses.contains(status.lowercased()) }
     public var isCompleted: Bool { WorkshopOutcomeScoreboard.completedStatuses.contains(status.lowercased()) }
 
-    /// Wall time from creation to the LAST mission.json write (createdAt →
+    /// Wall time from creation to the LAST execution.json write (createdAt →
     /// updatedAt). For the common case (an execution not edited after it finishes)
     /// the last write IS the terminal transition, so this ≈ end-to-end
-    /// execution time. CAVEAT (gpt-5.5 review): `updateWorkshopExecution` bumps
-    /// `updatedAt` on ANY later patch with no terminal-status guard, so a
-    /// execution edited post-terminal would overstate this — it's an UPPER BOUND
+    /// execution time. CAVEAT (gpt-5.5 review): later edits can bump
+    /// `updatedAt`, so an execution edited post-terminal would overstate
+    /// this — it's an UPPER BOUND
     /// on execution time, a useful trend signal, not an exact duration. Exact
     /// terminal duration needs a dedicated terminal timestamp / timeline parse
     /// (v2). Clamped at 0 (a clock skew / out-of-order write can't go negative).
     public var wallSeconds: Double { max(0, updatedAt.timeIntervalSince(createdAt)) }
-}
-
-/// Aggregated outcome stats for one ISO week (Monday 00:00 UTC start).
-public struct WeeklyOutcomeStats: Sendable, Equatable {
-    public var weekStart: Date
-    public var total: Int          // all Workshop executions created that week (any status)
-    public var terminal: Int       // reached a terminal status
-    public var completed: Int
-    public var failed: Int
-    public var cancelled: Int
-    public var unverified: Int
-    /// completed / terminal (0 when no terminal Workshop executions that week). Excludes
-    /// still-running/queued from the denominator so the rate isn't dragged
-    /// down by jobs that simply haven't finished yet.
-    public var completionRate: Double
-    public var medianTotalSteps: Double
-    public var medianCompletedSteps: Double
-    /// Median wall time (createdAt → last write) over TERMINAL Workshop executions only.
-    /// An UPPER BOUND on execution time — see `WorkshopOutcomeSample.wallSeconds`
-    /// for the post-terminal-edit caveat. Trend signal, not exact duration.
-    public var medianWallSeconds: Double
-    public var medianRerunCount: Double
-    /// Fraction of the week's Workshop executions whose planner FAILED and fell back to a
-    /// stub plan (the `planner_fallback` rate) — a PLAN-QUALITY signal: rising =
-    /// the planner is degrading. NOT every stub (excludes the autonomy-disabled
-    /// path, which is a deliberate disable, not a failure). 0 when total == 0.
-    public var stubRate: Double
-
-    public init(
-        weekStart: Date, total: Int, terminal: Int, completed: Int, failed: Int,
-        cancelled: Int, unverified: Int = 0, completionRate: Double, medianTotalSteps: Double,
-        medianCompletedSteps: Double, medianWallSeconds: Double, medianRerunCount: Double,
-        stubRate: Double = 0
-    ) {
-        self.weekStart = weekStart
-        self.total = total
-        self.terminal = terminal
-        self.completed = completed
-        self.failed = failed
-        self.cancelled = cancelled
-        self.unverified = unverified
-        self.completionRate = completionRate
-        self.medianTotalSteps = medianTotalSteps
-        self.medianCompletedSteps = medianCompletedSteps
-        self.medianWallSeconds = medianWallSeconds
-        self.medianRerunCount = medianRerunCount
-        self.stubRate = stubRate
-    }
 }
 
 public enum WorkshopOutcomeScoreboard {
@@ -141,71 +74,6 @@ public enum WorkshopOutcomeScoreboard {
     public static let unverifiedStatuses: Set<String> = ["unverified"]
     public static let terminalStatuses: Set<String> =
         completedStatuses.union(failedStatuses).union(cancelledStatuses).union(unverifiedStatuses)
-
-    /// ISO-8601 weeks in the Mac's current zone, the week the person lives in.
-    static var isoCalendar: Calendar { Calendar(identifier: .iso8601) }
-
-    /// Start of the ISO week (Monday 00:00 on the Mac's clock) containing `date`.
-    public static func weekStart(of date: Date) -> Date {
-        let cal = isoCalendar
-        let comps = cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
-        return cal.date(from: comps) ?? date
-    }
-
-    /// Median of a list of values; 0 for an empty list. Even count → mean of
-    /// the two middle values.
-    static func median(_ xs: [Double]) -> Double {
-        guard !xs.isEmpty else { return 0 }
-        let s = xs.sorted()
-        let n = s.count
-        if n % 2 == 1 { return s[n / 2] }
-        return (s[n / 2 - 1] + s[n / 2]) / 2
-    }
-
-    /// PURE aggregator core: samples → weekly stats, ascending by weekStart.
-    /// THE scoreboard number. Deterministic, no I/O, no clock reads — fully
-    /// unit-testable.
-    /// `onlyTriggerSource` (when non-nil) restricts the aggregate to Workshop executions
-    /// whose `triggerSource` matches, isolating one persisted cohort from other
-    /// Workshop executions.
-    public static func weekly(
-        from samples: [WorkshopOutcomeSample], onlyTriggerSource: String? = nil
-    ) -> [WeeklyOutcomeStats] {
-        let scoped = onlyTriggerSource.map { src in
-            samples.filter { $0.triggerSource == src }
-        } ?? samples
-        guard !scoped.isEmpty else { return [] }
-        var buckets: [Date: [WorkshopOutcomeSample]] = [:]
-        for s in scoped {
-            buckets[weekStart(of: s.createdAt), default: []].append(s)
-        }
-        return buckets.keys.sorted().map { wk in
-            let group = buckets[wk]!
-            let terminal = group.filter { $0.isTerminal }
-            let completed = group.filter { $0.isCompleted }.count
-            let failed = group.filter { failedStatuses.contains($0.status.lowercased()) }.count
-            let cancelled = group.filter { cancelledStatuses.contains($0.status.lowercased()) }.count
-            let unverified = group.filter { unverifiedStatuses.contains($0.status.lowercased()) }.count
-            let completionRate = terminal.isEmpty ? 0 : Double(completed) / Double(terminal.count)
-            let stubs = group.filter { $0.wasStub }.count
-            let stubRate = group.isEmpty ? 0 : Double(stubs) / Double(group.count)
-            return WeeklyOutcomeStats(
-                weekStart: wk,
-                total: group.count,
-                terminal: terminal.count,
-                completed: completed,
-                failed: failed,
-                cancelled: cancelled,
-                unverified: unverified,
-                completionRate: completionRate,
-                medianTotalSteps: median(group.map { Double($0.totalSteps) }),
-                medianCompletedSteps: median(group.map { Double($0.completedSteps) }),
-                medianWallSeconds: median(terminal.map { $0.wallSeconds }),
-                medianRerunCount: median(group.map { Double($0.rerunCount) }),
-                stubRate: stubRate
-            )
-        }
-    }
 
     /// Parse an execution ISO timestamp. Swift-written records use
     /// `[.withInternetDateTime, .withFractionalSeconds]` with a `+00:00`
@@ -264,9 +132,8 @@ public enum WorkshopOutcomeScoreboard {
         )
     }
 
-    /// Build the same aggregate sample from the canonical Workshop receipt
-    /// feed. Directed-task terminal outcomes use this path; the legacy record
-    /// scanner remains only as migration fallback and for live/non-terminal work.
+    /// Decode canonical directed-task receipts. Executions without such a
+    /// receipt are decoded from their canonical record, including live work.
     public static func sample(from receipt: WorkshopDirectedTaskReceipt) -> WorkshopOutcomeSample? {
         guard let created = parseTimestamp(receipt.createdAt) else { return nil }
         let completed = parseTimestamp(receipt.completedAt) ?? created
@@ -306,98 +173,83 @@ public enum WorkshopOutcomeScoreboard {
     }
 }
 
-extension WorkshopOutcomeScoreboard {
-    /// Compact, LLM-readable rendering of the recent weeks for the weekly
-    /// self-improvement pass — so the improvement brain reasons over the REAL
-    /// outcome trend ("is she completing more jobs, in fewer steps?"), not just
-    /// chat/error/doctor proxies. Returns "" when there's no history (the
-    /// caller then omits the signal entirely). Shows the last `maxWeeks` weeks
-    /// plus a week-over-week completion-rate trend headline.
-    public static func formatForPrompt(_ weeks: [WeeklyOutcomeStats], maxWeeks: Int = 8) -> String {
-        // Clamp maxWeeks >= 0 — `Array.suffix` traps on a negative length, and a
-        // 0 window has nothing to show (gpt-5.5 LOW). Empty either way → "".
-        let window = max(0, maxWeeks)
-        guard !weeks.isEmpty, window > 0 else { return "" }
-        let recent = Array(weeks.suffix(window))
-        let df = DateFormatter()
-        df.calendar = isoCalendar
-        df.locale = Locale(identifier: "en_US_POSIX")
-        df.dateFormat = "yyyy-MM-dd"
-
-        let lines = recent.map { w -> String in
-            let rate = Int((w.completionRate * 100).rounded())
-            let wall = w.medianWallSeconds >= 60
-                ? "\(Int((w.medianWallSeconds / 60).rounded()))m"
-                : "\(Int(w.medianWallSeconds.rounded()))s"
-            return "- week of \(df.string(from: w.weekStart)): "
-                + "\(w.total) job(s), \(w.completed)/\(w.terminal) completed (\(rate)%), "
-                + "\(w.unverified) unverified, "
-                + "median \(Int(w.medianTotalSteps.rounded())) steps, ~\(wall) wall, "
-                + "\(String(format: "%.1f", w.medianRerunCount)) reruns, "
-                + "\(Int((w.stubRate * 100).rounded()))% planner-fallback"
-        }
-
-        var trend = ""
-        if recent.count >= 2 {
-            let delta = (recent[recent.count - 1].completionRate
-                - recent[recent.count - 2].completionRate) * 100
-            let dir = delta > 0.5 ? "UP" : (delta < -0.5 ? "DOWN" : "flat")
-            trend = "\nTrend: completion rate \(dir) "
-                + "\(String(format: "%+.0f", delta)) pts week-over-week."
-        }
-
-        return """
-        ## Workshop outcomes (week-over-week - is the assistant completing real multi-step jobs better?)
-        \(lines.joined(separator: "\n"))\(trend)
-        """
-    }
-}
-
 extension SwiftNativeWorkshopRunner {
-    /// Weekly outcome aggregate over the handle-keyed Workshop receipt feed.
-    /// During staged migration, live tasks and daemon-era history without a
-    /// directed-task receipt fall back to the compatibility execution records.
-    /// `onlyTriggerSource` restricts the aggregate to one historical cohort.
-    public func weeklyOutcomeStats(
-        onlyTriggerSource: String? = nil
-    ) async -> [WeeklyOutcomeStats] {
-        let persistence = SwiftNativePersistenceCore()
-        let receiptPath = executionRecordsRoot
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("workshop", isDirectory: true)
-            .appendingPathComponent("receipts.jsonl")
-        let directedReceipts = ((try? await persistence.readJSONL(receiptPath)) ?? [])
-            .compactMap(WorkshopDirectedTaskReceipt.fromJSON)
+    /// Complete normalized evidence for the digest part. Missing stores mean
+    /// available empty history; unreadable sources throw, never become [].
+    /// L0 rejects a packet over its 4 MiB bound without truncating the history.
+    public func weeklyOutcomeInput() async throws -> JSONValue {
+        let root = executionRecordsRoot.deletingLastPathComponent().deletingLastPathComponent()
+        let feed = try await persistence.readJSONLReporting(root.appendingPathComponent("workshop/receipts.jsonl"))
+        guard feed.report.isClean else {
+            throw WorkshopExecutionError.persistenceFailure("Workshop outcome receipts are incomplete")
+        }
         var receiptByExecution: [String: WorkshopDirectedTaskReceipt] = [:]
-        for receipt in directedReceipts {
+        for row in feed.rows {
+            guard case .object(let object) = row else {
+                throw WorkshopExecutionError.persistenceFailure("Workshop outcome receipt is not an object")
+            }
+            // Session receipts are a different canonical variant, not directed
+            // task samples. A damaged directed-task row is never empty history.
+            guard object["kind"] == .string("directed_task") else { continue }
+            guard let receipt = WorkshopReceiptLog.directedReceipt(from: row) else {
+                throw WorkshopExecutionError.persistenceFailure("Workshop outcome receipt is unavailable")
+            }
             receiptByExecution[receipt.executionId] = receipt
         }
 
-        var samples: [WorkshopOutcomeSample] = []
-        for record in await listAll() {
+        var samples: [JSONValue] = []
+        // The checked reader keeps damaged canonical records visible. Such a
+        // record cannot supply a dated sample, so the digest is unavailable.
+        for (id, raw) in try await Self.readQueueRecords(dataRoot: root, persistence: persistence) {
+            try Task.checkCancellation()
+            guard Self.isSafeExecutionID(id) else {
+                throw WorkshopExecutionError.invalidRequest("executionId must be a single path component")
+            }
+            guard case .object(let object) = raw else {
+                throw WorkshopExecutionError.persistenceFailure("Workshop outcome record is unavailable: " + id)
+            }
+            let record = Self.recordFromJSON(object)
+            guard record.status != "corrupt", record.status != "unavailable" else {
+                throw WorkshopExecutionError.persistenceFailure("Workshop outcome record is unavailable: " + id)
+            }
+            var sample: WorkshopOutcomeSample
             if var receipt = receiptByExecution[record.id] {
-                // Hydrate pre-migration receipts from their canonical execution
-                // record when possible. This corrects existing scoreboards
-                // without inventing verification for orphaned legacy history.
+                // Old receipts inherit only the canonical record's actual
+                // verification evidence, never speculative verification.
                 if receipt.verificationStatus == nil {
                     receipt.verificationStatus = record.verification?.status
                 }
-                if let sample = WorkshopOutcomeScoreboard.sample(from: receipt) {
-                    samples.append(sample)
-                    continue
+                guard let decoded = WorkshopOutcomeScoreboard.sample(from: receipt) else {
+                    throw WorkshopExecutionError.persistenceFailure("Workshop outcome receipt timestamp is unavailable: " + id)
+                }
+                sample = decoded
+            } else {
+                guard let decoded = WorkshopOutcomeScoreboard.sample(from: record) else {
+                    throw WorkshopExecutionError.persistenceFailure("Workshop outcome timestamp is unavailable: " + id)
+                }
+                sample = decoded
+                let timeline = try await persistence.readJSONLReporting(timelinePath(record.id))
+                guard timeline.report.isClean else {
+                    throw WorkshopExecutionError.persistenceFailure("Workshop outcome timeline is incomplete: " + id)
+                }
+                sample.wasStub = timeline.rows.contains { row in
+                    if case .object(let o) = row, case .string("planner_fallback")? = o["event"] { return true }
+                    return false
                 }
             }
-            guard var sample = WorkshopOutcomeScoreboard.sample(from: record) else { continue }
-            // `fromStub` isn't on WorkshopExecutionRecord, so migration-fallback samples
-            // still derive plan quality from their compatibility timeline.
-            let rows = (try? await persistence.readJSONL(timelinePath(record.id))) ?? []
-            sample.wasStub = rows.contains { row in
-                if case .object(let o) = row, case .string("planner_fallback")? = o["event"] { return true }
-                return false
-            }
-            samples.append(sample)
+            samples.append(.object([
+                "createdDay": .string(NativeTimestampFormat.calendarDay(sample.createdAt)),
+                "status": .string(sample.status.lowercased()),
+                "terminal": .bool(sample.isTerminal),
+                "completed": .bool(sample.isCompleted),
+                "totalSteps": .int(Int64(sample.totalSteps)),
+                "completedSteps": .int(Int64(sample.completedSteps)),
+                "wallSeconds": .double(sample.wallSeconds),
+                "rerunCount": .int(Int64(sample.rerunCount)),
+                "triggerSource": .string(sample.triggerSource),
+                "wasStub": .bool(sample.wasStub),
+            ]))
         }
-        return WorkshopOutcomeScoreboard.weekly(from: samples, onlyTriggerSource: onlyTriggerSource)
+        return .object(["availability": .string("available"), "samples": .array(samples)])
     }
 }

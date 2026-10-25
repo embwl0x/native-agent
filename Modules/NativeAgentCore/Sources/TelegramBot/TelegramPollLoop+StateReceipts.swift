@@ -1,8 +1,13 @@
-import FeedPolicy
 import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TelegramPollLoop+StateReceipts.swift` | `TelegramPollLoop`: sole checked state.json reader and mutation owner (`readState`, `mutateState`) for polling, migration and status consumers; only missing state is empty, and unreadable/non-object state fails with a dedicated telegram/state.json error and is never overwritten; migration locks only existing legacy storage; `inferDataRoot`, `writeStatePatch`, `botTokenFingerprint`, `discoverSenders`; bounded setup pages persist in the canonical inbox before the bot cursor advances |
+
+private struct TelegramStateReadError: LocalizedError, CustomStringConvertible {
+    let description = "telegram_state_unavailable: telegram/state.json is unreadable or is not a JSON object. Its contents were preserved."
+    var errorDescription: String? { description }
+}
 
 extension TelegramPollLoop {
     static func botStorageIdentity(_ token: String) -> String {
@@ -17,17 +22,14 @@ extension TelegramPollLoop {
             throw TelegramOffsetCursorError.malformed
         }
         let store = SwiftNativePersistenceCore()
+        let legacyInbox = TelegramUpdateInbox(offsetURL: legacyOffsetURL, dataRoot: dataRoot)
+        guard FileManager.default.fileExists(atPath: legacyOffsetURL.path)
+                || FileManager.default.fileExists(atPath: legacyInbox.directory.path) else { return }
         // The saved bot ID survives token rotation and does not depend on a
         // private chat ever needing the optional username cache.
         try await store.withFileLock(legacyOffsetURL) {
             guard !FileManager.default.fileExists(atPath: offsetURL.path) else { return }
-            let legacyInbox = TelegramUpdateInbox(offsetURL: legacyOffsetURL)
-            guard FileManager.default.fileExists(atPath: legacyOffsetURL.path)
-                    || FileManager.default.fileExists(atPath: legacyInbox.directory.path) else { return }
-            let state = try await store.readJSON(telegramDir.appendingPathComponent("state.json"), ifMissing: .object([:]))
-            guard case .object(let root) = state else {
-                throw TelegramBotError.underlying("Legacy Telegram inbox ownership unavailable: state.json must be an object; polling paused.")
-            }
+            let root = try await Self.readState(dataRoot: dataRoot)
             let savedIdentity: String?
             // Only the previous poller's state can attribute legacy work.
             // Current credentials say nothing about who received that inbox.
@@ -43,9 +45,9 @@ extension TelegramPollLoop {
             guard ownsLegacy else {
                 throw TelegramBotError.underlying("Legacy Telegram inbox ownership unresolved for this bot; cursor and inbox preserved, polling paused. Restore historical bot identity evidence before retrying.")
             }
-            let inbox = TelegramUpdateInbox(offsetURL: offsetURL)
-            try await store.withFileLock(legacyInbox.directory.appendingPathComponent("claims_index.json")) {
-                if FileManager.default.fileExists(atPath: legacyInbox.directory.path) {
+            let inbox = TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot)
+            if FileManager.default.fileExists(atPath: legacyInbox.directory.path) {
+                try await store.withFileLock(legacyInbox.directory.appendingPathComponent("claims_index.json")) {
                     let manager = FileManager.default
                     if manager.fileExists(atPath: inbox.directory.path) {
                         guard manager.contentsEqual(atPath: legacyInbox.directory.path, andPath: inbox.directory.path) else {
@@ -54,7 +56,7 @@ extension TelegramPollLoop {
                         _ = try await inbox.snapshots()
                     } else {
                         let staged = TelegramUpdateInbox(offsetURL: offsetURL.deletingLastPathComponent()
-                            .appendingPathComponent(".migration-\(UUID().uuidString)"))
+                            .appendingPathComponent(".migration-\(UUID().uuidString)"), dataRoot: dataRoot)
                         try manager.createDirectory(at: inbox.directory.deletingLastPathComponent(), withIntermediateDirectories: true)
                         defer { try? manager.removeItem(at: staged.directory) }
                         try manager.copyItem(at: legacyInbox.directory, to: staged.directory)
@@ -65,9 +67,9 @@ extension TelegramPollLoop {
                         try manager.moveItem(at: staged.directory, to: inbox.directory)
                     }
                 }
-                let offset = try TelegramOffsetCursor(fileURL: legacyOffsetURL).load()
-                _ = try await TelegramOffsetCursor(fileURL: offsetURL).advance(to: offset)
             }
+            let offset = try TelegramOffsetCursor(fileURL: legacyOffsetURL).load()
+            _ = try await TelegramOffsetCursor(fileURL: offsetURL).advance(to: offset)
         }
     }
 
@@ -84,17 +86,9 @@ extension TelegramPollLoop {
     }
 
     func writeStatePatch(_ patch: [String: JSONValue]) async {
-        let store = SwiftNativePersistenceCore()
-        let path = telegramDir.appendingPathComponent("state.json")
         do {
-            try await store.withFileLock(path) {
-                let current = try await store.readJSON(path, ifMissing: .object([:]))
-                guard case .object(var obj) = current else {
-                    throw TelegramUpdateInboxError.malformedClaim("state.json")
-                }
-                guard patch.contains(where: { obj[$0.key] != $0.value }) else { return }
+            try await Self.mutateState(dataRoot: dataRoot) { obj in
                 for (key, value) in patch { obj[key] = value }
-                try await store.writeJSON(.object(obj), to: path)
             }
         } catch {
             // Never write over a state file that did not read back. Logged
@@ -109,6 +103,35 @@ extension TelegramPollLoop {
                 to: telegramDir.appendingPathComponent("errors.jsonl")
             )
             return
+        }
+    }
+
+    /// Sole checked state.json reader for polling and management diagnostics.
+    /// Only missing means empty; unreadable or non-object state is unavailable.
+    /// Local/off-disk backup, support state snapshot, phone status projection;
+    /// no production export. PrivacyMap: telegram.
+    public static func readState(dataRoot: URL) async throws -> [String: JSONValue] {
+        let current: JSONValue
+        do {
+            current = try await SwiftNativePersistenceCore().readJSON(
+                dataRoot.appendingPathComponent("telegram/state.json"), ifMissing: .object([:]))
+        } catch { throw TelegramStateReadError() }
+        guard case .object(let object) = current else { throw TelegramStateReadError() }
+        return object
+    }
+
+    /// Sole locked mutation owner; the checked read must succeed before editing.
+    public static func mutateState<Result: Sendable>(
+        dataRoot: URL, _ update: @Sendable (inout [String: JSONValue]) -> Result
+    ) async throws -> Result {
+        let store = SwiftNativePersistenceCore()
+        let path = dataRoot.appendingPathComponent("telegram/state.json")
+        return try await store.withFileLock(path) {
+            let current = try await Self.readState(dataRoot: dataRoot)
+            var object = current
+            let result = update(&object)
+            if current != object { try await store.writeJSON(.object(object), to: path) }
+            return result
         }
     }
 
@@ -137,18 +160,15 @@ extension TelegramPollLoop {
     /// left this loop answering as the PREVIOUS bot — every command addressed
     /// to the new @username read as another bot's and was dropped.
     func resolveBotUsername() async -> String? {
-        let store = SwiftNativePersistenceCore()
-        let path = telegramDir.appendingPathComponent("state.json")
-        let state: JSONValue
+        let root: [String: JSONValue]
         do {
-            state = try await store.readJSON(path, ifMissing: .object([:]))
+            root = try await Self.readState(dataRoot: dataRoot)
         } catch {
             await recordError(context: "state_read", error: String(describing: error))
             return nil
         }
         let fingerprint = Self.botTokenFingerprint(token)
-        if case .object(let root) = state,
-           let cached = _tgJSONString(root["botUsername"]),
+        if let cached = _tgJSONString(root["botUsername"]),
            !cached.isEmpty,
            _tgJSONString(root["botUsernameTokenFingerprint"]) == fingerprint,
            let cachedAt = _tgParseDate(_tgJSONString(root["botUsernameAt"])),
@@ -173,21 +193,11 @@ extension TelegramPollLoop {
 
     func syncCommandMenuIfNeeded() async {
         guard let syncCommandMenu else { return }
-        let store = SwiftNativePersistenceCore()
-        let path = telegramDir.appendingPathComponent("state.json")
-        let state: JSONValue
+        let root: [String: JSONValue]
         do {
-            state = try await store.readJSON(path, ifMissing: .object([:]))
+            root = try await Self.readState(dataRoot: dataRoot)
         } catch {
             await recordError(context: "state_read", error: String(describing: error))
-            return
-        }
-        if case .object(let root) = state,
-           case .object(let menu)? = root["commandMenu"],
-           _tgJSONInt(menu["commandCount"]) == TelegramCommandRegistry.commands.count,
-           _tgJSONString(menu["registryVersion"]) == TelegramCommandRegistry.version,
-           _tgJSONString(menu["botIdentity"]) == botIdentity,
-           _tgJSONString(menu["syncedAt"]) != nil {
             return
         }
         // U5 W-D: a failed setMyCommands used to re-attempt on EVERY tick
@@ -195,13 +205,21 @@ extension TelegramPollLoop {
         // success resets the curve.
         guard await commandMenuBackoff.shouldAttempt() else { return }
         do {
-            let status = try await syncCommandMenu(token, TelegramCommandRegistry.commands)
+            let projection = try await bot.commandProjection()
+            if case .object(let menu)? = root["commandMenu"], menu["synced"] == .bool(true),
+               _tgJSONInt(menu["commandCount"]) == projection.commands.count,
+               _tgJSONString(menu["registryVersion"]) == projection.version,
+               _tgJSONString(menu["botIdentity"]) == botIdentity,
+               _tgJSONString(menu["syncedAt"]) != nil {
+                return
+            }
+            let status = try await syncCommandMenu(token, projection.commands)
             await commandMenuBackoff.recordSuccess()
             await writeStatePatch([
                 "commandMenu": .object([
                     "botIdentity": .string(botIdentity),
                     "commandCount": .int(Int64(status.commandCount)),
-                    "registryVersion": .string(status.registryVersion),
+                    "registryVersion": .string(projection.version),
                     "syncedAt": .string(status.syncedAt),
                     "synced": .bool(true),
                     "lastSyncError": .null,
@@ -212,7 +230,7 @@ extension TelegramPollLoop {
             await writeStatePatch([
                 "commandMenu": .object([
                     "botIdentity": .string(botIdentity),
-                    "commandCount": .int(Int64(TelegramCommandRegistry.commands.count)),
+                    "commandCount": .int(Int64(TelegramCommandRegistry.menuCommandNames.count)),
                     "registryVersion": .string(TelegramCommandRegistry.version),
                     "synced": .bool(false),
                     "lastAttemptAt": .string(_tgNowString()),
@@ -273,7 +291,7 @@ extension TelegramPollLoop {
         let store = SwiftNativePersistenceCore()
         return try await store.withFileLock(loop.offsetURL.appendingPathExtension("discovery")) {
             let cursor = TelegramOffsetCursor(fileURL: loop.offsetURL)
-            let inbox = TelegramUpdateInbox(offsetURL: loop.offsetURL)
+            let inbox = TelegramUpdateInbox(offsetURL: loop.offsetURL, dataRoot: loop.dataRoot)
             let result = try await loop.bot.longPoll(token: token, offset: cursor.load(), timeoutSeconds: 0,
                                                      session: loop.longPollSession)
             var count = 0

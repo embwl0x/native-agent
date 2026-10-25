@@ -30,6 +30,8 @@
 
 import Foundation
 
+// Blueprint: | `MemoryDisplayText.swift` | `MemoryDisplayText`: canonical memory text rendering and USER.md coverage/join keys, preserving date-critical kinds |
+
 public enum MemoryDisplayText {
 
     /// Memory text as it should appear in prompts / USER.md / recall output.

@@ -4,6 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import NotificationInbox
 import DeviceSync
+// Blueprint: | `AttentionRouter+MacNotifications.swift` | Native UserNotifications transport, message-route binding and notification admission/receipts; fire-and-forget posts retain their handles through the OS outcome, and shutdown closes admission without joining or cancelling accepted banners |
 
 /// The identity a banner carries and what a click on it does. A click OPENS
 /// the item — it never approves, runs, or closes anything.
@@ -130,6 +131,16 @@ extension AttentionRouter {
 }
 
 public enum NativeAgentNotifications: MacNotificationDelivery {
+    private static let deliveryLock = NSLock()
+    nonisolated(unsafe) private static var stopped = false
+    nonisolated(unsafe) private static var posts: [UUID: Task<Void, Never>] = [:]
+
+    /// Already accepted banners finish and retire at the OS callback, including
+    /// errors. Close admission immediately; never join the OS during shutdown.
+    public static func shutdown() {
+        deliveryLock.withLock { stopped = true }
+    }
+
     /// Tool-authored messages can be answered. Bind the route at posting time,
     /// never to whichever conversation happens to be visible when Reply lands.
     /// Messages outside a turn own a new, retained notification conversation.
@@ -142,8 +153,13 @@ public enum NativeAgentNotifications: MacNotificationDelivery {
     }
 
     public static func post(title: String, body: String, userInfo: [String: String] = [:]) {
-        Task {
-            _ = await postAndReport(title: title, body: body, userInfo: userInfo)
+        deliveryLock.withLock {
+            guard !stopped else { return }
+            let id = UUID()
+            posts[id] = Task {
+                _ = await postAccepted(title: title, body: body, userInfo: userInfo, soundName: nil)
+                _ = deliveryLock.withLock { posts.removeValue(forKey: id) }
+            }
         }
     }
 
@@ -155,6 +171,18 @@ public enum NativeAgentNotifications: MacNotificationDelivery {
         body: String,
         userInfo: [String: String] = [:],
         soundName: String? = nil
+    ) async -> NativeAgentNotificationPostResult {
+        guard deliveryLock.withLock({ !stopped }) else {
+            return NativeAgentNotificationPostResult(
+                identifier: UUID().uuidString, status: "cancelled", delivery: "engine_shutdown",
+                posted: false, visibleAlertsEnabled: false, authorizationStatus: "", alertSetting: "",
+                soundSetting: "", badgeSetting: "", error: CancellationError().localizedDescription)
+        }
+        return await postAccepted(title: title, body: body, userInfo: userInfo, soundName: soundName)
+    }
+
+    private static func postAccepted(
+        title: String, body: String, userInfo: [String: String], soundName: String?
     ) async -> NativeAgentNotificationPostResult {
         await AttentionRouter.postMacNotification(
             title: title, body: body, userInfo: userInfo, soundName: soundName,

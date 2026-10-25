@@ -2,7 +2,7 @@ import PersistenceCore
 import MemoryV2
 import Foundation
 import SwiftUI
-import KnowledgeGraph
+// Blueprint: | `KnowledgeGraphView.swift` | `KnowledgeGraphView`: mounted graph, filters, policy and maintenance presentation; `loadKnowledgeGraphPolicy`, `reloadKnowledgeGraphPolicyAndGraph`, `loadGraph` |
 
 // ---------------------------------------------------------------------------
 // MARK: - Main view
@@ -73,7 +73,6 @@ struct KnowledgeGraphView: View {
     @State var filterType: String = "all"
     @State var isEnablingGraph = false
     @State var enableActionPresentation: KnowledgeGraphEnableActionPresentation = .idle
-    @State var nativeStack: KGNativeStackStatus = .empty
     // Single source of truth for selection. Both the list and the graph canvas
     // write here; `selectedEntity` (below) is derived. Avoids the two-state
     // drift the previous attempt had where graph clicks and list selections
@@ -134,8 +133,7 @@ struct KnowledgeGraphView: View {
     @State var gcPreviewCandidateIDs: Set<String> = []
     @State var showGCConfirm = false
 
-    // The graph and every entity read come from one facade, passed into
-    // KGEntityDetailView so all reads use the same root.
+    // The list, canvas and entity detail derive from one facade snapshot.
     var memory: MemoryFacade { appModel.engine.memory }
 
     let entityTypes = KnowledgeGraphFilterCatalog.entityTypes
@@ -215,7 +213,7 @@ struct KnowledgeGraphView: View {
             // The counts strip is this card's first row.
             AliveGroupCard {
                 KGNativeStackHeader(
-                    status: nativeStack,
+                    memory: memory,
                     totalEntities: totalEntities,
                     totalEdges: totalEdges ?? 0
                 )
@@ -767,7 +765,7 @@ extension KnowledgeGraphView {
             return true
         }
         do {
-            appModel.engine.trust.policy = try await appModel.engine.trust.load()
+            _ = try await appModel.engine.trust.load()
             policyReadError = nil
             return true
         } catch {
@@ -794,9 +792,7 @@ extension KnowledgeGraphView {
         // lives on the shared graph (`shownError`).
         await memory.loadGraph()
         guard !Task.isCancelled, memory.graphLoadError == nil else { return }
-        let status = await KGNativeStackStatus.load(entityCount: totalEntities)
-        guard !Task.isCancelled else { return }
-        nativeStack = status
+        await memory.refreshDiagnostics()
     }
 
     func enableKnowledgeGraph(enabled: Bool = true) async {
@@ -1004,7 +1000,7 @@ enum KnowledgeGraphPresentation {
     /// never labels a maintenance-action error as stale graph data.  A boolean
     /// from an earlier load attempt is insufficient: a later GC failure can
     /// replace the visible message while retained graph rows are still current.
-    enum ErrorOrigin: Equatable { case graphLoad, policyAction, maintenance }
+    enum ErrorOrigin: Equatable { case graphLoad, maintenance }
     static func content(
         isLoading: Bool,
         error: String?,

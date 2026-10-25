@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `UserMessageIntentSignals.swift` | `UserMessageIntentSignals`: pure lexical context/tool allocation signals and control-handoff recognition; never effect authority |
+
 /// Shared, pure lexical guards for the cheap turn router and preload predictor.
 /// These signals allocate context/tool schemas only; they never grant authority.
 public enum UserMessageIntentSignals {

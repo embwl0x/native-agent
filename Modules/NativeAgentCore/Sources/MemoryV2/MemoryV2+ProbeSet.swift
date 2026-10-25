@@ -37,6 +37,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `MemoryV2+ProbeSet.swift` | `MemoryProbeSet`: known-answer probe values, bundled/override loading and strict parsing for consolidation admission |
+
 // MARK: - MemoryProbe
 
 public struct MemoryProbe: Sendable, Equatable {
@@ -71,6 +73,8 @@ public struct MemoryProbe: Sendable, Equatable {
 
 // MARK: - MemoryProbeSet
 
+/// External probe_set.json override: local backup/export and memory PrivacyMap,
+/// no phone sync. This owner reads it; no app writer is intended.
 public struct MemoryProbeSet: Sendable, Equatable {
     public let version: Int
     /// Top-K recall window a probe must land in to count as a hit.

@@ -1,103 +1,13 @@
 import AppKit
 import SwiftUI
 import Senses
+import EngineRuntime
+// Blueprint: | `SensesView.swift` | `SensesView`; engine Senses projection, lifecycle controls and native share picker |
 
-/// These owners have no complete push invalidation contract yet. Sample only
-/// while the page is visible; no file paths or private ledger format are assumed.
-@MainActor
-@Observable
-final class SensesSurfaceState {
-    var records: [SenseRecord] = []
-    var surfaceNames: [SenseCorner: String] = [:]
-    var news: [SenseNews] = []
-    var interactiveView: SenseInteractiveView?
-    var isWired = false
-    var loaded = false
-    var saving: Set<String> = []
-    /// A switch or share that failed; the read's own failure is `readError`,
-    /// cleared by the next good read.
-    var error: String?
-    var readError: String?
-    @ObservationIgnored private var refreshGeneration = 0
-
-    func refresh() async {
-        refreshGeneration &+= 1
-        let generation = refreshGeneration
-        let hub = SensesHub.shared
-        let wired = hub.registry != nil
-        if isWired != wired { isWired = wired }
-        async let news = SenseNewsBoard.shared.latest(limit: SenseNewsBoard.capacity)
-        async let view = SenseNewsBoard.shared.interactiveView()
-        do {
-            let (sorted, names) = try await hub.presentationRecords()
-            guard generation == refreshGeneration, !Task.isCancelled else { return }
-            if self.records != sorted { self.records = sorted }
-            if surfaceNames != names { surfaceNames = names }
-            if readError != nil { readError = nil }
-        } catch {
-            guard generation == refreshGeneration, !Task.isCancelled else { return }
-            let message = "Senses registry unavailable: \(error.localizedDescription)"
-            if readError != message { readError = message }
-        }
-        let latest = Array((await news).prefix(12))
-        let nextView = await view
-        guard generation == refreshGeneration, !Task.isCancelled else { return }
-        if self.news != latest { self.news = latest }
-        if let view = nextView, view.isCurrent(in: self.records) {
-            if interactiveView != view { interactiveView = view }
-        } else {
-            if interactiveView != nil { interactiveView = nil }
-        }
-        if !loaded { loaded = true }
-    }
-
-    func observe() async {
-        while !Task.isCancelled {
-            await refresh()
-            do { try await Task.sleep(for: .seconds(5)) } catch { return }
-        }
-    }
-
-    func setEnabled(_ enabled: Bool, record: SenseRecord) async {
-        guard saving.insert(record.id).inserted else { return }
-        defer { saving.remove(record.id) }
-        guard let registry = SensesHub.shared.registry as? any SenseRegistryManaging else {
-            error = "Senses are not connected yet."
-            return
-        }
-        do {
-            _ = try await registry.setStatus(id: record.id, version: record.version, status: enabled ? .on : .off,
-                                             preview: false, ownerAuthorized: true)
-            error = nil
-        } catch {
-            self.error = "I couldn't save this switch: \(error.localizedDescription)"
-        }
-        await refresh()
-    }
-
-    /// Called only by User's native Share button and destination picker.
-    func export(_ record: SenseRecord) async {
-        guard saving.insert(record.id).inserted else { return }
-        defer { saving.remove(record.id) }
-        guard let registry = SensesHub.shared.registry as? any SenseRegistryManaging else {
-            error = "Senses are not connected yet."
-            return
-        }
-        let panel = NSSavePanel()
-        panel.title = "Share sense"
-        panel.nameFieldStringValue = "\(record.id).sense.json"
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
-        do {
-            _ = try await registry.exportBundle(id: record.id, to: destination, userApproved: true)
-            error = nil
-        } catch {
-            self.error = "I couldn't share this sense: \(error.localizedDescription)"
-        }
-    }
-}
 
 struct SensesView: View {
-    @State private var state = SensesSurfaceState()
+    @Environment(AppModel.self) private var appModel
+    private var state: SensesFacade { appModel.engine.senses }
 
     var body: some View {
         ScrollView {
@@ -147,7 +57,6 @@ struct SensesView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .navigationTitle("Senses")
-        .liveTask { await state.observe() }
         .quietReadTask(live: false) { await state.refresh() }
     }
 
@@ -178,7 +87,16 @@ struct SensesView: View {
             }
             .font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
             if record.language != .native {
-                Button("Share sense…") { Task { await state.export(record) } }
+                Button("Share sense…") {
+                    Task {
+                        await state.export(record) {
+                            let panel = NSSavePanel()
+                            panel.title = "Share sense"
+                            panel.nameFieldStringValue = "\(record.id).sense.json"
+                            return panel.runModal() == .OK ? panel.url : nil
+                        }
+                    }
+                }
                     .disabled(state.saving.contains(record.id))
                     .accessibilityIdentifier("senses.share.\(record.id)")
             }

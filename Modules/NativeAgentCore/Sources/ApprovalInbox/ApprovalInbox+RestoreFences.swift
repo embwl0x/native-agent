@@ -2,31 +2,40 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `ApprovalInbox+RestoreFences.swift` | `SwiftNativeApprovalInbox.mergeRestoreFences`: pre-owner restore merge of monotonic spends, resolutions and continuation facts, with unreadable-piece receipts |
+
 extension SwiftNativeApprovalInbox {
     /// Pre-owner restore merge for monotonic approval facts. This is invoked
     /// before the app constructs ApprovalInbox, so there is no live writer to
-    /// coordinate with. Existing malformed destination bytes throw and remain
-    /// untouched; they are never treated as an empty store.
+    /// coordinate with. An unreadable piece is omitted with a receipt; it never
+    /// prevents installing the backup or suppresses another readable piece.
     public nonisolated static func mergeRestoreFences(
         safetyRoot: URL,
         destinationRoot: URL
-    ) throws {
-        try mergeSpendStore(
+    ) throws -> [String] {
+        var notes: [String] = []
+        func carry(_ piece: String, _ merge: () throws -> String?) throws {
+            if let cause = try merge() {
+                notes.append("workflows/approvals/\(piece): \(cause); current consumption or resolution facts from this piece were not kept.")
+            }
+        }
+        try carry("effect_spends.json") { try mergeSpendStore(
             safetyPath: effectSpendPath(root: safetyRoot),
             destinationPath: effectSpendPath(root: destinationRoot),
             schema: effectSpendSchema,
             loader: loadEffectSpends
-        )
-        try mergeSpendStore(
+        ) }
+        try carry("injection_spends.json") { try mergeSpendStore(
             safetyPath: injectionSpendPath(root: safetyRoot),
             destinationPath: injectionSpendPath(root: destinationRoot),
             schema: injectionSpendSchema,
             loader: loadSpends
-        )
-        try mergeApprovalResolutionFacts(
+        ) }
+        try carry("requests.json") { try mergeApprovalResolutionFacts(
             safetyPath: approvalsPath(root: safetyRoot),
             destinationPath: approvalsPath(root: destinationRoot)
-        )
+        ) }
+        return notes
     }
 
     private nonisolated static func effectSpendPath(root: URL) -> URL {
@@ -51,23 +60,28 @@ extension SwiftNativeApprovalInbox {
         destinationPath: URL,
         schema: String,
         loader: (URL) throws -> [String: JSONValue]
-    ) throws {
-        guard FileManager.default.fileExists(atPath: safetyPath.path) else { return }
-        let safety = try loader(safetyPath)
+    ) throws -> String? {
+        guard FileManager.default.fileExists(atPath: safetyPath.path) else { return nil }
+        let safety: [String: JSONValue]
+        do { safety = try loader(safetyPath) }
+        catch { return error.localizedDescription }
         var destination = try loader(destinationPath)
         for (id, marker) in safety { destination[id] = marker }
         try writeRestoreJSON(
             .object(["schema": .string(schema), "spends": .object(destination)]),
             to: destinationPath
         )
+        return nil
     }
 
     private nonisolated static func mergeApprovalResolutionFacts(
         safetyPath: URL,
         destinationPath: URL
-    ) throws {
-        guard FileManager.default.fileExists(atPath: safetyPath.path) else { return }
-        let safety = try loadApprovalRowsChecked(at: safetyPath)
+    ) throws -> String? {
+        guard FileManager.default.fileExists(atPath: safetyPath.path) else { return nil }
+        let safety: [JSONValue]
+        do { safety = try loadApprovalRowsChecked(at: safetyPath) }
+        catch { return error.localizedDescription }
         var destination = try loadApprovalRowsChecked(at: destinationPath)
         var destinationIndexes: [String: Int] = [:]
         for (index, value) in destination.enumerated() {
@@ -93,9 +107,7 @@ extension SwiftNativeApprovalInbox {
             }
             guard targetObject["action"] == safetyObject["action"],
                   targetObject["payload"] == safetyObject["payload"] else {
-                throw ApprovalInboxError.malformedResponse(
-                    "restore fence id \(id) refers to different approval payloads"
-                )
+                return "restore fence id \(id) refers to different approval payloads"
             }
             // Resolution, execution and continuation facts only move forward.
             // Descriptive payload/title bytes still come from the selected backup.
@@ -109,6 +121,7 @@ extension SwiftNativeApprovalInbox {
             destination[index] = .object(targetObject)
         }
         try writeRestoreJSON(.array(destination), to: destinationPath)
+        return nil
     }
 
     private nonisolated static func writeRestoreJSON(_ value: JSONValue, to path: URL) throws {

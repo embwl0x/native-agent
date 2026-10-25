@@ -2,15 +2,12 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `LLMClient+AnthropicAdapter.swift` | `AnthropicAdapter`: Messages completion/stream transport, credential discovery, prompt blocks and thinking/tool wire controls |
+
 /// Anthropic Messages API adapter. URLSession is injectable for tests.
 public final class AnthropicAdapter: LLMAdapter {
     public static let toolWire = ProviderToolWire.native
     public let providerId: String
-    /// Request timeout for the API-key lane. Same resolved value the OAuth
-    /// direct adapters use (240s), so both lanes fail a stalled request the
-    /// same way instead of inheriting whatever the injected session carries.
-    static let requestTimeoutSeconds: TimeInterval = 240
-
     // INTERNAL (not private): the native-tools lane lives in
     // LLMClient+AnthropicNativeTools.swift — same module, separate file, so it
     // needs module-internal visibility on the transport seams. Still not
@@ -257,11 +254,6 @@ public final class AnthropicAdapter: LLMAdapter {
         req.setValue(key, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         req.setValue("application/json", forHTTPHeaderField: "content-type")
-        // An injected session may carry URLSession's 60s default (or none at
-        // all); match the OAuth lanes' resolved 240s so a stalled completion
-        // fails instead of hanging the turn.
-        req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : Self.requestTimeoutSeconds
-
         var body: [String: Any] = [
             "model": model,
             "max_tokens": requestMaxTokens(model: model),
@@ -283,7 +275,10 @@ public final class AnthropicAdapter: LLMAdapter {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            let (bytes, head) = try await ProviderWire.open(session, req)
+            defer { bytes.task.cancel() }
+            response = head
+            data = try await bytes.reduce(into: Data()) { $0.append($1) }
         } catch {
             // Cancellation MUST propagate as CancellationError so structured-
             // concurrency callers can distinguish cancel from a real network
@@ -457,10 +452,6 @@ public final class AnthropicAdapter: LLMAdapter {
         req.setValue(key, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         req.setValue("application/json", forHTTPHeaderField: "content-type")
-        // An injected session may carry URLSession's 60s default (or none at
-        // all); match the OAuth lanes' resolved 240s so a stalled completion
-        // fails instead of hanging the turn.
-        req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : Self.requestTimeoutSeconds
         // clear_at in the body REQUIRES its beta header. Same rule as the
         // OAuth lane: present iff a message carries the flag, absent
         // otherwise, so every pre-existing request stays byte-identical.
@@ -643,9 +634,7 @@ public final class AnthropicAdapter: LLMAdapter {
                 let bytes: URLSession.AsyncBytes
                 let response: URLResponse
                 do {
-                    if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-                    (bytes, response) = try await session.bytes(for: req)
-                    if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
+                    (bytes, response) = try await ProviderWire.open(session, req)
                 } catch {
                     continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "anthropic")")))
                     return

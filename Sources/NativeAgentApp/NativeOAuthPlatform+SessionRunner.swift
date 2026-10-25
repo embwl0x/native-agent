@@ -2,6 +2,7 @@ import ProviderRouting
 import Foundation
 import AppKit
 import AuthenticationServices
+// Blueprint: | `NativeOAuthPlatform+SessionRunner.swift` | `NativeOAuthPlatform`: `runAuthSession` |
 
 extension NativeOAuthPlatform {
     // MARK: - ASWebAuthenticationSession runner

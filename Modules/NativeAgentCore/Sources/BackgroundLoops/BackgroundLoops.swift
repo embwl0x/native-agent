@@ -1,7 +1,8 @@
-import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+
+// Blueprint: | `BackgroundLoops.swift` | `SwiftNativeLoopScheduler`, loop registrations and accounting: in-process scheduling, event deadlines, durable outcomes and worker lifecycle |
 
 private struct AnyKey: CodingKey, Hashable {
     var stringValue: String
@@ -155,12 +156,8 @@ public enum LoopTickOutcome: Sendable, Equatable {
 }
 
 /// Exponential-with-jitter retry curve applied by the scheduler when a loop's
-/// tick FAILS. Same shape as `TelegramExponentialBackoff` (which stays as the
-/// Telegram poll loop's own intra-tick gate); this one lives at the scheduler
-/// so every loop gets failure backoff, not just the one that hand-rolled it.
-///
-/// Without it a 2s-interval loop re-hit a dead endpoint every 2 seconds
-/// forever (Slack socket mode against a revoked token).
+/// tick fails, and by Telegram's intra-tick deadline gate. Each caller owns
+/// its failure counter and deadline; this policy owns the curve.
 public struct LoopFailureBackoffPolicy: Sendable, Equatable {
     public var baseDelay: TimeInterval
     public var maxDelay: TimeInterval
@@ -345,67 +342,19 @@ public func tickWithTimeoutOutcome(
     _ loop: any LoopRunner,
     timeout: TimeInterval
 ) async throws -> LoopTickOutcome {
-    let race = TickRace()
-    let tickTask = Task {
-        let outcome = await loop.tickOutcome()
-        await race.resolve(.finished(outcome))
-    }
-    let timeoutTask = Task {
-        do {
-            try await Task.sleep(nanoseconds: timeoutNanoseconds(timeout))
-            await race.resolve(.timedOut)
-        } catch {
-            // Cancelled because the tick finished first.
-        }
-    }
-
-    let result = await withTaskCancellationHandler {
-        await race.wait()
-    } onCancel: {
-        tickTask.cancel()
-        timeoutTask.cancel()
-        Task { await race.resolve(.cancelled) }
+    let result = await raceAgainstTimeout(nanoseconds: timeoutNanoseconds(timeout)) {
+        await loop.tickOutcome()
     }
 
     switch result {
-    case .finished(let outcome):
-        timeoutTask.cancel()
+    case .value(let outcome):
         return outcome
+    case .failure(let error):
+        return .failed(error: error)
     case .timedOut:
-        tickTask.cancel()
         throw TickTimeoutError()
     case .cancelled:
-        tickTask.cancel()
-        timeoutTask.cancel()
         throw CancellationError()
-    }
-}
-
-private enum TickRaceResult: Sendable {
-    case finished(LoopTickOutcome)
-    case timedOut
-    case cancelled
-}
-
-private actor TickRace {
-    private var result: TickRaceResult?
-    private var waiters: [CheckedContinuation<TickRaceResult, Never>] = []
-
-    func wait() async -> TickRaceResult {
-        if let result { return result }
-        return await withCheckedContinuation { cont in
-            waiters.append(cont)
-        }
-    }
-
-    func resolve(_ next: TickRaceResult) {
-        guard result == nil else { return }
-        result = next
-        let pending = waiters
-        waiters.removeAll()
-        for waiter in pending {
-            waiter.resume(returning: next)
-        }
     }
 }
 
@@ -414,10 +363,11 @@ private func timeoutNanoseconds(_ seconds: TimeInterval) -> UInt64 {
     return UInt64(clamped * 1_000_000_000)
 }
 
-/// Snapshot of the manager's settled outcomes and the scheduler's next wake.
+/// Snapshot of settled outcomes and projected timing.
 public struct LoopState: Sendable, Equatable {
     public var loopId: String
     public var lastTickAt: Date?
+    /// Periodic projection, also advanced by event/out-of-band accounting; not the retained sleeper.
     public var nextTickAt: Date?
     public var lastResult: String?
     public var lastError: String?
@@ -547,6 +497,8 @@ public actor SwiftNativeLoopScheduler {
     static let loopStateReceiptId = "loop_state"
     private var persistedStateLoaded = false
     private var persistedStateLoad: Task<PersistedLoopState, Never>?
+    /// Installed before suspension so snapshots reach disk in actor order.
+    private var persistedStateWrite: Task<Void, Never>?
     public static let healthCheckpointInterval: TimeInterval = 60
     private let durableFlushImmediateInterval: TimeInterval
     private var lastDurableFlushAt: Date?
@@ -612,7 +564,7 @@ public actor SwiftNativeLoopScheduler {
     //
     // THE BOUND both must respect: Doctor calls a loop overdue when it drifts
     // past `nextRun` by more than `DoctorLoopHealth.overdueTolerance` =
-    // max(estimatedInterval / 2, 60s). The scheduler publishes `nextTickAt`
+    // max(registered interval / 2, 60s). The scheduler publishes `nextTickAt`
     // AFTER applying jitter, so a jittered tick is never late against its own
     // advertised time — but a consumer holding a pre-jitter `nextRun` (a status
     // read racing the delay computation, or the spawn-time seed) would be. So
@@ -759,6 +711,13 @@ public actor SwiftNativeLoopScheduler {
         if running {
             spawnTaskIfNeeded(for: reg)
         }
+    }
+
+    /// Close scheduled work and passive domain resources while retaining the
+    /// registration: a canceled replacement must preserve its physical gate.
+    func stopWorkForReplacement(loopId: String) async {
+        tasks.removeValue(forKey: loopId)?.cancel()
+        await loops[loopId]?.loop.shutdown()
     }
 
     public func unregister(loopId: String) async {
@@ -1098,28 +1057,32 @@ public actor SwiftNativeLoopScheduler {
             row["cadenceSeconds"] = pulse.cadence.map { .double($0) }
             return .object(row)
         }
-        do {
-            try await persistence.writeJSON(
-                .object([
-                    "version": .string("1"),
-                    "loops": .object(loops),
-                    "completions": .object(completions),
-                    "firstSeen": .object(firstSeen),
-                    "pulses": .object(pulses),
-                ]),
-                to: loopStatePath
-            )
-            consecutiveFailures[Self.loopStateReceiptId] = 0
-        } catch {
-            lastDurableFlushAt = nil
-            FileHandle.standardError.write(Data(
-                "BackgroundLoops: failed to persist loop run state: \(error)\n".utf8
-            ))
-            // The attempt outlives this process as a receipt; repeats coalesce.
-            await appendFailureReceipt(loopId: Self.loopStateReceiptId,
-                error: "Loop run history could not be saved: \(error.localizedDescription)")
-            consecutiveFailures[Self.loopStateReceiptId, default: 0] += 1
+        let snapshot = JSONValue.object([
+            "version": .string("1"),
+            "loops": .object(loops),
+            "completions": .object(completions),
+            "firstSeen": .object(firstSeen),
+            "pulses": .object(pulses),
+        ])
+        let previous = persistedStateWrite
+        let write = Task {
+            await previous?.value
+            do {
+                try await persistence.writeJSON(snapshot, to: loopStatePath)
+                consecutiveFailures[Self.loopStateReceiptId] = 0
+            } catch {
+                lastDurableFlushAt = nil
+                FileHandle.standardError.write(Data(
+                    "BackgroundLoops: failed to persist loop run state: \(error)\n".utf8
+                ))
+                // The attempt outlives this process as a receipt; repeats coalesce.
+                await appendFailureReceipt(loopId: Self.loopStateReceiptId,
+                    error: "Loop run history could not be saved: \(error.localizedDescription)")
+                consecutiveFailures[Self.loopStateReceiptId, default: 0] += 1
+            }
         }
+        persistedStateWrite = write
+        await write.value
     }
 
     /// Keep sub-minute liveness current in memory and checkpoint it on an

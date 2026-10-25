@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `ChatPersistenceContext.swift` | `ChatPersistenceContext` enum |
 
 /// Request-scoped transcript intent. Regenerate/retry callers provide the
 /// assistant row they mean to replace without widening every provider/tool-loop

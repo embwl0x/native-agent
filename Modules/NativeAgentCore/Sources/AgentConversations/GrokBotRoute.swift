@@ -3,9 +3,11 @@ import GrokLink
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `GrokBotRoute.swift` | `GrokBotRoute` enum; `withHistory`, `takenByWaiter`; cancellation ends the waiter handoff without resampling |
 
 /// Only nonsecret correlation and delivery state are persisted here.
 public struct GrokPendingRequest: Codable, Sendable {
+    public var lifeID: String?
     public let messageID: String
     public let peerID: String
     public let conversationID: String
@@ -45,7 +47,8 @@ public struct GrokRequestStore: Sendable {
         try pruneSettled(now: now)
         return try CredentialFileLock.withLock(file) {
             guard !FileManager.default.fileExists(atPath: file.path) else { throw GrokLinkCredential.Failure.invalid }
-            let request = GrokPendingRequest(messageID: id, peerID: peer, conversationID: conversation,
+            let request = GrokPendingRequest(lifeID: try DataRootLife.current(in: root.deletingLastPathComponent().deletingLastPathComponent()),
+                messageID: id, peerID: peer, conversationID: conversation,
                 expiresAt: now.addingTimeInterval(600), state: "sending", quiet: quiet ? true : nil, route: route)
             try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(request), to: file)
             return request
@@ -62,6 +65,11 @@ public struct GrokRequestStore: Sendable {
         guard data.count <= 96 * 1024 else { throw GrokLinkCredential.Failure.invalid }
         var value = try JSONDecoder().decode(GrokPendingRequest.self, from: data)
         value.state = GrokBotRoute.normalizedStatus(value.state)
+        if try !DataRootLife.isCurrent(value.lifeID, in: root.deletingLastPathComponent().deletingLastPathComponent()),
+           !Self.isSettled(value) {
+            value.state = "stopped"
+            value.handOver = DataRootLife.stoppedReason
+        }
         return value
     }
     public func expiredUnanswered(peer: String, now: Date = Date()) throws -> GrokPendingRequest? {
@@ -110,8 +118,8 @@ public struct GrokRequestStore: Sendable {
     }
 
     private static func isSettled(_ value: GrokPendingRequest) -> Bool {
-        (value.state == "answered" || value.state.hasPrefix("webhook refused the request (HTTP "))
-            && !["pending", "handing over"].contains(value.handOver ?? "")
+        (value.state == "answered" || value.state == "stopped" || value.state.hasPrefix("webhook refused the request (HTTP "))
+            && !["pending", "running", "handing over"].contains(value.handOver ?? "")
     }
 
     /// Keep seven days, at most 256 settled receipts. Pending sends and reply
@@ -192,7 +200,7 @@ public enum GrokBotRoute {
     public static func takenByWaiter(peer: String, messageID: String, dataRoot: URL) async -> Bool {
         let running = AgentConversationRunning.shared
         let deadline = Date().addingTimeInterval(300) // a wait runs at most 300s
-        while Date() < deadline {
+        while !Task.isCancelled, Date() < deadline {
             let seen = running.seen
             let rows = (try? AgentConversationStore(dataRoot: dataRoot).records()) ?? []
             guard let row = rows.first(where: { $0.agent == "peer:" + peer && $0.readInput?["message_id"] == .string(messageID) }),
@@ -203,8 +211,12 @@ public enum GrokBotRoute {
     }
 
     public static let bundleID = "com.anysphere.sand"
+    public static func setupRequired(_ peer: AgentPeerContact) -> JSONValue {
+        .object(["status": .string("needs_setup"), "completed": .bool(false), "automatic_resend": .bool(false),
+                 "detail": .string("Grok Bot setup is \(peer.grokSetup ?? "unfinished"); no message was sent. Connect Grok Bot again to continue this contact's setup without removing it.")])
+    }
     public static func routineName(_ peer: String) -> String { "NativeAgent reply " + peer }
-    public static let securePasteBlocker = "Grok Bot's Routines panel did not expose one unambiguous webhook URL and readable key through Accessibility. Setup stopped. Paste the URL and key together in the secure field at Agents → Grok Bot → Routine credentials; never in chat."
+    public static let securePasteBlocker = "Grok Bot setup is unfinished. Connect again to continue native import; a navigation blocker names the control and agents/recipes/grok-bot.json to update. This secure field also accepts the URL and key together; never put credentials in chat."
     public static func instruction(peer: String, command: String) -> String {
         // Only app-owned fixed arguments form the command. Reply data is stdin.
         let quoted = "'" + command.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -228,12 +240,14 @@ public enum GrokBotRoute {
         if let reply = pending.reply { fields["reply"] = .string(reply); fields["untrusted_remote_data"] = .bool(true) }
         // Saved is not the same as handed to her: say which.
         if let handOver = pending.handOver { fields["hand_over"] = .string(handOver) }
+        if pending.state == "stopped" { fields["reason"] = .string(DataRootLife.stoppedReason) }
         return AgentConversationView.expiringReply(.object(fields))
     }
     public static func send(peer: AgentPeerContact, text: String, conversation: String, route: AgentBridgeCompletionRoute,
                             messageID: String, dataRoot: URL, credential: GrokLinkCredential, quiet: Bool = false,
                             post: @Sendable (URLRequest) async throws -> Int = postOnce) async throws -> JSONValue {
-        guard peer.grokSetup == "set up", let address = credential.webhookURL,
+        if peer.grokSetup != "set up" { return setupRequired(peer) }
+        guard let address = credential.webhookURL,
               let key = credential.webhookKey, let url = URL(string: address) else { throw GrokLinkCredential.Failure.unavailable }
         let store = GrokRequestStore(dataRoot: dataRoot)
         _ = try store.create(id: messageID, peer: peer.id, conversation: conversation, route: route, quiet: quiet)

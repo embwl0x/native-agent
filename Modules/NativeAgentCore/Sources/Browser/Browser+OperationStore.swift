@@ -1,10 +1,12 @@
-import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `Browser+OperationStore.swift` | SwiftNativeBrowserClient's checked run-array schema, lifecycle writes and terminal vocabulary shared by reconciliation; derived receipts and traces use appendPathOwnedJSONL; local backup/export/raw phone sync excluded, PrivacyMap lists Browser Runs |
 
 /// Canonical Browser lifecycle commands. WebKit/AppKit remain effect adapters;
 /// every durable lifecycle transition enters through this boundary.
+/// runs.json is the browser's JSON operation array, deliberately excluded from
+/// local backup, export and phone sync; PrivacyMap lists Browser Runs.
 public enum BrowserOperationInitialState: String, Sendable {
     case dryRun = "dry_run"
     case waitingApproval = "waiting_approval"
@@ -79,7 +81,6 @@ public enum BrowserOperationCommand: Sendable {
     case complete(BrowserOperationCompletion)
     case cancel(id: String?)
     case recoverStrandedRunning
-    case projectPendingReceipts
 }
 
 public struct BrowserOperationCommandResult: Sendable {
@@ -153,8 +154,6 @@ extension SwiftNativeBrowserClient {
             result = try await commitCancel(requestedID: requestedID)
         case .recoverStrandedRunning:
             result = try await recoverStrandedRunning()
-        case .projectPendingReceipts:
-            result = BrowserOperationCommandResult(run: nil, didTransition: false)
         }
         do {
             try await projectPendingBrowserReceipts()
@@ -263,6 +262,10 @@ extension SwiftNativeBrowserClient {
             row["opened"] = .bool(completion.opened)
             row["sourceReceipt"] = completion.sourceReceipt
             row["screenshotReceipt"] = completion.screenshotReceipt
+            if case .object(let receipt) = completion.sourceReceipt,
+               receipt["outcomeKind"] == .string("outcome_unknown") {
+                row["outcomeKind"] = .string("outcome_unknown")
+            }
             row["updatedAt"] = .string(timestamp)
             row["completedAt"] = .string(timestamp)
             row["verificationStatus"] = .string(
@@ -412,8 +415,7 @@ extension SwiftNativeBrowserClient {
             try await appendDerivedOnce(
                 trace, projectionID: projectionID,
                 to: tracesPath, label: "Browser.trace",
-                maxLines: JSONLLineCaps.traceEvents,
-                usesPathOwnedCap: true
+                maxLines: JSONLLineCaps.traceEvents
             )
 
             try await withCanonicalRunsLock {
@@ -455,8 +457,7 @@ extension SwiftNativeBrowserClient {
         projectionID: String,
         to path: URL,
         label: String,
-        maxLines: Int = JSONLLineCaps.actionReceipts,
-        usesPathOwnedCap: Bool = false
+        maxLines: Int = JSONLLineCaps.actionReceipts
     ) async throws {
         let work: @Sendable () async throws -> Void = {
             let existing = (try? await self.persistence.tailJSONL(
@@ -465,43 +466,47 @@ extension SwiftNativeBrowserClient {
             guard !existing.contains(where: {
                 Self.objectString($0, "transitionId") == projectionID
             }) else { return }
-            if usesPathOwnedCap {
-                try await appendPathOwnedJSONL(
-                    value, to: path, using: self.persistence,
-                    logLabel: label, takeLock: false
-                )
-            } else {
-                try await appendJSONLCapped(
-                    value, to: path, using: self.persistence,
-                    maxLines: maxLines, logLabel: label, takeLock: false
-                )
-            }
+            try await appendPathOwnedJSONL(
+                value, to: path, using: self.persistence,
+                logLabel: label, takeLock: false
+            )
         }
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
+        // Every persistence conformer uses the same path lock.
         try await persistence.withFileLock(path, work)
     }
 
     private func readCanonicalRuns() async throws -> [JSONValue] {
+        try await Self.readCanonicalRuns(at: runsPath, using: persistence)
+    }
+
+    static func readCanonicalRuns(
+        at runsPath: URL, using persistence: any PersistenceCoreProtocol,
+        malformed: any Error = BrowserOperationStoreError.corruptRunsDocument
+    ) async throws -> [JSONValue] {
         guard FileManager.default.fileExists(atPath: runsPath.path) else { return [] }
         let raw = try await persistence.readJSON(runsPath, ifMissing: .null)
-        guard case .array(let rows) = raw else {
-            throw BrowserOperationStoreError.corruptRunsDocument
+        guard case .array(let rows) = raw,
+              rows.allSatisfy({
+                  if case .object(let row) = $0, case .string? = row["status"] { return true }
+                  return false
+              }) else {
+            throw malformed
         }
         return rows
+    }
+
+    package static func terminalRun(id: String, at path: URL) async throws -> JSONValue? {
+        guard !id.isEmpty else { return nil }
+        let rows = try await readCanonicalRuns(at: path, using: SwiftNativePersistenceCore())
+        guard let row = rows.first(where: { objectString($0, "id") == id }),
+              let status = objectString(row, "status"), terminalStatuses.contains(status) else { return nil }
+        return row
     }
 
     private func withCanonicalRunsLock<T: Sendable>(
         _ operation: @Sendable () async throws -> T
     ) async throws -> T {
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
+        // Every persistence conformer uses the same path lock.
         return try await persistence.withFileLock(runsPath, operation)
     }
 

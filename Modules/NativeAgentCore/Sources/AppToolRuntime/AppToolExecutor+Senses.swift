@@ -1,8 +1,11 @@
-import ChatOrchestration
+import ChatTurnContracts
+import ChatToolRuntime
+import ChatToolParsing
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Senses
+// Blueprint: | `AppToolExecutor+Senses.swift` | Sense corner reads, served verb discovery and gated in-turn acts |
 
 extension AppActions {
     static func matchingSenses(_ query: String, records: [SenseRecord]) -> [SenseRecord] {
@@ -34,21 +37,22 @@ extension AppActions {
             }
             let reader = all.first { $0.id == id }!
             return AppAction(id, record.corner.key, "Read \(record.id) · \(record.corner.key)", reader.args,
-                warn: reader.warn, tool: reader.tool, input: reader.input.merging(input) { _, bound in bound },
+                toolClass: .read, warn: reader.warn, tool: reader.tool, input: reader.input.merging(input) { _, bound in bound },
                 read: true,
                 scope: ([record.id, record.corner.key, record.grownBecause ?? ""] + record.verbs).joined(separator: " "),
                 schema: schema(reader).map { LLMToolSchema(name: reader.tool,
+                    toolClass: .read,
                     description: "Read \(record.id) · \(record.corner.key)", parametersJSON: $0.parametersJSON) },
-                folded: reader.folded)
+                part: record.id, folded: reader.folded)
         }
         return reads + views.flatMap { view in
             view.page.things.flatMap { thing in
                 thing.verbs.compactMap { verb -> AppAction? in
                     let id = "sense.\(view.record.id).\(verb)"
                     guard seen.insert(id).inserted else { return nil }
-                    return AppAction(id, view.page.corner.key, verb + " " + thing.name, ["address", "args?:object"],
-                        tool: "sense_act", input: ["sense_id": .string(view.record.id), "verb": .string(verb)],
-                        scope: ([view.record.id, view.record.corner.key, view.page.title, thing.detail ?? ""] + view.record.verbs).joined(separator: " "))
+                    return AppAction(id, view.page.corner.key, verb + " " + thing.name, ["address", "args?:object"], tool: "sense_act", input: ["sense_id": .string(view.record.id), "verb": .string(verb)],
+                        scope: ([view.record.id, view.record.corner.key, view.page.title, thing.detail ?? ""] + view.record.verbs).joined(separator: " "),
+                        part: view.record.id)
                 }
             }
         }

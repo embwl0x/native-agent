@@ -2,6 +2,8 @@ import Foundation
 import PersistenceCore
 import ChatSessionWork
 
+// Blueprint: | `TelegramChatHandling.swift` | Telegram chat contracts: progress/compaction sinks and attempt context carrying decoded sender identity separately from chat identity |
+
 public typealias TelegramCompactionHandler = @Sendable (_ sessionId: String) async throws -> ChatSessionCompactionOutcome
 
 public enum TelegramChatProgressEvent: Sendable, Equatable {
@@ -61,9 +63,9 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
 /// Progress chat handler variant that also carries inbound image attachments
 /// (telegram-vision-in). When non-empty, `attachments` hold already-downloaded
 /// image bytes (`TelegramMediaAttachment.bytes` set) the app-layer handler
-/// converts to ChatOrchestration's MultimodalAttachment and threads onto the
-/// chat turn. Carrying `TelegramMediaAttachment` keeps this module free of a
-/// ChatOrchestration dependency. It returns her reply's face: its words and
+/// converts to ChatTurnContracts' MultimodalAttachment and threads onto the
+/// chat turn. Carrying `TelegramMediaAttachment` keeps this handler interface
+/// independent of the chat attachment contract. It returns her reply's face: its words and
 /// the images she chose, which Telegram renders together.
 public typealias TelegramProgressChatHandlerWithAttachments = @Sendable (
     _ chatId: Int,

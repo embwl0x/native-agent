@@ -8,9 +8,6 @@ extension ChatStore {
     // by taking the oldest pending placeholder) and updates it.
     func receiveICloudReply(_ msg: BridgeMessage) async {
         await restorationTask?.value
-        let offscreen = msg.correlationID.flatMap { pendingExchanges[$0] }
-            .map { $0.sessionID != Self.cleanSessionID(selectedSessionID) } ?? false
-        if !offscreen { await sessionCacheLoadTask?.value }
         guard msg.sender == "mac" else { return }  // only accept Mac replies
         // How a Steer ended: read by the turn that was working (its reply
         // answers it), or given back, to run as its own message.
@@ -28,7 +25,7 @@ extension ChatStore {
             guard queueSessionKey(queued.sessionID) == queueSessionKey(selectedSessionID) else { return }
             var note = ChatMessage(role: .assistant, text: msg.text, awaitingMacTranscript: true, runId: msg.correlationID)
             note.completionState = "completed"
-            messages.append(contentsOf: [ChatMessage(id: queued.id, role: .user, text: queued.text), note])
+            messages.append(contentsOf: [ChatMessage(id: queued.id, role: .user, text: queued.text, awaitingMacTranscript: true, runId: msg.correlationID), note])
             return
         }
         if let correlation = msg.correlationID,
@@ -57,13 +54,12 @@ extension ChatStore {
                     Self.end(&reply, lifecycle: kind == "cancelled" ? "Stopped" : Self.errorExplanation(msg),
                              state: kind == "cancelled" ? "incomplete" : "failed")
                 }
-                do {
-                    try await storage.checkpointReply(reply, key: transcriptStorageKey(for: record.sessionID),
-                        legacyKey: transcriptKey, sessionID: record.sessionID)
-                } catch {
-                    errorBanner = error.localizedDescription
-                    return
-                }
+                let key = record.sessionID ?? Self.nilQueueSessionKey
+                var transcript = iCloudSyncEngine.shared.chatTranscripts[key]
+                    ?? .init(records: [], messages: [], generation: nil)
+                transcript.messages.removeAll { $0.id == reply.id }
+                transcript.messages.append(reply)
+                iCloudSyncEngine.shared.chatTranscripts[key] = transcript
                 cancelReplyWaits(for: correlationID)
                 if record.sessionID == Self.cleanSessionID(selectedSessionID) {
                     await receiveICloudReply(msg)
@@ -198,10 +194,14 @@ extension ChatStore {
         // a fresh session.
         if let incoming = Self.cleanSessionID(msg.sessionID), selectedSessionID == nil {
             migrateQueuedSends(from: nil, to: incoming)
-            setSelectedSessionID(incoming)
-            if mainSessionID == nil {
-                rememberMainSessionIDIfNeeded(incoming)
+            if let outgoing = iCloudSyncEngine.shared.chatTranscripts.removeValue(forKey: Self.nilQueueSessionKey) {
+                var transcript = iCloudSyncEngine.shared.chatTranscripts[incoming]
+                    ?? .init(records: [], messages: [], generation: nil)
+                let ids = Set(transcript.messages.map(\.id))
+                transcript.messages.append(contentsOf: outgoing.messages.filter { !ids.contains($0.id) })
+                iCloudSyncEngine.shared.chatTranscripts[incoming] = transcript
             }
+            setSelectedSessionID(incoming)
         }
         if let correlationID = msg.correlationID, let placeholderId = timedOutPendingIds.removeValue(forKey: correlationID) {
             cancelReplyWaits(for: correlationID)
@@ -215,7 +215,7 @@ extension ChatStore {
                 // finishPlaceholder plays the soft "reply landed" haptic here.
                 finishPlaceholder(id: placeholderId, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true)
             } else {
-                messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true))
+                messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true, runId: msg.correlationID))
                 Haptics.replyFinalized()
             }
             onReply?(msg.text)
@@ -228,7 +228,7 @@ extension ChatStore {
             return
         }
         guard !pendingICloudPlaceholders.isEmpty else {
-            messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true))
+            messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true, runId: msg.correlationID))
             onReply?(msg.text)
             isLoading = false
             return
@@ -238,7 +238,7 @@ extension ChatStore {
             if let placeholderId = pendingICloudPlaceholders[correlationID] {
                 match = (correlationID, placeholderId)
             } else {
-                messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true))
+                messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true, runId: msg.correlationID))
                 onReply?(msg.text)
                 if pendingICloudPlaceholders.isEmpty {
                     isLoading = false
@@ -335,7 +335,6 @@ extension ChatStore {
             reply.completionState = state
             messages.append(reply)
         }
-        persistMessages()
     }
 
     /// The Mac says its transcript goes back further than the snapshot's
@@ -355,12 +354,7 @@ extension ChatStore {
         defer { isLoadingHistory = false }
         do {
             let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: session, beforeID: oldest.id.uuidString)
-            guard Self.cleanSessionID(selectedSessionID) == session,
-                  let at = messages.firstIndex(where: { $0.id == oldest.id }) else { return }
-            let existingIDs = Set(messages.map(\.id))
-            let older = page.messages.filter { !existingIDs.contains($0.id) }
-            pagedHistoryIDs.formUnion(older.map(\.id))
-            messages.insert(contentsOf: older, at: at)
+            guard Self.cleanSessionID(selectedSessionID) == session else { return }
             if !page.hasOlder { historyExhaustedSessionIDs.insert(session) }
         } catch {
             errorBanner = "Earlier messages did not load: \(error.localizedDescription)"
@@ -373,11 +367,7 @@ extension ChatStore {
         isLoadingHistory = true
         defer { isLoadingHistory = false }
         do {
-            let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: session, throughID: id.uuidString, limit: 1)
-            guard Self.cleanSessionID(selectedSessionID) == session,
-                  let whole = page.messages.first(where: { $0.id == id }),
-                  let index = messages.firstIndex(where: { $0.id == id }) else { return }
-            messages[index].text = whole.text
+            _ = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: session, throughID: id.uuidString, limit: 1)
         } catch {
             errorBanner = "The whole message did not load: \(error.localizedDescription)"
         }
@@ -561,12 +551,10 @@ extension ChatStore {
 
     private func setStreamingText(_ placeholderId: UUID, _ text: String) {
         guard let idx = messages.firstIndex(where: { $0.id == placeholderId }) else { return }
-        suppressMessagePersistence = true
         var updated = messages[idx]
         updated.text = text
         updated.isStreaming = true
         messages[idx] = updated
-        suppressMessagePersistence = false
     }
 
     func streamingHint(for message: ChatMessage) -> String {
@@ -659,7 +647,7 @@ extension ChatStore {
                     nextSnapshotPollAt = now.addingTimeInterval(Self.iCloudReplySnapshotBackstopSeconds)
 
                     // Force-refresh bypasses the 2s throttle.
-                    await self.forceRefresh(using: client, fallbackMessages: nil)
+                    await self.forceRefresh(using: client)
 
                     // Re-check: forceRefresh may have resolved the pending reply.
                     let stillPendingAfterSnapshot = await MainActor.run {
@@ -680,31 +668,14 @@ extension ChatStore {
     /// Like `refresh(using:)` but bypasses the 2-second throttle. Intended only for
     /// active-send polling — not for user-driven or scenePhase refreshes.
     /// Updates `lastRefreshAt` so throttled callers are debounced afterwards.
-    func forceRefresh(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) async {
+    func forceRefresh(using client: MacBridgeClient) async {
         await forceRefresh(
-            loadTranscript: { await client.readChatTranscript(sessionID: $0) },
-            fallbackMessages: fallbackMessages
-        )
-    }
-
-    /// The pre-2026-09-06 array-shaped loader: nil is an unavailable read and
-    /// an empty array carries no transcript version, so it can never clear.
-    func forceRefresh(
-        loadHistory: (String?) async -> [ChatMessage]?,
-        fallbackMessages: [ChatMessage]?
-    ) async {
-        await forceRefresh(
-            loadTranscript: { sessionID in
-                guard let messages = await loadHistory(sessionID) else { return .unavailable }
-                return .published(messages, generation: nil)
-            },
-            fallbackMessages: fallbackMessages
+            loadTranscript: { await client.readChatTranscript(sessionID: $0) }
         )
     }
 
     func forceRefresh(
-        loadTranscript: (String?) async -> MacTranscriptRead,
-        fallbackMessages: [ChatMessage]?
+        loadTranscript: (String?) async -> MacTranscriptRead
     ) async {
         lastRefreshAt = Date()
         let sessionID = Self.cleanSessionID(selectedSessionID ?? mainSessionID)
@@ -713,14 +684,6 @@ extension ChatStore {
         guard !Task.isCancelled,
               generation == sessionSwitchGeneration,
               sessionID == Self.cleanSessionID(selectedSessionID ?? mainSessionID) else { return }
-        guard read != .unavailable else {
-            if messages.isEmpty, let fallbackMessages, !fallbackMessages.isEmpty {
-                messages = fallbackMessages
-            }
-            return
-        }
-        // Push, foreground refresh, and missed-reply recovery share one merge
-        // owner, including same-ID text updates and timed-out reply recovery.
         applyMacTranscriptRead(read, sessionID: sessionID)
     }
 
@@ -807,11 +770,6 @@ extension ChatStore {
             errorBanner = nil
             Haptics.replyFinalized()
         }
-        // Arrival stamps record FIRST appearance; a turn that streamed longer
-        // than the preserve window would finalize already-stale and a stale
-        // snapshot right after could drop the just-arrived reply. Resolution
-        // is the arrival that matters for the stale-snapshot guard.
-        localArrivalDates[placeholderId] = Date()
     }
 
     /// Ends a bubble the Mac did not finish. Her words stay exactly as they
@@ -825,7 +783,6 @@ extension ChatStore {
         updated.awaitingMacTranscript = awaitingMacTranscript
         Self.end(&updated, lifecycle: lifecycle, state: state)
         messages[idx] = updated
-        localArrivalDates[placeholderId] = Date()
     }
 
     /// A bubble with no words yet has only the evidence to show.

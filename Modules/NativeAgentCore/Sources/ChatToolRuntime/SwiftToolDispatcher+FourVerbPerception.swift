@@ -7,11 +7,11 @@ import Dispatcher
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-import VisionPerception
 import Senses
+// Blueprint: | `SwiftToolDispatcher+FourVerbPerception.swift` | `SwiftToolDispatcherFourVerbPerceptionSource` struct; whole native masked observation through recognition, region crop and JPEG fitting only at model delivery; window obstructions from MacControl's `SystemMacVisualObstructionProbe` |
 
-/// The app-assembly bridge between MacControl's live fused capture and the pure
-/// VisionPerception compiler. MacControl stays independent of VisionPerception;
+/// The assembly bridge between MacControl's live fused capture and its pure
+/// VisionPerceptionCompiler;
 /// the four-verb surface receives one additive, source-neutral supplement.
 struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerceptionSource {
     let host: any MacControlClient
@@ -138,7 +138,8 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 logicalSize: (number(imageLogicalObject["w"] ?? logicalObject["w"]) ?? 0,
                               number(imageLogicalObject["h"] ?? logicalObject["h"]) ?? 0),
                 background: output["capture_isolated_window"] == .bool(true),
-                window: [bundleIdentifier ?? "", appName ?? "", title, windowFrame].joined(separator: "|")
+                window: [bundleIdentifier ?? "", appName ?? "", title, windowFrame].joined(separator: "|"),
+                captureDetail: string(output["message"]), captureRemedy: output["remedy"]
             )
             if let mainPicture = frame(output["semantic_focus_frame"]) {
                 pixels.focus(name: "the window's main picture area", frame: mainPicture)
@@ -533,6 +534,8 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
     private var screenRecording = false
     private var png: String?
     private var unavailable: String?
+    private var captureDetail: String?
+    private var captureRemedy: JSONValue?
     private var origin: (x: Double, y: Double) = (0, 0)
     private var logicalSize: (width: Double, height: Double) = (0, 0)
     private var background = false
@@ -546,7 +549,7 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
 
     func record(frameID: String, reason: String?, screenRecording: Bool, png: String?, unavailable: String?,
                 origin: (x: Double, y: Double), logicalSize: (width: Double, height: Double),
-                background: Bool, window: String) {
+                background: Bool, window: String, captureDetail: String? = nil, captureRemedy: JSONValue? = nil) {
         lock.lock(); defer { lock.unlock() }
         recorded = true
         self.frameID = frameID
@@ -555,6 +558,8 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         self.screenRecording = screenRecording
         self.png = png
         self.unavailable = unavailable
+        self.captureDetail = captureDetail
+        self.captureRemedy = captureRemedy
         self.origin = origin
         self.logicalSize = logicalSize
         self.background = background
@@ -609,16 +614,18 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         guard recorded, reason != nil || forced else { return nil }
         let why = reason.map { "thin accessibility: \($0)" } ?? "pixels:true"
         guard screenRecording else {
-            return "Pixels (\(why)): needs Screen Recording permission (the person's call). No capture was attempted and no prompt was opened; the words above are all I have. A scriptable app can be worked without the screen: write a tool for it with tool.propose (host.apps.call)."
+            return "Pixels (\(why)): screen_recording_not_trusted. No image was attached or permission prompt opened. The text read above retains its stated coverage. Request app {action:\"permissions.request\",args:{capability:\"screenRecording\",why:\"Allow NativeAgent to see the screen?\"}}; the owner decides."
         }
         guard !discarded else {
-            return "Pixels (\(why)): the window changed while I looked, so that capture was dropped and no image was attached; look again."
+            return "Pixels (\(why)): capture_window_changed. The window changed during capture; no image was attached. The text read above retains its stated coverage. Use mac.look for the affected app to inspect its current state."
         }
         guard let png else {
-            return "Pixels (\(why)): the window capture was unavailable (\(unavailable ?? "capture failed")); the words above are all I have."
+            let recovery = captureRemedy.flatMap { try? $0.serialize(pretty: false) }
+                ?? "Inspect the affected app's menu with mac.menu; correct the capture failure before another image request."
+            return "Pixels (\(why)): \(unavailable ?? "capture_failed"). \(captureDetail ?? "No usable image was returned.") No image was attached. The text read above retains its stated coverage. \(recovery)"
         }
         guard LocalToolImage.sink != nil else {
-            return "Pixels (\(why)): this call cannot carry an image, so none was attached; the words above are all I have."
+            return "Pixels (\(why)): image_delivery_unavailable. This call cannot carry an image. The text read above retains its stated coverage; request pixels from a model tool turn if an image is needed."
         }
         var scope = "the window"
         if let region { scope = "\(region.name), cropped at higher detail" }
@@ -651,7 +658,12 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         guard let jpeg = Self.boundedJPEG(source.image) else {
             return "Pixels (\(why)): the image could not be fitted under \(Self.maxBytes / 1000) KB; none was attached."
         }
-        let delivered = LocalToolImage.deliverPNG(jpeg.data, name: "screen-window.jpg",
+        // What it shows names it, so a newer look at the same window replaces it.
+        let parts = window.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        let app = parts.count > 1 && !parts[1].isEmpty ? parts[1] : parts.first ?? "the window"
+        let title = parts.count > 2 && !parts[2].isEmpty && parts[2] != app ? " “" + parts[2] + "”" : ""
+        let name = LocalToolImage.screenshotName(of: app + title + (region.map { ", " + $0.name } ?? ""), source: key)
+        let delivered = LocalToolImage.deliverPNG(jpeg.data, name: name,
             width: jpeg.width, height: jpeg.height, mediaType: "image/jpeg")
         guard case .object(let result) = delivered, result["status"] == .string("ok") else {
             return "Pixels (\(why)): this result already carries its image limit; none was attached."
@@ -664,7 +676,7 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
             bounds: MacAXFrame(x: source.origin.x, y: source.origin.y, w: source.logicalSize.width, h: source.logicalSize.height),
             pixelWidth: jpeg.width, pixelHeight: jpeg.height), id: frameID)
         imageFrame = frame.fields
-        ChatTurnExecution.current?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID)
+        ChatTurnExecution.current?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID, image: name)
         return attached + " " + frame.words
     }
 

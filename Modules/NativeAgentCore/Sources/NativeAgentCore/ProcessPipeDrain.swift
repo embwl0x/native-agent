@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+// Blueprint: | `Modules/NativeAgentCore/Sources/NativeAgentCore/ProcessPipeDrain.swift` | One nonblocking subprocess pipe reader shared by provider transport and Mac execution; MacControl translates setup failures at its execution boundary |
 
 /// Nonblocking readers keep EOF inside the subprocess deadline. A child
 /// exiting does not imply EOF when descendants still own pipe writers.

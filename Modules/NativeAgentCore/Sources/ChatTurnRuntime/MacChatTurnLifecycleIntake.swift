@@ -4,6 +4,7 @@ import TurnTrace
 import NativeAgentCore
 import NativeAgentShared
 import Transcripts
+// Blueprint: | `MacChatTurnLifecycleIntake.swift` | `MacChatTurnPresentationPort`: `beginChatTurnLifecycle`, `applyChatTurnLifecycleInput`, `receiveChatTurnActivity`; `OtherDoorTurns` retains its trace subscription consumer, counts reply progress only from surface output evidence, stops at engine termination and unsubscribes on exit |
 
 public extension MacChatTurnPresentationPort {
     /// Opens the exact generation for one accepted Mac turn. This is the only
@@ -455,18 +456,30 @@ public final class OtherDoorTurns {
     public static let shared = OtherDoorTurns()
     /// Each session's other-door turn that began and has not ended.
     private var open: [String: MacChatTurnLifecycleState] = [:]
-    private var started = false
+    private var task: Task<Void, Never>?
+    private var generation: UUID?
+    private var subscriptionID: UUID?
     /// Her words reaching the surface: movement, and the card reads "replying".
     private static let outputKinds: Set<String> = [
-        TurnLifecycleMilestone.providerFirstDelta.rawValue,
         TurnLifecycleMilestone.surfaceOutputEnqueued.rawValue,
         TurnLifecycleMilestone.surfaceFirstRender.rawValue,
     ]
 
     public func start(_ appModel: any MacChatTurnPresentationPort) {
-        guard !started else { return }
-        started = true
-        Task { await run(appModel) }
+        guard task == nil else { return }
+        let generation = UUID()
+        self.generation = generation
+        task = Task { await run(appModel, generation: generation) }
+    }
+
+    public func stop() -> Task<Void, Never> {
+        generation = nil
+        task?.cancel()
+        open.removeAll()
+        let subscriptionID = self.subscriptionID
+        return Task.detached {
+            if let subscriptionID { await TurnTraceBus.shared.unsubscribe(subscriptionID) }
+        }
     }
 
     /// Puts the session's open turn on its card, unless a Mac turn holds it.
@@ -478,13 +491,25 @@ public final class OtherDoorTurns {
         turns.lifecycleBySession[sessionId] = state
     }
 
-    private func run(_ appModel: any MacChatTurnPresentationPort) async {
+    private func run(_ appModel: any MacChatTurnPresentationPort, generation: UUID) async {
+        defer {
+            task = nil
+            subscriptionID = nil
+            open.removeAll()
+            if self.generation == generation { self.generation = nil }
+        }
         let subscription = await TurnTraceBus.shared.subscribe(capacity: 256)
+        guard self.generation == generation, !Task.isCancelled else {
+            await TurnTraceBus.shared.unsubscribe(subscription.id)
+            return
+        }
+        subscriptionID = subscription.id
         for turn in ChatCancelFlag.inFlightTurns(dataRoot: appModel.macChatTurns.dataRoot) {
             admit(MacChatTurnIdentity(sessionId: turn.sessionId, turnId: turn.turnId), at: turn.acceptedAt, appModel)
         }
         for sessionId in open.keys { show(sessionId, appModel) }
         for await event in subscription.stream {
+            guard self.generation == generation, !Task.isCancelled else { break }
             guard let sessionId = event.sessionId, let ended = reduce(event, appModel) else { continue }
             if ended {
                 // A refresh that started while the card was up is dropped by
@@ -494,6 +519,7 @@ public final class OtherDoorTurns {
                 show(sessionId, appModel)
             }
         }
+        await TurnTraceBus.shared.unsubscribe(subscription.id)
     }
 
     /// Opens a turn another door started: false when it is already open or
@@ -532,7 +558,7 @@ public final class OtherDoorTurns {
             kind = .working(action: action)
         case let output where Self.outputKinds.contains(output):
             kind = .streamProgress(accumulatedUTF16Length: state.presentation.streamedTextLength + 1)
-        case "turn.terminal", "turn.cancelled", "turn.failed":
+        case let terminal where TurnTraceEvent.isTerminalKind(terminal):
             open[sessionId] = nil
             if turns.lifecycle(for: sessionId)?.identity == identity {
                 turns.lifecycleBySession.removeValue(forKey: sessionId)

@@ -2,6 +2,7 @@ import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ProviderFailure.swift` | Typed provider failure classification and `Diagnostic` wrapper preserving redacted wire evidence and the owner's `ToolFailureError` repair through normalization; `repair` decides once whether a failed call owes repair (sign-in, account, model choice) or is a correction that owes nothing |
 
 /// 2026-09-18 WHY: adapters translate wire evidence once; recovery and surfaces
 /// consume a failure, never adapter wording. Cancellation is not a failure.
@@ -17,7 +18,9 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     /// it was and on what evidence (absent from older peers). Admission rides
     /// on the `Diagnostic`.
     case noReply(provider: String, seconds: Int, events: Int, account: String? = nil)
+    case outputLimit
     case refused
+    case requestRejected
     case malformedResponse
     case routingUnavailable
     case modelUnavailable
@@ -26,13 +29,16 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         switch self {
         case .authExpired: return "Your model connection needs attention; reconnect it in Settings."
         case .codexCLISessionExpired: return "Your Codex CLI sign-in needs updating. Run codex once, or sign in in NativeAgent."
-        case .rateLimited: return "The usage limit was reached; wait a while or choose another model."
+        case .rateLimited(let seconds?): return "The usage limit was reached; wait \(seconds) seconds before another request."
+        case .rateLimited(nil): return "The usage limit was reached; the provider gave no wait time. Check the account's usage allowance."
         case .overloaded: return "The model is busy; try again in a moment."
         case .contextTooLong: return "The conversation is too long; start a new chat or shorten your message."
         case .network: return "The connection was interrupted; check your internet connection and try again."
         case .noReply(let provider, let seconds, let events, let account):
             return account ?? "No reply from \(provider) in \(seconds) s (\(events) events)."
-        case .refused: return "The model turned this request down. Try again, or pick another model in Settings."
+        case .outputLimit: return "The model reached its output limit. Keep any partial output and request only the missing portion."
+        case .refused: return "The model refused this request. Read the refusal and stop if it is disallowed."
+        case .requestRejected: return "The provider rejected this request. Correct the reported request error."
         case .malformedResponse: return "The model returned an unreadable response; try again."
         case .routingUnavailable: return "Your model settings could not be loaded; check your model connection in Settings."
         case .modelUnavailable: return "The selected model is unavailable; choose another model."
@@ -43,7 +49,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     public static func http(status: Int, detail: String = "", retryAfter: Int? = nil) -> Self {
         switch status {
         case 401: return .authExpired
-        case 429: return .rateLimited(retryAfter: quotaExceeded(detail) && !rateLimitWording(detail) ? quotaRetryAfter : retryAfter)
+        case 429: return .rateLimited(retryAfter: retryAfter == nil && quotaExceeded(detail) && !rateLimitWording(detail) ? quotaRetryAfter : retryAfter)
         case 413: return .contextTooLong
         case 408: return .network
         case 409, 425, 500...599: return .overloaded
@@ -52,10 +58,11 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
             if contextOverflow(detail) { return .contextTooLong }
             // 2026-09-19 WHY: some quota responses use 403 rather than 429.
             if rateLimitWording(detail) { return .rateLimited(retryAfter: retryAfter) }
-            if quotaExceeded(detail) { return .rateLimited(retryAfter: quotaRetryAfter) }
+            if quotaExceeded(detail) { return .rateLimited(retryAfter: retryAfter ?? quotaRetryAfter) }
             if modelUnavailable(detail) { return .modelUnavailable }
             if status == 403 { return .authExpired }
-            return .refused
+            if modelRefusal(detail) { return .refused }
+            return .requestRejected
         }
     }
 
@@ -72,7 +79,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         return wireDetail(object["error"] as? [String: Any] ?? object)
     }
 
-    public static func wire(_ detail: String, fallback: Self = .refused) -> Self {
+    public static func wire(_ detail: String, fallback: Self = .requestRejected) -> Self {
         let text = detail.lowercased()
         if contextOverflow(text) { return .contextTooLong }
         if let status = Self.httpStatusCode(inDescription: text), status >= 400 {
@@ -90,7 +97,15 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         if ["llm: transient", "connection refused", "cannot connect", "network connection was lost", "code=-1001", "timed out", "upstream connect", "disconnect/reset", "transport failure"].contains(where: text.contains) {
             return .network
         }
+        if text.contains("stop_reason=max_tokens") { return .outputLimit }
+        if modelRefusal(text) { return .refused }
         return fallback
+    }
+
+    private static func modelRefusal(_ detail: String) -> Bool {
+        let text = detail.lowercased()
+        return text == "refusal" || text.hasPrefix("refusal ")
+            || ["stop_reason=refusal", "content_filter", "content_policy_violation"].contains(where: text.contains)
     }
 
     // A quota response without Retry-After asks for an hour before retrying.
@@ -191,7 +206,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
             case .notConfigured: return .routingUnavailable
             case .authRejected(_, let detail): return wire(detail ?? "", fallback: .authExpired)
             case .modelUnavailable: return .modelUnavailable
-            case .outputLengthLimit: return .refused
+            case .outputLengthLimit: return .outputLimit
             case .invalidResponse(let status): return http(status: status)
             case .transient(let detail): return wire(detail, fallback: .network)
             case .streamTruncated: return .network
@@ -209,7 +224,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         if admitted, let diagnostic = error as? Diagnostic {
             return Diagnostic(cause: diagnostic.cause, detail: diagnostic.detail,
                               deadlineExpired: diagnostic.deadlineExpired, admitted: true,
-                              repair: diagnostic.repair)
+                              repair: diagnostic.repair, tries: diagnostic.tries)
         }
         if error is any ProviderFailureWrapping { return error }
         // Output truncation carries partial prose; routing/configuration failures
@@ -237,13 +252,17 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         /// The provider began a response for this request.
         public let admitted: Bool
         public let repair: ToolFailureError?
+        /// How many times delivery dialed this request (ProviderWire): above 1,
+        /// asking again was already the wire's.
+        public let tries: Int
         public init(cause: ProviderFailure, detail: String, deadlineExpired: Bool = false, admitted: Bool = false,
-                    repair: ToolFailureError? = nil) {
+                    repair: ToolFailureError? = nil, tries: Int = 1) {
             self.cause = cause
             self.detail = String(ContextSecretContentPolicy.redactedFragment(detail).prefix(4096))
             self.deadlineExpired = deadlineExpired
             self.admitted = admitted
             self.repair = repair
+            self.tries = tries
         }
         public var errorDescription: String? { repair?.message ?? cause.errorDescription }
         public var providerFailureCause: Error { cause }
@@ -277,43 +296,105 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     /// or a model its account does not serve stays wrong until someone changes
     /// it: it names that owner and its lever and owes repair. An outage, a
     /// limit, a timeout, an empty or unreadable reply or a refusal is the
-    /// provider's answer to this request: it owes nothing, and its next call
-    /// shows the model choice. Nothing here proves the Mac healthy, so nothing
+    /// provider's answer to this request: it owes nothing and names its fix
+    /// and control. Nothing here proves the Mac healthy, so nothing
     /// says so. A failure already carrying its repair keeps it.
     public static func repair(_ error: Error, provider: String, model: String, surface: String,
                               dataRoot: URL, id: String, evidence: [Experience.Ref] = []) -> ToolFailureError {
         if let carried = (error as? Diagnostic)?.repair { return carried }
+        if error is CancellationError || (error as? URLError)?.code == .cancelled {
+            return ToolFailureError("provider_call_cancelled: The model call was cancelled. Keep any output already received and leave the call stopped; no further action is needed.",
+                effects: .unknown, code: "provider_call_cancelled", status: .cancelled,
+                instruction: "Keep any output already received and leave the call stopped; no further action is needed.", recovery: .terminal)
+        }
         let group = "providers." + (ProviderSurfaceGroups.group(for: surface) ?? ProviderSurfaceGroups.chat).id
         let detail = diagnosticDescription(error)
+        let cause = classify(error)
         var lever: String?
         let failure: ToolFailureError
         if let thrown = error as? ToolFailureError { failure = thrown }
+        else if let routing = error as? ProviderRoutingError { failure = routing.repair }
+        else if case .outputLengthLimit(let partial) = error as? LLMError {
+            let instruction = "Keep any partial output and request only the missing portion; inspect model choices with setting.get \(group)_model."
+            return ToolFailureError(
+                "provider_output_limit: \(provider) · \(model) reached its output limit (\(detail)). \(instruction)",
+                effects: partial.isEmpty ? .none : .partial,
+                nextCall: ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(group + "_model")])]),
+                code: "provider_output_limit", instruction: instruction, recovery: .inspect)
+        }
         else {
-            switch classify(error) {
+            switch cause {
             case .authExpired?, .codexCLISessionExpired?:
                 let connection = SwiftNativeProviderRouting.displayName(for: provider)
                 let signIn = NativeOAuthFlow.signInControl(providerID: provider, dataRoot: dataRoot)
                 let owner = connection + " (" + provider + ") saved " + (signIn == nil ? "API key" : "sign-in")
                 let tap = signIn ?? "Providers → Accounts & API keys → \(connection) → Manage → Key → Paste the key here → Save"
-                failure = ToolFailureError("\(owner): \(detail). Ask the person to open \(tap).", effects: .none, owner: owner, tap: tap)
+                let instruction = "Ask the person to reconnect at \(tap)."
+                failure = ToolFailureError("provider_auth_expired: \(owner): \(detail). \(instruction)", effects: .none, owner: owner, tap: tap,
+                    code: "provider_auth_expired", instruction: instruction, recovery: .repair)
             case .routingUnavailable?, .modelUnavailable?:
-                let setting = group + (classify(error) == .modelUnavailable ? "_model" : "_account")
+                let setting = group + (cause == .modelUnavailable ? "_model" : "_account")
                 lever = "setting.set:" + setting
+                let code = cause == .modelUnavailable ? "provider_model_unavailable" : "provider_routing_unavailable"
+                let instruction = "Read setting.get \(setting), then use setting.set with a listed value for \(surface)."
                 failure = ToolFailureError(
-                    "\(provider) · \(model): \(detail). \(setting) chooses what \(surface) runs; set it to one this Mac can serve (setting.get \(setting) lists the choices).",
+                    "\(code): \(provider) · \(model): \(detail). \(instruction)",
                     effects: .none, owner: "setting " + setting,
-                    nextCall: ToolFailureError.call("app", ["action": .string("setting.set"), "args": .object(["setting": .string(setting)])]))
+                    nextCall: ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(setting)])]),
+                    code: code, instruction: instruction, recovery: .repair)
             case .contextTooLong?:
                 // Full is not a passing outage: asking again sends the same context.
+                let instruction = "Compact this conversation with app {action:\"chat.compact\"}; repeating it unchanged sends the same full context."
                 return ToolFailureError(
-                    "\(provider) · \(model): the context is full (\(detail)). Asking again sends the same context. Compact this conversation (chat.context_window_mode and chat.compaction_threshold_tokens set where you compact), start a new chat (app chat.new), or choose a model with a larger window in \(group)_model.",
+                    "provider_context_limit: \(provider) · \(model): the context is full (\(detail)). \(instruction)",
                     effects: .none,
-                    nextCall: ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(group + "_model")])]))
+                    nextCall: ToolFailureError.call("app", ["action": .string("chat.compact")]),
+                    code: "provider_context_limit", instruction: instruction, recovery: .repair)
             default:
+                let code: String
+                let instruction: String
+                let status: ToolFailureError.Status
+                switch cause {
+                case .refused?: status = .refused
+                case .noReply?: status = .timeout
+                default: status = (error as? Diagnostic)?.deadlineExpired == true ? .timeout : .failed
+                }
+                switch cause {
+                case .rateLimited(let seconds?)?:
+                    code = "provider_rate_limited"
+                    instruction = "Wait \(seconds) seconds before another request; inspect the selected account and model with setting.get \(group)_model."
+                case .rateLimited(nil)?:
+                    code = "provider_rate_limited"
+                    instruction = "Check the account's usage allowance before another request; no wait time was supplied. Inspect its model choice with setting.get \(group)_model."
+                case .outputLimit?:
+                    code = "provider_output_limit"
+                    instruction = "Keep any partial output and request only the missing portion; inspect model choices with setting.get \(group)_model."
+                case .refused?:
+                    code = "provider_refused"
+                    instruction = "Read the refusal and stop if the request is disallowed; otherwise address the reported concern."
+                case .requestRejected?:
+                    code = "provider_request_rejected"
+                    instruction = "Inspect the rejection and correct the reported request error before another request."
+                case .network?:
+                    code = "provider_network_interrupted"
+                    instruction = "Check this Mac's internet connection in System Settings → Network; preserve any output already received."
+                case .noReply?:
+                    code = "provider_no_reply"
+                    instruction = "Inspect the deadline evidence and preserve any output already received; inspect the selected model with setting.get \(group)_model."
+                case .overloaded?:
+                    code = "provider_overloaded"
+                    instruction = "Wait for provider capacity before another request; inspect model choices with setting.get \(group)_model."
+                default:
+                    code = "provider_response_invalid"
+                    instruction = "Preserve any output already received and inspect the response error before continuing; inspect the selected model with setting.get \(group)_model."
+                }
                 return ToolFailureError(
-                    "\(provider) · \(model) did not answer: \(detail). Nothing is owed: ask again in a moment, or choose another model in \(group)_model.",
-                    effects: .none,
-                    nextCall: ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(group + "_model")])]))
+                    "\(code): \(provider) · \(model) response stopped: \(detail). \(instruction)",
+                    effects: .unknown,
+                    nextCall: cause == .network ? nil : ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(group + "_model")])]),
+                    tap: cause == .network ? "System Settings → Network" : nil,
+                    code: code, status: status,
+                    instruction: instruction, recovery: .inspect)
             }
         }
         if let owner = failure.owner, !failure.personDecides {

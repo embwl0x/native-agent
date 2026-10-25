@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+// Blueprint: | `MemoryStorage+Migrations.swift` | `MemoryStorage.migrator`; registered GRDB schema migrations |
 
 extension MemoryStorage {
     // MARK: - Migrator

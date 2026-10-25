@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 
+// Blueprint: | `ContextStageTrace.swift` | `ContextStageTrace`, stage vocabularies and lifecycle telemetry: bounded context timing, counts and recall/admission trace recording |
+
 /// Closed production vocabulary for stages emitted by bare turn-context
 /// assembly. The replay speed budget imports this type rather than restating
 /// stage strings, while the engine emits these cases directly.
@@ -134,10 +136,6 @@ public enum TurnLifecycleMilestone: String, CaseIterable, Sendable {
     case turnAccepted = "turn.accepted"
     case contextReady = "context.ready"
     case providerRequestStarted = "provider.requestStarted"
-    /// The same provider call, re-issued in place after a recoverable drop.
-    /// Not a new request boundary: the conversation is unchanged (replay) or
-    /// carries only a non-persisted continuation nudge, and no tool re-runs.
-    case providerRetry = "provider.retry"
     case providerFirstDelta = "provider.firstDelta"
     /// The in-flight conversation was trimmed mid-turn to keep fitting the
     /// model's window — either measured over the pressure line before a call,

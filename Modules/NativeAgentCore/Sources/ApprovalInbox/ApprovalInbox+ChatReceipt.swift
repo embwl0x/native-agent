@@ -1,10 +1,13 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Transcripts
+// Blueprint: | `ApprovalInbox+ChatReceipt.swift` | Approval receipt rows and healing order; transcript bytes are written through ContactThread |
 
 extension SwiftNativeApprovalInbox {
     /// One receipt identity per approval, including a healed execution outcome.
-    /// Presentation supplies the already-redacted envelope; the inbox owns IO.
+    /// Presentation supplies the already-redacted envelope; the inbox owns the
+    /// receipt row and ContactThread owns its transcript bytes.
     public func writeChatReceipt(
         approvalID: String, sessionID: String, toolName: String, surface: String,
         summary: String, resultClass: String, resultStatus: String?, ok: Bool?, resultPreview: String?,
@@ -85,7 +88,7 @@ extension SwiftNativeApprovalInbox {
                 if rows[existingIndex] != row {
                     var updated = rows
                     updated[existingIndex] = row
-                    try await persistence.replaceJSONL(updated, to: path)
+                    try ContactThread.replace(updated, to: path)
                 }
             } else if let recoveredAt,
                       let recoveredDate = NativeTimestampFormat.parseISO8601FractionalFirst(recoveredAt),
@@ -100,9 +103,9 @@ extension SwiftNativeApprovalInbox {
                 // before newer turns, under the same lock as ordinary appends.
                 var updated = rows
                 updated.insert(row, at: insertionIndex)
-                try await persistence.replaceJSONL(updated, to: path)
+                try ContactThread.replace(updated, to: path)
             } else {
-                try await persistence.appendJSONL(row, to: path)
+                try await ContactThread.append(row, to: path, using: persistence)
             }
             guard legacyStarted else { return nil }
             if case .string(let date)? = priorObject["createdAt"] { return date }

@@ -1,5 +1,7 @@
 import Cognition
 import Foundation
+
+// Blueprint: | `CognitionObservatoryView+Affect.swift` | Observatory affect presentation: snapshot axes and warmth context distinguish disabled/unavailable evidence from real zero |
 // Move-only extraction (tightness Wave C) from CognitionObservatoryView.swift
 
 import SwiftUI

@@ -1,7 +1,11 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `NativeRegistryEvaluation.swift` | `NativeRegistryEvaluation` enum; `appendBoundedRun` |
 
+/// Live target: improvements/gauntlet/runs.json, a bounded ImprovementGauntletRun
+/// array. Local backup includes it; production export and phone sync exclude it;
+/// support bundles include it and PrivacyMap lists improvements/.
 public enum NativeRegistryEvaluation {
     public static func appendBoundedRun(_ row: JSONValue, to path: URL) async throws {
         let persistence = SwiftNativePersistenceCore()

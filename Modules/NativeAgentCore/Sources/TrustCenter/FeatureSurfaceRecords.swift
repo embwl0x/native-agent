@@ -1,18 +1,11 @@
 import Foundation
 import NativeAgentCore
 
-// MARK: - Feature Surface Records (static literal port)
+// Blueprint: | `FeatureSurfaceRecords.swift` | `FeatureSurfaceRecord` and `featureSurfaceRecords`: feature surface manifest and the app actions that reach each surface |
+
+// MARK: - Feature Surface Records
 //
-// Byte-for-byte port of `NativeAgentRuntime.feature_surface_records()` at
-// the retired daemon (read 2026-05-31). The Python source is
-// a 309-line static list literal of 19 feature dicts; the only runtime
-// value is `updatedAt` (= `now_iso()`), which the Swift caller injects
-// at build time so tests can pin a fixed timestamp.
-//
-// Shape note: each Python dict has the same set of keys. `lastUsedAt` is
-// always `None` in the static literal so the Swift port models it as an
-// optional that's always nil; the field is preserved so JSON output stays
-// byte-equivalent.
+// Current feature surfaces and the app actions that reach them.
 
 public struct FeatureSurfaceRecord: Codable, Sendable, Equatable {
     public var id: String
@@ -48,9 +41,9 @@ public struct FeatureSurfaceRecord: Codable, Sendable, Equatable {
 
 /// Number of static feature surface records. Pinned constant so tests
 /// can assert parity with the Python source without recomputing the list.
-public let featureSurfaceRecordsCount: Int = 19
+public let featureSurfaceRecordsCount: Int = 18
 
-/// Build the 19-entry feature-surface manifest.
+/// Build the 18-entry feature-surface manifest.
 ///
 /// `nowISO` is injected so tests can pin the timestamp (mirrors the Python
 /// `now = now_iso()` line at the retired daemon). Production callers
@@ -71,7 +64,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/command/summary", "/v1/activity", "/v1/missions"]
+            endpoints: ["app mac.activity", "app workshop.status", "app workshop.submit"]
         ),
         FeatureSurfaceRecord(
             id: "feature:mac_assistant_watch_setup",
@@ -87,7 +80,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/mac-assistant/status", "/v1/connectors/actions"]
+            endpoints: []
         ),
         FeatureSurfaceRecord(
             id: "feature:chat_sessions",
@@ -103,7 +96,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/chat", "/v1/chat/sessions", "/v1/chat/messages", "/v1/context/latest"]
+            endpoints: ["app chat.send", "app chat.list", "app chat.search", "app chat.message"]
         ),
         FeatureSurfaceRecord(
             id: "feature:memory_system",
@@ -119,7 +112,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/memory", "/v1/memory/update", "/v1/memory/delete", "/v1/memory/consolidate", "/v1/graph", "/v1/graph/search", "/v1/memory/vector/status"]
+            endpoints: ["app memory.list", "app memory.rewrite", "app memory.forget", "app memory.consolidate", "app graph.search"]
         ),
         FeatureSurfaceRecord(
             id: "feature:personality_engine",
@@ -135,23 +128,23 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/personality", "/v1/personality/docs", "/v1/personality/compiled"]
+            endpoints: ["app persona.set", "app persona.read"]
         ),
         FeatureSurfaceRecord(
             id: "feature:skills",
             sourceId: "skills",
-            name: "Skill routines",
+            name: "Abilities",
             kind: "feature",
             status: "ready",
-            description: "JavaScript routines arrive by trigger with descriptions and signatures; run with skill.run, and request source only for review.",
-            triggers: ["skill", "procedure", "run a skill", "repeatable workflow"],
+            description: "The abilities you grow arrive as their own actions (authored.<id>); read their code with ability.read only for review.",
+            triggers: ["ability", "skill", "procedure", "run a skill", "repeatable workflow"],
             permissions: [],
             riskClass: "routine",
             autoload: false,
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["app skill.list", "app skill.read", "app skill.run", "app skill.save", "app skill.validate", "app skill.enable"]
+            endpoints: ["app ability.list", "app ability.read", "app authored.<id>", "app ability.save", "app ability.validate", "app ability.enable"]
         ),
         FeatureSurfaceRecord(
             id: "feature:runnable_tools",
@@ -159,7 +152,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             name: "Sandboxed Runnable Tools",
             kind: "feature",
             status: "ready",
-            description: "Signed JSON stdin/stdout tools with manifests, validation, tests, sandbox execution, quarantine, and lazy auto-routing.",
+            description: "JavaScript tools share the ability lifecycle, exact admission, ordinary Trust gates and explicit repair obligations.",
             triggers: ["tool", "script", "parse", "convert", "validate", "automate"],
             permissions: ["app_data_read"],
             riskClass: "sandboxed_tool",
@@ -167,7 +160,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/tools", "/v1/tools/propose", "/v1/tools/validate", "/v1/tools/run"]
+            endpoints: ["app ability.list", "app ability.save", "app ability.validate", "app authored.<id>"]
         ),
         FeatureSurfaceRecord(
             id: "feature:capability_foundry",
@@ -175,7 +168,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             name: "Capability Foundry",
             kind: "feature",
             status: "ready",
-            description: "Unified index for feature surfaces, skills, tools, workflows, MCP servers, and catalog packs without loading all bodies into context.",
+            description: "Unified index for feature surfaces, skills, tools, workflows, and catalog packs without loading all bodies into context.",
             triggers: ["capability", "what can you do", "feature", "tool list", "skill list"],
             permissions: [],
             riskClass: "read_only",
@@ -183,7 +176,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/capabilities", "/v1/agent/map"]
+            endpoints: ["app capabilities.lookup"]
         ),
         FeatureSurfaceRecord(
             id: "feature:proactive_autonomy",
@@ -199,7 +192,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/proactive/summary", "/v1/proactive/scan", "/v1/proactive/goals", "/v1/proactive/outcome", "/v1/inbox"]
+            endpoints: []
         ),
         FeatureSurfaceRecord(
             id: "feature:workflows",
@@ -215,7 +208,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/workflows", "/v1/workflows/run", "/v1/workflows/resume", "/v1/workflows/cancel", "/v1/workflows/rollback", "/v1/approvals"]
+            endpoints: []
         ),
         FeatureSurfaceRecord(
             id: "feature:agent_swarm",
@@ -231,23 +224,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/agent/swarms", "/v1/agent/swarms/run"]
-        ),
-        FeatureSurfaceRecord(
-            id: "feature:mcp_runtime",
-            sourceId: "mcp_runtime",
-            name: "MCP Runtime",
-            kind: "feature",
-            status: "ready",
-            description: "Internal, stdio, and HTTP MCP discovery/invocation with session warming and consent ledger.",
-            triggers: ["mcp", "server", "resource", "tool call", "connector tool"],
-            permissions: ["network_localhost"],
-            riskClass: "consent_gated",
-            autoload: false,
-            useCount: 0,
-            lastUsedAt: nil,
-            updatedAt: nowISO,
-            endpoints: ["/v1/mcp/servers", "/v1/mcp/tools", "/v1/mcp/tools/call", "/v1/mcp/sessions", "/v1/mcp/consent"]
+            endpoints: ["app agent.swarm"]
         ),
         FeatureSurfaceRecord(
             id: "feature:research_browser",
@@ -263,7 +240,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/research/lab/run", "/v1/research/fetch", "/v1/browser/status", "/v1/browser/run"]
+            endpoints: ["app web.search", "app web.read", "app browser.status", "app browser.open", "app browser.text", "app browser.links"]
         ),
         FeatureSurfaceRecord(
             id: "feature:connectors",
@@ -271,20 +248,20 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             name: "Connector Registry and Actions",
             kind: "feature",
             status: "ready",
-            description: "Telegram, SearXNG, local files, native surfaces, GitHub, email, and calendar connector records with safe dry-run action receipts.",
-            triggers: ["connector", "telegram", "github", "calendar", "email", "workspace", "local files"],
+            description: "Telegram, SearXNG, local files, native surfaces, email, and calendar connector records with safe dry-run action receipts.",
+            triggers: ["connector", "telegram", "calendar", "email", "workspace", "local files"],
             permissions: ["network", "workspace_read"],
             riskClass: "approval_gated",
             autoload: false,
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/connectors", "/v1/connectors/actions", "/v1/connectors/actions/run", "/v1/connectors/workspaces"]
+            endpoints: []
         ),
         FeatureSurfaceRecord(
             id: "feature:trust_doctor",
             sourceId: "trust_doctor",
-            name: "Trust Center and Doctor",
+            name: "Trust and Doctor",
             kind: "feature",
             status: "ready",
             description: "Policy simulation, backups, provider repair, SearXNG autodetect, OAuth browser login, support diagnostics, and release checks.",
@@ -295,7 +272,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/doctor", "/v1/trust", "/v1/trust/simulate", "/v1/backups", "/v1/support/diagnostics", "/v1/auth/login/browser"]
+            endpoints: ["app doctor.run", "app setting.get", "app setting.set", "app backup.now", "app doctor.support_report", "app provider.sign_in"]
         ),
         FeatureSurfaceRecord(
             id: "feature:auto_improvement",
@@ -311,7 +288,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/improvements/summary", "/v1/improvements", "/v1/improvements/recurring", "/v1/improvements/gauntlet", "/v1/improvements/gauntlet/run"]
+            endpoints: []
         ),
         FeatureSurfaceRecord(
             id: "feature:nextgen_runtime",
@@ -327,7 +304,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/nextgen/summary", "/v1/nextgen/phases", "/v1/nextgen/action", "/v1/context/preview", "/v1/context/lookup"]
+            endpoints: ["app capabilities.lookup"]
         ),
         FeatureSurfaceRecord(
             id: "feature:native_mac_power",
@@ -343,7 +320,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/native-power", "/v1/native-actions", "/v1/native/intents", "/v1/notifications/status"]
+            endpoints: []
         ),
         FeatureSurfaceRecord(
             id: "feature:eval_release_ops",
@@ -359,7 +336,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/evals/run", "/v1/release/checklist", "/v1/watchdog", "/v1/traces", "/v1/production/export"]
+            endpoints: ["app trace.recent", "app export.bundle"]
         ),
     ]
 }

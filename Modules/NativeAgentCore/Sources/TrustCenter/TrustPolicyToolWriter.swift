@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `TrustPolicyToolWriter.swift` | `TrustPolicyToolWriter` enum; `applyTrustPolicyPatch` |
 
 public enum TrustPolicyToolWriter {
     public static func applyTrustPolicyPatch(

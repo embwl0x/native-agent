@@ -4,6 +4,7 @@ import Cognition
 import PersistenceCore
 import Desk
 import WorkshopExecution
+// Blueprint: | `WorkshopPumpLoopRunner.swift` | `WorkshopPumpLoopRunner` struct; `physiologyEvents`, `nextMeaningfulDeadline` |
 
 public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
     public let loopId = "workshop_pump"
@@ -52,8 +53,6 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
             return .skipped(reason: "organism posture unavailable")
         case .postureNotNormal:
             return .skipped(reason: "organism posture not normal")
-        case .resourcePressure:
-            return .skipped(reason: "resource pressure")
         case .quiet:
             return unknown.isEmpty ? .skipped(reason: "nothing due") : .failed(error: "nothing else due" + unknown)
         case .unavailable(let cause):

@@ -1,4 +1,5 @@
 import Foundation
+import PersistenceCore
 import ProviderRouting
 import ApprovalInbox
 import Desk
@@ -6,6 +7,7 @@ import MemoryV2
 import NativeAgentShared
 import NotificationInbox
 import Transcripts
+// Blueprint: | `DeviceSyncHost.swift` | Engine snapshot/action seam; transcript timestamps bound read-only other-room exchanges to shown history; message owners omit previews for transport budgets |
 
 /// Snapshot rows whose type the app's mirrors still own. Device sync only
 /// encodes them, with the snapshot encoder, so the phone's bytes are the app
@@ -13,10 +15,12 @@ import Transcripts
 public typealias DeviceSyncSnapshotRows = any Encodable & Sendable
 
 /// One transcript row as the phone reads it. The app's chat model supplies the
-/// bytes; the snapshot only trims its content.
+/// bytes; transport budgets can trim content and omit optional previews.
 public protocol DeviceSyncTranscriptMessage: Encodable {
     var id: String { get }
+    var createdAt: String { get }
     var content: String { get set }
+    mutating func omitAttachmentPreviews()
     /// False for a row that is hers alone (her wake inputs): the phone's view
     /// of the conversation omits it, though it still anchors history paging.
     var isPersonVisible: Bool { get }
@@ -64,8 +68,12 @@ public protocol DeviceSyncHost: Sendable {
         approvals: Result<[ApprovalRequest], Error>, inbox: Result<[InboxItemRecord], Error>
     )
     func getChatSessions() async throws -> [NativeAgentShared.ChatSession]
+    @MainActor func sessionNavigation(for sessions: [NativeAgentShared.ChatSession]) -> ChatSessionNavigation
+    @MainActor func surfaceLayout() -> SurfaceLayout
     func getChatMessages(sessionId: String) async throws -> [any DeviceSyncTranscriptMessage & Sendable]
+    func getOtherRoomExchanges() async throws -> [OtherRoomExchange]
     func getHealth() async throws -> RuntimeHealth
+    func turnSummariesSnapshotData() async -> Data?
     func pendingMemoryProposals() async throws -> DeviceSyncSnapshotRows
     func getSkills() async throws -> DeviceSyncSnapshotRows
     func activeMemories() async throws -> [MemoryV2.MemoryRecord]
@@ -74,12 +82,14 @@ public protocol DeviceSyncHost: Sendable {
     func providers() async throws -> DeviceSyncSnapshotRows
     func providerCatalogSnapshot() async throws -> (providers: [NAProviderCatalogProvider], routing: ProviderRoutingSnapshot)
     func trustSnapshotData() async throws -> Data
+    func macIntegrationPermissionsSnapshot() async throws -> [String: [String: Bool]]
     func telegramSnapshot() async throws -> MobileTelegramSnapshot
     func changeTelegram(_ change: MobileTelegramChange) async throws -> MobileTelegramSnapshot
     func getPersonality() async throws -> PersonalityProfile
     func knowledgeGraphSnapshotData() async throws -> Data
     func getRunsStrict() async -> [RunRecord]?
     // The phone's signed actions.
+    func schedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue
     /// The Mac's settings registry: every row as its page reads it, and one
     /// row set through the write its page control calls.
     @MainActor func appSettings() async throws -> [MobileAppSetting]
@@ -96,7 +106,7 @@ public protocol DeviceSyncHost: Sendable {
     func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord
     func inboxAction(_ id: String, action: String) async throws
     @MainActor func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String]
-    func cancelChatSession(sessionId: String) async throws
+    func cancelChatSession(sessionId: String, runIDs: [String]) async throws
     func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String?) async throws
     @MainActor func startProviderSignIn(_ id: String, requestID: String) -> [String: String]
     @MainActor func providerSignInStates() -> [String: [String: String]]

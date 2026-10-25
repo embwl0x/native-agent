@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+// Blueprint: | `Owed.swift` | `Owed`: what they owes or is owed under the id its owner hands their (a reply's delivery id, a card's `interaction:<id>`), born owing one key and moved only by that owner at its persistence boundary, so desk.wait and repair.let_go read one experience |
 
 /// Something she owes or is owed, under the id its owner hands her (a reply's
 /// delivery id, a card's `interaction:<id>`): born owing `key` to `to` the

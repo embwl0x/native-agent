@@ -1,6 +1,7 @@
 import AppToolRuntime
-import ChatOrchestration
 import SwiftUI
+
+// Blueprint: | `ShellSidebarRail.swift` | `ShellSidebarRail`: canonical rail item presentation, selection and focus-ring rendering |
 
 // ui-simplify 2026-09-02 (Lane A): the rail.
 //
@@ -122,6 +123,7 @@ struct ShellRailFocusRing: View {
 /// Quiet groups on a floating glass plate, as the layout orders them, with
 /// the last (Settings, as seeded) at the foot.
 struct ShellSidebarRail: View {
+    @Environment(AppModel.self) private var appModel
     @Binding var selection: SidebarItem
     /// The places that have something waiting on him. A dot, never a count —
     /// the caller does the counting and this rail only says whether.
@@ -136,7 +138,7 @@ struct ShellSidebarRail: View {
     var body: some View {
         // Every row but the last renders at the top; the last is pushed to the
         // bottom, so the setup door is never mistaken for a place to work.
-        let rail = SidebarItem.rail(SurfaceLayoutLive.shared.layout)
+        let rail = SidebarItem.rail(appModel.engine.layout.layout)
         VStack(spacing: 4) {
             ForEach(rail.dropLast(), id: \.self) { row(item: $0) }
             Spacer(minLength: 8)

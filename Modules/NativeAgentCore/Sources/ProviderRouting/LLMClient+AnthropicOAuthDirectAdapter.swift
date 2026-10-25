@@ -3,6 +3,7 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+// Blueprint: | `LLMClient+AnthropicOAuthDirectAdapter.swift` | `AnthropicOAuthDirectAdapter`: `requestMaxTokens`, `clearAtBeta`, `installedClaudeCodeVersion`; indexed content-block validation shared by OAuth text and Anthropic native-tool streams, keeping text/thinking/signature/tool deltas on their own blocks |
 
 /// Optional effect-time admission carried through an unattended adapter call.
 /// Ordinary chat leaves this nil. Throws propagate without transport remapping.
@@ -45,10 +46,10 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     public init(
         session: URLSession = AnthropicOAuthDirectAdapter.productionSession,
         endpoint: URL = URL(string: "https://api.anthropic.com/v1/messages")!,
-        refreshEndpoint: URL = URL(string: "https://platform.claude.com/v1/oauth/token")!,
+        refreshEndpoint: URL = URL(string: ProviderOAuthConfig.anthropic.tokenEndpoint)!,
         authPathOverride: URL? = nil,
         maxTokens: Int? = nil,
-        clientID: String = "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        clientID: String = ProviderOAuthConfig.anthropic.clientId,
         telemetryDataRootOverride: URL? = nil
     ) {
         self.session = session
@@ -114,10 +115,6 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         return found.compactMap { v in parts(v).map { (v, $0) } }
             .max { $0.1.lexicographicallyPrecedes($1.1) }?.0
     }
-    /// Refresh proactively when the token has less than this many seconds
-    /// of life left. Mirrors OpenAI adapter's 120s buffer.
-    static let tokenExpiryBufferSec: TimeInterval = 120
-
     static func makeProductionSession(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URLSession {
@@ -521,9 +518,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             let bytes: URLSession.AsyncBytes
             let response: URLResponse
             do {
-                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-                (bytes, response) = try await session.bytes(for: req)
-                if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
+                (bytes, response) = try await ProviderWire.open(session, req)
             } catch {
                 throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "stream"))
             }
@@ -733,9 +728,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             let bytes: URLSession.AsyncBytes
             let response: URLResponse
             do {
-                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-                (bytes, response) = try await session.bytes(for: req)
-                if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
+                (bytes, response) = try await ProviderWire.open(session, req)
             } catch {
                 throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
             }
@@ -794,7 +787,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             cacheMarkers: Self.cacheMarkers(in: body),
                             stopReason: lastStopReason
                         )
-                        if lastStopReason == "max_tokens" {
+                        if LLMToolBoundaryReason(stopReason: lastStopReason) == .outputLimit {
                             Self.logCutoffShape(runaway.text)
                             RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
                             continuation.yield(.toolBoundary(.outputLimit))
@@ -809,7 +802,9 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             )
                         }
                         Self.logStopWithoutToolCall(lastStopReason, runaway.text)
-                        if let reason = runaway.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
+                        if let reason = LLMToolBoundaryReason(stopReason: lastStopReason) ?? runaway.toolBoundaryReason {
+                            continuation.yield(.toolBoundary(reason))
+                        }
                         continuation.finish()
                         return
                     case "content_block_start":
@@ -897,7 +892,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
 
     /// Return a fresh access token, refreshing through the shared serial
     /// actor if the on-disk `expires_at` is within
-    /// `tokenExpiryBufferSec` of now (or in the past), or if forceRefresh
+    /// the shared renewal margin of now (or in the past), or if forceRefresh
     /// is set. Mirrors OpenAIOAuthDirectAdapter.ensureFreshAccessToken.
     func ensureFreshAccessToken(
         forceRefresh: Bool = false,
@@ -913,7 +908,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // Fast path — no refresh needed.
         if !forceRefresh, let (token, exp) = Self.accessTokenAndExpiry(in: object) {
             if let exp = exp {
-                if exp.timeIntervalSinceNow > Self.tokenExpiryBufferSec {
+                if exp.timeIntervalSinceNow > NativeOAuthSupport.renewalMargin {
                     return token
                 }
                 // Else fall through to refresh.
@@ -946,23 +941,13 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 return token
             }
             if !forceRefresh, let (token, exp) = Self.accessTokenAndExpiry(in: object) {
-                if let exp = exp, exp.timeIntervalSinceNow > Self.tokenExpiryBufferSec {
+                if let exp = exp, exp.timeIntervalSinceNow > NativeOAuthSupport.renewalMargin {
                     return token
                 }
                 if exp == nil { return token }
             }
             return try await self.refreshTokens(requestAccount: requestAccount)
         }
-    }
-
-    /// Read `(access_token, expires_at)` from the JSON. Returns nil if the
-    /// file is missing/unparseable or has no token. `expires_at` is
-    /// optional — long-lived setup_tokens omit it.
-    static func loadAccessTokenAndExpiry(from path: URL) -> (String, Date?)? {
-        guard let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
-        return accessTokenAndExpiry(in: obj)
     }
 
     private static func accessTokenAndExpiry(in obj: [String: Any]) -> (String, Date?)? {
@@ -978,46 +963,33 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     /// Can the credential in `auth` (this adapter's auth file, parsed) serve a
     /// call? Answered by the rules `ensureFreshAccessToken` itself applies: a
     /// token `loadAccessTokenAndExpiry` reads, used as-is when it carries no
-    /// expiry or has more than `tokenExpiryBufferSec` left, and otherwise a
+    /// expiry or has more than the shared renewal margin left, and otherwise a
     /// `refresh_token` that `refreshTokens` can spend. Routing readiness and
     /// the Providers page ask this, so neither reports signed in for a file
     /// the adapter refuses — a bare `setup_token` key, for one (the app saves
     /// a setup token as `access_token`).
-    public static func credentialStatus(_ auth: [String: Any]?) -> (usable: Bool, detail: String) {
-        guard let auth else { return (false, "anthropic_oauth_direct.json missing or malformed") }
-        let tokens = OAuthRefreshBinding.tokenSet(auth, provider: "anthropic_oauth_direct")
+    public static func credentialStatus(_ auth: [String: Any]?) -> (usable: Bool, detail: String, health: OAuthCredentialHealth) {
+        let object = auth ?? [:]
+        let tokens = OAuthRefreshBinding.tokenSet(object, provider: "anthropic_oauth_direct")
         let canRefresh = OAuthRefreshBinding.string(tokens["refresh_token"]) != nil
-            && OAuthRefreshBinding.permitsRefresh(auth, provider: "anthropic_oauth_direct")
-        guard let (_, expiry) = accessTokenAndExpiry(in: auth) else {
-            return canRefresh
-                ? (true, "No access_token - refresh on next chat")
-                : (false, "no access_token - sign in required")
-        }
-        guard let expiry else { return (true, "Signed in") }
-        if expiry.timeIntervalSinceNow > tokenExpiryBufferSec { return (true, "Signed in (valid)") }
-        return canRefresh
-            ? (true, "Access expired - refresh on next chat")
-            : (false, "Access expired and no refresh_token - re-auth required")
-    }
-
-    /// Instance shim used by older call paths / tests.
-    private func loadAccessToken() throws -> String {
-        try Self.loadAccessToken(from: resolveAuthPath())
-    }
-
-    static func loadAccessToken(from path: URL) throws -> String {
-        guard let (token, _) = loadAccessTokenAndExpiry(from: path) else {
-            throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
-        }
-        return token
+            && OAuthRefreshBinding.permitsRefresh(object, provider: "anthropic_oauth_direct")
+        let token = accessTokenAndExpiry(in: object)
+        let expiry = token?.1
+        let fresh = token != nil && (expiry.map { $0.timeIntervalSinceNow > NativeOAuthSupport.renewalMargin } ?? true)
+        let usable = fresh || canRefresh
+        let detail = auth == nil ? "anthropic_oauth_direct.json missing or malformed"
+            : token == nil ? (canRefresh ? "No access_token - refresh on next chat" : "no access_token - sign in required")
+            : fresh ? (expiry == nil ? "Signed in" : "Signed in (valid)")
+            : canRefresh ? "Access expired - refresh on next chat" : "Access expired and no refresh_token - re-auth required"
+        return (usable, detail, OAuthCredentialHealth(configured: usable, expiresAt: expiry,
+            canRefresh: canRefresh, requiresRefresh: !fresh))
     }
 
     // MARK: - Token refresh
 
     /// POST to the OAuth refresh endpoint, persist the rotated tokens
-    /// (atomically, 0600), return the new access token. On non-2xx the
-    /// caller sees `.notConfigured` — the api-key adapter chain will then
-    /// take over (and likely also throw, but with the right error shape).
+    /// (atomically, 0600), return the new access token. Refresh failures are
+    /// classified and thrown through this selected OAuth provider's route.
     @discardableResult
     func refreshTokens(requestAccount: OAuthRequestAccount = OAuthRequestAccount()) async throws -> String {
         let path = resolveAuthPath()
@@ -1034,25 +1006,14 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         }
 
         try OAuthRefreshBinding.requireRefresh(obj, provider: "anthropic_oauth_direct")
-        let body: [String: Any] = [
+        let body: [String: String] = [
             "grant_type":    "refresh_token",
             "refresh_token": refreshToken,
             "client_id":     clientID,
         ]
-        var req = URLRequest(url: refreshEndpoint)
-        req.httpMethod = "POST"
-        // User, 2026-09-06: the refresh holds the shared serial refresh actor,
-        // so it needs a bound of its own rather than the session's chat-sized
-        // request timeout — a hung token endpoint otherwise blocks every later
-        // turn's token read for minutes.
-        req.timeoutInterval = 30
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-
         let (rdata, response): (Data, URLResponse)
         do {
-            (rdata, response) = try await session.data(for: req)
+            (rdata, response) = try await NativeOAuthSupport.post(refreshEndpoint, body, json: true, timeout: 30, session: session)
         } catch {
             throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: refreshEndpoint, operation: "refresh"))
         }
@@ -1184,7 +1145,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         return newAccess
     }
 
-    /// Atomic 0600 write. Same pattern as NativeOAuthFlow.writeJSONObject.
+    /// Private durable commit; the caller retains its credential lock.
     private func saveAuthBlob(_ blob: [String: Any], to path: URL) throws {
         try FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(),
@@ -1194,19 +1155,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             withJSONObject: blob,
             options: [.prettyPrinted, .sortedKeys]
         )
-        let tmp = path.appendingPathExtension("tmp-\(UUID().uuidString)")
-        try data.write(to: tmp, options: .atomic)
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: tmp.path
-        )
-        if FileManager.default.fileExists(atPath: path.path) {
-            _ = try FileManager.default.replaceItemAt(path, withItemAt: tmp)
-        } else {
-            try FileManager.default.moveItem(at: tmp, to: path)
-        }
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: path.path
-        )
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
     }
 }
 

@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `TranscriptSearch.swift` | `TranscriptSearchDocument`, `TranscriptSearchResult`, `TranscriptSearchResponse`, `TranscriptSearch` |
 
 /// A rebuildable projection over an already loaded transcript.
 /// JSONL remains authoritative: this type writes no sidecar index and

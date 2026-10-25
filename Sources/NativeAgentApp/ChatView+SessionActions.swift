@@ -1,9 +1,9 @@
 import EngineRuntime
 import Transcripts
-import ChatOrchestration
 import Foundation
 import SwiftUI
 import MultimodalTTS
+// Blueprint: | `ChatView+SessionActions.swift` | `ChatView`: `showToast`, `rename`, `renameActiveChatTitle` |
 
 extension VoiceOutputController {
     static func forChat() -> VoiceOutputController {

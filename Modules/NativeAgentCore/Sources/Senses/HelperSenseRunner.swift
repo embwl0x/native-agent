@@ -4,6 +4,7 @@ import CryptoKit
 import Darwin
 import PersistenceCore
 import NativeAgentCore
+// Blueprint: | `HelperSenseRunner.swift` | Isolated plug supervision with validated progress-based stall detection excluding app-served reply waits, read-to-watch idle holds, subscription-owned lifetime and restarts; source callbacks keep newest material and signal EnginePartWake for unattended interpretation, fenced by helper generation; canonical sense disable/replacement retires only that selected lifetime's passive helpers (including unattended on-call wakes) and pending admissions; late retirement and failure reporting cannot affect a replacement, and availability reports rejected by the registry post no news, while sense-identified accepted human on-call work settles with its requesting owner; notebook access delegates to AbilityStore; versioned use and visible live failure news, sealed view events, detached site following and app change deduplication/news; app reads use assembly's Trust-admitted read closure |
 
 /// One sandboxed helper per live sense/source; on-call helpers are discarded after
 /// their answer. Only a caller's act request can reach the installed door.
@@ -20,6 +21,7 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
 
     private struct Live {
         let record: SenseRecord
+        let selection: String
         var source: any SenseSourceProvider
         var process: SenseHelperProcess?
         var generation: UUID
@@ -31,19 +33,26 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
     }
 
     private let dataRoot: URL
+    private let fileRegistry: FileSenseRegistry
     private let helperURL: URL
     private let profile: SandboxProfile
     private let limits: Limits
     private let apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)?
-    private let notebooks = PartNotebooks.shared
     private var live: [String: Live] = [:]
-    private var onCall: [UUID: SenseHelperProcess] = [:]
-    private var viewAddresses: [String: (version: Int, address: String?)] = [:]
+    private struct Call {
+        let selection: String
+        let passive: Bool
+        let process: SenseHelperProcess
+    }
+    private var onCall: [UUID: Call] = [:]
+    private var admissions: [UUID: String] = [:]
+    private var viewAddresses: [String: (selection: String, address: String?)] = [:]
     private var shutDown = false
 
     public init(dataRoot: URL, helperURL: URL, sandboxProfile: @escaping SandboxProfile,
                 limits: Limits = Limits(), apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)? = nil) {
         self.dataRoot = dataRoot.standardizedFileURL.resolvingSymlinksInPath()
+        self.fileRegistry = FileSenseRegistry(dataRoot: dataRoot)
         self.helperURL = helperURL
         self.profile = sandboxProfile
         self.limits = limits
@@ -65,7 +74,6 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
             return .failed(SenseFailure(code: "unavailable", message: "Sense runner has shut down.", provenance: provenance))
         }
         if record.status == .off {
-            await stop(record.id)
             return .failed(SenseFailure(code: "disabled", message: "Sense is off.", provenance: provenance))
         }
         if record.status == .unavailable {
@@ -80,7 +88,6 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
             return .failed(SenseFailure(code: "cancelled", message: "Sense request cancelled.", provenance: provenance))
         }
         if record.language == .native {
-            await stop(record.id)
             guard let sense = NativeSenseCatalog.shared.sense(id: record.id) else {
                 return .failed(SenseFailure(code: "unsupported", message: "Native sense is not registered.", provenance: provenance))
             }
@@ -90,26 +97,32 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
             }
             return await complete(outcome, record: record, request: request)
         }
+        var selected: String?
         do {
+            let selection = try fileRegistry.helperSelection(record)
+            selected = selection
             try requireHelper()
             let process: SenseHelperProcess
             let callID = UUID()
+            admissions[callID] = selection
+            defer { admissions.removeValue(forKey: callID) }
             let address: String? = switch request {
             case .read(let address): address
             case .act(_, let address, _): address
             case .watch: nil
             }
-            let key = try await slotKey(record, source: source, address: address)
+            let key = try await slotKey(record, selection: selection, source: source, address: address)
+            if record.status == .on, let registry = SensesHub.shared.registry {
+                guard let current = try await registry.sense(for: record.corner),
+                      current.status == .on, try fileRegistry.helperSelection(current) == selection else {
+                    throw CancellationError()
+                }
+            }
+            try requireRunning()
+            try Task.checkCancellation()
+            guard admissions[callID] == selection else { throw CancellationError() }
             let generation: UUID
             if record.mode == .live {
-                try Task.checkCancellation()
-                if let previous = live[key],
-                   previous.record.version != record.version || previous.record.entry != record.entry
-                    || previous.record.reach != record.reach || previous.record.status != record.status
-                    || previous.record.language != record.language || previous.record.corner != record.corner {
-                    await stopSlot(key)
-                }
-                try Task.checkCancellation()
                 if let slot = live[key], let existing = slot.process {
                     generation = slot.generation
                     if case .site = record.corner {
@@ -123,7 +136,7 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
                 } else {
                     generation = UUID()
                     let created = try makeProcess(record, key: key, generation: generation, address: address)
-                    live[key] = Live(record: record, source: source, process: created,
+                    live[key] = Live(record: record, selection: selection, source: source, process: created,
                         generation: generation, failures: live[key]?.failures ?? [], address: address, idleAt: Date().addingTimeInterval(limits.idleSeconds))
                     armIdle(key)
                     process = created
@@ -131,7 +144,7 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
             } else {
                 generation = UUID()
                 process = try makeProcess(record, key: key, generation: generation, address: address)
-                onCall[callID] = process
+                onCall[callID] = Call(selection: selection, passive: SensesHub.passiveObservation, process: process)
             }
             let outcome: SenseOutcome
             if record.mode == .live, request != .watch {
@@ -141,8 +154,8 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
                     live[key]?.following = result.following
                     armIdle(key)
                 }
-                if let failure = result.watchFailure {
-                    _ = await complete(.failed(failure), record: record, request: .watch)
+                if let failure = result.watchFailure, !shutDown, admissions[callID] == selection {
+                    _ = await complete(.failed(failure), record: record, request: .watch, selection: selection)
                     if record.status == .on {
                         await SenseNewsBoard.shared.post(SenseNews(senseID: record.id, version: record.version,
                             address: address ?? record.corner.key,
@@ -152,44 +165,43 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
             } else {
                 outcome = await process.request(request, source: source, perform: SenseActionContext.perform)
             }
+            if record.mode == .onCall {
+                await process.stop()
+                onCall.removeValue(forKey: callID)
+            }
             if let view = await SenseNewsBoard.shared.interactiveView(), view.senseID == record.id, view.version == record.version {
-                if !Task.isCancelled {
-                    viewAddresses[record.id] = (record.version, address)
+                if !shutDown, !Task.isCancelled, admissions[callID] == selection {
+                    viewAddresses[record.id] = (selection, address)
                 }
             }
-            if record.mode == .onCall {
-                onCall.removeValue(forKey: callID)
-                await process.stop()
-            }
-            return await complete(outcome, record: record, request: request)
+            return await complete(outcome, record: record, request: request, selection: selection)
         } catch {
-            return await complete(.failed(Self.failure(error, provenance: provenance)), record: record, request: request)
+            return await complete(.failed(Self.failure(error, provenance: provenance)), record: record, request: request, selection: selected)
         }
     }
 
-    private func complete(_ outcome: SenseOutcome, record: SenseRecord, request: SenseRequest) async -> SenseOutcome {
+    private func complete(_ outcome: SenseOutcome, record: SenseRecord, request: SenseRequest, selection: String? = nil) async -> SenseOutcome {
         guard !Task.isCancelled else {
             return .failed(SenseFailure(code: "cancelled", message: "Sense request cancelled.", provenance: SenseProvenance(record: record)))
         }
+        guard !shutDown else {
+            return .failed(SenseFailure(code: "unavailable", message: "Sense runner has shut down.", provenance: SenseProvenance(record: record)))
+        }
         var outcome = Self.attributed(outcome, to: record)
-        if case .failed(let failure) = outcome,
+        if let selection, case .failed(let failure) = outcome,
            ["helper_missing", "helper_not_executable", "spawn_failed"].contains(failure.code)
             || (record.mode == .onCall && ["crashed", "resource_limit", "timeout", "bad_output"].contains(failure.code)) {
-            await unavailable(record, failure: failure)
+            await unavailable(record, selection: selection, failure: failure)
         }
         if case .page(var page, var provenance) = outcome {
             guard page.text.utf8.count <= NativePage.maximumTextBytes else {
-                return await complete(.failed(SenseFailure(code: "bad_output", message: "Sense page exceeds the text ceiling; fold it and offer more.")), record: record, request: request)
+                return await complete(.failed(SenseFailure(code: "bad_output", message: "Sense page exceeds the text ceiling; fold it and offer more.")), record: record, request: request, selection: selection)
             }
             if record.status == .on, !record.verbsEnabled { for i in page.things.indices { page.things[i].verbs = [] } }
             if case .read = request, record.status == .on, let registry = SensesHub.shared.registry,
                (try? AbilityStore(dataRoot: dataRoot).read(id: record.id)) == nil {
-                if let managing = registry as? any SenseRegistryManaging {
-                    do {
-                        try await managing.recordUse(senseID: record.id, version: record.version)
-                    }
-                    catch { return .failed(Self.failure(error, provenance: provenance)) }
-                } else { await registry.recordUse(senseID: record.id) }
+                do { try await registry.recordUse(senseID: record.id, version: record.version) }
+                catch { return .failed(Self.failure(error, provenance: provenance)) }
                 provenance.uses += 1
             }
             outcome = .page(page, provenance)
@@ -199,45 +211,63 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
 
     public func receiveViewEvent(_ event: JSONValue, for record: SenseRecord,
                                  source: any SenseSourceProvider) async throws {
+        var selected: String?
         do {
-            guard !shutDown, record.language != .native, let registry = SensesHub.shared.registry,
-                  let current = try await registry.sense(for: record.corner), current.id == record.id,
-                  current.version == record.version, current.status == .on,
+            let unavailable = SenseFailure(code: "view_unavailable", message: "Sense view is no longer enabled or its event is too large.")
+            let selection = try fileRegistry.helperSelection(record)
+            selected = selection
+            let token = UUID()
+            admissions[token] = selection
+            defer { admissions.removeValue(forKey: token) }
+            guard !shutDown, record.language != .native, let registry = SensesHub.shared.registry else { throw unavailable }
+            guard let current = try await registry.sense(for: record.corner), !shutDown,
+                  current.status == .on, try fileRegistry.helperSelection(current) == selection,
                   try JSONEncoder().encode(event).count <= 16_384 else {
-                throw SenseFailure(code: "view_unavailable", message: "Sense view is no longer enabled or its event is too large.")
+                throw unavailable
             }
             try requireHelper()
             let process: SenseHelperProcess
-            let token = UUID()
-            let address = viewAddresses[record.id].flatMap { $0.version == record.version ? $0.address : nil }
-            let key = try await slotKey(record, source: source, address: address)
-            if let existing = live[key]?.process, live[key]?.record.version == record.version {
+            let address = viewAddresses[record.id].flatMap { $0.selection == selection ? $0.address : nil }
+            let key = try await slotKey(record, selection: selection, source: source, address: address)
+            try requireRunning()
+            try Task.checkCancellation()
+            guard admissions[token] == selection else { throw CancellationError() }
+            if let existing = live[key]?.process {
                 process = existing
             } else if record.mode == .live {
                 // A resident sense keeps the slot an event wakes, with its context.
-                await stopSlot(key)
+                live[key]?.idle?.cancel()
                 let generation = UUID()
                 process = try makeProcess(record, key: key, generation: generation, address: address)
-                live[key] = Live(record: record, source: source, process: process, generation: generation,
+                live[key] = Live(record: record, selection: selection, source: source, process: process, generation: generation,
                                  failures: [], address: address, idleAt: Date().addingTimeInterval(limits.idleSeconds))
                 armIdle(key)
             } else {
                 process = try makeProcess(record, key: key, generation: UUID(), address: address)
-                onCall[token] = process
+                onCall[token] = Call(selection: selection, passive: SensesHub.passiveObservation, process: process)
             }
             let outcome = await SenseActionContext.$perform.withValue(nil) {
                 await process.viewEvent(event, source: source)
             }
-            if onCall.removeValue(forKey: token) != nil { await process.stop() }
+            if onCall[token] != nil { await process.stop(); onCall.removeValue(forKey: token) }
             if case .failed(let failure) = outcome { throw failure }
         } catch {
-            let outcome = await complete(.failed(Self.failure(error, provenance: SenseProvenance(record: record))), record: record, request: .watch)
+            let outcome = await complete(.failed(Self.failure(error, provenance: SenseProvenance(record: record))), record: record, request: .watch, selection: selected)
             if case .failed(let failure) = outcome { throw failure }
         }
     }
 
-    public func stop(_ senseID: String) async {
-        for key in live.keys.filter({ live[$0]?.record.id == senseID }) { await stopSlot(key) }
+    func retire(selection: String) async {
+        admissions = admissions.filter { $0.value != selection }
+        viewAddresses = viewAddresses.filter { $0.value.selection != selection }
+        // Close admission and detach all passive resources before the first await.
+        let slots = live.filter { $0.value.selection == selection }
+        for (key, slot) in slots { live.removeValue(forKey: key); slot.idle?.cancel() }
+        let calls = onCall.filter { $0.value.selection == selection && $0.value.passive }
+        for (id, _) in calls { onCall.removeValue(forKey: id) }
+        // Accepted human reads/actions keep their call-owned helper until settlement.
+        for slot in slots.values { await slot.process?.stop() }
+        for call in calls.values { await call.process.stop() }
     }
 
     private func stopSlot(_ key: String) async {
@@ -248,22 +278,29 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
 
     public func shutdown() async {
         shutDown = true
+        admissions.removeAll()
         viewAddresses.removeAll()
         for key in Array(live.keys) { await stopSlot(key) }
         let active = Array(onCall.values)
         onCall.removeAll()
-        for process in active { await process.stop() }
+        for call in active { await call.process.stop() }
     }
 
-    private func slotKey(_ record: SenseRecord, source: any SenseSourceProvider, address: String?) async throws -> String {
+    private func requireRunning() throws {
+        guard !shutDown else { throw SenseFailure(code: "unavailable", message: "Sense runner has shut down.") }
+    }
+
+    private func slotKey(_ record: SenseRecord, selection: String, source: any SenseSourceProvider, address: String?) async throws -> String {
         let identity: String
         if case .fileKind = record.corner, case .file(let path, _, _) = try await source.material(for: record.corner, address: address) {
             identity = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
         } else { identity = record.corner.key }
-        return record.id + "\0" + identity
+        return record.id + "\0" + selection + "\0" + identity
     }
 
     private func makeProcess(_ record: SenseRecord, key: String, generation: UUID, address: String? = nil) throws -> SenseHelperProcess {
+        // Shutdown is terminal; this actor check and helper publication never suspend.
+        try requireRunning()
         try requireHelper()
         guard record.language == .javascript else {
             throw SenseFailure(code: "unsupported", message: "Authored senses require JavaScript. Convert this historical Swift sense before enabling it.")
@@ -273,7 +310,6 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
               let entry = record.entry, !entry.isEmpty, !entry.hasPrefix("/") else {
             throw SenseFailure(code: "bad_entry", message: "Sense entry must stay inside its version folder.")
         }
-        let folder = dataRoot.appendingPathComponent("senses/\(record.id)")
         let registry = FileSenseRegistry(dataRoot: dataRoot)
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("sense-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: false,
@@ -283,10 +319,14 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
                   let script = String(data: code, encoding: .utf8) else {
                 throw SenseFailure(code: "bad_entry", message: "Sense source must be UTF-8 and at most 512 KiB.")
             }
-            let notebook = (record.status == .draft ? scratch : folder).appendingPathComponent("state.json")
-            return try SenseHelperProcess(record: record, dataRoot: dataRoot, script: script, notebook: notebook, notebooks: notebooks,
+            let notebook = record.status == .draft ? scratch.appendingPathComponent("state.json") : AbilityStore.notebookPath(dataRoot: dataRoot, id: record.id)
+            return try SenseHelperProcess(record: record, dataRoot: dataRoot, script: script, notebook: notebook,
                 scratch: scratch, helper: helperURL, profile: profile(record, registry.root, scratch), limits: limits,
                 initialAddress: address, apps: apps,
+                onSourceChange: { [dataRoot] in
+                    AbilityStore(dataRoot: dataRoot).signal("sense.source.changed", part: record.id,
+                        ["slot": .string(key), "generation": .string(generation.uuidString)])
+                },
                 onSettled: { [weak self] in
                     await self?.settled(key, generation: generation)
                 },
@@ -299,12 +339,19 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
         }
     }
 
+    /// Only EnginePartWake admits unattended interpretation. Material stays in
+    /// the source-bound helper; a retired generation can never consume it.
+    public func sourceChanged(slot key: String, generation: UUID) async {
+        guard !shutDown, let slot = live[key], slot.generation == generation else { return }
+        await slot.process?.drainChange()
+    }
+
     private func requireHelper() throws {
         guard FileManager.default.fileExists(atPath: helperURL.path) else {
-            throw SenseFailure(code: "helper_missing", message: "Sense helper is missing at \(helperURL.path). Reinstall NativeAgent, then switch the sense on to retry.")
+            throw SenseFailure(code: "helper_missing", message: "Tell the person: this copy of NativeAgent is missing its sense helper at \(helperURL.path).")
         }
         guard FileManager.default.isExecutableFile(atPath: helperURL.path) else {
-            throw SenseFailure(code: "helper_not_executable", message: "Sense helper is not executable at \(helperURL.path). Repair the app installation, then switch the sense on to retry.")
+            throw SenseFailure(code: "helper_not_executable", message: "Tell the person: NativeAgent's sense helper is not executable at \(helperURL.path).")
         }
     }
 
@@ -343,7 +390,7 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
         let cause = ["timeout", "resource_limit", "bad_output", "output_limit", "registry_failure"].contains(failure.code) ? failure.code : "crashed"
         if !slot.failures.insert(cause).inserted {
             live.removeValue(forKey: id)?.idle?.cancel()
-            await unavailable(slot.record, failure: failure)
+            await unavailable(slot.record, selection: slot.selection, failure: failure)
             return
         }
         live[id] = slot
@@ -355,7 +402,7 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
         do {
             if let registry = SensesHub.shared.registry {
                 guard let current = try await registry.sense(for: slot.record.corner), current.status == .on,
-                      current.id == slot.record.id, current.version == slot.record.version else { await stopSlot(id); return }
+                      try fileRegistry.helperSelection(current) == slot.selection else { await stopSlot(id); return }
                 guard let refreshed = live[id], refreshed.generation == generation else { return }
                 slot = refreshed
             }
@@ -367,19 +414,24 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
         } catch {
             guard live[id]?.generation == generation else { return }
             live.removeValue(forKey: id)?.idle?.cancel()
-            await unavailable(slot.record, failure: Self.failure(error, provenance: SenseProvenance(record: slot.record)))
+            await unavailable(slot.record, selection: slot.selection, failure: Self.failure(error, provenance: SenseProvenance(record: slot.record)))
         }
     }
 
-    private func unavailable(_ record: SenseRecord, failure: SenseFailure) async {
+    private func unavailable(_ record: SenseRecord, selection: String, failure: SenseFailure) async {
         guard record.status == .on else { return }
         var reason = "Sense helper at \(helperURL.path): \(failure.code): \(failure.message)"
+        var announce = true
         do {
-            try await (SensesHub.shared.registry as? any SenseRegistryManaging)?.markUnavailable(id: record.id, version: record.version, reason: reason)
+            if let registry = SensesHub.shared.registry as? any SenseRegistryManaging {
+                announce = try await registry.markUnavailable(id: record.id, selection: selection, reason: reason)
+            }
         } catch { reason += "\n\(error.localizedDescription)" }
-        for key in live.keys.filter({ live[$0]?.record.id == record.id && live[$0]?.record.version == record.version }) { await stopSlot(key) }
-        await SenseNewsBoard.shared.post(SenseNews(senseID: record.id, version: record.version,
-            address: record.corner.key, summary: "Sense unavailable: \(ContextSecretContentPolicy.redactedFragment(reason))", at: Date()))
+        await retire(selection: selection)
+        if announce {
+            await SenseNewsBoard.shared.post(SenseNews(senseID: record.id, version: record.version,
+                address: record.corner.key, summary: "Sense unavailable: \(ContextSecretContentPolicy.redactedFragment(reason))", at: Date()))
+        }
     }
 
     private static func attributed(_ outcome: SenseOutcome, to record: SenseRecord) -> SenseOutcome {
@@ -413,13 +465,13 @@ private actor SenseHelperProcess {
     private let dataRoot: URL
     private let script: String
     private let notebook: URL
-    private let notebooks: PartNotebooks
     private let scratch: URL
     private let limits: HelperSenseRunner.Limits
     private let apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)?
     private let transport: OwnedProgramProcess
     private let onExit: @Sendable (SenseFailure?) async -> Void
     private let onSettled: @Sendable () async -> Void
+    private let onSourceChange: @Sendable () -> Void
     private var nextID = 0
     private var pending: Pending?
     private var stopped = false
@@ -437,12 +489,14 @@ private actor SenseHelperProcess {
     private var reader: Task<Void, Never>?
     private var idleHolds = 0
 
-    init(record: SenseRecord, dataRoot: URL, script: String, notebook: URL, notebooks: PartNotebooks, scratch: URL, helper: URL,
+    init(record: SenseRecord, dataRoot: URL, script: String, notebook: URL, scratch: URL, helper: URL,
          profile: String, limits: HelperSenseRunner.Limits, initialAddress: String?, apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)?,
+         onSourceChange: @escaping @Sendable () -> Void,
          onSettled: @escaping @Sendable () async -> Void,
          onExit: @escaping @Sendable (SenseFailure?) async -> Void) throws {
-        self.record = record; self.dataRoot = dataRoot; self.script = script; self.notebook = notebook; self.notebooks = notebooks; self.scratch = scratch
+        self.record = record; self.dataRoot = dataRoot; self.script = script; self.notebook = notebook; self.scratch = scratch
         self.limits = limits; self.onExit = onExit; self.onSettled = onSettled
+        self.onSourceChange = onSourceChange
         self.sourceAddress = initialAddress
         self.apps = apps
         transport = try OwnedProgramProcess(helper: helper, profile: profile, scratch: scratch, memoryBytes: limits.memoryBytes)
@@ -749,11 +803,8 @@ private actor SenseHelperProcess {
         let waiting = waiters; waiters.removeAll()
         for waiter in waiting.values { waiter.resume() }
         Task { await onSettled() }
-        if watching, pendingChange != nil {
-            if isSite { Task.detached(priority: .utility) { [weak self] in await self?.drainChange() } }
-            else {
-                Task { await drainChange() }
-            }
+        if !stopped, watching, pendingChange != nil {
+            onSourceChange()
         }
     }
 
@@ -853,11 +904,12 @@ private actor SenseHelperProcess {
             try Task.checkCancellation()
             try reply(fields, type: "source_reply", value: wire, field: "material")
         case .string("state_get"), .string("state_set"):
-            guard case .string(let key)? = fields["key"], !key.isEmpty, key.utf8.count <= 256 else {
+            guard case .string(let key)? = fields["key"], SenseWire.validStateKey(key) else {
                 throw SenseFailure(code: "bad_state", message: "Sense notebook key is invalid.")
             }
             let setting = fields["type"] == .string("state_set")
-            let value = try await notebooks.access(notebook, key: key, setting: setting, value: fields["value"] ?? .null)
+            let value = try AbilityStore.notebook(notebook, key: key, setting: setting, value: fields["value"] ?? .null,
+                failure: { SenseFailure(code: $0, message: $1) })
             try reply(fields, type: "state_reply", value: value)
         case .string("source_watch"):
             guard record.mode == .live, fields["corner"] == .string(record.corner.key) else {
@@ -901,7 +953,7 @@ private actor SenseHelperProcess {
                                 lastAppObservation = content
                             }
                             pendingChange = material
-                            if pending == nil, watching { await drainChange() }
+                            if pending == nil, watching { onSourceChange() }
                         }
                         guard !Task.isCancelled, !stopped else { return }
                         if case .app = record.corner {
@@ -932,7 +984,7 @@ private actor SenseHelperProcess {
     private func receiveSiteChange(_ material: SenseMaterial, generation: UUID) async {
         guard !stopped, generation == observationGeneration else { return }
         pendingChange = material
-        if pending == nil, watching { await drainChange() }
+        if pending == nil, watching { onSourceChange() }
     }
 
     private func siteObservationEnded(_ generation: UUID) async {
@@ -941,6 +993,7 @@ private actor SenseHelperProcess {
         await postNews(SenseNews(senseID: record.id, version: record.version,
             address: sourceAddress ?? record.corner.key,
             summary: "Stopped following this site because its Chrome source events ended.", at: Date()))
+        guard generation == observationGeneration, !stopped, !Task.isCancelled else { return }
         await terminate(failure: nil)
     }
 
@@ -951,8 +1004,8 @@ private actor SenseHelperProcess {
         return .object(fields)
     }
 
-    private func drainChange() async {
-        guard !stopped, watching, pending == nil, let material = pendingChange, let source = observedSource else { return }
+    fileprivate func drainChange() async {
+        guard !stopped, watching, pending == nil, pendingChange != nil, let source = observedSource else { return }
         let generation = observationGeneration
         do {
             if let registry = SensesHub.shared.registry {
@@ -961,12 +1014,14 @@ private actor SenseHelperProcess {
                     await stop(); return
                 }
             }
-            guard pending == nil, !isSite || (watching && observationGeneration == generation) else { return }
+            guard !stopped, !Task.isCancelled, pending == nil,
+                  watching && observationGeneration == generation, let material = pendingChange else { return }
             pendingChange = nil
             let previousNews = newsGeneration
             let outcome = await SenseActionContext.$perform.withValue(nil) {
                 await request(.watch, source: source, perform: nil, changed: material)
             }
+            guard !stopped, !Task.isCancelled, observationGeneration == generation else { return }
             if case .failed(let failure) = outcome {
                 await postNews(SenseNews(senseID: record.id, version: record.version,
                     address: sourceAddress ?? record.corner.key,
@@ -975,22 +1030,16 @@ private actor SenseHelperProcess {
                 await postNews(SenseNews(senseID: record.id, version: record.version,
                     address: sourceAddress ?? record.corner.key, summary: "App view changed.", at: Date()))
             }
-        } catch { await terminate(failure: HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record))) }
+        } catch {
+            guard !stopped, !Task.isCancelled, observationGeneration == generation else { return }
+            await terminate(failure: HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record)))
+        }
     }
 
     private func decodePage(_ value: JSONValue?, material: JSONValue) throws -> NativePage {
-        guard case .object(var fields)? = value else { throw SenseFailure(code: "bad_output", message: "Sense page is missing.") }
-        fields["corner"] = try JSONValue.fromEncodable(record.corner)
-        if fields["things"] == nil { fields["things"] = .array([]) }
-        if fields["folded"] == nil { fields["folded"] = .array([]) }
-        if case .array(let things)? = fields["things"] {
-            fields["things"] = .array(things.map { thing in
-                guard case .object(var row) = thing else { return thing }
-                if row["verbs"] == nil || row["verbs"] == .null || (record.status == .on && !record.verbsEnabled) { row["verbs"] = .array([]) }
-                return .object(row)
-            })
-        }
-        var page = try JSONDecoder().decode(NativePage.self, from: JSONEncoder().encode(JSONValue.object(fields)))
+        guard case .object(let fields)? = value else { throw SenseFailure(code: "bad_output", message: "Sense page is missing.") }
+        var page = try SenseWire.decodePage(fields, corner: record.corner)
+        if record.status == .on && !record.verbsEnabled { for i in page.things.indices { page.things[i].verbs = [] } }
         if let more = page.more, case .fileKind = record.corner, case .object(let material) = material,
            case .string(let version)? = material["version"] {
             let parts = more.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
@@ -1000,23 +1049,16 @@ private actor SenseHelperProcess {
             query.queryItems = (query.queryItems ?? []).filter { $0.name != "version" } + [URLQueryItem(name: "version", value: version)]
             page.more = String(parts[0]) + "?" + (query.percentEncodedQuery ?? "")
         }
-        guard !page.address.isEmpty else {
-            throw SenseFailure(code: "bad_output", message: "Sense page requires an address and at most 40,000 text bytes.")
-        }
-        guard page.text.utf8.count <= NativePage.maximumTextBytes else {
-            throw SenseFailure(code: "bad_output", message: "Sense page exceeds the text ceiling; fold it and offer more.")
-        }
+        try SenseWire.validatePage(page)
         return page
     }
 
     private func decodeNews(_ value: JSONValue?) throws -> SenseNews {
-        guard case .object(let fields)? = value, case .string(let address)? = fields["address"],
-              case .string(let summary)? = fields["summary"], summary.utf8.count <= 4_000,
+        guard case .object(let fields)? = value,
               fields["senseID"] == .string(record.id), fields["version"] == .int(Int64(record.version)) else {
             throw SenseFailure(code: "bad_output", message: "Sense news requires an address and summary.")
         }
-        return SenseNews(senseID: record.id, version: record.version,
-            address: address, summary: summary, at: Date())
+        return try SenseWire.news(value, senseID: record.id, version: record.version)
     }
 
     private func postNews(_ news: SenseNews) async {
@@ -1032,12 +1074,7 @@ private actor SenseHelperProcess {
     }
 
     private func decodeView(_ value: JSONValue?) throws -> SenseInteractiveView? {
-        if value == .null { return nil }
-        guard case .object(let fields)? = value, case .string(let title)? = fields["title"],
-              case .string(let html)? = fields["html"], html.utf8.count <= 256 * 1_024 else {
-            throw SenseFailure(code: "bad_output", message: "Sense view requires title and at most 256 KiB of HTML.")
-        }
-        return SenseInteractiveView(senseID: record.id, version: record.version, title: title, html: html)
+        try SenseWire.view(value, senseID: record.id, version: record.version)
     }
 
     private func send(_ message: JSONValue) throws {
@@ -1137,29 +1174,7 @@ private actor SenseHelperProcess {
     /// Stored ZIP keeps package member identities intact without granting the
     /// helper filesystem access or staging a copy of User's material in scratch.
     private nonisolated static func packageArchive(_ root: URL, dataRoot: URL) throws -> (data: Data, bytes: Int) {
-        let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
-        var traversalFailed = false
-        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys,
-            errorHandler: { _, _ in traversalFailed = true; return false }) else {
-            throw SenseFailure(code: "source_unavailable", message: "Sense document package is unavailable.")
-        }
-        var files: [URL] = []
-        for case let url as URL in enumerator {
-            let values = try url.resourceValues(forKeys: Set(keys))
-            guard values.isSymbolicLink != true else {
-                throw SenseFailure(code: "source_denied", message: "Sense document packages cannot contain symbolic links.")
-            }
-            if values.isRegularFile == true { files.append(url) }
-            else if values.isDirectory != true {
-                throw SenseFailure(code: "source_denied", message: "Sense document package contains unsupported members.")
-            }
-            guard files.count <= 8_000 else {
-                throw SenseFailure(code: "input_limit", message: "Sense document package exceeds its member limit.")
-            }
-        }
-        guard !traversalFailed else {
-            throw SenseFailure(code: "source_unavailable", message: "Sense document package could not be read completely.")
-        }
+        let files = try ExistingCornersSourceProvider.packageManifest(root).filter(\.isFile).map(\.url)
         func word<T: FixedWidthInteger>(_ number: T, into data: inout Data) {
             var value = number.littleEndian
             withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
@@ -1202,48 +1217,5 @@ private actor SenseHelperProcess {
         word(UInt16(files.count), into: &archive); word(UInt16(files.count), into: &archive)
         word(UInt32(directory.count), into: &archive); word(offset, into: &archive); word(UInt16(0), into: &archive)
         return (archive, totalBytes)
-    }
-}
-
-/// All invocations share one non-suspending read/mutate/write owner. Atomic
-/// replacement alone cannot serialize concurrent processes' notebook updates.
-public actor PartNotebooks {
-    public static let shared = PartNotebooks()
-
-    /// The sense notebook is also the durable state of tools and skills. It is
-    /// separate from AbilityStore's lifecycle accounting, keyed by part id.
-    public func access(dataRoot: URL, id: String, setting: Bool, value: JSONValue) throws -> JSONValue {
-        guard !id.isEmpty, id != ".", id != "..", !id.contains("/"), !id.contains("\\") else {
-            throw SenseFailure(code: "bad_state", message: "Part notebook id is invalid.")
-        }
-        return try access(dataRoot.appendingPathComponent("senses/\(id)/state.json"),
-                          key: "part", setting: setting, value: value)
-    }
-
-    func access(_ notebook: URL, key: String, setting: Bool, value: JSONValue) throws -> JSONValue {
-        guard notebook.resolvingSymlinksInPath().path == notebook.standardizedFileURL.path else {
-            throw SenseFailure(code: "bad_state", message: "Sense notebook cannot be a symbolic link.")
-        }
-        var state: [String: JSONValue] = [:]
-        do {
-            let attrs = try FileManager.default.attributesOfItem(atPath: notebook.path)
-            guard attrs[.type] as? FileAttributeType == .typeRegular,
-                  ((attrs[.size] as? NSNumber)?.intValue ?? Int.max) <= 65_536,
-                  let saved = try? JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: notebook)) else {
-                throw SenseFailure(code: "bad_state", message: "Sense notebook is malformed or too large.")
-            }
-            state = saved
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {}
-        if setting {
-            guard try JSONEncoder().encode(value).count <= 16_384 else {
-                throw SenseFailure(code: "state_limit", message: "Sense notebook values must be at most 16 KiB.")
-            }
-            state[key] = value
-            let data = try JSONEncoder().encode(state)
-            guard data.count <= 65_536 else { throw SenseFailure(code: "state_limit", message: "Sense notebook exceeds 64 KiB.") }
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: notebook)
-            return .null
-        }
-        return state[key] ?? .null
     }
 }

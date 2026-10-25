@@ -1,13 +1,18 @@
 import BackgroundLoops
 import DoctorChecks
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import Privacy
 import Experiences
+// Blueprint: | `DoctorLoopRecovery.swift` | `DoctorLoopRecovery` enum; `checks`, `repair` over core loop-manager state |
 
 /// Core's live registration and the launch manifest's IDs are passive inputs.
 public enum DoctorLoopRecovery {
     public static let checkPrefix = "live.background_loop."
+    /// Loops NativeAgent no longer runs: a repair one owed from before settles
+    /// on a reading that it is not needed.
+    static let retired = ["github_tracking": "GitHub tracking was retired with the GitHub connector; nothing runs it."]
 
     public static func checks(
         manager: BackgroundLoops.BackgroundLoopsManager,
@@ -32,7 +37,7 @@ public enum DoctorLoopRecovery {
         var pending: Set<String> = []
         do {
             let open = try await ExperienceStore.at(dataRoot).projection()
-            for id in loopIDs {
+            for id in loopIDs.union(retired.keys) {
                 let owed = open.filter { $0.owes["repair"]?.phase.isSettled == false
                     && $0.claims.contains { $0.claim == "operation: doctor.check:" + checkPrefix + id } }
                 let format = ISO8601DateFormatter()
@@ -44,10 +49,17 @@ public enum DoctorLoopRecovery {
                 }) { pending.insert(id) }
             }
         } catch {
-            return [CheckResult(source: "experiences/experiences.sqlite", id: "doctor.repair_store", title: "Repairs owed", status: "fail",
-                detail: "Background work repair obligations could not be read: \(error.localizedDescription)")]
+            return [CheckResult(source: "experiences/experiences.sqlite",
+                id: "doctor.repair_store", title: "Repairs owed", status: "fail",
+                detail: "Background work repair obligations could not be read: \(error.localizedDescription)",
+                human_action: ToolFailureError.fileRepairInstruction(dataRoot.appendingPathComponent("experiences/experiences.sqlite"),
+                    shape: "This SQLite experience store retains original experiences, claims, evidence and obligation phases. Preserve their identities and settlement history."))]
         }
-        return loopIDs.sorted().map { id in
+        let retirements = retired.filter { pending.contains($0.key) }.sorted { $0.key < $1.key }.map { id, why in
+            CheckResult(source: "Background loop registration: " + id, id: checkPrefix + id, title: "Background loop: \(id)",
+                        status: "not needed", detail: why)
+        }
+        return retirements + loopIDs.sorted().map { id in
             let status = byID[id]
             let verdict = verdictByID[id]
             let level = verdict?.level ?? .fail
@@ -57,13 +69,14 @@ public enum DoctorLoopRecovery {
             let off = level == .off || level == .notNeeded
             let waiting = pending.contains(id) && !off
             let state = (verdict?.detail ?? "The app-owned loop is absent from the live manager.")
-                + (waiting ? " Repair remains owed until this loop completes successful work." : "")
+                .trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))
+                + (waiting ? "; repair remains owed until this loop completes successful work" : "")
             let lastFailure = status?.lastError.map {
-                " Last failure: \(NativeAppSecretRedactor.redactText(String($0.prefix(500))))."
+                "; last failure: \(NativeAppSecretRedactor.redactText(String($0.prefix(500))).trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))"
             } ?? ""
             let interval = configured[id] ?? status?.interval ?? 300
-            let detail = "Configured interval: \(Int(interval)) seconds. "
-                + NativeAppSecretRedactor.redactText(String(state.prefix(700))) + lastFailure
+            let detail = "Configured interval: \(Int(interval)) seconds; "
+                + NativeAppSecretRedactor.redactText(String(state.prefix(700))) + lastFailure + "."
             let failure = [status?.lastError, status?.lastResult].compactMap { $0 }.joined(separator: " ")
             let action = MaintenanceBackgroundWork.loopSettingFix(loopId: id, error: failure)
             let missingRegistration = !off && managerRunning && configured[id] != nil && status?.running != true
@@ -74,10 +87,8 @@ public enum DoctorLoopRecovery {
             return CheckResult(source: action?.step ?? "Background loop registration: " + id,
                 id: checkPrefix + id,
                 title: "Background loop: \(id)",
-                // A single failed tick is an observation; a persistent failure or a
-                // broken schedule is durable. Its lever is the setting, the native
-                // restart, or, where neither changes it, the build.
-                status: durable ? "fail" : level.isFault || waiting ? "unmeasured" : level.statusText,
+                // Durability chooses the healer, never erases a measured fault.
+                status: missingRegistration || level == .fail ? "fail" : level == .warn || waiting ? "warn" : level.statusText,
                 detail: detail,
                 harm: missingRegistration ? "\(friendlyLoopName(id)) has no running registration."
                     : durable ? "\(friendlyLoopName(id)) is failing or is not being done on schedule." : nil,

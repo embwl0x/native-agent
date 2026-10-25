@@ -1,7 +1,8 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `AgentWorkspaceKnowledge.swift` | `AgentWorkspaceKnowledge` enum; `project`, `memoryTitle` |
 
-/// Presents the existing memory, research and skill owners without retaining
+/// Presents the existing memory and research owners without retaining
 /// their content or interpreting instructions embedded in retrieved material.
 enum AgentWorkspaceKnowledge {
     static let destinations: [AgentWorkspaceDestination] = [
@@ -9,25 +10,17 @@ enum AgentWorkspaceKnowledge {
               tool: "recall_memory", searchField: "query", tools: ["recall_memory", "commit_memory"], searchLabel: "Recall something"),
         .init(id: "research", title: "Research", summary: "Search the web, read a source, or investigate in the browser.",
               tool: nil, tools: ["read_page", "browser.chrome_navigate"]),
-        .init(id: "skills", title: "Skills", summary: "Open installed guidance or write a new skill.",
-              tool: "list_skills", tools: ["list_skills", "read_skill", "save_skill"]),
     ]
 
-    /// Her private web search (the built-in SearXNG server), never a tab.
-    static let webSearchTool = "mcp__searxng-local__search"
+    /// Her private web search, never a tab.
+    static let webSearchTool = "web_search"
 
-    static let readTools: Set<String> = ["recall_memory", "recall_search", "list_skills", "read_skill", "read_page", webSearchTool]
+    static let readTools: Set<String> = ["recall_memory", "recall_search", "read_page", webSearchTool]
 
     static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
         switch tool {
         case webSearchTool: return webSearch(input: input, result: result)
         case "recall_memory", "recall_search": return memory(input: input, result: result)
-        case "list_skills": return skills(result)
-        case "read_skill":
-            return .init(title: text(input["name"]) ?? "Skill", content: result, items: [], actions: [
-                .init(label: "Installed skills", action: .open(.record(tool: "list_skills", input: [:], title: "Skills"))),
-                .init(label: "Write a skill", action: .configure(tool: "save_skill", input: [:], title: "Write a skill")),
-            ])
         case "read_page":
             // Coverage and source receipts stay attached, including partial or
             // unsupported extraction. A fetch is never labeled verified truth.
@@ -129,29 +122,6 @@ enum AgentWorkspaceKnowledge {
         return next
     }
 
-    private static func skills(_ result: JSONValue) -> AgentWorkspaceProjection {
-        guard case .array(let skills) = result else {
-            return .init(title: "Skills", content: result, items: [], actions: [])
-        }
-        let items = skills.map { skill -> AgentWorkspaceItem in
-            let row = object(skill)
-            let name = identifier(row["name"])
-            // Prefer the exact registered ID; names are the owner's documented
-            // fallback for persona body inventory. Neither is a filesystem path.
-            let handle = identifier(row["id"]) ?? name
-            let actions: [AgentWorkspaceButton] = handle.map { handle in
-                [.init(label: "Open skill", action: .open(.record(tool: "read_skill", input: ["name": .string(handle)], title: name ?? "Skill")))]
-            } ?? []
-            return .init(title: name ?? "Skill", content: skill, actions: actions)
-        }
-        return .init(title: "Skills", content: .object([
-            "returned_skills": .int(Int64(items.count)),
-            "meaning": .string("Installed guidance; opening a skill does not grant authority or run it."),
-        ]), items: items, actions: [
-            .init(label: "Read a named skill", action: .perform(tool: "read_skill", input: [:], title: "Skill", textField: "name", isEffect: false), needsText: true),
-            .init(label: "Write a skill", action: .configure(tool: "save_skill", input: [:], title: "Write a skill")),
-        ])
-    }
 
     private static func object(_ value: JSONValue) -> [String: JSONValue] {
         guard case .object(let row) = value else { return [:] }; return row

@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+// Blueprint: | `NativeOAuthLoopbackCallbackServer.swift` | shared ChatGPT/xAI loopback callback socket lifecycle; one admitted wait (concurrent waits reject before installing cancellation or timeout), bounded blocking clients on Dispatch, protocol-specific response shape, state validation and exactly-once completion; browser opening stays in the owning session |
 
 public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unchecked Sendable {
     public let redirectURI: URL
@@ -12,7 +13,8 @@ public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unc
     private let callbackPageMessage: @Sendable (URL) -> String
     private let lock = NSLock()
     private var continuation: CheckedContinuation<URL, Error>?
-    private var worker: Task<Void, Never>?
+    private var workerStarted = false
+    private var waitStarted = false
     private var activeClients: Set<Int32> = []
     private var didFinish = false
     private var openAIFlow = false
@@ -89,7 +91,10 @@ public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unc
         }
         server.openAIFlow = true
         defer { server.cancel() }
-        Task { @MainActor in NSWorkspace.shared.open(authURL) }
+        try Task.checkCancellation()
+        await MainActor.run {
+            if !Task.isCancelled { NSWorkspace.shared.open(authURL) }
+        }
         do {
             return try await server.wait(timeoutSeconds: 300, expectedState: expectedState)
         } catch OAuthLoopbackCallbackError.timedOut {
@@ -102,7 +107,16 @@ public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unc
     }
 
     public func wait(timeoutSeconds: TimeInterval, expectedState: String) async throws -> URL {
-        try await withTaskCancellationHandler {
+        // Claim the whole wait, including its timeout/cancellation handler.
+        // A rejected second caller must not finish the first caller's listener.
+        // An already-canceled first caller still installs that handler so it
+        // retires the listener it just claimed.
+        try lock.withLock {
+            guard !didFinish else { throw OAuthLoopbackCallbackError.canceled }
+            guard !waitStarted else { throw OAuthLoopbackCallbackError.alreadyWaiting }
+            waitStarted = true
+        }
+        return try await withTaskCancellationHandler {
             try await withThrowingTaskGroup(of: URL.self) { group in
                 group.addTask { try await self.acceptOnce(expectedState: expectedState) }
                 group.addTask {
@@ -135,7 +149,10 @@ public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unc
                 return
             }
             continuation = cont
-            worker = Task.detached { [self] in
+            workerStarted = true
+            // Blocking sockets belong to Dispatch, never Swift's cooperative
+            // executor (which must remain free to deliver the timeout).
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
                 acceptRequests(expectedState: expectedState)
             }
             lock.unlock()
@@ -144,9 +161,9 @@ public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unc
 
     private func acceptRequests(expectedState: String) {
         // Keep the descriptor reserved until the worker can no longer enter
-        // accept(), including cancellation before this task starts running.
+        // accept(), including cancellation before this worker starts running.
         defer { Darwin.close(fd) }
-        while !Task.isCancelled {
+        while true {
             var addr = sockaddr()
             var len = socklen_t(MemoryLayout<sockaddr>.size)
             let client = Darwin.accept(fd, &addr, &len)
@@ -160,13 +177,20 @@ public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unc
                 Darwin.close(client)
                 return
             }
+            // Reserve before dispatch; slow local clients cannot grow an
+            // unbounded collection of blocking readers or queued work items.
+            guard activeClients.count < (openAIFlow ? 4 : 1) else {
+                lock.unlock()
+                Darwin.close(client)
+                continue
+            }
             var noSigPipe: Int32 = 1
             _ = Darwin.setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe,
                                   socklen_t(MemoryLayout<Int32>.size))
             activeClients.insert(client)
             lock.unlock()
             if openAIFlow {
-                Task.detached { [self] in
+                DispatchQueue.global(qos: .userInitiated).async { [self] in
                     if let url = acceptRequest(client, expectedState: expectedState) {
                         finish(.success(url))
                     }
@@ -244,15 +268,12 @@ public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unc
         didFinish = true
         let cont = continuation
         continuation = nil
-        let worker = worker
-        self.worker = nil
         // The worker owns close; shutdown interrupts an accepted socket's
         // blocking read/write without racing descriptor reuse.
         for client in activeClients { Darwin.shutdown(client, SHUT_RDWR) }
         Darwin.shutdown(fd, SHUT_RDWR)
-        if worker == nil { Darwin.close(fd) }
+        if !workerStarted { Darwin.close(fd) }
         lock.unlock()
-        worker?.cancel()
         switch result {
         case .success(let url):
             cont?.resume(returning: url)

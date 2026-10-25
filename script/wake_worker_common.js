@@ -14,6 +14,18 @@ function nowISO() {
   return new Date().toISOString();
 }
 
+// Her first life; work queued before lives were stamped began in it (DataRootLife.first).
+const FIRST_LIFE = "00000000-0000-0000-0000-000000000000";
+function lifeOf(stamp) { return stamp || FIRST_LIFE; }
+
+// The Swift data-root owner creates this identity before admitting work.
+function dataRootLife() {
+  if (!process.env.NATIVE_AGENT_DATA_ROOT) throw new Error("NativeAgent data root is unavailable");
+  const life = fs.readFileSync(path.join(process.env.NATIVE_AGENT_DATA_ROOT, "life-id"), "utf8");
+  if (life.length !== 36 || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(life)) throw new Error("NativeAgent life id is unreadable");
+  return life;
+}
+
 // Preserve valid JSON values verbatim; callers own shape checks and the value
 // used when the file cannot be read or decoded.
 function readWakeJSON(file, fallback = null) {
@@ -451,6 +463,8 @@ function missingWakeCompletionOrigin(sessionId, agentName) {
 }
 
 module.exports = {
+  dataRootLife,
+  lifeOf,
   jsonOut, nowISO, redactDiagnosticText, processStartIdentity, unicodePrefix,
   dirLockOwnerAlive, ensureDir, fsyncDirectorySync, safeFilePart,
   createProcessStartIdentityReader, postBridgeRequest, postWakeCompletion, writeSyncedAndClose,

@@ -104,16 +104,32 @@ repair deadlines; continuous decay is projected at read time. App assembly
 retains daily maintenance, replay and reflection registrations as recovery
 sweeps (`EngineRuntime/EngineLaunch.swift`).
 
+Canon, horizon and Reach source observations register before their first read
+and stop with the runtime. Canon watches journal inputs and archive membership;
+audit output is excluded, and directory events invalidate it only when input
+stamps change. Their 30-, 15- and 10-minute I/O limits remain;
+unchanged sources are reread only at real silence, eligibility, quiet-hour,
+expiry or cooldown boundaries on the existing residual deadline. Reach retains
+a blocked timing gate's eligibility boundary before candidates have been read;
+opening the gate schedules the pending source scan. Committed dreams invalidate
+Reach through the existing `dreamCompleted` signal, including after a clean scan.
+Desk and moment invalidations plus exact defer/three-day expiry boundaries
+refresh rumination; body sampling no longer starts a five-minute Desk rescan. Quiet-hour
+preferences follow file/clock invalidations. Clock invalidation follows organism
+configuration so concurrent reads cannot erase it. Reach watches handoff
+selection changes as well as selected content;
+unrelated home-directory events with unchanged input stamps do not request scans.
+The composite body evidence read retains its two-second sampled cache because
+its host/transport gauges have no complete shared push owner. Daily integrity
+sweeps remain.
+
 Reflection has an enable switch, an in-flight reservation and a rolling
 24-hour call ceiling. Spontaneous reflection also requires unresolved load;
 requested reflection bypasses that load threshold, not the cost ceiling.
 Its model/provider comes from checked `cognition_reflection` routing, not
 a fixed model name.
 
-Low Power Mode, serious/critical thermal pressure and a sleeping organism
-posture can defer background cognition. Conserve posture throttles expensive
-lanes with a 45-minute starvation floor. These are admission rules, not a
-measurement of idle CPU or long-term usefulness.
+They are always on while the Mac is on (User 10-24): their model calls run at the provider, so no power, heat or tiredness gate defers or throttles any background lane.
 
 ### Reach notification privacy
 
@@ -199,5 +215,4 @@ These diagnostic and recovery paths are relative to `<dataRoot>`:
 |---|---|
 | `cognition/organism_state.json` | Persisted body state and organism continuity |
 | `cognition/caring_appraisals.jsonl` | Caring appraisal receipts and the body's dosing response |
-| `memory/moment_receipts.jsonl` | Moment-lane outcome receipts, including abstention and extraction failures |
 | `studio/wander/wander.json` | Hour/wander refractory state and trace history |

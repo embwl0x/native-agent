@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `HomePath.swift` | `HomePath.expand`: expands only the current user's home shorthand, leaving named-user paths unchanged |
+
 /// Expand only the current user's home shorthand; leave named users untouched.
 public enum HomePath {
     public static func expand(

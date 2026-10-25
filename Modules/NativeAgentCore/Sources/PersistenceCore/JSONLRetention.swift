@@ -1,7 +1,7 @@
-import FeedPolicy
 import Foundation
 import Darwin
 import NativeAgentCore
+// Blueprint: | `JSONLRetention.swift` | SwiftNativePersistenceCore owns the activity event envelope, path and append; producers preserve redacted values, IDs and timestamps; JSONLCapCheckCounter owns cap-check cadence |
 
 // MARK: - JSONL line cap (U5 W-G, 2026-06-11)
 
@@ -233,6 +233,55 @@ public func enforceJSONLByteCap(
     // Same durable rewrite as enforceJSONLLineCap — see the note there.
     try SwiftNativePersistenceCore.atomicWrite(Data(trimmed.utf8), to: path)
     return dropped
+}
+
+/// Owns activity/events.jsonl: the event envelope, path and capped append.
+/// Producers supply their original redacted values, IDs and timestamps.
+/// Local backup/export and phone sync exclude it; off-disk backup and support
+/// bundles include it; PrivacyMap lists activity/. FeedPolicy.swift owns retention beside this enforcement.
+extension SwiftNativePersistenceCore {
+    public static func activityEventsPath(dataRoot: URL) -> URL {
+        dataRoot.appendingPathComponent("activity/events.jsonl")
+    }
+
+    public static func activityTail(dataRoot: URL) throws -> (data: Data, startsMidFile: Bool) {
+        let path = activityEventsPath(dataRoot: dataRoot)
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: path.path) else { return (Data(), false) }
+        let attributes = try fileManager.attributesOfItem(atPath: path.path)
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        guard size > 0 else { return (Data(), false) }
+
+        let maximumBytes = UInt64(1_048_576)
+        let count = min(size, maximumBytes)
+        let startsMidFile = size > count
+        let handle = try FileHandle(forReadingFrom: path)
+        defer { try? handle.close() }
+        if startsMidFile {
+            try handle.seek(toOffset: size - count)
+        }
+        let data = handle.readData(ofLength: Int(count))
+        return (data, startsMidFile)
+    }
+
+    public static func activityEvent(
+        id: String, kind: String, title: String, detail: String, status: String,
+        executionId: String?, payload: JSONValue, createdAt: String
+    ) -> JSONValue {
+        .object([
+            "id": .string(id), "kind": .string(kind), "title": .string(title),
+            "detail": .string(detail), "status": .string(status),
+            "executionId": executionId.map(JSONValue.string) ?? .null,
+            "payload": payload, "createdAt": .string(createdAt),
+        ])
+    }
+
+    public static func appendActivityEvent(
+        _ event: JSONValue, to path: URL, using persistence: any PersistenceCoreProtocol,
+        logLabel: String
+    ) async throws {
+        try await appendJSONLCapped(event, to: path, using: persistence, logLabel: logLabel)
+    }
 }
 
 /// U5 fix-round (2026-06-11, gpt-5.5 review): THE shared capped-append for

@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `RuntimeTrace.swift` | `RuntimeTrace` struct |
 
 public struct RuntimeTrace: Identifiable, Codable, Hashable {
     public var id: String

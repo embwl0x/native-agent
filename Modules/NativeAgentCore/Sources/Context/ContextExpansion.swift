@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ContextExpansion.swift` | `ContextExpander.expand`: expands selector-offered pointers without mutating context or deriving authority from their contents |
+
 public enum ContextExpansionError: Error, Equatable, Sendable {
     case invalidCharacterLimit
     case invalidCharacterOffset
@@ -169,81 +171,17 @@ public struct ContextExpander: Sendable {
                 atom: atom.draft.sourceHash
             )
         }
-        guard Self.isValidAt(generationID, from: atom.validFromGeneration,
-                             through: atom.validToGeneration) else {
-            throw ContextExpansionError.atomGenerationMismatch(atom.draft.id)
-        }
-        guard Self.isValidAt(generationID, from: source.validFromGeneration,
-                             through: source.validToGeneration) else {
-            throw ContextExpansionError.sourceGenerationMismatch(source.descriptor.id)
-        }
-        guard source.health != .removed else {
-            throw ContextExpansionError.sourceRemoved(source.descriptor.id)
-        }
+        if let failure = ContextSelector.commonEligibilityFailure(
+            for: atom, generationID: generationID, source: source, need: need
+        ) { throw failure.expansionError }
         // Admission follows the offered representation, not the full body's
         // length: a short summary can omit a body below the render threshold.
-        let omittedInPacket = atom.draft.injectionPolicy != .neverInject
-            && offeredSelectedItems.contains { item in
+        let omittedInPacket = offeredSelectedItems.contains { item in
                 item.pointer == pointer
-                    && (item.representation == .deterministicSummary
-                        || (need.packetAtomExpandThresholdChars > 0
-                            && item.text.count > need.packetAtomExpandThresholdChars))
+                    && item.isExpandable(thresholdChars: need.packetAtomExpandThresholdChars)
             }
         guard atom.draft.injectionPolicy == .onDemand || omittedInPacket else {
             throw ContextExpansionError.atomNotExpandable(policy: atom.draft.injectionPolicy)
-        }
-        guard source.descriptor.injectionPolicy != .neverInject else {
-            throw ContextExpansionError.sourceInjectionDenied(source.descriptor.id)
-        }
-
-        if need.deletedAtomIDs.contains(atom.draft.id) {
-            throw ContextExpansionError.deleted(atom.draft.id)
-        }
-        if need.tombstonedAtomIDs.contains(atom.draft.id) {
-            throw ContextExpansionError.tombstoned(atom.draft.id)
-        }
-        if need.staleRuntimeAtomIDs.contains(atom.draft.id) {
-            throw ContextExpansionError.staleRuntime(atom.draft.id)
-        }
-        if need.secretBearingAtomIDs.contains(atom.draft.id) {
-            throw ContextExpansionError.secretBearing(atom.draft.id)
-        }
-        guard need.authorization.allowedOrigins.contains(need.origin) else {
-            throw ContextExpansionError.originDenied(need.origin)
-        }
-        guard need.authorization.allowedSourceIDs.contains(source.descriptor.id) else {
-            throw ContextExpansionError.sourcePermissionDenied(source.descriptor.id)
-        }
-        if let allowedAtomIDs = need.authorization.allowedAtomIDs,
-           !allowedAtomIDs.contains(atom.draft.id) {
-            throw ContextExpansionError.atomPermissionDenied(atom.draft.id)
-        }
-        guard source.descriptor.permittedSurfaces.contains(need.surface) else {
-            throw ContextExpansionError.sourceSurfaceDenied(
-                source: source.descriptor.id,
-                surface: need.surface
-            )
-        }
-        guard atom.draft.permittedSurfaces.contains(need.surface) else {
-            throw ContextExpansionError.atomSurfaceDenied(
-                atom: atom.draft.id,
-                surface: need.surface
-            )
-        }
-        guard need.authorization.allowedPrivacy.contains(source.descriptor.privacy) else {
-            throw ContextExpansionError.sourcePrivacyDenied(
-                source: source.descriptor.id,
-                privacy: source.descriptor.privacy
-            )
-        }
-        guard need.authorization.allowedPrivacy.contains(atom.draft.privacy) else {
-            throw ContextExpansionError.atomPrivacyDenied(
-                atom: atom.draft.id,
-                privacy: atom.draft.privacy
-            )
-        }
-        guard !atom.draft.freshness.isExpired(at: need.evaluationTime) else {
-            throw ContextExpansionError.expired(atom.draft.id)
         }
 
         let sourceRangeByteCount = atom.draft.sourceRange.utf8End
@@ -297,11 +235,4 @@ public struct ContextExpander: Sendable {
         return ContextExpansionResult(pointer: pointer, text: text, receipt: receipt)
     }
 
-    private static func isValidAt(
-        _ generationID: Int64,
-        from validFrom: Int64,
-        through validTo: Int64?
-    ) -> Bool {
-        validFrom <= generationID && (validTo.map { $0 >= generationID } ?? true)
-    }
 }

@@ -3,6 +3,7 @@ import AttentionRouting
 import Foundation
 import AppKit
 import ApplicationServices
+import CoreBluetooth
 import CoreGraphics
 import EventKit
 import Contacts
@@ -11,6 +12,9 @@ import MacIntegration
 import MacControl
 import NativeAgentCore
 import NativeAgentShared
+import Photos
+
+// Blueprint: | `SystemPermissionPreflight.swift` | `SystemPermissionPreflight`: person-initiated macOS permission prompts before System Settings handoff, including Bluetooth prompt lifecycle |
 
 extension SystemPermissionPreflight {
     /// From a card tap, with the person there: fire macOS's own prompt where
@@ -58,6 +62,11 @@ extension SystemPermissionPreflight {
             case .location: MacLocationReader.requestAuthorization()
             case .microphone where status(gate) == .notDetermined:
                 _ = await AVCaptureDevice.requestAccess(for: .audio)
+            case .camera where status(gate) == .notDetermined:
+                _ = await AVCaptureDevice.requestAccess(for: .video)
+            case .photos where status(gate) == .notDetermined:
+                _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+            case .bluetooth where status(gate) == .notDetermined: await BluetoothPrompt.ask()
             // These two list the app in their pane on first ask, so the
             // person has a switch to turn on.
             case .accessibility:
@@ -73,4 +82,27 @@ extension SystemPermissionPreflight {
         return await cardBlockReason(ids, mode: mode) != nil
     }
 
+}
+
+/// Bluetooth has no request call: macOS asks when the app first makes a
+/// central manager, and the manager's state settles on the answer.
+@MainActor
+private final class BluetoothPrompt: NSObject, @preconcurrency CBCentralManagerDelegate {
+    private var manager: CBCentralManager?
+    private var answered: CheckedContinuation<Void, Never>?
+
+    static func ask() async {
+        let prompt = BluetoothPrompt()
+        await withCheckedContinuation { continuation in
+            prompt.answered = continuation
+            prompt.manager = CBCentralManager(delegate: prompt, queue: .main)
+        }
+        prompt.manager = nil
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        guard CBManager.authorization != .notDetermined else { return }
+        answered?.resume()
+        answered = nil
+    }
 }

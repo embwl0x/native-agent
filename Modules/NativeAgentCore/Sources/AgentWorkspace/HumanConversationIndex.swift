@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
+// Blueprint: | `HumanConversationIndex.swift` | `HumanConversationIndex` enum; `string`, `object` |
 
 package enum HumanConversationIndex {
     package static func string(_ value: JSONValue?) -> String? {
@@ -54,13 +55,10 @@ package enum HumanConversationIndex {
     /// one per-line path first; a preview with no stamp is not shown at all.
     package static func shownPreview(_ row: [String: JSONValue]) -> String? {
         guard let text = string(row["lastMessagePreview"]), let stamp = previewStamp(row) else { return nil }
-        consume(stamp, text: text)
+        ContactThread.consume(.init(text: text, stamp: stamp), mark: { peer, _ in
+            AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
+        })
         return text
     }
 
-    package static func consume(_ stamp: TranscriptRowStamp, text: String) {
-        ContactThread.consume(mine: !stamp.contact, source: stamp.source, steeredBy: stamp.steeredBy, text: text) { peer, _ in
-            AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
-        }
-    }
 }

@@ -38,9 +38,9 @@ main pages.
 | Agent interface | One always-on `app` tool. `app {}` is home, “where I left off”; pages, items, search, actions and JavaScript reach the app's capabilities. |
 | Memory and context | MemoryV2 stores durable memory with lexical and semantic recall. Fluid Context prepares bounded context from the underlying stores. |
 | Work | Desk holds projects, dependencies, schedules, progress and outcomes; standing helpers have their own briefs, models and conversations. |
-| Mac and web | App actions reach files, shell, Mac apps, screen control, the built-in browser and the optional Chrome extension. `web.search` uses Codex for general queries and SearXNG for category-specific queries or when Codex fails. |
-| Connections | Connectors and agent contacts live under **Connectors**. Mounted MCP tools appear as `mcp.<server>.<tool>` actions inside `app`. |
-| Growth | Skills provide reusable guidance and optional admitted scripts: `skill.save`, `skill.enable`, `skill.run`, `skill.resume` and `skill.rollback`. They grant no new authority; see the [manifest spec](docs/skill_manifest_spec.md). `tool.propose` files authored code; `tool.approve` activates it as `authored.<id>`. |
+| Mac and web | App actions reach files, shell, Mac apps, screen control, the built-in browser and the optional Chrome extension. `web.search` uses SearXNG (found on the Mac without setup) and searches in Chrome or their own browser when there is none; a failure says why. |
+| Connections | Connectors and agent contacts live under **Connectors**. An MCP server they wants is an ability they grows. |
+| Growth | What they works out they keeps as their own abilities: `ability.save`, kept by them under Full Mac or by the owner's card, runs as `authored.<id>`; `ability.read`, `ability.enable`, `ability.resume` and `ability.rollback` are its lifecycle. Parts grant no new authority; see the [manifest spec](docs/skill_manifest_spec.md). Skills are built-in guidance to read. |
 | Trust | Safe, Work mode, Builder and Full Mac govern access. Full Mac grants autonomy; macOS privacy permission resets still ask the owner. Peer-steered turns retain extra approval boundaries, except for authenticated agents enabled in Trust → Connected agents; ordinary Trust and domain checks still apply. |
 | Inner life | Settings controls reflection, dreams and memory in replies; Diagnostics exposes cognition and organism state. |
 

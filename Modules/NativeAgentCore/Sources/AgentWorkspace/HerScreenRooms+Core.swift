@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+// Blueprint: | `HerScreenRooms+Core.swift` | `HerScreen`: `familyRoom`, `coreAction`, `coreProjection` |
 
 /// Families on her screen (2026-09-24, tool discovery). Every capability is a
 /// name she can open, the way a person opens an app: home's PLACES lists the
@@ -21,10 +22,6 @@ extension HerScreen {
         .init(name: "contacts", about: "people in Contacts", tools: ["contacts_"]),
         .init(name: "notes", about: "Apple Notes", tools: ["notes_"]),
         .init(name: "music", about: "Music: playing, library, playlists", tools: ["music_"]),
-        .init(name: "markets", about: "quotes and watchlists", tools: ["market_", "tradingview_"]),
-        .init(name: "x", about: "X (Twitter)", tools: ["x_"]),
-        .init(name: "slack", about: "Slack", tools: ["slack_"]),
-        .init(name: "notion", about: "Notion", tools: ["notion_"]),
         .init(name: "clipboard", about: "the Mac clipboard", tools: ["clipboard_"]),
         .init(name: "images", about: "make a picture", tools: ["image_generate"]),
     ]
@@ -53,14 +50,15 @@ extension HerScreen {
                 + (args.optional.count > 4 ? " +\(args.optional.count - 4)" : "")
             let action = port.appAction(schema.name)
             rows.append("    " + clip((action.map { "app " + $0 } ?? schema.name) + " · " + needs + also, 100))
-            let example = args.required.isEmpty ? "{}" : "{" + args.required.map { "\"\($0)\":…" }.joined(separator: ",") + "}"
+            let schemaValue = try JSONValue.parse(schema.parametersJSON)
+            let example = try ToolSignature.example(schemaValue, name: "args").serialize(pretty: false)
             verbs.append((action.map { "app {\"action\":\"\($0)\",\"args\":\(example)}" } ?? schema.name + " " + example, "one call"))
         }
         if tools.count > shown.count {
             rows.append("+\(tools.count - shown.count) more · app {\"find\":\"\(family.name)\"}")
         }
-        return screen([family.name.uppercased(), family.about, tools.isEmpty ? "not available here" : "\(tools.count) things to do"],
-            [tools.isEmpty ? ["none of its tools are on in this session (a connection or a Trust setting is off)"] : rows],
+        return screen([family.name.uppercased(), family.about, tools.isEmpty ? "not available here" : "\(tools.count) actions"],
+            [tools.isEmpty ? ["no actions from this family are exposed in this session"] : rows],
             verbs: verbs.isEmpty ? [("home", "back to your home screen")] : verbs)
     }
 }
@@ -71,12 +69,12 @@ extension HerScreen {
 /// is app {find}; there is no tools room.
 extension HerScreen {
     static let coreDestinations: [AgentWorkspaceDestination] = [
-        .init(id: "notify", title: "Notify", summary: "Send a notification to this Mac or to the paired phone. Both send at once; nothing is read here.",
+        .init(id: "notify", title: "Notify", summary: "Send a notification now to this Mac or the paired phone; no read.",
               tool: nil, tools: ["mac_notify", "mobile_notify"]),
-        .init(id: "status", title: "Status", summary: "How the app and its links are doing: the doctor check, Telegram, this Mac. Recent turns and the time are app trace.recent and app time.now.",
+        .init(id: "status", title: "Status", summary: "Health: doctor, Telegram, Mac. Turns: app {action:\"trace.recent\"}; time: app {action:\"time.now\"}.",
               tool: nil, tools: ["system_info"]),
         // A room, not a tool listing (walk 4: "1 things to do"). Nothing is read until a verb asks.
-        .init(id: "activity", title: "Activity", summary: "Which Mac apps were in use, and for how long, from the on-device activity record. Nothing is read until you ask.",
+        .init(id: "activity", title: "Activity", summary: "On-device app use and duration; read only when asked.",
               tool: nil, tools: ["activity_query"]),
     ]
 

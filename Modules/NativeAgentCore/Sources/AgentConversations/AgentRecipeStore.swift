@@ -3,13 +3,14 @@ import Experiences
 import NativeAgentCore
 import os
 import PersistenceCore
+// Blueprint: | `AgentRecipeStore.swift` | `AgentRecipeStore` enum: one recipe per agent host under agents/recipes/, seeded from the host tables and bundled `Resources/grok-routine.json` through the existing authored-field-preserving merge, read by `AgentHostDirectory.rows`, and one per A2A contact under its id (`AgentHostRow.A2A`, `recipe(for:)` seeds a missing one on the spot); `grokRoutine(dataRoot:)` rereads the editable Grok navigation file at each setup under the store/file locks; `load`, `recipe`, `launch` (Trust's reader), `read`/`write` (the door's, one shape check, under the file lock; write can create a new host.id without overwriting existing bytes), `learn` (a dry run's findings, source "learned"), `dryRun` |
 
 /// HOW THIS APP REACHES EACH AGENT, as files she can read and fix.
 ///
 /// One recipe per agent host under agents/recipes/<host-id>.json: the row
 /// every connect, send and health check reads (`AgentHostDirectory.rows`),
 /// with its launch line, search paths and window labels; and one per A2A
-/// contact under its id, its card. The Swift tables are only the seed. A
+/// contact under its id, its card. Host tables and bundled JSON are seeds. A
 /// missing file is seeded at version 1; later seeds update only fields still
 /// owned by the seed. Authored fields survive every update. A host no table
 /// knows loads from its file alone.
@@ -55,6 +56,31 @@ public enum AgentRecipeStore {
     public static var rows: [AgentHostRow] { recipes.map(\.host) }
 
     public static func recipe(_ id: String) -> Recipe? { withLoaded { $0.recipes.first { $0.host.id == id } } }
+
+    /// Setup reads her current file, including a hand edit, under the same
+    /// store/file locks as recipe writes. No asynchronous snapshot can publish
+    /// over this read. Navigation data never contains credential operations.
+    public static func grokRoutine(dataRoot: URL) throws -> AgentHostRow.GrokRoutine {
+        try loaded.withLock { state in
+            var current = state ?? scan(dataRoot)
+            defer { state = current }
+            let file = folder(dataRoot).appendingPathComponent("grok-bot.json")
+            guard current.root.standardizedFileURL == dataRoot.standardizedFileURL else {
+                throw ShapeError(description: "The loaded agent recipes belong to a different data root")
+            }
+            return try CredentialFileLock.withLock(file) {
+                let recipe = try validated(file: file)
+                guard recipe.host.id == "grok-bot", let routine = recipe.host.grokRoutine else {
+                    throw ShapeError(description: "host.grokRoutine is missing from \(file.path)")
+                }
+                if let index = current.recipes.firstIndex(where: { $0.host.id == recipe.host.id }) {
+                    current.recipes[index] = recipe
+                } else { current.recipes.append(recipe) }
+                current.problems[recipe.host.id] = nil
+                return routine
+            }
+        }
+    }
 
     /// An A2A contact's recipe. A missing file is seeded now
     /// (`AgentHostDirectory.seed`); one that is there and does not read as a
@@ -150,7 +176,7 @@ public enum AgentRecipeStore {
                     return .object(["status": .string("written"), "changed": .bool(true), "host": .string(id),
                         "recipe_version": .int(1), "host_digest": .string(saved.hostDigest), "path": .string(file.path),
                         "undo_unavailable": .string("This new recipe has no previous version; its file is \(file.path).")])
-                } } catch { return refused("write_failed", "\(file.path) could not be written: \(error.localizedDescription).") }
+                } } catch { return writeFailed(file: file, previous: nil, error: error) }
             }
             let file = folder(state.root).appendingPathComponent(id + ".json")
             let previous = folder(state.root).appendingPathComponent(id + ".previous.json")
@@ -193,7 +219,7 @@ public enum AgentRecipeStore {
                     if let restored { receipt["restored_version"] = .int(Int64(restored)) }
                     return .object(receipt)
                 }
-            } catch { return refused("write_failed", "\(file.path) could not be written: \(error.localizedDescription).") }
+            } catch { return writeFailed(file: file, previous: previous, error: error) }
         }
     }
 
@@ -215,7 +241,7 @@ public enum AgentRecipeStore {
                     state.recipes[index] = saved
                     return .success(saved)
                 }
-            } catch { return .failure(ShapeError(description: "\(file.path) could not be written: \(error.localizedDescription)")) }
+            } catch { return .failure(ShapeError(description: "Recipe save failed: \(error.localizedDescription). \(file.path) or \(previous.path) may have changed; inspect both files on disk before another write.")) }
         }.get()
     }
 
@@ -236,6 +262,15 @@ public enum AgentRecipeStore {
 
     private static func refused(_ reason: String, _ detail: String) -> JSONValue {
         .object(["status": .string("failed"), "reason": .string(reason), "changed": .bool(false), "detail": .string(detail + " Nothing was written.")])
+    }
+
+    private static func writeFailed(file: URL, previous: URL?, error: Error) -> JSONValue {
+        .object(["status": .string("failed"), "reason": .string("write_failed"), "changed": .null,
+            "effects": .string("unknown"), "path": .string(file.path), "previous": previous.map { .string($0.path) } ?? .null,
+            "detail": .string("Recipe save failed: \(error.localizedDescription). The recipe\(previous == nil ? "" : " or its previous-version backup") may have changed."),
+            "remedy": Repair.reconcile(instruction: "Inspect the recipe and any previous-version file on disk before another write; ask the person to resolve the reported storage failure, preserving every version.",
+                nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("files.read"),
+                    "args": .object(["path": .string(file.path)])])]))])
     }
 
     private static func unknown(_ host: String, _ state: Loaded) -> JSONValue {
@@ -269,10 +304,23 @@ public enum AgentRecipeStore {
         let folder = folder(root)
         let order = AgentHostDirectory.seed.map(\.id)
         let build = NativeAgentBuildIdentity.current
-        for host in AgentHostDirectory.seed + peers.map(AgentHostDirectory.seed) {
+        var hosts = AgentHostDirectory.seed + peers.map(AgentHostDirectory.seed)
+        var seedProblems: [String: String] = [:]
+        do {
+            guard let file = Bundle.module.url(forResource: "grok-routine", withExtension: "json") else {
+                throw ShapeError(description: "The bundled grok-routine.json seed is missing; tell the person this copy of NativeAgent is missing its Grok navigation seed")
+            }
+            let routine = try JSONValue.parse(Data(contentsOf: file)).decodedExactly(as: AgentHostRow.GrokRoutine.self)
+            if let index = hosts.firstIndex(where: { $0.id == "grok-bot" }) { hosts[index].grokRoutine = routine }
+        } catch {
+            seedProblems["grok-bot"] = "Grok Bot's navigation seed could not be read: \(error.localizedDescription)"
+            // Do not seed a missing/invalid shipped recipe over her saved one.
+            hosts.removeAll { $0.id == "grok-bot" }
+        }
+        for host in hosts {
             seed(host, in: folder, from: "\(build.version) (\(build.build))")
         }
-        var recipes: [Recipe] = [], problems: [String: String] = [:]
+        var recipes: [Recipe] = [], problems = seedProblems
         for name in (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [] where name.hasSuffix(".json") {
             let id = String(name.dropLast(5))
             // <id>.previous.json is the version a write replaced, kept for undo.
@@ -286,7 +334,7 @@ public enum AgentRecipeStore {
             problems[id] = "agents/recipes/\(name) doesn't read as a recipe: \(why). Write its whole recipe with "
                 + "agent.recipe_write, which keeps this file as \(id).previous.json; until then this app doesn't know \(id)."
             owe(root, id: id, file: folder.appendingPathComponent(name), words: problems[id]!,
-                recipe: (AgentHostDirectory.seed + peers.map(AgentHostDirectory.seed)).first { $0.id == id })
+                recipe: hosts.first { $0.id == id })
         }
         // The table's order first, as `AgentHostDirectory.row(named:)` always matched.
         recipes.sort { (order.firstIndex(of: $0.host.id) ?? order.count, $0.host.id) < (order.firstIndex(of: $1.host.id) ?? order.count, $1.host.id) }

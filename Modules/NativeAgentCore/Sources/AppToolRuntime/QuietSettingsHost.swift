@@ -4,6 +4,7 @@ import PersistenceCore
 import NativeAgentShared
 import ProviderRouting
 import TrustCenter
+// Blueprint: | `QuietSettingsHost.swift` | `QuietSettingsHost` protocol; `saveChatBrainDefaultsFailure`, `saveMacControlPolicy` |
 
 /// The settings page's observed values and existing UI write actions.
 @MainActor
@@ -12,6 +13,7 @@ public protocol QuietSettingsHost: AnyObject {
     var trustPolicy: TrustPolicy? { get }
     var personality: PersonalityProfile? { get }
     var dreamError: String? { get }
+    var makeShelfFault: String? { get }
     var chatModel: String { get set }
     var chatReasoningEffort: String { get set }
     var chatFastMode: Bool { get set }
@@ -22,6 +24,7 @@ public protocol QuietSettingsHost: AnyObject {
     func saveChatBrainDefaultsFailure() async -> String?
     func saveMacControlPolicy(
         _ policy: TrustMacControlPolicy,
+        comparedTo baseline: TrustMacControlPolicy,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)?
     ) async throws -> TrustPolicy
     func applySavedTrustPolicy(_ policy: TrustPolicy, status: String)

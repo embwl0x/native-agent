@@ -1,6 +1,7 @@
 import NativeAgentCore
 import Foundation
 import PersistenceCore
+// Blueprint: | `OrganismPredictionModels.swift` | `OrganismPredictionKind` enum |
 
 public enum OrganismPredictionKind: String, Codable, Sendable, Equatable, CaseIterable {
     case toolCompletion

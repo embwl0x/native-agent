@@ -7,6 +7,7 @@ import UIKit
 import NativeAgentShared
 #if canImport(CloudKit)
 import CloudKit
+// Blueprint: | `NativeAgentMobileApp.swift` | `NativeAgentMobileApp` struct |
 #endif
 
 extension Notification.Name {
@@ -277,7 +278,7 @@ struct NativeAgentMobileApp: App {
     @State private var foregroundRefreshPairing: Data?
 
     private func refreshOnForeground() {
-        PhoneTurnActivity.shared.resume()
+        PhoneTurnActivity.shared.resumeWorkActivities()
         guard pairingStore.usesICloudTransport else { return }
         let pairing = pairingStore.iCloudPairingSecret
         guard foregroundRefreshTask == nil || foregroundRefreshPairing != pairing else { return }
@@ -320,7 +321,7 @@ struct NativeAgentMobileApp: App {
                             // waiting for the user to notice and retry.
                             bridgeClient.onNetworkPathRestored = { [weak chatStore = chatStore] in
                                 chatStore?.recoverQueuedSendTransport()
-                                PhoneTurnActivity.shared.resume()
+                                PhoneTurnActivity.shared.resumeWorkActivities()
                             }
                             iCloudBridge.shared.onTransportSucceeded = { [weak chatStore = chatStore] in
                                 chatStore?.recoverQueuedSendTransport()
@@ -460,7 +461,7 @@ struct NativeAgentMobileApp: App {
         // status when paired but the bridge has been offline for >30 s.
         bridgeClient.pairingStore = pairingStore
         PhonePlaces.shared.resume()
-        PhoneTurnActivity.shared.resume()
+        PhoneTurnActivity.shared.resumeWorkActivities()
         // Use iCloud when either the paired flag is set OR the HMAC secret is present
         // (the secret survives app reinstalls and Skip flows via Keychain).
         if pairingStore.usesICloudTransport {

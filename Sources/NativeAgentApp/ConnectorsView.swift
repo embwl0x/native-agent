@@ -1,4 +1,3 @@
-import Cognition
 import EngineRuntime
 import SwiftUI
 import AppKit
@@ -7,19 +6,19 @@ import ScreenCaptureKit
 import ScreenVision
 import Speech
 import AVFoundation
-import EventKit
 import UniformTypeIdentifiers
 import NativeAgentShared
 import NativeAgentCore
 import MemoryV2
 import PersistenceCore
 import Connectors
-import ChatOrchestration
+import ProviderRouting
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
 #if canImport(CloudKit)
 import CloudKit
+// Blueprint: | `ConnectorsView.swift` | `ConnectorsView` struct: engine connector projection for the secrets the keyring keeps (name, where each may go, account, when granted; Remove after a confirmation) and the built-in accounts |
 #endif
 
 enum ConnectorUIState: Equatable {
@@ -268,7 +267,6 @@ enum WorkspaceAddOutcome: Equatable {
 
 struct ConnectorsView: View {
     @Environment(AppModel.self) private var appModel
-    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     private var workspaceName: String {
         get { appModel.editDraft("workspace:new:workspaceName", seed: "") }
         nonmutating set { appModel.setEditDraft(newValue, for: "workspace:new:workspaceName") }
@@ -283,18 +281,16 @@ struct ConnectorsView: View {
     }
     @State private var workspaceQuery = ""
     @State private var workspaceSearchState: SharedFolderSearchState = .notSearched
+    @State private var workspaceRead = LatestRead()
     // PATCH-2026-05-07: connector-wizard-b ConnectorWizard sheet per card
     @State private var wizardPresentation = ConnectorWizardPresentationState()
     @State private var connectorStatusMessage: ConnectorsStatusMessagePresentation.Message?
     @State private var isAddingWorkspace = false
-    @State private var checkedAccounts: Result<[ConnectorRecord], Error> = .success([])
-    @State private var accountsGeneration = 0
+    @State private var removingSecret: String?
 
     var body: some View {
-        // Screenshot hosts suppress liveTask, so their first render reads the same checked records.
-        let checked = quietOffscreenRead
-            ? Result { try ConnectorStatusProjection.checkedConnectorRecords(root: appModel.engine.dataRoot, platform: AppConnectorStatusPlatform()) }
-            : checkedAccounts
+        let checked = appModel.engine.connectors.accounts
+        let secrets = appModel.engine.connectors.secrets
         let accountsReadFailed = if case .failure = checked { true } else { false }
         let registryRowsForDisplay = registryRowsForDisplay((try? checked.get()) ?? [])
         ScrollView {
@@ -304,6 +300,25 @@ struct ConnectorsView: View {
                         text: connectorStatusMessage.text,
                         color: statusColor(for: connectorStatusMessage.tone)
                     )
+                }
+
+                AdvancedSection(title: "Secrets", card: .bare) {
+                    switch secrets {
+                    case nil:
+                        EmptyView()
+                    case .failure(let error)?:
+                        ConnectorsCard {
+                            ConnectorsNote(text: "I couldn't read the keyring: \(error.localizedDescription)", color: NativeAgentShell.trouble)
+                        }
+                    case .success(let kept)? where kept.isEmpty:
+                        ConnectorsCard {
+                            ConnectorsNote(text: "No secrets kept yet.", color: NativeAgentShell.secondary)
+                        }
+                    case .success(let kept)?:
+                        AliveGroupCard {
+                            ForEach(kept, id: \.name) { secretRow($0) }
+                        }
+                    }
                 }
 
                 AdvancedSection(title: "Accounts", card: .bare) {
@@ -335,12 +350,12 @@ struct ConnectorsView: View {
                 }
 
                 AdvancedSection(title: "Folders I may open", card: .bare) {
-                    if appModel.workspaces.isEmpty {
+                    if appModel.engine.connectors.workspaces.isEmpty {
                         ConnectorsCard {
                             ConnectorsNote(
-                                text: appModel.panelRefreshStatus[.connectors] == nil
+                                text: appModel.engine.connectors.workspaceSnapshot == nil && appModel.engine.connectors.workspacesReadError == nil
                                     ? "Shared folders haven't loaded yet. Choose Refresh to load them."
-                                    : appModel.panelRefreshStatus[.connectors]?.failedEndpoints.contains("shared folders") == true
+                                    : appModel.engine.connectors.workspacesReadError != nil
                                         ? "Shared folders could not be refreshed. Try Refresh to load them."
                                         : "No folder is shared yet. Add one below and I can read the files in it.",
                                 color: NativeAgentShell.secondary
@@ -348,7 +363,7 @@ struct ConnectorsView: View {
                         }
                     } else {
                         AliveGroupCard {
-                            ForEach(appModel.workspaces) { workspace in
+                            ForEach(appModel.engine.connectors.workspaces) { workspace in
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(workspace.name)
                                         .font(ShellType.rowTitle)
@@ -375,29 +390,34 @@ struct ConnectorsView: View {
             .padding(.bottom, 32)
         }
         .navigationTitle("Connectors")
+        .quietReadTask(live: false) { await appModel.engine.connectors.refresh(quiet: true) }
         .liveTask {
             await appModel.refreshForSidebarItem(.connectors)
-            let root = appModel.engine.dataRoot
-            let credentials = ["github", "slack", "notion", "gmail", "calendar", "x", "email"].flatMap { id in
-                ["oauth_tokens/\(id).json", "connectors/\(id)/auth.json", "connectors/\(id)/oauth_app.json"].map { root.appendingPathComponent($0) }
-            }
-            await EventDeadlinePhysiology.refreshOnChanges(paths: [ConnectorStatusProjection.connectorRegistryPath(root: root),
-                ConnectorProofLedger.receiptsPath(root: root)] + credentials +
-                ["telegram/config.json", "research/config.json", "slack/config.json", "slack/state.json",
-                 "slack", "connectors/slack/save_intent.json"].map { root.appendingPathComponent($0) },
-                notifications: [NSApplication.didBecomeActiveNotification, .NSSystemClockDidChange, .EKEventStoreChanged]) {
-                await refreshAccounts()
-            }
+            await appModel.engine.connectors.observe()
         }
         .pageActions {
             Button(accountsReading ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise") {
                 Task {
                     await appModel.refreshForSidebarItem(.connectors)
-                    await refreshAccounts()
                 }
             }
             .accessibilityLabel("Refresh connectors")
             .disabled(accountsReading)
+        }
+        .confirmationDialog("Remove \(removingSecret ?? "")?", isPresented: Binding(
+            get: { removingSecret != nil }, set: { if !$0 { removingSecret = nil } }
+        ), titleVisibility: .visible) {
+            Button("Remove", role: .destructive) {
+                guard let name = removingSecret else { return }
+                Task {
+                    do { try await Keyring.forget(name) } catch {
+                        connectorStatusMessage = .init(text: "\(name) could not be removed: \(error.localizedDescription)", tone: .failure)
+                    }
+                    await appModel.engine.connectors.refresh()
+                }
+            }
+        } message: {
+            Text("What uses it stops reaching where it went until it is granted again.")
         }
         // PATCH-2026-05-07: connector-wizard-b Sheet for ConnectorWizardView
         .sheet(
@@ -419,15 +439,29 @@ struct ConnectorsView: View {
         }
     }
 
-    private func refreshAccounts() async {
-        accountsGeneration &+= 1
-        let generation = accountsGeneration
-        let root = appModel.engine.dataRoot
-        let checked = await Task.detached(priority: .userInitiated) {
-            Result { try ConnectorStatusProjection.checkedConnectorRecords(root: root, platform: AppConnectorStatusPlatform()) }
-        }.value
-        guard !Task.isCancelled, generation == accountsGeneration else { return }
-        checkedAccounts = checked
+    /// One kept secret: its name, where it may go, its account and when it
+    /// was granted. Never its value.
+    private func secretRow(_ entry: ConnectorStatusProjection.SecretMetadata) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(entry.name)
+                .font(ShellType.rowTitle)
+                .foregroundStyle(NativeAgentShell.text)
+            Text("May go to " + (entry.hosts + entry.programs.map(\.path)).joined(separator: ", "))
+                .font(ShellType.rowDetail)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 12) {
+                if let account = entry.account { Text("Account \(account)") }
+                Text("Granted \(entry.at.formatted(date: .abbreviated, time: .omitted))")
+                Spacer(minLength: 8)
+                Button("Remove") { removingSecret = entry.name }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+            .font(ShellType.caption)
+            .foregroundStyle(NativeAgentShell.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var shareFolderSection: some View {
@@ -542,14 +576,19 @@ struct ConnectorsView: View {
         let query = workspaceQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !workspaceSearchState.isSearching, !query.isEmpty else { return }
         workspaceSearchState = .searching
+        _ = await workspaceRead.read({ () async -> Result<WorkspaceSearchResponse, Error> in
+            do { return Result.success(try await ConnectorRegistryActions.searchWorkspace(query: query, root: appModel.engine.dataRoot)) }
+            catch { return .failure(error) }
+        }, publish: { result in
         do {
-            let response = try await ConnectorRegistryActions.searchWorkspace(query: query, root: appModel.engine.dataRoot)
+            let response = try result.get()
             appModel.statusText = "Workspace search found \(response.results.count)"
             workspaceSearchState = .completed(response)
         } catch {
             appModel.setFailureStatus(error, action: "search the workspace")
             workspaceSearchState = .failed
         }
+        })
     }
 
 
@@ -743,7 +782,6 @@ struct ConnectorsView: View {
     static func plainDescription(_ connector: ConnectorRecord) -> String {
         switch connector.id {
         case "shortcuts": "Run Apple Shortcuts for Desk tasks, Diagnostics, status, and chat."
-        case "agentmail": "My own email inbox. I can read and search it, and send mail from it."
         case "telegram": "Talk with me from Telegram. Only people and group chats you approve can message me, and everyone in an approved group can."
         case "browser": "I browse in a window you can watch, and keep a record of what I looked at."
         case "local_files": "Folders you have approved as workspaces, which I can search and read."

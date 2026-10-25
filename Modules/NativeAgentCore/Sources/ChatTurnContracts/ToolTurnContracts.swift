@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ToolTurnContracts.swift` | `ToolDispatchClient`: `dispatch`, `listAvailableTools`, `listAvailableToolSchemas` |
 
 public protocol ToolDispatchClient: Sendable {
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue

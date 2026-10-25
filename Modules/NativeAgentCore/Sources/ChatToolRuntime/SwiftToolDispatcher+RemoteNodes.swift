@@ -2,6 +2,7 @@ import Foundation
 import MacControl
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SwiftToolDispatcher+RemoteNodes.swift` | `SwiftToolDispatcher`: `impl_remote_node_list`, `impl_remote_node_execute` |
 
 extension SwiftToolDispatcher {
     func impl_remote_node_list() async throws -> JSONValue {

@@ -4,6 +4,8 @@ import ChatToolRuntime
 import NativeAgentCore
 import SwiftUI
 
+// Blueprint: | `InlineCard.swift` | Inline card view family: shared visual grammar and action closures for needs, approvals and receipts; no store or work lifecycle ownership |
+
 /// The inline card family — one grammar for every moment where Agent needs the
 /// person before she can carry on: a connection, a permission, a model choice,
 /// an API key, a capability, a plain decision, an approval, and the receipt a
@@ -131,7 +133,7 @@ extension InlineCardModel {
         switch state {
         case .settled: return .done
         case .declined: return .declined
-        case .failed, .unknown: return .unknown
+        case .failed, .stopped, .unknown: return .unknown
         case .pending, .running, .superseded: return .done
         }
     }
@@ -418,7 +420,7 @@ struct InlineCardBusyLine: View {
     var body: some View {
         HStack(spacing: NativeAgentSpacing.sm) {
             ProgressView().controlSize(.small).scaleEffect(0.7).frame(width: 14, height: 14)
-            Text(text).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary)
+            Text(text).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).textSelection(.enabled)
         }
     }
 }
@@ -655,7 +657,7 @@ struct InlineCardView: View {
         switch model.state {
         case .pending, .running:
             liveCard.transition(.identity)
-        case .failed:
+        case .failed, .stopped:
             failedCard.transition(.identity)
         case .settled, .declined, .unknown:
             receipt.transition(.identity)
@@ -683,6 +685,8 @@ struct InlineCardView: View {
                 if model.state == .running && !collectsInput {
                     runningRow
                 } else {
+                    // What a running sign-in asks of the person (a device code) shows beside its fields too.
+                    if model.state == .running, let note = model.busyNote { InlineCardBusyLine(text: note) }
                     InlineCardActions(
                         primary: model.state == .running
                             ? (model.busyLabel ?? primaryLabel) : primaryLabel,
@@ -747,7 +751,7 @@ struct InlineCardView: View {
                 }
                 if model.canRetry {
                     InlineCardActions(
-                        primary: "Try again",
+                        primary: model.state == .stopped ? "Resume" : "Try again",
                         primaryEnabled: primaryEnabled,
                         secondary: model.secondaryLabel,
                         consequence: model.consequence,

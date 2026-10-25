@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `CognitiveSubstrate+ConversationalAppraisal.swift` | `CognitiveSubstrate`: `relationalWarmthBoost`, `isUserAuthored`, `conversationalAppraisal` |
 
 extension CognitiveSubstrate {
     /// Relational-warmth signal for the affect layer. Returns >0 ONLY on genuine

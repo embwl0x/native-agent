@@ -2,24 +2,21 @@ import Foundation
 import MacControl
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `HerScreenRooms+Build.swift` | `HerScreen`: `buildRoom`, `buildTarget`, `buildRecordRoom` |
 
-/// Her-screen rooms for files, code and GitHub (2026-09-24). Each opens by
-/// name (`files`, `code`, `github`) as a short text room, and its rows and
-/// verbs act by name (`files.3`, `github.2.files`, `code.diff`). Only local,
-/// cheap reads: the workspace folder's newest files, one `git status` and
-/// `git log` on the source checkout, the builder's own audit receipts, and
-/// the GitHub tracker's last saved snapshot. No network; nothing on home.
+/// Her-screen rooms for files and code (2026-09-24). Each opens by name
+/// (`files`, `code`) as a short text room, and its rows and verbs act by name
+/// (`files.3`, `code.diff`). Only local, cheap reads: the workspace folder's
+/// newest files, one `git status` and `git log` on the source checkout, and
+/// the builder's own audit receipts. No network; nothing on home.
 enum AgentWorkspaceBuild {
     static let destinations: [AgentWorkspaceDestination] = [
         .init(id: "code", title: "Code", summary: "The source checkout: branch, changes, commits and recent builder runs.",
               tool: nil, tools: ["git_diff", "git_log", "shell", "swift_build"]),
-        .init(id: "github", title: "GitHub", summary: "Tracked repositories and their open pull requests and issues.",
-              tool: nil, tools: ["github_read_repository_content", "github_get_pull_request", "github_project_digest"]),
     ]
 
     /// Reads these rooms' names open; each is the owner's ordinary tool.
-    static let readTools: Set<String> = ["git_diff", "git_log", "clipboard_read", "github_get_pull_request", "github_get_issue",
-                                         "github_pull_request_files", "github_pull_request_activity", "github_read_repository_content", "github_search"]
+    static let readTools: Set<String> = ["git_diff", "git_log", "clipboard_read"]
 }
 
 extension HerScreen {
@@ -27,7 +24,6 @@ extension HerScreen {
         switch location {
         case .area("files"): return filesRoom(dataRoot: dataRoot, now: now)
         case .area("code"): return await codeRoom(dataRoot: dataRoot, now: now)
-        case .area("github"): return githubRoom(dataRoot: dataRoot, now: now)
         default: return nil
         }
     }
@@ -35,7 +31,7 @@ extension HerScreen {
     /// A name from these rooms to its action, or nil.
     static func buildTarget(_ name: String, dataRoot: URL) -> Target? {
         let parts = name.split(separator: ".").map(String.init)
-        guard parts.count >= 2, ["files", "code", "github", "clipboard"].contains(parts[0]) else { return nil }
+        guard parts.count >= 2, ["files", "code", "clipboard"].contains(parts[0]) else { return nil }
         func read(_ tool: String, _ input: [String: JSONValue], _ title: String, text: String? = nil) -> Target {
             .action(.perform(tool: tool, input: input, title: title, textField: text, isEffect: false))
         }
@@ -50,9 +46,6 @@ extension HerScreen {
         case ("code", "diff", 2): return read("git_diff", [:], "Uncommitted changes")
         case ("code", "log", 2): return read("git_log", ["limit": .int(10)], "Recent commits")
         case ("code", "run", 2): return effect("shell", [:], "Run in the source checkout", text: "cmd")
-        case ("github", "read", 2): return read("github_read_repository_content", [:], "Read from GitHub", text: "repo")
-        case ("github", "search", 2): return read("github_search", ["sort": .string("created"), "order": .string("desc")], "Search GitHub", text: "query")
-        case ("github", "refresh", 2): return effect("github_project_digest", ["refresh": .bool(true)], "Refresh GitHub")
         default: break
         }
         guard let n = Int(parts[1]), parts.count <= 3 else { return nil }
@@ -65,32 +58,20 @@ extension HerScreen {
             default: return nil
             }
         }
-        // Tracker keys read "owner/name#pr#12" or "owner/name#issue#12".
-        if parts[0] == "github", let key = withNames(dataRoot, { $0.id("github", n) }) {
-            let bits = key.split(separator: "#").map(String.init)
-            guard bits.count == 3, let number = Int(bits[2]) else { return nil }
-            let target: [String: JSONValue] = ["repo": .string(bits[0]), "number": .int(Int64(number))]
-            let pr = bits[1] == "pr"
-            switch verb {
-            case nil: return read(pr ? "github_get_pull_request" : "github_get_issue", target, "\(bits[0])#\(number)")
-            case "files" where pr: return read("github_pull_request_files", target, "Files of \(bits[0])#\(number)")
-            case "activity" where pr: return read("github_pull_request_activity", target, "Activity on \(bits[0])#\(number)")
-            default: return nil
-            }
-        }
         return nil
     }
 
     // MARK: Reads as rooms
 
-    /// A read opened from a room (a file, a Mac look, a memory, a skill, a
-    /// saved reply, commits, a pull request, app activity, the app's
+    /// A read opened from a room (a file, a Mac look, a memory, a
+    /// saved reply, commits, app activity, the app's
     /// settings), laid out like the other rooms: header, its text or rows
     /// with an honest count, and the owner's own verbs under the name it was
     /// listed as (`files.3.add`, `replies.2.follow`). Nil leaves the old view.
-    static func buildRecordRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, dataRoot: URL, issue: String?) -> String? {
+    static func buildRecordRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, dataRoot: URL, issue: String?) async -> String? {
         guard case .record(let tool, let input, let title) = location, let value, let room = family(tool, input: input, dataRoot: dataRoot) else { return nil }
-        let projection = AgentWorkspaceProjection.project(location: location, result: value)
+        if let issue { return screen([room.uppercased(), "read incomplete"], [[issue]], verbs: []) }
+        let projection = await AgentWorkspaceProjection.project(location: location, result: value, dataRoot: dataRoot)
         let object: [String: JSONValue] = if case .object(let row) = value { row } else { [:] }
         func text(_ value: JSONValue?) -> String? {
             switch value {
@@ -115,21 +96,6 @@ extension HerScreen {
             let commits = rowsOf(object["commits"])
             rows = commits.map { pad(text($0["hash"]) ?? "", 11) + pad(String((text($0["date"]) ?? "").prefix(16)), 18) + clip(text($0["subject"]) ?? "", 80) }
             header = ["COMMITS", "\(commits.count) newest"]; label = "LOG"
-        case "github_get_pull_request", "github_get_issue":
-            let item: [String: JSONValue] = if case .object(let row)? = object["pullRequest"] ?? object["issue"] { row } else { [:] }
-            func sub(_ key: String, _ field: String) -> String? { if case .object(let row)? = item[key] { text(row[field]) } else { nil } }
-            let facts: [String?] = [
-                text(item["state"]).map { "state     " + $0 + (item["merged"] == .bool(true) ? " (merged)" : "") },
-                sub("user", "login").map { "author    " + $0 },
-                sub("head", "ref").map { "branch    " + $0 + (sub("base", "ref").map { " → " + $0 } ?? "") },
-                text(object["reviewState"]).map { "reviews   " + $0 },
-                text(item["changed_files"]).map { "changes   " + $0 + " files, +" + (text(item["additions"]) ?? "0") + " −" + (text(item["deletions"]) ?? "0") },
-                text(item["updated_at"]).map { "updated   " + $0 },
-                text(item["html_url"]).map { "link      " + $0 },
-            ]
-            rows = facts.compactMap { $0 }
-            if let words = text(item["body"]), !words.isEmpty { rows += [""] + words.split(separator: "\n").prefix(12).flatMap { wrap(String($0)) } }
-            header = [clip(text(item["title"]) ?? title, 60), room]; label = "ITEM"; body = nil
         case "activity_query":
             // Seconds per app over the range, busiest first.
             var seconds: [String: Double] = [:]
@@ -195,7 +161,7 @@ extension HerScreen {
     }
 
     /// The name a read shows under: the family's list name plus the number
-    /// it was listed as (`files.3`, `skills.5`, `github.1`), or the bare
+    /// it was listed as (`files.3`, `replies.5`), or the bare
     /// family when it was reached some other way. Never mints a number.
     private static func family(_ tool: String, input: [String: JSONValue], dataRoot: URL) -> String? {
         // The newest number minted for this read is the one its list row
@@ -212,14 +178,8 @@ extension HerScreen {
         let path: String? = if case .string(let text)? = input["path"] { text } else { nil }
         switch tool {
         case "read_file": return path.map { path in listed("file", "files") { $0 == path } } ?? "files"
-        case "read_skill": return listed("item.skills", "skills", sameRead)
         case "shelf_entry": return listed("item.replies", "replies", sameRead)
         case "recall_memory": return input["memory_id"] == nil ? "memory" : listed("item.memory", "memory", sameRead)
-        case "github_get_pull_request", "github_get_issue":
-            let repo: String = if case .string(let text)? = input["repo"] { text.lowercased() } else { "" }
-            let number: String = switch input["number"] { case .int(let n)?: String(n); case .string(let s)?: s; default: "" }
-            let kind = tool == "github_get_pull_request" ? "pr" : "issue"
-            return listed("github", "github") { $0 == "\(repo)#\(kind)#\(number)" }
         case "git_log": return "code"
         case "screen": return "mac"
         case "activity_query": return "activity"
@@ -250,20 +210,21 @@ extension HerScreen {
         let root = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot).standardizedFileURL
         let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey, .isDirectoryKey]
         var files: [(path: String, at: Date, size: Int)] = [], seen = 0, visited = 0
+        var scanNote = "up to 3 folders deep"
         if let walk = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys,
                                                      options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
             for case let url as URL in walk {
                 visited += 1
-                if visited > 20_000 { seen = max(seen, 4000); break }
+                if visited > 20_000 { scanNote += " · 20,000-entry limit reached"; break }
                 guard let values = try? url.resourceValues(forKeys: Set(keys)) else { continue }
                 if values.isDirectory == true { if walk.level >= 3 { walk.skipDescendants() }; continue }
                 guard values.isRegularFile == true else { continue }
                 seen += 1
                 files.append((url.standardizedFileURL.path, values.contentModificationDate ?? .distantPast, values.fileSize ?? 0))
-                if seen >= 4000 { break }
+                if seen >= 4000 { scanNote += " · 4,000-file limit reached"; break }
             }
         }
-        // Real files first; stubs under 256 bytes (test fixtures) get one short line.
+        // Size is evidence of size alone; small files are not necessarily stubs.
         let newest = files.sorted { $0.at > $1.at }
         let recent = newest.filter { $0.size >= 256 }.prefix(8), tiny = newest.filter { $0.size < 256 }
         func row(_ book: inout NameBook, _ file: (path: String, at: Date, size: Int)) -> (name: String, shown: String) {
@@ -279,8 +240,8 @@ extension HerScreen {
                 return pad(name, 10) + pad(size(file.size), 8) + clip(shown, 60)
             } + (tiny.count > 3 ? ["+\(tiny.count - 3) more under 256 B"] : []))
         }
-        return screen(["FILES", clip(root.path, 60), seen >= 4000 ? "4000+ files" : "\(seen) file\(seen == 1 ? "" : "s")"],
-            [section("RECENT", rows.isEmpty ? ["nothing in the workspace yet · files.new writes one"] : rows), section("TINY", stubs)],
+        return screen(["FILES", clip(root.path, 60), "\(seen) files found in scan"],
+            [[scanNote], section("RECENT", rows.isEmpty ? ["no files of 256 B or more found in this scan"] : rows), section("TINY", stubs)],
             verbs: [("files.N", "read it"), ("files.N.append", "add to its end (text)"), ("files.new", "write a new file (form)"),
                     ("files.find", "find a document by what it was for (text)"), ("clipboard.read", "what is on the clipboard"),
                     ("clipboard.copy", "put text on the clipboard (text)"), ("app files.list · files.grep", "any other folder, or inside files")])
@@ -337,63 +298,26 @@ extension HerScreen {
                   let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tool = row["toolName"] as? String, builder.contains(tool) else { return nil }
             let exit = row["exitCode"] as? Int ?? row["processExitCode"] as? Int
+            if row["timedOut"] as? Bool == true || exit != 0 {
+                var evidence = JSONValue(fromFoundation: row).objectValue ?? [:]
+                if evidence["status"] == nil {
+                    evidence["status"] = .string(row["reason"] as? String == "stopped" ? "cancelled" : row["timedOut"] as? Bool == true ? "timeout" : "failed")
+                }
+                if evidence["reason"] == nil { evidence["reason"] = .string(exit == nil ? "builder_exit_unrecorded" : "builder_exit_nonzero") }
+                evidence["detail"] = .object(["exit_code": exit.map { .int(Int64($0)) } ?? .null,
+                    "timed_out": evidence["timedOut"] ?? .null,
+                    "stderr": evidence["stderr"] ?? .null, "stdout": evidence["stdout"] ?? .null])
+                if evidence["effects"] == nil { evidence["effects"] = .string("unknown") }
+                if evidence["remedy"] == nil {
+                    evidence["remedy"] = Repair.reconcile(instruction: "Read the build receipt and fix its reported cause before another execution; effects are unverified.",
+                        nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("files.read"), "args": .object(["path": .string(url.path)])])]))
+                }
+                return pad(age(now.timeIntervalSince(at)), 6) + pad(tool, 8) + failureFace(.object(evidence))
+            }
             let mark = row["timedOut"] as? Bool == true ? "✗ timed out" : exit == 0 ? "✓" : "✗ exit \(exit.map(String.init) ?? "?")"
             let what = row["sourcePayload"] as? String ?? (row["args"] as? [String])?.joined(separator: " ") ?? ""
             return pad(age(now.timeIntervalSince(at)), 6) + pad(mark, 4) + pad(tool, 8) + clip(what, 60)
         }
         return rows.isEmpty ? ["no builder runs yet"] : Array(rows.prefix(4))
-    }
-
-    // MARK: GitHub
-
-    /// The tracker's saved view (connectors/github): repos and open items.
-    private static func githubRoom(dataRoot: URL, now: Date) -> String {
-        func object(_ path: String) -> [String: Any] {
-            (try? Data(contentsOf: dataRoot.appendingPathComponent(path)))
-                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
-        }
-        let config = object("connectors/github/tracking.json"), snapshot = object("connectors/github/tracking_snapshot.json")
-        let repos = (config["repositories"] as? [[String: Any]] ?? []).compactMap { $0["fullName"] as? String }
-        let open = (snapshot["entities"] as? [[String: Any]] ?? []).filter { ($0["state"] as? String ?? "open") == "open" && $0["key"] is String }
-        let ordered = open.sorted {
-            let a = ($0["needsUser"] as? Bool == true || $0["blocked"] as? Bool == true ? 1 : 0, $0["updatedAt"] as? String ?? "")
-            let b = ($1["needsUser"] as? Bool == true || $1["blocked"] as? Bool == true ? 1 : 0, $1["updatedAt"] as? String ?? "")
-            return a > b
-        }
-        let person = names(dataRoot).person
-        let rows: [String] = withNames(dataRoot) { book in
-            ordered.prefix(8).map { item in
-                let n = book.number("github", id: item["key"] as? String ?? "") { Set(open.compactMap { $0["key"] as? String }) }
-                let repo = (item["repository"] as? String ?? "").split(separator: "/").last.map(String.init) ?? ""
-                var state = [item["kind"] as? String == "pull_request" ? "PR" : "issue"]
-                if item["needsUser"] as? Bool == true { state.append("needs " + person) }
-                if item["blocked"] as? Bool == true { state.append("blocked") }
-                if let at = (item["updatedAt"] as? String).flatMap(date) { state.append(age(now.timeIntervalSince(at))) }
-                return pad("github.\(n)", 11) + clip("\(repo)#\(item["number"] as? Int ?? 0) \(item["title"] as? String ?? "")", 56)
-                    + " · " + state.joined(separator: " · ")
-            }
-        }
-        // Each repo with its open count, busiest first: "only one on X" reads here.
-        var counts: [String: Int] = [:]
-        for item in open { counts[(item["repository"] as? String ?? "").lowercased(), default: 0] += 1 }
-        let short = repos.sorted { counts[$0.lowercased(), default: 0] > counts[$1.lowercased(), default: 0] }.map { repo in
-            (repo.split(separator: "/").last.map(String.init) ?? repo) + " \(counts[repo.lowercased(), default: 0])"
-        }
-        // The tracker keeps pull requests (and issues their bodies link); say so.
-        let prsOnly = !open.contains { $0["kind"] as? String != "pull_request" }
-        let refreshed = (snapshot["refreshedAt"] as? String).flatMap { text in
-            date(text) ?? date(text.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression))
-        }
-        var header = ["GITHUB"]
-        if repos.isEmpty && open.isEmpty { header.append("nothing tracked yet · github.refresh") }
-        else { header += ["\(repos.count) repo\(repos.count == 1 ? "" : "s")", "\(open.count) open" + (prsOnly ? " PRs · issues not tracked" : "")] }
-        if let refreshed { header.append("saved " + age(now.timeIntervalSince(refreshed)) + " ago") }
-        return screen(header,
-            [section("OPEN", rows.isEmpty ? ["no open pull requests or issues saved"] : rows + (open.count > 8 ? ["+\(open.count - 8) more · github.search finds any"] : [])),
-             section("OPEN BY REPO", short.isEmpty ? [] : [clip(short.prefix(10).joined(separator: " · ") + (short.count > 10 ? " · +\(short.count - 10) with none" : ""), 110)])],
-            verbs: [("github.N", "open it: state, reviews, checks"), ("github.N.files", "a PR's changed files"),
-                    ("github.N.activity", "a PR's comments and reviews"), ("github.read", "a repo file or folder (text: owner/name or link)"),
-                    ("github.search", "issues or PRs live (text: repo:owner/name is:issue is:open)"),
-                    ("github.refresh", "re-read the saved list from GitHub and update the Desk")])
     }
 }

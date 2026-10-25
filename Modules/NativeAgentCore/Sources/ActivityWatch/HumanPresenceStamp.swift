@@ -1,6 +1,7 @@
 import PersistenceCore
 import Foundation
 import NativeAgentCore
+// Blueprint: | `HumanPresenceStamp.swift` | `HumanPresenceStamp` enum; durable present/away crossings at `ActivityWatchPaths.presenceTransitionURL`, shared with the scheduler through `transitionURL` |
 
 /// Publishes present/away crossings for the trigger scheduler without app metadata.
 public enum HumanPresenceStamp {

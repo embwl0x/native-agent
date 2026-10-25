@@ -2,6 +2,7 @@ import NativeAgentCore
 import Privacy
 import Foundation
 import PersistenceCore
+// Blueprint: | `InboxPushNotifier.swift` | `AttentionRouter.notifyIfAttentionWorthy`: severity and live-root notification routing |
 
 extension AttentionRouter {
     public func notifyIfAttentionWorthy(

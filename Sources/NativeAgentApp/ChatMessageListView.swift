@@ -2,7 +2,6 @@ import EngineRuntime
 import MultimodalTTS
 import Transcripts
 import SwiftUI
-import ImageIO
 import AppKit
 import CoreGraphics
 import ScreenCaptureKit
@@ -14,12 +13,14 @@ import NativeAgentShared
 import MemoryV2
 import PersistenceCore
 import TurnTrace
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatSessionWork
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
 #if canImport(CloudKit)
 import CloudKit
+// Blueprint: | `ChatMessageListView.swift` | Windowed transcript interleaves HerScreen other-room exchanges from the contact projection; rows open the sidebar's contact thread; attachments use transcript-owned previews |
 #endif
 
 // PATCH-2026-05-08: wave2-chat-ux — groups consecutive tool messages into collapsible stacks
@@ -133,7 +134,7 @@ enum InlineCardMount {
         return built
     }
 
-    /// Assistant row id → the tool rows whose cards mount under it.
+    /// Assistant row id → ordinary tool rows whose cards mount under it.
     static func hosts(groups: [MessageGroup]) -> [String: [String]] {
         var hosts: [String: [String]] = [:]
         for (index, group) in groups.enumerated() where group.isToolGroup {
@@ -144,7 +145,7 @@ enum InlineCardMount {
                   reply.role == "assistant",
                   isReadableReply(reply.content)
             else { continue }
-            hosts[reply.id, default: []].append(contentsOf: group.messages.map(\.id))
+            hosts[reply.id, default: []].append(contentsOf: group.messages.filter { $0.metadata?.interactionMirror == nil }.map(\.id))
         }
         return hosts
     }
@@ -198,29 +199,8 @@ enum ChatAttachmentPresentation {
     }
 }
 
-/// The visible state for an image attachment that was persisted with a local
-/// path. A load failure is distinct from the short loading placeholder: a
-/// transcript must not silently turn an unreadable image into a blank bubble.
+/// The unavailable label for an image projected by the transcript owner.
 enum ChatLocalImageAttachmentPresentation {
-    enum State: Equatable {
-        case loading
-        case loaded
-        case unavailable
-    }
-
-    static func state(
-        path: String?,
-        hasLoadedImage: Bool,
-        loadFailed: Bool
-    ) -> State {
-        let hasPath = path?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .isEmpty == false
-        guard hasPath else { return .unavailable }
-        if hasLoadedImage { return .loaded }
-        return loadFailed ? .unavailable : .loading
-    }
-
     static func unavailableDetail(for attachment: PersistedAttachment) -> String {
         let name = attachment.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !name.isEmpty { return name }
@@ -488,6 +468,7 @@ struct ChatMessageListView: View {
     @State private var pageAnchorID: String?
     @State private var pagedSearchID: String?
     @State private var revealedSessionId = ""
+    @State private var openedContact: AgentContactPresentation?
     private struct Revision: Equatable, Sendable {
         let sessionId: String
         let version: UInt64
@@ -583,6 +564,11 @@ struct ChatMessageListView: View {
         VStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
             transcriptRows
         }
+        .sheet(item: $openedContact) { contact in
+            SimpleContactThread(contact: contact, store: appModel.engine.contactThreads) { openedContact = nil }
+                .frame(minWidth: 600, minHeight: 500)
+        }
+        .onAppear { appModel.engine.contactThreads.start() }
         .task(id: PreparationKey(revision: revision, count: messages.count, lastID: messages.last?.id)) {
             let revision = revision
             let messages = messages
@@ -601,6 +587,16 @@ struct ChatMessageListView: View {
         let range = windowRange(for: allGroups)
         let hidden = range.lowerBound
         let groups = Array(allGroups[range])
+        let nextPageAt = range.upperBound < allGroups.count
+            ? allGroups[range.upperBound].messages.first.flatMap { UserDisplayFormatters.parseISOTimestamp($0.createdAt) } : nil
+        let exchanges = OtherRoomExchange.anchored(appModel.engine.contactThreads.otherRooms.filter { event in
+            event.sessionID != sessionId && nextPageAt.map { event.at < $0 } != false
+        },
+            to: groups.compactMap { group in
+                group.messages.first.flatMap { message in
+                    UserDisplayFormatters.parseISOTimestamp(message.createdAt).map { (id: group.id, at: $0) }
+                }
+            })
         // Prose first, card under it as the handle (Agent, 2026-09-13).
         // Computed once per transcript structure, never per streamed chunk.
         // The live tail: the final row, while this session is streaming into
@@ -622,6 +618,7 @@ struct ChatMessageListView: View {
             }
         }
         ForEach(groups) { group in
+            exchangeRows(exchanges[group.id] ?? [])
             if let gapAbove = group.gapAbove {
                 ChatQuietGapLine(date: gapAbove)
             }
@@ -632,10 +629,8 @@ struct ChatMessageListView: View {
                         InlineApprovalCard(message: msg)
                             .transcriptLayoutProbe(rowID: msg.id, kind: .approval)
                             .readingBlock(msg.id)
-                    } else if let mirrored = msg.metadata?.interactionMirror {
-                        // A card raised in another thread, answered here on the original.
-                        InteractionInboxCard(mirrorOf: .init(sessionID: mirrored.sessionID,
-                                                             interactionID: mirrored.interactionID))
+                    } else if msg.metadata?.interactionMirror != nil {
+                        InlineCardsForRow(rowID: msg.id)
                             .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
                             .transcriptLayoutProbe(rowID: msg.id, kind: .approval)
                             .readingBlock(msg.id)
@@ -644,13 +639,13 @@ struct ChatMessageListView: View {
                             .transcriptLayoutProbe(rowID: msg.id, kind: .toolRow)
                             .readingBlock(msg.id)
                     }
-                    // 0.4.12 cards round: an interaction that blocks this tool
+                    // An ordinary interaction that blocks this tool
                     // row appears HERE, under the row it belongs to, and never
                     // in a modal — unless the turn left a reply, in which case
                     // the card mounts under her words instead. With nothing
                     // injected this renders nothing and the transcript is
                     // exactly as it was.
-                    if !relocatedRows.contains(msg.id) {
+                    if msg.metadata?.interactionMirror == nil, !relocatedRows.contains(msg.id) {
                         ReadingCards(rowID: msg.id)
                     }
                 } else {
@@ -699,6 +694,7 @@ struct ChatMessageListView: View {
         .onChange(of: revealedSessionId == sessionId && pageAnchorID != nil, initial: true) { _, pagedBack in
             onPagedBackChange?(pagedBack)
         }
+        exchangeRows(exchanges[""] ?? [])
         if range.upperBound < allGroups.count {
             HStack {
                 Button("Later messages") {
@@ -716,6 +712,21 @@ struct ChatMessageListView: View {
             .font(ShellType.label)
             .foregroundStyle(NativeAgentShell.secondary)
             .padding(.vertical, 8)
+        }
+    }
+
+    private func exchangeRows(_ exchanges: [OtherRoomExchange]) -> some View {
+        ForEach(exchanges) { exchange in
+            Button {
+                openedContact = appModel.engine.contactThreads.contacts.first { $0.id == exchange.contactID }
+            } label: {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(exchange.title)
+                    Text(exchange.subtitle).foregroundStyle(.secondary)
+                }.font(.callout).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .disabled(!appModel.engine.contactThreads.contacts.contains { $0.id == exchange.contactID })
         }
     }
 }
@@ -942,113 +953,6 @@ enum ChatParagraphGap {
         }
         cache.insertIfAbsent(out, for: key)
         return out
-    }
-}
-
-// Process-local, pixel-budgeted image storage. File identity invalidates rewrites;
-// read and bounded decode run together off the UI actor.
-final class ChatImageCache: @unchecked Sendable {
-    static let shared = ChatImageCache()
-
-    private let cache = NSCache<NSString, NSImage>()
-    /// ~96 MB of decoded pixels. Well under what a chat with a few screenshots
-    /// needs, and `NSCache` also evicts under memory pressure on its own.
-    private static let byteBudget = 96 * 1024 * 1024
-
-    private init() {
-        cache.totalCostLimit = Self.byteBudget
-    }
-
-    /// Identity of the file at `url` — nil when it cannot be stat'd (the caller
-    /// then skips the cache entirely rather than caching under a guessed key).
-    /// Safe to call off the main actor.
-    static func identityKey(for url: URL) -> String? {
-        // stat-strength identity (gpt-5.5 wave-2 NEEDS_FIX): Date+size
-        // misses a same-second or metadata-preserving rewrite; dev+inode+
-        // size+mtime_ns matches the Desk/transcript memo stamps.
-        var info = stat()
-        guard stat(url.path, &info) == 0 else { return nil }
-        return "\(url.path)|\(info.st_dev)|\(info.st_ino)|\(info.st_size)|\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec)"
-    }
-
-    static func image(forKey key: String) -> NSImage? {
-        shared.cache.object(forKey: key as NSString)
-    }
-
-    static func store(_ image: NSImage, forKey key: String) {
-        shared.cache.setObject(image, forKey: key as NSString, cost: pixelByteCost(image))
-    }
-
-    /// Decoded pixel bytes at 4 bytes/pixel. Prefers the largest bitmap rep's
-    /// true pixel dimensions (which differ from `size` on Retina assets); falls
-    /// back to point size for vector/unknown reps. Floored at 1 so a degenerate
-    /// image can never be a zero-cost entry that `NSCache` keeps forever.
-    static func pixelByteCost(_ image: NSImage) -> Int {
-        var pixels = 0
-        for rep in image.representations {
-            pixels = max(pixels, rep.pixelsWide * rep.pixelsHigh)
-        }
-        if pixels == 0 {
-            pixels = Int(max(0, image.size.width) * max(0, image.size.height))
-        }
-        return max(1, pixels * 4)
-    }
-}
-
-/// The production image read/decode/cache seam used by transcript bubbles.
-/// It is synchronous by design so callers can move the whole disk operation
-/// off the render actor; it never fabricates a thumbnail when the bytes cannot
-/// be read or decoded.
-enum ChatLocalImageAttachmentLoader {
-    static func cachedImage(forKey key: String?) -> NSImage? {
-        guard let key else { return nil }
-        return ChatImageCache.image(forKey: key)
-    }
-
-    static func readData(at url: URL) -> Data? {
-        try? Data(contentsOf: url)
-    }
-
-    /// Longest side of a decoded transcript image, in pixels. The bubble shows
-    /// it in a 360 pt box, so 720 px is exactly 2× and sharp on every Mac
-    /// display; a 2560-wide screenshot decoded whole is 15 MB of pixels the
-    /// frame never shows. User, 2026-09-04: the transcript is a plain VStack
-    /// now, so every image row in a thread decodes at open; thirty screenshots
-    /// at 1440 px measured 141 MB of raster, at 720 px a quarter of that.
-    static let maxDecodedPixelSize = 720
-
-    static func decode(_ data: Data, cacheKey: String?) -> NSImage? {
-        guard let image = decodeBounded(data) ?? NSImage(data: data) else { return nil }
-        if let key = cacheKey { ChatImageCache.store(image, forKey: key) }
-        return image
-    }
-
-    /// Decodes through ImageIO at `maxDecodedPixelSize`, keeping the point size
-    /// the full image would have had so layout does not move. Returns nil when
-    /// ImageIO cannot read the bytes, and the caller falls back to `NSImage`.
-    private static func decodeBounded(_ data: Data) -> NSImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              CGImageSourceGetCount(source) > 0,
-              let full = NSImage(data: data)
-        else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxDecodedPixelSize,
-        ]
-        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-        else { return nil }
-        return NSImage(cgImage: cg, size: full.size)
-    }
-
-    static func load(at url: URL) -> NSImage? {
-        let key = ChatImageCache.identityKey(for: url)
-        if let cached = cachedImage(forKey: key) {
-            return cached
-        }
-        guard let data = readData(at: url) else { return nil }
-        return decode(data, cacheKey: key)
     }
 }
 
@@ -1750,36 +1654,15 @@ private struct MessageAttachmentChipView: View {
 private struct MessageLocalImageAttachmentView: View {
     let attachment: PersistedAttachment
 
-    @State private var loadedImage: NSImage?
-    @State private var loadFailed = false
-
     private var imagePath: String? {
         guard let path = attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines),
               !path.isEmpty else { return nil }
         return path
     }
 
-    var body: some View {
-        // 2026-09-13: the load used to hang off the LOADING branch only, so it
-        // was torn down the moment the image arrived and re-armed whenever a
-        // re-render put the placeholder back — `closure #4 in
-        // MessageLocalImageAttachmentView.body` was 130 main-thread samples
-        // while clicking through the rail. One `.task` per attachment identity,
-        // on the row itself, runs once and stays run.
-        imageBody
-            .task(id: attachment.path) { await loadImage() }
-    }
-
     @ViewBuilder
-    private var imageBody: some View {
-        // 2026-07-21 audit: NSImage(contentsOfFile:) used to run synchronously
-        // in body on every re-render; the load is now cached in @State via .task.
-        let state = ChatLocalImageAttachmentPresentation.state(
-            path: imagePath,
-            hasLoadedImage: loadedImage != nil,
-            loadFailed: loadFailed
-        )
-        if state == .loaded, let image = loadedImage {
+    var body: some View {
+        if let png = attachment.preview?.png, let image = NSImage(data: png) {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFit()
@@ -1799,7 +1682,7 @@ private struct MessageLocalImageAttachmentView: View {
                         }
                     }
                 }
-        } else if state == .loading {
+        } else if attachment.preview == nil {
             Color.clear
                 .frame(width: 160, height: 120)
                 .overlay { ProgressView().controlSize(.small) }
@@ -1826,25 +1709,6 @@ private struct MessageLocalImageAttachmentView: View {
         }
     }
 
-    private func loadImage() async {
-        // The task now lives on the row, not on the placeholder, so a re-armed
-        // task must not redo a decode that already landed.
-        if loadedImage != nil { return }
-        guard let path = imagePath else {
-            loadFailed = true
-            return
-        }
-        let url = URL(fileURLWithPath: path)
-        let image = await Task.detached(priority: .userInitiated) {
-            ChatLocalImageAttachmentLoader.load(at: url)
-        }.value
-        guard !Task.isCancelled else { return }
-        guard let image else {
-            loadFailed = true
-            return
-        }
-        loadedImage = image
-    }
 }
 
 // PATCH-2026-05-09: chat-ux-polish — hover action bar shown on bubble hover
@@ -2034,13 +1898,51 @@ struct ChatPreparedContent: View {
 
     private var source: Source { Source(text: text, spacing: lineSpacing, proseOnly: proseOnly) }
 
+    /// A reply settles in the frame it finishes: an ordinary-sized text is
+    /// prepared here (cached), so this view never mounts empty. An empty first
+    /// frame collapsed the finished reply and jumped the transcript (User's
+    /// recording, 10-24). Long texts still prepare off the main thread.
+    init(text: String, lineSpacing: CGFloat, seatsRight: Bool = false, proseOnly: Bool = false) {
+        self.text = text
+        self.lineSpacing = lineSpacing
+        self.seatsRight = seatsRight
+        self.proseOnly = proseOnly
+        let source = Source(text: text, spacing: lineSpacing, proseOnly: proseOnly)
+        if text.utf8.count <= 24_000 {
+            _blocks = State(initialValue: Self.prepared(source))
+            _preparedSource = State(initialValue: source)
+        }
+    }
+
+    private final class PreparedBox { let blocks: [Block]; init(_ blocks: [Block]) { self.blocks = blocks } }
+    nonisolated(unsafe) private static let preparedCache: NSCache<NSString, PreparedBox> = {
+        let cache = NSCache<NSString, PreparedBox>()
+        cache.countLimit = 400
+        return cache
+    }()
+
+    nonisolated private static func prepared(_ source: Source) -> [Block] {
+        let key = "\(source.proseOnly ? 1 : 0)|\(source.spacing)|\(source.text)" as NSString
+        if let hit = preparedCache.object(forKey: key) { return hit.blocks }
+        let raw = source.proseOnly ? [.prose(source.text)] : ChatRichContentCache.blocks(source.text)
+        let blocks = raw.map { block -> Block in
+            switch block {
+            case .prose(let text): return .prose(segments(text, lineSpacing: source.spacing))
+            case .code(let language, let code): return .code(language, code)
+            }
+        }
+        preparedCache.setObject(PreparedBox(blocks), forKey: key)
+        return blocks
+    }
+
     var body: some View {
         // A real container, not a Group: the task below must have a host
         // while nothing is prepared yet, or it never runs and the text never
         // appears (a modifier on a Group goes to its children, and there are
         // none until preparation finishes).
         VStack(alignment: seatsRight ? .trailing : .leading, spacing: 0) {
-            if preparedSource == source {
+            // While a changed text prepares, the last prepared words stay up.
+            if preparedSource == source || !blocks.isEmpty {
                 if blocks.count == 1, case .prose(let segments) = blocks[0] {
                     proseSegments(segments)
                 } else {
@@ -2057,15 +1959,8 @@ struct ChatPreparedContent: View {
         }
         .task(id: source) {
             let source = source
-            let prepared = await Task.detached(priority: .userInitiated) {
-                let raw = source.proseOnly ? [.prose(source.text)] : ChatRichContentCache.blocks(source.text)
-                return raw.map { block -> Block in
-                    switch block {
-                    case .prose(let text): return .prose(Self.segments(text, lineSpacing: source.spacing))
-                    case .code(let language, let code): return .code(language, code)
-                    }
-                }
-            }.value
+            guard preparedSource != source else { return }
+            let prepared = await Task.detached(priority: .userInitiated) { Self.prepared(source) }.value
             guard !Task.isCancelled else { return }
             blocks = prepared
             preparedSource = source

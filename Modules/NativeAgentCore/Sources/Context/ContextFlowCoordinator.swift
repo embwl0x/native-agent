@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+// Blueprint: | `ContextFlowCoordinator.swift` | Immutable arena publication and trim rehydration; verification filters delivered items/pointers but retains selection-time receipt/budget and feedback IDs; compile/publication admission waits leave on cancellation or stop; stop invalidates candidates and separately drains entered publication before returning; feedback replay reused only for matching generation, events and decay bucket; SQLite retains derived generations and ranking events, while turn traces own displayed receipts |
 
 public enum ContextFlowMode: String, Codable, CaseIterable, Sendable {
     case off
@@ -144,11 +145,16 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     private var pendingProjectionReconciliationRequestIDs: [String: UInt64] = [:]
     private var pendingReconciliationReason = "source_change"
     private var publicationInProgress = false
-    private var publicationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var publicationWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    /// Stop drains an entered publisher even if its own caller is cancelled.
+    /// Admission waiters, in contrast, leave on cancellation or stop.
+    private var publicationDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    private var reconciliationClosed = false
+    private var lifecycleID: UInt64 = 0
     /// One compile at a time. A request arriving during one waits, and only
     /// the newest waiter compiles: an older one's commit would be refused.
     private var compileInProgress = false
-    private var compileWaiters: [CheckedContinuation<Void, Never>] = []
+    private var compileWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     /// Housekeeping rebuilds a turn requested or launch started; no turn awaits it.
     private var backgroundReconciliation: Task<Void, Never>?
     private var degradedSourceIDs: Set<ContextSourceID> = []
@@ -273,14 +279,18 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     public func start() async {
         guard !started else { return }
         started = true
+        reconciliationClosed = false
+        lifecycleID &+= 1
+        let lifecycleID = self.lifecycleID
         guard mode != .off else { return }
 
         let coalescer = ContextSourceEventCoalescer { [weak self] directories in
+            guard await self?.isCurrent(lifecycleID) == true else { return }
             await self?.reconcile(dirtyDirectories: directories)
         }
         self.coalescer = coalescer
         let monitor = ContextSourceMonitor { [weak self] event in
-            await self?.observe(event)
+            await self?.observe(event, lifecycleID: lifecycleID)
         }
         self.monitor = monitor
 
@@ -290,32 +300,55 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         // receipt until the first build publishes; none waits for it.
         do {
             if let published = try await store.loadActiveGeneration() {
+                guard isCurrent(lifecycleID) else { return }
+                guard await beginPublication(for: nextReconciliationRequestID) else { return }
+                defer { finishPublication() }
                 try await activate(published, projectionResults: [:])
             }
         } catch {
+            guard isCurrent(lifecycleID) else { return }
             lastError = "the published context generation could not be reopened: \(error)"
         }
+        guard isCurrent(lifecycleID) else { return }
         reconcileInBackground(reason: "launch")
         await restoreFeedbackEvents()
     }
 
     private func reconcileInBackground(reason: String) {
-        guard backgroundReconciliation == nil else { return }
+        guard !reconciliationClosed, backgroundReconciliation == nil else { return }
+        let lifecycleID = self.lifecycleID
         backgroundReconciliation = Task {
             await reconcileAll(reason: reason)
+            guard isCurrent(lifecycleID) else { return }
             await refreshWatchedDirectories()
-            if !Task.isCancelled { backgroundReconciliation = nil }
+            if isCurrent(lifecycleID) { backgroundReconciliation = nil }
         }
     }
 
     public func stop() async {
-        backgroundReconciliation?.cancel()
-        backgroundReconciliation = nil
-        await coalescer?.cancel()
+        // Close admission and invalidate compiled candidates before suspending.
+        // A publisher already inside the gate may finish, but replacement must
+        // not start until its durable and resident publications have drained.
+        reconciliationClosed = true
+        lifecycleID &+= 1
+        nextReconciliationRequestID &+= 1
+        started = false
+        resumeCompileWaiters()
+        resumePublicationWaiters()
+        let background = backgroundReconciliation
+        background?.cancel()
+        // Passive watches close before joining any entered reconciliation.
         await monitor?.stop()
+        await coalescer?.cancel()
+        await background?.value
+        backgroundReconciliation = nil
+        if publicationInProgress {
+            await withCheckedContinuation { publicationDrainWaiters.append($0) }
+        }
         coalescer = nil
         monitor = nil
-        started = false
+        pendingRegistrations.removeAll()
+        pendingProjectionReconciliationRequestIDs.removeAll()
         activeStoredGeneration = nil
         activeCompiledSources.removeAll()
         cachedFeedback = nil
@@ -323,9 +356,11 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     }
 
     public func reconcileAfterWake() async {
-        guard mode != .off else { return }
+        guard !reconciliationClosed, mode != .off else { return }
+        let lifecycleID = self.lifecycleID
         _ = try? arena.applyMemoryPressure(.normal)
         await reconcileAll(reason: "wake")
+        guard isCurrent(lifecycleID) else { return }
         await refreshWatchedDirectories()
     }
 
@@ -337,7 +372,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     /// on publication. Health is not a completion receipt: cancellation keeps
     /// health unchanged, and another request may publish while this one fails.
     public func reconcileSourceChanges(_ changes: [DerivedSourceChange]) async -> Bool {
-        guard mode != .off, !changes.isEmpty, !Task.isCancelled else { return false }
+        guard !reconciliationClosed, mode != .off, !changes.isEmpty, !Task.isCancelled else { return false }
+        let lifecycleID = self.lifecycleID
         let semanticChanges = changes.filter(\.semantic)
         let invalidatedProjectionIDs = Set(compiledProjectionProviders.compactMap { provider in
             semanticChanges.contains(where: provider.isInvalidated)
@@ -364,6 +400,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         }
         guard await refreshDiscoveredSources() else { return false }
         let all = await registry.allRegistrations()
+        guard isCurrent(lifecycleID) else { return false }
         let byID = Dictionary(uniqueKeysWithValues: all.map { ($0.descriptor.id.rawValue, $0) })
         var selected: [ContextSourceRegistration] = []
         var requiresFullReconciliation = false
@@ -400,6 +437,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 compiledProjectionIdentifiers: invalidatedProjectionIDs
             )
         }
+        guard isCurrent(lifecycleID) else { return false }
         await refreshWatchedDirectories()
         return completed && !Task.isCancelled
     }
@@ -499,7 +537,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             generation: generation
         )
         precoveredSourceIDs.formUnion(userPrecoverage.precoveredSourceIDs)
-        // Suppress only facts in the USER block actually carried this turn.
+        // Suppress only facts in the USER block actually carried this turn
+        // (its preamble in the stable segment, its pinned facts in the dynamic tail).
         // Persona USER atoms remain precovered: omitted facts must come from
         // their canonical memory sources, never from the generated document.
         if let user = mirror.documents.first(where: { $0.id.rawValue == "USER.md" }),
@@ -838,8 +877,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         }
     }
 
-    /// The body never speaks what its owner no longer stands behind: chosen
-    /// atoms that fail are dropped, and their receipts join the packet.
+    /// Excludes rejected items/pointers and adds verification notices. Selection
+    /// receipt and budget stay unchanged; outcome feedback retains the original IDs.
     private static func verified(
         _ packet: ContextPacket, by verifier: @Sendable ([ContextStoredAtom]) async -> ContextTurnExclusion,
         in generation: ContextStoredGeneration
@@ -967,16 +1006,20 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     }
 
     private func restoreFeedbackEvents() async {
+        let lifecycleID = self.lifecycleID
         cachedFeedback = nil
         do {
             let restored = try await store.recentFeedbackEvents(limit: 4_096)
-            feedbackEvents = restored
-            cachedFeedback = nil
+            guard isCurrent(lifecycleID) else { return }
             // Event IDs are ordinal-scoped. Retaining the current high-water
             // mark prevents a relaunch from overwriting a retained event.
-            feedbackOrdinal = try await store.feedbackEventOrdinalHighWaterMark()
+            let ordinal = try await store.feedbackEventOrdinalHighWaterMark()
+            guard isCurrent(lifecycleID) else { return }
+            feedbackEvents = restored
+            feedbackOrdinal = ordinal
             cachedFeedback = nil
         } catch {
+            guard isCurrent(lifecycleID) else { return }
             lastError = "context feedback restore failed: \(error)"
             diagnostics("[context-flow] \(lastError ?? "context feedback restore failed")")
         }
@@ -1316,39 +1359,47 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
 
     // MARK: - Event handling
 
-    private func observe(_ event: ContextDirectoryEvent) async {
-        if event.requiresRearm {
-            // Retire only the invalid descriptor; parents keep observing.
-            await monitor?.invalidateWatch(for: event.directory)
-        }
+    private func isCurrent(_ lifecycleID: UInt64) -> Bool {
+        self.lifecycleID == lifecycleID && !reconciliationClosed && !Task.isCancelled
+    }
+
+    private func observe(_ event: ContextDirectoryEvent, lifecycleID: UInt64) async {
+        guard isCurrent(lifecycleID) else { return }
         await coalescer?.enqueue(event.directory)
     }
 
     private func reconcile(dirtyDirectories: Set<URL>) async {
+        let lifecycleID = self.lifecycleID
         guard await refreshDiscoveredSources() else {
             await refreshWatchedDirectories()
             return
         }
-        guard !Task.isCancelled else { return }
+        guard isCurrent(lifecycleID) else { return }
         var affected: [ContextSourceRegistration] = []
         for directory in dirtyDirectories.sorted(by: { $0.path < $1.path }) {
             if let rows = try? await registry.registrations(affectedBy: directory) {
+                guard isCurrent(lifecycleID) else { return }
                 affected.append(contentsOf: rows)
             }
         }
+        guard isCurrent(lifecycleID) else { return }
         await reconcile(
             registrations: Self.unique(affected),
             reason: "directory_event",
             compiledProjectionIdentifiers: []
         )
+        guard isCurrent(lifecycleID) else { return }
         await refreshWatchedDirectories()
     }
 
     @discardableResult
     private func reconcileAll(reason: String) async -> Bool {
+        let lifecycleID = self.lifecycleID
         guard await refreshDiscoveredSources(), !Task.isCancelled else { return false }
+        let registrations = await registry.allRegistrations()
+        guard isCurrent(lifecycleID) else { return false }
         return await reconcile(
-            registrations: await registry.allRegistrations(),
+            registrations: registrations,
             reason: reason,
             compiledProjectionIdentifiers: Set(
                 compiledProjectionProviders.map(\.projectionIdentifier)
@@ -1362,7 +1413,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         reason: String,
         compiledProjectionIdentifiers: Set<String>
     ) async -> Bool {
-        guard mode != .off, !Task.isCancelled else { return false }
+        guard !reconciliationClosed, mode != .off, !Task.isCancelled else { return false }
         nextReconciliationRequestID &+= 1
         let requestID = nextReconciliationRequestID
         for registration in registrations {
@@ -1382,10 +1433,18 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         // Launch used to compile twice at once (start, and the memory
         // migration's invalidation). Pending demand accumulates, so the newest
         // request's one compile answers every request that waited for it.
-        while compileInProgress {
-            await withCheckedContinuation { compileWaiters.append($0) }
+        while compileInProgress, !reconciliationClosed, !Task.isCancelled {
+            let id = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    guard !Task.isCancelled else { continuation.resume(); return }
+                    compileWaiters[id] = continuation
+                }
+            } onCancel: {
+                Task { await self.cancelCompileWaiter(id) }
+            }
         }
-        guard requestID == nextReconciliationRequestID, !Task.isCancelled else { return false }
+        guard !reconciliationClosed, requestID == nextReconciliationRequestID, !Task.isCancelled else { return false }
         // A push's compiler may already have answered this flight's demand.
         if pendingRegistrations.isEmpty, pendingProjectionReconciliationRequestIDs.isEmpty {
             return activeStoredGeneration != nil
@@ -1421,7 +1480,15 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
 
     private func finishCompile() {
         compileInProgress = false
-        let waiters = compileWaiters
+        resumeCompileWaiters()
+    }
+
+    private func cancelCompileWaiter(_ id: UUID) {
+        compileWaiters.removeValue(forKey: id)?.resume()
+    }
+
+    private func resumeCompileWaiters() {
+        let waiters = Array(compileWaiters.values)
         compileWaiters.removeAll(keepingCapacity: true)
         for waiter in waiters {
             waiter.resume()
@@ -1430,13 +1497,21 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
 
     /// `stopWhenSuperseded`: a newer request has taken over this batch's
     /// demand and its commit would be refused, so stop between sources.
+    private func checkCandidateAdmission(_ requestID: UInt64, enabled: Bool) throws {
+        if enabled, reconciliationClosed || Task.isCancelled || requestID != nextReconciliationRequestID {
+            throw CancellationError()
+        }
+    }
+
     private func makeCandidate(
         for batch: ReconciliationBatch,
         compileFailures: inout [ContextSourceID: String],
         stopWhenSuperseded: Bool = false
     ) async throws -> ReconciliationCandidate {
+        try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
         // A failed arena publication can leave SQLite ahead of the resident body.
         let durableGeneration = try await store.activeGeneration()
+        try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
         let active: ContextStoredGeneration?
         let previousBySource: [ContextSourceID: ContextCompiledSource]
         if let retained = activeStoredGeneration, retained.generation.id == durableGeneration?.id {
@@ -1445,12 +1520,14 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         } else {
             if let durableGeneration {
                 active = try await store.loadGeneration(id: durableGeneration.id)
+                try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
             } else {
                 active = nil
             }
             previousBySource = Self.previousCompiledSources(active)
         }
         let authoritativeSources = await registry.authoritativeSourceIDsByOwner()
+        try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
         var changedSources: [ContextCompiledSource] = []
         // Discovery can remove a registration before this loop sees it.
         // Retire only sources whose owner explicitly supplied a complete
@@ -1464,7 +1541,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         var projectionResults: [String: ContextCompiledProjectionResult] = [:]
 
         for registration in batch.registrations {
-            if stopWhenSuperseded, batch.requestID != nextReconciliationRequestID { throw CancellationError() }
+            try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
             let sourceID = registration.descriptor.id
             if let currentIDs = authoritativeSources[registration.descriptor.owner],
                !currentIDs.contains(sourceID) {
@@ -1493,6 +1570,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     previous: previousBySource[sourceID],
                     updatedAt: updatedAt
                 )
+                try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
                 successfulSources[sourceID] = compiled
                 // 2026-09-22: an embedding-provider change leaves bytes
                 // (and so sourceHash) unchanged; without this the
@@ -1520,8 +1598,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         if !projectionIdentifiers.isEmpty {
             for provider in compiledProjectionProviders where
                 projectionIdentifiers.contains(provider.projectionIdentifier) {
-                if stopWhenSuperseded, batch.requestID != nextReconciliationRequestID { throw CancellationError() }
+                try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
                 let result = try await provider.compiledProjection(previousSources: previousBySource)
+                try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
                 projectionResults[provider.projectionIdentifier] = result
                 for source in result.changedSources {
                     if changedSources.contains(where: { $0.descriptor.id == source.descriptor.id }) {
@@ -1728,19 +1807,36 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     }
 
     private func beginPublication(for requestID: UInt64) async -> Bool {
-        while publicationInProgress {
-            await withCheckedContinuation { continuation in
-                publicationWaiters.append(continuation)
+        while publicationInProgress, !reconciliationClosed, !Task.isCancelled {
+            let id = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    guard !Task.isCancelled else { continuation.resume(); return }
+                    publicationWaiters[id] = continuation
+                }
+            } onCancel: {
+                Task { await self.cancelPublicationWaiter(id) }
             }
         }
-        guard requestID == nextReconciliationRequestID, !Task.isCancelled else { return false }
+        guard !reconciliationClosed, requestID == nextReconciliationRequestID, !Task.isCancelled else { return false }
         publicationInProgress = true
         return true
     }
 
     private func finishPublication() {
         publicationInProgress = false
-        let waiters = publicationWaiters
+        resumePublicationWaiters()
+        let drains = publicationDrainWaiters
+        publicationDrainWaiters.removeAll(keepingCapacity: true)
+        for drain in drains { drain.resume() }
+    }
+
+    private func cancelPublicationWaiter(_ id: UUID) {
+        publicationWaiters.removeValue(forKey: id)?.resume()
+    }
+
+    private func resumePublicationWaiters() {
+        let waiters = Array(publicationWaiters.values)
         publicationWaiters.removeAll(keepingCapacity: true)
         for waiter in waiters {
             waiter.resume()
@@ -1764,8 +1860,11 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     }
 
     private func refreshWatchedDirectories() async {
-        guard mode != .off else { return }
-        await monitor?.setDirectories(await registry.watchedDirectories())
+        let lifecycleID = self.lifecycleID
+        guard mode != .off, isCurrent(lifecycleID) else { return }
+        let directories = await registry.watchedDirectories()
+        guard isCurrent(lifecycleID) else { return }
+        await monitor?.setDirectories(directories)
     }
 
     /// Refresh failure must stop this reconciliation request. Continuing with
@@ -1773,12 +1872,15 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     /// for a new picker value and cause the app-side ordering fence to consider
     /// that value reconciled. The last good generation remains active instead.
     private func refreshDiscoveredSources() async -> Bool {
+        let lifecycleID = self.lifecycleID
+        guard isCurrent(lifecycleID) else { return false }
         do {
             try await mirrorProvider.refreshContextSources(in: registry)
-            return true
+            return isCurrent(lifecycleID)
         } catch is CancellationError {
             return false
         } catch {
+            guard isCurrent(lifecycleID) else { return false }
             lastError = String(describing: error)
             return false
         }

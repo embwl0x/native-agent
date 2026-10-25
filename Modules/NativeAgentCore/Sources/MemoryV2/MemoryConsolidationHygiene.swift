@@ -40,10 +40,10 @@
 
 import Foundation
 import ApprovalInbox
-import KnowledgeGraph
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `MemoryConsolidationHygiene.swift` | `MemoryConsolidationHygiene`: sole typed hygiene receipt reader/writer, including approved-swap reconciliation; `runOnce`, `lastRunPath` |
 
 // MARK: - Shared hygiene implementation
 
@@ -67,10 +67,9 @@ public enum MemoryConsolidationHygiene {
             ]
         }
         let consolidator = MemoryConsolidator(storage: storage)
-        // Honest-status fix (2026-07-24): consolidation is gated — it stages
-        // an approval card and never mutates the live store here. Surface the
-        // real outcome so the UI can say "queued for approval" instead of
-        // reporting planned counters as applied work.
+        // New consolidation work is staged for approval. The call may also
+        // backfill live tombstone vectors and apply previously approved swaps.
+        // Report the candidate's planned counters separately from applied work.
         let outcome = try await consolidator.consolidateGated()
         let report: ConsolidationReport
         var extra: [String: Any] = [:]
@@ -352,9 +351,8 @@ public enum MemoryConsolidationHygiene {
     }
 
     /// Live-memory fact list the KG GC reconciles against — same shape
-    /// KnowledgeGraphView+Maintenance.listGCFacts builds for the manual
-    /// sweep, so the hygiene-path GC and the button-path GC can never
-    /// drift on what "live" means.
+    /// KnowledgeGraphMaintenanceActions uses for the manual sweep, so the
+    /// hygiene-path GC and the button-path GC share what "live" means.
     static func listGCFacts(_ storage: MemoryStorage) async throws -> [KnowledgeGraphMemoryFact] {
         let mems = try await storage.listMemories(persona: nil, status: nil, limit: nil)
         return mems.map {
@@ -370,18 +368,52 @@ public enum MemoryConsolidationHygiene {
         }
     }
 
-    public static func write(_ report: MemoryHygieneReport, dataRoot: URL) throws {
+    /// One schema and file owner for hygiene and approved-swap health.
+    /// Included in memory backup/export and PrivacyMap; not phone-synced.
+    static func read(dataRoot: URL) throws -> MemoryHygieneReport? {
         let path = lastRunPath(dataRoot: dataRoot)
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(report).write(to: path, options: .atomic)
+        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        return try JSONDecoder().decode(MemoryHygieneReport.self, from: Data(contentsOf: path))
     }
 
-    /// Whole-second internet datetime — parseable by the plain
-    /// ISO8601DateFormatter() that readHygieneLastRun uses to compute
-    /// nextScheduled (fractional seconds would make that parse fail).
+    static func reconcileAppliedMaintenanceTruth(
+        dataRoot: URL, runId: String, status: String, at: String
+    ) {
+        guard status == "applied" || status == "applied_prior",
+              let appliedAt = MemoryConsolidationGate.parseISO8601(at) else { return }
+        do {
+            try CredentialFileLock.withLock(lastRunPath(dataRoot: dataRoot)) {
+                var report = try read(dataRoot: dataRoot) ?? MemoryHygieneReport()
+                if let existingAt = report.createdAt.flatMap(MemoryConsolidationGate.parseISO8601) {
+                    if existingAt > appliedAt { return }
+                    if existingAt == appliedAt, report.consolidationRunId != runId { return }
+                }
+                report.id = report.id ?? "consolidation-\(runId)"
+                report.status = "completed"
+                report.reason = status == "applied_prior"
+                    ? "approved consolidation was already applied and its projections were reconciled"
+                    : "approved consolidation applied and its projections were reconciled"
+                report.version = report.version ?? "swift-memory-v2-consolidator"
+                report.createdAt = at
+                report.nextScheduled = MemoryConsolidationGate.iso8601(appliedAt.addingTimeInterval(7 * 24 * 60 * 60))
+                report.consolidationRunId = runId
+                try write(report, dataRoot: dataRoot)
+            }
+        } catch {
+            nativeLog("consolidation health projection failed for %@: %@", runId, String(describing: error))
+        }
+    }
+
+    public static func write(_ report: MemoryHygieneReport, dataRoot: URL) throws {
+        let path = lastRunPath(dataRoot: dataRoot)
+        try CredentialFileLock.withLock(path) {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(report).write(to: path, options: .atomic)
+        }
+    }
+
+    /// The runner's report timestamp format; its schedule is written with it.
     private static func iso(_ date: Date) -> String {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]

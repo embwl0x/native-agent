@@ -4,6 +4,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+ThoughtSeeds.swift` | `CognitiveSubstrate`: `boundedThoughtSeedSources`, `addThoughtSeed`, `decayThoughtSeedsInMemory` |
 
 extension CognitiveSubstrate {
     static let thoughtSeedPriorityHalfLife: TimeInterval = 24 * 60 * 60
@@ -61,13 +62,15 @@ extension CognitiveSubstrate {
             materialProvenances: materialProvenances,
             marksSubstrateDirty: true,
             undoable: undoable
-        )
+        ).seed
     }
 
     /// The microcycle may synthesize a seed while settling the dirty state it
     /// already consumed. That internal mutation is persisted by the same cycle
     /// and must not manufacture another pending settle. All external callers use
     /// the public overload above and continue to mark the substrate dirty.
+    /// The returned revision belongs to this mutation, never a later writer
+    /// observed after suspension. A no-op returns no revision to roll back.
     func addThoughtSeed(
         kind: CognitiveThoughtSeedKind,
         text: String,
@@ -76,11 +79,13 @@ extension CognitiveSubstrate {
         sourcePeerIds: [String]? = nil,
         materialProvenances: [String] = [],
         marksSubstrateDirty: Bool,
-        undoable: Bool = false
-    ) async -> CognitiveThoughtSeed? {
-        guard configuration.enabled else { return nil }
+        undoable: Bool = false,
+        reflectionRequest: CognitiveReflectionRequest? = nil
+    ) async -> (seed: CognitiveThoughtSeed?, mutationRevision: UInt64?) {
+        if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return (nil, nil) }
+        guard configuration.enabled else { return (nil, nil) }
         let trimmed = bounded(text.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 240)
-        guard !trimmed.isEmpty, configuration.maximumThoughtSeeds > 0 else { return nil }
+        guard !trimmed.isEmpty, configuration.maximumThoughtSeeds > 0 else { return (nil, nil) }
         let now = dependencies.now()
         let key = thoughtSeedKey(kind: kind, text: trimmed)
         if let existingID = thoughtSeeds.values.first(where: { thoughtSeedKey(kind: $0.kind, text: $0.text) == key })?.id,
@@ -106,7 +111,7 @@ extension CognitiveSubstrate {
                 .suffix(Self.maximumThoughtSeedSourceIds))
             if existing.text == trimmed, mergedSources == existing.sourceNodeIds,
                mergedPeers == existing.sourcePeerIds, mergedMaterial == existing.materialProvenances {
-                return existing
+                return (existing, nil)
             }
             // Re-worded text (different wording, same family key) or genuinely
             // new evidence IS a new touch: materialize the priority that is
@@ -125,7 +130,7 @@ extension CognitiveSubstrate {
                 // The dirty microcycle folds this family into its one canonical
                 // cognition transaction. Do not open a competing SQLite write
                 // for the same transition.
-                return existing
+                return (existing, thoughtSeedRevision)
             }
             let revision = thoughtSeedRevision
             do {
@@ -135,11 +140,12 @@ extension CognitiveSubstrate {
                     thoughtSeeds = previous
                     thoughtSeedRevision &+= 1
                 }
-                return thoughtSeeds[existingID]
+                return (thoughtSeeds[existingID], nil)
             }
+            if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return (nil, nil) }
             if undoable { await recordUndo(key: "seed:\(existingID.uuidString)", what: "re-touched thought: \(existing.text)",
                              previous: before.toJSON(), stamp: Self.undoStamp(existing)) }
-            return existing
+            return (existing, revision)
         }
 
         let previous = thoughtSeeds
@@ -159,7 +165,7 @@ extension CognitiveSubstrate {
         enforceThoughtSeedCap(at: now)
         thoughtSeedRevision &+= 1
         if !marksSubstrateDirty {
-            return thoughtSeeds[seed.id]
+            return (thoughtSeeds[seed.id], thoughtSeedRevision)
         }
         let revision = thoughtSeedRevision
         do {
@@ -169,13 +175,14 @@ extension CognitiveSubstrate {
                 thoughtSeeds = previous
                 thoughtSeedRevision &+= 1
             }
-            return nil
+            return (nil, nil)
         }
+        if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return (nil, nil) }
         if undoable, thoughtSeeds[seed.id] != nil {
             await recordUndo(key: "seed:\(seed.id.uuidString)", what: "new thought: \(seed.text)",
                              previous: .null, stamp: Self.undoStamp(seed))
         }
-        return thoughtSeeds[seed.id]
+        return (thoughtSeeds[seed.id], revision)
     }
 
     /// Await-free maintenance primitive. The full maintenance pass folds this

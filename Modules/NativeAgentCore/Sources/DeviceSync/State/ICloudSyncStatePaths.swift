@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `ICloudSyncStatePaths.swift` | `ICloudSyncStatePaths` and bridge health reader: local sync bookkeeping paths and read-only live bridge health, without probing or sync authority |
+
 /// Read-only view of the running bridge. No probing, persisted mirror, or sync authority.
 public struct ICloudBridgeHealthSnapshot: Sendable {
     public enum Transport: Sendable { case cloudKit, iCloudDrive }

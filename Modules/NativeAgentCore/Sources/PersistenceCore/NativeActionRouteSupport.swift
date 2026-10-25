@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `NativeActionRouteSupport.swift` | `NativeActionRouteSupport` enum; `jsonValueBody`, `notImplemented` |
 
 public enum NativeActionRouteSupport {
     public static func jsonValueBody(_ body: [String: Any]) throws -> [String: JSONValue] {

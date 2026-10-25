@@ -3,6 +3,7 @@ import Foundation
 import PersistenceCore
 import Desk
 import NativeAgentShared
+// Blueprint: | `MacSyncEngine+NeedsUserNotify.swift` | `NeedsUserEdgeNotifier` actor; `evaluate`, `stableDigest` |
 
 // Needs-User edge notifier (User, 2026-07-12: "if she ever does turn to needs
 // User I should get an apns about it so I know").

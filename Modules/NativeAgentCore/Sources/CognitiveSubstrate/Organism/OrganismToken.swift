@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `OrganismToken.swift` | `OrganismToken` enum; `canonicalToken` |
 
 // Stable identifier normalization shared by field and prediction records.
 enum OrganismToken {

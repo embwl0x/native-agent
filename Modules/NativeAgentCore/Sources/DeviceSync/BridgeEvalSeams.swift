@@ -1,5 +1,8 @@
 import Foundation
+import DeviceSyncState
 import NativeAgentShared
+
+// Blueprint: | `BridgeEvalSeams.swift` | Bridge value policies: durable seen-ID bounds, incoming disposition, KVS keyspace/nudge admission and snapshot/inbox sweep plans |
 
 /// Bounded, durable replay-filter state shared by bridge lifecycles.
 enum ICloudSeenIDDefaultsStore {
@@ -155,7 +158,7 @@ enum MacSyncArchiveRetentionWatchPaths {
         guard let responsesDirectory, let transactionDirectory else { return [] }
         let rejected = inboxDirectory?.appendingPathComponent("_rejected", isDirectory: true)
         let paths = [inboxDirectory, responsesDirectory, rejected, transactionDirectory,
-                     dataRoot.appendingPathComponent("icloud/_rejected", isDirectory: true),
+                     ICloudSyncStatePaths.completedUnarchivedDirectory(dataRoot: dataRoot),
                      dataRoot.appendingPathComponent("icloud/chat_transactions", isDirectory: true)].compactMap { $0 }
         for path in paths {
             var isDirectory: ObjCBool = false

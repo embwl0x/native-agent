@@ -63,6 +63,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
 # shellcheck source=lib/development_bundle_signing.sh
 source "$ROOT/script/lib/development_bundle_signing.sh"
+source "$ROOT/script/lib/development_bundle_validation.sh"
 source "$ROOT/script/lib/release_symbols.sh"
 
 # Keep the installer's final signing identity aligned with build_and_run.sh.
@@ -84,47 +85,14 @@ APP_DEST="$HOME/Applications/$APP_NAME.app"
 FORCE_CHECKOUT_SWITCH="${FORCE_CHECKOUT_SWITCH:-0}"
 NATIVEAGENT_MAC_BUNDLE_ID="${NATIVEAGENT_MAC_BUNDLE_ID:-io.github.embwl0x.nativeagent.mac}"
 
-# 2026-07-21 audit: checkout-identity guard. The installed bundle's
-# Resources/REPO_PATH stamp names the checkout the app's data-root resolution
-# points at. Reinstalling from a DIFFERENT live clone/worktree would silently
-# restamp the installed bundle with this checkout's path and bounce the live
-# app onto a foreign data root. Refuse unless --force-checkout-switch; a stamp
-# naming a deleted checkout is not a conflict.
-if [[ "$FORCE_CHECKOUT_SWITCH" != "1" && -f "$APP_DEST/Contents/Resources/REPO_PATH" ]]; then
-    installed_repo_path="$(head -n 1 "$APP_DEST/Contents/Resources/REPO_PATH")"
-    if [[ -n "$installed_repo_path" && -d "$installed_repo_path" ]]; then
-        installed_repo_resolved="$(cd "$installed_repo_path" 2>/dev/null && pwd -P || true)"
-        root_resolved="$(cd "$ROOT" && pwd -P)"
-        if [[ -n "$installed_repo_resolved" && "$installed_repo_resolved" != "$root_resolved" ]]; then
-            echo "[install_app.sh] ERROR: the installed app belongs to a different checkout:" >&2
-            echo "  installed: $installed_repo_resolved" >&2
-            echo "  this run : $root_resolved" >&2
-            echo "Reinstalling would repoint the live app's data root and bounce it." >&2
-            echo "Pass --force-checkout-switch to switch the installed app to this checkout." >&2
-            exit 2
-        fi
-    fi
-fi
+# Installing always checks the live bundle's checkout before building its replacement.
+nativeagent_require_installed_checkout "$APP_DEST" "$ROOT" "$FORCE_CHECKOUT_SWITCH" \
+  "[install_app.sh]" "Reinstalling would repoint the live app's data root and bounce it."
 
 if [ "${NATIVE_AGENT_INSTALL_WITH_ST:-0}" = "1" ]; then
     echo "[install_app.sh] ERROR: NATIVE_AGENT_INSTALL_WITH_ST is retired. NativeAgent bundles zero Python; embeddings must use the Swift/CoreML path." >&2
     exit 2
 fi
-
-_assert_no_python_artifacts() {
-    local bundle="$1" hit
-    hit="$(find "$bundle/Contents/Resources" \
-        \( -type d \( -name python -o -name __pycache__ \) \
-           -o -type f \( -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o -name '*python*' \) \
-           -o -type l -name '*python*' \) \
-        -print -quit 2>/dev/null || true)"
-    if [[ -n "$hit" ]]; then
-        echo "[install_app.sh] ERROR: Python artifact present in app bundle: $hit" >&2
-        echo "[install_app.sh] NativeAgent install artifacts must be Swift-native and zero-Python." >&2
-        exit 1
-    fi
-}
-
 # Phase 11b: log rotation targets repo/data/logs/ (the authoritative live path).
 # The old DATA variable pointed at ~/Library/Application Support/NativeAgent which
 # is now only a legacy duplicate; rotating it was rotating empty/stale files.
@@ -292,7 +260,7 @@ fi
 # locate the source-tree persona/ directory at runtime.
 printf '%s\n' "$ROOT" > "$TEMP_BUNDLE/Contents/Resources/REPO_PATH"
 
-_assert_no_python_artifacts "$TEMP_BUNDLE"
+nativeagent_assert_no_python_artifacts "$TEMP_BUNDLE" "[install_app.sh]" present install
 
 # 3. Re-codesign with entitlements (on temp bundle before atomic swap). The
 # shared owner keeps this second pass identical to build_and_run.sh.
@@ -333,38 +301,53 @@ pkill -f "$APP_DEST/Contents/Resources/native_agentd.py" 2>/dev/null || true
 # recovery for a wedged/ignored quit request. 30s, not 15: a quit mid-turn
 # first waits up to 20s for the turn to finish (applicationShouldTerminate),
 # then the 3s drain.
-APP_PROCESS_PATTERN="$(printf '%s' "$APP_DEST/Contents/MacOS/NativeAgentApp" | sed 's/[][\.^$*+?(){}|]/\\&/g')([[:space:]].*)?"
+APP_EXECUTABLE_PATTERN="$(printf '%s' "$APP_DEST/Contents/MacOS/NativeAgentApp" | sed 's/[][\.^$*+?(){}|]/\\&/g')"
+APP_PROCESS_PATTERN="$APP_EXECUTABLE_PATTERN([[:space:]].*)?"
+APP_HELPER_PATTERN="^[0-9]+[[:space:]]+$APP_EXECUTABLE_PATTERN[[:space:]]+--nativeagent-(install-helper|relaunch-after-exit)([[:space:]]|$)"
+# The same executable also hosts detached helpers. They own installation or
+# relaunch across app exit, so every quit/wait/stop selects only app-mode PIDs.
+_nativeagent_app_pids() {
+  pgrep -flx "$APP_PROCESS_PATTERN" 2>/dev/null \
+    | grep -Ev "$APP_HELPER_PATTERN" \
+    | awk '{ print $1 }'
+}
 # Quit the running process itself, by pid. A quit addressed by name or bundle
 # path goes through LaunchServices, which can resolve it to another copy
 # (/Applications/NativeAgent.app) or to the dead unit a bundle swap leaves, so
 # the quit reached nothing and the app was force-stopped (2026-10-18: every
 # rollback SIGTERMed the replacement after a quit by name).
-_quit_nativeagent() { # $1 = pgrep -fx pattern for the executable
+_quit_nativeagent() {
   local pid
-  for pid in $(pgrep -fx "$1" 2>/dev/null); do
+  for pid in $(_nativeagent_app_pids); do
     osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSRunningApplication.runningApplicationWithProcessIdentifier($pid).terminate" >/dev/null 2>&1 || true
   done
 }
-_quit_nativeagent "$APP_PROCESS_PATTERN"
+_stop_nativeagent() {
+  local pid
+  for pid in $(_nativeagent_app_pids); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+}
+_quit_nativeagent
 quit_deadline=$((SECONDS + 30))
-while pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1 && (( SECONDS < quit_deadline )); do
+while _nativeagent_app_pids >/dev/null 2>&1 && (( SECONDS < quit_deadline )); do
   sleep 0.1
 done
-if pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
+if _nativeagent_app_pids >/dev/null 2>&1; then
   echo "[install_app.sh] graceful quit exceeded 30s; forcing NativeAgentApp stop"
   # Path-scoped: a bare `pkill -x` killed every NativeAgent on the Mac,
   # including the public test install and scratch walks (2026-09-15).
-  pkill -fx "$APP_PROCESS_PATTERN" 2>/dev/null || true
+  _stop_nativeagent
 fi
 # 2026-09-14: the new instance refuses to start while the old pid is still
 # exiting ("another NativeAgent instance is already running … exiting
 # duplicate"), and the readiness probe then times out and rolls back a good
 # build. Wait until the old process is actually gone before the swap/launch.
 gone_deadline=$((SECONDS + 15))
-while pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1 && (( SECONDS < gone_deadline )); do
+while _nativeagent_app_pids >/dev/null 2>&1 && (( SECONDS < gone_deadline )); do
   sleep 0.2
 done
-if pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
+if _nativeagent_app_pids >/dev/null 2>&1; then
   echo "[install_app.sh] ERROR: NativeAgentApp still running after forced stop; refusing to launch a duplicate." >&2
   exit 1
 fi
@@ -497,13 +480,13 @@ if [[ "$INSTALL_READY" == "1" ]]; then
 fi
 
 echo "[install_app.sh] replacement failed authenticated readiness verification." >&2
-_quit_nativeagent "$APP_PROCESS_PATTERN"
+_quit_nativeagent
 rollback_deadline=$((SECONDS + 5))
-while pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 \
+while _nativeagent_app_pids >/dev/null 2>&1 \
     && (( SECONDS < rollback_deadline )); do
   sleep 0.1
 done
-pkill -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" 2>/dev/null || true
+_stop_nativeagent
 if [[ -d "$APP_OLD" ]]; then
   FAILED_APP="${APP_DEST}.failed.$(date +%Y%m%d-%H%M%S)"
   mv "$APP_DEST" "$FAILED_APP"

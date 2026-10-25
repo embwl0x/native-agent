@@ -29,6 +29,9 @@ const MAX_SNAPSHOT_FRAMES = 64;
 // The relay admits at most 1,048,576 UTF-8 bytes including the response
 // envelope. Reserve headroom rather than relying on character/node counts.
 const MAX_SNAPSHOT_RESULT_BYTES = 1_000_000;
+// 2026-09-22: under the app's 30 s request timeout so the reply arrives. The
+// one deadline a navigate or a read waits for Chrome to finish loading the tab.
+const PAGE_LOAD_DEADLINE_MS = 25_000;
 const PAGE_CHANGE_STORAGE_KEY = "nativeAgentPageChangeGenerationsV1";
 const PAGE_VIEW_STORAGE_KEY = "nativeAgentPageSnapshotViewsV1";
 const utf8Encoder = new TextEncoder();
@@ -351,7 +354,7 @@ async function dispatch(request) {
     case "navigate":
       return navigateOwnedTab(request.payload, request.id);
     case "page.snapshot.read":
-      return readStructuredSnapshot(request.payload);
+      return readStructuredSnapshot(request.payload, request.id);
     case "page.element.click":
       return clickSnapshotNode(request.payload, request.id);
     case "page.element.fill":
@@ -427,9 +430,13 @@ async function navigateOwnedTab(payload, actionId) {
       await workspace.yieldForTab(ownedTab.tabId, "tab_activated_during_navigation");
       throw new ProtocolError("focus_invariant_failed", "Navigation unexpectedly activated the NativeAgent tab.");
     }
-    // 2026-09-22: under the app's 30s request timeout so the result arrives.
-    // Done when the new document's content is parsed, not when every ad loads.
-    await waitForTabComplete(ownedTab.tabId, 25_000, requireCurrentNavigation, topDocument);
+    // Done when Chrome finishes loading the tab. A deadline that passes after
+    // the new document committed still returns that page, marked as loading.
+    const loaded = await waitForTabComplete(ownedTab.tabId, PAGE_LOAD_DEADLINE_MS, requireCurrentNavigation, actionId)
+      .then(() => true, (error) => {
+        if (error.code !== "navigation_timeout" || !topDocument.committedDocumentId) throw error;
+        return false;
+      });
     const tab = await chrome.tabs.get(ownedTab.tabId);
     await requireCurrentNavigation();
     if (tab.active === true) {
@@ -445,6 +452,7 @@ async function navigateOwnedTab(payload, actionId) {
       detail: {
         tabId: ownedTab.tabId, requestedUrl: payload.url,
         url: tab.url, title: tab.title ?? "", status: tab.status, verified: false,
+        ...(loaded ? {} : { loading: "Chrome had not finished loading this page when the deadline passed." }),
       },
     });
   } catch (error) {
@@ -466,8 +474,13 @@ async function navigateOwnedTab(payload, actionId) {
   }
 }
 
-async function readStructuredSnapshot(payload) {
+async function readStructuredSnapshot(payload, actionId) {
   const ownedTab = await workspace.requireForPageAction(payload);
+  // A read waits for Chrome to finish loading the tab. Past the deadline it
+  // reads what is there and says the page had not finished loading.
+  const loaded = await waitForTabComplete(ownedTab.tabId, PAGE_LOAD_DEADLINE_MS,
+    () => workspace.requireForPageAction(payload), actionId)
+    .then(() => true, (error) => { if (error.code !== "navigation_timeout") throw error; return false; });
   payload = { ...pageSnapshotViews.get(ownedTab.tabId), ...payload };
   invalidateTabSnapshots(ownedTab.tabId);
   const capture = { localSnapshotKeys: new Set(), invalidatedSnapshotKeys: new Set(), invalidationOverflow: false };
@@ -482,7 +495,7 @@ async function readStructuredSnapshot(payload) {
     // Retain the successful reader's exact view durably before its reply,
     // without another page read. Writes serialize across tabs.
     await persistPageViews(ownedTab);
-    return snapshot;
+    return { ...snapshot, rendering: { ...snapshot.rendering, loaded } };
   } finally {
     if (activeSnapshotReads.get(ownedTab.tabId) === capture) activeSnapshotReads.delete(ownedTab.tabId);
     void drainSiteChanges(ownedTab.tabId);
@@ -905,7 +918,7 @@ async function waitForPage(payload, actionId) {
     // `timeoutMs`, so this could take twice the time the caller asked for.
     const deadlineAtMs = Date.now() + timeoutMs;
     try {
-      await waitForTabComplete(ownedTab.tabId, timeoutMs, () => workspace.requireForPageAction(payload), null, actionId);
+      await waitForTabComplete(ownedTab.tabId, timeoutMs, () => workspace.requireForPageAction(payload), actionId);
       const quiet = await awaitNavigationQuiet(ownedTab.tabId, payload.settleMs ?? 0, deadlineAtMs, actionId);
       const tab = await chrome.tabs.get(ownedTab.tabId);
       await workspace.requireForPageAction(payload);
@@ -1246,31 +1259,19 @@ async function pageHistoryStep(tabId, delta) {
   }
 }
 
-// The top document committed after this watch began, and whether its content
-// is parsed: an older document's late DOMContentLoaded is not this navigation's.
+// The top document committed after this watch began: proof the navigation
+// reached a page, even when Chrome has not finished loading it.
 function watchTopDocument(tabId) {
-  const watch = { committedDocumentId: null, parsed: false, onParsed: null };
+  const watch = { committedDocumentId: null };
   const committed = (details) => {
-    if (details.tabId === tabId && details.frameId === 0) {
-      watch.committedDocumentId = details.documentId;
-      watch.parsed = false;
-    }
-  };
-  const loaded = (details) => {
-    if (details.tabId !== tabId || details.frameId !== 0 || details.documentId !== watch.committedDocumentId) return;
-    watch.parsed = true;
-    watch.onParsed?.();
+    if (details.tabId === tabId && details.frameId === 0) watch.committedDocumentId = details.documentId;
   };
   chrome.webNavigation.onCommitted.addListener(committed);
-  chrome.webNavigation.onDOMContentLoaded.addListener(loaded);
-  watch.stop = () => {
-    chrome.webNavigation.onCommitted.removeListener(committed);
-    chrome.webNavigation.onDOMContentLoaded.removeListener(loaded);
-  };
+  watch.stop = () => chrome.webNavigation.onCommitted.removeListener(committed);
   return watch;
 }
 
-async function waitForTabComplete(tabId, timeoutMs, requireCurrent = () => {}, topDocument = null, actionId = undefined) {
+async function waitForTabComplete(tabId, timeoutMs, requireCurrent = () => {}, actionId = undefined) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const waits = activeTabWaits.get(tabId) ?? new Set();
@@ -1280,7 +1281,6 @@ async function waitForTabComplete(tabId, timeoutMs, requireCurrent = () => {}, t
       settled = true;
       clearTimeout(timeout);
       chrome.tabs.onUpdated.removeListener(listener);
-      if (topDocument) topDocument.onParsed = null;
       waits.delete(cancel);
       if (waits.size === 0 && activeTabWaits.get(tabId) === waits) activeTabWaits.delete(tabId);
       if (activeRequestWaits.get(actionId) === cancel) activeRequestWaits.delete(actionId);
@@ -1304,20 +1304,8 @@ async function waitForTabComplete(tabId, timeoutMs, requireCurrent = () => {}, t
       if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
       observe(tab);
     }
-    function parsed() {
-      void chrome.tabs.get(tabId).then(async (tab) => {
-        if (settled) return;
-        await requireCurrent();
-        if (tab.id !== tabId) throw new ProtocolError("tab_identity_changed", "Chrome returned a different tab identity.");
-        if (!tab.pendingUrl) finish(null, tab);
-      }).catch((error) => finish(error));
-    }
     waits.add(cancel);
     chrome.tabs.onUpdated.addListener(listener);
-    if (topDocument) {
-      topDocument.onParsed = parsed;
-      if (topDocument.parsed) parsed();
-    }
     void chrome.tabs.get(tabId).then(observe).catch((error) => finish(error));
     registerRequestWait(actionId, cancel);
   });

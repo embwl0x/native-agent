@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import Experiences
+import ToolExecution
+// Blueprint: | `SwiftToolDispatcher+DeskTools.swift` | `SwiftToolDispatcher`: `deskAlias`, `impl_desk_read`, `impl_desk_add_item` |
 
 // MARK: - Agent Desk chat lane (desk_*)
 //
@@ -22,21 +24,6 @@ import Experiences
 // class as task_ledger_post (`ledger_write`, medium).
 
 extension SwiftToolDispatcher {
-
-    static func latchDeskPeers(_ items: [DeskItem]) {
-        for item in items {
-            guard let step = item.step else { continue }
-            step.peers.forEach { PeerDataTaint.markConsumed(peer: $0) }
-            step.elevated.forEach { PeerDataTaint.markElevated(peer: $0) }
-        }
-    }
-
-    static func latchDeskRecordPeers(_ item: DeskItem, in state: DeskState) {
-        let handles = Set([item.handle] + item.blockedOn + (item.parent.map { [$0] } ?? []))
-        latchDeskPeers(state.items.filter {
-            handles.contains($0.handle) || $0.parent == item.handle || $0.blockedOn.contains(item.handle)
-        })
-    }
 
     private func deskStore() -> SwiftNativeDeskStore {
         SwiftNativeDeskStore(dataRoot: dataRoot)
@@ -334,7 +321,6 @@ extension SwiftToolDispatcher {
         } else {
             renderState = board
         }
-        Self.latchDeskPeers(renderState.items)
         var text = DeskProjection.render(renderState)
         if isFiltered, matches.isEmpty {
             text += "\nno live Desk items matched"
@@ -363,7 +349,6 @@ extension SwiftToolDispatcher {
         // A query that finds exactly one item opens it too: no second read.
         if handle?.isEmpty == false || matches.count == 1 {
             for match in matches {
-                Self.latchDeskRecordPeers(match, in: state)
                 text += "\n\n" + DeskProjection.renderRecord(match, in: state)
             }
         }
@@ -1220,7 +1205,7 @@ extension SwiftToolDispatcher {
     ///
     /// Agent parses the intent ("stay on me about the release track" / "go
     /// quiet, I'm busy this week"); the TOOL takes explicit arguments and never
-    /// guesses. Actions: enable | disable | mute | unmute | status.
+    /// guesses. Actions: enable | disable | mute | unmute | proposal | status.
     ///
     /// `unmute` is the one that carries weight: it clears the mute, opens a new
     /// attention window (re-arming every item's one nag), AND returns the drift
@@ -1299,19 +1284,24 @@ extension SwiftToolDispatcher {
                 "config": deskNagConfigJSON(next),
             ])
 
-        case "unmute":
-            // Read the desk ONCE, then compute the digest and consume the drift
-            // against that same snapshot inside the config flock.
-            let state = try await deskStore().liveState()
-            let now = Date()
-            let plan = DeskSequencing.compute(state, now: now)
-            let (next, digest) = try await configStore.updating { current in
-                let lines = DeskNagEvaluator.digestOnUnmute(state: state, plan: plan, config: current, now: now)
-                // Consume BEFORE the window bump: what User just read in the
-                // digest must not come straight back as a nag on the next tick.
-                let consumed = DeskNagEvaluator.consumingDrift(state: state, plan: plan, config: current, now: now)
-                return (consumed.unmuted(), lines)
+        case "unmute", "proposal":
+            // The person's click or her turn already bound this originating
+            // door in AppChatToolDispatcher.withAuthoredProgramHost.
+            let preview = action == "proposal"
+            let read = try await DeskNotificationRead.read(dataRoot: dataRoot, now: Date(), unmute: !preview)
+            let proposal: DeskNotificationProposal
+            switch await Parts(root: dataRoot).call(id: "desk-notify", input: read.input, preview: preview, as: DeskNotificationProposal.self) {
+            case .success(let value): proposal = value
+            case .failure(let error): throw error
             }
+            if preview {
+                try read.validate(proposal)
+                return .object(["status": .string("ok"), "effects": .string("none"),
+                    "as_of": .string(read.state.generatedTs), "evaluated_at": .double(read.now.timeIntervalSince1970),
+                    "proposal": try .fromEncodable(proposal)])
+            }
+            let next = try await read.commit(proposal, dataRoot: dataRoot)
+            let digest = proposal.digest
             let summary = digest.isEmpty
                 ? "nagging back on (window \(next.windowId)) — nothing drifted while you were quiet"
                 : "nagging back on (window \(next.windowId)) — \(digest.count) item(s) moved while quiet"
@@ -1348,7 +1338,7 @@ extension SwiftToolDispatcher {
 
         default:
             throw AutonomyGateError.toolDenied(
-                reason: "desk_nag_control: unknown action '\(action)' (expected enable|disable|mute|unmute|status|read)")
+                reason: "desk_nag_control: unknown action '\(action)' (expected enable|disable|mute|unmute|proposal|status|read)")
         }
     }
 

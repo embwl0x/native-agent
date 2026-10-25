@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 
+// Blueprint: | `SystemOps+CapabilityScoring.swift` | Capability scoring: shared keyword tokenization, context capability score components and bounded catalog selection |
+
 // MARK: - Token classifier (shared by RouterPlan SwiftNative impl)
 
 /// `keyword_tokens` byte-for-byte. Regex
@@ -49,7 +51,7 @@ private func isWordCont(_ c: Unicode.Scalar) -> Bool {
 // MARK: - Capability scoring (port of select_context_capabilities)
 //
 // The deterministic route scorer ranks feature surfaces and connector actions.
-// Skills, authored tools, workflows and MCP sources have their own Swift
+// Skills, authored tools and workflows have their own Swift
 // owners and discovery paths; they are not inputs to this scorer.
 
 /// In-memory capability record used for scoring. Subset of the Python dict
@@ -148,11 +150,11 @@ func scoreContextCapabilityParts(_ record: CapabilityScoringRecord, tokens: Set<
     }
     let modeKindBias: [String: Set<String>] = [
         "memory": ["feature:memory_system", "skill", "tool"],
-        "workflow": ["workflow", "tool", "skill", "mcp", "feature:agent_swarm"],
-        "research": ["feature:research_browser", "mcp", "catalog"],
+        "workflow": ["workflow", "tool", "skill", "feature:agent_swarm"],
+        "research": ["feature:research_browser", "catalog"],
         "ops": ["feature:trust_doctor", "feature:eval_release_ops", "feature:nextgen_runtime"],
         "personality": ["feature:personality_engine", "skill"],
-        "capability": ["feature", "skill", "tool", "workflow", "mcp", "catalog"],
+        "capability": ["feature", "skill", "tool", "workflow", "catalog"],
     ]
     let biases = modeKindBias[mode] ?? []
     // Python: `record.get("sourceId") or record.get("id") or ""` — empty
@@ -239,7 +241,7 @@ func selectContextCapabilities(
 ///   • featureSurfaceRecords()
 ///   • connectorActionDescriptors()
 ///
-/// Skills, authored tools, workflows and MCP sources are discovered by their
+/// Skills, authored tools and workflows are discovered by their
 /// Swift owners rather than this static route-scoring catalog.
 func swiftNativeCapabilityRecords(nowISO: String) -> [CapabilityScoringRecord] {
     var records: [CapabilityScoringRecord] = []

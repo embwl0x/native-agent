@@ -1,11 +1,14 @@
 import EngineRuntime
 import SwiftUI
 import Agents
-import ChatOrchestration
+import ChatSessionWork
+import AgentWorkspace
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import StandingBots
+
+// Blueprint: | `SimpleThreadViews.swift` | Simple contact/helper/crew threads: canonical conversation/run projections and composers bound to the selected contact or helper |
 
 // Simple view's right-hand panes besides the chat: what the agent and one
 // contact have said to each other, what one helper has done and said, and what
@@ -142,7 +145,7 @@ struct SimpleContactThread: View {
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.tertiary)
                 }
-                if let flight, let words = SimpleLiveReply.stopWords(flight, name: contact.name) {
+                if let flight, let words = SimpleLiveReply.stopWords(flight) {
                     Text(words)
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
@@ -282,15 +285,13 @@ private struct SimpleLiveReply: View {
     private var flight: SimpleFlight? { store.flight(for: contact.id) }
 
     /// A stop that could not stop, in plain words, for as long as it applies.
-    static func stopWords(_ flight: SimpleFlight, name: String) -> String? {
+    static func stopWords(_ flight: SimpleFlight) -> String? {
         switch flight.stop?.state {
-        case "cannot_stop"? where flight.inFlight: "\(name) can't be stopped — its reply will still arrive."
-        case "released"?: "\(name) can't be stopped from here, so this thread stopped waiting. Its reply will still arrive."
+        case "cannot_stop"? where flight.inFlight: flight.stop?.detail
+        case "released"?: flight.stop?.detail
         default: nil
         }
     }
-
-    private var stopState: String? { flight?.stop?.state }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -301,11 +302,11 @@ private struct SimpleLiveReply: View {
                 Text(contact.name)
                     .font(ShellType.labelSemibold)
                     .foregroundStyle(NativeAgentShell.text)
-                if stopping || stopState == "stopping" {
+                if stopping {
                     Text("Stopping…")
                         .font(ShellType.caption)
                         .foregroundStyle(NativeAgentShell.tertiary)
-                } else if flight != nil, stopState == nil {
+                } else if flight != nil, flight?.stop == nil {
                     Button(action: stop) {
                         Label("Stop", systemImage: "stop.fill")
                             .labelStyle(.titleAndIcon)
@@ -436,7 +437,7 @@ struct SimpleHelperRuns: View {
 
     var body: some View {
         let lines = store.lines[key] ?? []
-        let runs = store.helperRuns[record.id] ?? []
+        let runs = store.helperRuns[record.id]?.history ?? []
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 14) {
                 if runs.isEmpty, lines.isEmpty {
@@ -446,11 +447,11 @@ struct SimpleHelperRuns: View {
                 }
                 ForEach(runs) { entry in
                     HStack(alignment: .firstTextBaseline, spacing: 14) {
-                        Text(BotsShelfRecord.shortDate(entry.runAt))
+                        Text(BotsShelfRecord.shortDate(entry.entry.runAt))
                             .font(ShellType.caption)
                             .foregroundStyle(NativeAgentShell.tertiary)
                             .frame(width: 124, alignment: .leading)
-                        Text(Self.line(entry))
+                        Text(SimpleViewStore.firstLine(entry.line))
                             .font(ShellType.label)
                             .foregroundStyle(NativeAgentShell.text)
                             .lineLimit(2)
@@ -528,17 +529,6 @@ struct SimpleHelperRuns: View {
         return true
     }
 
-    /// What one run came to, in a line: its first line of reply, or its state.
-    static func line(_ entry: ShelfEntry) -> String {
-        let said = SimpleViewStore.firstLine(entry.actualReply)
-        switch entry.runtimeStatus {
-        case .completed: return said.isEmpty ? BotsShelfRecord.health(entry.runHealth) : said
-        case .waitingForApproval: return "Waiting for approval"
-        case .waitingOnPerson: return entry.statusDetail.map { "Waiting on you — \($0)" } ?? "Waiting on you"
-        case .failed: return "Failed: " + (entry.statusDetail ?? "cause not recorded")
-        case .interrupted: return "Interrupted" + (entry.statusDetail.map { ": " + $0 } ?? (said.isEmpty ? "" : ": " + said))
-        }
-    }
 }
 
 extension View {
@@ -620,7 +610,8 @@ struct SimpleCrewThread: View {
         case "completed": return "Done"
         case "partial": return "Done, some workers fell short"
         case "cancelled": return "Stopped"
-        case "interrupted": return "Interrupted"
+        case "interrupted": return "Interrupted · completion time unknown"
+        case "unknown": return "Liveness unknown"
         case "failed": return "Didn't finish"
         default: return crew.live ? "Working now" : "Finished"
         }
@@ -639,7 +630,8 @@ struct SimpleCrewThread: View {
                         Text(worker.name)
                             .font(ShellType.labelSemibold)
                             .foregroundStyle(NativeAgentShell.text)
-                        Text(SimpleTranscriptEntry.inline(Self.said(worker)))
+                        Text(SimpleTranscriptEntry.inline(crew.liveness == .unknown && worker.status == "working"
+                            ? "Liveness unknown" : Self.said(worker)))
                             .font(worker.status == "completed" ? ShellType.body : ShellType.label)
                             .foregroundStyle(worker.status == "completed" ? NativeAgentShell.text : NativeAgentShell.secondary)
                             .lineSpacing(NativeAgentShellLayout.replyLineSpacing)

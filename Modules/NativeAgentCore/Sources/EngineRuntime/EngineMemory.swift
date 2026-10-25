@@ -1,20 +1,48 @@
 import Foundation
+import NativeAgentCore
 import Observation
 import PersistenceCore
 import MemoryV2
-import KnowledgeGraph
 import TrustCenter
 import NativeAgentShared
+import DeviceSync
+// Blueprint: | `EngineMemory.swift` | Memory v2 status and read availability publish through `refreshStatuses`; pending proposals publish checked rows and failure together through `proposals(status:)`, retaining checked rows on failure and leaving decision animation to the Mac; memory reads/search/writes and durable review-reminder crossing; one checked `graphSnapshot` shared by Knowledge Graph and Capabilities; `ProposalRecord` evidence; LatestRead orders pending proposals and memory status; committed proposal decisions use write() with the Mac's existing animation transaction. |
 
 /// `NativeAgentEngine.memory` (S10's first typed facade): MemoryV2 and the
 /// Knowledge Graph for one data root, in
 /// core types. The kept list, the review queue, search and the graph are
-/// observable state the Memories and Knowledge Graph pages render; the reads
-/// and writes are nonisolated so the phone lanes use the same owner.
+/// observable state the Memories and Knowledge Graph pages render; phone
+/// lanes use the same owner.
 @MainActor
 @Observable
 public final class MemoryFacade {
     public nonisolated let dataRoot: URL
+    private var embeddingSource: (owner: SwiftNativeMemoryV2, runtime: ManagedEmbeddingProvider)?
+    @ObservationIgnored private let embeddingsRead = LatestRead()
+    public private(set) var embeddingsError: String?
+    public var embeddingsStatus: EmbeddingsStatus? {
+        embeddingSource.map { MemoryStatusProjection.embeddingsStatus(from: $0.runtime.snapshot()) }
+    }
+
+    public func loadEmbeddings() async {
+        _ = await embeddingsRead.read { () async -> Result<(owner: SwiftNativeMemoryV2, runtime: ManagedEmbeddingProvider), Error> in
+            do { return .success(try await Task.detached {
+                let owner = self.owner
+                return (owner, try await owner.managedEmbeddingRuntime())
+            }.value) }
+            catch { return Result<(owner: SwiftNativeMemoryV2, runtime: ManagedEmbeddingProvider), Error>.failure(error) }
+        } publish: { result in
+            switch result {
+            case .success(let source): embeddingSource = source; embeddingsError = nil
+            case .failure(let error): embeddingSource = nil; embeddingsError = error.localizedDescription
+            }
+        }
+    }
+    public func toggleEmbeddings(_ enabled: Bool) async throws {
+        guard let embeddingSource else { throw MemoryV2Error.storageUnavailable }
+        try await embeddingSource.owner.configureEmbeddingBackendAndReindex(enabled: enabled)
+    }
+
     public private(set) var cachedAgentDisplayName = UserDefaults.standard.string(forKey: "cachedAgentDisplayName")
 
     public func teachAssistantName(_ profile: PersonalityProfile?) {
@@ -26,15 +54,34 @@ public final class MemoryFacade {
         if !name.isEmpty { AdaptiveCandidateHygiene.insertAssistantName(name) }
     }
 
+    public private(set) var status: MemoryV2Status?
+    public private(set) var statusRefresh: PanelRefreshStatus?
+    @ObservationIgnored private let statusesRead = LatestRead()
+    @ObservationIgnored private let proposalsRead = LatestRead()
+
     /// The newest 200 active memories, written by the app's refresh paths.
     public var memories: [MemoryV2.MemoryRecord] = []
+    @ObservationIgnored private let memoriesRead = LatestRead()
+
+    @discardableResult
+    public func refreshMemories() async throws -> [MemoryV2.MemoryRecord] {
+        try await memoriesRead.read({ try await activeMemories() }, publish: { memories = $0 })
+    }
+    public var totalCount: Int? { status?.counts?.active }
+    public private(set) var diagnostics: MemoryV2NativeStackSnapshot = .empty
+    public private(set) var diagnosticsCheckedAt: Date?
     /// Pending proposals that still pass review.
-    public var proposals: [ProposalRecord] = [] {
+    public private(set) var proposals: [ProposalRecord] = [] {
         didSet { proposalsDidChange?() }
     }
     @ObservationIgnored public var proposalsDidChange: (@MainActor () -> Void)?
 
     public private(set) var proposalsReadFailed = false
+    public private(set) var rejectedProposals: [ProposalRecord] = []
+    public private(set) var rejectedHistoryError: String?
+    @ObservationIgnored private lazy var rejectedHistoryRead = LatestRead()
+    @ObservationIgnored private lazy var diagnosticsRead = LatestRead()
+    @ObservationIgnored private lazy var graphSnapshotRead = LatestRead()
 
     /// Semantic search for the Memories field. nil results mean no search.
     public private(set) var searchResults: [MemoryV2.MemoryRecord]?
@@ -45,13 +92,14 @@ public final class MemoryFacade {
     /// A semantic request is in flight for `searchResultQuery`, distinct from
     /// an empty result.
     public private(set) var searchIsLoading = false
-    @ObservationIgnored private var searchGate = LatestAsyncRequestGate()
+    @ObservationIgnored private lazy var searchRead = LatestRead()
 
-    /// The whole graph, every page, edges deduped.
-    public private(set) var graphEntities: [KnowledgeGraphEntity] = []
-    public private(set) var graphEdges: [KnowledgeGraphEdge] = []
-    public private(set) var graphTotalEntities = 0
-    public private(set) var graphTotalEdges: Int?
+    /// One checked whole-graph snapshot for the graph page and Capabilities.
+    public private(set) var graphSnapshot: CanonicalAgentGraphProjection?
+    public var graphEntities: [KnowledgeGraphEntity] { graphSnapshot?.canvasEntities ?? [] }
+    public var graphEdges: [KnowledgeGraphEdge] { graphSnapshot?.canvasEdges ?? [] }
+    public var graphTotalEntities: Int { graphEntities.count }
+    public var graphTotalEdges: Int? { graphSnapshot?.canvasEdges.count }
     public private(set) var graphLoading = false
     /// Why the last whole-graph read failed; nil after a good read.
     public private(set) var graphLoadError: String?
@@ -70,6 +118,28 @@ public final class MemoryFacade {
     }
 
     // MARK: - Reads
+
+    public func refreshDiagnostics() async {
+        _ = await diagnosticsRead.read {
+            await MemoryV2NativeStackSnapshot.load(dataRoot: dataRoot)
+        } publish: {
+            diagnostics = $0
+            diagnosticsCheckedAt = Date()
+        }
+    }
+
+    public func refreshEmbeddingDiagnostics() async {
+        await refreshDiagnostics()
+        for _ in 0..<10 where diagnostics.shouldPollEmbeddingStartup {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if Task.isCancelled { return }
+            _ = await diagnosticsRead.read {
+                var snapshot = diagnostics
+                snapshot.applyEmbeddingRuntime(await owner.embeddingRuntimeSnapshot())
+                return snapshot
+            } publish: { diagnostics = $0 }
+        }
+    }
 
     /// Active memories: the newest `limit` (nil is every one), graduated
     /// lessons among them as history, or the recall-eligible rows for `ids`
@@ -96,22 +166,59 @@ public final class MemoryFacade {
     /// review: a statement whose successor is recorded, or one that fails the
     /// current quality contract, is never offered for acceptance. History
     /// reads keep every row, including the fragments the gate let go.
-    public nonisolated func proposals(status: String) async throws -> [ProposalRecord] {
-        do {
-            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-            let records = try await storage.listProposals(status: status)
-                .filter { status != "pending" || SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }
-                .map(ProposalRecord.init(stored:))
-            if status == "pending" { await recordProposalsRead(failed: false) }
-            return records
-        } catch {
-            if status == "pending" { await recordProposalsRead(failed: true) }
-            throw error
-        }
+    public func proposals(status: String,
+        publish: @MainActor @Sendable (_ change: () -> Void) -> Void = { $0() }
+    ) async throws -> [ProposalRecord] {
+        guard status == "pending" else { return try await readProposals(status: status) }
+        let result: Result<[ProposalRecord], Error> = await proposalsRead.read({
+            do { return .success(try await readProposals(status: status)) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            switch result {
+            case .success(let records):
+                proposalsReadFailed = false
+                if proposals != records { publish { proposals = records } }
+            case .failure: proposalsReadFailed = true
+            }
+        })
+        return try result.get()
     }
 
-    private func recordProposalsRead(failed: Bool) {
-        proposalsReadFailed = failed
+    private nonisolated func readProposals(status: String) async throws -> [ProposalRecord] {
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        return try await storage.listProposals(status: status)
+            .filter { status != "pending" || SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }
+            .map(ProposalRecord.init(stored:))
+    }
+
+    public func refreshStatuses() async -> [(endpoint: String, label: String, error: Error)] {
+        let read = await statusesRead.read({
+            var memory: MemoryV2Status?
+            var failures: [(endpoint: String, label: String, error: Error)] = []
+            do { memory = try await MemoryStatusProjection.getMemoryV2Status(dataRoot: dataRoot) }
+            catch { failures.append(("memory v2 status", "getMemoryV2Status", error)) }
+            return (memory, failures)
+        }, publish: { read in
+            if let value = read.0 { status = value }
+            statusRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
+                lastSuccessAt: read.1.isEmpty ? Date() : statusRefresh?.lastSuccessAt, failedEndpoints: read.1.map { $0.endpoint })
+        })
+        return read.1
+    }
+
+    public func refreshRejectedHistory() async {
+        _ = await rejectedHistoryRead.read {
+            do { return Result<[ProposalRecord], Error>.success(try await proposals(status: "rejected")) }
+            catch { return .failure(error) }
+        } publish: { result in
+            switch result {
+            case .success(let records):
+                rejectedProposals = records
+                rejectedHistoryError = nil
+            case .failure:
+                rejectedHistoryError = "Could not reload rejected memory history."
+            }
+        }
     }
 
     // MARK: - Writes
@@ -135,12 +242,19 @@ public final class MemoryFacade {
         guard try await owner.deleteMemoryIfPresent(id: id) else { throw Self.notFound(id) }
     }
 
-    public nonisolated func accept(proposalID: String) async throws -> MemoryV2.MemoryRecord {
-        try await owner.acceptProposal(id: proposalID)
+    public func accept(proposalID: String,
+        publish: @MainActor @Sendable (_ change: () -> Void) -> Void = { $0() }
+    ) async throws -> MemoryV2.MemoryRecord {
+        let accepted = try await owner.acceptProposal(id: proposalID)
+        proposalsRead.write { publish { proposals.removeAll { $0.id == proposalID } } }
+        return accepted
     }
 
-    public nonisolated func reject(proposalID: String, reason: String) async throws {
+    public func reject(proposalID: String, reason: String,
+        publish: @MainActor @Sendable (_ change: () -> Void) -> Void = { $0() }
+    ) async throws {
         _ = try await owner.rejectProposal(id: proposalID, reason: reason.isEmpty ? nil : reason)
+        proposalsRead.write { publish { proposals.removeAll { $0.id == proposalID } } }
     }
 
     nonisolated private static func notFound(_ id: String) -> NSError {
@@ -154,80 +268,78 @@ public final class MemoryFacade {
     /// Semantic recall over this root, projected onto kept records by id and
     /// unioned with text matches. Queries under three characters clear it.
     public func search(query: String) async {
-        let requestToken = searchGate.begin()
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        searchResultQuery = trimmed
-        searchIsLoading = trimmed.count >= 3
-        searchResults = nil
-        searchError = nil
+        searchRead.write {
+            searchResultQuery = trimmed
+            searchIsLoading = trimmed.count >= 3
+            searchResults = nil
+            searchError = nil
+        }
         if trimmed.count < 3 {
             searchIsLoading = false
             return
         }
-        // Debounce at the request-owner boundary: the view invalidates a prior
-        // result immediately, and the generation gate keeps a canceled older
-        // query from landing after the newest keystroke.
-        do {
-            try await Task.sleep(nanoseconds: 150_000_000)
-        } catch {
-            if searchGate.accepts(requestToken) { searchIsLoading = false }
-            return
-        }
-        guard !Task.isCancelled, searchGate.accepts(requestToken) else { return }
-        // Semantic recall can return nothing where an obvious text match
-        // exists, so text matches always ride along.
-        let lower = trimmed.lowercased()
-        // Only the memory's words: its layer is an internal label ("semantic"
-        // on every row), and matching it put every row under "man" or "sem".
-        let memories = memories
-        let lexical = await Task.detached {
-            memories.filter { $0.text.lowercased().contains(lower) }
-        }.value
-        guard !Task.isCancelled, searchGate.accepts(requestToken) else { return }
-        let owner = owner
-        do {
-            // User, 2026-09-06: retrieve WITHOUT crediting use_count. This runs
-            // on every keystroke pause and asks for 50 rows, most of which
-            // never reach the list; the rows actually shown are credited below.
-            let response = try await owner.recall(
-                MemoryV2RecallRequest(text: trimmed, topK: 50, persona: nil),
-                recordingUsage: false
-            )
-            let hitIDs = response.hits.compactMap { hit -> String? in
-                guard case .object(let obj)? = hit.extras,
-                      case .string(let id)? = obj["id"] else { return nil }
-                return id
+        // The query clears its old result immediately; LatestRead owns publication.
+        _ = await searchRead.read { () -> (String, [MemoryV2.MemoryRecord]?, String?, [String]) in
+            do {
+                try await Task.sleep(nanoseconds: 150_000_000)
+            } catch {
+                return (trimmed, nil, nil, [])
             }
-            // A matching older memory must not disappear because it is
-            // outside the newest 200 rows.
-            let records = try await activeMemories(ids: hitIDs)
-            var seen = Set<String>()
-            var ordered: [MemoryV2.MemoryRecord] = []
-            var deliveredIDs: [String] = []
-            for id in hitIDs where !seen.contains(id) {
-                guard let record = records.first(where: { $0.id == id }) else { continue }
-                seen.insert(id)
-                ordered.append(record)
-                deliveredIDs.append(id)
+            // Semantic recall can return nothing where an obvious text match
+            // exists, so text matches always ride along.
+            let lower = trimmed.lowercased()
+            // Only the memory's words: its layer is an internal label ("semantic"
+            // on every row), and matching it put every row under "man" or "sem".
+            let memories = memories
+            let lexical = await Task.detached {
+                memories.filter { $0.text.lowercased().contains(lower) }
+            }.value
+            let owner = owner
+            do {
+                // User, 2026-09-06: retrieve WITHOUT crediting use_count. This runs
+                // on every keystroke pause and asks for 50 rows, most of which
+                // never reach the list; the rows actually shown are credited below.
+                let response = try await owner.recall(
+                    MemoryV2RecallRequest(text: trimmed, topK: 50, persona: nil),
+                    recordingUsage: false
+                )
+                let hitIDs = response.hits.compactMap { hit -> String? in
+                    guard case .object(let obj)? = hit.extras,
+                          case .string(let id)? = obj["id"] else { return nil }
+                    return id
+                }
+                // A matching older memory must not disappear because it is
+                // outside the newest 200 rows.
+                let records = try await activeMemories(ids: hitIDs)
+                var seen = Set<String>()
+                var ordered: [MemoryV2.MemoryRecord] = []
+                var deliveredIDs: [String] = []
+                for id in hitIDs where !seen.contains(id) {
+                    guard let record = records.first(where: { $0.id == id }) else { continue }
+                    seen.insert(id)
+                    ordered.append(record)
+                    deliveredIDs.append(id)
+                }
+                for record in lexical where !seen.contains(record.id) {
+                    seen.insert(record.id)
+                    ordered.append(record)
+                }
+                return (trimmed, ordered, nil, deliveredIDs)
+            } catch {
+                return (trimmed, lexical, "Semantic memory is unavailable; showing text matches only.", [])
             }
-            for record in lexical where !seen.contains(record.id) {
-                seen.insert(record.id)
-                ordered.append(record)
-            }
-            guard !Task.isCancelled, searchGate.accepts(requestToken) else { return }
-            searchResults = ordered
-            searchError = nil
+        } publish: { query, records, error, deliveredIDs in
+            searchResultQuery = query
+            searchResults = records
+            searchError = error
             searchIsLoading = false
             // Credit exactly what the semantic lane delivered. Fire-and-forget,
             // like recall's own bump: a dropped bump self-heals on next serve.
-            if !deliveredIDs.isEmpty {
+            if !Task.isCancelled, !deliveredIDs.isEmpty {
+                let owner = owner
                 Task { try? await owner.recordRecallHits(ids: deliveredIDs) }
             }
-        } catch {
-            guard !Task.isCancelled, searchGate.accepts(requestToken) else { return }
-            searchResults = lexical
-            searchError = "Semantic memory is unavailable; showing text matches only."
-            searchIsLoading = false
         }
     }
 
@@ -239,35 +351,12 @@ public final class MemoryFacade {
             .appendingPathComponent("knowledge_graph.json")
     }
 
-    nonisolated private var graphReader: SwiftNativeKnowledgeGraphReader {
-        makeKnowledgeGraphReader(graphPath: graphPath)
-    }
-
-    /// The graph canvas, entity list and status, all from one checked
-    /// snapshot of this root's graph, so a page never composes them from
-    /// different generations. The Desk task count is supplementary: an
-    /// unreadable Desk leaves it nil rather than failing a sound graph.
-    public nonisolated func graphView() async throws -> KnowledgeGraphViewRead {
-        let projection = try await KnowledgeGraphReadProjection.canonicalAgentGraphProjection(
-            graphPath: graphPath, timestamp: SwiftNativeManifestSigner.isoTimestamp
-        )
-        let executionCount = try? await DeskFacade(dataRoot: dataRoot).taskRows().count
-        return KnowledgeGraphViewRead(
-            agentGraph: KnowledgeGraphReadProjection.agentGraph(from: projection, executionCount: executionCount),
-            entities: projection.entities,
-            status: KnowledgeGraphReadProjection.graphIndexStatus(from: projection)
-        )
-    }
-
     public nonisolated func searchGraph(query: String) async throws -> GraphSearchResponse {
         try await KnowledgeGraphReadProjection.searchGraph(query: query, graphPath: graphPath)
     }
 
-    /// Reads every page. Termination is store-authoritative (total_entities)
-    /// with an empty-page break and a hard page cap. Pages carry the edges
-    /// touching their own entities, so an edge can repeat across pages and is
-    /// deduped by from/to/kind. A failed read keeps what loaded before and
-    /// says why in `graphLoadError`.
+    /// Reads one complete checked snapshot. A failed read keeps the prior
+    /// snapshot and says why in `graphLoadError`.
     ///
     /// One read at a time for every mounted graph page, and a page going away
     /// does not stop the read another page is showing. A call while a read is
@@ -291,54 +380,22 @@ public final class MemoryFacade {
     }
 
     private func readGraph() async {
-        graphLoadError = nil
-        let reader = graphReader
-        do {
-            var all: [KnowledgeGraphEntity] = []
-            var allEdges: [KnowledgeGraphEdge] = []
-            var seenEdgeKeys = Set<String>()
-            var total = 0
-            var totalEdges: Int?
-            let maxPages = 500
-            var page = 0
-            while page < maxPages {
-                let resp = try await reader.entityPageChecked(page: page)
-                if page == 0 {
-                    total = resp.totalEntities
-                    totalEdges = resp.totalEdges
-                }
-                if resp.entities.isEmpty { break }
-                all.append(contentsOf: resp.entities)
-                for edge in resp.edges ?? [] where seenEdgeKeys.insert(edge.id).inserted {
-                    allEdges.append(edge)
-                }
-                if total > 0 && all.count >= total { break }
-                page += 1
+        _ = await graphSnapshotRead.read {
+            do { return Result<CanonicalAgentGraphProjection, Error>.success(try await KnowledgeGraphReadProjection.canonicalAgentGraphProjection(
+                graphPath: graphPath, timestamp: SwiftNativeManifestSigner.isoTimestamp
+            )) } catch { return .failure(error) }
+        } publish: { result in
+            switch result {
+            case .success(let snapshot): graphSnapshot = snapshot; graphLoadError = nil
+            case .failure(let error): graphLoadError = error.localizedDescription
             }
-            graphEntities = all
-            graphEdges = allEdges
-            graphTotalEntities = total > 0 ? total : all.count
-            graphTotalEdges = totalEdges
-        } catch {
-            graphLoadError = error.localizedDescription
         }
     }
 
-    /// One entity with its edges and neighbours. An unknown id throws
-    /// `URLError(.resourceUnavailable)`, apart from store read errors.
-    public nonisolated func neighborhood(entityID: String) async throws -> KnowledgeGraphNeighborhood {
-        guard let found = try await graphReader.neighborhoodChecked(id: entityID) else {
-            throw URLError(.resourceUnavailable)
-        }
-        return found
+    /// Detail is derived from the exact whole-graph revision beside it.
+    public func neighborhood(entityID: String) -> KnowledgeGraphNeighborhood? {
+        graphSnapshot?.neighborhood(entityID: entityID)
     }
-}
-
-/// One coherent mounted graph read; see `MemoryFacade.graphView()`.
-public struct KnowledgeGraphViewRead: Sendable {
-    public let agentGraph: AgentGraph
-    public let entities: [GraphEntity]
-    public let status: GraphIndexStatus
 }
 
 extension ProposalRecord {

@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `CognitiveModels.swift` | `CognitiveNode`, snapshots and `CognitiveFrozenRead`: source/subject identity, bounded emotional tags, association edges and persistence health values |
+
 public enum CognitiveSourceClass: String, Sendable, Equatable, CaseIterable {
     case observed
     case userStated
@@ -207,7 +209,7 @@ public struct CognitiveFeltProxyReads: Sendable, Equatable {
 
 /// Immutable presentation-only inputs captured with a frozen cognition epoch.
 /// This is not durable cognition: it only prevents previews or failed provider
-/// calls from consuming cadence, continuity, or Sound-brake state.
+/// calls from consuming cadence or continuity state.
 public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     public var fingerprintFamily: String?
     public var fingerprintCount: Int
@@ -216,7 +218,6 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     /// on User's next turn (Phase 5A), whatever his turns since.
     public var owedSinceGap: Date?
     public var lastSessionBridgeAt: Date?
-    public var negativeSoundEchoRun: Int
     /// Consecutive accepted turns the "- Settling:" line was presented. Capped
     /// so a long warm phase over old negative nodes cannot turn the line into a
     /// standing instruction (W4/P4).
@@ -295,7 +296,6 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         fingerprintLastSurfacedAt: Date? = nil,
         owedSinceGap: Date? = nil,
         lastSessionBridgeAt: Date? = nil,
-        negativeSoundEchoRun: Int = 0,
         settlingRun: Int = 0,
         soundRutSignature: String? = nil,
         soundRutLastSurfacedAt: Date? = nil,
@@ -316,7 +316,6 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         self.fingerprintLastSurfacedAt = fingerprintLastSurfacedAt
         self.owedSinceGap = owedSinceGap
         self.lastSessionBridgeAt = lastSessionBridgeAt
-        self.negativeSoundEchoRun = max(0, negativeSoundEchoRun)
         self.settlingRun = max(0, settlingRun)
         self.soundRutSignature = soundRutSignature
         self.soundRutLastSurfacedAt = soundRutLastSurfacedAt

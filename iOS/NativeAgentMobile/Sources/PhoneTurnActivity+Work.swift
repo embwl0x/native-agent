@@ -1,6 +1,7 @@
 import ActivityKit
 import NativeAgentShared
 import SwiftUI
+// Blueprint: | `PhoneTurnActivity+Work.swift` | `PhoneTurnActivity`: `setEnabled`, `receive`, `resumeWorkActivities`; Live Activities and the thinking light share Mac-projected activity state and Experience correlation evidence; no local turn-status persistence or bridge-event reducer |
 
 extension PhoneTurnActivity {
     func setEnabled(_ enabled: Bool) {
@@ -16,8 +17,6 @@ extension PhoneTurnActivity {
             startTokenObserver?.cancel(); startTokenObserver = nil
             for task in tokenObservers.values { task.cancel() }
             tokenObservers.removeAll()
-            for task in workExpirations.values { task.cancel() }
-            workExpirations.removeAll()
             registerActivity(enabled: false)
             Task { await Self.endAllWork() }
         }
@@ -28,8 +27,6 @@ extension PhoneTurnActivity {
         if workPairing != snapshot.pairingFingerprint { work.removeAll(); workPairing = snapshot.pairingFingerprint }
         if isEnabled, activityPairing != UserDefaults.standard.string(forKey: "NativeAgentMobile.workActivityPairing") {
             setEnabled(false)
-            work.removeAll()
-            return
         }
         pushConfigured = snapshot.pushConfigured
         if disableRegistrationPending { registerActivity(enabled: false) }
@@ -42,6 +39,9 @@ extension PhoneTurnActivity {
             applyWork(row)
         }
         let ids = Set(snapshot.activities.map(\.id))
+        workCorrelations = Dictionary((snapshot.experiences ?? []).filter { ids.contains("turn:" + $0.id) }.map {
+            ("turn:" + $0.id, Set($0.evidence.filter { $0.source == "correlation" }.map(\.id)))
+        }, uniquingKeysWith: { $0.union($1) })
         for activity in Activity<PhoneTurnAttributes>.activities where !ids.contains(activity.attributes.workID) {
             let workID = activity.attributes.workID
             enqueueWork(workID) { await Self.endWork(workID, content: nil) }
@@ -56,8 +56,8 @@ extension PhoneTurnActivity {
 
     func resumeWorkActivities() {
         failedWorkStarts.removeAll()
-        guard activityPairing != nil else { Task { await Self.endAllWork() }; return }
-        if workPairing != activityPushPairing { work.removeAll(); workPairing = activityPushPairing }
+        guard activityPairing != nil else { workCorrelations = [:]; Task { await Self.endAllWork() }; return }
+        if workPairing != activityPushPairing { work.removeAll(); workCorrelations = [:]; workPairing = activityPushPairing }
         Task { await Self.endUnpairedWork() }
         if activityObserver == nil { activityObserver = Task { await Self.observeWorkActivities() } }
         guard isEnabled else {
@@ -81,14 +81,13 @@ extension PhoneTurnActivity {
     }
 
     private func applyWork(_ row: MobileWorkActivity) {
-        guard isEnabled else { return }
         workExpirations.removeValue(forKey: row.id)?.cancel()
         if row.content.state.isTerminal {
             enqueueWork(row.id) { await Self.endWork(row.id, content: row.content) }
             return
         } else if row.staleDate <= Date() {
             enqueueWork(row.id) { await Self.endWork(row.id, content: nil) }
-        } else {
+        } else if isEnabled {
             enqueueWork(row.id) {
                 guard self.isEnabled, self.work[row.id] == row else { return }
                 self.startWork(row)
@@ -105,7 +104,10 @@ extension PhoneTurnActivity {
                 // APNs may have advanced ActivityKit beyond the cached snapshot.
                 deadline = nextDeadline
             }
-            if !Task.isCancelled { workExpirations.removeValue(forKey: row.id) }
+            if !Task.isCancelled {
+                workCorrelations.removeValue(forKey: row.id)
+                workExpirations.removeValue(forKey: row.id)
+            }
         }
     }
 

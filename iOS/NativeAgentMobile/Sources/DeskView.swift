@@ -1,5 +1,6 @@
 import SwiftUI
 import NativeAgentShared
+// Blueprint: | `DeskView.swift` | Shared Desk rows and reading copies; selected handles resolve current fields or an unavailable state |
 
 struct MobileLoadedRecordsDisclosure: View {
     let title: String
@@ -104,7 +105,7 @@ struct MobileDeskView: View {
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
     private let sync = iCloudSyncEngine.shared
-    @State private var selectedItem: MobileDeskItem?
+    @State private var selectedItemHandle: String?
     @State private var showingNewItem = false
     @State private var showingTasks = false
     @State private var showingPairing = false
@@ -181,13 +182,14 @@ struct MobileDeskView: View {
             guard !items.isEmpty else { return }
             hasAttemptedDeskLoad = true
             deskLoadError = nil
-            if let item = items.first(where: { $0.handle == selectedItem?.handle }) {
-                selectedItem = item
-            }
             openNotifiedItem()
         }
-        .sheet(item: $selectedItem) { item in
-            MobileDeskItemDetail(item: item, errorMessage: $errorMessage)
+        .sheet(isPresented: Binding(get: { selectedItemHandle != nil }, set: { if !$0 { selectedItemHandle = nil } })) {
+            if let item = rows.first(where: { $0.handle == selectedItemHandle }) {
+                MobileDeskItemDetail(item: item, errorMessage: $errorMessage)
+            } else {
+                AliveCalmState(title: "Desk item unavailable", line: "This item is no longer on the published Desk.")
+            }
         }
         .sheet(isPresented: $showingNewItem) {
             NewMobileDeskItemSheet(errorMessage: $errorMessage)
@@ -265,7 +267,7 @@ struct MobileDeskView: View {
     }
 
     private func workCard(_ item: MobileDeskItem) -> some View {
-        Button { selectedItem = item } label: {
+        Button { selectedItemHandle = item.handle } label: {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
                     DeskStatusMark(status: item.status,
@@ -321,7 +323,7 @@ struct MobileDeskView: View {
     }
 
     private func historyRow(_ item: MobileDeskItem) -> some View {
-        Button { selectedItem = item } label: {
+        Button { selectedItemHandle = item.handle } label: {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.title)
@@ -414,7 +416,7 @@ struct MobileDeskView: View {
     /// `-deskSample detail|new|tasks|taskdetail|tasknew` opens that screen over the sample board.
     private func openSampleRoute() {
         switch MobileDeskSample.mode {
-        case "detail": selectedItem = rows.first
+        case "detail": selectedItemHandle = rows.first?.handle
         case "tasks", "taskdetail", "tasknew": showingTasks = true
         case "new": showingNewItem = true
         default: break
@@ -424,7 +426,7 @@ struct MobileDeskView: View {
     private func openNotifiedItem() {
         guard let handle = notifiedHandle else { return }
         if let item = sync.deskItems.first(where: { $0.handle == handle }) {
-            selectedItem = item
+            selectedItemHandle = item.handle
             notifiedHandle = nil
         }
     }

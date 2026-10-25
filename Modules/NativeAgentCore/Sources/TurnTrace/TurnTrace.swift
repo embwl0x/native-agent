@@ -1,9 +1,9 @@
 import AuthoredCapabilities
-import FeedPolicy
 import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `TurnTrace.swift` | `TurnTraceEvent.isTerminalKind` and `TerminalState` own terminal kind/status vocabulary for chat and restore settlement; durable terminal delivery (its notification carries the trace day file, session, surface and the part whose run started the turn) before checkpoint retirement; bounded ingress/disk queues retain their sole workers through settlement, checked JSONL framing before kind/turn filtering including one exact day-file read per receipt lookup without a retention scan, and first-render correlation/publication; turn-bound calls, dispatches and plans persist only here, with standalone and unmatched historical ledger rows through `traceEvidence`, preserving historical outcomes when canonical status is absent; model-call rows retain the former ledger byte budget to preserve cache-prefix evidence |
 
 // MARK: - Turn Inspector W1 (turn-inspector build plan, ledger d6143561)
 //
@@ -179,6 +179,9 @@ public actor TurnFirstRenderRegistry {
 /// bodies, never bot tokens. String fields are bounded to
 /// `maxPayloadStringChars` so an oversized field can't bloat the feed.
 public struct TurnTraceEvent: Sendable, Equatable {
+    public enum TerminalState: String, Sendable, Codable {
+        case completed, stopped, interrupted, waiting, failed
+    }
     /// Per-string-field cap applied to every string LEAF in the payload.
     public static let maxPayloadStringChars = 2000
     /// Hard serialized persisted-row ceiling for turn events. Model-call
@@ -207,6 +210,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
     public let turnId: String
     public let ts: Date
     public let kind: String
+    private static let terminalKinds: Set<String> = ["turn.terminal", "turn.cancelled", "turn.failed"]
+    public static func isTerminalKind(_ kind: String) -> Bool { terminalKinds.contains(kind) }
     public let sessionId: String?
     public let surface: String?
     /// The conversation this turn answers into. Defaulted from
@@ -216,8 +221,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
     /// not inherit task-locals.
     public let destinationId: String?
     public let threadId: String?
-    /// Pre-redacted, bounded payload object. Construction runs every string
-    /// leaf through `boundString`.
+    /// Callers must redact sensitive content. Construction bounds payload size
+    /// and string lengths; it does not run TurnTraceRedactor.
     public let payload: JSONValue
 
     public init(
@@ -241,7 +246,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
         // A turn's end names the part whose run started it (its end must not
         // wake that part) and whose words steered it, read on the turn's own task.
         var payload = payload
-        if TurnTracePersistLane.terminalKinds.contains(boundedKind), case .object(var fields) = payload {
+        if Self.isTerminalKind(boundedKind), case .object(var fields) = payload {
             if let part = SkillRunContext.partID { fields["part"] = .string(part) }
             if let steer = Self.steer() { fields["steered_by"] = .string(steer) }
             payload = .object(fields)
@@ -759,25 +764,27 @@ public actor TurnTraceBus {
         private let lock = NSLock()
         private var queue: [Element] = []
         private var head = 0
-        private var draining = false
+        private var worker: Task<Void, Never>?
         private var idleWaiters: [CheckedContinuation<Void, Never>] = []
         private let capacity: Int
         init(capacity: Int) { self.capacity = capacity }
-        /// Returns true only when the caller must start the sole drain worker.
-        func enqueue(_ pending: Element) -> Bool {
+        /// Queue admission and publication of the sole retained worker share
+        /// the lock. Its handle retires only after the final delivery settles.
+        func enqueue(_ pending: Element, deliver: @escaping @Sendable (Element) async -> Void) {
             lock.lock(); defer { lock.unlock() }
-            guard queue.count - head < capacity else { return false }
+            guard queue.count - head < capacity else { return }
             queue.append(pending)
-            guard !draining else { return false }
-            draining = true
-            return true
+            guard worker == nil else { return }
+            worker = Task.detached(priority: .utility) { [self] in
+                while let next = self.next() { await deliver(next) }
+            }
         }
         func next() -> Element? {
             lock.lock()
             guard head < queue.count else {
                 queue.removeAll(keepingCapacity: true)
                 head = 0
-                draining = false
+                worker = nil
                 let waiters = idleWaiters
                 idleWaiters.removeAll()
                 lock.unlock()
@@ -801,7 +808,7 @@ public actor TurnTraceBus {
         func waitUntilIdle() async {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 lock.lock()
-                guard draining || head < queue.count else {
+                guard worker != nil || head < queue.count else {
                     lock.unlock()
                     continuation.resume()
                     return
@@ -827,11 +834,8 @@ public actor TurnTraceBus {
         }
 
         func submit(_ event: TurnTraceEvent) {
-            guard queue.enqueue(event) else { return }
-            Task.detached(priority: .utility) { [self] in
-                while let next = queue.next() {
-                    await lane.append(next)
-                }
+            queue.enqueue(event) { [lane] next in
+                await lane.append(next)
             }
         }
 
@@ -858,7 +862,7 @@ public actor TurnTraceBus {
 
     /// Fire-and-forget emission entry. NEVER call from the hot path with
     /// `await` on the bus mutation — use this static shim, which spawns the
-    /// actor hand-off detached so the caller pays only task-creation cost.
+    /// actor hand-off through the retained pump so the caller only enqueues.
     /// In-flight emissions are BOUNDED (4096); over the cap the event drops
     /// at the gate so a stalled disk can never grow task backlog.
     ///
@@ -866,12 +870,8 @@ public actor TurnTraceBus {
     /// nil-turnId event is dropped — it has no story to join (matches the
     /// "unbound → no mirror" contract of TurnTraceContext).
     public nonisolated static func fire(_ event: TurnTraceEvent, on bus: TurnTraceBus = .shared) {
-        let shouldStart = emissionPump.enqueue(.init(event: event, bus: bus))
-        guard shouldStart else { return }
-        Task.detached(priority: .utility) {
-            while let pending = emissionPump.next() {
-                await pending.bus.deliver(pending.event)
-            }
+        emissionPump.enqueue(.init(event: event, bus: bus)) { pending in
+            await pending.bus.deliver(pending.event)
         }
     }
 
@@ -913,7 +913,9 @@ public actor TurnTraceBus {
         let wrote = try await persistPump.lane.appendGuarded(event, shouldAppend: { current in
             guard event.kind == "turn.terminal", case .object(let payload) = event.payload,
                   case .string(let status)? = payload["status"] else { return true }
-            return !AbandonedTurnReconciler.containsTerminal(forTurn: event.turnId, in: current, status: status)
+            // This terminal is known by its live owner. Damage elsewhere in
+            // the feed cannot prevent its append or invalidate an exact duplicate.
+            return !TurnTraceReplayReader.containsTerminal(forTurn: event.turnId, in: current.events, status: status)
         })
         if wrote { deliverToSubscribers(event) }
     }
@@ -1075,7 +1077,7 @@ public struct TurnTracePersistLane: Sendable {
                 // is posted below and the Doctor's one-shot refresh fires on it, so the
                 // row has to be on the platter before the signal goes out (GPT-5.6 round
                 // review, 2026-09-11). Non-terminal trace rows stay non-durable.
-                durable: Self.terminalKinds.contains(event.kind)
+                durable: TurnTraceEvent.isTerminalKind(event.kind)
             )
             postTerminalIfNeeded(event, trace: target)
         } catch {
@@ -1084,9 +1086,6 @@ public struct TurnTracePersistLane: Sendable {
             )
         }
     }
-
-    /// Terminal row kinds. A turn ends with exactly one of these.
-    static let terminalKinds: Set<String> = ["turn.terminal", "turn.cancelled", "turn.failed"]
 
     /// DURABLE TURN-TERMINAL SIGNAL. `.chatTurnCompleted` is an overloaded UI
     /// refresh notification — transcript compaction posts it with no turn
@@ -1098,7 +1097,7 @@ public struct TurnTracePersistLane: Sendable {
     /// finished, so it does not post. Her parts that wake on `turn.ended` get
     /// this edge, with where its rows are and the part whose run started it.
     private func postTerminalIfNeeded(_ event: TurnTraceEvent, trace: URL) {
-        guard Self.terminalKinds.contains(event.kind) else { return }
+        guard TurnTraceEvent.isTerminalKind(event.kind) else { return }
         if case .object(let payload) = event.payload,
            case .string("terminal_reconciliation")? = payload["observedBy"] {
             return
@@ -1123,9 +1122,11 @@ public struct TurnTracePersistLane: Sendable {
     /// Check and append have to sit in one critical section, and this lane owns
     /// the lock that every `turn.terminal` row is written under.
     ///
-    /// `shouldAppend` receives the target file's current text (empty when the
-    /// file does not exist yet). Returns false only when the predicate confirms
-    /// no append is needed; read, guard and persistence failures throw.
+    /// `shouldAppend` receives the target file's decoded rows and coverage report
+    /// (empty and clean when absent). Malformed rows stay in the report, including
+    /// invalid UTF-8; they do not make readable siblings unavailable. Returns false
+    /// only when the predicate confirms no append is needed; read, predicate and
+    /// persistence failures throw.
     ///
     /// `alsoLocking` extends the critical section over further files the
     /// predicate reads (the reconciler's sibling day files). Every lock in the
@@ -1135,7 +1136,7 @@ public struct TurnTracePersistLane: Sendable {
     public func appendGuarded(
         _ event: TurnTraceEvent,
         alsoLocking siblings: [URL] = [],
-        shouldAppend: @escaping @Sendable (String) throws -> Bool
+        shouldAppend: @escaping @Sendable (TurnTraceReplayReader.ReadResult) throws -> Bool
     ) async throws -> Bool {
         let target = path(for: event.ts)
         let dir = target.deletingLastPathComponent()
@@ -1147,8 +1148,8 @@ public struct TurnTracePersistLane: Sendable {
             .sorted()
             .map { URL(fileURLWithPath: $0) }
         return try await withFileLocks(lockOrder) {
-            let existing = FileManager.default.fileExists(atPath: target.path)
-                ? try String(contentsOf: target, encoding: .utf8) : ""
+            let existing: TurnTraceReplayReader.ReadResult = FileManager.default.fileExists(atPath: target.path)
+                ? try TurnTraceReplayReader.parse(Data(contentsOf: target)) : ([], .clean)
             guard try shouldAppend(existing) else { return false }
             try await appendJSONLCapped(
                 event.jsonRow,
@@ -1296,26 +1297,24 @@ public struct TurnTraceRecentReader: Sendable {
             }
             if since != nil || trace != nil {
                 sources.append(path)
-                let receipt = try await persistence.readJSONLReporting(path)
+                let receipt = try await TurnTraceReplayReader.read(path)
                 malformedRows += receipt.report.malformedLineCount
                 trailingPartialLine = trailingPartialLine || receipt.report.trailingPartialLine
                 if !receipt.report.isClean { truncated = true }
-                for row in receipt.rows {
-                    guard let event = TurnTraceEvent(jsonRow: row) else { malformedRows += 1; truncated = true; continue }
+                for event in receipt.events {
                     guard marks.isEmpty || marks.contains(event.kind) || marks.contains(event.turnId) else { continue }
                     guard since.map({ event.ts >= $0 }) ?? true, event.ts <= now else { continue }
                     events.append(event)
                 }
                 continue
             }
-            let receipt = try await persistence.tailJSONLReadReceipt(path, limit: remainingRows, maxBytes: remainingBytes)
+            let receipt = try await TurnTraceReplayReader.tail(path, limit: remainingRows, maxBytes: remainingBytes)
             sources.append(path)
-            let decoded = receipt.rows.compactMap(TurnTraceEvent.init(jsonRow:))
-            malformedRows += receipt.malformedJSONRowCount + receipt.rows.count - decoded.count
-            events += decoded
-            remainingRows -= receipt.physicalRowsScanned
+            malformedRows += receipt.report.malformedLineCount
+            events += receipt.events
+            remainingRows -= receipt.report.physicalLineCount
             remainingBytes -= receipt.bytesRead
-            truncated = truncated || receipt.truncatedToByteWindow || remainingRows <= 0
+            truncated = truncated || receipt.truncated || remainingRows <= 0
         }
         return Snapshot(sourceURL: sourceURL, events: events, sourceURLs: sources, truncated: truncated, oldestRetainedDay: oldestRetainedDay, malformedRows: malformedRows, trailingPartialLine: trailingPartialLine)
     }

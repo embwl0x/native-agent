@@ -1,13 +1,44 @@
 import Foundation
 import WebKit
+// Blueprint: | `BrowserActionRoutes+DOM.swift` | DOM scripts, mutation/readiness-driven reads with one 3750ms deadline and operation-owned cancellation, result decoding and browser errors |
 
 extension BrowserActionRoutes {
-    private static let readRetryDelays: [Duration] = [
-        .milliseconds(250),
-        .milliseconds(500),
-        .seconds(1),
-        .seconds(2),
-    ]
+    /// Evaluated with callAsyncJavaScript in the app's isolated content world.
+    /// One operation owns the observer and the old 250+500+1000+2000ms budget.
+    private static func domReadScript(read: String, ready: String) -> String {
+        """
+        return await new Promise((resolve, reject) => {
+          let done = false, timer, observer;
+          const read = () => { \(read) };
+          const finish = (value, error) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            observer.disconnect();
+            document.removeEventListener('DOMContentLoaded', check);
+            document.removeEventListener('readystatechange', check);
+            window.removeEventListener('pageshow', check);
+            window.removeEventListener('pagehide', end);
+            if (globalThis.__nativeAgentDOMRead?.id === operationID) delete globalThis.__nativeAgentDOMRead;
+            if (error) reject(error); else resolve(value);
+          };
+          const check = () => {
+            try { const value = read(); if (\(ready)) finish(value); }
+            catch (error) { finish(undefined, error); }
+          };
+          const end = () => { try { finish(read()); } catch (error) { finish(undefined, error); } };
+          observer = new MutationObserver(check);
+          observer.observe(document, {subtree:true, childList:true, characterData:true, attributes:true});
+          document.addEventListener('DOMContentLoaded', check);
+          document.addEventListener('readystatechange', check);
+          window.addEventListener('pageshow', check);
+          window.addEventListener('pagehide', end);
+          globalThis.__nativeAgentDOMRead = {id: operationID, cancel: () => finish(undefined)};
+          timer = setTimeout(end, 3750);
+          check();
+        });
+        """
+    }
 
     // N9 fix: JSON-encode every interpolated value so crafted selectors or text
     // containing quotes, backslashes, or other JS metacharacters cannot inject
@@ -74,49 +105,29 @@ extension BrowserActionRoutes {
         """
     }
 
-    @MainActor public static func readText(runJS: @MainActor (String) async throws -> Any?) async throws -> String {
-        var last = ""
-        for index in 0...Self.readRetryDelays.count {
-            let result = try await runJS("""
-            (function(){
+    @MainActor public static func readText(runDOMRead: @MainActor (String) async throws -> Any?) async throws -> String {
+        try Task.checkCancellation()
+        let result = try await runDOMRead(domReadScript(read: """
               var body = document.body;
               var root = document.documentElement;
               return ((body && (body.innerText || body.textContent)) ||
                       (root && (root.innerText || root.textContent)) ||
                       '').trim();
-            })()
-            """)
-            last = result as? String ?? ""
-            if !last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return last
-            }
-            if index < Self.readRetryDelays.count {
-                try? await Task.sleep(for: Self.readRetryDelays[index])
-            }
-        }
-        return last
+            """, ready: "typeof value === 'string' && value.trim().length > 0"))
+        try Task.checkCancellation()
+        return result as? String ?? ""
     }
 
-    @MainActor public static func readLinks(runJS: @MainActor (String) async throws -> Any?) async throws -> [BrowserLink] {
-        let js = """
-        (function(){
+    @MainActor public static func readLinks(runDOMRead: @MainActor (String) async throws -> Any?) async throws -> [BrowserLink] {
+        try Task.checkCancellation()
+        let js = domReadScript(read: """
           return Array.from(document.querySelectorAll('a[href]')).slice(0,200).map(function(a){
             return {url: a.href, text: (a.innerText || a.textContent || '').trim()};
           });
-        })()
-        """
-        var links: [BrowserLink] = []
-        for index in 0...Self.readRetryDelays.count {
-            guard let raw = try await runJS(js) else { return [] }
-            links = try decodeBrowserLinks(raw)
-            if !links.isEmpty {
-                return links
-            }
-            if index < Self.readRetryDelays.count {
-                try? await Task.sleep(for: Self.readRetryDelays[index])
-            }
-        }
-        return links
+        """, ready: "value.length > 0")
+        let raw = try await runDOMRead(js)
+        try Task.checkCancellation()
+        return try raw.map(decodeBrowserLinks) ?? []
     }
 
     private static func decodeBrowserLinks(_ raw: Any) throws -> [BrowserLink] {
@@ -136,6 +147,7 @@ public enum BrowserError: LocalizedError {
     /// C7 fix: returned when navigate is called while another navigation is in progress.
     case busy
     case timeout
+    case outcomeUnknown
     /// C7 fix (N8): returned when the current page's URL scheme is not http/https.
     case unsafeScheme(String)
 
@@ -146,8 +158,16 @@ public enum BrowserError: LocalizedError {
         case .badRequest(let msg): return "Bad request: \(msg)"
         case .fillFailed(let detail): return "Browser fill failed: \(detail)"
         case .busy: return "Browser is busy with another navigation — try again shortly"
-        case .timeout: return "Browser navigation timed out"
+        case .timeout: return "Browser navigation timed out; its outcome is unknown."
+        case .outcomeUnknown: return "Browser operation was interrupted after dispatch; its outcome is unknown."
         case .unsafeScheme(let scheme): return "Current page scheme '\(scheme)' is not allowed; only http/https are permitted"
+        }
+    }
+
+    var hasUnknownOutcome: Bool {
+        switch self {
+        case .timeout, .outcomeUnknown: return true
+        default: return false
         }
     }
 }

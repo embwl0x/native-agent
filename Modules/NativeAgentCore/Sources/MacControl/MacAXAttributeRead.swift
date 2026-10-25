@@ -1,9 +1,10 @@
 import Foundation
 #if canImport(ApplicationServices) && os(macOS)
 import ApplicationServices
+// Blueprint: | `MacAXAttributeRead.swift` | `MacAXAttributeRead` enum; one checked raw attribute copy preserves AX failures for required native evidence, with nil-tolerant perception/action projections; package-native clients share raw/string, parent, label, action-name and frame reads; static-text selectors use their text when no caption names them, while field values stay separate; visible list/table/outline child ordering shared by reads and action paths, on-screen/total counts; `copyTextRange`, `copyRaw`, `copyWindowIdentity`, shared identity `copyLabel` retaining redaction captions, separate display names with help cleanup and explicit AX title-element captions |
 
-/// Nil-tolerant AX attribute copies shared by perception and actuation.
-enum MacAXAttributeRead {
+/// AX attribute copies shared by perception and actuation; native evidence uses checked reads.
+package enum MacAXAttributeRead {
     static func copyWindowIdentity(_ window: AXUIElement, pid: Int32, index: Int) -> MacAXWindowIdentity {
         MacAXWindowIdentity(
             pid: pid,
@@ -35,18 +36,28 @@ enum MacAXAttributeRead {
         return NSRange(location: range.location, length: range.length)
     }
 
-    static func copyRaw(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
-        guard prepare(element) else { return nil }
-        defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
-        var raw: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success else { return nil }
-        return raw
+    package static func copyRaw(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
+        try? checkedRaw(element, attribute)
     }
 
-    static func copyString(_ element: AXUIElement, _ attribute: String) -> String? {
-        guard let raw = copyRaw(element, attribute), CFGetTypeID(raw) == CFStringGetTypeID() else { return nil }
-        let string = raw as! CFString as String
-        return string.isEmpty ? nil : string
+    package static func checkedRaw(_ element: AXUIElement, _ attribute: String) throws -> CFTypeRef? {
+        try Task.checkCancellation()
+        guard prepare(element) else {
+            throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility read of \(attribute) exhausted the shared reader time budget.")
+        }
+        defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
+        var raw: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(element, attribute as CFString, &raw)
+        try Task.checkCancellation()
+        switch status {
+        case .success: return raw
+        case .attributeUnsupported, .noValue: return nil
+        default: throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility read of \(attribute) failed (AX error \(status.rawValue)).")
+        }
+    }
+
+    package static func copyString(_ element: AXUIElement, _ attribute: String) -> String? {
+        (try? checkedText(element, attribute)).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     static func copyBool(_ element: AXUIElement, _ attribute: String) -> Bool? {
@@ -54,7 +65,7 @@ enum MacAXAttributeRead {
         return CFBooleanGetValue((raw as! CFBoolean))
     }
 
-    static func copyElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+    package static func copyElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
         guard let raw = copyRaw(element, attribute), CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
         return (raw as! AXUIElement)
     }
@@ -89,7 +100,7 @@ enum MacAXAttributeRead {
             + (total > visible ? " More \(kind) off screen." : "")
     }
 
-    static func copyElementArray(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
+    package static func copyElementArray(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
         let attribute = attribute == kAXChildrenAttribute ? childAttribute(element) : attribute
         if MacAXLimits.readDeadline != nil {
             guard prepare(element) else { return [] }
@@ -199,13 +210,14 @@ enum MacAXAttributeRead {
                 copyString(sibling, kAXValueAttribute) ?? copyString(sibling, kAXTitleAttribute)
             ) else { continue }
             guard let frame = copyFrame(sibling), frame.h <= 2 * field.h,
-                  MacScreenViewTextRedaction.isLabel(frame, forValueAt: field) else { return nil }
+                  MacScreenViewTextRedaction.isLabel(frame, forValueAt: field,
+                      proximity: MacScreenViewTextRedaction.proximityPoints) else { return nil }
             return text
         }
         return nil
     }
 
-    static func copyActions(_ element: AXUIElement) -> [String] {
+    package static func copyActions(_ element: AXUIElement) -> [String] {
         guard prepare(element) else { return [] }
         defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
         var raw: CFArray?
@@ -214,7 +226,7 @@ enum MacAXAttributeRead {
     }
 
     /// Both position and size must be readable; never fabricate a missing half.
-    static func copyFrame(_ element: AXUIElement) -> MacAXFrame? {
+    package static func copyFrame(_ element: AXUIElement) -> MacAXFrame? {
         var point = CGPoint.zero
         var size = CGSize.zero
         var hasPoint = false
@@ -227,6 +239,34 @@ enum MacAXAttributeRead {
         }
         guard hasPoint && hasSize else { return nil }
         return MacAXFrame(x: Double(point.x), y: Double(point.y), w: Double(size.width), h: Double(size.height))
+    }
+
+    package static func text(_ element: AXUIElement, _ attribute: String) -> String {
+        copyString(element, attribute) ?? ""
+    }
+
+    package static func checkedText(_ element: AXUIElement, _ attribute: String) throws -> String {
+        try checkedRaw(element, attribute) as? String ?? ""
+    }
+
+    /// Native selectors use the same identity as the hands. Static text is
+    /// named by its text when it has no separate caption; fields keep values
+    /// separate from identity, including inside credential views.
+    package static func label(_ element: AXUIElement) -> String {
+        let role = text(element, kAXRoleAttribute)
+        return copyLabel(element, role: role)
+            ?? (role == kAXStaticTextRole ? copyString(element, kAXValueAttribute) : nil) ?? ""
+    }
+
+    package static func parent(_ element: AXUIElement) -> AXUIElement? {
+        copyElement(element, kAXParentAttribute)
+    }
+
+    package static func frame(_ element: AXUIElement) -> CGRect? {
+        guard let frame = copyFrame(element),
+              frame.x.isFinite, frame.y.isFinite, frame.w.isFinite, frame.h.isFinite,
+              frame.w > 0, frame.h > 0 else { return nil }
+        return CGRect(x: frame.x, y: frame.y, width: frame.w, height: frame.h)
     }
 }
 #endif

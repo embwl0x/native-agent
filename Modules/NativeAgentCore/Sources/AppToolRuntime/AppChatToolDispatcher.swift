@@ -1,7 +1,11 @@
 import AuthoredCapabilities
 import Foundation
 import Agents
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatToolRuntime
+import AgentWorkspace
+import ChatToolParsing
 import ChromeControl
 import Cognition
 import CognitiveSubstrate
@@ -16,6 +20,7 @@ import StandingBots
 import ToolRegistry
 import Senses
 import PersonaEngine
+// Blueprint: | `AppChatToolDispatcher.swift` | Composed tool dispatch, Security Center admission and settled-result observers; `withAuthoredProgramHost` is the one host binding for turns and native scheduled/UI owners, retaining their originating gated reentry |
 
 /// Core's composed gate in front of the tool router on chat surfaces.
 ///
@@ -116,14 +121,18 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
                 "tool": .string(tool),
             ])
         }
-        var canonicalInput = input
-        // Bind the same session as Core before any route.
-        let taskSession = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty }
-        if let taskSession {
-            canonicalInput["__session_id"] = .string(taskSession)
+        let canonicalInput = ChatToolSessionInjection.apply(toolName: tool, input: input)
+        let result = try await withAuthoredProgramHost(surface: surface) {
+            try await self.dispatchWithoutOrganismPosture(tool: tool, input: canonicalInput, surface: surface)
         }
+        await observeMotorOutcomeIfNeeded(tool: tool, result: result)
+        return result
+    }
+
+    /// Turns and native owners bind the same host. The caller supplies its
+    /// complete gate chain through AppDoorReentry; this binding grants no reach.
+    public func withAuthoredProgramHost<Value: Sendable>(surface: String,
+        operation: @Sendable () async throws -> Value) async throws -> Value {
         let host = AppToolExecutor.authoredProgramHost(dataRoot: securityCenter.dataRoot, reach: { operation, arguments in
             guard let dispatcher = self.inner as? SwiftToolDispatcher else {
                 throw SenseFailure(code: "unavailable", message: "The originating tool dispatcher is unavailable.")
@@ -148,7 +157,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             }
             return nil
         }
-        let result = try await OwnedProgramInvocation.$host.withValue(host) {
+        return try await OwnedProgramInvocation.$host.withValue(host) {
             try await MacScreenWatch.$open.withValue({ request, hands in
                 guard let dispatcher = self.inner as? SwiftToolDispatcher else {
                     throw SenseFailure(code: "unavailable", message: "The originating tool dispatcher is unavailable.")
@@ -162,14 +171,10 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
                     return await self.interactions.waitForAnswer(need, tool: tool, input: input,
                         sessionID: session, dataRoot: self.securityCenter.dataRoot)
                 }) {
-                    try await dispatchWithoutOrganismPosture(
-                        tool: tool, input: canonicalInput, surface: surface
-                    )
+                    try await operation()
                 }
             }
         }
-        await observeMotorOutcomeIfNeeded(tool: tool, result: result)
-        return result
     }
 
     private func observeMotorOutcomeIfNeeded(tool: String, result: JSONValue) async {
@@ -190,7 +195,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             origin: Self.securityOrigin(surface: surface),
             enforceAutonomy: enforceAutonomySecurity
         )
-        try? await securityCenter.record(envelope)
+        try await securityCenter.record(envelope)
         // Composed chat and approved replay resolve asks in the outer approval
         // membrane. Recheck hard blocks here without asking a second time.
         guard envelope.decision != .block,

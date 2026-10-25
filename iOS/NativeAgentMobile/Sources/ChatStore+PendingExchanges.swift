@@ -240,7 +240,6 @@ extension ChatStore {
     /// Silence changes the status word. The partial answer, the bubble and the
     /// observation all stay exactly where they are.
     func notePendingExchangeSilent(correlationID: String) {
-        PhoneTurnActivity.shared.silence(correlationID)
         guard var record = pendingExchanges[correlationID] else { return }
         record.isSilent = true
         pendingExchanges[correlationID] = record
@@ -276,7 +275,6 @@ extension ChatStore {
     /// the record. Nothing else does.
     func closePendingExchange(_ correlationID: String) {
         iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
-        PhoneTurnActivity.shared.finish(correlationID)
         pendingExchanges.removeValue(forKey: correlationID)
     }
 
@@ -305,7 +303,7 @@ extension ChatStore {
         }
         func position(_ record: ChatPendingExchange) -> Int {
             guard let user = pendingUserMessage(for: record.correlationID) else { return messages.endIndex }
-            return indexOfUserOccurrence(user, in: messages) ?? messages.endIndex
+            return messages.firstIndex(where: { $0.id == user.id || ($0.role == .user && $0.runId == record.correlationID) }) ?? messages.endIndex
         }
         let ordered = records.sorted {
             let left = position($0), right = position($1)
@@ -326,20 +324,14 @@ extension ChatStore {
                 bubble.isStreaming = true
                 messages[index] = bubble
             } else {
-                // 2026-09-13: the bubble being absent is NOT evidence the turn
-                // ended. persistMessages() drops every streaming row, so the
-                // placeholder of an unfinished exchange is never in the cache
-                // it is restored from — the old code deleted the durable record
-                // here, and the partial answer plus the observation went with
-                // it. Re-create the bubble from the record instead: same
-                // placeholder id, whatever partial text had arrived, still
-                // streaming. Only a terminal receipt closes an exchange.
+                // An unfinished exchange owns its partial reply until settlement.
                 insertRestoredPlaceholder(
                     ChatMessage(
                         id: record.placeholderID,
                         role: .assistant,
                         text: record.partialText,
-                        isStreaming: true
+                        isStreaming: true,
+                        runId: record.correlationID
                     ), for: record
                 )
             }
@@ -358,7 +350,7 @@ extension ChatStore {
     private func insertRestoredPlaceholder(_ bubble: ChatMessage, for record: ChatPendingExchange) {
         insertPendingUserIfNeeded(pendingId: record.correlationID, before: nil)
         if let user = pendingUserMessage(for: record.correlationID),
-           let index = indexOfUserOccurrence(user, in: messages) {
+           let index = messages.firstIndex(where: { $0.id == user.id || ($0.role == .user && $0.runId == record.correlationID) }) {
             messages.insert(bubble, at: messages.index(after: index))
         } else {
             messages.append(bubble)

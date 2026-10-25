@@ -1,5 +1,5 @@
 import AppToolRuntime
-import ChatOrchestration
+import ChatSessionWork
 import NativeAgentCore
 import SwiftUI
 import AppKit
@@ -9,6 +9,8 @@ import Desk
 import StandingBots
 import DreamREMCycle
 import MemoryV2
+
+// Blueprint: | `CommandPalette.swift` | `CommandPaletteView`: keyboard navigation/search across pages, sessions and saved items; coordinator owns navigation and canonical owners supply actions |
 
 // PATCH-2026-06-06: command-palette — Cmd+K modal that lets the user jump to any
 // sidebar tab, any chat session, or any well-known recent action without
@@ -63,14 +65,14 @@ extension PaletteItem {
             id: "desk.\(row.handle)",
             title: row.title,
             subtitle: "\(row.alias) · \(row.status) · \(row.project)",
-            systemImage: row.isActionable ? "tray.full" : "eye",
+            systemImage: "tray.full",
             kind: .deskItem(row.handle)
         )
     }
 }
 
-/// What the Desk page adds when ⌘K opens there: its live rows (GitHub watcher
-/// rows included), the row already selected, and its three verbs. A leading
+/// What the Desk page adds when ⌘K opens there: its live rows, the row
+/// already selected, and its three verbs. A leading
 /// close / defer / note turns the field into a Desk command; anything else is
 /// the ordinary app-wide search with the Desk's rows in it.
 struct DeskPaletteScope {
@@ -90,7 +92,7 @@ enum DeskPalettePresentation {
         highlighted: Int
     ) -> DeskPaletteRow? {
         if parsed.verb != nil, parsed.query.isEmpty {
-            return rows.first { $0.handle == selectedHandle && $0.isActionable }
+            return rows.first { $0.handle == selectedHandle }
         }
         guard !matches.isEmpty else { return nil }
         return matches[min(max(highlighted, 0), matches.count - 1)]
@@ -137,8 +139,6 @@ enum CommandPaletteRecentAction: String, CaseIterable, Sendable {
 /// from the sheet lets every presentation state use the same exact pool and
 /// ranking rules the user interacts with.
 enum CommandPalettePresentation {
-    @MainActor private static var poolInputs: (sessions: [ChatSession], settings: [PaletteItem], saved: [PaletteItem], rail: [SidebarItem], revision: UInt64)?
-    @MainActor private static var poolItems: [PaletteItem] = []
     /// `confirmed` are rows already matched elsewhere (a chat's words, found
     /// by the message index): listed after the pool's matches, never
     /// re-matched against what they display.
@@ -174,28 +174,25 @@ enum CommandPalettePresentation {
     }
 
     /// The rail top to bottom, in its own words — the Navigate menu's order.
-    @MainActor static func railItems() -> [SidebarItem] {
-        SidebarItem.rail(SurfaceLayoutLive.shared.layout).compactMap { $0 }
+    @MainActor static func railItems(_ layout: SurfaceLayout) -> [SidebarItem] {
+        SidebarItem.rail(layout).compactMap { $0 }
     }
 
     @MainActor
     static func itemPool(
+        layout: SurfaceLayout,
         sessions: [ChatSession],
         settings: [PaletteItem] = [],
         saved: [PaletteItem] = []
     ) -> [PaletteItem] {
-        let rail = railItems()
-        let revision = ChatShellOpeningLine.shared.revision
-        if let previous = poolInputs, previous.sessions == sessions, previous.settings == settings,
-           previous.saved == saved, previous.rail == rail, previous.revision == revision { return poolItems }
-        poolInputs = (sessions, settings, saved, rail, revision)
+        let rail = railItems(layout)
         let pages = rail.map { item in
             PaletteItem(id: "tab.\(item.rawValue)", title: item.shellRailTitle, subtitle: nil,
                         systemImage: item.systemImage, kind: .tab(item))
         }
         // Every tab, under the rail page that holds it; a page's first tab
         // shares its name and is the page row above.
-        let tabs = ShellRailTab.all.flatMap { page, tabs in
+        let tabs = ShellRailTab.all(layout).flatMap { page, tabs in
             tabs.filter { $0.title != page.shellRailTitle }.map { tab in
                 PaletteItem(id: "railtab.\(page.rawValue).\(tab.key)", title: tab.title,
                             subtitle: page.shellRailTitle, systemImage: page.systemImage,
@@ -215,7 +212,7 @@ enum CommandPalettePresentation {
         }
         // Destinations and chats rank first on an equal match; the saved things
         // sit behind them, so ⌘K still opens a page when that is what was typed.
-        poolItems = pages + tabs + settings + chats + saved + CommandPaletteRecentAction.allCases.map { action in
+        return pages + tabs + settings + chats + saved + CommandPaletteRecentAction.allCases.map { action in
             let presentation = action.presentation
             return PaletteItem(
                 id: "action.\(action.rawValue)",
@@ -225,7 +222,6 @@ enum CommandPalettePresentation {
                 kind: .recentAction(action.rawValue)
             )
         }
-        return poolItems
     }
 
     static func visibleSessions(_ sessions: [ChatSession]) -> [ChatSession] {
@@ -254,19 +250,15 @@ enum CommandPalettePresentation {
 }
 
 
-/// The saved things ⌘K can find: Desk items (still open AND finished), what a
-/// bot actually said, dreams, and every memory by its words. Read once when
-/// the palette opens, through the canonical readers, newest first; the Desk,
-/// bot replies and dreams are bounded — finished work recedes, it does not
-/// disappear.
+/// Search rows derived from the engine's current Desk and diary revisions.
+/// Bot replies and the full memory listing use their existing checked readers.
 enum CommandPaletteSavedThings {
-    static func load(dataRoot: URL, memories: [MemoryV2.MemoryRecord]) async -> [PaletteItem] {
-        let saved = await RuntimeReadProjection.savedThings(dataRoot: dataRoot)
-        var items = deskItems(saved.desk)
-        items += botReplies(saved.botReplies)
-        items += dreams(saved.dreams)
-        items += memoryItems(memories)
-        return items
+    @MainActor
+    static func shared(engine: NativeAgentEngine) -> [PaletteItem] {
+        deskItems(Array(engine.desk.board.items.sorted { $0.updatedAt > $1.updatedAt }.prefix(40)))
+            + dreams(Array((engine.cognitionView.diary?.entries ?? []).prefix(40)))
+            + botReplies(engine.transcripts.savedBotReplies)
+            + memoryItems(engine.transcripts.savedMemories)
     }
 
     private static func firstLine(_ text: String, limit: Int = 90) -> String {
@@ -342,8 +334,9 @@ struct CommandPaletteView: View {
 
     @State private var query: String = ""
     @State private var selection: Int = 0
-    /// Desk items, bot replies, dreams and memories — read once per opening.
-    @State private var savedThings: [PaletteItem] = []
+    private var savedThings: [PaletteItem] {
+        CommandPaletteSavedThings.shared(engine: appModel.engine)
+    }
     /// The settings registry's controls — read once per opening.
     @State private var settingThings: [PaletteItem] = []
     /// Conversations whose words hold the query, from the message index.
@@ -351,8 +344,20 @@ struct CommandPaletteView: View {
     /// The query `messageHits` answer; another query shows none of them.
     @State private var messageHitsQuery = ""
     @State private var messagesIndexed = false
-    /// Conversations the index could not read this opening.
+    @State private var indexRevision: UInt64 = 0
+    private struct IndexRequest: Equatable {
+        var sessions: [ChatSession]
+        var revision: UInt64
+    }
+    private var indexRequest: IndexRequest {
+        IndexRequest(sessions: appModel.engine.transcripts.sessions,
+                     revision: appModel.engine.transcripts.structureVersion)
+    }
+    /// Conversations the current index could not read.
     @State private var unreadChats = 0
+    @State private var indexRead = LatestRead()
+    @State private var matchesRead = LatestRead()
+    @State private var hitsRead = LatestRead()
     private struct MatchRequest: Equatable, Sendable {
         let pool: [PaletteItem]
         let query: String
@@ -414,6 +419,10 @@ struct CommandPaletteView: View {
                 Divider()
             }
 
+            if let error = appModel.engine.transcripts.savedSearchError ?? appModel.engine.cognitionView.diaryError ?? appModel.engine.desk.board.deskError {
+                Text(error).font(ShellType.label).foregroundStyle(NativeAgentShell.trouble)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+            }
             let items = filteredItems()
             if items.isEmpty {
                 VStack(spacing: 8) {
@@ -503,49 +512,57 @@ struct CommandPaletteView: View {
                 fieldFocused = true
             }
         }
-        // The saved things land behind the field; typing never waits on them.
         .task {
             settingThings = CommandPalettePresentation.settingItems(appModel: appModel)
-            savedThings = await CommandPaletteSavedThings.load(
-                dataRoot: PersistenceCore.defaultDataRoot(),
-                memories: (try? await appModel.engine.memory.activeMemories(limit: nil)) ?? []
-            )
-            let sessions = CommandPalettePresentation.visibleSessions(appModel.engine.transcripts.sessions)
-                .map { (id: $0.id, stamp: CommandPaletteMessageIndex.stamp($0)) }
-            unreadChats = await CommandPaletteMessageIndex.shared.refresh(sessions, transcripts: appModel.engine.transcripts)
-            messagesIndexed = true
+            _ = await appModel.engine.desk.loadBoard()
+            await appModel.engine.cognitionView.refreshDiary()
         }
-        .task(id: appModel.engine.transcripts.sessions) {
-            try? await ChatShellOpeningLine.shared.prepare(
-                appModel.engine.transcripts.sessions, dataRoot: appModel.engine.transcripts.dataRoot
-            )
+        .task {
+            await appModel.engine.transcripts.observeSavedSearch(bots: appModel.engine.bots, memory: appModel.engine.memory)
+        }
+        .task(id: indexRequest) {
+            let transcripts = appModel.engine.transcripts
+            let sessions = CommandPalettePresentation.visibleSessions(transcripts.sessions)
+                .map { (id: $0.id, stamp: CommandPaletteMessageIndex.stamp($0)
+                        + "|\(transcripts.structureVersion(for: $0.id))") }
+            _ = await indexRead.read({ await transcripts.messageIndex.refresh(sessions, transcripts: transcripts) }, publish: { unread in
+                unreadChats = unread
+                messagesIndexed = true
+                indexRevision &+= 1
+            })
+            guard !Task.isCancelled else { return }
+            try? await ChatShellOpeningLine.shared.prepare(transcripts.sessions, dataRoot: transcripts.dataRoot)
         }
         .task(id: matchRequest) {
             let request = matchRequest
-            let result = await Task.detached(priority: .userInitiated) {
+            _ = await matchesRead.read({
+            await Task.detached(priority: .userInitiated) {
                 CommandPalettePresentation.filteredItems(pool: request.pool, query: request.query,
                                                          confirmed: request.confirmed, rail: request.rail)
             }.value
-            guard !Task.isCancelled else { return }
+            }, publish: { result in
             matches = result
             matchedRequest = request
             if pendingCommit { pendingCommit = false; commitCurrent() }
+            })
         }
         // The words of every chat, searched a beat after typing stops.
-        .task(id: "\(messagesIndexed) \(query)") {
+        .task(id: "\(messagesIndexed) \(indexRevision) \(query)") {
             let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard messagesIndexed, text.count >= 3 else { messageHits = []; return }
+            guard messagesIndexed, text.count >= 3 else { hitsRead.write { messageHits = [] }; return }
+            _ = await hitsRead.read({
             try? await Task.sleep(for: .milliseconds(150))
-            guard !Task.isCancelled else { return }
-            let hits = await CommandPaletteMessageIndex.shared.search(text)
-            guard !Task.isCancelled else { return }
+            let hits = await appModel.engine.transcripts.messageIndex.search(text)
             let sessions = appModel.engine.transcripts.sessions
-            messageHitsQuery = text
-            messageHits = hits.compactMap { hit in
+            return hits.compactMap { hit -> PaletteItem? in
                 guard let session = sessions.first(where: { $0.id == hit.sessionID }) else { return nil }
                 return PaletteItem(id: "message.\(hit.sessionID)", title: ChatShellConversationRow.title(for: session),
                                    subtitle: hit.snippet, systemImage: "text.bubble", kind: .chatSession(hit.sessionID))
             }
+            }, publish: { hits in
+                messageHitsQuery = text
+                messageHits = hits
+            })
         }
     }
 
@@ -593,9 +610,7 @@ struct CommandPaletteView: View {
         case .chatSession: return "Chat"
         case .recentAction: return "Action"
         case .deskItem(let handle):
-            guard let row = desk?.rows.first(where: { $0.handle == handle }) else { return "Desk" }
-            if handle == desk?.selectedHandle { return "Selected" }
-            return row.isActionable ? "Desk" : "Watch only"
+            return handle == desk?.selectedHandle ? "Selected" : "Desk"
         case .bot: return "Bot"
         case .dream: return "Dream"
         case .memory: return "Memory"
@@ -638,6 +653,7 @@ struct CommandPaletteView: View {
 
     private func itemPool() -> [PaletteItem] {
         CommandPalettePresentation.itemPool(
+            layout: appModel.engine.layout.layout,
             sessions: appModel.engine.transcripts.sessions,
             settings: settingThings,
             saved: savedThings
@@ -646,11 +662,11 @@ struct CommandPaletteView: View {
 
     private var matchRequest: MatchRequest {
         MatchRequest(pool: itemPool(), query: query, confirmed: currentMessageHits,
-                     rail: CommandPalettePresentation.railItems())
+                     rail: CommandPalettePresentation.railItems(appModel.engine.layout.layout))
     }
 
     private func deskMatches(_ desk: DeskPaletteScope, _ parsed: DeskPaletteQuery) -> [DeskPaletteRow] {
-        DeskFuzzy.filter(parsed.verb == nil ? desk.rows : desk.rows.filter(\.isActionable), query: parsed.query)
+        DeskFuzzy.filter(desk.rows, query: parsed.query)
     }
 
     /// The row a Desk command applies to: the selected row when only the verb

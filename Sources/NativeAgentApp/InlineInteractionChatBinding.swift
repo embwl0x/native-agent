@@ -1,31 +1,17 @@
 import EngineRuntime
 import ApprovalTransactions
 import AppToolRuntime
-import ChatOrchestration
 import Foundation
 import NativeAgentShared
-import PersistenceCore
 import SwiftUI
 import TrustCenter
 
-/// What the transcript injects into `\.inlineCardSource` and
-/// `\.inlineCardAction`: the persisted interactions of the open conversation,
-/// keyed by the tool row they were raised on, and the one handler that turns a
-/// tap into "open the control that already exists, then ask its owner".
-///
-/// Everything durable lives in the transcript and is read back through
-/// `InlineInteractionResolver`. This holds only what a view needs between
-/// reads: the projected cards, and whichever sheet is currently open. A
-/// relaunch rebuilds it from disk, with each card's state intact, because it
-/// never was the authority in the first place.
+// Blueprint: | `InlineInteractionChatBinding.swift` | `InlineInteractionChatBinding`: card action/control presentation, existing setup sheets and verify-on-return settlement |
+
+/// Card actions and open controls only. TranscriptsFacade owns card reads.
 @MainActor
 @Observable
 final class InlineInteractionChatBinding {
-
-    /// Cards by transcript row id. Rebuilt whole on every refresh; a card whose
-    /// revision moved is replaced in place because its `id` — the request, not
-    /// the message — is stable across re-observations.
-    private(set) var cardsByRow: [String: [InlineCardModel]] = [:]
 
     /// The connector setup sheet, when a card opened one. `ConnectorWizardView`
     /// is the control Connectors already ships; the card presents that, it does
@@ -38,7 +24,8 @@ final class InlineInteractionChatBinding {
     var panelPage: SidebarItem?
 
     private var sessionID: String = ""
-    private var dataRoot: URL { PersistenceCore.defaultDataRoot() }
+    private var engine = NativeAgentEngine.live
+    private var dataRoot: URL { engine.dataRoot }
 
     /// Interactions the person left through a control (Trust, Providers) and
     /// has not come back from. On return to chat each is re-verified with its
@@ -49,10 +36,6 @@ final class InlineInteractionChatBinding {
     /// Providers, and the answer still belongs to the transcript that asked.
     private var awaitingReturn: [String: String] = [:]
 
-    /// The pending debounced read started by `refreshSoon`.
-    @ObservationIgnored private var coalescedRefresh: Task<Void, Never>?
-    @ObservationIgnored private var refreshGeneration: UInt64 = 0
-
     struct ConnectorSheetRequest: Identifiable, Equatable {
         let id: String
         let provider: String
@@ -62,58 +45,6 @@ final class InlineInteractionChatBinding {
         let sessionID: String
     }
 
-    // MARK: - Source
-
-    func cards(forRow rowID: String) -> [InlineCardModel] {
-        cardsByRow[rowID] ?? []
-    }
-
-    /// One transcript read, projected. Called on session change and on every
-    /// `.chatTurnCompleted` — the same signal the resolver posts after it
-    /// persists, which is what makes a settled card become its receipt without
-    /// the view polling anything.
-    /// `reclaim` is false for the offscreen copy a quiet read mounts. The
-    /// projection below only reads and assigns; the reclaim pass WRITES — it
-    /// persists released claims and starts the turns they were holding — and a
-    /// read of the page must not do that.
-    /// The coalesced form, for the transcript-version edge.
-    ///
-    /// 2026-09-14: every structural write to the transcript bumps that version,
-    /// and one turn bumps it many times — the user row, each tool receipt, the
-    /// reply. Each bump used to start its own `refresh`, and a refresh READS
-    /// AND JSON-PARSES THE WHOLE TRANSCRIPT, then reassigns `cardsByRow`, which
-    /// invalidates the card mount under every row. A burst now settles into one
-    /// read. Nothing waits on this: a card appearing a quarter-second after the
-    /// row it hangs off is not something anyone can see, and the explicit edges
-    /// (appearance, session switch, turn completion) still refresh immediately.
-    func refreshSoon(sessionID: String) {
-        coalescedRefresh?.cancel()
-        coalescedRefresh = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(250))
-            guard !Task.isCancelled, let self else { return }
-            self.coalescedRefresh = nil
-            await self.refresh(sessionID: sessionID)
-        }
-    }
-
-    func refresh(sessionID: String, reclaim: Bool = true) async {
-        coalescedRefresh?.cancel()
-        coalescedRefresh = nil
-        refreshGeneration &+= 1
-        let generation = refreshGeneration
-        self.sessionID = sessionID
-        guard !sessionID.isEmpty else {
-            cardsByRow = [:]
-            return
-        }
-        if let built = await InlineCardProjection.cardsByRow(
-            sessionID: sessionID, dataRoot: dataRoot, reclaim: reclaim,
-            isCurrent: { self.sessionID == sessionID && self.refreshGeneration == generation }
-        ) {
-            cardsByRow = built
-        }
-    }
-
     // MARK: - Actions
 
     func handle(
@@ -121,7 +52,9 @@ final class InlineInteractionChatBinding {
         action: InlineCardAction,
         appModel: AppModel
     ) {
-        let sessionID = self.sessionID
+        let sessionID = card.sessionID
+        self.sessionID = sessionID
+        engine = appModel.engine
         guard !sessionID.isEmpty else { return }
         switch action {
         case .secondary:
@@ -244,11 +177,12 @@ final class InlineInteractionChatBinding {
                 case .internetAccounts:
                     NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Internet-Accounts-Settings.extension")!)
                 case .pairDevice:
-                    UserDefaults.standard.set("iphone", forKey: ShellRailTab.storageKey(.connectors))
+                    // The route lands on the page's first tab, so the tab is chosen after it.
                     self.openPage(.connectors, for: interaction.id, sessionID: sessionID)
+                    UserDefaults.standard.set("iphone", forKey: ShellRailTab.storageKey(.connectors))
                 case .connectorManualToken where descriptor.target == "telegram":
                     self.openPage(.telegram, for: interaction.id, sessionID: sessionID)
-                case .connectorManualToken, .connectorOAuth:
+                case .connectorManualToken:
                     self.connectorSheet = ConnectorSheetRequest(
                         id: interaction.id, provider: descriptor.target, sessionID: sessionID)
                 case .trustPostureRequired:
@@ -320,7 +254,7 @@ final class InlineInteractionChatBinding {
     @ObservationIgnored private let grantWatch = InlineInteractionResolver.GrantWatch.shared
 
     private func watchUntilGranted(_ id: String, sessionID: String) {
-        grantWatch.watchUntilGranted(id, sessionID: sessionID) { [weak self] in
+        grantWatch.watchUntilGranted(id, sessionID: sessionID, dataRoot: dataRoot) { [weak self] in
             await self?.refreshCurrent()
         }
     }
@@ -329,6 +263,6 @@ final class InlineInteractionChatBinding {
     /// goes through this: the action belongs to the session it started in, the
     /// cards on screen belong to the session on screen.
     private func refreshCurrent() async {
-        await refresh(sessionID: sessionID)
+        await engine.transcripts.refreshCards(in: sessionID)
     }
 }

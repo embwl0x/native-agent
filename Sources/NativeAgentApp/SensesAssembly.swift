@@ -4,10 +4,13 @@ import AppToolRuntime
 import PersistenceCore
 import NativeAgentCore
 import EngineRuntime
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
 import MemoryV2
 import MacControl
 import TrustCenter
+
+// Blueprint: | `SensesAssembly.swift` | `SensesAssembly`: launch-only shared hub installation and gated raw-read bindings; quiet reads borrow no turn authority |
 
 /// Launch composition only. Runtime callers go through the shared hub.
 enum SensesAssembly {

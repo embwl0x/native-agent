@@ -3,8 +3,9 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
-import ChatOrchestration
+import ChatTurnRuntime
 import Cognition
+// Blueprint: | `EngineProviders+Probe.swift` | `ProvidersFacade`: `testProvider`, `clearProvider` |
 
 extension ProvidersFacade {
     // DAEMON-DEAD PORT (2026-06-02): native reachability probe. Resolves the
@@ -63,7 +64,7 @@ extension ProvidersFacade {
             // No turn context may override the probe's provider or budget.
             let probe = Task.detached {
                 try await LLMCallContext.$providerId.withValue(id) {
-                    try await llm.complete(prompt: "ping", system: "This is a provider connection check. Reply with one word.", model: probeModel, surface: "chat", purpose: "probe")
+                    try await llm.complete(prompt: "ping", system: "This is a provider connection check.", model: probeModel, surface: "chat", purpose: "probe")
                 }
             }
             // The sign-in this check sends, hashed before it is sent, as a key's

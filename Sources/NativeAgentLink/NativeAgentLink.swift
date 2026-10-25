@@ -3,6 +3,8 @@ import Foundation
 import Darwin
 import PersistenceCore
 
+// Blueprint: | `NativeAgentLink.swift` | `NativeAgentLink`: authenticated local bridge client for host stdio relay and explicit replies; credentials stay out of arguments, output and persisted state |
+
 private enum LinkFailure: Error {
     /// No descriptor, or nothing listening on its port: the app is quit or
     /// restarting, and the request never left this process.
@@ -238,8 +240,8 @@ private struct NativeAgentLink {
     }
 
     static let usage = """
-    nativeagent-link message <text> [--session id] [--request id]
-    nativeagent-link reply --session id --request id [--offset n]
+    nativeagent-link message <text> [--session id] [--request id] [--contact id]
+    nativeagent-link reply --session id --request id [--offset n] [--contact id]
     nativeagent-link reply --contact id < reply.json
     nativeagent-link mcp
 
@@ -280,6 +282,7 @@ private struct NativeAgentLink {
                 remaining.removeFirst()
             }
             var seen = Set<String>()
+            var contact: String?
             while !remaining.isEmpty {
                 guard remaining.count >= 2 else { throw LinkFailure.invalidArguments }
                 let key = remaining.removeFirst(), value = remaining.removeFirst()
@@ -292,6 +295,11 @@ private struct NativeAgentLink {
                         }
                     } else if !exactUUID(value) { throw LinkFailure.invalidArguments }
                     arguments[key == "--session" ? "session_id" : "request_id"] = value
+                case "--contact":
+                    // A contact (Grok Bot) speaks with its own credential, read here
+                    // from the keychain: it never crosses arguments, stdout or Grok.
+                    guard exactUUID(value), value == value.lowercased() else { throw LinkFailure.invalidArguments }
+                    contact = value
                 case "--offset":
                     guard operation == "reply", let offset = Int(value), (0...1_048_576).contains(offset) else { throw LinkFailure.invalidArguments }
                     arguments["offset"] = offset
@@ -306,8 +314,15 @@ private struct NativeAgentLink {
                 throw LinkFailure.invalidArguments
             }
             recovery = ["session_id": session, "request_id": request,
-                        "read_with": ["command": "nativeagent-link", "arguments": ["reply", "--session", session, "--request", request]]]
-            let descriptor = try BridgeDescriptor.load()
+                        "read_with": ["command": "nativeagent-link", "arguments": ["reply", "--session", session, "--request", request]
+                            + (contact.map { ["--contact", $0] } ?? [])]]
+            let descriptor: BridgeDescriptor
+            if let contact {
+                let credential = try GrokLinkCredential.read(peer: contact)
+                descriptor = try BridgeDescriptor.load(pathOverride: credential.descriptorPath, bearer: credential.replyToken)
+            } else {
+                descriptor = try BridgeDescriptor.load()
+            }
             try await BridgeHTTP.initialize(descriptor: descriptor)
             let rpcID = UUID().uuidString
             let payload: [String: Any] = ["jsonrpc": "2.0", "id": rpcID, "method": "tools/call",

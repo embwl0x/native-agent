@@ -44,6 +44,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Studio
+// Blueprint: | `SwiftToolDispatcher+StandingViewTools.swift` | `SwiftToolDispatcher`: `impl_hold_view`, `impl_release_view` |
 
 /// The live mind's standing-view seam. Implemented by the app's cognition
 /// runtime, the only object that owns the substrate.

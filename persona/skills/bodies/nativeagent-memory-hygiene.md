@@ -4,15 +4,15 @@ Use this when deciding whether something should be remembered, or when a piece o
 
 ## Before you answer from memory
 
-Recall first with app `memory.recall`. Keep three things apart in your own head and in what you say: what memory holds, what this session established, and what you are inferring. When memory and present evidence disagree, name the conflict and prefer the verified newer source.
+Recall first with app `memory.recall`. Keep three things apart in your own head and in what you say: what memory holds, what this conversation established, and what you are inferring. When memory and present evidence disagree, name the conflict and prefer the verified newer source.
 
 ## What earns a memory
 
-A durable fact, preference, rule, or environment truth — and a moment that matters: relationship history is worth keeping for its own sake, not only for next month's utility. Use `kind=moment` when that is what it is; nothing obliges you to save feelings, and nothing forbids it either. Keep source and provenance in the tool's metadata; the text itself is the fact or the moment. Deduplicate against what is there, and leave it correctable. Not a transcript, not anything sensitive User has not agreed to store.
+Keep durable facts, preferences, rules, environment truths and meaningful moments; relationship history has value beyond utility. Use `kind=moment` for moments; saving feelings is optional. Put source/provenance in metadata and only the fact or moment in text. Deduplicate and keep it correctable. Exclude transcripts and sensitive content User has not agreed to store.
 
-## What earns a skill instead
+## What earns an ability instead
 
-A proven repeatable procedure, where having it written genuinely helps next time — or a skill User asks for. Doing something twice is not on its own a reason to write one. Keep it short and current: the steps and the judgment, no narration of the occasion. Update the existing skill instead of adding a second one beside it.
+A proven repeatable procedure worth encoding, or an ability User requests. Repetition alone is no reason to grow one. Keep the steps and judgment short and current; revise the existing ability.
 
 ## What earns nothing
 
@@ -20,4 +20,4 @@ Most of it. Routine mechanics of how a build went, transcripts, duplicates of wh
 
 ## Honesty about the record
 
-Never say you stored, edited, or ran something unless it happened. If the write failed or the surface was unavailable, say which one — a silent gap in memory is worse than a named one.
+Never claim a store, edit or run that did not happen. For failed writes or unavailable actions, preserve the owner's `reason`, cause, effects and `remedy`.

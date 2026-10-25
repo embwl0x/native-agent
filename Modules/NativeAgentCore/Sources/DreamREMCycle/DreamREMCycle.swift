@@ -146,10 +146,6 @@ public struct REMRunResult: Sendable, Codable, Equatable {
 // MARK: - Errors
 
 public enum DreamREMCycleError: Error, LocalizedError {
-    case invalidRequest
-    case notFound
-    case invalidResponse(status: Int)
-    case unavailable
     case underlying(String)
     case remDecodeFailure(String)
     /// WAVE 35 W15: the cycle's gate is off. Mirrors the daemon POST routes'
@@ -161,10 +157,6 @@ public enum DreamREMCycleError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .invalidRequest: return "dream/rem: invalid request"
-        case .notFound: return "dream/rem: entry not found"
-        case .invalidResponse(let s): return "dream/rem: native implementation returned unexpected status \(s)"
-        case .unavailable: return "dream/rem: unavailable"
         case .underlying(let m), .remDecodeFailure(let m): return "dream/rem: \(m)"
         case .cycleDisabled(_, let detail): return "dream/rem: \(detail)"
         }
@@ -294,13 +286,6 @@ public struct DreamREMGatePolicy: Sendable, Equatable {
 /// Nightly dreams run at 03:30 on the MACHINE's own clock and write the
 /// previous local calendar day's diary key.
 public enum DreamREMSchedule {
-    /// The Mac's current time zone for both scheduling and diary date keys.
-    /// The stored schedule follows the Mac: "local" is the scheduler's own
-    /// follow-the-Mac zone, resolved at fire time. A pinned identifier was
-    /// rewritten over the person's edit on every bootstrap pass and went stale
-    /// the moment the Mac moved.
-    public static var timeZoneIdentifier: String { "local" }
-
     /// Dream loop fire time.
     public static let dreamHour = 3
     public static let dreamMinute = 30
@@ -337,22 +322,16 @@ public enum DreamREMSchedule {
     }
 }
 
-// MARK: - FileBackedDreamDiary (true read-path port)
+// MARK: - FileBackedDreamDiary
 
 /// File-backed diary listing and by-date reads, including archived entries.
 /// No LLM, scheduler or persona is needed to read a dream.
+/// Markdown under dream_diary (including archive): backed up, excluded from
+/// production export and phone sync; PrivacyMap: dream_diary.
 ///
-/// Semantics pinned against the daemon source:
-///   - list: `sorted(self._diary_dir.glob("*.md"), reverse=True)[:limit]`.
-///     Python sorts the full Path lexicographically descending; for
-///     `YYYY-MM-DD.md` stems that is newest-first. We sort by FILENAME
-///     descending to match (not by stem-parsed date) so the byte order is
-///     identical to Python's, including any non-date `.md` files that happen
-///     to live in the dir. `date` is `path.stem`, `modified_at` is the
-///     UTC ISO mtime.
-///   - latest: `list_entries(limit=1)[0]` (L199-201).
-///   - by-date: `<diary>/<date_key>.md`; nil when absent. Note the daemon's
-///     by-date payload OMITS `modified_at` (L203-212) — we match that omission.
+/// Browsing sorts all Markdown by filename descending, carries the full stem
+/// as `DreamEntry.date`, and includes archives. REM uses the discovered day
+/// prefix; theme cues select exact nightly filenames. By-date reads omit mtime.
 public struct FileBackedDreamDiary: Sendable {
     private let diaryDir: URL
     // `FileManager` is not Sendable, so we use `FileManager.default` inline
@@ -364,35 +343,81 @@ public struct FileBackedDreamDiary: Sendable {
         self.diaryDir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
     }
 
-    /// Mirror `list_entries(limit)`: newest-first by filename, capped at `limit`
-    /// (at least 1). No upper ceiling: the Dreams page pages past a year of
-    /// nights, and every entry must stay reachable. Callers bound themselves.
-    /// Every `.md` in the diary, plus the ones weekly REM moved into
-    /// `archive/<year>/`. Archival is housekeeping, not deletion: the diary is
-    /// one history, and a dream that aged past fourteen days must still be
-    /// listed and openable by date.
-    private func diaryFiles() -> (files: [(name: String, url: URL)], unreadableDirectory: Bool) {
-        var found: [(name: String, url: URL)] = []
+    public enum Location: Sendable { case active, includingArchives }
+    public enum Filenames: Sendable { case markdown, dated, nightly }
+
+    public struct DiaryFile: Sendable {
+        public let name: String
+        public let url: URL
+        /// Calendar-day prefix, including session-suffixed entries; nil for other Markdown.
+        public let day: String?
+        public var stem: String { (name as NSString).deletingPathExtension }
+    }
+
+    private static let dateStemRegex = try! NSRegularExpression(pattern: "^(\\d{4}-\\d{2}-\\d{2})(?:_.+)?$")
+
+    private static func day(from stem: String) -> String? {
+        guard let match = dateStemRegex.firstMatch(in: stem, range: NSRange(stem.startIndex..., in: stem)),
+              let range = Range(match.range(at: 1), in: stem) else { return nil }
+        return String(stem[range])
+    }
+
+    /// Discovery only: callers choose active/history coverage and filename policy.
+    /// A date window uses local calendar days, like weekly REM.
+    public func discover(
+        in location: Location, matching filenames: Filenames,
+        since: Date? = nil
+    ) throws -> [DiaryFile] {
+        var failure: (any Error)?
+        let files = diaryFiles(in: location, matching: filenames) { _, error in
+            if (error as? CocoaError)?.code != .fileReadNoSuchFile { failure = error }
+        }
+        if let failure { throw failure }
+        return files.filter { file in
+            guard let since else { return true }
+            guard let day = file.day, let date = Self.localDate(from: day) else { return false }
+            return date >= DreamREMSchedule.localCalendar().startOfDay(for: since)
+        }
+    }
+
+    private static func localDate(from day: String) -> Date? {
+        let parts = day.split(separator: "-")
+        guard parts.count == 3,
+              let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]) else { return nil }
+        return DreamREMSchedule.localCalendar().date(from: DateComponents(year: year, month: month, day: day))
+    }
+
+    private func diaryFiles(
+        in location: Location, matching filenames: Filenames,
+        onFailure: (URL, any Error) -> Void
+    ) -> [DiaryFile] {
+        var found: [DiaryFile] = []
         // A directory that EXISTS but cannot be listed is a read failure, not
         // an empty diary. A directory that is simply absent is the empty case.
-        var unreadable = false
         func names(in directory: URL) -> [String] {
             do { return try fm.contentsOfDirectory(atPath: directory.path) } catch {
-                if fm.fileExists(atPath: directory.path) { unreadable = true }
+                onFailure(directory, error)
                 return []
             }
         }
-        for name in names(in: diaryDir) where name.hasSuffix(".md") {
-            found.append((name, diaryDir.appendingPathComponent(name)))
-        }
-        let archive = diaryDir.appendingPathComponent("archive", isDirectory: true)
-        for year in names(in: archive) {
-            let yearDir = archive.appendingPathComponent(year, isDirectory: true)
-            for name in names(in: yearDir) where name.hasSuffix(".md") {
-                found.append((name, yearDir.appendingPathComponent(name)))
+        func collect(in directory: URL) {
+            for name in names(in: directory) {
+                guard (filenames == .dated ? name.lowercased() : name).hasSuffix(".md") else { continue }
+                let stem = (name as NSString).deletingPathExtension
+                let day = Self.day(from: stem)
+                if filenames == .dated && day == nil { continue }
+                if filenames == .nightly && (day == nil || day != stem) { continue }
+                found.append(DiaryFile(name: name, url: directory.appendingPathComponent(name), day: day))
             }
         }
-        return (found, unreadable)
+        collect(in: diaryDir)
+        if location == .includingArchives {
+            let archive = diaryDir.appendingPathComponent("archive", isDirectory: true)
+            for year in names(in: archive) {
+                collect(in: archive.appendingPathComponent(year, isDirectory: true))
+            }
+        }
+        return found
     }
 
     /// A listing that says what it could NOT read. `listEntries` returns the
@@ -417,18 +442,22 @@ public struct FileBackedDreamDiary: Sendable {
     /// The same listing, with what it could not read carried out alongside it.
     public func listEntriesChecked(limit: Int) -> DiaryListing {
         let clamped = max(1, limit)
-        let scan = diaryFiles()
+        var unreadableDirectory = false
+        let discovered = diaryFiles(in: .includingArchives, matching: .markdown) { directory, _ in
+            if fm.fileExists(atPath: directory.path) { unreadableDirectory = true }
+        }
         // Filename DESCENDING == Python sorted(reverse=True); the archived
         // files carry the same `YYYY-MM-DD` stems, so one sort still orders
         // the merged diary newest-first.
-        let files = scan.files
+        let files = discovered
             .sorted { $0.name > $1.name }
             .prefix(clamped)
         let isoOut = ISO8601DateFormatter()
         isoOut.formatOptions = [.withInternetDateTime]
         var out: [DreamEntry] = []
         var failures: [String: String] = [:]
-        for (name, url) in files {
+        for file in files {
+            let (name, url) = (file.name, file.url)
             do {
             let text = try String(contentsOf: url, encoding: .utf8)
             let attrs = try fm.attributesOfItem(atPath: url.path)
@@ -437,7 +466,7 @@ public struct FileBackedDreamDiary: Sendable {
                 throw CocoaError(.fileReadUnknown)
             }
             out.append(DreamEntry(
-                date: (name as NSString).deletingPathExtension,
+                date: file.stem,
                 filename: name,
                 content: text,
                 size: size,
@@ -446,8 +475,8 @@ public struct FileBackedDreamDiary: Sendable {
             } catch { failures[url.path] = error.localizedDescription }
         }
         return DiaryListing(
-            entries: out, totalEntries: scan.files.count,
-            storageUnreadable: scan.unreadableDirectory, failures: failures)
+            entries: out, totalEntries: discovered.count,
+            storageUnreadable: unreadableDirectory, failures: failures)
     }
 
     /// Outcome of a by-date read so the caller can distinguish the daemon's
@@ -551,7 +580,7 @@ public actor SwiftNativeDreamREMCycle {
             dataRoot: dataRoot,
             personaRoot: personaRoot,
             llm: llm,
-            memoryDeltaProvider: dreamMemoryDeltaProvider ?? { [] },
+            memoryDeltaProvider: dreamMemoryDeltaProvider ?? { _ in [] },
             feltSummaryProvider: dreamFeltSummaryProvider ?? { nil },
             feltOriginProvider: dreamFeltOriginProvider ?? { [] },
             receiptSink: dreamReceiptSink ?? { _, _ in },
@@ -707,3 +736,4 @@ public func makeDreamREMCycle(
         lifecycleObserver: lifecycleObserver)
 }
 import CognitiveSubstrate
+// Blueprint: | `DreamREMCycle.swift` | `FileBackedDreamDiary`: typed active/archive discovery, filename/day extraction, checked browsing and by-date reads |

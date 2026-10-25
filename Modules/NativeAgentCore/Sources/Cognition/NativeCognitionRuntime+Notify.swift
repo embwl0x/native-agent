@@ -1,5 +1,5 @@
 import Privacy
-import ChatOrchestration
+import ChatToolRuntime
 import CognitiveSubstrate
 import Foundation
 import NativeAgentCore
@@ -7,6 +7,8 @@ import NotificationInbox
 import PersonaEngine
 import PersistenceCore
 import MemoryV2
+
+// Blueprint: | `NativeCognitionRuntime+Notify.swift` | `NativeCognitionRuntime.innerStateReading`: one reading across mind/body owners and pending stake-bearing expectations |
 
 // NativeCognitionRuntime+Notify.swift
 // Personality depth item 3 (2026-09-02) — she is asked how she feels, so she

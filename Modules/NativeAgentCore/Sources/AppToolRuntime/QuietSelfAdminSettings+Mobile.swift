@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
+// Blueprint: | `QuietSelfAdminSettings+Mobile.swift` | mobile settings projection and writes |
 
 extension TrustPolicyPreset {
     public static func saveMobilePreset(_ preset: MobileTrustAction.Preset, dataRoot: URL, fullMacConfirmed: Bool) async throws -> TrustPolicy {

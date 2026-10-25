@@ -2,6 +2,8 @@ import AppToolRuntime
 import AppKit
 import SwiftUI
 
+// Blueprint: | `ThinkingSlider.swift` | `ThinkingPane` and slider: model-supported effort presentation, bounded selection gestures and shared composer pane styling |
+
 /// The Thinking pane behind the composer's thinking word.
 ///
 /// User, 2026-09-25: the system slider read as clunky — a hairline with ticks

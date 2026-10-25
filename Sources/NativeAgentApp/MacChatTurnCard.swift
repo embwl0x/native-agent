@@ -1,11 +1,13 @@
 import EngineRuntime
 import ApprovalTransactions
-import ChatOrchestration
+import ChatTurnRuntime
 import SwiftUI
 import ApprovalInbox
 import CoreGraphics
 import NativeAgentCore
 import NativeAgentShared
+
+// Blueprint: | `MacChatTurnCard.swift` | `MacChatTurnCard`: one display over canonical lifecycle state, shared by main/detached windows without card-local clocks or state machines |
 
 /// The one live-work card for an accepted Mac chat turn.
 ///
@@ -46,13 +48,10 @@ struct MacChatTurnCard: View {
     var isResolvingApproval: Bool = false
 
     @State private var isShowingPreviewSheet = false
-    /// How long she thought before her first words, measured when the
-    /// thinking line ends. The card is keyed by turn, so this is per turn.
-    @State private var thoughtFor: TimeInterval?
 
     /// "Thought for 8s" while her reply streams, in place of "is working…".
     private var thoughtTitle: String? {
-        guard model.isReplying, let thoughtFor else { return nil }
+        guard let thoughtFor = model.thoughtFor else { return nil }
         return "Thought for \(MacChatTurnCardFormat.duration(max(1, thoughtFor)))"
     }
 
@@ -256,9 +255,6 @@ struct MacChatTurnCard: View {
             }
         }
         .sheet(isPresented: $isShowingPreviewSheet) { previewSheet }
-        .onChange(of: model.thinkingSince) { since, now in
-            if let since, now == nil { thoughtFor = Date().timeIntervalSince(since) }
-        }
         // The empty container path also excluded its borderless buttons from
         // mouse hit testing, even though accessibility could activate them.
         // Keep the inset card's bounds hittable; settled cards remain inert.
@@ -567,8 +563,7 @@ struct MacChatTurnCardHost: View {
                 _ = try await appModel.resolveApproval(id: approvalId, decision: decision)
             } catch ApprovalInboxError.alreadyResolved {
                 // Stale card: re-read the inbox so it settles to the real decision.
-                appModel.engine.approvals.records = (try? await appModel.engine.approvals.list())
-                    ?? appModel.engine.approvals.records
+                await appModel.engine.approvals.refresh()
             } catch {
                 appModel.systemToasts.push(
                     error: UserFacingError.message(error, action: "record that decision")

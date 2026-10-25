@@ -1,5 +1,7 @@
 import SwiftUI
 
+// Blueprint: | `ChatPacedReveal.swift` | `ChatStreamPacer` and shared streaming views: paragraph-aware paced reveal, edge fade and settle crossfade for Mac/iPhone |
+
 // Shared by the Mac transcript and the iPhone chat (2026-10-04): the live
 // reply's paced reveal, its edge fade and the settle crossfade, so both
 // platforms stream with one feel.

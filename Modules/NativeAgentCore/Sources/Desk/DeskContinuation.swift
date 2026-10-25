@@ -1,8 +1,10 @@
 import Foundation
 import PersistenceCore
+import NativeAgentCore
+// Blueprint: | `DeskContinuation.swift` | `DeskContinuation`; life-stamped resumable work, stopped/restored projection; receiptIsUnresolved and toJSON |
 
 public struct DeskContinuation: Codable, Sendable, Equatable {
-    public enum State: String, Codable, Sendable { case running, ready, blocked, complete, canceled }
+    public enum State: String, Codable, Sendable { case running, ready, blocked, complete, canceled, stopped }
     /// One dispatched call. Only a redacted, bounded summary and the
     /// references a domain verifier needs are kept — never raw arguments or
     /// results, which can carry typed secrets.
@@ -31,6 +33,7 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
     }
     public var version = 1
     public var revision = UUID().uuidString
+    public var lifeID: String?
     public var state: State = .running
     public var processID: String
     public var runID: String
@@ -200,11 +203,11 @@ public actor DeskContinuationTurn {
         guard record.settled.count + record.pending.count <= 128 else { throw DeskContinuationError.full }
         let item = try await store.liveState().items.first { $0.handle == handle }
         guard let item, !item.status.isTerminal else { throw DeskContinuationError.conflict }
-        // A live turn may take over a stopped continuation; never a live one,
-        // and never one (stopped, canceled or done) still holding unresolved effects.
+        // A new life starts fresh. Within one life an unresolved effect still
+        // belongs to its continuation, even after Stop.
         if let previous = item.continuation {
-            guard [.complete, .canceled, .blocked].contains(previous.state) else { throw DeskContinuationError.conflict }
-            guard previous.pending.isEmpty else { throw DeskContinuationError.unsafe }
+            guard [.complete, .canceled, .blocked, .stopped].contains(previous.state) else { throw DeskContinuationError.conflict }
+            guard previous.state == .stopped || previous.pending.isEmpty else { throw DeskContinuationError.unsafe }
         }
         record.remainingWork = remainingWork
         record.revision = UUID().uuidString
@@ -215,7 +218,7 @@ public actor DeskContinuationTurn {
     public func resume() async throws {
         await acquireWriter()
         defer { releaseWriter() }
-        guard !fenced else { throw DeskContinuationError.unsafe }
+        guard !fenced, try DataRootLife.isCurrent(record.lifeID, in: store.dataRoot) else { throw DeskContinuationError.unsafe }
         record.state = .running
         record.processID = DeskContinuationScope.processID
         try await save()

@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `DoctorStatusProjection+Config.swift` | `AutoDoctorConfig`; `DoctorStatusProjection`: `readAutoDoctorConfig`, `boolValue`, `intValue` |
 
 public struct AutoDoctorConfig: Codable, Hashable {
     public var enabled: Bool?

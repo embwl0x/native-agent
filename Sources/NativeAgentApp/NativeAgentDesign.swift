@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+// Blueprint: | `NativeAgentDesign.swift` | `View`: `settingsCardSurface`, `appShimmer` |
 
 /// The panel every page still reaches for: an eyebrow over one card, the
 /// kit's (`aliveCard`). `tint` and `systemImage` stay in the signature —

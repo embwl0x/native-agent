@@ -13,8 +13,10 @@ import Foundation
 import Combine
 import NativeAgentShared
 import NativeAgentCore
-import KnowledgeGraph
+import MemoryV2
 import PersistenceCore
+
+// Blueprint: | `MacSyncEngine.swift` | Mac snapshot/inbox state, active chat tasks and stop bookkeeping; chat snapshots add read-only other-room exchanges beside canonical messages |
 
 // MARK: - MacSyncEngine
 
@@ -36,8 +38,17 @@ public final class MacSyncEngine: ObservableObject {
     /// by app/store mutation seams; unchanged passes write nothing and make no
     /// provider calls.
     var snapshotIntegrityTask: Task<Void, Never>?
-    /// The phone's evidence the Mac is up between publications (`NAMacPresence`).
-    var presenceBeatTask: Task<Void, Never>?
+    var snapshotIntegrityWatcher: FileChangeWatcher?
+    var snapshotIntegrityReconcileTask: Task<Void, Never>?
+    var snapshotIntegrityReconcileQueued = false
+    var snapshotIntegrityRetryRequested = false
+    var snapshotIntegrityObservedSkips: [String: String]?
+    /// The engine owns protocol state; BackgroundLoops owns the beat deadline.
+    var presenceBeatRegistrationTask: Task<Void, Never>?
+    var presenceBeatRegistrationID = UUID()
+    var presenceBeatEvents: AsyncStream<Void>.Continuation?
+    var presenceBeatDue: Date?
+    var presenceBeatDelay = NAMacPresence.beat
     /// Payload-free resident-state subscription. This closes the normal
     /// cognition/organism -> iOS snapshot path without shortening the slow
     /// integrity fallback or adding a polling loop.
@@ -66,6 +77,8 @@ public final class MacSyncEngine: ObservableObject {
     var archiveRetentionRetryAfter: Date?
     var archiveRetentionWatcher: FileChangeWatcher?
     var schedulerSnapshotWatcher: FileChangeWatcher?
+    var connectorsSnapshotWatcher: FileChangeWatcher?
+    var connectorHealthState: JSONValue?
     var activeDocsURL: URL?
     var snapshotWriteInFlight = false
     var snapshotWriteQueued = false
@@ -77,16 +90,10 @@ public final class MacSyncEngine: ObservableObject {
     /// Invalidates any snapshot pass suspended across stop/restart. A late pass
     /// must never publish into a newly selected cache/container generation.
     var snapshotLifecycleGeneration: UInt64 = 0
-    var inboxProcessingInFlight = false
+    /// Retained through accepted action settlement; stop closes the next admission.
+    var inboxProcessingTask: Task<Void, Never>?
     var inboxProcessingQueued = false
-    var snapshotFileDigests: [String: String] = [:]
-    /// 2026-09-06: the last published transcript block per session, keyed by
-    /// the transcript generation it was read at, so a completion edge re-reads
-    /// history only for the sessions whose generation actually moved. In-memory
-    /// only (a cold start republishes from source) and pruned every pass to the
-    /// sessions that fit the chat group's byte budget.
-    var chatTranscriptBlockCache: [String: ChatTranscriptBlock] = [:]
-    var lastHeavySnapshotAt: Date?
+    var snapshotFileDigests: [String: SnapshotFileDigest] = [:]
     // fix-R9-9 Maintain insertion order so oldest are evicted first (not random).
     var processedMsgIds: Set<String> = []
     var processedMsgIdsOrdered: [String] = []
@@ -130,6 +137,9 @@ public final class MacSyncEngine: ObservableObject {
     }
 
     var activeChatTasks: [String: ActiveChatTask] = [:]
+    // Stopping passive sync deliberately leaves these accepted human turns
+    // registered until their forwarder settles and unregisters the exact task.
+    // Remote Stop remains the separate explicit cancellation path.
 
     /// 2026-09-06: run ids a scoped Stop named while the run was still in
     /// handoff (minted on the phone, not yet registered here), with the moment
@@ -253,18 +263,16 @@ public final class MacSyncEngine: ObservableObject {
         var transcriptGeneration: Int?
         /// The Mac holds rows older than this window (`chat_history_page`).
         var hasOlder = false
+        var readError: String? = nil
+        var otherRooms: [OtherRoomExchange]? = nil
+
+        func omittingAttachmentPreviews() -> Self {
+            var copy = self
+            for index in copy.messages.indices { copy.messages[index].message.omitAttachmentPreviews() }
+            return copy
+        }
     }
 
-    /// One session's published transcript held for reuse (see
-    /// `chatTranscriptBlockCache`), with the encoded size the chat group's byte
-    /// budget is spent against. `generation` is `nil` on rows that carry no
-    /// counter — those are never reused, since nothing can say whether they
-    /// moved.
-    struct ChatTranscriptBlock {
-        var generation: Int?
-        var snapshot: ChatTranscriptSnapshot
-        var encodedBytes: Int
-    }
     let processedIdsCap = 5000
     var _pairingSecret: Data?
     var pairingSecretRotationInProgress = false

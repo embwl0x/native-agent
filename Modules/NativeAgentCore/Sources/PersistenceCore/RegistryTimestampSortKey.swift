@@ -1,3 +1,4 @@
+// Blueprint: | `RegistryTimestampSortKey.swift` | `RegistryTimestampSortKey` enum; `sortKey` |
 /// Shared registry timestamp compatibility; registry owners retain ordering and IO.
 package enum RegistryTimestampSortKey {
     private static func isTruthy(_ v: JSONValue) -> Bool {

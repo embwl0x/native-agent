@@ -11,6 +11,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `CognitiveSubstrate+AttentionSignals.swift` | `CognitiveSubstrate.attentionSignals`: pure bounded workspace/question/subject projection and resident handoff publication |
+
 extension CognitiveSubstrate {
     public func attentionSignals(at date: Date) async -> CognitiveAttentionSignals? {
         makeAttentionSignals(at: date)

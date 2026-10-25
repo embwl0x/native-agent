@@ -1,6 +1,7 @@
 import Foundation
 import BackgroundLoops
 import NativeAgentCore
+// Blueprint: | `CognitiveBackgroundLoops.swift` | `CognitiveMaintenanceLoop` struct; `tick`, `tickOutcome` |
 
 public struct CognitiveMaintenanceLoop: LoopRunner {
     public let interval: TimeInterval

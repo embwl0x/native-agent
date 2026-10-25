@@ -1,5 +1,7 @@
 import EngineRuntime
 import Foundation
+
+// Blueprint: | `SetupView.swift` | `SetupView`: settings page assembly, shared row controls and model pickers over canonical settings owners |
 // Lane B (2026-09-02, ui-simplify): THE SETUP PAGE.
 //
 // "Four things make up <name>. The rest is below."
@@ -154,7 +156,6 @@ struct ShellPageFrame<Content: View>: View {
 
 struct SetupView: View {
     @Environment(AppModel.self) private var appModel
-    @Environment(\.colorScheme) private var colorScheme
 
     // AN INNER LIFE — the Subconscious master plus the lanes it owns. Same
     // keys SlimSettingsView's Subconscious section binds, so the two surfaces
@@ -186,9 +187,6 @@ struct SetupView: View {
         get { appModel.engine.cognitionView.reflectionRoute }
         nonmutating set { appModel.engine.cognitionView.reflectionRoute = newValue }
     }
-    @State private var macPermissions: [String: MacIntegrationPermission] = [:]
-    @State private var macPermissionsLoaded = false
-    @State private var macPermissionsUnavailable = false
     /// Every sentence on this page is built out of this: the agent's name,
     /// never a gender.
     private var voice: AgentVoice {
@@ -254,7 +252,7 @@ struct SetupView: View {
             }
         }
         .liveTask {
-            await refreshMacPermissions()
+            await appModel.engine.macIntegration.refresh()
             // LIVE STATE, NOT DEFAULTS: `.settings` is the sidebar item whose
             // refresh this page's rows read (AppModel+ChatSessions).
             await appModel.refreshForSidebarItem(.settings)
@@ -262,14 +260,14 @@ struct SetupView: View {
             // swallowed failure here left the PREVIOUS policy on screen and
             // nothing said so. Say so.
             do {
-                appModel.engine.trust.policy = try await appModel.engine.trust.load()
+                _ = try await appModel.engine.trust.load()
             } catch {
                 innerLifeError = "I couldn't read the trust policy just now, so what this page shows may be out of date."
             }
         }
         // A screenshot's offscreen copy reads the Mac grants too (a read,
         // counted so the capture waits), instead of drawing "Checking…".
-        .quietReadTask(live: false) { await refreshMacPermissions() }
+        .quietReadTask(live: false) { await appModel.engine.macIntegration.refresh() }
     }
 
     // MARK: Header
@@ -319,9 +317,9 @@ struct SetupView: View {
         // integration, where the grants are.
         SetupInfoCard(
             title: "Use my Mac",
-            detail: macPermissionsUnavailable
+            detail: appModel.engine.macIntegration.permissionLoadError != nil
                 ? "Can't read this right now. Open Mac settings for details."
-                : macPermissionsLoaded
+                : !appModel.engine.macIntegration.permissions.isEmpty
                     ? (anyMacCapabilityEnabled
                         ? "On — macOS still asks for each app."
                         : "Off. Choose what I may reach.")
@@ -405,7 +403,7 @@ struct SetupView: View {
     }
 
     private var anyMacCapabilityEnabled: Bool {
-        macPermissions.values.contains { $0.read || $0.write }
+        appModel.engine.macIntegration.permissions.values.contains { $0.read || $0.write }
     }
 
     private var appearanceRow: some View {
@@ -438,18 +436,6 @@ struct SetupView: View {
         reflectionBudget = state.reflectionBudget
         organismEnabled = state.organismEnabled
         innerLifeError = problem
-    }
-
-    @MainActor
-    private func refreshMacPermissions() async {
-        do {
-            macPermissions = try await MacIntegrationPermissionStore.shared.currentChecked()
-            macPermissionsUnavailable = false
-        } catch {
-            macPermissions = [:]
-            macPermissionsUnavailable = true
-        }
-        macPermissionsLoaded = true
     }
 
 }
@@ -709,18 +695,7 @@ struct ProviderThenModelPicker: View {
 /// through `NativeCognitionRuntime.setReflectionSelection`, which is what
 /// persists `cognitiveSubstrateReflectionModel` / `…Provider`.
 struct SetupReflectionModelPicker: View {
-    private struct Choice: Identifiable, Equatable {
-        let id: String
-        let providerID: String
-        let modelID: String
-        let label: String
-        let ready: Bool
-    }
-
     @Environment(AppModel.self) private var appModel
-    @State private var reflectionModel = ""
-    @State private var reflectionProvider = ""
-    @State private var loaded = false
     @State private var saving = false
     @State private var pendingProviderID: String?
     @State private var pendingModelID: String?
@@ -728,7 +703,7 @@ struct SetupReflectionModelPicker: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if !loaded {
+            if appModel.engine.providers.settings == nil {
                 ProgressView().controlSize(.small)
             } else if appModel.engine.providers.connections.isEmpty {
                 Text("Connect a provider to choose the mind I reflect with.")
@@ -744,72 +719,37 @@ struct SetupReflectionModelPicker: View {
                             models: provider.models.map { ProviderThenModelPicker.Model(id: $0.id, name: $0.name) }
                         )
                     },
-                    currentProviderID: pendingProviderID ?? currentProviderID,
-                    currentModelID: pendingModelID ?? reflectionModel,
+                    currentProviderID: pendingProviderID ?? appModel.engine.providers.settings?.routing.activeProviders["cognition_reflection"] ?? "",
+                    currentModelID: pendingModelID ?? appModel.engine.providers.settings?.routing.preferences["cognition_reflection"]?.model ?? "",
                     disabled: saving
                 ) { provider, model in
                     pendingProviderID = provider.id
                     pendingModelID = model.id
                     Task {
-                        await save(Choice(
-                            id: choiceID(provider.id, model.id),
-                            providerID: provider.id,
-                            modelID: model.id,
-                            label: "\(model.name) · \(provider.name)",
-                            ready: provider.ready
-                        ))
+                        await save(providerID: provider.id, modelID: model.id)
                     }
                 }
                 .font(.callout)
             }
-            if let errorMessage {
+            if let errorMessage = errorMessage ?? appModel.engine.providers.settingsError {
                 Text(errorMessage).font(.caption).foregroundStyle(.orange)
             }
         }
-        .task {
-            let root = appModel.engine.providers.dataRoot
-            await EventDeadlinePhysiology.refreshOnChanges(paths: ["providers/surfaces.json", "providers/active.json",
-                "providers/pending-surface-configuration.json"].map { root.appendingPathComponent($0) }) {
-                await load()
-            }
-        }
-    }
-
-    private var currentProviderID: String {
-        reflectionProvider
     }
 
     @MainActor
-    private func load() async {
-        do {
-            let snapshot = try await appModel.engine.providers.routing.checkedProviderSnapshot()
-            appModel.engine.providers.connections = try ProvidersFacade.connections(from: snapshot)
-            reflectionModel = snapshot.routing.preferences["cognition_reflection"]?.model ?? ""
-            reflectionProvider = snapshot.routing.activeProviders["cognition_reflection"] ?? ""
-            errorMessage = nil
-            loaded = true
-        } catch {
-            reflectionModel = ""
-            reflectionProvider = ""
-            loaded = false
-            errorMessage = UserFacingError.message(error, action: "load the mind settings")
-        }
-    }
-
-    private func choiceID(_ providerID: String, _ modelID: String) -> String {
-        providerID + "\u{1f}" + modelID
-    }
-
-    @MainActor
-    private func save(_ choice: Choice) async {
+    private func save(providerID: String, modelID: String) async {
         saving = true
         defer { saving = false }
         do {
             try await NativeAgentEngine.liveCognition.setReflectionSelection(
-                model: choice.modelID,
-                provider: choice.providerID
+                model: modelID,
+                provider: providerID
             )
-            await load()
+            if case .failed(let detail) = await appModel.engine.providers.refreshSettings(
+                refreshCatalog: false, cause: { error, _ in error.localizedDescription }
+            ) { throw ProviderRoutingError.underlying(detail) }
+            errorMessage = nil
         } catch {
             errorMessage = UserFacingError.message(error, action: "save that mind")
         }
@@ -824,20 +764,20 @@ struct SetupReflectionModelPicker: View {
 /// Writes the whole group through the same transaction Providers uses.
 struct SetupStudioWanderPicker: View {
     @Environment(AppModel.self) private var appModel
-    @State private var providers: [ProviderInfo] = []
-    @State private var activeProvider = ""
-    @State private var model = ""
-    @State private var reasoningEffort = "high"
-    @State private var serviceTier: String?
-    @State private var loaded = false
+    @State private var pendingProvider: String?
+    @State private var pendingModel: String?
     @State private var saving = false
     @State private var errorMessage: String?
 
     private let surface = NativeCognitionRuntime.studioWanderSurface
+    private var providers: [ProviderInfo] { appModel.engine.providers.connections }
+    private var preference: SurfacePreference? { appModel.engine.providers.settings?.routing.preferences[surface] }
+    private var activeProvider: String { pendingProvider ?? appModel.engine.providers.settings?.routing.activeProviders[surface] ?? "" }
+    private var model: String { pendingModel ?? preference?.model ?? "" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if !loaded {
+            if appModel.engine.providers.settings == nil {
                 ProgressView().controlSize(.small)
             } else if providers.isEmpty {
                 Text("Connect a provider to choose the mind my hour is spent with.")
@@ -848,9 +788,8 @@ struct SetupStudioWanderPicker: View {
                     Picker("\(AgentVoice.live.possessive) hour — provider", selection: Binding(
                         get: { activeProvider },
                         set: { newValue in
-                            activeProvider = newValue
-                            let first = models(for: newValue).first?.id ?? ""
-                            model = first
+                            pendingProvider = newValue
+                            pendingModel = models(for: newValue).first?.id ?? ""
                             Task { await save() }
                         }
                     )) {
@@ -866,7 +805,7 @@ struct SetupStudioWanderPicker: View {
                     Picker("\(AgentVoice.live.possessive) hour — model", selection: Binding(
                         get: { model },
                         set: { newValue in
-                            model = newValue
+                            pendingModel = newValue
                             Task { await save() }
                         }
                     )) {
@@ -884,15 +823,8 @@ struct SetupStudioWanderPicker: View {
                 .disabled(saving)
                 .font(.callout)
             }
-            if let errorMessage {
+            if let errorMessage = errorMessage ?? appModel.engine.providers.settingsError {
                 Text(errorMessage).font(.caption).foregroundStyle(.orange)
-            }
-        }
-        .task {
-            let root = appModel.engine.providers.dataRoot
-            await EventDeadlinePhysiology.refreshOnChanges(paths: ["providers/surfaces.json", "providers/active.json",
-                "providers/pending-surface-configuration.json"].map { root.appendingPathComponent($0) }) {
-                await load()
             }
         }
     }
@@ -902,49 +834,24 @@ struct SetupStudioWanderPicker: View {
     }
 
     @MainActor
-    private func load() async {
-        do {
-            let snapshot = try await appModel.engine.providers.routing.checkedProviderSnapshot()
-            providers = try ProvidersFacade.connections(from: snapshot)
-            activeProvider = snapshot.routing.activeProviders[surface] ?? ""
-            if let preference = snapshot.routing.preferences[surface] {
-                model = preference.model
-                reasoningEffort = preference.reasoningEffort
-                serviceTier = preference.serviceTier
-            } else {
-                model = ""
-            }
-            errorMessage = nil
-            loaded = true
-        } catch {
-            loaded = false
-            errorMessage = UserFacingError.message(error, action: "load the mind settings")
-        }
-    }
-
-    @MainActor
     private func save() async {
         guard !activeProvider.isEmpty, !model.isEmpty else { return }
         saving = true
-        defer { saving = false }
+        defer { saving = false; pendingProvider = nil; pendingModel = nil }
         do {
-            let result = try await appModel.saveProviderGroupSelection(
+            _ = try await appModel.saveProviderGroupSelection(
                 group: ProviderSurfaceGroups.mind,
                 providerID: activeProvider,
                 model: model,
-                reasoningEffort: reasoningEffort,
-                serviceTier: serviceTier
+                reasoningEffort: preference?.reasoningEffort ?? "high",
+                serviceTier: preference?.serviceTier
             )
-            activeProvider = result.snapshot.activeProviders[surface] ?? ""
-            if let preference = result.snapshot.preferences[surface] {
-                model = preference.model
-                reasoningEffort = preference.reasoningEffort
-                serviceTier = preference.serviceTier
-            }
+            if case .failed(let detail) = await appModel.engine.providers.refreshSettings(
+                refreshCatalog: false, cause: { error, _ in error.localizedDescription }
+            ) { throw ProviderRoutingError.underlying(detail) }
             errorMessage = nil
             appModel.statusText = "Memory and mind → \(model) saved"
         } catch {
-            await load()
             errorMessage = UserFacingError.message(error, action: "save the mind for my hour")
         }
     }
@@ -1017,15 +924,6 @@ enum SlimSettingsSubconsciousStatusLine {
         let tone: Tone
         let systemImage: String
         var recovery: Recovery? = nil
-
-        var requiresAttention: Bool {
-            switch tone {
-            case .warning, .unavailable:
-                true
-            case .neutral, .progress, .healthy:
-                false
-            }
-        }
     }
 
     static func state(

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+// Blueprint: | `OrganismBodySchema.swift` | `ProviderPathEvidenceOutcome` enum |
 
 public enum ProviderPathEvidenceOutcome: String, Codable, Sendable, Equatable {
     case succeeded

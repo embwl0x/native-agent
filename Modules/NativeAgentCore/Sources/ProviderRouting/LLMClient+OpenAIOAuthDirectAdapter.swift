@@ -3,6 +3,7 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+// Blueprint: | `LLMClient+OpenAIOAuthDirectAdapter.swift` | `CodexOAuthAccessContext` struct |
 
 // MARK: - OpenAIOAuthDirectAdapter
 //
@@ -11,7 +12,7 @@ import TurnTrace
 // refreshes the persisted tokens. Requests use the shared backend identity
 // and the account ID from persisted tokens or the access-token JWT.
 // Refreshes are serialized per credential path and persisted atomically.
-// ChatOrchestration owns tool permission, dispatch, persistence, and budgets.
+// ChatTurnRuntime owns tool permission, dispatch, persistence, and budgets.
 
 /// Stable exhaustion marker for credentials that require signing in again.
 /// Routing surfaces this failure instead of switching to an API-key adapter.
@@ -45,6 +46,9 @@ actor AsyncSerialQueue {
         let me = Task { () -> Result<T, Error> in
             await prev.value
             do {
+                // Waiting for the predecessor does not observe cancellation.
+                // A canceled queued refresh must never enter its body.
+                try Task.checkCancellation()
                 let v = try await body()
                 return .success(v)
             } catch {
@@ -122,10 +126,10 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     public init(
         session: URLSession = OpenAIOAuthDirectAdapter.productionSession,
         endpoint: URL = URL(string: "https://chatgpt.com/backend-api/codex/responses")!,
-        refreshEndpoint: URL = URL(string: "https://auth.openai.com/oauth/token")!,
+        refreshEndpoint: URL = URL(string: ProviderOAuthConfig.openai.tokenEndpoint)!,
         authPathOverride: URL? = nil,
         dataRootOverride: URL? = nil,
-        openAIPublicClientID: String = "app_EMoamEEZ73f0CkXaXp7hrann",
+        openAIPublicClientID: String = ProviderOAuthConfig.openai.clientId,
         telemetryDataRootOverride: URL? = nil
     ) {
         self.session = session
@@ -140,7 +144,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     // MARK: - prompt_cache_key (U1 step 4, 2026-06-10)
 
     /// Stable per-session prompt-cache routing key for the Responses API.
-    /// Derived from the task-local session id bound by the ChatOrchestration
+    /// Derived from the task-local session id bound by the ChatTurnRuntime
     /// tool loop (LLMCallContext.sessionId). Returns nil when no session id
     /// reaches the adapter — in that case NO prompt_cache_key field is added
     /// and the request body is byte-identical to pre-U1 behavior.
@@ -332,9 +336,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         let bytes: URLSession.AsyncBytes
                         let response: URLResponse
                         do {
-                            if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-                            (bytes, response) = try await session.bytes(for: req)
-                            if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
+                            (bytes, response) = try await ProviderWire.open(session, req)
                         } catch {
                             throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
                         }
@@ -729,15 +731,11 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     }
 
     func resolveAuthPath() -> URL {
-        if let override = authPathOverride { return override }
-        if let root = dataRootOverride { return Self.boundRootReadAuthPath(dataRoot: root) }
-        return Self.preferredAuthPath()
+        Self.preferredAuthPath(dataRoot: dataRootOverride, authPathOverride: authPathOverride)
     }
 
 
     // MARK: - Token refresh
-
-    private static let tokenExpiryBufferSec: Int = 120
 
     private func exhaustedCredentialError() -> LLMError {
         if Self.isUserCodexPath(resolveAuthPath()) {
@@ -746,11 +744,31 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         return .authRejected(provider: "openai_oauth_direct", detail: OpenAIOAuthDirectExhaustedMarker)
     }
 
-    private static func accessTokenIsFresh(_ access: String, blob: [String: Any], buffer: Int) -> Bool {
+    static func effectiveExpiry(_ access: String, blob: [String: Any]) -> Int? {
         let tokens = blob["tokens"] as? [String: Any] ?? [:]
-        let expiry = [tokenExpiresAt(access), persistedExpiresAt(blob: blob, tokens: tokens)]
+        return [tokenExpiresAt(access), persistedExpiresAt(blob: blob, tokens: tokens)]
             .compactMap { $0 }.min()
-        return expiry.map { $0 - Int(Date().timeIntervalSince1970) > buffer } ?? false
+    }
+
+    private static func accessTokenIsFresh(_ access: String, blob: [String: Any], buffer: Int) -> Bool {
+        effectiveExpiry(access, blob: blob).map { $0 - Int(Date().timeIntervalSince1970) > buffer } ?? false
+    }
+
+    /// The adapter's read verdict; CLI rotation remains owned by the CLI.
+    public static func credentialStatus(_ auth: [String: Any]?, path: URL) -> (usable: Bool, detail: String, health: OAuthCredentialHealth) {
+        let tokens = auth?["tokens"] as? [String: Any] ?? [:]
+        let access = tokens["access_token"] as? String ?? ""
+        let cli = isUserCodexPath(path)
+        let canRefresh = !cli && OAuthRefreshBinding.string(tokens["refresh_token"]) != nil
+            && auth.map { OAuthRefreshBinding.permitsRefresh($0, provider: "openai_oauth_direct") } == true
+        let expiry = auth.flatMap { effectiveExpiry(access, blob: $0) }.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        let fresh = !access.isEmpty && auth.map { accessTokenIsFresh(access, blob: $0,
+            buffer: cli ? 0 : Int(NativeOAuthSupport.renewalMargin)) } == true
+        let usable = !access.isEmpty && (fresh || canRefresh)
+        let detail = usable ? (fresh ? "Signed in" : "Signed in. Your session will renew on your next chat.")
+            : auth == nil ? "Sign in to your ChatGPT account in Providers." : "Reconnect your ChatGPT account in Providers."
+        return (usable, detail, OAuthCredentialHealth(configured: usable, expiresAt: expiry,
+            canRefresh: canRefresh, requiresRefresh: !fresh))
     }
 
     /// The CLI owns token rotation. Re-read its file once on expiry or 401;
@@ -813,7 +831,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             // out-of-band rotation (clock skew, manual sign-in) doesn't
             // serve a token past its real expiry. Mirrors how the daemon
             // tracks expiry independently of the JWT claim.
-            if Self.accessTokenIsFresh(access0, blob: blob0, buffer: Self.tokenExpiryBufferSec) {
+            if Self.accessTokenIsFresh(access0, blob: blob0, buffer: Int(NativeOAuthSupport.renewalMargin)) {
                 return access0
             }
             // missing-exp on both sides falls through to refresh (matches
@@ -843,7 +861,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 return access
             }
             if !forceRefresh {
-                if Self.accessTokenIsFresh(access, blob: blob, buffer: Self.tokenExpiryBufferSec) {
+                if Self.accessTokenIsFresh(access, blob: blob, buffer: Int(NativeOAuthSupport.renewalMargin)) {
                     return access  // someone else already refreshed
                 }
             }
@@ -856,16 +874,17 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// an hour or more left.
     private static let codexChildRefreshBufferSec: Int = 3_600
 
-    /// Run before spawning a Codex child on `codexHome`. When it is an app
-    /// child home, the app renews its own credential through the normal
-    /// refresh queue if the token is near expiry, then re-syncs the child's
-    /// access-only copy. Any other home is left alone.
-    public static func prepareCodexChildHome(_ codexHome: URL) async throws {
-        guard codexHome.standardizedFileURL.lastPathComponent == "codex_child_home" else { return }
-        let authPath = preferredAuthPath(
-            dataRoot: codexHome.standardizedFileURL.deletingLastPathComponent(),
-            allowSharedFallbacks: false
-        )
+    /// Validate the selected credential before spawning. App-owned credentials
+    /// renew through the normal refresh queue and sync their access-only copy;
+    /// CLI-owned sessions remain read-only. Never resolve a second path here.
+    public static func prepareCodexChildHome(_ codexHome: URL, authPath: URL) async throws {
+        guard credentialStatus(loadAuthBlob(at: authPath), path: authPath).usable else {
+            throw LLMError.notConfigured(provider: "openai_oauth_direct")
+        }
+        guard let childHome = codexChildHome(mirroring: authPath) else { return }
+        guard childHome.standardizedFileURL == codexHome.standardizedFileURL else {
+            throw LLMError.underlying(message: "Codex child home does not match the selected credential.")
+        }
         if let blob = loadAuthBlob(at: authPath),
            let access = (blob["tokens"] as? [String: Any])?["access_token"] as? String,
            !access.isEmpty,
@@ -907,29 +926,21 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         try OAuthRefreshBinding.requireRefresh(blob, provider: "openai_oauth_direct")
         // Build the form body — NO scope, NO redirect_uri (matches Python's
         // exact body shape at L536-L540).
-        var components = URLComponents()
-        components.queryItems = [
-            URLQueryItem(name: "grant_type", value: "refresh_token"),
-            URLQueryItem(name: "refresh_token", value: refresh),
-            URLQueryItem(name: "client_id", value: openAIPublicClientID),
+        let body = [
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": openAIPublicClientID,
         ]
-        let bodyString = components.percentEncodedQuery ?? ""
-        let bodyData = bodyString.data(using: .utf8) ?? Data()
-
-        var req = URLRequest(url: refreshEndpoint)
-        req.httpMethod = "POST"
-        // User, 2026-09-06: the refresh holds the serial queue, so it needs a
-        // bound of its own rather than the session's chat-sized request
-        // timeout — a hung token endpoint otherwise blocks every later turn's
-        // token read for minutes.
-        req.timeoutInterval = 30
-        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        req.httpBody = bodyData
 
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            (data, response) = try await NativeOAuthSupport.post(refreshEndpoint, body, timeout: 30, session: session,
+                encodeForm: { fields in
+                    var components = URLComponents()
+                    components.queryItems = fields.map { URLQueryItem(name: $0.key, value: $0.value) }
+                    return components.percentEncodedQuery ?? ""
+                })
         } catch {
             throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: refreshEndpoint, operation: "refresh"))
         }

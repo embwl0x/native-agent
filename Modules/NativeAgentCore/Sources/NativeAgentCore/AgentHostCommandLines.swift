@@ -1,6 +1,10 @@
+import CryptoKit
 import Darwin
 import Foundation
 import os
+import Security
+
+// Blueprint: | `AgentHostCommandLines.swift` | `AgentHostCommandLines`: data-driven CLI launch/stream contracts, executable resolution and scrubbed environment; no host-specific adapter branches |
 
 /// HOW A COMMAND-LINE AGENT TAKES A PROMPT AND PRINTS A REPLY — data, like
 /// everything else on a known-agent row. One adapter reads this; nothing
@@ -320,6 +324,29 @@ public enum AgentHostCommandLines {
     public static func resolveExecutable(_ name: String) -> String? {
         resolveExecutable(name, directories: [],
                           home: FileManager.default.homeDirectoryForCurrentUser.path)
+    }
+
+    /// A command as the file that runs: an absolute path, or a name on the
+    /// login PATH, with its links resolved; nil when no executable file.
+    public static func resolveCommand(_ command: String) -> String? {
+        guard command.hasPrefix("/") else { return resolveExecutable(command) }
+        let path = URL(fileURLWithPath: command).resolvingSymlinksInPath().path
+        var info = stat()
+        return stat(path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG && access(path, X_OK) == 0 ? path : nil
+    }
+
+    /// What an executable file is: its code directory hash when signed, else
+    /// the SHA-256 of its bytes. A program that changes has another identity.
+    public static func identity(ofExecutable path: String) -> String? {
+        var code: SecStaticCode?
+        var info: CFDictionary?
+        if SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess, let code,
+           SecCodeCopySigningInformation(code, [], &info) == errSecSuccess,
+           let unique = (info as? [String: Any])?[kSecCodeInfoUnique as String] as? Data {
+            return "cdhash:" + unique.map { String(format: "%02x", $0) }.joined()
+        }
+        guard let bytes = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) else { return nil }
+        return "sha256:" + SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
     public static func resolveExecutable(_ name: String, directories: [String], home: String) -> String? {

@@ -3,6 +3,7 @@ import NativeAgentCore
 // SSEEventStream (shared SSE framing — R15) lives in PersistenceCore, same as
 // every other adapter's stream parser in this module.
 import PersistenceCore
+// Blueprint: | `LLMClient+AnthropicNativeTools.swift` | `AnthropicAdapter`: buffered JSON and SSE both open through `ProviderWire`; native-tool stream decoding commits explicit object input at content-block close; empty-input candidates and later blocks wait in wire order for the terminal verdict; interruptions discard unconfirmed empty candidates and release explicit calls, retaining thinking replay; shared Anthropic event type, wire errors, usage and stop-reason accumulation |
 
 // MARK: - Native tool-use lane for the Anthropic-wire api-key adapter
 //
@@ -513,8 +514,10 @@ extension AnthropicAdapter {
         let data: Data
         let response: URLResponse
         do {
-            if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-            (data, response) = try await session.data(for: req)
+            let (bytes, head) = try await ProviderWire.open(session, req)
+            defer { bytes.task.cancel() }
+            response = head
+            data = try await bytes.reduce(into: Data()) { $0.append($1) }
         } catch {
             throw mapTransportError(error, fallback: .underlying(
                 message: "connection refused: \(endpoint.host ?? "anthropic")"))
@@ -581,7 +584,7 @@ extension AnthropicAdapter {
     // MARK: - Streaming
 
     /// Mirrors streamMessages: stall-only text authoring and the first-party
-    /// native tool lane parse SSE. Interactive buffered paths stay unchanged.
+    /// native tool lane parse SSE; other paths buffer the ProviderWire response.
     public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind {
         (firstPartyAnthropicToolContract && usesNativeToolLane(tools))
             || (ProviderStreamContext.stallOnly && (tools?.isEmpty ?? true)) ? .incremental : .bufferedKeepAlive
@@ -598,11 +601,8 @@ extension AnthropicAdapter {
     ///     have traded marker-parsing for a frozen bubble. Same shape the
     ///     OAuth-direct adapter already runs, so the surface's live-delta
     ///     behavior is identical on both Claude transports.
-    ///   * kimi-code: the original blocking `completeMessagesWithTools` + a
-    ///     `.keepAlive` heartbeat. kimi-code launched on that shape (this
-    ///     adapter used to inherit the LLMAdapter default, which is exactly
-    ///     it), its SSE tool framing was never wire-probed, and the K3 surface
-    ///     has no live-delta expectation to preserve. Unchanged, deliberately.
+    ///   * kimi-code: `completeMessagesWithTools` buffers JSON from ProviderWire
+    ///     with a `.keepAlive` heartbeat; the guard owns timeouts and redials.
     ///
     /// The non-native branch (no tools) is the same blocking shape:
     /// completeMessages → one textDelta when non-empty → finish, heartbeat
@@ -645,26 +645,9 @@ extension AnthropicAdapter {
         }
         return AsyncThrowingStream { continuation in
             let task = Task {
-                // F1-H1 KEEPALIVE: this override is a SINGLE blocking
-                // complete*(…) call that yields nothing until it returns — no
-                // per-token stream. ProviderStreamGuard (idle default 90s, clock
-                // started at admitProducer) therefore kills any healthy turn
-                // whose thinking exceeds ~90s. kimi-for-coding defaults to
-                // reasoning_effort max with a 32k thinking budget, so heavy turns
-                // routinely think silently past 90s and died as "idle" while the
-                // surface retry ladders replayed into the same wall.
-                //
-                // While the blocking call is in flight, a heartbeat task yields
-                // `.keepAlive` every ~30s — real guard-visible activity
-                // (ProviderStreamGuard.markActivity resets its idle clock on ANY
-                // yield) that consumers treat as a no-op (they IGNORE .keepAlive
-                // so no empty/placeholder content leaks into the reply). Matches
-                // the keepalive contract the OAuth/Moonshot SSE paths already use.
-                //
-                // Cancelled on ALL exits — success, throw, and onTermination —
-                // via `defer`: onTermination cancels this task, the in-flight
-                // cancellation-aware URLSession await throws, control reaches the
-                // catch, the body unwinds, and defer fires. No leaked task.
+                // Buffered replies yield only on completion. Keep the idle guard
+                // alive meanwhile; ProviderWire marks the sent request and only
+                // the guard bounds it. Cancellation ends the wire and heartbeat.
                 let heartbeatInterval = self.nativeToolKeepAliveInterval
                 let heartbeat = Task {
                     let nanos = UInt64(max(0.001, heartbeatInterval) * 1_000_000_000)
@@ -677,7 +660,6 @@ extension AnthropicAdapter {
                 defer { heartbeat.cancel() }
                 do {
                     guard usesNativeToolLane(tools), let tools else {
-                        // Byte-identical to the LLMAdapter default.
                         let reply = try await completeMessages(
                             messages: messages, system: system, model: model, tools: tools
                         )
@@ -747,9 +729,7 @@ extension AnthropicAdapter {
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
         do {
-            if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-            (bytes, response) = try await session.bytes(for: req)
-            if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
+            (bytes, response) = try await ProviderWire.open(session, req)
         } catch {
             throw mapTransportError(error, fallback: .underlying(
                 message: "connection refused: \(endpoint.host ?? "anthropic")"))
@@ -836,7 +816,7 @@ extension AnthropicAdapter {
                 try AnthropicAdapter.consumeStreamEvent(obj, event: effectiveEvent, usage: &usage, stopReason: &lastStopReason)
                 switch effectiveEvent {
                 case "message_stop":
-                    let cutByTokenLimit = (lastStopReason == "max_tokens")
+                    let cutByTokenLimit = LLMToolBoundaryReason(stopReason: lastStopReason) == .outputLimit
                     let durationMs = Int(
                         (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                     await telemetry.record(
@@ -864,6 +844,7 @@ extension AnthropicAdapter {
                             expectedOutput: "answer text or tool call"
                         )
                     }
+                    if let reason = LLMToolBoundaryReason(stopReason: lastStopReason) { continuation.yield(.toolBoundary(reason)) }
                     continuation.finish()
                     return
                 case "content_block_start":

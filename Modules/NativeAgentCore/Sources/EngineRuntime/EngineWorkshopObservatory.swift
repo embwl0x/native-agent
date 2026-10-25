@@ -2,6 +2,7 @@ import Foundation
 import PersistenceCore
 import Desk
 import WorkshopExecution
+// Blueprint: | `EngineWorkshopObservatory.swift` | `WorkshopScoreView`, `DeskPursuitVetoRationale`; Workshop read projections |
 
 // MARK: - Pure view-models (data-shaping, no SwiftUI)
 
@@ -235,8 +236,8 @@ public enum WorkshopReceiptsReader {
     /// permissions) is `.unavailable`, never a zero.
     public static func load(receiptsPath: URL, limit: Int = rowLimit) async -> WorkshopReceiptsState {
         do {
-            let receipt = try await SwiftNativePersistenceCore().tailJSONLReadReceipt(
-                receiptsPath, limit: min(rowLimit, max(1, limit)), maxBytes: 1_048_576
+            let receipt = try await WorkshopReceiptLog.readRecent(
+                at: receiptsPath, limit: min(rowLimit, max(1, limit))
             )
             let parsed = receipt.rows.compactMap(WorkshopReceiptRow.fromJSON)
             if parsed.isEmpty, receipt.bytesRead > 0 {

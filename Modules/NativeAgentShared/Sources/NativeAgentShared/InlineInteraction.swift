@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `InlineInteraction.swift` | `InlineInteraction`: durable card kind/state/scope, continuation and outcome contract shared by dispatch, transcript and renderers |
+
 /// One durable conversation interaction: a need raised at the point of use
 /// ("connect GitHub", "allow Desktop access", "which model for this image"),
 /// rendered inline as a card, resolved by the EXISTING control, and left in
@@ -25,7 +27,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
     /// The six control types. The card switches on THIS, never on a service
     /// name — adding a connector adds a registry row, not a card branch.
     public enum Kind: String, Codable, Sendable, Equatable, CaseIterable {
-        /// `target` is a canonical connector ID ("github", "gmail").
+        /// `target` is a canonical connector ID ("slack", "telegram").
         case connector
         /// `target` is a canonical Mac capability/integration ID.
         /// `additionalTargets` carries the rest of a predictable chain.
@@ -111,6 +113,54 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         }
     }
 
+    // MARK: Secret
+
+    /// What an `.apiKey` card for a keyring secret (`target` "secret:<name>")
+    /// asks the person to grant: where the value may go, and the sign-in
+    /// NativeAgent runs in place of a paste when she supplied one. Public
+    /// parameters only; the value never rides here.
+    public struct SecretAsk: Codable, Sendable, Equatable {
+        public var hosts: [String]
+        public var programs: [String]
+        public var signIn: SignIn?
+        /// The person is asked to remove the secret instead of granting it.
+        public var remove: Bool?
+        /// Where it is kept for now and stops going once this grant is kept.
+        public var stops: [String]?
+
+        /// An OAuth authorization-code sign-in with PKCE through a loopback
+        /// redirect, or with `device` in place of `authorize` a device sign-in
+        /// (RFC 8628). `authorize` may carry extra query parameters of its own.
+        /// A client secret is never here: the person types it on the card.
+        public struct SignIn: Codable, Sendable, Equatable {
+            public var authorize: String?
+            /// The device authorization endpoint of a device sign-in.
+            public var device: String?
+            public var token: String
+            public var clientID: String
+            public var scopes: String?
+            /// The registered loopback redirect, when the service needs an exact one.
+            public var redirect: String?
+            /// "basic" when the client authenticates at the token endpoint by HTTP Basic; nil in the body.
+            public var clientAuth: String?
+            public init(authorize: String?, device: String? = nil, token: String, clientID: String, scopes: String? = nil, redirect: String? = nil,
+                        clientAuth: String? = nil) {
+                self.authorize = authorize; self.device = device; self.token = token; self.clientID = clientID
+                self.scopes = scopes; self.redirect = redirect; self.clientAuth = clientAuth
+            }
+        }
+
+        public init(hosts: [String], programs: [String], signIn: SignIn? = nil, remove: Bool = false, stops: [String] = []) {
+            self.hosts = hosts; self.programs = programs; self.signIn = signIn; self.remove = remove ? true : nil
+            self.stops = stops.isEmpty ? nil : stops
+        }
+
+        /// Where it may go, said once: "api.example.com, program npx".
+        public var line: String {
+            (hosts + programs.map { "program \($0)" }).joined(separator: ", ")
+        }
+    }
+
     // MARK: Outcome / state
 
     /// What actually happened, verified by the canonical owner. Bounded and
@@ -140,6 +190,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         case settled(Outcome)
         case declined
         case failed(reason: String)
+        case stopped(reason: String)
         /// A newer, identical ask replaced this one before anybody answered
         /// it. Terminal, and nobody's fault: the card goes quiet rather than
         /// leaving four live copies of the same question in scrollback
@@ -155,6 +206,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             case .settled: return "settled"
             case .declined: return "declined"
             case .failed: return "failed"
+            case .stopped: return "stopped"
             case .superseded: return "superseded"
             case .unknown(let raw): return raw
             }
@@ -185,6 +237,13 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         public var failureReason: String? {
             if case .failed(let reason) = self { return reason }
             return nil
+        }
+
+        public var isRetryable: Bool {
+            switch self {
+            case .failed, .stopped: return true
+            default: return false
+            }
         }
     }
 
@@ -226,6 +285,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             /// duplicate continuation, exactly what this state exists to stop.
             case replaying
             case resumed
+            case stopped
             /// Dismissal, Stop, or a cleared conversation.
             case invalidated
 
@@ -236,6 +296,8 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         }
 
         public var originRunId: String?
+        public var lifeID: String?
+        public var reason: String?
         public var toolCallId: String?
         public var toolName: String?
         /// The blocked call's EXACT arguments, as the model wrote them.
@@ -368,6 +430,8 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
     public var createdAt: Date
     public var settledAt: Date?
     public var continuation: Continuation?
+    /// A keyring secret's ask; nil on every other card.
+    public var secret: SecretAsk?
 
     // MARK: Init
 
@@ -391,7 +455,8 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         state: State = .pending,
         createdAt: Date = Date(),
         settledAt: Date? = nil,
-        continuation: Continuation? = nil
+        continuation: Continuation? = nil,
+        secret: SecretAsk? = nil
     ) {
         self.version = version
         self.id = id
@@ -413,6 +478,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         self.createdAt = createdAt
         self.settledAt = settledAt
         self.continuation = continuation
+        self.secret = secret
     }
 
     /// Every capability this interaction asks for, primary first. One grant
@@ -541,7 +607,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         case version, id, revision, kind, target, additionalTargets, mode, title, why
         case primaryActionLabel, secondaryActionLabel, declineConsequence
         case persistenceNote, cardProse, options, primaryScope, state, createdAt, settledAt
-        case continuation
+        case continuation, secret
     }
 
     private struct WireState: Codable {
@@ -572,6 +638,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         settledAt = try container.decodeIfPresent(Date.self, forKey: .settledAt)
         continuation = try container.decodeIfPresent(Continuation.self, forKey: .continuation)
+        secret = try container.decodeIfPresent(SecretAsk.self, forKey: .secret)
         let wire = try container.decodeIfPresent(WireState.self, forKey: .state)
             ?? WireState(name: "pending", outcome: nil, reason: nil)
         switch wire.name {
@@ -583,6 +650,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             state = .settled(wire.outcome ?? Outcome(summary: ""))
         case "declined": state = .declined
         case "failed": state = .failed(reason: wire.reason ?? "")
+        case "stopped": state = .stopped(reason: wire.reason ?? "")
         case "superseded": state = .superseded
         default: state = .unknown(wire.name)
         }
@@ -611,6 +679,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         try container.encode(createdAt, forKey: .createdAt)
         try container.encodeIfPresent(settledAt, forKey: .settledAt)
         try container.encodeIfPresent(continuation, forKey: .continuation)
+        try container.encodeIfPresent(secret, forKey: .secret)
         let wire: WireState
         switch state {
         case .pending: wire = WireState(name: "pending", outcome: nil, reason: nil)
@@ -619,6 +688,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         case .declined: wire = WireState(name: "declined", outcome: nil, reason: nil)
         case .superseded: wire = WireState(name: "superseded", outcome: nil, reason: nil)
         case .failed(let reason): wire = WireState(name: "failed", outcome: nil, reason: reason)
+        case .stopped(let reason): wire = WireState(name: "stopped", outcome: nil, reason: reason)
         case .unknown(let raw): wire = WireState(name: raw, outcome: nil, reason: nil)
         }
         try container.encode(wire, forKey: .state)

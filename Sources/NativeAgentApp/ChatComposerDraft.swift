@@ -1,35 +1,30 @@
 import Foundation
 import SwiftUI
+// Blueprint: | `ChatComposerDraft.swift` | `ChatComposerDraft`: the shared session text, edit timestamp and manual-edit revision for dictation; AppModel owns its lifetime and composers bind to the same object |
 
-/// The in-progress composer text, lifted out of `ChatView`'s `@State`.
-///
-/// User, 2026-09-13: typing lagged 1-2s per keystroke. The draft used to be
-/// `@State` on `ChatView`, so every character invalidated `ChatView.body` —
-/// which re-diffed the whole `[ChatMessage]` (`ChatMessage.==` was the hottest
-/// app frame in `/usr/bin/sample`), re-ran every `MessageBubble` body with its
-/// per-message bridge-tag string parsing, and rebuilt the conversation list
-/// rows (`ChatShellConversationRow.title(for:openingLine:)`), all inside the
-/// window's layout pass.
-///
-/// As an `@Observable` reference type the draft only invalidates the views that
-/// actually READ `text` during their own body. `ChatView.body` reads none of
-/// these properties (the one place it did — `canSend` — moved into
-/// `ChatComposerInput`), so a keystroke now re-runs the composer alone.
-///
-/// The three bookkeeping fields keep the 2026-09-06 two-composer rules intact:
-/// `sessionId` is the conversation the text belongs to, `adoptedText` is what
-/// this composer last loaded (an untouched composer must not clobber another
-/// surface's draft), and `editedAt` is when it was last changed HERE.
+/// One live draft per session, owned by AppModel and shared by its composers.
+/// Only views reading text observe keystrokes; the registry is unobserved.
 @MainActor
 @Observable
 final class ChatComposerDraft {
     var text = ""
-    var sessionId = ""
-    var adoptedText = ""
+    let sessionId: String
     var editedAt = Date.distantPast
+    private(set) var manualEditRevision: UInt64 = 0
 
-    /// A local edit: the text changed on THIS surface, so it wins a flush race.
+    init(sessionId: String) { self.sessionId = sessionId }
+
+    /// Typing in either composer changes the same object.
     func edit(_ newText: String) {
+        manualEditRevision &+= 1
+        text = newText
+        editedAt = Date()
+    }
+
+    /// Dictation advances its own text without claiming a manual edit.
+    /// Once typing intervenes, every later update from that dictation is stale.
+    func dictate(_ newText: String, revision: UInt64) {
+        guard manualEditRevision == revision else { return }
         text = newText
         editedAt = Date()
     }

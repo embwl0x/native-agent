@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `MacSyncActionRouter+Providers.swift` | `MacSyncActionRouter`: `configureEncryptedProvider`, `startProviderSignIn` |
 
 extension MacSyncActionRouter {
     /// dispatch has already checked the HMAC and the approved phone signature.

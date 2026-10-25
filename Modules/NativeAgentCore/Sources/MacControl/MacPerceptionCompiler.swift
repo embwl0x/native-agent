@@ -10,6 +10,8 @@ import AppKit
 import os
 #endif
 
+// Blueprint: | `MacPerceptionCompiler.swift` | `MacPerceptionCompiler`, look frames and handles: graded perception from the existing AX snapshot, redacted readouts and fresh target resolution |
+
 // MARK: - The PERCEPTION COMPILER (native-look item 2)
 //
 // NORTHSTAR clause 5: "a feature that leaves the agent translating the human
@@ -1853,6 +1855,7 @@ public extension MacPerceptionCompiler {
 public actor MacLookFrameStore {
     public static let shared = MacLookFrameStore()
 
+    /// Shared lifetime of semantic handles and fused-view marks.
     public static let ttlSeconds: TimeInterval = 180
 
     public enum ResolveFailure: String, Sendable, Equatable, Error {
@@ -1864,7 +1867,7 @@ public actor MacLookFrameStore {
         public var guidance: String {
             switch self {
             case .noFrame:
-                return "no look has been taken yet — call mac_look first"
+                return "No screen frame exists. Use mac.look."
             case .staleFrame:
                 // Agent round 7, envelope F13EB82C: she reused a handle from
                 // before an `open` and got this. The refusal was RIGHT and cost
@@ -1872,13 +1875,11 @@ public actor MacLookFrameStore {
                 // after an act, because the act ALREADY returned a fresh frame
                 // with fresh handles. Sending her to re-look for something she
                 // was handed is how a correct refusal still wastes a call.
-                return "that frame is not the latest one — every mac_act returns a NEW frame_id with "
-                    + "re-minted handles, so a handle from before your last act cannot be used; take "
-                    + "the handles from that act's result (or call mac_look if you have not acted)"
+                return "That frame is stale. Use the latest frame_id and handles returned by the previous action, or mac.look if none were returned."
             case .frameExpired:
-                return "that frame is older than \(Int(MacLookFrameStore.ttlSeconds))s — call mac_look again"
+                return "That frame is older than \(Int(MacLookFrameStore.ttlSeconds))s. Use mac.look."
             case .unknownHandle:
-                return "that handle is not in the latest look's affordances"
+                return "That handle is absent from the latest frame. Use a handle from its controls or inspect with mac.look."
             }
         }
     }

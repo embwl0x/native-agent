@@ -1,9 +1,11 @@
 import Privacy
-import ChatOrchestration
+import ChatTurnRuntime
+import AgentConversations
 import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CodexCompletionLifecycle.swift` | `CodexCompletionLifecycle` struct; claims require the pinned response run; digest-bound answer and exact return intent; remote settlement delegates to the route journal; launch/event reconciliation isolates corrupt jobs and sends settlement candidates to codex_thread_wakeup.js, the sole reply-deliveries.jsonl writer; its existing ledger.lock protects compare-and-append and producer rotation; closed peer reply findings settle covered records as let_go; delivery admission, artifact reservation and dispatch transition reject let-go records before transport; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
 
 /// Durable state transitions for Codex completions delivered through
 /// `ClaudeBridge`.
@@ -15,7 +17,7 @@ import PersistenceCore
 public struct CodexCompletionLifecycle: Sendable {
     public enum ClaimDecision: Sendable, Equatable {
         case start
-        case cached(ChatOrchestration.ChatResponse)
+        case cached(ChatTurnRuntime.ChatResponse)
         case settled(AgentBridgeCompletionDelivery?)
         case inProgress
         case outcomeUnknown
@@ -60,6 +62,7 @@ public struct CodexCompletionLifecycle: Sendable {
         case outcomeUnknown = "outcome_unknown"
         case settled
         case failedBeforeAnswer = "failed_before_answer"
+        case stopped
     }
 
     fileprivate enum ArtifactPhase: String, Codable, Sendable, Hashable {
@@ -86,12 +89,13 @@ public struct CodexCompletionLifecycle: Sendable {
         static let schema = "codex-completion-lifecycle.v2"
 
         var schema: String = Self.schema
+        var lifeID: String? = nil
         var deliveryId: String
         var requestDigest: String
         var sessionId: String?
         var phase: CompletionPhase
         var ownerInstanceId: String
-        var response: ChatOrchestration.ChatResponse?
+        var response: ChatTurnRuntime.ChatResponse?
         var artifacts: [String: ArtifactState]
         var delivery: AgentBridgeCompletionDelivery?
         var detail: String?
@@ -110,7 +114,7 @@ public struct CodexCompletionLifecycle: Sendable {
         var deliveryId: String
         var requestDigest: String
         var ownerInstanceId: String? = nil
-        var response: ChatOrchestration.ChatResponse? = nil
+        var response: ChatTurnRuntime.ChatResponse? = nil
         var artifactId: String? = nil
         var artifactKind: String? = nil
         var retrySafe: Bool? = nil
@@ -183,6 +187,7 @@ public struct CodexCompletionLifecycle: Sendable {
                     updatedAt: Self.nowISO()
                 )
                 created.responseRunId = responseRunId
+                created.lifeID = try DataRootLife.current(in: dataRoot)
                 created.route = route
                 created.principal = principal
                 created.source = source
@@ -214,6 +219,8 @@ public struct CodexCompletionLifecycle: Sendable {
             case .responseCached:
                 guard let response = state.response else { throw LifecycleError.corruptReceipt }
                 return .cached(response)
+            case .stopped:
+                return .settled(state.delivery)
             case .settled, .failedBeforeAnswer:
                 if state.delivery?.status == "let_go" { return .settled(state.delivery) }
                 if let response = state.response { return .cached(response) }
@@ -275,7 +282,7 @@ public struct CodexCompletionLifecycle: Sendable {
     }
 
     public func cacheResponse(
-        _ response: ChatOrchestration.ChatResponse,
+        _ response: ChatTurnRuntime.ChatResponse,
         deliveryId: String,
         requestDigest: String
     ) async throws {
@@ -378,8 +385,8 @@ public struct CodexCompletionLifecycle: Sendable {
             guard let status = decision.status else { continue }
             // One still owed from before its delivery was an experience becomes one
             // here, and an open one whose settlement was written but not projected settles.
-            let terminal = ["delivered", "let_go"].contains(status)
-            if !terminal || open.contains(state.deliveryId) { Self.project(state, dataRoot: dataRoot, born: !terminal) }
+            let terminal = ["delivered", "let_go", "stopped"].contains(status)
+            if !terminal || open.contains(state.deliveryId) { try Self.project(state, dataRoot: dataRoot, born: !terminal) }
             rows.append((state.deliveryId, state.requestDigest, status, state.response, state.route, decision.routeSettled, state.principal))
         }
         return rows
@@ -545,22 +552,18 @@ public struct CodexCompletionLifecycle: Sendable {
             settlements[id] = record
         }
         guard !settlements.isEmpty else { return }
-        let candidates = settlements
-        // JS append and rotation hold this same ledger.lock flock.
-        try await persistence.withFileLock(ledger) {
-            let read = try await persistence.readJSONLReporting(ledger)
-            guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine,
-                  read.rows.allSatisfy({ if case .object = $0 { return true }; return false }) else { throw LifecycleError.corruptReceipt }
-            var latest: [String: [String: JSONValue]] = [:]
-            for case .object(let row) in read.rows {
-                if case .string(let id)? = row["jobId"] { latest[id] = row }
-            }
-            let rows = candidates.keys.sorted().compactMap { id -> JSONValue? in
-                guard latest[id] == nil || latest[id] == records[id] else { return nil }
-                return candidates[id].map(JSONValue.object)
-            }
-            try await persistence.appendJSONLDurable(rows, to: ledger)
+        var environment = AgentBridgeRuntime.processEnvironment()
+        environment.merge(InstallPaths.current.bridgeEnvironment(configRoot: ledger.deletingLastPathComponent().deletingLastPathComponent())) { _, scoped in scoped }
+        environment["NATIVE_AGENT_CODEX_REPLY_DELIVERIES_PATH"] = ledger.path
+        guard let helper = AgentBridgeRuntime.codexHelperURL(dataRoot: dataRoot),
+              let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else { throw CocoaError(.fileNoSuchFile) }
+        let input = settlements.keys.sorted().map { id in
+            JSONValue.object(["expected": .object(records[id]!), "record": .object(settlements[id]!)])
         }
+        let result = await AgentBridgeRuntime.runBuilderWakeupHelper(node: node, helper: helper,
+            inputData: try JSONValue.array(input).serializedData(pretty: false), cwd: dataRoot.deletingLastPathComponent(),
+            environment: environment, timeoutSeconds: nil, arguments: ["--settle-reply-deliveries"])
+        guard case .object(let fields) = result, fields["status"] == .string("ok") else { throw LifecycleError.corruptReceipt }
     }
 
     func deliveryAdmission(deliveryId: String, requestDigest: String) async throws
@@ -592,7 +595,7 @@ public struct CodexCompletionLifecycle: Sendable {
         return try await persistence.withFileLock(path) {
             guard var state = try await loadState(path) else { throw LifecycleError.responseMissing }
             try Self.requireDigest(state, requestDigest)
-            if let delivery = state.delivery, delivery.status == "let_go" { return .settled(delivery) }
+            if let delivery = state.delivery, ["let_go", "stopped"].contains(delivery.status) { return .settled(delivery) }
             guard state.response != nil,
                   state.phase == .responseCached || state.phase == .settled else {
                 throw LifecycleError.responseMissing
@@ -749,7 +752,7 @@ public struct CodexCompletionLifecycle: Sendable {
             let newlyRetained = try await persistence.withFileLock(path) { () async throws -> Bool? in
                 guard var state = try await loadState(path) else { throw LifecycleError.responseMissing }
                 try Self.requireDigest(state, requestDigest)
-                guard state.delivery?.status != "let_go" else { return nil }
+                guard !["let_go", "stopped"].contains(state.delivery?.status ?? "") else { return nil }
                 guard state.delivery?.status != "completed" || delivery.status != "owed" else { return nil }
                 guard state.phase != .settled || state.delivery != delivery else { return nil }
                 let newlyRetained = state.phase != .settled && state.response != nil
@@ -783,7 +786,7 @@ public struct CodexCompletionLifecycle: Sendable {
         try await persistence.withFileLock(path) {
             guard var state = try await loadState(path) else { throw LifecycleError.responseMissing }
             try Self.requireDigest(state, requestDigest)
-            guard phase != .dispatchStarted || state.delivery?.status != "let_go" else { throw LifecycleError.invalidArtifactTransition }
+            guard phase != .dispatchStarted || !["let_go", "stopped"].contains(state.delivery?.status ?? "") else { throw LifecycleError.invalidArtifactTransition }
             guard var artifact = state.artifacts[artifactId] else {
                 throw LifecycleError.artifactMissing
             }
@@ -812,10 +815,18 @@ public struct CodexCompletionLifecycle: Sendable {
     private func loadState(_ url: URL) async throws -> State? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let data = try Data(contentsOf: url)
-        guard let state = try? JSONDecoder().decode(State.self, from: data),
+        guard var state = try? JSONDecoder().decode(State.self, from: data),
               state.schema == State.schema,
               stateURL(state.deliveryId).lastPathComponent == url.lastPathComponent else {
             throw LifecycleError.corruptReceipt
+        }
+        if try !DataRootLife.isCurrent(state.lifeID, in: dataRoot),
+           !["delivered", "let_go"].contains(CodexCompletionLifecycleProjection(state).status ?? "") {
+            state.phase = .stopped
+            state.detail = DataRootLife.stoppedReason
+            state.delivery = AgentBridgeCompletionDelivery(status: "stopped", surface: state.route?.surface ?? "",
+                delivery: state.delivery?.delivery ?? "", artifactCount: state.delivery?.artifactCount ?? 0,
+                attempts: state.delivery?.attempts ?? 0, reason: DataRootLife.stoppedReason)
         }
         return state
     }
@@ -827,25 +838,25 @@ public struct CodexCompletionLifecycle: Sendable {
         }
         let value = try JSONValue.parse(JSONEncoder().encode(state))
         try await persistence.writeJSON(value, to: url)
-        Self.project(state, dataRoot: dataRoot)
+        try Self.project(state, dataRoot: dataRoot)
     }
 
     /// The reply a completion owes its asker is one experience under its
     /// delivery id, moved here at every write of its state: owed once there is
     /// an answer, accepted when delivered, let go when its owner lets it go.
-    private static func project(_ state: State, dataRoot: URL, born: Bool = true) {
-        let status = CodexCompletionLifecycleProjection(state).status
-        guard let status, state.response != nil || ["failed_before_answer", "let_go", "delivered"].contains(status) else { return }
+    private static func project(_ state: State, dataRoot: URL, born: Bool = true) throws {
+        let status = try CodexCompletionLifecycleProjection(state).reading(in: dataRoot).status
+        guard let status, state.response != nil || ["failed_before_answer", "let_go", "delivered", "stopped"].contains(status) else { return }
         let phase: Owed.Phase = switch status {
         case "delivered": .accepted
-        case "let_go": .letGo(.abandoned)
+        case "let_go", "stopped": .letGo(.abandoned)
         default: .owed
         }
         let who = state.principal.map { "agent:" + $0 }
             ?? state.route.map { "route:" + $0.surface } ?? "route:unknown"
         var evidence = [Experience.Ref(source: "codex-completion-lifecycle", id: state.deliveryId)]
         if let run = state.response?.runId ?? state.responseRunId { evidence.append(.init(source: "run", id: run)) }
-        Owed.record(dataRoot, id: state.deliveryId, kind: .message, key: "deliver", to: who, phase: phase, evidence: evidence, born: born)
+        Owed.record(dataRoot, id: state.deliveryId, kind: .message, key: "deliver", to: who, phase: phase, evidence: evidence, born: born && status != "stopped")
     }
 
     private static func requireDigest(_ state: State, _ digest: String) throws {
@@ -879,7 +890,7 @@ public struct CodexCompletionLifecycle: Sendable {
         }
         let migrated = Self.state(fromLegacyRows: rows, ownerInstanceId: ownerInstanceId)
         try await write(migrated, to: path)
-        return migrated
+        return try await loadState(path)
     }
 
     private func migrateAllLegacyStates() async throws {
@@ -1022,7 +1033,7 @@ public struct CodexCompletionLifecycle: Sendable {
 
     private func recoverTranscriptResponse(
         deliveryId: String, requestDigest: String?, sessionId: String?, runId: String?
-    ) async throws -> ChatOrchestration.ChatResponse? {
+    ) async throws -> ChatTurnRuntime.ChatResponse? {
         guard let sessionId,
               let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId)
         else { return nil }
@@ -1122,7 +1133,7 @@ public struct CodexCompletionLifecycle: Sendable {
 
 private extension CodexCompletionLifecycleProjection {
     init(_ state: CodexCompletionLifecycle.State) {
-        self.init(deliveryId: state.deliveryId, principal: state.principal, source: state.source,
+        self.init(deliveryId: state.deliveryId, lifeID: state.lifeID, principal: state.principal, source: state.source,
             updatedAt: state.updatedAt, phase: state.phase.rawValue,
             response: state.response.map { ($0.runId, $0.sessionId, $0.output, ($0.attachments ?? []).map(\.id)) }, responseRunId: state.responseRunId,
             sessionId: state.sessionId, delivery: state.delivery.map { ($0.status, $0.delivery) },

@@ -3,6 +3,7 @@
 import SwiftUI
 import CloudKit
 import NativeAgentShared
+// Blueprint: | `MemoryView.swift` | Memory presentation and submission state; memories and proposals read the shared sync projection without local suppression |
 
 // MARK: - MemoryView
 
@@ -90,8 +91,6 @@ struct MemoryView: View {
         }
         .refreshable { await store.refresh() }
         .onAppear { Task { await store.refresh() } }
-        .onChange(of: sync.memories) { _, _ in store.applySyncedState(from: sync) }
-        .onChange(of: sync.memoryProposals) { _, _ in store.applySyncedState(from: sync) }
         .task(id: scenePhase) {
             guard scenePhase == .active,
                   DeviceCloudKitPreflight.entitlementGrantsContainer(NativeAgentICloudBridgeConstants.containerID) else { return }
@@ -144,7 +143,7 @@ struct MemoryView: View {
             lastSyncedAt: sync.transportDeliveryAt(screenGroup: Self.snapshotGroup(for: segment)),
             fixed: sampleSyncState != nil, showsFreshAge: true)) { context in
             let sample = sampleSyncState
-            let state = MacSnapshotPageFreshness.state(
+            let state = StatusConnectionPresentation.syncState(
                 // This segment's own delivery clock, not the cache-read clock.
                 lastSyncedAt: sample == "stale"
                     ? context.date.addingTimeInterval(-7200)
@@ -322,8 +321,8 @@ private struct MemoryErrorLine: View {
 
 @MainActor
 final class MemoryStore: ObservableObject {
-    @Published var memories: [MemoryRecord] = []
-    @Published var memoryProposals: [MemoryProposalRecord] = []
+    var memories: [MemoryRecord] { iCloudSyncEngine.shared.memories }
+    var memoryProposals: [MemoryProposalRecord] { iCloudSyncEngine.shared.memoryProposals }
     @Published var decidingMemoryProposalIDs: Set<String> = []
     @Published var deletingMemoryIDs: Set<String> = []
     @Published var isLoading = false
@@ -331,9 +330,6 @@ final class MemoryStore: ObservableObject {
 
     private let refreshMemorySnapshot: () async -> Void
     private let syncErrorProvider: () -> String?
-
-    private var hiddenResolvedMemoryProposalIDs: Set<String> = []
-    private var hiddenDeletedMemoryIDs: Set<String> = []
 
     init(
         refreshMemorySnapshot: @escaping () async -> Void = {
@@ -351,8 +347,6 @@ final class MemoryStore: ObservableObject {
         isLoading = true
         if !preservingActionError { error = nil }
         await refreshMemorySnapshot()
-        let sync = iCloudSyncEngine.shared
-        applySyncedState(from: sync)
         if !preservingActionError || error == nil {
             error = MemoryErrorLinePresentation.visibleMessage(syncErrorProvider())
         }
@@ -361,28 +355,6 @@ final class MemoryStore: ObservableObject {
 
     func dismissError() {
         error = nil
-    }
-
-    func applySyncedState(from sync: iCloudSyncEngine) {
-        applySyncedState(memories: sync.memories, memoryProposals: sync.memoryProposals)
-    }
-
-    func applySyncedState(
-        memories syncedMemories: [MemoryRecord],
-        memoryProposals syncedMemoryProposals: [MemoryProposalRecord]
-    ) {
-        let memoryIDs = Set(syncedMemories.map(\.id))
-        let proposalIDs = Set(syncedMemoryProposals.map(\.id))
-        // This intersection bounds the local hide set to ids still present in
-        // the current snapshot or an active delete, including repeated swipes.
-        hiddenDeletedMemoryIDs.formIntersection(memoryIDs.union(deletingMemoryIDs))
-        hiddenResolvedMemoryProposalIDs.formIntersection(
-            proposalIDs.union(decidingMemoryProposalIDs)
-        )
-        memories = syncedMemories.filter { !hiddenDeletedMemoryIDs.contains($0.id) }
-        memoryProposals = syncedMemoryProposals.filter {
-            !hiddenResolvedMemoryProposalIDs.contains($0.id)
-        }
     }
 
     func approveMemoryProposal(_ proposal: MemoryProposalRecord) {
@@ -410,10 +382,7 @@ final class MemoryStore: ObservableObject {
         }
     }
 
-    /// Runs one proposal decision and then reconciles the current Mac snapshot.
-    /// It remains visible after every unconfirmed failure; only a successful
-    /// action may retain the optimistic hide while snapshot publication catches
-    /// up.
+    /// The sync owner adopts the Mac's confirmed memory and proposal readback.
     func performMemoryProposalDecision(
         _ proposal: MemoryProposalRecord,
         approve: Bool,
@@ -423,16 +392,10 @@ final class MemoryStore: ObservableObject {
         guard !decidingMemoryProposalIDs.contains(proposal.id) else { return }
         error = nil
         decidingMemoryProposalIDs.insert(proposal.id)
-        hiddenResolvedMemoryProposalIDs.insert(proposal.id)
-        memoryProposals.removeAll { $0.id == proposal.id }
 
         do {
             try await submit(approve, proposal.id)
         } catch {
-            // A timeout only means the phone did not observe the Mac's answer.
-            // It cannot prove the action was applied, so do not leave the
-            // proposal optimistically hidden from the next snapshot.
-            hiddenResolvedMemoryProposalIDs.remove(proposal.id)
             if iCloudSyncEngine.isMacResponseTimeout(error) {
                 self.error = "Decision sent; waiting for Mac/iCloud to publish the result."
             } else {
@@ -440,37 +403,22 @@ final class MemoryStore: ObservableObject {
             }
         }
         decidingMemoryProposalIDs.remove(proposal.id)
-        await refresh()
+        if error != nil { await refresh() }
     }
 
     func deleteMemory(_ memory: MemoryRecord) {
         guard !deletingMemoryIDs.contains(memory.id) else { return }
         error = nil
         deletingMemoryIDs.insert(memory.id)
-        hiddenDeletedMemoryIDs.insert(memory.id)
-        memories.removeAll { $0.id == memory.id }
 
         Task {
-            var deleteConfirmed = false
             do {
                 try await iCloudSyncEngine.shared.deleteMemory(id: memory.id)
-                deleteConfirmed = true
             } catch {
-                self.hiddenDeletedMemoryIDs.remove(memory.id)
                 self.error = error.localizedDescription
+                await refresh(preservingActionError: true)
             }
             self.deletingMemoryIDs.remove(memory.id)
-            if deleteConfirmed {
-                // The action receipt proves only that the Mac accepted the
-                // tombstone. Until its next snapshot omits this id, do not
-                // keep the row invisibly suppressed forever.
-                self.hiddenDeletedMemoryIDs.remove(memory.id)
-            }
-            await refresh(preservingActionError: true)
-            if deleteConfirmed,
-               iCloudSyncEngine.shared.memories.contains(where: { $0.id == memory.id }) {
-                self.error = "Delete recorded; waiting for Mac/iCloud to remove this memory."
-            }
         }
     }
 }

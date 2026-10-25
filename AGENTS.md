@@ -40,6 +40,20 @@ is a defect to fix at once. First law: docs/NORTHSTAR.md.
   agents when helpful. They must not run separate tests either. Then check
   the installed app yourself, with Agent's help where useful.
 - Documentation/rules-only changes need a text readback, not an app build.
+- **Compile what you change.** A core module: `script/check_module.sh <Module> …`
+  (no names: all of NativeAgentCore; works in any checkout or fresh worktree,
+  no app build, no signing). The app's own files, and any change to a public or
+  package signature in core (app callers break otherwise): `script/check_app.sh`
+  (SwiftPM, no Xcode, no signing, no launch; the first run in a checkout is slow).
+- **No fallbacks, no rollbacks.** Fix a failure at its cause and go forward;
+  never revert a good change to the old way (docs/NORTHSTAR.md, clause 2).
+- **Stop cancels the work, never its settlement** ([docs/STOP.md](docs/STOP.md)):
+  saving what was produced, the one terminal record and releasing what was held
+  run through `settle { … }`, exactly once, however the work ended.
+- **One owner's snapshot reads through `LatestRead`.** A read returns what it
+  read; publication moves forward only (an older read never replaces a newer
+  snapshot, a committed write publishes through `write`). Never hand-roll a
+  generation counter for "which read may publish".
 - **Least code, and don't break what works.** Check an item's premise
   against git log before building it — plans go stale.
 - The live runtime is `NativeAgent.app` in-process. `EngineRuntime` and
@@ -59,12 +73,24 @@ in `git log`, [CHANGELOG.md](CHANGELOG.md) and `docs/release-notes/`.
 - **Docs map:** [docs/README.md](docs/README.md) maps the current documents,
   including the files the app and scripts read (keep those paths stable).
 - **Source owners:** [docs/ARCHITECTURE_BLUEPRINT.md](docs/ARCHITECTURE_BLUEPRINT.md);
-  `script/check_architecture_blueprint.swift` holds its table rows to the files
-  on disk.
+  edit the file's own `// Blueprint: <table row>` line directly after imports
+  (at the top without imports), then run
+  `swift script/generate_architecture_blueprint.swift`. Never hand-edit generated
+  table regions. `script/check_architecture_blueprint.swift` checks generated
+  equality, file coverage and policy.
+- **Turn part versions:** never hand-number `turn.js` lane revisions or edit
+  shipped digests. Keep its declared version; committed bodies may share it.
+  Run `swift script/generate_turn_part_versions.swift` after committing body
+  edits; `script/build_and_run.sh` runs it before compiling. It reads every
+  committed body from full git history and omits only the currently bundled
+  version/body pair from upgrade candidates. Commit the generated Swift file;
+  source archives compile that committed table without git history.
 - **App tool:** [docs/TOOL_LOADING.md](docs/TOOL_LOADING.md) is the contract;
   changing it needs User's word.
-- **Private notes:** `docs/HANDOFF_CURRENT.md` (the current maintainer state; the old log is `docs/history/`) and
-  `docs/build_plans/` — stripped from the public export, history not a queue.
+- **Private notes:** `docs/HANDOFF_CURRENT.md` (the lead maintainer's current
+  state; lanes never edit it, their commits and reports are the record; the old
+  log is `docs/history/`) and `docs/build_plans/` — stripped from the public
+  export, history not a queue.
 - **This file is not the agent's persona.** Runtime persona documents,
   including `AGENTS.md`, live in the root resolved by `defaultPersonaRoot`:
   the source checkout's `persona/` or the app data root's `persona/`.

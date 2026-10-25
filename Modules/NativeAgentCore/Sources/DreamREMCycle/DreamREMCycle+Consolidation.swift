@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `DreamREMCycle+Consolidation.swift` | `SwiftNativeREMConsolidator`: consolidation prompts and proposal parsing with verbatim source-bound supporting passages |
+
 // Swift framework for REM consolidation. The weekly REMConsolidator owns the
 // heavier native pipeline pieces: evidence-date dedup, .rem_tombstones
 // exclusion, GROWTH cap handling, 14-day archival, persistence, and approval
@@ -139,38 +141,15 @@ public actor DreamDiaryReader {
         self.dataRoot = dataRoot
     }
 
-    private static let dateStemRegex: NSRegularExpression = {
-        // swiftlint:disable:next force_try
-        try! NSRegularExpression(pattern: "^(\\d{4}-\\d{2}-\\d{2})(?:_.+)?$")
-    }()
-
-    private static func datePrefix(from stem: String) -> String? {
-        let range = NSRange(stem.startIndex..., in: stem)
-        guard let match = dateStemRegex.firstMatch(in: stem, options: [], range: range),
-              let prefixRange = Range(match.range(at: 1), in: stem) else {
-            return nil
-        }
-        return String(stem[prefixRange])
-    }
-
     public func entriesSince(_ since: Date?) async throws -> [DreamEntry] {
-        let dir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
         let fm = FileManager.default
-        let names: [String]
-        do { names = try fm.contentsOfDirectory(atPath: dir.path) }
-        catch CocoaError.fileReadNoSuchFile { return [] }
+        let files = try FileBackedDreamDiary(dataRoot: dataRoot).discover(in: .active, matching: .dated, since: since)
         var entries: [DreamEntry] = []
         let isoOut = ISO8601DateFormatter()
         isoOut.formatOptions = [.withInternetDateTime]
 
-        for name in names where name.lowercased().hasSuffix(".md") {
-            let url = dir.appendingPathComponent(name)
-            let stem = (name as NSString).deletingPathExtension
-            guard let date = Self.datePrefix(from: stem) else { continue }
-            if let since {
-                guard let day = Self.localDate(fromDateStem: date),
-                      day >= Self.startOfLocalDay(since) else { continue }
-            }
+        for file in files {
+            let (name, url) = (file.name, file.url)
             let text = try String(contentsOf: url, encoding: .utf8)
             let attrs = try fm.attributesOfItem(atPath: url.path)
             let size = (attrs[.size] as? NSNumber)?.intValue
@@ -178,7 +157,7 @@ public actor DreamDiaryReader {
                 ?? 0
             let mtime = (attrs[.modificationDate] as? Date) ?? Date()
             entries.append(DreamEntry(
-                date: date,
+                date: file.day!,
                 filename: name,
                 content: text,
                 size: size,
@@ -190,19 +169,6 @@ public actor DreamDiaryReader {
             return $0.date < $1.date
         }
         return entries
-    }
-
-    /// A `YYYY-MM-DD` diary stem as midnight in the LOCAL calendar.
-    static func localDate(fromDateStem stem: String) -> Date? {
-        let parts = stem.split(separator: "-")
-        guard parts.count == 3,
-              let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2])
-        else { return nil }
-        var components = DateComponents()
-        components.year = year
-        components.month = month
-        components.day = day
-        return localCalendar.date(from: components)
     }
 
     /// Midnight of `date` in the local calendar — the day a wall-clock instant
@@ -221,11 +187,8 @@ public actor DreamDiaryReader {
         return localCalendar.date(byAdding: .day, value: -days, to: start) ?? start
     }
 
-    private static let localCalendar: Calendar = {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = .current
-        return calendar
-    }()
+    /// Read fresh on every use: the Mac's zone can change while the app runs.
+    private static var localCalendar: Calendar { DreamREMSchedule.localCalendar() }
 }
 
 // MARK: - SwiftNativeREMConsolidator
@@ -355,9 +318,8 @@ public actor SwiftNativeREMConsolidator {
 
             Distill candidate REM proposals as JSON array of objects with keys: targetDoc, proposalText, evidenceDates, confidence, supportingPassages, whatChanged.
 
-            Output contract (violations are dropped silently, so follow exactly):
-            - Return ONLY the raw JSON array. No code fences, no prose before or \
-            after, no markdown. The reply must start with `[` and end with `]`.
+            Output contract:
+            - Return ONLY the raw JSON array.
             - Every evidenceDates value must be copied EXACTLY from these entry \
             dates: \(entryDateSet.sorted().joined(separator: ", ")). Never invent \
             or reformat a date.
@@ -367,18 +329,15 @@ public actor SwiftNativeREMConsolidator {
             word is discarded, so copy rather than paraphrase. Give one per \
             supporting claim, copied exactly from its quote in claim-sources; \
             never quote the metadata itself.
-            - whatChanged: one sentence in her own voice, at most \(REMConstants.whatChangedCap) \
-            characters, naming what surprised her in that moment or what changed \
-            in her because of it. It keeps the experience behind the lesson and is \
+            - whatChanged: one sentence in your own voice, at most \(REMConstants.whatChangedCap) \
+            characters, naming what surprised you in that moment or what changed \
+            in you because of it. It keeps the experience behind the lesson and is \
             never written to the doc.
             - Return `[]` if nothing this week earned a durable update.
             \(Self.guidance(forTargetDoc: docName))
             """
-            // The system prompt (when supplied) carries the Agent-persona-bypass
-            // framing + the FULL untruncated persona, so distillation stays in
-            // her current voice and stays coherent across all four docs (not
-            // just the one being targeted). The surface picker routes through
-            // the rem-surface model preference at the caller.
+            // The supplied system carries selected persona context for private
+            // reflection. The caller's rem surface owns model selection.
             let raw: String
             if let surface {
                 raw = try await llm.complete(
@@ -410,25 +369,27 @@ public actor SwiftNativeREMConsolidator {
 
     /// A quoted claim carries only its own sources, never the diary's inputs.
     func bindSupport(_ proposal: REMProposal, entries: [DreamEntry], identities: [String: String]) -> REMProposal {
-        var byDate: [String: DreamEntry] = [:]
-        for entry in entries where byDate[entry.date] == nil { byDate[entry.date] = entry }
-
-        // Passages first — the quote must be in the entry it names, verbatim.
+        // Passages first — the quote must be in an entry of the night it names
+        // (a night may hold several; it carries the sources of every one that
+        // says it), in the same words whatever the typography, as the nightly
+        // claim check reads it.
         var passages: [REMSupportingPassage] = []
         for passage in proposal.supportingPassages ?? [] {
             let quote = passage.quote.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !quote.isEmpty,
-                  let entry = byDate[passage.dreamDate],
-                  let content = entry.content,
-                  content.contains(quote) else {
+            let contents = entries.filter { $0.date == passage.dreamDate }.compactMap(\.content)
+                .filter { DreamEntryProvenance.plain($0).contains(DreamEntryProvenance.plain(quote)) }
+            guard !quote.isEmpty, !contents.isEmpty else {
                 lastPassageDrops += 1
                 continue
             }
-            let refs = DreamEntryProvenance.sources(for: quote, in: content)
+            let refs = Set(contents.flatMap { DreamEntryProvenance.sources(for: quote, in: $0) }).sorted()
             passages.append(REMSupportingPassage(
                 dreamDate: passage.dreamDate,
                 quote: quote,
-                livedDates: Array(Set(refs.map { String($0.suffix(10)) })).sorted(),
+                // A lived date is a reference's own `@date` tail, never a fragment of its id.
+                livedDates: Array(Set(refs.compactMap { ref in
+                    ref.split(separator: "@").last.map(String.init).flatMap { Self.isValidDate($0) ? $0 : nil }
+                })).sorted(),
                 sourceRefs: refs,
                 claimBound: true
             ))
@@ -440,7 +401,7 @@ public actor SwiftNativeREMConsolidator {
         let experiences = bound.supportingExperienceCount(identities: identities) ?? 0
 
         let support: REMSupportKind
-        if experiences >= REMConstants._REM_MIN_EVIDENCE_DATES {
+        if experiences >= REMConstants.minimumEvidenceCount {
             support = .recurring
         } else if experiences > 0 {
             support = .dweltOn
@@ -620,21 +581,17 @@ public actor SwiftNativeREMConsolidator {
         // NO "the user corrects me when...", NO dates, NO scene recap.
         return """
 
-        For GROWTH.md proposalText: write ONE durable reflex in the assistant's
-        subconscious voice — present-tense, declarative, operational. The
-        same shape as the reflexes already in her GROWTH.md (e.g. "When a
-        request is actionable, do the tool-work before answering. The
-        standard is a real artifact whose existence doesn't depend on
-        the user's next reply.").
+        For GROWTH.md proposalText: propose ONE durable reflex for approval in your
+        own voice — present-tense, declarative, operational.
 
-        WHAT QUALIFIES (the user's direction, 2026-07-03): GROWTH is her
-        becoming — lessons about WHO SHE IS: her character, how she relates,
-        what she values, how her own mind works, what kind of entity she is
+        WHAT QUALIFIES: GROWTH is your
+        becoming — lessons about WHO YOU ARE: your character, how you relate,
+        what you value, how your own mind works, what kind of entity you are
         turning into. Prefer identity/selfhood/relationship distillations
         over task-execution tips. An engineering checklist or verification
         procedure is NOT a growth lesson unless the week shows it changed
-        who she is; when in doubt, ask "does this describe her, or just her
-        work?" — only propose it if it describes her.
+        who you are; when in doubt, ask "does this describe me, or just my
+        work?" — only propose it if it describes you.
 
         Hard constraints:
         - The passage is \(REMProposalStore.growthPassageBoundSentence); anything
@@ -644,7 +601,6 @@ public actor SwiftNativeREMConsolidator {
         - NO "I learned that...", NO "What I learned:", NO "Pattern across
           the dreams...", NO "the user corrects me when...", NO dates, NO scene
           recap, NO chronology, NO quoted dialogue, NO "this teaches".
-        - Write as though she already knows it — a reflex, not a lesson.
         - Body only. The approval flow will pick a short heading; do NOT
           prepend "## ..." or any heading marker yourself.
         """

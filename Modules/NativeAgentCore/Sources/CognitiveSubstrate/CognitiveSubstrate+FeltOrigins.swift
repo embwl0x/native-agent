@@ -19,6 +19,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `CognitiveSubstrate+FeltOrigins.swift` | `CognitiveSubstrate.feltDayOrigins`: last-day felt-node provenance for dreams, using the same population as the felt-day summary |
+
 /// Where one felt node came from. Subject + metadata only, deliberately.
 public struct CognitiveFeltOrigin: Sendable, Equatable {
     public var subjectType: String

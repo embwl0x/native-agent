@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `MobileDeskSnapshot.swift` | `WorkOverview` and mobile Desk values: bounded canonical-identity reading copies, owner counts and execution movement; no second decision owner |
+
 /// A reading copy, never a second work or decision owner. References use the
 /// canonical identity rather than a title, alias, path, or chat draft.
 public struct WorkOverviewReference: Codable, Equatable, Sendable {

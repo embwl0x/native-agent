@@ -1,4 +1,6 @@
 import NativeAgentCore
+
+// Blueprint: | `CognitiveSubstrate+AppraisalStakes.swift` | `CognitiveSubstrate.feltResolutionIsAtStake`: stake admission and semantic resolution provenance for felt outcomes |
 // CognitiveSubstrate+AppraisalStakes.swift
 // COGNITION STEP 1 (APPRAISAL) · D-2 — appraise against STAKES, not event class.
 // (2026-08-02)

@@ -1,6 +1,8 @@
 import Context
 import Foundation
 
+// Blueprint: | `NativeContextMemoryPressureObserver.swift` | `DispatchContextMemoryPressureObserver`: cancellable OS pressure event bridge; runtime and coordinator retain trim policy |
+
 /// The platform event source is deliberately a tiny lifecycle owner. The
 /// runtime owns the policy and the coordinator owns trimming; this bridge only
 /// translates an OS pressure edge into the shared Context pressure value.

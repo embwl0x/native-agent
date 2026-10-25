@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `OAuthContinuationGate.swift` | `OAuthContinuationGate` class; `install`, `resume` |
 
 public final class OAuthContinuationGate: @unchecked Sendable {
     public init() {}

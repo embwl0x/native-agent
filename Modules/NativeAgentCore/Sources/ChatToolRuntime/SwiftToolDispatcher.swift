@@ -8,22 +8,19 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import ToolRegistry
 import TrustCenter
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
+// Blueprint: | `SwiftToolDispatcher.swift` | Native dispatcher construction and built-in and registry catalogs; authored projections share AbilityStore's checked ToolRecord projection and exact catalog revision; named schema construction consumes parsed registry rows and selects before encoding |
 
 // MARK: - SwiftToolDispatcher
 
-/// Native ToolDispatchClient for built-in Swift tools, registered tools and
-/// mounted MCP tools. Tools contributed by an app executor share this catalog
+/// Native ToolDispatchClient for built-in Swift tools and registered tools.
+/// Tools contributed by an app executor share this catalog
 /// and run in that executor, including the Core tools it explicitly replaces.
 /// Chat exposes `app`; its actions reach the underlying dispatch routes, whose
 /// permission and availability checks still apply.
@@ -33,9 +30,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     /// instead of reaching across bodies.
     static let canonicalBodyOnlyToolNames: Set<String> = [
         "restart_app", "agent_swarm", "image_generate",
-        "market_status", "market_watchlists", "tradingview_watchlist", "market_quote",
-        "x_status", "x_me", "x_search", "x_timeline", "x_user_tweets",
-        "slack_status", "slack_list_channels", "slack_search_messages", "slack_post_message",
     ]
 
     let allowsCanonicalBodyTools: Bool
@@ -87,29 +81,9 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     private let builtInSchemaCacheLock = NSLock()
     private var builtInSchemaCache: [BuiltInSchemaCacheKey: [LLMToolSchema]] = [:]
 
-    /// Sandbox anchor for read/list tools. All caller paths resolve under
-    /// this URL — the SOURCE-REPO root (= dataRoot's parent in both dev
-    /// and bundled-with-REPO_PATH cases).
-    ///
-    /// Why parent-of-dataRoot:
-    ///   - dev: defaultDataRoot() walks up looking for <repo>/data — so
-    ///     dataRoot = <repo>/data and .parent = <repo>. SOUL.md, AGENTS.md,
-    ///     VOICE.md, GROWTH.md, USER.md all live FLAT at <repo>/persona/*.
-    ///   - bundled install with stamped REPO_PATH: defaultDataRoot() step
-    ///     2 returns <stampedRepo>/data — so .parent = stampedRepo, same
-    ///     layout as dev.
-    ///   - bundled AppSupport fallback (NO repo stamp): dataRoot is
-    ///     ~/Library/Application Support/NativeAgent (no /data suffix);
-    ///     .parent gives ~/Library/Application Support/ which has nothing
-    ///     in the allow-list — every read fails closed. That's fine: it's
-    ///     a degenerate setup where no source content exists anyway.
-    ///
-    /// An earlier patch this turn anchored at dataRoot directly (allow-list
-    /// = data/-subdirs) which could only see split data-root mirrors instead
-    /// of the active persona root — Agent correctly flagged the "two tools,
-    /// two roots" seam in her telegram diagnostic.
-    /// One tool used PersonaRootResolver (which walks to repo), the other
-    /// stayed at dataRoot. Same root for both = one canonical answer.
+    /// Source-repository anchor for the legacy relative-path allowlist.
+    /// resolveTrustedFilePath also accepts workspace aliases, bundled docs,
+    /// workspace-relative paths and absolute paths under trusted roots.
     var rootForRead: URL { dataRoot.deletingLastPathComponent().standardizedFileURL }
 
     /// Her requests carry one tool, `app` (docs/TOOL_LOADING.md); every
@@ -217,13 +191,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         return generated
     }
 
-    // context_expand is ALWAYS catalogued (2026-09-01). These three walks used
-    // to drop it whenever the current packet carried no expandable pointers,
-    // which made the advertised contract — and the cached prompt prefix —
-    // change shape between turns for a reason the model never asked about. It
-    // is in alwaysOnCoreNames; the floor does not move. With nothing to
-    // expand, impl_context_expand says so at dispatch, which costs one tool
-    // result instead of a whole prefix rewrite.
     public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
         if names == ["app"] {
             return appTools == nil ? [] : executorDescriptors.values.filter { names.contains($0.name) }.map(\.schema)
@@ -235,13 +202,11 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         await catalogSnapshot(includeSchemas: true).schemas
     }
 
-    func catalogSnapshot(includeSchemas: Bool, schemaNames: Set<String>? = nil) async -> (names: [String], schemas: [LLMToolSchema], hiddenMCPNames: Set<String>, externalMCPNames: [String]) {
+    func catalogSnapshot(includeSchemas: Bool, schemaNames: Set<String>? = nil) async -> (names: [String], schemas: [LLMToolSchema]) {
         let records = readRegistryRecords()
         let access = await fullMacToolAccess()
         let activity = await activityCaptureEnabled()
-        if includeSchemas { MCPToolCatalogWarmer.shared.kickDetached(dataRoot: dataRoot) }
-        let mcp = MCPToolBridge.listMCPTools(dataRoot: dataRoot)
-        let names = availableToolNames(records: records, access: access, activity: activity, mcpNames: mcp.map(\.bridgedName))
+        let names = availableToolNames(records: records, access: access, activity: activity)
         var schemas: [LLMToolSchema] = []
         if includeSchemas {
             let builtIn = cachedBuiltInToolSchemas(
@@ -253,15 +218,12 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
                 requestedNames: schemaNames
             ).map { executorDescriptors[$0.name]?.schema ?? $0 }
             let registry = Self.authoredTools(records: records, named: schemaNames).map(\.schema)
-            let combined = builtIn + registry + Self.mcpToolSchemas(mcp.filter {
-                $0.serverId != "nativeagent-internal" && schemaNames?.contains($0.bridgedName) != false
-            })
+            let combined = builtIn + registry
             schemas = withContributedSchemas(usesCanonicalBody
                 ? combined
                 : combined.filter { !Self.canonicalBodyOnlyToolNames.contains($0.name) }, named: schemaNames)
         }
-        return (names, schemas, Set(mcp.filter { $0.serverId == "nativeagent-internal" }.map(\.bridgedName)),
-                mcp.filter { $0.serverId != "nativeagent-internal" }.map(\.bridgedName))
+        return (names, schemas)
     }
 
     /// Assembly and authored admission reserve every executor-owned name.
@@ -297,9 +259,9 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         await catalogSnapshot(includeSchemas: false).names
     }
 
-    private func availableToolNames(records: [JSONRow], access: FullMacToolAccess, activity: Bool, mcpNames: [String]) -> [String] {
+    private func availableToolNames(records: [JSONRow], access: FullMacToolAccess, activity: Bool) -> [String] {
         // Registry discovery may never advertise a spelling that dispatch
-        // resolves to a native/MCP route. Otherwise a disabled built-in such
+        // resolves to a native route. Otherwise a disabled built-in such
         // as `shell`, or a dotted alias such as `desk.read`, can leak back
         // into the catalog from registry.json even though its custom manifest
         // can never own the call.
@@ -367,15 +329,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             let existing = Set(names)
             names.append(contentsOf: Self.activityQueryToolNames.filter { !existing.contains($0) })
         }
-        // Surface configured MCP servers' tools under the bridged
-        // `mcp__<server>__<tool>` convention. Dispatch for these names routes
-        // through SwiftNativeMCPDispatcher.callToolLive for stdio servers.
-        if !mcpNames.isEmpty {
-            // De-dup: a registry.json entry shadowing a bridged name wins.
-            let existing = Set(names)
-            names.append(contentsOf: mcpNames.filter { !existing.contains($0) })
-            names.sort()
-        }
         if !usesCanonicalBody {
             names.removeAll { Self.canonicalBodyOnlyToolNames.contains($0) }
         }
@@ -412,8 +365,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     /// tools while it lasts, and her home owes the repair until a read works.
     static func authoredRegistry(dataRoot: URL) -> Result<[JSONValue], any Error> {
         do {
-            let registry = try AbilityStore(dataRoot: dataRoot).registry(kind: .tool)
-            guard case .array(let rows) = registry else { throw CocoaError(.fileReadCorruptFile) }
+            let rows = try AbilityStore(dataRoot: dataRoot).checkedToolRecords().map { $0.toJSON() }
             RepairOwed.settle(dataRoot, operation: "abilities.tool_registry", evidence: .init(source: "abilities", id: UUID().uuidString))
             return .success(rows)
         } catch {
@@ -451,10 +403,10 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     }()
 
     /// A name a tool she writes may take: no built-in's (or its dotted
-    /// spelling), no `mcp__` bridge name, nothing an alias rewrites.
+    /// spelling), nothing an alias rewrites.
     public static func isAuthorableToolName(_ id: String) -> Bool {
         !registryReservedNames.contains(id) && !AppActionBinding.builtInToolName(id)
-            && !id.hasPrefix("mcp__") && CanonicalToolNameDispatcher.canonical(id) == id
+            && CanonicalToolNameDispatcher.canonical(id) == id
     }
 
     /// The same, for the `app` door's generated `authored.<id>` actions, with
@@ -462,21 +414,30 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     /// The store's lock and canonical revision cover local and external changes.
     /// A failed read is not memoized; the key is read before the catalog walk.
     package static func authoredTools(dataRoot: URL) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
+        switch checkedAuthoredTools(dataRoot: dataRoot) {
+        case .success(let tools): return tools
+        case .failure: return [] // Unreadable authority offers no executable actions.
+        }
+    }
+
+    /// Inventory readers retain the fault; execution discovery stays fail-closed.
+    package static func checkedAuthoredTools(dataRoot: URL) -> Result<[(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)], any Error> {
         AbilityStore.withLock {
             let revision: [String]
             do { revision = try AbilityStore(dataRoot: dataRoot).revision() } catch {
                 RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .act, operation: "abilities.tool_registry", owner: "abilities",
                                words: "Her tool registry's revision did not read (\(error.localizedDescription)); her own tools are not offered until it reads again.")
-                return []
+                return .failure(error)
             }
             let key = (dataRoot.path, revision, AppActionBinding.registeredToolCount)
-            if let memo = authoredToolsMemo, memo.key == key { return memo.tools }
-            guard case .success(let rows) = authoredRegistry(dataRoot: dataRoot) else { return [] }
-            let records = rows.compactMap { try? JSONRow($0) }
-            guard records.count == rows.count else { return [] }
-            let tools = authoredTools(records: records)
-            authoredToolsMemo = (key, tools)
-            return tools
+            if let memo = authoredToolsMemo, memo.key == key { return .success(memo.tools) }
+            return authoredRegistry(dataRoot: dataRoot).flatMap { rows in
+                Result {
+                    let tools = authoredTools(records: try rows.map { try JSONRow($0) })
+                    authoredToolsMemo = (key, tools)
+                    return tools
+                }
+            }
         }
     }
     nonisolated(unsafe) private static var authoredToolsMemo: (key: (String, [String], Int),
@@ -486,17 +447,13 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         let active = records
             .filter { $0.fields["status"] == .string("active") && $0.fields["disabledBy"] != .string("owner") }
         var tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] = []
-        // mcp__-prefixed ids are excluded too: dispatch's default case parses
-        // that prefix as an MCP bridge name BEFORE consulting the registry, so
-        // a registry schema under it would advertise a route that never fires.
         for row in active {
             guard let id = (try? row.string("id")) ?? (try? row.string("name")),
                   names?.contains(id) != false, isAuthorableToolName(id) else { continue }
             guard row.fields["language"] == .string("javascript") else { continue }
             guard let digest = try? row.string("codeFingerprint"), !digest.isEmpty,
                   case .object(let admission)? = row.fields["admission"], admission["candidate"] == .string(digest) else { continue }
-            let description = (try? row.string("description"))
-                ?? "Custom registry tool \(id)."
+            guard let description = try? row.string("description") else { continue }
             let schemaObject: [String: JSONValue] = if case .object(let schema)? = row.fields["inputSchema"] {
                 schema
             } else { ["type": .string("object")] }
@@ -506,8 +463,12 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             }
             let page: String? = if case .object(let face)? = row.fields["face"], case .string(let page)? = face["page"] { page } else { nil }
             let action: String? = if case .object(let face)? = row.fields["face"], case .string(let action)? = face["action"] { action } else { nil }
-            tools.append((LLMToolSchema(name: id, description: description, parametersJSON: schemaData),
-                          (try? row.strings("permissions")) ?? [], (try? row.strings("actions")) ?? [],
+            let permissions = (try? row.strings("permissions")) ?? []
+            let reach = PermissionLaw.reach(ofPermissions: permissions)
+            let toolClass = permissions.map(PermissionLaw.permissionClass).max() ?? (schemaObject["readOnly"] == .bool(true) ? .read : .write)
+            tools.append((LLMToolSchema(name: id, toolClass: toolClass, reach: reach,
+                                       capabilities: ["tool_call", "safe_read"], description: description, parametersJSON: schemaData),
+                          permissions, (try? row.strings("actions")) ?? [],
                           page, action))
         }
         return tools.sorted { $0.schema.name < $1.schema.name }

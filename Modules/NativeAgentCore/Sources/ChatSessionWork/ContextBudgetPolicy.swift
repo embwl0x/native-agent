@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 import ProviderRouting
+import os
+// Blueprint: | `ContextBudgetPolicy.swift` | Shared model-input budgets for every door; `compactionHistoryCharacters`, `floors`; derived budget reuse by exact effective window after current model/catalog resolution |
 
 /// SINGLE SOURCE OF TRUTH for every prompt-assembly character budget.
 ///
@@ -146,11 +148,6 @@ public enum ContextBudgetPolicy {
     /// aggregate character budget (`packetChars`) is the window-scaled knob.
     package static let packetAtomExpandThresholdChars = 400
 
-    /// Lead length used when an atom carries no `summary`: the first
-    /// sentence(s) up to this many characters, cut at a sentence boundary.
-    /// Strictly below the threshold so truncating always shortens.
-    package static let packetAtomLeadChars = 240
-
     // MARK: - Floors (today's literals, verbatim)
 
     /// The pre-policy budget table. Every value here shipped before this file
@@ -159,7 +156,6 @@ public enum ContextBudgetPolicy {
     public struct Floors: Sendable {
         public let historyChars: Int
         public let userCap: Int
-        public let assistantCap: Int
         public let systemCap: Int
         public let compactionSummaryCap: Int
         public let toolCap: Int
@@ -171,7 +167,6 @@ public enum ContextBudgetPolicy {
     static let floors = Floors(
         historyChars: 22_000,
         userCap: 1_800,
-        assistantCap: 2_200,
         systemCap: 1_200,
         compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
         toolCap: 320,
@@ -197,7 +192,6 @@ public enum ContextBudgetPolicy {
         // History renderer
         public let historyChars: Int
         public let userCap: Int
-        public let assistantCap: Int
         public let systemCap: Int
         public let compactionSummaryCap: Int
         public let toolCap: Int
@@ -248,6 +242,11 @@ public enum ContextBudgetPolicy {
 
     // MARK: - Resolution
 
+    /// Only the derived pure projection is retained, keyed by the exact effective
+    /// window. Model/catalog and saved-window authority are still resolved on
+    /// every model-based call before reaching this cache; no route is frozen.
+    private static let resolvedGeneration = OSAllocatedUnfairLock<Resolved?>(initialState: nil)
+
     /// The one entry point. `windowTokens == nil` (unknown/unresolved model)
     /// or a window at/below `floorWindowTokens` returns the floor table with no
     /// arithmetic applied.
@@ -255,7 +254,15 @@ public enum ContextBudgetPolicy {
         guard let windowTokens, windowTokens > floorWindowTokens else {
             return floorBudget(floors: floors, windowTokens: windowTokens)
         }
+        return resolvedGeneration.withLock { generation in
+            if let generation, generation.windowTokens == windowTokens { return generation }
+            let resolved = deriveBudget(windowTokens: windowTokens)
+            generation = resolved
+            return resolved
+        }
+    }
 
+    private static func deriveBudget(windowTokens: Int) -> Resolved {
         let allowance = derivedCharacterAllowance(windowTokens: windowTokens)
         // Scale from the shared floor total and never below it.
         let scale = max(1.0, Double(allowance) / Double(referenceFloorTotalCharacters))
@@ -284,7 +291,6 @@ public enum ContextBudgetPolicy {
                 compactionHistoryCharacters(windowTokens: windowTokens)
             ),
             userCap: grow(floors.userCap, rowScale),
-            assistantCap: grow(floors.assistantCap, rowScale),
             systemCap: grow(floors.systemCap, rowScale),
             // The distiller never writes more than maxSummaryChars, so more
             // room than that buys literally nothing.
@@ -339,7 +345,6 @@ public enum ContextBudgetPolicy {
         Resolved(
             historyChars: floors.historyChars,
             userCap: floors.userCap,
-            assistantCap: floors.assistantCap,
             systemCap: floors.systemCap,
             compactionSummaryCap: floors.compactionSummaryCap,
             toolCap: floors.toolCap,

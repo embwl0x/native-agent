@@ -1,7 +1,7 @@
 // Swift-native cutover mem-m7: regenerate USER.md from the SQLite memory store.
 //
 // Canonical path: the active persona root's `USER.md`. MemoryV2 owns the
-// contents, but it writes into the same persona doc the compiler and tools read.
+// rendering and commits of the same document the compiler and tools read.
 // No fallback to the legacy `<dataRoot>/memory/USER.md`.
 //
 // MemoryV2 owns the truth (SQLite); USER.md is a derived, human-readable +
@@ -12,12 +12,15 @@
 // debounced to once per 30s.
 
 import Darwin
+import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 
-public enum UserMDGeneratorError: Error, CustomStringConvertible {
+// Blueprint: | `MemoryV2+UserMDGen.swift` | `UserMDGenerator`: coalesced regeneration of derived USER.md at the active canonical persona root; SQLite remains truth |
+
+public enum UserMDGeneratorError: Error, CustomStringConvertible, LocalizedError {
     /// USER.md was requested on an install that has not completed onboarding.
     /// Not a failure: writing it there would fabricate the identity anchor
     /// onboarding is about to create.
@@ -27,16 +30,27 @@ public enum UserMDGeneratorError: Error, CustomStringConvertible {
     /// instead of treating damage as an intentionally absent preamble.
     case damagedExistingDocument(String)
 
-    public var description: String {
+    public var failure: ToolFailureError {
         switch self {
         case .onboardingIncomplete:
-            return "USER.md generation is gated until onboarding completes"
+            return ToolFailureError("USER.md generation requires completed setup.", effects: .none,
+                owner: "Setup", tap: "Setup", personDecides: true,
+                code: "user_projection_setup_required", status: .refused,
+                instruction: "Complete setup before generating USER.md.")
         case .damagedExistingDocument(let reason):
-            return "USER.md generation refused because the existing document is damaged: \(reason)"
+            return ToolFailureError("Existing USER.md is damaged: \(reason)", effects: .none, owner: "USER.md",
+                nextCall: ToolFailureError.call("app", ["action": .string("persona.read"), "args": .object(["kind": .string("user")])]),
+                code: "user_projection_document_damaged", status: .refused,
+                instruction: "Inspect USER.md; repair its encoding or paired preamble markers while preserving all authored text.")
         }
     }
+
+    public var description: String { MemoryV2Error.describe(failure) }
+    public var errorDescription: String? { description }
 }
 
+/// USER.md is backed up/exported under the persona PrivacyMap scope, never
+/// phone-synced. Onboarding supplies its initial bytes to this commit owner.
 public actor UserMDGenerator {
     // One owner: `UserMDAutogenMarkers` in NativeAgentCore. The Context
     // compiler cuts per-fact atoms on these exact strings and the flow
@@ -56,9 +70,11 @@ public actor UserMDGenerator {
     /// U5 W-G trailing-edge fix (2026-06-11): personas whose regeneration
     /// was debounced and is owed a trailing run when the window closes.
     private var pendingPersonas: Set<String> = []
-    /// Single in-flight trailing-edge timer task; nil when none scheduled.
-    /// Lifecycle: set in `scheduleTrailingEdge`, cleared in `flushPending`.
+    /// Owns the deadline AND regeneration, until the flight actually exits.
     private var pendingTask: Task<Void, Never>?
+    private var pendingTaskWaiting = false
+    private var stopped = false
+    private var shutdownTask: Task<Void, Never>?
 
     public init(
         storage: MemoryStorage,
@@ -131,12 +147,17 @@ public actor UserMDGenerator {
     /// expiry, coalescing every poke that arrives meanwhile.
     @discardableResult
     public func requestRegeneration(persona: String = MemoryV2Defaults.personaID) async throws -> URL? {
+        guard !stopped else { throw CancellationError() }
         // Checked before the debounce bookkeeping so a pre-onboarding poke
         // cannot schedule a trailing-edge task that will only fail later.
         guard onboardingHasCompleted else {
             throw UserMDGeneratorError.onboardingIncomplete
         }
         let projectionPersona = projectionPersona(for: persona)
+        if pendingTask != nil {
+            pendingPersonas.insert(projectionPersona)
+            return nil
+        }
         if let last = lastRegen {
             let elapsed = nowProvider().timeIntervalSince(last)
             if elapsed < debounceInterval {
@@ -144,7 +165,7 @@ public actor UserMDGenerator {
                 return nil
             }
         }
-        return try await regenerate(persona: projectionPersona)
+        return try await regenerateDocument(persona: projectionPersona)
     }
 
     /// The app writes one active persona document. Its memory partition is a
@@ -158,24 +179,54 @@ public actor UserMDGenerator {
     private func scheduleTrailingEdge(persona: String, after delay: TimeInterval) {
         pendingPersonas.insert(persona)
         guard pendingTask == nil else { return }
-        pendingTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
-            await self?.flushPending()
+        pendingTaskWaiting = true
+        pendingTask = Task {
+            defer {
+                pendingTaskWaiting = false
+                pendingTask = nil
+                if !stopped, let persona = pendingPersonas.first {
+                    let elapsed = lastRegen.map { nowProvider().timeIntervalSince($0) } ?? debounceInterval
+                    scheduleTrailingEdge(persona: persona, after: max(0, debounceInterval - elapsed))
+                }
+            }
+            do {
+                try await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
+                try Task.checkCancellation()
+            }
+            catch { return }
+            pendingTaskWaiting = false
+            await flushPending()
         }
     }
 
     private func flushPending() async {
-        pendingTask = nil
         let personas = pendingPersonas
         pendingPersonas.removeAll()
         for persona in personas {
             do {
-                _ = try await regenerate(persona: persona)
+                _ = try await regenerateDocument(persona: persona)
             } catch {
                 nativeLog("UserMDGenerator: trailing-edge regeneration failed for %@: %@",
                       persona, String(describing: error))
             }
         }
+    }
+
+    /// Stop future pokes, cancel only a sleeping deadline, then flush accepted
+    /// requests. A regeneration already writing is joined without cancellation.
+    public func shutdown() async {
+        if let shutdownTask { await shutdownTask.value; return }
+        guard !stopped else { return }
+        stopped = true
+        if pendingTaskWaiting { pendingTask?.cancel() }
+        let trailing = pendingTask
+        let drain = Task {
+            await trailing?.value
+            await flushPending()
+        }
+        shutdownTask = drain
+        await drain.value
+        shutdownTask = nil
     }
 
     /// Regenerate USER.md from active memories for `persona`. Called on app
@@ -185,6 +236,11 @@ public actor UserMDGenerator {
     /// not finished onboarding — see `onboardingHasCompleted`.
     @discardableResult
     public func regenerate(persona: String = MemoryV2Defaults.personaID) async throws -> URL {
+        guard !stopped else { throw CancellationError() }
+        return try await regenerateDocument(persona: persona)
+    }
+
+    private func regenerateDocument(persona: String) async throws -> URL {
         // fix-blank-install-onboarding (2026-08-02): USER.md is one of
         // onboarding's OWN transaction targets, and its mere existence used to
         // satisfy onboarding's `hasExisting`/`hasIdentityAnchor` checks. Launch
@@ -205,36 +261,46 @@ public actor UserMDGenerator {
         let manifestPath = dataRoot.appendingPathComponent("onboarding/pending-completion.json")
         // Match onboarding's lock order and hold its manifest lock from the
         // completion check through replacement of the derived document.
-        let generatedAt = try await core.withFileLock(manifestPath) { [self, storage, nowProvider, target] in
-            guard onboardingHasCompleted else {
-                throw UserMDGeneratorError.onboardingIncomplete
+        do {
+            let generatedAt = try await core.withFileLock(manifestPath) { [self, storage, nowProvider, target] in
+                guard onboardingHasCompleted else {
+                    throw UserMDGeneratorError.onboardingIncomplete
+                }
+                try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+                return try await core.withFileLock(target) {
+                    // Read canonical memory only after owning the projection lock.
+                    // Otherwise a waiter can publish an old snapshot after a newer
+                    // regeneration won this non-FIFO lock and already wrote new facts.
+                    // listMemories is database-only and never acquires the USER lock.
+                    let memories = try await storage.listMemories(
+                        persona: projectionPersona, status: "active", limit: nil
+                    )
+                    let now = nowProvider()
+                    let body = Self.renderBody(memories: memories, now: now)
+                    let existing = try Self.loadPreambleForRegeneration(at: target)
+                    let payload = Self.assemble(preamble: existing.preamble, body: body)
+                    try Self.atomicReplaceIfChanged(payload, existingBytes: existing.bytes, at: target)
+                    return now
+                }
             }
-            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            return try await core.withFileLock(target) {
-                // Read canonical memory only after owning the projection lock.
-                // Otherwise a waiter can publish an old snapshot after a newer
-                // regeneration won this non-FIFO lock and already wrote new facts.
-                // listMemories is database-only and never acquires the USER lock.
-                let memories = try await storage.listMemories(
-                    persona: projectionPersona, status: "active", limit: nil
-                )
-                let now = nowProvider()
-                let body = Self.renderBody(memories: memories, now: now)
-                let existing = try Self.loadPreambleForRegeneration(at: target)
-                let payload = Self.assemble(preamble: existing.preamble, body: body)
-                try Self.atomicReplaceIfChanged(payload, existingBytes: existing.bytes, at: target)
-                return now
-            }
+            lastRegen = generatedAt
+            RepairOwed.settle(dataRoot, operation: "memory.user_projection", evidence: .init(source: "memory", id: projectionPersona))
+            return target
+        } catch UserMDGeneratorError.onboardingIncomplete {
+            throw UserMDGeneratorError.onboardingIncomplete  // expected on a blank install; onboarding supplies the initial content
+        } catch {
+            RepairOwed.owe(dataRoot, id: "user-projection:" + UUID().uuidString, kind: .act, operation: "memory.user_projection",
+                owner: target.path, words: "USER.md regeneration failed: \(error)")
+            throw error
         }
-        lastRegen = generatedAt
-        return target
     }
 
     /// Durable atomic replacement through the shared persistence core. This is
     /// the same temp-fsync + rename + parent-directory-fsync contract used by
     /// canonical chat/session state; a successful regeneration must survive a
-    /// power loss, not merely a process crash.
-    private static func atomicReplaceIfChanged(_ payload: String, existingBytes: Data?, at target: URL) throws {
+    /// power loss, not merely a process crash. The caller holds the target lock;
+    /// onboarding has already verified its exact transaction base bytes.
+    package static func atomicReplaceIfChanged(_ payload: String, existingBytes: Data?, at target: URL) throws {
         let bytes = Data(payload.utf8)
         // Launch reconciliation is intentionally allowed to call regenerate,
         // but an identical derived projection must not manufacture a file
@@ -276,7 +342,7 @@ public actor UserMDGenerator {
             // it just doesn't ride the identity doc. Cost accepted: a genuine
             // User-fact mislabeled `decision` drops out until relabeled; a
             // 100%-about-User doc beats a complete-but-70%-noise one.
-            guard let kind = Self.memoryKind(m),
+            guard let kind = MemoryRecallScoring.kind(of: m.metadata),
                   Self.userIdentityKinds.contains(kind) else { continue }
             // Admission parity with the memory CONTEXT projection
             // (2026-07-24). USER.md is a projection of the same rows the
@@ -301,14 +367,16 @@ public actor UserMDGenerator {
             // The on-disk document is surface-independent. Prompt rendering
             // filters disclosure before using these facts as its initial core.
             guard MemoryLifecycle.isRecallEligible(m.lifecycle) else { continue }
+            // A cold write is not a fact until its vector lands and passes admission.
+            guard !MemoryStorage.metadataFlag(m.metadata, MemoryStorage.pendingAdmissionKey) else { continue }
             guard MemoryCandidateQuality.isDurableCandidate(
                 text: m.content,
                 source: m.source,
-                kind: Self.memoryKind(m)
+                kind: MemoryRecallScoring.kind(of: m.metadata)
             ) else { continue }
             let content = MemoryTextClip.memoryDisplayText(
                 m.content.replacingOccurrences(of: "\n", with: " "),
-                kind: Self.memoryKind(m)
+                kind: MemoryRecallScoring.kind(of: m.metadata)
             )
             guard !content.isEmpty else { continue }
             facts.append(content)
@@ -332,18 +400,17 @@ public actor UserMDGenerator {
     /// core carries only `userIdentityKinds`; every pin writer (the chat tool,
     /// the Memories page, the phone) refuses with these words.
     public static func pinRefusal(kind: String?) -> String? {
-        userIdentityKinds.contains(kind ?? "") ? nil
-            : "Pins carry facts about the owner; a \(kind ?? "memory with no kind") stays in recall, so nothing changed."
+        pinFailure(kind: kind).map(MemoryV2Error.describe)
     }
 
-    private static func memoryKind(_ memory: StoredMemory) -> String? {
-        guard case .object(let obj)? = memory.metadata,
-              case .string(let kind)? = obj["kind"] else {
-            return nil
-        }
-        let trimmed = kind.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+    public static func pinFailure(kind: String?) -> ToolFailureError? {
+        if userIdentityKinds.contains(kind ?? "") { return nil }
+        return ToolFailureError("Pins carry owner facts; \(kind ?? "a memory with no kind") is excluded.", effects: .none,
+            nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
+            code: "memory_pin_kind_excluded", status: .refused,
+            instruction: "Leave it unpinned; read saved memories with memory.list.", recovery: .inspect)
     }
+
 
     private static func loadPreambleForRegeneration(at url: URL) throws -> (preamble: String?, bytes: Data?) {
         let fm = FileManager.default

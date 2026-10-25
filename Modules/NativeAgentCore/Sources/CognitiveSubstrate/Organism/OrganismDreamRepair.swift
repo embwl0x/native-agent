@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `OrganismDreamRepair.swift` | `OrganismDreamRepair` enum; `applying`, `applyingResidualPressure` |
 
 public enum OrganismRepairOperationKind: String, Codable, Sendable, Equatable, CaseIterable {
     case softenHighArousal

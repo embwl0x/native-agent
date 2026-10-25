@@ -4,6 +4,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+Serialization.swift` | `CognitiveSubstrate`: `cleanedSessionId` |
 
 extension CognitiveAffectState {
     func toJSON(
@@ -173,6 +174,7 @@ extension CognitiveReflectionReceipt {
             "reason": .string(request.reason),
             "prompt": .string(request.prompt),
             "surface": .string(request.surface),
+            // Planning configuration; execution re-resolves the surface route.
             "model": .string(request.model),
             "requestProvider": .string(request.provider),
             "reasoningEffort": .string(request.reasoningEffort),

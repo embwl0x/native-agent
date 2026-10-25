@@ -1,4 +1,6 @@
 import NativeAgentCore
+
+// Blueprint: | `DetachedChatPanel.swift` | `DetachedChatWindowController`: session-window creation, persisted pins/frames, focus, appearance and lifecycle teardown |
 // DetachedChatPanel — free-floating chat windows for individual sessions.
 //
 // Drag a session card off the sidebar onto the desktop and it spawns one
@@ -203,7 +205,6 @@ final class DetachedChatWindowController {
     private let defaults: UserDefaults
     private let panelBuilder: DetachedChatPanelBuilder
     private let pinSession: DetachedChatSessionPinner
-    private let appearanceObserver: DarkModePreferenceObserver
 
     /// UserDefaults key for the persisted open-set (comma-separated
     /// sessionIds). AppDelegate reads this on launch and replays open().
@@ -211,7 +212,6 @@ final class DetachedChatWindowController {
 
     private init() {
         defaults = .standard
-        appearanceObserver = DarkModePreferenceObserver(object: defaults)
         panelBuilder = { request in
             LiveDetachedChatPanelHandle(request: request)
         }
@@ -226,49 +226,22 @@ final class DetachedChatWindowController {
     init(
         defaults: UserDefaults,
         panelBuilder: @escaping DetachedChatPanelBuilder,
-        pinSession: @escaping DetachedChatSessionPinner,
-        appearanceObserver: DarkModePreferenceObserver? = nil
+        pinSession: @escaping DetachedChatSessionPinner
     ) {
         self.defaults = defaults
         self.panelBuilder = panelBuilder
         self.pinSession = pinSession
-        self.appearanceObserver = appearanceObserver
-            ?? DarkModePreferenceObserver(object: defaults)
     }
 
     /// Inject the AppModel after it constructs: the controller is a singleton
     /// that predates the AppModel, so the reference comes in via this hook.
     func attach(appModel: AppModel) {
         self.appModel = appModel
-        observeAppearancePreference()
     }
 
     // MARK: - Appearance
 
-    /// The app's dark-mode preference. SwiftUI's `.preferredColorScheme` inside
-    /// the hosted view styles the CONTENT only — the panel's titlebar is AppKit
-    /// chrome and needs the window's own appearance set, or a dark panel wears a
-    /// light title bar (User, 2026-07-25).
-    /// Maps the one persisted preference into AppKit chrome. Keeping this
-    /// small reader injectable lets a hermetic evaluation prove that an open
-    /// detached panel follows the same authority as the main SwiftUI window.
-    static func preferredAppearance(defaults: UserDefaults = .standard) -> NSAppearance? {
-        // User, 2026-09-06: dark is the default. Only an explicit persisted
-        // Bool(false) hands the panel to the system appearance.
-        let preferDark = (defaults.object(forKey: "nativeagent.darkMode") as? Bool) ?? true
-        guard preferDark else { return nil }
-        return NSAppearance(named: .darkAqua)
-    }
-
-    /// Keep open panels in sync when the preference flips while they are up.
-    private func observeAppearancePreference() {
-        appearanceObserver.start { [weak self] in
-            self?.applyAppearanceToOpenPanels()
-        }
-    }
-
-    private func applyAppearanceToOpenPanels() {
-        let appearance = Self.preferredAppearance(defaults: defaults)
+    func applyAppearanceToOpenPanels(_ appearance: NSAppearance?) {
         for panel in panels.values where panel.appearance != appearance {
             panel.appearance = appearance
         }
@@ -347,7 +320,7 @@ final class DetachedChatWindowController {
             title: title,
             initialFrame: initialFrame,
             appModel: appModel,
-            appearance: Self.preferredAppearance(),
+            appearance: AppearanceController.shared.appearance,
             onClose: { [weak self] in
                 self?.handleWillClose(sessionId: sessionId)
             }
@@ -444,46 +417,5 @@ private final class PanelDelegate: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard notification.object is DetachedChatPanel else { return }
         onWillClose?()
-    }
-}
-
-/// Owns the detached-window preference subscription. It deliberately accepts a
-/// notification center so its single-subscription and teardown guarantees can
-/// be exercised without observing the user's real defaults domain.
-final class DarkModePreferenceObserver {
-    private let center: NotificationCenter
-    private let name: Notification.Name
-    private let object: AnyObject?
-    private var token: NSObjectProtocol?
-
-    init(
-        center: NotificationCenter = .default,
-        name: Notification.Name = UserDefaults.didChangeNotification,
-        object: AnyObject? = UserDefaults.standard
-    ) {
-        self.center = center
-        self.name = name
-        self.object = object
-    }
-
-    var isObserving: Bool { token != nil }
-
-    func start(_ handler: @escaping @MainActor () -> Void) {
-        guard token == nil else { return }
-        token = center.addObserver(forName: name, object: object, queue: .main) { _ in
-            Task { @MainActor in handler() }
-        }
-    }
-
-    func stop() {
-        guard let token else { return }
-        center.removeObserver(token)
-        self.token = nil
-    }
-
-    deinit {
-        if let token {
-            center.removeObserver(token)
-        }
     }
 }

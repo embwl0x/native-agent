@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `LLMClient.swift` | `LLMClient` and shared message/tool/stream contracts: task-local call context, lifecycle evidence, deadlines and failure/effect vocabulary |
+
 // MARK: - LLMCallContext (request-scoped, additive)
 //
 // U1 step-1/4 (2026-06-10): task-local request context threaded DOWN to the
@@ -104,6 +106,8 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
     public let streamKind: String?
     /// The stream guard cut this call (`ProviderFailure.noReply`).
     public let noReply: Bool
+    /// What the request asked the provider to read (`LLMMessage.inputBytes`).
+    public let requestBytes: Int?
 
     public init(
         id: String,
@@ -118,8 +122,10 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
         occurredAt: Date = Date(),
         firstOutputMs: Int? = nil,
         streamKind: String? = nil,
-        noReply: Bool = false
+        noReply: Bool = false,
+        requestBytes: Int? = nil
     ) {
+        self.requestBytes = requestBytes
         self.id = String(id.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
         self.phase = phase
         self.providerId = String(providerId.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
@@ -138,7 +144,7 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
     }
 
     public func terminal(_ phase: LLMCallLifecyclePhase, at date: Date = Date(), firstOutputMs: Int? = nil,
-                         streamKind: String? = nil, noReply: Bool = false) -> Self {
+                         streamKind: String? = nil, noReply: Bool = false, requestBytes: Int? = nil) -> Self {
         precondition(phase != .started)
         return Self(
             id: id,
@@ -153,7 +159,8 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
             occurredAt: date,
             firstOutputMs: firstOutputMs,
             streamKind: streamKind,
-            noReply: noReply
+            noReply: noReply,
+            requestBytes: requestBytes
         )
     }
 }
@@ -161,8 +168,8 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
 public protocol LLMCallLifecycleObserving: Sendable {
     func observeProviderCall(_ event: LLMCallLifecycleEvent) async
     /// Asked once as a stream starts: how long this provider has taken to its
-    /// first output on this model and stream kind.
-    func firstOutputDeadline(provider: String, model: String, streamKind: String?) async -> FirstOutputDeadline
+    /// first output on this model and stream kind, for a request this size.
+    func firstOutputDeadline(provider: String, model: String, streamKind: String?, requestBytes: Int) async -> FirstOutputDeadline
 }
 
 /// A provider's slowest first output (text, thinking or tool, the adapter's `ttftMs`)
@@ -172,17 +179,48 @@ public struct FirstOutputDeadline: Sendable, Equatable {
     public static let callsNeeded = 100
     public let calls: Int
     public let slowest: TimeInterval?
+    /// The slowest first output per input byte among those calls: what reading
+    /// (upload and prefill) has cost this provider at its worst.
+    public let slowestPerByte: Double?
+    /// This request's input bytes.
+    public let requestBytes: Int
 
-    public init(calls: Int, slowest: TimeInterval?) {
+    public init(calls: Int, slowest: TimeInterval?, slowestPerByte: Double? = nil, requestBytes: Int = 0) {
         self.calls = calls
         self.slowest = slowest
+        self.slowestPerByte = slowestPerByte
+        self.requestBytes = requestBytes
     }
 
     /// The slowest, deliberately not a p99: cutting a real slow start wastes
     /// the request while waiting longer costs seconds. On her
     /// trace 10-10 a p99 deadline would have cut 13 real replies in 37 h
-    /// (12 gpt-6-luna, 1 claude-opus-5-5); the slowest cut none.
-    public var seconds: TimeInterval? { calls >= Self.callsNeeded ? slowest : nil }
+    /// (12 gpt-6-luna, 1 claude-opus-5-5); the slowest cut none. A request
+    /// bigger than those calls gets each of them scaled to its size:
+    /// max over calls of seconds × max(1, bytes / their bytes), which is
+    /// max(slowest, slowestPerByte × bytes). A big prefill is never a dead wire.
+    public var seconds: TimeInterval? {
+        guard calls >= Self.callsNeeded, let slowest else { return nil }
+        return max(slowest, (slowestPerByte ?? 0) * Double(requestBytes))
+    }
+}
+
+extension LLMMessage {
+    /// What a request asks the provider to read, in bytes as sent: the system
+    /// prompt, every block (an image as its base64) and the tool schemas.
+    public static func inputBytes(_ messages: [LLMMessage], system: String?, tools: [LLMToolSchema] = []) -> Int {
+        (system?.utf8.count ?? 0) + tools.reduce(0) { $0 + $1.name.utf8.count + $1.description.utf8.count + $1.parametersJSON.count }
+            + messages.reduce(0) { total, message in
+                message.content.reduce(total) { total, block in
+                    switch block {
+                    case .text(let text): total + text.utf8.count
+                    case .toolUse(let id, let name, let input): total + id.utf8.count + name.utf8.count + input.count
+                    case .toolResult(let id, let content, _): total + id.utf8.count + content.utf8.count
+                    case .image(_, let base64, _, _): total + base64.utf8.count
+                    }
+                }
+            }
+    }
 }
 
 /// Stable/dynamic split of an assembled system prompt (U1 step 2b/3b).
@@ -355,7 +393,15 @@ extension LLMClient {
 
 /// Failure evidence supplied by the owner, never inferred from an error message.
 public struct ToolFailureError: Error, LocalizedError, Sendable {
-    public enum Effects: String, Sendable { case none, occurred, unknown }
+    public enum Status: String, Sendable { case failed, refused, timeout, cancelled }
+    public enum Effects: String, Sendable { case none, occurred, partial, unknown }
+    public enum Recovery: String, Sendable {
+        case correctArguments = "correct_arguments"
+        case repair, reconcile, inspect, terminal
+    }
+    /// The owner's stable cause, not a dispatch or presentation code.
+    public let code: String?
+    public let status: Status
     public let message: String
     public let argumentPath: String?
     public let accepted: String?
@@ -374,9 +420,17 @@ public struct ToolFailureError: Error, LocalizedError, Sendable {
     /// A lawful person-only decision (a Trust posture or block, a consent):
     /// it names its owner and his control and owes nothing.
     public let personDecides: Bool
+    /// The plain fix, separate from the explanation of what happened.
+    public let instruction: String?
+    /// The owner's recovery meaning; a terminal instruction explains why
+    /// there is no next call. Existing owners may keep their current fields.
+    public let recovery: Recovery?
 
     public init(_ message: String, argumentPath: String? = nil, accepted: String? = nil, effects: Effects,
-                owner: String? = nil, nextCall: String? = nil, tap: String? = nil, personDecides: Bool = false) {
+                owner: String? = nil, nextCall: String? = nil, tap: String? = nil, personDecides: Bool = false,
+                code: String? = nil, status: Status = .failed, instruction: String? = nil, recovery: Recovery? = nil) {
+        self.code = code
+        self.status = status
         self.message = message
         self.argumentPath = argumentPath
         self.accepted = accepted
@@ -385,6 +439,8 @@ public struct ToolFailureError: Error, LocalizedError, Sendable {
         self.nextCall = nextCall
         self.tap = tap
         self.personDecides = personDecides
+        self.instruction = instruction
+        self.recovery = recovery
     }
 
     public var errorDescription: String? { message }
@@ -398,14 +454,20 @@ public struct ToolFailureError: Error, LocalizedError, Sendable {
 public enum ToolClass: Int, Sendable, Comparable {
     case read, write, send, destructive
 
+    /// What a tool of this class carries unless it says otherwise: every tool is a tool_call; a read is a safe read.
+    public var baseCapabilities: Set<String> { self == .read ? ["safe_read", "tool_call"] : ["tool_call"] }
+
     public static func < (lhs: ToolClass, rhs: ToolClass) -> Bool { lhs.rawValue < rhs.rawValue }
 }
 
-/// JSON Schema descriptor for a single tool the LLM is allowed to call. Lives
-/// in NativeAgentCore (no PersistenceCore dep) so the `parameters` JSON Schema
-/// body is stored as raw canonical-JSON bytes rather than a duplicated
-/// JSONValue ADT. Adapters that send tools (OpenAI Responses, Anthropic
-/// Messages) deserialize the bytes back into a `[String: Any]` and embed.
+/// Which side a tool's fixed effects reach; path policy still resolves named paths.
+public enum ToolReach: String, Sendable { case hers, his }
+
+/// Argument-dependent effects, declared by their owning tool.
+public enum ToolEffectInputPolicy: Sendable { case fixed, agentConnection, agentMessage }
+
+/// Offered JSON schema and its local effect declaration. Policy fields never
+/// enter CodingKeys; adapters retain the same provider-visible contract.
 public struct LLMToolSchema: Sendable, Codable, Equatable {
     public let name: String
     public let description: String
@@ -425,13 +487,18 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
     /// FALSE for every other lane and every other provider, so a request that
     /// never sets it is byte-identical to the pre-2026-09 wire.
     public let deferLoading: Bool
-    /// The class its declaration gives it; nil for a schema that came from
-    /// elsewhere (a decoded copy, an MCP server). Never on the wire.
+    /// The class its declaration gives it; nil on a decoded wire copy.
     public let toolClass: ToolClass?
+    public let reach: ToolReach
+    public let capabilities: Set<String>
+    public let effectInputPolicy: ToolEffectInputPolicy
 
     public init(
         name: String,
         toolClass: ToolClass? = nil,
+        reach: ToolReach = .hers,
+        capabilities: Set<String>? = nil,
+        effectInputPolicy: ToolEffectInputPolicy = .fixed,
         description: String,
         parametersJSON: Data,
         deferLoading: Bool = false
@@ -441,6 +508,9 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
         self.parametersJSON = parametersJSON
         self.deferLoading = deferLoading
         self.toolClass = toolClass
+        self.reach = reach
+        self.capabilities = capabilities ?? toolClass?.baseCapabilities ?? []
+        self.effectInputPolicy = effectInputPolicy
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -463,6 +533,9 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
         self.parametersJSON = try container.decode(Data.self, forKey: .parametersJSON)
         self.deferLoading = try container.decodeIfPresent(Bool.self, forKey: .deferLoading) ?? false
         self.toolClass = nil
+        self.reach = .his
+        self.capabilities = []
+        self.effectInputPolicy = .fixed
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -531,6 +604,18 @@ public enum LLMToolBoundaryReason: String, Sendable, Equatable {
     case repeatedBlock, repeatedAction, fabricatedResult, postCallProse, outputLimit, incompleteCall, interrupted
     /// The person steered mid-reply: the stream was cut at the next delta so their words land now.
     case steered
+    /// The provider's safety layer stopped the reply (stop_reason refusal).
+    case refusal
+
+    /// What a provider's own stop reason says ended the reply, before any
+    /// guess from where the text stopped; nil for a reply that ended itself.
+    public init?(stopReason: String?) {
+        switch stopReason {
+        case "max_tokens": self = .outputLimit
+        case "refusal": self = .refusal
+        default: return nil
+        }
+    }
 }
 
 public enum LLMMessageStreamEvent: Sendable, Equatable {

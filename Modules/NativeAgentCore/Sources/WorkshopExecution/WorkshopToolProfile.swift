@@ -5,6 +5,7 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import ToolRegistry
+// Blueprint: | `WorkshopToolProfile.swift` | `WorkshopToolProfile` struct; `permits` |
 
 // The Workshop membrane. A workshop work session runs through the SAME chat
 // orchestration and gated chain a normal turn does, with the same tools and
@@ -197,7 +198,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         let data = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
         return LLMToolSchema(
             name: artifactToolName,
-            toolClass: .write,
+            toolClass: .write, reach: .his, capabilities: ["filesystem_write", "outside_app_data_write", "tool_call"],
             description:
                 "Write a workshop artifact (notes, findings, drafts) into this pursuit's own "
                 + "folder, data/workshop/<handle>/.",
@@ -218,7 +219,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         let data = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
         return LLMToolSchema(
             name: artifactReadToolName,
-            toolClass: .read,
+            toolClass: .read, reach: .his,
             description: "Read one prior artifact owned by this Desk handle (maximum 64 KiB).",
             parametersJSON: data
         )
@@ -241,7 +242,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         let data = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
         return LLMToolSchema(
             name: progressToolName,
-            toolClass: .write,
+            toolClass: .write, reach: .his,
             description: "Record a typed Desk-owned progress disposition. Call once near the end of the session.",
             parametersJSON: data
         )
@@ -326,6 +327,8 @@ public enum WorkshopMembraneError: Error, LocalizedError, Equatable {
 /// control characters, then assert the canonicalized target stays under the
 /// handle root. Belt-and-suspenders — the component check AND the resolved-path
 /// prefix check both have to pass.
+/// UTF-8 artifacts: local backup/export include workshop/; no phone content sync;
+/// PrivacyMap lists Workshop.
 public struct WorkshopArtifactWriter: Sendable {
     /// The app data root (e.g. `.../data`); artifacts live under
     /// `<dataRoot>/workshop/<handle>/`.

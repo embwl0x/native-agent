@@ -17,6 +17,7 @@ import ApplicationServices
 #endif
 #if canImport(UserNotifications)
 import UserNotifications
+// Blueprint: | `MacControl+Types.swift` | `MacControlSensitivePathFence` owns the mutation floor both raw file routes use: OS paths and dedicated Mac-control state/audit, their screen, activity capture and experience stores, including protected parents; reads and copy sources keep their scope |
 #endif
 
 // MARK: - Result type
@@ -114,15 +115,15 @@ public enum MacControlError: Error, Sendable, Equatable, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .unknownAction(let a): return "unknown mac_control action: \(a)"
-        case .missingField(let f): return "missing required field: \(f)"
-        case .sensitivePathDenied(let p): return "sensitive_path_denied: \(p)"
-        case .appControlFailed(let s): return "app control failed: \(s)"
-        case .applescriptFailed(let s): return "applescript failed: \(s)"
-        case .notificationFailed(let s): return "notification failed: \(s)"
-        case .malformedResponse(let s): return "malformed response: \(s)"
-        case .ioFailure(let s): return "io failure: \(s)"
-        case .operation(let s): return "operation error: \(s)"
+        case .unknownAction(let a): return "unknown_mac_action: \(a). Choose a supported action from app {find:\"Mac\"}."
+        case .missingField(let f): return "missing_field: \(f). Supply this field in the action's args; use app {find:\"Mac\"} for its accepted shape."
+        case .sensitivePathDenied(let p): return "sensitive_path_denied: \(p). Choose a path outside protected app data in the action's path argument; this boundary cannot be bypassed."
+        case .appControlFailed(let s): return "app_control_failed: \(s). Inspect the affected app with mac.look before another action."
+        case .applescriptFailed(let s): return "applescript_failed: \(s). Correct the reported script or per-app Automation grant before execution; inspect the affected app with mac.look for possible effects."
+        case .notificationFailed(let s): return "notification_failed: \(s). Inspect NativeAgent's notification settings in System Settings > Notifications > NativeAgent before deciding whether another send is appropriate."
+        case .malformedResponse(let s): return "malformed_mac_response: \(s). Inspect the affected app with mac.look; repair the response producer before another action."
+        case .ioFailure(let s): return "mac_io_failed: \(s). Inspect the named path with files.info and correct the reported file-access cause before another write."
+        case .operation(let s): return "mac_operation_failed: \(s). Inspect the affected app with mac.look before another action; preserve mac_control/operations.json while repairing the reported operation-store cause."
         }
     }
 }
@@ -687,10 +688,7 @@ public enum MacWakeGuard {
 /// the session flag alone never proves a password lock.
 public enum MacScreenLock {
     public static func personAway() -> Bool {
-        if MacScreenLock.isLocked() { return true }
-        guard let any = CGEventType(rawValue: ~0) else { return false }
-        let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: any)
-        return idle.isFinite && idle >= 180
+        MacPersonInput.presence()?.here == false
     }
 
     public static let reply = "The screen is still covered, so I can't see or use the apps underneath."
@@ -715,9 +713,13 @@ public enum MacScreenLock {
 
     /// User (09-24): "the Mac is never locked, it's just a screen saver." The
     /// flag is set under both, so the reads first try the wake nudge; this
-    /// records whether the last wake found a focused login password field, so home
-    /// never calls another obstruction (or human input) a password lock.
-    nonisolated(unsafe) public static var wakeFailed = false
+    /// records whether the newest wake found a focused login password field, so
+    /// home never calls another obstruction (or human input) a password lock.
+    /// Older wakes cannot overwrite its result after suspending.
+    public static var wakeFailed: Bool { wakeLock.withLock { passwordFocusedAfterWake } }
+    private static let wakeLock = NSLock()
+    nonisolated(unsafe) private static var wakeGeneration: UInt64 = 0
+    nonisolated(unsafe) private static var passwordFocusedAfterWake = false
 
     public static func isLocked() -> Bool {
         #if canImport(CoreGraphics) && os(macOS)
@@ -768,8 +770,12 @@ public enum MacScreenLock {
             return MacAXAttributeRead.copyString(field, kAXRoleAttribute) == kAXSecureTextFieldSubrole
                 || MacAXAttributeRead.copyString(field, kAXSubroleAttribute) == kAXSecureTextFieldSubrole
         }
-        guard covered() else { wakeFailed = false; return }
-        wakeFailed = false
+        let generation = wakeLock.withLock {
+            wakeGeneration &+= 1
+            passwordFocusedAfterWake = false
+            return wakeGeneration
+        }
+        guard covered() else { return }
         guard (CGSessionCopyCurrentDictionary() as? [String: Any])?["kCGSSessionOnConsoleKey"] as? Bool == true else {
             throw Covered(detail: "Another user's login session owns the screen.")
         }
@@ -818,14 +824,16 @@ public enum MacScreenLock {
             }
             for _ in 0..<15 {
                 try await Task.sleep(for: .milliseconds(200))
-                if !covered() { wakeFailed = false; return }
+                if !covered() { return }
             }
         }
         let loginWindow = loginWindowUp()
         // loginwindow also draws passwordless savers; only a focused secure
         // field is positive authentication evidence. Unreadable AX stays unknown.
         let locked = loginWindow && CGDisplayIsAsleep(CGMainDisplayID()) == 0 && loginPasswordFocused()
-        wakeFailed = locked
+        wakeLock.withLock {
+            if wakeGeneration == generation { passwordFocusedAfterWake = locked }
+        }
         throw Covered(detail: CGDisplayIsAsleep(CGMainDisplayID()) != 0
             ? "The display stayed asleep after two wake nudges."
             : locked
@@ -1044,9 +1052,10 @@ public protocol MacControlPolicyProvider: Sendable {
     /// case production callers fail closed before any side effect. Tests can
     /// omit the provider when they need to exercise a handler directly.
     func currentPolicy() async -> MacControlPolicy?
-    /// The one authorization decision for a raw dispatch: the permission
-    /// law's level (`auto`, `confirm`, `blocked`), reason and lever. Nil: the
-    /// door that built this provider already consumed that decision.
+    /// The one authorization decision for a raw dispatch of `tool` (the
+    /// action): the level (`auto`, `confirm`, `blocked`), reason and lever.
+    /// Nil: nothing more to decide, or the door that built this provider
+    /// already consumed that decision.
     func authorize(tool: String, input: [String: JSONValue]) async -> (level: String, reason: String, remedy: JSONValue?)?
 }
 
@@ -1067,8 +1076,7 @@ public extension MacControlPolicyProvider {
 /// the FileManager call can still bypass the check. Callers shrink the
 /// window by re-resolving + re-fencing immediately before the syscall
 /// (see `handleFileRead` / `handleFileList`), but the gap is not closed.
-/// Sensitive-path safety against an active local attacker is the daemon's
-/// responsibility, not Swift's.
+/// Swift owns this fence; the residual race above remains.
 public enum MacControlSensitivePathFence {
     /// Protected files relative to the app's data root, never global basenames.
     public static let bannedDataRootFiles: [String] = [
@@ -1088,6 +1096,8 @@ public enum MacControlSensitivePathFence {
         "research/config.json",
         "auto_doctor/config.json",
         "tools/.manifest_signing_key",
+        "catalog/.pack_signing_key",
+        "mcp/servers.json",
     ]
 
     /// Directory prefixes (relative to $HOME) that are NEVER touched.
@@ -1228,7 +1238,8 @@ public enum MacControlSensitivePathFence {
         return checkSingle(path: expanded, includingProtectedDescendants: true)
     }
 
-    public static func protectedSystemMutationReason(forPath rawPath: String) -> String? {
+    /// Copy sources keep the OS floor; writes also preserve dedicated store ownership.
+    public static func protectedSystemMutationReason(forPath rawPath: String, write: Bool = true) -> String? {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "protected_system_path_denied: empty path" }
         let expanded = (trimmed as NSString).expandingTildeInPath
@@ -1236,8 +1247,16 @@ public enum MacControlSensitivePathFence {
             URL(fileURLWithPath: expanded).standardizedFileURL.path,
             URL(fileURLWithPath: expanded).standardizedFileURL.resolvingSymlinksInPath().path,
         ]
+        // Both raw file routes leave these bytes to their dedicated owners.
+        let ownedStores = ["mac_control", "her_screen", "activity_watch", "experiences",
+                           "mac_control_audit.jsonl", "mac_control_audit.jsonl.lock"]
+        let roots = [swiftDataRootPath, NSHomeDirectory() + "/Library/Application Support/NativeAgent"]
+            + (legacyDaemonDataRootPath.map { [$0] } ?? [])
+        let prefixes = protectedSystemMutationPrefixes + (write ? roots.flatMap { root in
+            ownedStores.map { (root as NSString).appendingPathComponent($0) }
+        } : [])
         for path in candidates {
-            if let prefix = protectedSystemMutationPrefixes.first(where: {
+            if let prefix = prefixes.first(where: {
                 isSelfOrAncestor(root: $0, path: path) || isSelfOrAncestor(root: path, path: $0)
             }) {
                 return "protected_system_path_denied: \(prefix)"
@@ -1296,6 +1315,11 @@ public enum MacControlSensitivePathFence {
             let target = normalizedPath(path)
             if target.hasPrefix(root + "/") {
                 let relative = String(target.dropFirst(root.count + 1))
+                // A local backup's payload (backups/<id>/data/…) is the data root again: what is fenced there is fenced in it.
+                if let payload = relative.range(of: "^backups/[^/]+/data/", options: .regularExpression),
+                   let reason = checkSingle(path: root + "/" + relative[payload.upperBound...], includingProtectedDescendants: includingProtectedDescendants) {
+                    return reason
+                }
                 let parts = relative.split(separator: "/")
                 if isConnectorCredential(relative)
                     || (includingProtectedDescendants && parts.first == "connectors" && parts.count <= 2) {

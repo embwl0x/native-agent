@@ -1,40 +1,43 @@
 import Foundation
 import NativeAgentCore
+// Blueprint: | `SwiftToolDispatcher+SubprocessSupport.swift` | `SubprocessWork` owns launch admission, verified process tree, timeout and physical exit; Stop freezes and kills the effect tree immediately, then `settle` releases descendants and runs the adapter's one output/audit settlement; shared bounded invoke/image pipe capture with adapter-specific limits and decoding |
 
 extension SwiftToolDispatcher {
     /// Bounded pipe capture shared by builder and image subprocess adapters.
     /// Final drain must not wait for a descendant that inherited a write FD.
     final class InvokeOutputCapture: @unchecked Sendable {
-        private let stdout = Pipe()
-        private let stderr = Pipe()
-        private let stdoutBuffer = BoundedBuffer(cap: 512 * 1024)
+        private let stdoutBuffer: BoundedBuffer
         private let stderrBuffer: BoundedBuffer
+        private let stdoutDrain: ProcessPipeDrain
+        private let stderrDrain: ProcessPipeDrain
 
-        init(process: Process, stderrCap: Int = 128 * 1024) {
-            stderrBuffer = BoundedBuffer(cap: stderrCap)
+        init(process: Process, stderrCap: Int = 128 * 1024) throws {
+            let stdout = Pipe()
+            let stderr = Pipe()
+            let stdoutBuffer = BoundedBuffer(cap: 512 * 1024)
+            let stderrBuffer = BoundedBuffer(cap: stderrCap)
+            self.stdoutBuffer = stdoutBuffer
+            self.stderrBuffer = stderrBuffer
             process.standardOutput = stdout
             process.standardError = stderr
-            for (pipe, buffer) in [(stdout, stdoutBuffer), (stderr, stderrBuffer)] {
-                pipe.fileHandleForReading.readabilityHandler = { handle in
-                    let data = handle.availableData
-                    if data.isEmpty {
-                        handle.readabilityHandler = nil
-                    } else {
-                        buffer.append(data)
-                    }
-                }
+            let stdoutDrain = try ProcessPipeDrain(handle: stdout.fileHandleForReading) { stdoutBuffer.append($0) }
+            do {
+                stderrDrain = try ProcessPipeDrain(handle: stderr.fileHandleForReading) { stderrBuffer.append($0) }
+            } catch {
+                stdoutDrain.stopAndWait()
+                throw error
             }
+            self.stdoutDrain = stdoutDrain
         }
 
         func stopReading() {
-            stdout.fileHandleForReading.readabilityHandler = nil
-            stderr.fileHandleForReading.readabilityHandler = nil
+            // Settle queued reads and their appends before any output snapshot.
+            stdoutDrain.stopAndWait()
+            stderrDrain.stopAndWait()
         }
 
         func finish(strictUTF8: Bool = false) -> (stdout: String, stderr: String) {
             stopReading()
-            SwiftToolDispatcher.drainPipeNonBlocking(stdout.fileHandleForReading, into: stdoutBuffer)
-            SwiftToolDispatcher.drainPipeNonBlocking(stderr.fileHandleForReading, into: stderrBuffer)
             let decode: (Data) -> String = strictUTF8
                 ? { String(data: $0, encoding: .utf8) ?? "" }
                 : { String(decoding: $0, as: UTF8.self) }
@@ -50,149 +53,92 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// Launch and cancellation share a lock so Stop cannot miss a child that
-    /// is between admission and Process.run(). Foundation reaps the direct
-    /// child and delivers its termination handler after the tree is killed.
-    final class InvokeCancellation: @unchecked Sendable {
+    /// One effect owner, one settlement. Launch and Stop share admission;
+    /// Stop freezes the tree before killing it, leaving no grace in which it
+    /// can fork work. Only physical exit releases the waiter to settlement.
+    final class SubprocessWork: @unchecked Sendable {
+        struct Exit: Sendable {
+            let code: Int32
+            let stopped: Bool
+            let timedOut: Bool
+            let launchError: String?
+            let launched: Bool
+        }
+        private let process: Process
         private let lock = NSLock()
-        private var cancelled = false
         private var tree: ProcessTreeSnapshot?
+        private var deadline: DispatchSourceTimer?
+        private var stopped = false
+        private var timedOut = false
+        private var exited = false
 
-        var isCancelled: Bool {
+        init(_ process: Process) { self.process = process }
+
+        func stop(timedOut: Bool = false) {
             lock.lock(); defer { lock.unlock() }
-            return cancelled
-        }
-
-        func launch(_ process: Process) throws {
-            lock.lock(); defer { lock.unlock() }
-            guard !cancelled else { throw CancellationError() }
-            try process.run()
-            ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(process.processIdentifier)
-            tree = ProcessTreeReaper.snapshot(rootPID: process.processIdentifier)
-        }
-
-        func cancel() {
-            lock.lock()
-            cancelled = true
-            let launchedTree = tree
-            lock.unlock()
-            if let launchedTree {
-                let current = ProcessTreeReaper.snapshot(
-                    rootPID: launchedTree.rootPID, retaining: launchedTree
-                )
-                _ = ProcessTreeReaper.quiesceAndKill(current)
+            if exited || stopped { return }
+            stopped = true
+            self.timedOut = timedOut
+            deadline?.cancel()
+            if let tree {
+                self.tree = ProcessTreeReaper.quiesceAndKill(
+                    ProcessTreeReaper.snapshot(rootPID: tree.rootPID, retaining: tree))
             }
         }
-    }
 
-    /// Single-fire latch for `withCheckedContinuation` paths where multiple
-    /// callbacks could race to resume the continuation (subprocess
-    /// terminationHandler + timeout watchdog + spawn-error early-return).
-    /// Resuming a continuation more than once is undefined behavior +
-    /// triggers a fatalError in DEBUG.
-    package final class ResumeGuard: @unchecked Sendable {
-        package init() {}
-        private var fired = false
-        private let lock = NSLock()
-        package func tryResume() -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            if fired { return false }
-            fired = true
-            return true
-        }
-    }
-
-    static func armSubprocessTimeout(
-        process: Process,
-        timeoutSeconds: Int,
-        onTimeout: (@Sendable () -> Void)? = nil
-    ) {
-        let childPid = process.processIdentifier
-        ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(childPid)
-        let launchedTree = ProcessTreeReaper.snapshot(rootPID: childPid)
-
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .seconds(timeoutSeconds)) {
-            let timeoutTree = ProcessTreeReaper.snapshot(rootPID: childPid, retaining: launchedTree)
-            if process.isRunning || ProcessTreeReaper.hasLiveDescendant(in: timeoutTree) {
-                // Mark BEFORE killing so the terminationHandler can tell a
-                // watchdog timeout (exit 143/SIGTERM) apart from a crash or an
-                // external kill — Agent hit exactly this ambiguity (2026-06-09).
-                onTimeout?()
-                ProcessTreeReaper.signal(timeoutTree, signal: SIGTERM)
-                DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(2)) {
-                    // Re-scan even if the direct child already exited: a
-                    // background descendant may have escaped the group and
-                    // inherited its pipe descriptors.
-                    let survivorTree = ProcessTreeReaper.snapshot(
-                        rootPID: childPid, retaining: timeoutTree
-                    )
-                    if process.isRunning || ProcessTreeReaper.hasLiveDescendant(in: survivorTree) {
-                        ProcessTreeReaper.quiesceAndKill(survivorTree)
+        func run<T: Sendable>(
+            timeoutSeconds: Int? = nil, reapDescendantsOnExit: Bool = true,
+            settlement: @escaping @Sendable (Exit) async -> T
+        ) async -> T {
+            await withTaskCancellationHandler {
+                let error: String? = await withCheckedContinuation { continuation in
+                    lock.lock(); defer { lock.unlock() }
+                    if stopped {
+                        exited = true
+                        continuation.resume(returning: nil)
+                        return
+                    }
+                    process.terminationHandler = { [self] _ in
+                        lock.lock()
+                        exited = true
+                        deadline?.cancel()
+                        deadline = nil
+                        lock.unlock()
+                        continuation.resume(returning: nil)
+                    }
+                    do {
+                        try process.run()
+                        ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(process.processIdentifier)
+                        tree = ProcessTreeReaper.snapshot(rootPID: process.processIdentifier)
+                        if let timeoutSeconds {
+                            let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+                            timer.schedule(deadline: .now() + .seconds(timeoutSeconds))
+                            timer.setEventHandler { [self] in stop(timedOut: true) }
+                            deadline = timer
+                            timer.resume()
+                        }
+                    } catch {
+                        exited = true
+                        continuation.resume(returning: String(describing: error))
                     }
                 }
-            }
-        }
-    }
-
-    /// agent_cancel's stop for a run this app launched: SIGINT (what a person
-    /// at the terminal sends), SIGTERM 3 s later if it is still going, then the
-    /// quiesced kill 2 s after that. A snapshot without a root identity
-    /// reaches only the listed descendants, never the root process.
-    static func interruptThenTerminate(_ tree: ProcessTreeSnapshot,
-                                       stillRunning: @escaping @Sendable () -> Bool = { false }) {
-        ProcessTreeReaper.signal(tree, signal: SIGINT)
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
-            let later = ProcessTreeReaper.snapshot(rootPID: tree.rootPID, retaining: tree)
-            guard stillRunning() || ProcessTreeReaper.hasLiveDescendant(in: later) else { return }
-            ProcessTreeReaper.signal(later, signal: SIGTERM)
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) {
-                let survivors = ProcessTreeReaper.snapshot(rootPID: tree.rootPID, retaining: later)
-                if stillRunning() || ProcessTreeReaper.hasLiveDescendant(in: survivors) {
-                    ProcessTreeReaper.quiesceAndKill(survivors)
+                return await settle { [self] in
+                    // The effect has exited; its owner alone now holds the
+                    // immutable tree, output and terminal record.
+                    if let tree, reapDescendantsOnExit || stopped {
+                        ProcessTreeReaper.quiesceAndKill(
+                            ProcessTreeReaper.snapshot(rootPID: tree.rootPID, retaining: tree))
+                    }
+                    process.terminationHandler = nil
+                    return await settlement(Exit(
+                        code: tree == nil ? 127 : process.terminationStatus,
+                        stopped: stopped, timedOut: timedOut, launchError: error, launched: tree != nil))
                 }
-            }
+            } onCancel: { self.stop() }
         }
     }
 
-    /// SETTLE A FINISHED RUN'S PROCESS GROUP. The direct child exiting says
-    /// nothing about what it backgrounded, and a stranger's command must not
-    /// leave a process alive past its turn or past the temp directory it was
-    /// given. TERM the verified tree, then, after the same grace the watchdog
-    /// uses, KILL whatever is still there. Used by the agent-host command
-    /// adapter only; the builder tools' own runs are unchanged.
-    static func reapLaunchedTree(_ tree: ProcessTreeSnapshot) {
-        guard ProcessTreeReaper.hasLiveDescendant(in: tree) else { return }
-        ProcessTreeReaper.signal(tree, signal: SIGTERM)
-        Thread.sleep(forTimeInterval: 2)
-        let survivors = ProcessTreeReaper.snapshot(rootPID: tree.rootPID, retaining: tree)
-        if ProcessTreeReaper.hasLiveDescendant(in: survivors) {
-            ProcessTreeReaper.quiesceAndKill(survivors)
-        }
-    }
-
-    /// The tree as it was at launch, handed from the spawn site to the
-    /// termination handler. Taken while the child is alive, because once it
-    /// exits its descendants are reparented and can no longer be found from it.
-    final class LaunchedTreeBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var tree: ProcessTreeSnapshot?
-        func set(_ value: ProcessTreeSnapshot) { lock.lock(); tree = value; lock.unlock() }
-        var value: ProcessTreeSnapshot? { lock.lock(); defer { lock.unlock() }; return tree }
-    }
-
-    /// Tiny thread-safe latch — set from the timeout-watchdog thread, read from
-    /// the Process terminationHandler thread (2026-06-09: lets the audit + the
-    /// failure envelope distinguish watchdog-timeout from crash/external kill).
-    final class AtomicFlag: @unchecked Sendable {
-        private let lock = NSLock()
-        private var value = false
-        func set() { lock.lock(); value = true; lock.unlock() }
-        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
-    }
-
-    // Bounded thread-safe Data accumulator for pipe drain.
-    // FileHandle.readabilityHandler is `@Sendable` and fires on a private
-    // queue, so the buffer must be safe to mutate from any thread.
+    // Bounded thread-safe Data accumulator for subprocess pipe capture.
     final class BoundedBuffer: @unchecked Sendable {
         private let lock = NSLock()
         private var head = Data()
@@ -297,26 +243,6 @@ extension SwiftToolDispatcher {
         let elided = text.count - total
         let marker = "\n… [\(elided) chars elided from middle — head+tail kept so trailing build errors survive] …\n"
         return (head + marker + tail, true)
-    }
-
-    // Final pipe drain for subprocess terminationHandlers. availableData /
-    // readToEnd block until EOF, and EOF requires EVERY holder of the write
-    // end to close it — a backgrounded grandchild (`sh -c 'server &'`)
-    // inherits the FD and keeps it open after the direct child exits, which
-    // would pin the terminationHandler (and the chat turn awaiting its
-    // continuation) forever. O_NONBLOCK read grabs whatever is already
-    // buffered and stops at EAGAIN instead of waiting for an EOF that may
-    // never come. (Audit 2026-06-09.)
-    nonisolated static func drainPipeNonBlocking(_ handle: FileHandle, into buffer: BoundedBuffer) {
-        let fd = handle.fileDescriptor
-        let flags = fcntl(fd, F_GETFL, 0)
-        if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
-        var chunk = [UInt8](repeating: 0, count: 65_536)
-        while true {
-            let n = read(fd, &chunk, chunk.count)
-            guard n > 0 else { break } // 0 = EOF, <0 = EAGAIN/error: stop
-            buffer.append(Data(bytes: chunk, count: n))
-        }
     }
 
 }

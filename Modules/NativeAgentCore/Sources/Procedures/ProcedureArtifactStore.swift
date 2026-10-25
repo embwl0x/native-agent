@@ -1,6 +1,7 @@
 import NativeAgentCore
 import Foundation
 import PersistenceCore
+// Blueprint: | `ProcedureArtifactStore.swift` | `ProcedureArtifactStore` actor; artifact installation and invocation admission/receipts; explicit backup/export/sync decisions and privacy-map coverage; all store instances share one coalesced retention flight per canonical root, opened and terminally closed/drained by engine lifecycle, with cancellation checked before deletion; the invocation-ledger file lock excludes reference publication from retention eligibility/deletion across store instances; automatic admission takes it before the active-pointer lock |
 
 public enum ProcedureArtifactStoreError: String, Error, Sendable, Equatable {
     case invalidArtifact = "invalid_artifact"
@@ -150,16 +151,69 @@ public struct ProcedureArtifactStatusSnapshot: Sendable, Equatable {
     public let unreadable: [String]
 }
 
-/// Injected-root immutable artifact owner plus a manual-only canonical
-/// invocation bridge for the initial low-risk Workshop production scope. It
-/// has no automatic selection API and cannot execute an external-send,
-/// confirm-required, or GitHub-oracle artifact.
+/// Immutable procedure artifacts, canonical invocation receipts and exact activations.
 public actor ProcedureArtifactStore {
+    // Owns the procedure schemas below, including exact activations. Local backup,
+    // production export and phone sync exclude this store; off-disk backup includes
+    // it without lock sidecars. PrivacyMap lists living_fabric/procedures.
     package let root: URL
     package let persistence: any PersistenceCoreProtocol
     package let clock: @Sendable () -> Date
-    private var retentionFlight: Task<Void, Never>?
-    private var retentionOwed = false
+    private static let retention = Retention()
+
+    /// The engine opens/closes one root; store instances only request its flight.
+    private actor Retention {
+        struct Root {
+            let id = UUID()
+            var open = true
+            var owed: ProcedureArtifactStore?
+            var flight: Task<Void, Never>?
+        }
+        var roots: [String: Root] = [:]
+
+        func start(_ key: String) {
+            if roots[key] == nil { roots[key] = Root() }
+        }
+
+        func request(_ store: ProcedureArtifactStore, key: String) {
+            guard roots[key]?.open == true else { return }
+            roots[key]?.owed = store
+            guard roots[key]?.flight == nil, let id = roots[key]?.id else { return }
+            roots[key]?.flight = Task.detached(priority: .utility) {
+                while let store = await self.claim(key, id: id) {
+                    _ = await store.sweepUnreferencedArtifacts()
+                }
+            }
+        }
+
+        func claim(_ key: String, id: UUID) -> ProcedureArtifactStore? {
+            guard roots[key]?.id == id else { return nil }
+            guard roots[key]?.open == true, !Task.isCancelled, let store = roots[key]?.owed else {
+                roots[key]?.flight = nil
+                return nil
+            }
+            roots[key]?.owed = nil
+            return store
+        }
+
+        func stop(_ key: String) async {
+            // Termination is terminal, including a launch continuation that
+            // reaches start after this stop closed admission.
+            if roots[key] == nil { roots[key] = Root() }
+            guard let root = roots[key] else { return }
+            roots[key]?.open = false
+            roots[key]?.owed = nil
+            root.flight?.cancel()
+            await root.flight?.value
+        }
+    }
+
+    private static func retentionKey(_ dataRoot: URL) -> String {
+        dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    public static func startRetention(dataRoot: URL) async { await retention.start(retentionKey(dataRoot)) }
+    public static func stopRetention(dataRoot: URL) async { await retention.stop(retentionKey(dataRoot)) }
 
     public init(
         dataRoot: URL,
@@ -171,16 +225,10 @@ public actor ProcedureArtifactStore {
         self.clock = clock
     }
 
-    /// Installed-artifact retention knobs (audit 2026-07-21). Without a GC the
-    /// artifacts directory grew monotonically until `loadInstalledArtifacts`
-    /// fail-closed PERMANENTLY at `maxInstalledArtifacts` — and the guard
-    /// mislabeled that as `corruptArtifact`. The sweep below keeps the store
-    /// well below the ceiling.
+    /// Retention keeps installed artifacts below the admission ceiling.
     static let maxInstalledArtifacts = 1_024
-    /// Post-sweep target — comfortably below the fail-closed ceiling.
     static let artifactRetentionTarget = 768
-    /// An artifact no active pointer references becomes sweep-eligible after
-    /// this age (file mtime).
+    /// Unreferenced artifacts become sweep-eligible after this file age.
     static let artifactRetentionAge: TimeInterval = 30 * 24 * 60 * 60
 
     @discardableResult
@@ -207,9 +255,9 @@ public actor ProcedureArtifactStore {
             }
             try await persistence.writeJSON(value, to: path)
         }
-        // Retention is housekeeping: it runs off this actor after the install
-        // lands, and neither the install nor a later selection waits for it.
-        requestRetentionSweep()
+        // Retention runs off this actor after installation. Reference admission
+        // shares the invocation ledger lock with a sweep's eligibility/deletion.
+        await requestRetentionSweep()
         return path
     }
 
@@ -308,7 +356,7 @@ public actor ProcedureArtifactStore {
         }
         guard urls.count <= Self.maxInstalledArtifacts else {
             // An over-ceiling store heals by its sweep, never fail-closed forever.
-            requestRetentionSweep()
+            await requestRetentionSweep()
             throw ProcedureArtifactStoreError.artifactCapacityExceeded
         }
         var artifacts: [DeclarativeProcedureArtifact] = []
@@ -469,22 +517,26 @@ public actor ProcedureArtifactStore {
         executor: any ProcedureCanonicalExecuting
     ) async throws -> ProcedureInvocationReceipt {
         let pointerPath = exactActivationPointerPath(procedureID)
-        // Admission and canonical consequence share the pointer lock.
-        return try await persistence.withFileLock(pointerPath) {
-            let active = try await loadActiveExactProcedure(
-                procedureID: procedureID,
-                implementationIdentity: implementationIdentity
-            )
-            guard active.artifact.id == expectedArtifactID else {
-                throw ProcedureExactActivationError.activationBindingMismatch
+        let invocationPath = root.appendingPathComponent("invocations.jsonl")
+        // Always take the shared retention/reference lock before the pointer
+        // lock, as activation does. Admission and dispatch retain both.
+        return try await persistence.withFileLock(invocationPath) {
+            try await persistence.withFileLock(pointerPath) {
+                let active = try await loadActiveExactProcedure(
+                    procedureID: procedureID,
+                    implementationIdentity: implementationIdentity
+                )
+                guard active.artifact.id == expectedArtifactID else {
+                    throw ProcedureExactActivationError.activationBindingMismatch
+                }
+                return try await invoke(
+                    artifactID: expectedArtifactID,
+                    opaqueInputReference: opaqueInputReference,
+                    context: context,
+                    selection: .automaticExact(active.manifest),
+                    executor: executor
+                )
             }
-            return try await invoke(
-                artifactID: expectedArtifactID,
-                opaqueInputReference: opaqueInputReference,
-                context: context,
-                selection: .automaticExact(active.manifest),
-                executor: executor
-            )
         }
     }
 
@@ -536,6 +588,11 @@ public actor ProcedureArtifactStore {
         )
         let invocationPath = root.appendingPathComponent("invocations.jsonl")
         return try await persistence.withFileLock(invocationPath) {
+            // Re-read after exclusion is acquired: a sweep may have removed
+            // the artifact while this invocation was waiting for the ledger.
+            guard try await loadForInvocation(artifactID) == artifact else {
+                throw ProcedureArtifactStoreError.immutableConflict
+            }
             if let existing = try await Self.existingReceipt(
                 invocationID: invocationID,
                 artifactID: artifact.id,
@@ -640,28 +697,32 @@ public actor ProcedureArtifactStore {
     /// or undecodable ledger aborts the sweep, exactly like an undecodable
     /// pointer — a recent receipt we cannot parse might name an artifact we are
     /// about to delete.
-    /// One store-owned housekeeping flight: requests coalesce into it, a
-    /// request during a pass earns one more pass, and each pass runs off this
-    /// actor with its own single removal count.
-    func requestRetentionSweep() {
-        retentionOwed = true
-        guard retentionFlight == nil else { return }
-        retentionFlight = Task.detached(priority: .utility) { [self] in
-            while await claimRetentionPass() { _ = await sweepUnreferencedArtifacts() }
-        }
-    }
-
-    private func claimRetentionPass() -> Bool {
-        guard retentionOwed else {
-            retentionFlight = nil
-            return false
-        }
-        retentionOwed = false
-        return true
+    /// One root-scoped, engine-owned flight; a request during a pass earns
+    /// one more pass, including requests from another store instance.
+    func requestRetentionSweep() async {
+        let dataRoot = root.deletingLastPathComponent().deletingLastPathComponent()
+        await Self.retention.request(self, key: Self.retentionKey(dataRoot))
     }
 
     @discardableResult
     public nonisolated func sweepUnreferencedArtifacts(now: Date = Date()) async -> Int {
+        let invocationPath = root.appendingPathComponent("invocations.jsonl")
+        do {
+            return try await persistence.withFileLock(invocationPath) {
+                await sweepUnreferencedArtifactsWithReferencesLocked(now: now)
+            }
+        } catch {
+            nativeLog("ProcedureArtifactStore: retention sweep could not acquire reference lock: %@",
+                      error.localizedDescription)
+            return 0
+        }
+    }
+
+    // The same ledger lock excludes activation publication and invocation
+    // references across this entire eligibility snapshot and deletion pass,
+    // including across store instances. Actor isolation alone cannot do that.
+    private nonisolated func sweepUnreferencedArtifactsWithReferencesLocked(now: Date) async -> Int {
+        guard !Task.isCancelled else { return 0 }
         let fm = FileManager.default
         let artifactsDirectory = root.appendingPathComponent("artifacts", isDirectory: true)
         guard let urls = try? fm.contentsOfDirectory(
@@ -745,6 +806,7 @@ public actor ProcedureArtifactStore {
         }
         var candidates: [Candidate] = []
         for url in urls {
+            guard !Task.isCancelled else { return 0 }
             let id = url.deletingPathExtension().lastPathComponent
             guard !referenced.contains(id),
                   let values = try? url.resourceValues(
@@ -769,6 +831,7 @@ public actor ProcedureArtifactStore {
         var remaining = urls.count
         var failures: [String] = []
         for candidate in candidates {
+            if Task.isCancelled { break }
             // Oldest-first: once a candidate is neither aged out nor needed
             // for the target, no later (newer) candidate is either.
             guard candidate.modified < cutoff || remaining > Self.artifactRetentionTarget else { break }

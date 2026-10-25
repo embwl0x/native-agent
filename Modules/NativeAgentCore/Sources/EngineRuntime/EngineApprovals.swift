@@ -3,44 +3,19 @@ import Observation
 import ApprovalInbox
 import NativeAgentShared
 import PersistenceCore
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatToolRuntime
 import ApprovalTransactions
 import Agents
-import SlackConnector
-
-public extension ExternalSendExecutionDependencies {
-    static let production = ExternalSendExecutionDependencies(
-        slackSend: { input, idempotencyKey, dataRoot in
-            do {
-                let result = try await SlackConnectorActions.postMessage(
-                    input: input,
-                    idempotencyKey: idempotencyKey,
-                    dataRoot: dataRoot
-                )
-                return ExternalSendProviderOutcome.classifySlack(result)
-            } catch {
-                return ExternalSendProviderOutcome.classifySlackFailure(error)
-            }
-        },
-        agentMailSend: { input, idempotencyKey, dataRoot in
-            let result = await AgentMailActions.sendNow(
-                input: input,
-                approvalId: nil,
-                idempotencyKey: idempotencyKey,
-                dataRoot: dataRoot,
-                recordReceipt: false
-            )
-            return ExternalSendProviderOutcome.classifyAgentMail(result)
-        }
-    )
-}
 import NativeAgentCore
 import DeviceSync
 import TrustCenter
+// Blueprint: | `EngineApprovals.swift` | `ApprovalsFacade`: one checked records/loading/error publication for health, sidebar, views, actions and phone overview; failed reads retain checked rows and mark them unavailable; shared inline settlement, single-flight resolution and outcome/preflight checks; shared summary/failure wording; Approval reads return their own result; LatestRead orders records/failure publication and committed decisions use write(). |
 
 /// `NativeAgentEngine.approvals` (S10): the ApprovalInbox for one data root, in
-/// core types. Every surface that shows approvals renders `records`; the read
-/// is nonisolated so the phone lanes use the same owner. Decisions run
+/// core types. Every read publishes `records` and its load state for all surfaces.
+/// Decisions run
 /// through the approval executors (`ApprovalTransactionCoordinator`).
 @MainActor
 @Observable
@@ -48,9 +23,34 @@ public final class ApprovalsFacade {
     public nonisolated let dataRoot: URL
 
     /// Every approval, pending and decided, newest first, as of the last read.
-    public var records: [ApprovalRecord] = [] {
+    public private(set) var records: [ApprovalRecord] = [] {
         didSet { recordsDidChange?() }
     }
+    public private(set) var refreshErrorText: String?
+    public private(set) var hasLoadedSnapshot = false
+    private var readsInFlight = 0
+    public var isRefreshing: Bool { readsInFlight > 0 }
+    @ObservationIgnored private let latest = LatestRead()
+
+    public var summaryTitle: String {
+        if refreshErrorText != nil {
+            return hasLoadedSnapshot ? "Approval refresh failed" : "Approval status unavailable"
+        }
+        guard hasLoadedSnapshot else { return "Checking approvals…" }
+        let count = WorkOverviewRead.waitingApprovals(records).count
+        return count == 0 ? "No actions need approval" : "\(count) \(count == 1 ? "action needs" : "actions need") approval"
+    }
+
+    public var summaryDetail: String {
+        if refreshErrorText != nil {
+            return hasLoadedSnapshot
+                ? "Showing previously loaded approvals. Choose Refresh to check for changes."
+                : "Approvals could not be loaded. Choose Refresh to try again."
+        }
+        guard hasLoadedSnapshot else { return "Checking which actions need your permission." }
+        return "Review requests to use tools, change memories, control your Mac or browser, make changes in connected apps, work on Desk tasks, or improve the agent."
+    }
+
     @ObservationIgnored public var recordsDidChange: (@MainActor () -> Void)?
     @ObservationIgnored private var resolutionTasks: [String: Task<ApprovalRecord, Error>] = [:]
     @ObservationIgnored private var resolutionDecisions: [String: String] = [:]
@@ -63,12 +63,29 @@ public final class ApprovalsFacade {
         SwiftNativeApprovalInbox(root: dataRoot)
     }
 
-    /// Every approval record, newest first.
-    public nonisolated func list() async throws -> [ApprovalRecord] {
-        try await inbox.list(filter: .all)
+    /// Returns this read; only a forward publication replaces the shared rows.
+    public func list() async throws -> [ApprovalRecord] {
+        readsInFlight += 1
+        defer { readsInFlight -= 1 }
+        let result: Result<[ApprovalRecord], Error> = await latest.read({
+            do { return .success(try await inbox.list(filter: .all)) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            switch result {
+            case .success(let loaded):
+                if records != loaded { records = loaded }
+                hasLoadedSnapshot = true
+                refreshErrorText = nil
+            case .failure(let error):
+                refreshErrorText = ApprovalLoadFailurePresentation.banner(error: error, retainedApprovalCount: records.count)
+            }
+        })
+        return try result.get()
     }
 
-    /// The one file the reader and the resolver share; mounted pages watch it.
+    public func refresh() async { _ = try? await list() }
+
+    /// The one file the reader, resolver and app-lifetime observer share.
     public nonisolated func requestsPath() async -> URL {
         await inbox.approvalsPath
     }
@@ -101,17 +118,14 @@ public final class ApprovalsFacade {
     public func settleInlineCard(
         id: String, decision: String, coordinator: ApprovalTransactionCoordinator,
         resolutionChanged: @MainActor (String, Bool) -> Void,
-        didResolve: @MainActor (String) -> Void,
         refreshHealth: @MainActor () async -> Void
     ) async throws {
         do {
             _ = try await resolveApproval(id: id, decision: decision, coordinator: coordinator,
                                           resolutionChanged: resolutionChanged)
-            didResolve(decision)
             await refreshHealth()
         } catch ApprovalInboxError.alreadyResolved {
-            records = (try? await list()) ?? records
-            didResolve(records.first(where: { $0.id == id })?.decision ?? "")
+            _ = try await list()
         }
     }
 
@@ -141,7 +155,15 @@ public final class ApprovalsFacade {
             return try await task.value
         }
         let task = Task<ApprovalRecord, Error> { @MainActor in
-            return try await coordinator.resolveApproval(id: trimmedID, decision: decision)
+            let resolved = try await coordinator.resolveApproval(id: trimmedID, decision: decision)
+            latest.write {
+                if let index = records.firstIndex(where: { $0.id == resolved.id }) {
+                    records[index] = resolved
+                } else {
+                    records.insert(resolved, at: 0)
+                }
+            }
+            return resolved
         }
         resolutionTasks[trimmedID] = task
         resolutionDecisions[trimmedID] = normalizedDecision
@@ -152,6 +174,19 @@ public final class ApprovalsFacade {
             resolutionChanged(trimmedID, false)
         }
         return try await task.value
+    }
+}
+
+/// Retained approvals are last-known, not evidence that the inbox is healthy.
+public enum ApprovalLoadFailurePresentation {
+    public static func banner(error: any Error, retainedApprovalCount: Int) -> String {
+        let detail = UserFacingError.cause(error, action: "load approvals")
+        let retained = retainedApprovalCount == 1
+            ? "Approvals couldn't refresh — showing 1 previously loaded approval."
+            : retainedApprovalCount > 1
+                ? "Approvals couldn't refresh — showing \(retainedApprovalCount) previously loaded approvals."
+                : "Approvals couldn't load."
+        return "\(retained) \(detail)"
     }
 }
 

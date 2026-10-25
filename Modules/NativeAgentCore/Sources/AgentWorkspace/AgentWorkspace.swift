@@ -3,6 +3,7 @@ import ChatSessionWork
 import CryptoKit
 import PersistenceCore
 import NativeAgentCore
+// Blueprint: | `AgentWorkspace.swift` | `AgentWorkspace` enum; `dispatch`; `AgentWorkspaceNavigation.Session` retains the conversation's last undo receipt alongside its navigation, scoped by data root and session, never in a second ledger |
 
 /// Navigation references only. Canonical owners still supply every fresh read
 /// and perform every action through the ordinary dispatcher/permission chain.
@@ -882,7 +883,7 @@ package enum AgentWorkspace {
                 if await HerScreen.room(place, dataRoot: dataRoot, scope: scope) == nil,
                    let projection = try? await AgentWorkspaceEnvironment.view(location: place, dataRoot: dataRoot, catalog: catalog, perform: perform) {
                     let frame: JSONValue = .object(["status": AgentWorkspaceEnvironment.outcome(projection.content)])
-                    if HerScreen.lifeRoom(place, projection: projection, frame: frame, dataRoot: dataRoot) == nil,
+                    if await HerScreen.lifeRoom(place, projection: projection, frame: frame, dataRoot: dataRoot) == nil,
                        let room = HerScreen.textRoomName(place) {
                         _ = HerScreen.textRoom(room, place: place, projection: projection, frame: frame, dataRoot: dataRoot)
                     }
@@ -1162,7 +1163,7 @@ package enum AgentWorkspace {
                 }
             case .searchWeb:
                 // Desk walk 3 (09-24): research.search opened a Google tab in
-                // User's Chrome. Searching is her private SearXNG read; a result
+                // User's Chrome. Searching is her private web read; a result
                 // opens in Chrome only when she chooses that result.
                 guard let suppliedText, suppliedText.count <= 2000 else { throw AgentWorkspaceFailure(message: "Give the web search words, up to 2000 characters.") }
                 location = .record(tool: AgentWorkspaceKnowledge.webSearchTool, input: ["query": .string(suppliedText)], title: "Web search: " + suppliedText)
@@ -1265,7 +1266,7 @@ package enum AgentWorkspace {
         func shown(_ projection: AgentWorkspaceProjection, key: String, outcome: JSONValue) async -> JSONValue {
             let projection = AgentWorkspaceReadiness.filter(projection)
             let frame = await navigation.present(projection, key: key, outcome: outcome)
-            if let life = HerScreen.lifeRoom(place, projection: projection, frame: frame, dataRoot: dataRoot) {
+            if let life = await HerScreen.lifeRoom(place, projection: projection, frame: frame, dataRoot: dataRoot) {
                 return .object(["status": outcome, "content": .string(life)])
             }
             guard let room = HerScreen.textRoomName(place) else { return frame }
@@ -1277,7 +1278,7 @@ package enum AgentWorkspace {
         var roomObservation: (world: HerWorld, at: Date, health: Set<String>)?
         // Her own rooms that need no owner read first: desk, mac, helpers, people, conversations.
         if [.area("ongoing"), .area("computer"), .area("helpers"), .area("browser"), .people(page: 0), .conversations(page: 0),
-            .area("files"), .area("code"), .area("github"), .area("x")].contains(location)
+            .area("files"), .area("code")].contains(location)
             || { if case .conversations = location { return true }; return false }(),
            let room = await HerScreen.room(location, dataRoot: dataRoot, scope: scope,
                                            observed: { roomObservation = ($0, $1, $2) }) {
@@ -1427,7 +1428,8 @@ package enum AgentWorkspace {
         if !suppressSourceSelection { await navigation.rememberDocument(location: location, result: value, key: key) }
         let outcome: JSONValue
         if case .object(let row) = value {
-            if row["ok"] == .bool(false) || row["error"] != nil || row["error_code"] != nil { outcome = .string("failed") }
+            if let status = row["status"] { outcome = status }
+            else if row["ok"] == .bool(false) || row["error"] != nil || row["error_code"] != nil { outcome = .string("failed") }
             else { outcome = row["status"] ?? row["state"] ?? .string("ok") }
         }
         else { outcome = .string("ok") }
@@ -1435,7 +1437,7 @@ package enum AgentWorkspace {
         if case .record("chat_conversations", let args, _) = location {
             projection = AgentWorkspaceHumanProjection.project(input: args, result: value,
                 observations: await navigation.observationStamps(key: key))
-        } else { projection = .project(location: location, result: value) }
+        } else { projection = await .project(location: location, result: value, dataRoot: dataRoot) }
         var recoveredProjection = projection
         // A named session keeps the name it was opened under, not raw bridge text.
         if case .record("chat_conversations", let args, let title) = location, args["conversation_session_id"] != nil,
@@ -1445,14 +1447,16 @@ package enum AgentWorkspace {
         // failure is shown in the room rather than hidden.
         let issue: String? = {
             guard !completedReadOutcome(value) else { return nil }
-            let row: [String: JSONValue] = if case .object(let row) = value { row } else { [:] }
-            return [row["detail"], row["error"], row["message"]].compactMap { if case .string(let text)? = $0 { text } else { nil } }.first ?? "The read did not complete."
+            return HerScreen.failureFace(value)
         }()
         if let room = await HerScreen.room(location, dataRoot: dataRoot, scope: scope, issue: issue, value: value,
                                            observed: { roomObservation = ($0, $1, $2) }) {
             _ = await navigation.observe(location: location, result: value, key: key)
             await HerScreen.markRoomSeen(location, dataRoot: dataRoot, scope: scope, observation: roomObservation)
-            return .object(["status": outcome, "content": .string(room)])
+            var fields: [String: JSONValue] = if issue != nil, case .object(let row) = value { row } else { [:] }
+            fields["status"] = outcome
+            fields["content"] = .string(room)
+            return .object(fields)
         }
         // A person's window holds both directions: the chats they opened with
         // her over the bridge sit beside the ones she started (2026-09-22).
@@ -1476,7 +1480,7 @@ package enum AgentWorkspace {
            let changes = await navigation.observe(location: location, result: value, key: key) {
             fields["changes"] = changes; frame = .object(fields)
         }
-        if let life = HerScreen.lifeRoom(location, projection: recoveredProjection, frame: frame, dataRoot: dataRoot) {
+        if let life = await HerScreen.lifeRoom(location, projection: recoveredProjection, frame: frame, dataRoot: dataRoot) {
             return .object(["status": outcome, "content": .string(life)])
         }
         // A read with a room of its own (status.doctor) shows as that room, as

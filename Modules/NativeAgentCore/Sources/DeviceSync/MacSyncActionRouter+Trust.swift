@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentShared
+// Blueprint: | `MacSyncActionRouter+Trust.swift` | `MacSyncActionRouter`: `applyTrustAction` |
 
 extension MacSyncActionRouter {
     func applyTrustAction(_ payload: [String: String]) async throws -> [String: String] {

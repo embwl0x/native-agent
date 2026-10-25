@@ -3,6 +3,7 @@ import NativeAgentShared
 import Foundation
 import ProviderRouting
 import PersistenceCore
+// Blueprint: | `ProviderSettingsComponents.swift` | `ProviderRowView` struct; ProviderConfigSheet receives its live connection by ID from ProvidersFacade; credential/model drafts and operation progress stay local |
 
 // MARK: - Provider Row
 // A provider row carries no surface of its own: the card it sits in is the
@@ -185,8 +186,7 @@ struct ProviderConfigSheet: View {
         get { appModel.editDraft("provider:\(provider.provider_id):model", seed: savedModel) }
         nonmutating set { appModel.setEditDraft(newValue, for: "provider:\(provider.provider_id):model") }
     }
-    @State private var savedProvider: ProviderInfo
-    @State private var availableModels: [NativeAgentShared.ProviderModelInfo]
+    private var availableModels: [NativeAgentShared.ProviderModelInfo] { provider.models }
     @State private var testResult: NativeAgentShared.ProviderTestResult? = nil
     @State private var isTesting = false
     @State private var isSaving = false
@@ -201,21 +201,14 @@ struct ProviderConfigSheet: View {
 
     private var authModePickerState: ProvidersFacade.AuthModePickerState {
         ProvidersFacade.authModePickerState(
-            advertisedModes: savedProvider.auth_modes,
-            savedMode: savedProvider.auth_mode,
-            providerIsReady: savedProvider.auth_status.eligible
+            advertisedModes: provider.auth_modes,
+            savedMode: provider.auth_mode,
+            providerIsReady: provider.auth_status.eligible
         )
     }
 
-    init(provider: ProviderInfo, onDone: @escaping () -> Void) {
-        self.provider = provider
-        self.onDone = onDone
-        _savedProvider = State(initialValue: provider)
-        _availableModels = State(initialValue: provider.models)
-    }
-
     private var savedModel: String {
-        let model = savedProvider.default_model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let model = provider.default_model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return model.isEmpty ? (provider.models.first?.id ?? "") : model
     }
 
@@ -485,12 +478,6 @@ struct ProviderConfigSheet: View {
                 didSave: {
                     Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
                     if savedAuthMode == "api_key", apiKey == savedInput { apiKey = "" }
-                },
-                readback: { refreshed in
-                    if let current = refreshed.first(where: { $0.provider_id == provider.provider_id }) {
-                        savedProvider = current
-                        availableModels = current.models
-                    }
                 },
                 refreshProviders: { _ = await appModel.loadProvidersForChat() },
                 failure: { error, action in appModel.setFailureStatus(error, action: action) },

@@ -1,7 +1,7 @@
-import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SlackRuntimeDiagnostics.swift` | `SlackRuntimeStateWriteOutcome` enum |
 
 /// Result of patching the loop's diagnostic state. State is observational, but
 /// an existing unreadable file is still evidence: it must not be overwritten
@@ -70,6 +70,7 @@ public enum SlackRuntimeStateFeed {
         public let connected: Bool
         public let updatedAt: String
         public let hasReportedError: Bool
+        public let lastError: String?
     }
 
     public enum Observation: Equatable, Sendable {
@@ -127,13 +128,17 @@ public enum SlackRuntimeStateFeed {
             let snapshot = Snapshot(
                 connected: connected,
                 updatedAt: updatedAt,
-                hasReportedError: hasReportedError
+                hasReportedError: hasReportedError,
+                lastError: {
+                    if case .string(let detail)? = object["lastError"] { return detail }
+                    return nil
+                }()
             )
             return now.timeIntervalSince(date) > max(0, staleAfter)
                 ? .stale(snapshot)
                 : .current(snapshot)
         } catch {
-            return .unavailable("Slack runtime state could not be read")
+            return .unavailable("Slack runtime state could not be read: \(error.localizedDescription)")
         }
     }
 }

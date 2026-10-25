@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `OrganismLivingStatus.swift` | `OrganismLivingStatusFile`: rebuildable shared body/status transport values with explicit unavailable boundaries; cognition remains Mac-owned |
+
 /// Whether this file is a complete current projection or an explicit boundary
 /// condition. Consumers must not infer a calm zero from an unavailable file.
 public enum OrganismLivingStatusAvailability: String, Codable, Hashable, Sendable {

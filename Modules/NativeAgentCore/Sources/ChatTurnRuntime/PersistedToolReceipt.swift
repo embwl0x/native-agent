@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `PersistedToolReceipt.swift` | `PersistedToolReceipt.project`: bounded, redacted historical tool facts and exact continuations; oversized locators are omitted rather than clipped |
+
 /// A historical receipt, not another copy of the source or an extension of a
 /// turn-scoped output handle. Preserve small factual fields before the preview
 /// so later exact history reads need not rely on the assistant's own summary.

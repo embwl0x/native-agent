@@ -31,6 +31,8 @@ import ToolRegistry
 import TrustCenter
 import WorkshopExecution
 
+// Blueprint: | `main.swift` | PermissionsSnapshot executable: deterministic permission-law row projection through the real gated dispatcher with recording ports; not app runtime |
+
 let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("permissions-snapshot", isDirectory: true)
 try? FileManager.default.removeItem(at: scratch)
 let root = scratch.appendingPathComponent("root", isDirectory: true)
@@ -155,7 +157,7 @@ let surfaces: [Surface] = [
     Surface(name: "synth", origin: "workshop", fileAccess: { _ in "auto" }, scope: nil),
     // SwarmChatClientFactory over the parent's dispatcher, on the parent's surface.
     Surface(name: "swarm", origin: "chat", fileAccess: { _ in "auto" }, scope: nil),
-    // StandingBotContinuity: the ordinary chat client on the bot surface.
+    // StandingBotContinuity: the helper runner's shared tool gates on the bot surface.
     Surface(name: "bot", origin: "bot", fileAccess: chatFileAccess, scope: nil, helper: true),
     // DesktopAgentConversationRoute's operator tools.
     Surface(name: "desktop", origin: "chat", fileAccess: { _ in "auto" },

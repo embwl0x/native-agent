@@ -1,4 +1,7 @@
 import Foundation
+import TurnTrace
+
+// Blueprint: | `CognitiveSubstrate+CaringAppraisal.swift` | `CaringAppraisalRequest`, verdict and lane contracts: semantic caring judgments, distinctness and admission/refusal interfaces |
 
 // THE CARING APPRAISAL (2026-09-11, second pass).
 //
@@ -250,8 +253,7 @@ public enum CaringAppraisalLane {
     /// closed); a verdict with `kind == nil` is the model saying "none", which
     /// is a successful call with the common answer.
     public static func parse(_ raw: String) -> CaringAppraisalVerdict? {
-        guard let slice = jsonObjectSlice(in: raw),
-              let data = slice.data(using: .utf8),
+        guard let data = raw.data(using: .utf8),
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return nil }
         guard let rawKind = object["kind"] as? String else { return nil }
@@ -263,15 +265,23 @@ public enum CaringAppraisalLane {
         let why = ((object["why"] as? String) ?? "")
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let verdict: CaringAppraisalVerdict
         if normalized == "none" || normalized.isEmpty {
-            return CaringAppraisalVerdict(kind: nil, why: why)
+            verdict = CaringAppraisalVerdict(kind: nil, why: why)
+        } else {
+            guard let kind = wireKinds[normalized] else { return nil }
+            verdict = CaringAppraisalVerdict(
+                kind: kind,
+                why: why,
+                distinctness: distinctness(in: object)
+            )
         }
-        guard let kind = wireKinds[normalized] else { return nil }
-        return CaringAppraisalVerdict(
-            kind: kind,
-            why: why,
-            distinctness: distinctness(in: object)
-        )
+        if rawKind != normalized || normalized.isEmpty
+            || normalized == "caredfor" || normalized == "roommade" || normalized == "needmet"
+            || (verdict.kind != nil && (object["distinct"] as? String) != verdict.distinctness.rawValue) {
+            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("M20"), "site": .string("CognitiveSubstrate+CaringAppraisal.swift:parse")]))
+        }
+        return verdict
     }
 
     /// The relay's distinctness answer. A field the model did not write is
@@ -287,37 +297,5 @@ public enum CaringAppraisalLane {
         case "retelling", "no", "false", "retold", "repeat": return .retelling
         default: return .unsure
         }
-    }
-
-    /// The first balanced `{…}` in the reply, so a fenced or prefaced answer
-    /// still decodes. Local rather than borrowed from MemoryV2: this module must
-    /// not depend on that one.
-    static func jsonObjectSlice(in raw: String) -> String? {
-        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let start = text.firstIndex(of: "{") else { return nil }
-        var depth = 0
-        var inString = false
-        var escaped = false
-        var index = start
-        while index < text.endIndex {
-            let character = text[index]
-            if escaped {
-                escaped = false
-            } else if character == "\\" && inString {
-                escaped = true
-            } else if character == "\"" {
-                inString.toggle()
-            } else if !inString {
-                if character == "{" { depth += 1 }
-                if character == "}" {
-                    depth -= 1
-                    if depth == 0 {
-                        return String(text[start...index])
-                    }
-                }
-            }
-            index = text.index(after: index)
-        }
-        return nil
     }
 }

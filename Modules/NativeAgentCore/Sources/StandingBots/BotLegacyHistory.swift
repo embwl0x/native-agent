@@ -1,4 +1,5 @@
 import Foundation
+// Blueprint: | `BotLegacyHistory.swift` | `ShelfStore`: `legacyHistory` |
 
 public struct BotHistoryImport: Sendable {
     public let id: String

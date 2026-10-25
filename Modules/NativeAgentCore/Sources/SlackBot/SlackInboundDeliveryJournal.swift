@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `SlackInboundDeliveryJournal.swift` | `SlackInboundDeliveryJournal` actor; socket/history/recovery admission, retains accepted handler tasks until actual exit with one active handler per event in the process (across loop replacements), and terminal delivery truth; `path`, `recoverySummary`, `failedReplyClaims`, `confirmReplyPart` retain confirmed text/image progress across holds; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
 
 enum SlackInboundDeliveryPhase: String, Codable, Sendable {
     case claimed
@@ -13,8 +14,9 @@ enum SlackInboundDeliveryPhase: String, Codable, Sendable {
     case outcomeUnknown = "outcome_unknown"
     case sentUnconfirmed = "sent_unconfirmed"
     case failedBeforeAnswer = "failed_before_answer"
+    case stopped
 
-    var isTerminal: Bool { self == .delivered || self == .interrupted || self == .sentUnconfirmed || self == .failedBeforeAnswer }
+    var isTerminal: Bool { self == .delivered || self == .interrupted || self == .sentUnconfirmed || self == .failedBeforeAnswer || self == .stopped }
 }
 
 struct SlackPreparedUpload: Codable, Equatable, Sendable {
@@ -106,6 +108,7 @@ struct SlackDurableInboundPayload: Codable, Equatable, Sendable {
 }
 
 struct SlackInboundDeliveryRecord: Codable, Equatable, Sendable {
+    var lifeID: String? = nil
     struct Rejection: Codable, Equatable, Sendable {
         let reason: String
         let preparedFingerprint: String
@@ -192,7 +195,12 @@ public actor SlackInboundDeliveryJournal {
     private let terminalCap = 500
     private let pendingCap = 100
     private let encoder: JSONEncoder
-    private var activeHandlers: Set<String> = []
+    /// One handler per accepted event in this process, whichever loop's
+    /// journal took it: a loop replaced while its handler still runs leaves
+    /// that handler the event, and the replacement's recovery skips it.
+    nonisolated(unsafe) private static var activeHandlers: Set<String> = []
+    nonisolated(unsafe) private static var handlerTasks: [String: Task<Void, Never>] = [:]
+    private static let handlerLock = NSLock()
 
     init(dataRoot: URL) {
         path = Self.path(dataRoot: dataRoot)
@@ -256,6 +264,7 @@ public actor SlackInboundDeliveryJournal {
             let pending = file.records.filter { !$0.phase.isTerminal }.count
             guard pending < pendingCap else { throw SlackInboundJournalError.saturated(pendingCap) }
             let record = SlackInboundDeliveryRecord(
+                lifeID: try DataRootLife.current(in: dataRoot),
                 inbound: SlackDurableInboundPayload(inbound),
                 phase: .claimed,
                 prepared: nil,
@@ -270,7 +279,29 @@ public actor SlackInboundDeliveryJournal {
     }
 
     func acquireHandler(eventId: String) -> Bool {
-        activeHandlers.insert(eventId).inserted
+        Self.handlerLock.withLock { Self.activeHandlers.insert(path.path + "\u{0}" + eventId).inserted }
+    }
+
+    /// Accepted human work belongs to the journal, not a socket session. Claim
+    /// before launching, retain through settlement, and retire at actual exit.
+    /// The stream lets a history reader stop waiting without cancelling a turn.
+    func startHandler(eventId: String, operation: @escaping @Sendable () async -> Bool) -> AsyncStream<Bool> {
+        let (results, completion) = AsyncStream<Bool>.makeStream()
+        let key = path.path + "\u{0}" + eventId
+        Self.handlerLock.withLock {
+            guard Self.activeHandlers.insert(key).inserted else {
+                completion.yield(false)
+                completion.finish()
+                return
+            }
+            Self.handlerTasks[key] = Task(priority: .userInitiated) {
+                let delivered = await operation()
+                self.releaseHandler(eventId: eventId)
+                completion.yield(delivered)
+                completion.finish()
+            }
+        }
+        return results
     }
 
     func reserveReply(_ inbound: SlackInboundMessage, reply: SlackPreparedReply, runId: String,
@@ -284,7 +315,7 @@ public actor SlackInboundDeliveryJournal {
                 return record
             }
             guard file.records.filter({ !$0.phase.isTerminal }).count < pendingCap else { throw SlackInboundJournalError.saturated(pendingCap) }
-            let record = SlackInboundDeliveryRecord(inbound: SlackDurableInboundPayload(inbound),
+            let record = SlackInboundDeliveryRecord(lifeID: try DataRootLife.current(in: dataRoot), inbound: SlackDurableInboundPayload(inbound),
                 phase: priorVerdict == "completed" ? .delivered : priorVerdict == nil ? .prepared : .sentUnconfirmed,
                 prepared: reply, dispatchStartedAt: nil, updatedAt: Date(),
                 outcomeDetail: priorVerdict == "sent_unconfirmed" ? "legacy_completion_dispatch_unconfirmed" : nil,
@@ -324,7 +355,11 @@ public actor SlackInboundDeliveryJournal {
     private static let botEventClaimCap = 1_000
 
     func releaseHandler(eventId: String) {
-        activeHandlers.remove(eventId)
+        Self.handlerLock.withLock {
+            let key = path.path + "\u{0}" + eventId
+            Self.handlerTasks.removeValue(forKey: key)
+            Self.activeHandlers.remove(key)
+        }
     }
 
     func prepare(eventId: String, reply: SlackPreparedReply, failedBeforeAnswer: Bool = false,
@@ -492,14 +527,19 @@ public actor SlackInboundDeliveryJournal {
         do {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            let file = try decoder.decode(File.self, from: data)
+            var file = try decoder.decode(File.self, from: data)
             guard file.version == 1,
                   Set(file.records.map { $0.inbound.eventId }).count == file.records.count,
                   file.records.allSatisfy({
                       !$0.inbound.eventId.isEmpty
                         && ($0.phase == .claimed || $0.phase == .generating || $0.phase == .interrupted
-                            || $0.phase == .outcomeUnknown || $0.phase == .failedBeforeAnswer || $0.prepared != nil)
+                            || $0.phase == .outcomeUnknown || $0.phase == .failedBeforeAnswer || $0.phase == .stopped || $0.prepared != nil)
                   }) else { throw SlackInboundJournalError.malformed }
+            for i in file.records.indices where try !DataRootLife.isCurrent(file.records[i].lifeID, in: path.deletingLastPathComponent().deletingLastPathComponent())
+                && file.records[i].phase != .delivered {
+                file.records[i].phase = .stopped
+                file.records[i].outcomeDetail = DataRootLife.stoppedReason
+            }
             return file
         } catch {
             // Unreadable replay evidence cannot authorize a fresh admission.

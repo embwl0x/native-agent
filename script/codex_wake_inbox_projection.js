@@ -3,8 +3,11 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { isDeepStrictEqual } = require("util");
 
-// Project already-decided delivery outcomes into the existing inbox under its lock.
+// Own the inbox JSONL schema, admission, history and delivery updates under one lock.
+// Private protocol files: no app backup/export/phone file sync; contact status is
+// projected separately. PrivacyMap resolves primary and relocated bridge directories.
 function createCodexWakeInboxProjection({ BRIDGE_DIR, inboxLockDir, withDirLock, nowISO, writeJSONAtomic, writeTextAtomic }) {
 function historyPath(inboxPath, messageId) {
   const key = crypto.createHash("sha256").update(messageId).digest("hex");
@@ -24,7 +27,7 @@ function compactInbox(lines, inboxPath) {
       throw new Error("codex inbox cannot be compacted; original bytes preserved");
     }
     const id = messageIdForPayload(row);
-    if (!id || identities.has(id) || (row.id && row.messageId && row.id !== row.messageId)) {
+    if (!id || identities.has(id) || (row.id !== undefined && row.messageId !== undefined && row.id !== row.messageId)) {
       throw new Error("codex inbox retry identity conflicts; original bytes preserved");
     }
     identities.add(id);
@@ -55,6 +58,79 @@ function rowMessageIds(row) {
   if (row && row.id != null) ids.push(String(row.id));
   if (row && row.messageId != null) ids.push(String(row.messageId));
   return ids.filter(Boolean);
+}
+
+async function appendInbox({ inboxPath, entry }) {
+  return await withDirLock(inboxLockDir(), async () => {
+    fs.mkdirSync(path.dirname(inboxPath), { recursive: true, mode: 0o700 });
+    let raw;
+    try { raw = fs.readFileSync(inboxPath).toString("latin1"); }
+    catch (error) { if (error.code !== "ENOENT") throw error; raw = ""; }
+    const rows = [];
+    const valid = [];
+    let malformed = 0, parsed = 0, trailingPartial = false, nonObject = false;
+    const physical = raw.split("\n");
+    if (physical[physical.length - 1] === "") physical.pop();
+    for (const [index, bytes] of physical.entries()) {
+      let row, line;
+      try { line = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(bytes, "latin1")); }
+      catch { malformed++; continue; }
+      try { row = JSON.parse(line); }
+      catch {
+        if (index === physical.length - 1 && !raw.endsWith("\n")) trailingPartial = true;
+        else malformed++;
+        continue;
+      }
+      parsed++;
+      if (!row || typeof row !== "object" || Array.isArray(row)) { nonObject = true; continue; }
+      rows.push(row);
+      valid.push(line);
+    }
+    let lines = valid;
+    let quarantinedPath;
+    if (malformed || trailingPartial || nonObject) {
+      const base = `${inboxPath}.quarantined-${Math.floor(Date.now() / 1000)}`;
+      quarantinedPath = base;
+      for (let collision = 1; fs.existsSync(quarantinedPath); collision++) quarantinedPath = `${base}-${collision}`;
+      fs.copyFileSync(inboxPath, quarantinedPath, fs.constants.COPYFILE_EXCL);
+      writeTextAtomic(inboxPath, valid.length ? valid.join("\n") + "\n" : "");
+      try { fs.appendFileSync(path.join(path.dirname(inboxPath), "bridge-inbox-quarantine.jsonl"), JSON.stringify({
+        event: "builder_inbox_quarantined", quarantinedAt: nowISO(), inboxPath, quarantinedPath,
+        reason: "builder inbox is malformed; original bytes preserved",
+        malformedLineCount: malformed, trailingPartialLine: trailingPartial,
+        physicalLineCount: physical.length, parsedRowCount: parsed,
+      }) + "\n"); } catch { /* Original bytes are already preserved, as in the other bridge inboxes. */ }
+    }
+    const id = messageIdForPayload(entry);
+    const matching = rows.filter((row) => rowMessageIds(row).includes(id));
+    if (matching.length > 1) throw new Error("builder inbox message identity is ambiguous; original bytes preserved");
+    let existing = matching[0];
+    if (existing === undefined) {
+      try { existing = JSON.parse(fs.readFileSync(historyPath(inboxPath, id), "utf8")); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+    }
+    if (existing !== undefined && (!existing || typeof existing !== "object" || Array.isArray(existing)
+        || (existing.id !== undefined && existing.messageId !== undefined && existing.id !== existing.messageId)
+        || !rowMessageIds(existing).includes(id))) {
+      throw new Error("codex inbox retry identity is unreadable; original bytes preserved");
+    }
+    lines = compactInbox(lines, inboxPath);
+    let status = "appended", retryWake = false, queuedAt = entry.createdAt;
+    if (existing !== undefined) {
+      const fields = ["text", "topic", "conversationId", "workingDirectory", "executionProfile",
+        "deskHandle", "completionMode", "pairReviewer", "sessionId", "origin", "brain", "priority",
+        "model", "reasoningEffort", "serviceTier", "fast"];
+      status = fields.every((key) => isDeepStrictEqual(existing[key], entry[key])) ? "duplicate" : "conflict";
+      retryWake = existing.read === false && typeof existing.createdAt === "string" && !!existing.createdAt
+        && (existing.consumedAt == null || (typeof existing.consumedAt === "string" && !existing.consumedAt.trim()));
+      queuedAt = existing.createdAt || queuedAt;
+    } else {
+      lines = lines.filter((line) => line.trim());
+      lines.push(JSON.stringify(entry));
+    }
+    writeTextAtomic(inboxPath, lines.filter((line) => line.trim()).join("\n") + "\n");
+    return { status, retryWake, queuedAt, quarantinedPath };
+  }, { waitMs: 30000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
 }
 
 async function rewriteInboxEntries(entries, rewriteRow, successStatus) {
@@ -111,7 +187,7 @@ async function rewriteInboxEntries(entries, rewriteRow, successStatus) {
           try { row = JSON.parse(fs.readFileSync(archivedPath, "utf8")); }
           catch (error) { if (error.code === "ENOENT") continue; throw error; }
           if (!row || typeof row !== "object" || Array.isArray(row)
-              || (row.id && row.messageId && row.id !== row.messageId)
+              || (row.id !== undefined && row.messageId !== undefined && row.id !== row.messageId)
               || !rowMessageIds(row).includes(id)) {
             throw new Error("codex inbox retry identity conflicts; original bytes preserved");
           }
@@ -125,7 +201,7 @@ async function rewriteInboxEntries(entries, rewriteRow, successStatus) {
           marked: [...seen],
           missing: [...targets.keys()].filter((id) => !seen.has(id)),
         };
-      }, { waitMs: 5000, staleMs: 10 * 60 * 1000 });
+      }, { waitMs: 5000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
       if (result.status === "ok") {
         changed.push(...result.marked.map((messageId) => ({ inboxPath, messageId })));
         missing.push(...result.missing.map((messageId) => ({ inboxPath, messageId })));
@@ -179,7 +255,7 @@ async function markInboxTerminal(entries) {
   return await rewriteInboxEntries(entries, (row, entry, match) => {
     const terminal = entry && entry.terminalDisposition || {};
     row.messageId = row.messageId || row.id || match;
-    row.deliveryStatus = "dead_letter";
+    row.deliveryStatus = terminal.reason === "restored" ? "stopped" : "dead_letter";
     row.deliveryTerminalAt = row.deliveryTerminalAt
       || terminal.deadLetteredAt
       || nowISO();
@@ -188,7 +264,7 @@ async function markInboxTerminal(entries) {
   }, "marked_terminal");
 }
 
-return { markInboxConsumed, markInboxTerminal, messageIdForPayload };
+return { appendInbox, markInboxConsumed, markInboxTerminal, messageIdForPayload };
 }
 
 module.exports = { createCodexWakeInboxProjection };

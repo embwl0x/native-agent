@@ -1,5 +1,5 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnContracts
 import Connectors
 import MacControl
 import MacIntegration
@@ -13,8 +13,12 @@ import PersistenceCore
 import Privacy
 import NativeAgentCore
 import NativeAgentShared
+import AppToolRuntime
+import ToolExecution
+// Blueprint: | `MacIntegrationDeliveryActions.swift` | Mac integration protocol execution, scheduler and Spotlight routing; due-reminders passes the requesting dispatcher's root to LocalPIMConnectorActions; Music calls the editable music part through L0, and Mail/Messages/Notes recovery words come from their parts while facts/evidence stay native; mobile notifications delegate to AppToolRuntime with the dispatcher surface; checked pairing and phone result routing; Mac notification receipts and MacControl adapter |
 
 public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolArgumentValidating {
+    private var dataRoot: URL { deviceSync().dataRoot }
     private let postMessage: @Sendable (String, String) async -> [String: JSONValue]
     private let router: @Sendable () -> AttentionRouter
     private let deviceSync: @Sendable () -> DeviceSync
@@ -57,16 +61,19 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
         try await LocalPIMConnectorActions.remindersUpdate(input: input)
     }
 
-    public func remindersListDueToday(input: [String: JSONValue]) async throws -> JSONValue {
-        try await LocalPIMConnectorActions.remindersListDueToday(input: input)
+    public func remindersListDueToday(input: [String: JSONValue], dataRoot: URL) async throws -> JSONValue {
+        try await LocalPIMConnectorActions.remindersListDueToday(input: input, dataRoot: dataRoot)
     }
 
     public func macNotify(input: [String: JSONValue]) async throws -> JSONValue {
         try await Self.macNotify(input: input, postMessage: postMessage)
     }
 
-    public func mobileNotify(input: [String: JSONValue]) async throws -> JSONValue {
-        try await Self.mobileNotify(input: input, router: router())
+    public func mobileNotify(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        let router = router()
+        return try await AppToolExecutor.mobileNotify(input: input, surface: surface, toolName: "mobile_notify") { title, body, userInfo in
+            try await AppToolExecutor.defaultMobileNotificationSender(title: title, body: body, userInfo: userInfo, router: router)
+        }
     }
 
     public func phoneRequest(input: [String: JSONValue]) async throws -> JSONValue {
@@ -82,7 +89,7 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
     }
 
     public func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.mailListRecent(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailListRecent(input: input), integration:"mail", dataRoot:dataRoot)
     }
 
     public func mailAttachment(input: [String: JSONValue]) async throws -> (filename: String, data: Data) {
@@ -90,47 +97,47 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
     }
 
     public func mailReadBatch(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAppleScriptBridge.mailBatch(input: input, effects: false)
+        await MacAssistantParts.recover(await MacAppleScriptBridge.mailBatch(input: input, effects: false), integration:"mail", dataRoot:dataRoot)
     }
 
     public func mailTriageBatch(input: [String: JSONValue]) async throws -> JSONValue {
-        await MacAppleScriptBridge.mailBatch(input: input, effects: true)
+        await MacAssistantParts.recover(await MacAppleScriptBridge.mailBatch(input: input, effects: true), integration:"mail", dataRoot:dataRoot)
     }
 
     public func mailSearch(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.mailSearch(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailSearch(input: input), integration:"mail", dataRoot:dataRoot)
     }
 
     public func mailSenders(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.mailSenders(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailSenders(input: input), integration:"mail", dataRoot:dataRoot)
     }
 
     public func mailSend(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.mailSend(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailSend(input: input), integration:"mail", dataRoot:dataRoot)
     }
 
     public func messagesRecentThreads(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.messagesRecentThreads(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.messagesRecentThreads(input: input), integration:"messages", dataRoot:dataRoot)
     }
 
     public func messagesSend(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.messagesSend(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.messagesSend(input: input), integration:"messages", dataRoot:dataRoot)
     }
 
     public func notesSearch(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.notesSearch(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.notesSearch(input: input), integration:"notes", dataRoot:dataRoot)
     }
 
     public func notesCreate(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.notesCreate(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.notesCreate(input: input), integration:"notes", dataRoot:dataRoot)
     }
 
     public func musicNowPlaying(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.musicNowPlaying(input: input)
+        try await musicPart("now_playing", input: input)
     }
 
     public func musicControl(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.musicControl(input: input)
+        try await musicPart("control", input: input)
     }
 
     public func calendarCreateEvent(input: [String: JSONValue]) async throws -> JSONValue {
@@ -167,43 +174,52 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
     // Mail manage (W2)
 
     public func mailMarkRead(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.mailMarkRead(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailMarkRead(input: input), integration:"mail", dataRoot:dataRoot)
     }
 
     public func mailArchive(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.mailArchive(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailArchive(input: input), integration:"mail", dataRoot:dataRoot)
     }
 
     public func mailDelete(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.mailDelete(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailDelete(input: input), integration:"mail", dataRoot:dataRoot)
     }
 
     public func mailReply(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.mailReply(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailReply(input: input), integration:"mail", dataRoot:dataRoot)
     }
 
     public func mailDraft(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.mailDraft(input: input)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.mailDraft(input: input), integration:"mail", dataRoot:dataRoot)
     }
 
     // Notes update (W2)
 
     public func notesModify(input: [String: JSONValue], deleting: Bool) async throws -> JSONValue {
-        try await MacAppleScriptBridge.notesModify(input: input, deleting: deleting)
+        await MacAssistantParts.recover(try await MacAppleScriptBridge.notesModify(input: input, deleting: deleting), integration:"notes", dataRoot:dataRoot)
     }
 
     // Music library (W2)
 
     public func musicSearchLibrary(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.musicSearchLibrary(input: input)
+        try await musicPart("search", input: input)
     }
 
     public func musicListLibrary(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.musicListLibrary(input: input)
+        try await musicPart("library", input: input)
     }
 
     public func musicListPlaylists(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.musicListPlaylists(input: input)
+        try await musicPart("playlists", input: input)
+    }
+
+    private func musicPart(_ operation: String, input: [String: JSONValue]) async throws -> JSONValue {
+        switch await Parts(root: dataRoot).call(id: operation == "control" ? "music" : "music-library", input: .object([
+            "operation": .string(operation), "input": .object(input)
+        ]), as: JSONValue.self) {
+        case .success(let result): return result
+        case .failure(let error): throw error
+        }
     }
 
     // Contacts delete (inline)
@@ -305,42 +321,6 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
         return .object(obj)
     }
 
-    public static func mobileNotify(input: [String: JSONValue], router: AttentionRouter) async throws -> JSONValue {
-        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mobile_notify")
-        let source = input["source"]?.stringValue ?? "chat_tool"
-        // B5 review round 2 (MED): pass through the same routing params the
-        // AppChatToolDispatcher shim preserves (screen/urgency, + surface when
-        // the caller provides one) — the two paths reach the same backend and
-        // must hand it the same envelope, or unwrapped workshop/tool-step
-        // notifies render differently from wrapped-chat ones.
-        let screen = input["screen"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let urgency = input["urgency"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
-        var userInfo: [String: String] = [
-            "screen": (screen?.isEmpty == false ? screen! : "inbox"),
-            "source": source,
-            "urgency": (urgency?.isEmpty == false ? urgency! : "normal"),
-        ]
-        if let surface = input["surface"]?.stringValue, !surface.isEmpty {
-            userInfo["surface"] = surface
-        }
-        // Item 26: one exit, through the router. Owner-waiting and PINNED to
-        // the phone — `mobile_notify` names its channel, so it keeps delivering
-        // a real APNS receipt. Payload unchanged.
-        let receipt = try await router.route(
-            eventId: "mobile_notify:\(AttentionRouter.stableDigest(title + "|" + message))",
-            importance: .ownerWaiting,
-            title: title,
-            body: message,
-            userInfo: userInfo,
-            pinnedTo: .phone
-        ).requireReceipt()
-        var obj = receipt.deliveryFields()
-        obj.merge([
-            "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
-        ]) { _, new in new }
-        return .object(obj)
-    }
 
     public static func phoneRequest(input: [String: JSONValue], deviceSync: DeviceSync) async throws -> JSONValue {
         guard let kindName = input["kind"]?.stringValue, let kind = PhoneRequest.Kind(rawValue: kindName) else {

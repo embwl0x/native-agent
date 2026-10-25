@@ -4,8 +4,6 @@ import ToolRegistry
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
-import MCPDispatcher
-import KnowledgeGraph
 import PersonaEngine
 import ProviderRouting
 import TrustCenter
@@ -15,10 +13,13 @@ import Context
 import SwarmRuns
 import WorkshopExecution
 import DreamREMCycle
+// Blueprint: | `SwiftToolDispatcher+PersonaTools.swift` | `SwiftToolDispatcher`: `impl_get_persona_doc`, `impl_persona_read`, `impl_persona_write` |
 
 // MARK: - Persona and runtime introspection tools
 
 extension SwiftToolDispatcher {
+    private static let personaDocMaxBytes = 64 * 1024
+
     func impl_get_persona_doc(input: [String: JSONValue]) async throws -> JSONValue {
         // 2026-09-22: persona_read/write/append take `kind`; accept it here too.
         let doc = try requireString(input, input["doc"] == nil && input["kind"] != nil ? "kind" : "doc")
@@ -56,8 +57,8 @@ extension SwiftToolDispatcher {
                 reason: "SwiftToolDispatcher: persona doc not found at '\(url.path)'"
             )
         }
-        if bytes.count > Self.maxFileBytes {
-            let head = bytes.prefix(Self.maxFileBytes)
+        if bytes.count > Self.personaDocMaxBytes {
+            let head = bytes.prefix(Self.personaDocMaxBytes)
             let headText = String(data: head, encoding: .utf8) ?? text
             return .string(headText + "\n... [truncated, \(bytes.count) bytes total]")
         }
@@ -65,30 +66,22 @@ extension SwiftToolDispatcher {
     }
 
     func impl_persona_read(input: [String: JSONValue]) async throws -> JSONValue {
-        let kind = canonicalPersonaKind(try requireString(input, "kind"))
-        let allowedKinds: Set<String> = ["soul", "user", "voice", "growth", "agents"]
-        guard allowedKinds.contains(kind) else {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher persona_read kind must be one of: \(allowedKinds.sorted().joined(separator: ", "))"
-            )
+        let kind = try requireString(input, "kind")
+        let result = PersonaSystemActions.personaRead(["kind": .string(kind)],
+            ConnectorActionContext(repoRoot: rootForRead.path, dataRoot: dataRoot.path,
+                                   personaRoot: personaRootForTools().path))
+        if case .object(let fields) = result, fields["ok"] == .bool(false) {
+            let error = jsonString(fields["error"]) ?? ""
+            if fields["error_code"] == .string("bad_input") {
+                throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher persona_read " + error)
+            }
+            if fields["error_code"] == .string("persona_not_found"),
+               let target = SwiftNativePersonaEngine.personaDocumentPath(kind: kind, root: personaRootForTools()) {
+                throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher persona_read doc not found at '\(target.path)'")
+            }
+            throw AutonomyGateError.toolDenied(reason: error)
         }
-        guard let target = personaToolPath(kind: kind) else {
-            throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher persona_read could not resolve persona path")
-        }
-        guard let bytes = try? Data(contentsOf: target),
-              let content = String(data: bytes, encoding: .utf8) else {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher persona_read doc not found at '\(target.path)'"
-            )
-        }
-        return .object([
-            "ok": .bool(true),
-            "status": .string("ok"),
-            "kind": .string(kind),
-            "path": .string(target.path),
-            "content": .string(content),
-            "size_bytes": .int(Int64(bytes.count)),
-        ])
+        return result
     }
 
     func impl_persona_write(input: [String: JSONValue]) async throws -> JSONValue {
@@ -209,7 +202,7 @@ extension SwiftToolDispatcher {
             ]),
             "runtime_instance_id": .string(runtimeInstanceID),
             "process_id": .int(Int64(pid)),
-            "tool_state": .string("app is your one tool; app {find} finds an action by what you want done. Request detail=full for diagnostic roots, MCP names, and outcome population health"),
+            "tool_state": .string("app is your one tool; app {find} finds an action by what you want done. Request detail=full for diagnostic roots and outcome population health"),
         ]
         if case .object(let stamp) = provider, case .string(let model)? = stamp["model"] {
             response["context_window"] = .object(ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
@@ -226,9 +219,7 @@ extension SwiftToolDispatcher {
         guard fullDetail else { return .object(response) }
 
         let catalog = await catalogSnapshot(includeSchemas: false)
-        let availableTools = Set(catalog.names.filter { !catalog.hiddenMCPNames.contains($0) && !Self.isModelHidden($0) })
-        MCPToolCatalogWarmer.shared.kickDetached(dataRoot: dataRoot)
-        let mcpTools = catalog.externalMCPNames.sorted()
+        let availableTools = Set(catalog.names.filter { !Self.isModelHidden($0) })
         let modelVisibleAvailableTools = Self.modelVisibleCatalogToolNames(availableTools)
         let activeTools = Self.alwaysOnCoreNames
             .union(LLMCallContext.turnActiveTools ?? [])
@@ -261,11 +252,8 @@ extension SwiftToolDispatcher {
         response["tool_count_semantics"] = .object([
             "active_tool_count": .string("Tools advertised to the model this turn: always-on core + turn-scoped, intersected with the model-visible catalog."),
             "available_tool_count": .string("Every model-visible tool in the catalog, loaded or not."),
-            "mcp_tool_count": .string("External MCP servers' tools, each an app action mcp.<server>.<tool> (not in active_tool_count)."),
         ])
         response["discovery"] = .string("every capability is an app action: app {} is home and the pages, app {find} finds an action")
-        response["mcp_tool_count"] = .int(Int64(mcpTools.count))
-        response["mcp_tools"] = .array(mcpTools.map { .string(ToolNameAliases.appAction($0) ?? $0) })
         response["compatibility"] = .object([
             "recall_search": .string("alias_for_recall_memory"),
         ])

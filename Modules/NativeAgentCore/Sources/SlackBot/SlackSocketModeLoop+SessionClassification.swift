@@ -1,5 +1,6 @@
 import Foundation
 import BackgroundLoops
+// Blueprint: | `SlackSocketModeLoop+SessionClassification.swift` | `SlackSocketModeLoop`: `classifySessionClosure`, `disconnectDisposition`, `classifyReceiveLoopReturn` |
 
 extension SlackSocketModeLoop {
     static func classifySessionClosure(

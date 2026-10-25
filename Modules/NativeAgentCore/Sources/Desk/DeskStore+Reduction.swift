@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `DeskStore+Reduction.swift` | `SwiftNativeDeskStore`: `compact`, `aliasSeq`, `orderByAlias` |
 
 extension SwiftNativeDeskStore {
     // MARK: - Compaction (pure fold — rebuild MUST equal in-memory fold)

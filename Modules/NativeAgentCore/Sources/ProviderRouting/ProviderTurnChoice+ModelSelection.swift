@@ -1,3 +1,4 @@
+// Blueprint: | `ProviderTurnChoice+ModelSelection.swift` | provider turn model selection |
 public extension ProviderTurnChoice {
     init(
         provider: String, model: String, reasoningEffort: String, fast: Bool,

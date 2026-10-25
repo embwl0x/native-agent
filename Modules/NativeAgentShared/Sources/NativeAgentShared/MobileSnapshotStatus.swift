@@ -3,6 +3,7 @@ import Foundation
 
 #if canImport(Compression)
 import Compression
+// Blueprint: | `MobileSnapshotStatus.swift` | `NAMobileSnapshotGroup` enum; `groups`; declares live phone snapshot inputs only: unread promotion_candidates.json is retired; training_proposals.json retains its active phone readers |
 #endif
 
 /// Rebuildable Mac-owned read projections carried through the existing
@@ -34,11 +35,6 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "organism_living_status.json",
                 "sessions.json",
                 "pinned_chat_sessions.json",
-                // The conversation anchor — which chat session the human is
-                // currently active in, on whichever remote surface published
-                // it. Rides in .core with the sessions it refers to so the
-                // phone never sees a pin naming a session it has not received.
-                "chat_anchor.json",
                 "connectors.json",
                 "telegram.json",
                 "providers.json",
@@ -79,7 +75,6 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "memories.json",
                 "memory_proposals.json",
                 "training_proposals.json",
-                "promotion_candidates.json",
                 "inbox.json",
             ]
         case .advanced:
@@ -129,7 +124,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
             "approvals": "Approvals", "workshop_tasks": "Workshop", "work_activity": "Activity",
             "providers": "Providers", "connectors": "Connectors", "health": "Health", "trust_policy": "Trust",
             "sessions": "Chat", "chat_sessions": "Chat", "chat_transcripts": "Chat",
-            "chat_anchor": "Chat", "pinned_chat_sessions": "Chat", "memory_proposals": "Memory proposals",
+            "pinned_chat_sessions": "Chat", "memory_proposals": "Memory proposals",
             "organism_living_status": "Status", "helpers_agents": "Helpers and Agents", "telegram": "Telegram",
             "skills_snapshot": "Skills & Tools", "tools_snapshot": "Skills & Tools", "model_preferences": "Providers",
             "ui_layout": "Layout",

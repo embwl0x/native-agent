@@ -2,14 +2,17 @@ import Darwin
 import Dispatch
 import Foundation
 
-/// kqueue-backed append-file watcher. Missing files are watched through their
-/// nearest existing ancestors; directory creation and rename/delete events
-/// re-arm the target vnode.
+// Blueprint: | `FileChangeWatcher.swift` | `FileChangeWatcher`: pooled file/directory vnode subscriptions, ancestor watches and replacement rearming with serialized teardown |
+
+/// Pooled vnode watcher for files and directories. Missing targets follow their
+/// nearest existing ancestors; creation and replacement re-arm the target vnode.
 public final class FileChangeWatcher: @unchecked Sendable {
     public typealias Handler = @Sendable (URL) -> Void
+    public typealias EventHandler = @Sendable (URL, DispatchSource.FileSystemEvent) -> Void
     private struct Armed { let source: DispatchSourceFileSystemObject }
     private let paths: [URL]
-    private let handler: Handler
+    private let handler: EventHandler
+    private let onFailure: Handler?
     private let queue = DispatchQueue(label: "com.nativeagent.persistence.file-watcher", qos: .utility)
     /// fix-watcher-deinit-race (2026-08-02): `sources`/`stopped` used to be
     /// bare stored properties mutated on `queue` (arm/install) but read and
@@ -20,26 +23,52 @@ public final class FileChangeWatcher: @unchecked Sendable {
     /// lifetime. The state now lives under `stateLock`, which every accessor —
     /// queue or not, deinit included — takes. Only the kqueue work stays on the
     /// queue; the lock is never held across a `cancel()`/`open()` call.
-    private let stateLock = NSLock()
+    private let stateLock = NSCondition()
     private var sources: [URL: Armed] = [:]
+    // Arming runs on `queue` and can recurse when a missing target appears.
+    private var armingDepth = 0
     private var stopped = false
     private var pooledSubscription: SharedFileChangeWatcherRegistry.Subscription?
 
-    public init(paths: [URL], handler: @escaping Handler) {
-        self.paths = Array(Set(paths.map(\.standardizedFileURL)))
-        self.handler = handler
-        pooledSubscription = SharedFileChangeWatcherRegistry.shared.subscribe(paths: self.paths, handler: handler)
+    public convenience init(paths: [URL], onFailure: Handler? = nil, handler: @escaping Handler) {
+        self.init(paths: paths, onFailure: onFailure, eventHandler: { path, _ in handler(path) })
     }
+
+    /// Target vnode flags; a target appearing through an ancestor emits `.write`.
+    public init(paths: [URL], onFailure: Handler? = nil, eventHandler: @escaping EventHandler) {
+        self.paths = Array(Set(paths.map(\.standardizedFileURL)))
+        self.handler = eventHandler
+        self.onFailure = onFailure
+        pooledSubscription = SharedFileChangeWatcherRegistry.shared.subscribe(paths: self.paths, onFailure: onFailure, handler: eventHandler)
+    }
+
+    /// A registration can fail (for example, descriptor exhaustion). Inspect
+    /// this after construction; returning from initialization alone is no proof.
+    /// Wait for an active arm attempt rather than exposing its source-table gap.
+    public var unarmedPaths: [URL] {
+        stateLock.lock()
+        if !stopped, let pooledSubscription {
+            stateLock.unlock()
+            return pooledSubscription.unarmedPaths
+        }
+        while !stopped && armingDepth > 0 { stateLock.wait() }
+        let unarmed = stopped ? paths : paths.filter { sources[$0] == nil }
+        stateLock.unlock()
+        return unarmed
+    }
+
+    public var isArmed: Bool { !paths.isEmpty && unarmedPaths.isEmpty }
 
     public static func armed(paths: [URL], handler: @escaping Handler) async -> FileChangeWatcher {
         await Task.detached(priority: .utility) { FileChangeWatcher(paths: paths, handler: handler) }.value
     }
 
-    fileprivate init(unpooledPath: URL, handler: @escaping Handler) {
+    fileprivate init(unpooledPath: URL, onFailure: Handler?, handler: @escaping EventHandler) {
         // The registry's own key, already standardized: publish matches on it.
         self.paths = [unpooledPath]
         self.handler = handler
-        // Return only after the vnode sources are armed. An asynchronous first
+        self.onFailure = onFailure
+        // Return only after attempting to arm. An asynchronous first
         // arm leaves a startup window where a CLI can create/replace the file
         // before any source exists, and that edge would remain invisible until
         // a later write.
@@ -63,6 +92,7 @@ public final class FileChangeWatcher: @unchecked Sendable {
         sources.removeAll()
         let pooledSubscription = self.pooledSubscription
         self.pooledSubscription = nil
+        stateLock.broadcast()
         stateLock.unlock()
         pooledSubscription?.cancel()
         old.forEach { $0.source.cancel() }
@@ -79,10 +109,19 @@ public final class FileChangeWatcher: @unchecked Sendable {
     private func armAll() { guard !isStopped else { return }; paths.forEach(arm) }
 
     private func arm(_ path: URL) {
-        guard !isStopped else { return }
         stateLock.lock()
+        guard !stopped else { stateLock.unlock(); return }
+        armingDepth += 1
         let previous = sources.removeValue(forKey: path)
         stateLock.unlock()
+        defer {
+            stateLock.lock()
+            armingDepth -= 1
+            let failed = armingDepth == 0 && !stopped && sources[path] == nil
+            stateLock.broadcast()
+            stateLock.unlock()
+            if failed { onFailure?(path) }
+        }
         previous?.source.cancel()
         let fd = open(path.path, O_EVTONLY)
         if fd >= 0 {
@@ -90,7 +129,7 @@ public final class FileChangeWatcher: @unchecked Sendable {
                 fd: fd,
                 targetPath: path,
                 directory: false,
-                mask: [.write, .extend, .rename, .delete, .revoke, .attrib]
+                mask: [.write, .extend, .rename, .delete, .revoke, .attrib, .link]
             )
             return
         }
@@ -124,7 +163,7 @@ public final class FileChangeWatcher: @unchecked Sendable {
         if missing, FileManager.default.fileExists(atPath: child.path) {
             arm(path)
             if FileManager.default.fileExists(atPath: path.path) {
-                queue.async { [self] in if !isStopped { handler(path) } }
+                queue.async { [self] in if !isStopped { handler(path, .write) } }
             }
         }
     }
@@ -149,13 +188,13 @@ public final class FileChangeWatcher: @unchecked Sendable {
                     // second atomic replacement lands while the consumer is
                     // reading the first edge, the newly armed vnode observes
                     // it instead of leaving a re-arm loss window.
-                    self.handler(targetPath)
+                    self.handler(targetPath, .write)
                 }
             } else {
                 if event.contains(.rename) || event.contains(.delete) || event.contains(.revoke) {
                     self.arm(targetPath)
                 }
-                self.handler(targetPath)
+                self.handler(targetPath, event)
             }
         }
         // Publish under the lock, and never publish into a torn-down watcher:
@@ -207,6 +246,13 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
         private let paths: [URL]
         private var cancelled = false
 
+        var unarmedPaths: [URL] {
+            lock.lock()
+            let registry = cancelled ? nil : self.registry
+            lock.unlock()
+            return registry?.unarmedPaths(id: id, paths: paths) ?? paths
+        }
+
         init(registry: SharedFileChangeWatcherRegistry, id: UUID, paths: [URL]) {
             self.registry = registry
             self.id = id
@@ -230,12 +276,16 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
     }
 
     private final class Entry {
-        var handlers: [UUID: FileChangeWatcher.Handler]
+        struct Callbacks {
+            let change: FileChangeWatcher.EventHandler
+            let failure: FileChangeWatcher.Handler?
+        }
+        var handlers: [UUID: Callbacks]
         var watcher: FileChangeWatcher?
         let armed = DispatchGroup()
 
-        init(id: UUID, handler: @escaping FileChangeWatcher.Handler) {
-            handlers = [id: handler]
+        init(id: UUID, onFailure: FileChangeWatcher.Handler?, handler: @escaping FileChangeWatcher.EventHandler) {
+            handlers = [id: Callbacks(change: handler, failure: onFailure)]
             armed.enter()
         }
     }
@@ -245,12 +295,13 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
 
     func subscribe(
         paths: [URL],
-        handler: @escaping FileChangeWatcher.Handler
+        onFailure: FileChangeWatcher.Handler?,
+        handler: @escaping FileChangeWatcher.EventHandler
     ) -> Subscription {
         let normalized = Array(Set(paths.map(\.standardizedFileURL)))
         let id = UUID()
         for path in normalized {
-            add(id: id, path: path, handler: handler)
+            add(id: id, path: path, onFailure: onFailure, handler: handler)
         }
         return Subscription(registry: self, id: id, paths: normalized)
     }
@@ -258,24 +309,27 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
     private func add(
         id: UUID,
         path: URL,
-        handler: @escaping FileChangeWatcher.Handler
+        onFailure: FileChangeWatcher.Handler?,
+        handler: @escaping FileChangeWatcher.EventHandler
     ) {
         lock.lock()
         if let entry = entries[path] {
-            entry.handlers[id] = handler
+            entry.handlers[id] = Entry.Callbacks(change: handler, failure: onFailure)
             lock.unlock()
             entry.armed.wait()
             return
         }
-        let entry = Entry(id: id, handler: handler)
+        let entry = Entry(id: id, onFailure: onFailure, handler: handler)
         entries[path] = entry
         lock.unlock()
         defer { entry.armed.leave() }
 
-        // Every subscriber waits for the shared inode to be armed before its
+        // Every subscriber waits for the shared arm attempt before its
         // registration-race read, including one arriving during the first arm.
-        let watcher = FileChangeWatcher(unpooledPath: path) { [weak self] changedPath in
-            self?.publish(path: changedPath)
+        let watcher = FileChangeWatcher(unpooledPath: path, onFailure: { [weak self] failedPath in
+            self?.publishFailure(path: failedPath)
+        }) { [weak self] changedPath, flags in
+            self?.publish(path: changedPath, flags: flags)
         }
 
         lock.lock()
@@ -291,17 +345,37 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
     /// `path` is the entry's own key. Standardizing it again here missed the
     /// entry once a watched file appeared: an existing path under /private/tmp
     /// or /private/var standardizes to /tmp or /var.
-    private func publish(path: URL) {
+    private func publish(path: URL, flags: DispatchSource.FileSystemEvent) {
         lock.lock()
-        let handlers: [FileChangeWatcher.Handler]
+        let handlers: [FileChangeWatcher.EventHandler]
         if let entry = entries[path] {
-            handlers = Array(entry.handlers.values)
+            handlers = entry.handlers.values.map(\.change)
         } else {
             handlers = []
         }
         lock.unlock()
         for handler in handlers {
-            handler(path)
+            handler(path, flags)
+        }
+    }
+
+    private func publishFailure(path: URL) {
+        lock.lock()
+        let handlers = entries[path]?.handlers.values.compactMap(\.failure) ?? []
+        lock.unlock()
+        for handler in handlers { handler(path) }
+    }
+
+    fileprivate func unarmedPaths(id: UUID, paths: [URL]) -> [URL] {
+        lock.lock()
+        let watchers = paths.map { path -> FileChangeWatcher? in
+            guard let entry = entries[path], entry.handlers[id] != nil else { return nil }
+            return entry.watcher
+        }
+        lock.unlock()
+        // Waiting on one path must not block failure delivery or cancellation.
+        return zip(paths, watchers).compactMap { path, watcher in
+            watcher?.isArmed == true ? nil : path
         }
     }
 

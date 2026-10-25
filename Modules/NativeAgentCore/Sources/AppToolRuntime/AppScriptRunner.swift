@@ -1,13 +1,19 @@
 import AuthoredCapabilities
-import ChatOrchestration
+import ChatTurnRuntime
+import ChatTurnContracts
+import ChatToolRuntime
+import ChatSessionWork
+import ChatToolParsing
 import Foundation
 import MacControl
+import NativeAgentCore
 import PersistenceCore
 import Privacy
 import PersonaEngine
 import Senses
 import TrustCenter
 import ToolRegistry
+// Blueprint: | `AppScriptRunner.swift` | Shared-runner app host adapter, the signing key's file revision for invocation bindings, dependency shapes and ordinary turn-chain re-entry; NativeAgentSecretRedactor owns recursive credential recognition for ordinary typing and flow steps, alongside declared credential args; digest-only saved pins retain their historical encoding, while full saved contracts ignore retired scriptability metadata; an older door id or an older spelling of a part's action in a part's code resolves through `partAlias`, as a turn's call does; declarations grant no action authority |
 
 /// The app door supplies its registry and gate chain to the shared executor.
 /// Receipt classification, journal/replay, quotas and the VM have one owner.
@@ -18,30 +24,14 @@ enum AppScriptRunner {
     typealias ScriptError = OwnedProgramRunner.ScriptError
     typealias Replay = OwnedProgramRunner.Replay
 
-    static func run(source: String, preview: Bool, strict: Bool = false, input: JSONValue? = nil,
-                    replay: Replay? = nil, program: OwnedProgram? = nil,
-                    dataRoot: URL = PersistenceCore.defaultDataRoot(), perform: @escaping Perform) async -> JSONValue {
+    static func run(source: String, preview: Bool, dataRoot: URL = PersistenceCore.defaultDataRoot(), perform: @escaping Perform) async -> JSONValue {
         guard source.utf8.count <= sourceLimit else {
             return AppToolExecutor.doorRefusal("script_too_long",
                 "The script is \(source.utf8.count) bytes; the limit is \(sourceLimit). Nothing ran.",
                 remedy: "shorten", "Split it, or read first and act in a shorter script.")
         }
-        if let input {
-            guard case .object = input, let text = try? input.serialize(pretty: false), text.utf8.count <= OwnedProgramRunner.inputLimit else {
-                return AppToolExecutor.doorRefusal("invalid_input",
-                    "A script's input is one JSON object of at most \(OwnedProgramRunner.inputLimit) bytes. Nothing ran.",
-                    remedy: "correct_arguments", "Pass the input as one smaller object.")
-            }
-            if let path = secretPath(input) {
-                return AppToolExecutor.doorRefusal("secret_in_input",
-                    "\(path) carries a key or token, and a script's input never does. Nothing ran.",
-                    remedy: "use_actions", "Pass a key as a single app action, not in a script.")
-            }
-        }
-
-        let program = program ?? OwnedProgram(kind: strict ? .skill : .script, id: "app-script", version: "1",
-                                   source: source, entry: .functionBody)
-        return await runner(dataRoot: dataRoot).run(program, input: input, preview: preview, replay: replay, host: Host(call: perform, dataRoot: dataRoot))
+        let program = OwnedProgram(kind: .script, id: "app-script", version: "1", source: source, entry: .functionBody)
+        return await runner(dataRoot: dataRoot).run(program, input: nil, preview: preview, replay: nil, host: Host(call: perform, dataRoot: dataRoot))
     }
 
     static func runner(dataRoot root: URL) -> OwnedProgramRunner {
@@ -54,23 +44,6 @@ enum AppScriptRunner {
 
     static func ownVersions(_ journal: [JSONValue]) -> [String] { OwnedProgramRunner.ownVersions(journal) }
     static func versionScope(_ version: String) -> String { OwnedProgramRunner.versionScope(version) }
-
-    /// The first place a script's input carries a key or token: a field
-    /// named as one, or a value shaped like one.
-    static func secretPath(_ value: JSONValue, at path: String = "input") -> String? {
-        switch value {
-        case .string(let text): return NativeAgentSecretRedactor.redactText(text) == text ? nil : path
-        case .array(let list): return list.indices.lazy.compactMap { secretPath(list[$0], at: "\(path)[\($0)]") }.first
-        case .object(let fields):
-            return fields.keys.sorted().lazy.compactMap { key -> String? in
-                if ["api_key", "apikey", "token", "access_token", "refresh_token", "password", "passphrase", "secret",
-                    "client_secret", "private_key", "authorization", "cookie", "credential", "credentials", "bearer"]
-                    .contains(key.lowercased()), fields[key] != .null { return "\(path).\(key)" }
-                return secretPath(fields[key] ?? .null, at: "\(path).\(key)")
-            }.first
-        default: return nil
-        }
-    }
 
     /// Door args from a script call: one object is the args by name (a second
     /// object carries expected_version or preview); anything else is
@@ -110,10 +83,11 @@ enum AppScriptRunner {
         return .success(input)
     }
 
-    /// A key or token never rides a script: its source is kept, so the key
-    /// goes in a single app action, whose args are redacted.
+    /// Saved source refuses credential shapes and declared credential args;
+    /// ordinary typing uses the same recursive detector as every script input.
     private static func secretRefusal(_ action: AppAction, _ args: [String: JSONValue]) -> ScriptError? {
-        guard action.secretArgs.contains(where: { args[$0].map { $0 != .null && $0 != .string("") } ?? false })
+        guard NativeAgentSecretRedactor.secretPath(.object(args)) != nil
+            || action.secretArgs.contains(where: { args[$0].map { $0 != .null && $0 != .string("") } ?? false })
         else { return nil }
         return ScriptError(reason: "secret_in_script",
             detail: "Pass a key as a single app action, not in a script: \(action.id) was not run.")
@@ -128,40 +102,35 @@ enum AppScriptRunner {
         let call: Perform
         var reach = Host.unwiredReach
         var validation: (@Sendable ([String: JSONValue], OwnedProgramFixtures) async -> JSONValue)?
-        var toolHost = false
         var dataRoot = PersistenceCore.defaultDataRoot()
         var admit: @Sendable (String, [String: JSONValue]) async -> JSONValue? = { _, _ in
             AppToolExecutor.failure("door_unavailable", "Authored execution requires the originating Trust gate.")
         }
         func dependencyRevision(_ dependencies: [String]) throws -> [String] {
-            let paths = Set(["tools/.manifest_signing_key"]).union(dependencies.flatMap { resolved($0)?.dependencyFiles ?? [] })
-            return try [String(AppActionBinding.registeredToolCount),
-                AppActions.senses().map { $0.id + ":" + $0.page }.sorted().joined(separator: ",")]
-                + paths.sorted().map { try AbilityStore.fileRevision(dataRoot.appendingPathComponent($0)) }
+            try [String(AppActionBinding.registeredToolCount),
+                AppActions.senses().map { $0.id + ":" + $0.page }.sorted().joined(separator: ","),
+                AbilityStore.fileRevision(SwiftNativeManifestSigner(dataRoot: dataRoot).keyPath)]
         }
-        var actionIDs: [String] { (AppActions.all + AppActions.mcp(dataRoot: dataRoot) + AppActions.authored(dataRoot: dataRoot) + AppActions.senses()).map(\.id) }
+        var actionIDs: [String] { (AppActions.all + AppActions.authored(dataRoot: dataRoot) + AppActions.senses()).map(\.id) }
         var floorReasons: Set<String> { AppToolExecutor.doorFloorReasons }
         var scriptKey: String { AppToolExecutor.doorScriptKey }
         func action(_ id: String) -> OwnedProgramAction? {
-            resolved(id).map { action in
-                OwnedProgramAction(id: action.id, page: action.page, read: action.read, advisory: action.advisory, partID: action.partAction ? action.tool : nil,
-                                   program: action.authored, readOnly: { action.readOnly(args: $0) })
+            if let action = resolved(id) {
+                return OwnedProgramAction(id: action.id, page: action.page, read: action.read, advisory: action.advisory, partID: action.partAction ? action.tool : nil,
+                                          program: action.authored, versioned: !action.versionExempt, readOnly: { action.readOnly(args: $0) })
             }
+            // An older door, or an older spelling of a part's own action: the
+            // door answers it through its alias, with the alias note.
+            guard let alias = AppToolExecutor.partAlias(id, [:], root: dataRoot) else { return nil }
+            let target = AppActions.action(alias.id, dataRoot: dataRoot)
+            return OwnedProgramAction(id: id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), page: target?.page ?? "tools",
+                                      read: target?.read ?? false, program: target?.authored ?? alias.id.hasPrefix("authored."),
+                                      readOnly: { target?.readOnly(args: $0) ?? false })
         }
         func canonicalAction(_ id: String) -> String { resolved(id)?.id ?? AppActions.pagePrefixedAction(id)?.id ?? id }
+        /// A part's call takes its args by name, or positionally as the action's line declares them.
         func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], ScriptError> {
-            if toolHost {
-                let named: [String: JSONValue]
-                if given.isEmpty { named = [:] }
-                else if given.count == 1, case .object(let object) = given[0] { named = object }
-                else {
-                    return .failure(ScriptError(reason: "invalid_args", detail: "An authored dependency takes no arguments or one named argument object; two or more arguments or a non-object are not accepted."))
-                }
-                guard let action = resolved(id) else { return AppScriptRunner.doorInput(id: id, given: given, dataRoot: dataRoot) }
-                if let refusal = AppScriptRunner.secretRefusal(action, named) { return .failure(refusal) }
-                return .success(["action": .string(action.id), "args": .object(named)])
-            }
-            return AppScriptRunner.doorInput(id: id, given: given, dataRoot: dataRoot)
+            AppScriptRunner.doorInput(id: id, given: given, dataRoot: dataRoot)
         }
         func opensHomeItem(_ input: [String: JSONValue]) -> Bool { AppToolExecutor.opensHomeItem(input) }
         func secretLine(_ text: String) -> Bool { MacInjectionArgRedaction.namesAppDoorSecretAction(text) }
@@ -204,18 +173,27 @@ enum AppScriptRunner {
         func resolved(_ id: String) -> AppAction? {
             AppActions.action(id, dataRoot: dataRoot)
         }
+        /// An alias's contract is the alias itself: the one form answers it.
         func dependencyShape(_ id: String) -> JSONValue? {
-            guard let action = resolved(id) else { return nil }
-            return AppActions.dependencyContract(action, dataRoot: dataRoot)
+            if let action = resolved(id) { return AppActions.dependencyContract(action, dataRoot: dataRoot) }
+            return AppToolExecutor.partAlias(id, [:], root: dataRoot).map { _ in
+                .object(["alias": .string(id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())])
+            }
         }
         func dependencyPin(_ id: String) -> String? {
             dependencyShape(id).flatMap(pin)
         }
         private func pin(_ shape: JSONValue) -> String? {
-            guard let digest = try? OwnedProgramStore.hash(shape) else { return nil }
+            guard case .object(var legacy) = shape else { return nil }
+            // Preserve admitted digest-only pins; this retired field is hash
+            // compatibility, never discovery or a callability decision.
+            legacy["scriptable"] = .bool(true)
+            guard let digest = try? OwnedProgramStore.hash(.object(legacy)) else { return nil }
             return AppActions.legacyContractPins[digest] ?? digest
         }
         func dependencyMatches(_ id: String, _ saved: JSONValue?) -> Bool {
+            // Whatever an older door's contract was, its alias answers every call it took.
+            if resolved(id) == nil, AppToolExecutor.partAlias(id, [:], root: dataRoot) != nil { return saved != nil }
             guard let saved, let current = dependencyShape(id) else { return false }
             if saved == current || saved == pin(current).map(JSONValue.string) { return true }
             // A full shape (older authored tools stored theirs inside discovery) still
@@ -226,6 +204,16 @@ enum AppScriptRunner {
         func admitTool(_ id: String, input: [String: JSONValue]) async -> JSONValue? { await admit(id, input) }
         func performReach(_ operation: String, arguments: JSONValue) async throws -> JSONValue {
             try await reach(operation, arguments)
+        }
+        func think(messages: [LLMMessage], tools: [String], surface: String?, host: any OwnedProgramHostProfile) async -> OwnedProgramThought {
+            let scoped = PartThoughtTools(host: host, names: tools, userText: ChatToolSessionContext.userText)
+            let client = makeChatOrchestrationClient(tools: scoped, dataRoot: dataRoot)
+            do {
+                let output = try await client.runPartToolTurn(messages: messages, surface: surface)
+                return .init(output: .success(output), effects: await scoped.effects)
+            } catch {
+                return .init(output: .failure(error), effects: await scoped.effects)
+            }
         }
     }
 }
@@ -245,6 +233,6 @@ extension AppToolExecutor {
     public static func authoredProgramHost(dataRoot: URL,
         reach: (@Sendable (String, JSONValue) async throws -> JSONValue)? = nil,
         admit: @escaping @Sendable (String, [String: JSONValue]) async -> JSONValue?) -> any OwnedProgramToolHost {
-        AppScriptRunner.Host(call: doorCall(), reach: reach ?? AppScriptRunner.Host.unwiredReach, toolHost: true, dataRoot: dataRoot, admit: admit)
+        AppScriptRunner.Host(call: doorCall(), reach: reach ?? AppScriptRunner.Host.unwiredReach, dataRoot: dataRoot, admit: admit)
     }
 }

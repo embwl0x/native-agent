@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 
+// Blueprint: | `ContextCorrectionScope.swift` | `ContextCorrectionScope`: applicability gates for canonical corrections and endpoint-scoped graph relations; selection utility grants no authority |
+
 /// Applicability is not authority. Existing corrections remain global unless
 /// their canonical memory explicitly supplies topics; attention/utility cannot
 /// make a topic-scoped correction apply to an unrelated conversation.

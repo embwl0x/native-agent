@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `OncePerPeriodReservation.swift` | `OncePerPeriodReservation`: locked durable periodic admission and stamp-specific restoration of a failed reservation |
+
 /// Outcome of a `reserveOncePerPeriod` attempt.
 public enum OncePerPeriodReservation: Sendable {
     /// This tick won the slot. `stamp` is the exact marker value this

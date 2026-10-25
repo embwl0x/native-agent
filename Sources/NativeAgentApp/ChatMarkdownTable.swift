@@ -1,6 +1,8 @@
 import EngineRuntime
 import SwiftUI
 
+// Blueprint: | `ChatMarkdownTable.swift` | `ChatMarkdownTableParser` and view: pure prose segmentation, alignment/cell parsing and rendered transcript tables |
+
 // Third pass (the conversation itself), item 2. A Markdown table used to land
 // in the transcript as pipes and dashes: the rich-content model knows prose and
 // fenced code only, and the prose path falls through to inline text. The

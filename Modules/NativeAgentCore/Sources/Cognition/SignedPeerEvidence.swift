@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `SignedPeerEvidence.swift` | `SignedPeerEvidence` struct |
 
 /// Latest authenticated observation of the paired iOS peer: the one record of
 /// when the phone was last heard from.

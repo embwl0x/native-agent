@@ -3,6 +3,8 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Transcripts
+// Blueprint: | `ChatTranscriptEvidenceRendering.swift` | recorded tool outcomes and attachment evidence; voice history renders the retained utterance and original audio reference; re-exports ChatToolParsing's shared result classification |
 
 /// Pure presentation of evidence already recorded by transcript persistence.
 /// Shared by history and compaction; no storage, semantic interpretation,
@@ -175,16 +177,12 @@ package enum ChatTranscriptEvidenceRendering {
         return "[sent \(label): \(references)]"
     }
 
-    /// Origin records a route, not permission or an attested worker identity.
-    /// Coordinator instructions and returns share it; roles stay unchanged.
-    package static func recordedOriginLabel(_ value: JSONValue?) -> String? {
-        guard case .object(let origin)? = value else { return nil }
-        switch (string(origin["surface"]), string(origin["agent"])) {
-        case ("codex-bridge", "codex"): return "Codex bridge"
-        case ("claude-bridge", "claude"): return "Claude bridge"
-        case ("omp-bridge", "omp"): return "OMP bridge"
-        default: return "unattributed route"
-        }
+    /// Only contact speech has an origin decoration, under the same display
+    /// rule as every other reader. Her own rows and the person's stay theirs.
+    package static func recordedOriginLabel(_ row: [String: JSONValue], role: String? = nil) -> String? {
+        let line = ContactThread.Line(row, role: role)
+        guard line.contact else { return nil }
+        return ContactThread.project([line]).first?.speaker
     }
 
     /// Fragments remain useful evidence, but not completed replies. Only the
@@ -192,8 +190,8 @@ package enum ChatTranscriptEvidenceRendering {
     package static func recordedIncompleteReplyLabel(
         extras: [String: JSONValue]?, metadata: [String: JSONValue]?
     ) -> String? {
-        if case .bool(true)? = extras?["cancelled"] { return "cancelled" }
-        if case .bool(true)? = metadata?["cancelled"] { return "cancelled" }
+        if case .bool(true)? = extras?["cancelled"] { return "stopped" }
+        if case .bool(true)? = metadata?["cancelled"] { return "stopped" }
         if case .bool(true)? = metadata?["partial"] { return "interrupted" }
         return nil
     }

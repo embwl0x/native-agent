@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import StandingBots
+// Blueprint: | `AgentConversationRouting.swift` | `AgentConversationRouting` enum; `route`, `wrap` |
 
 /// Argument translation only. Callers must dispatch through the original tool's
 /// admission and execution owners; this type grants no authority or tool access.
@@ -23,6 +24,7 @@ public enum AgentConversationRouting {
     }
 
     public static func namingSavedContact(_ tool: String, _ input: [String: JSONValue], dataRoot: URL?) throws -> [String: JSONValue] {
+        if tool == "agent_message", HelperContact.matches(input) { return input }
         guard ["agent_message", "agent_read", "agent_cancel"].contains(tool), let dataRoot,
               case .string(let raw)? = input["agent"], !raw.contains(":") else { return input }
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -42,6 +44,7 @@ public enum AgentConversationRouting {
     }
 
     public static func route(tool: String, input: [String: JSONValue], dataRoot: URL? = nil) throws -> Route? {
+        if tool == "agent_message", HelperContact.matches(input) { return nil }
         guard tool == "agent_message" || tool == "agent_read" else { return nil }
         if let details = input["details"], details != .null {
             guard tool == "agent_read", case .bool = details else { throw invalid("details is a boolean for agent_read only.") }

@@ -9,17 +9,15 @@ import PersistenceCore
 import TurnTrace
 import PersonaEngine
 import MemoryV2
-import MCPDispatcher
 import ProviderRouting
 import ToolRegistry
 import TrustCenter
-import KnowledgeGraph
-import XConnector
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
 import StandingBots
+// Blueprint: | `ChatOrchestrationClient+DispatchWrappers.swift` | `FileAccessGatedDispatcher` class; `preApprovalRefusal`, `approvalCardReason`, `sharedFileAccess`; `sharedChatFileAccess`; carries the chain's file access to the organs and refuses only an unrecognized mode and a pathful read under `none` (no tool-name lists; admission is posture × declared class in TrustCenter); declared part app-data reach approves matching read/write paths; peer approval uses the declared class without an external-tool resolver; `AutonomyGatedDispatcher` audit rows that fail are owed repairs |
 
 // MARK: - File-access wrapping dispatcher
 
@@ -175,10 +173,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     /// that the executor spent moments ago, and it is good for exactly one
     /// dispatch. Nil ⇒ no replay exemption is granted at all (fail closed).
     private let approvedReplayVerifier: (any ApprovedReplayVerifying)?
-    /// Whether an external `mcp__*` tool has effects, per the MCP registry's
-    /// own per-tool risk metadata. Used only on peer turns. Nil ⇒ every
-    /// external tool is treated as effectful (fail closed).
-    private let externalToolIsEffect: (@Sendable (String) -> Bool)?
     /// The data root whose persona documents a first-conversation write would
     /// target — supplied ONLY by the Mac chat dispatcher, and nil on every
     /// other chain (bridge, background, ephemeral, approval replay), which is
@@ -227,13 +221,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         approvedReplay: ApprovedChatToolReplay? = nil,
         injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier,
         approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil,
-        externalToolIsEffect: (@Sendable (String) -> Bool)? = nil,
         firstConversationDataRoot: URL? = nil,
         peerDirectoryDataRoot: URL? = nil,
         fileAccess: String? = nil
     ) {
         self.fileAccess = fileAccess
-        self.externalToolIsEffect = externalToolIsEffect
         self.firstConversationDataRoot = firstConversationDataRoot
         self.peerDirectoryDataRoot = peerDirectoryDataRoot
         self.approvedReplayVerifier = approvedReplayVerifier
@@ -300,8 +292,12 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     }
                     try Task.checkCancellation()
                     result = event.record.decision == "approved" ? event.result
-                        ?? .object(["status": .string("failed"), "reason": .string("card_outcome_unavailable"),
-                            "detail": .string("The approved action returned no outcome; check its receipt before continuing.")])
+                        ?? .object(["status": .string("unknown"), "reason": .string("card_outcome_unavailable"),
+                            "effects": .string("unknown"), "approval_id": .string(approval),
+                            "detail": .string("Approved card \(approval) returned no outcome; approval alone does not prove the action completed."),
+                            "remedy": Repair.reconcile(instruction: "Read this exact card's retained execution record, then inspect the affected state before repeating the action.",
+                                nextCall: .object(["tool": .string("app"), "input": .object([
+                                    "action": .string("files.read"), "args": .object(["path": .string(securityCenter.dataRoot.appendingPathComponent("workflows/approvals/requests.json").path)])])]))])
                         : .object(["status": .string("failed"), "reason": .string(event.record.status == "orphaned" ? "approval_expired" : "declined"),
                             "detail": .string("workflows/approvals/requests.json card \(approval): status=\(event.record.status), decision=\(event.record.decision ?? "unanswered"). Nothing ran; the part is no longer waiting."), "effects": .string("none")])
                     if event.record.status == "orphaned", case .object(var fields) = result {
@@ -314,7 +310,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 await ApprovalLifecycleBus.shared.finish(id)
                 if let need = InlineInteractionNeed.interaction(in: result) {
                     guard let wait = AppDoorReentry.waitForInteraction else {
-                        throw ToolFailureError("A card needs the originating conversation.", effects: .none)
+                        throw ToolFailureError("Card \(need.id) cannot resume because the originating conversation is not bound to this call.",
+                            effects: .unknown, owner: "originating conversation",
+                            nextCall: (try? SwiftNativeTurnEngine.dispatchReceiptCall().serialize(pretty: false)),
+                            code: "card_conversation_unavailable",
+                            instruction: "Read this turn's receipts to locate the conversation for this card, then resolve the existing card there. Check its outcome before requesting the action again.", recovery: .reconcile)
                     }
                     result = await wait(need, tool, input)
                 }
@@ -530,23 +530,19 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // answers the same card, and Full Mac keeps an allowed connect allowed.
         let peerReasonMayReplace: Bool
         if case .deny = decision { peerReasonMayReplace = false } else { peerReasonMayReplace = true }
-        let protectedAction = PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: envelope.capabilities,
-            externalToolIsEffect: externalToolIsEffect, input: input,
-            workspaceRoot: NativeAgentWorkspaceRoot.resolve(dataRoot: peerDirectoryDataRoot ?? defaultDataRoot()),
-            relativeBases: SwiftToolDispatcher.builderSourceRepoRoot(
-                dataRoot: peerDirectoryDataRoot ?? defaultDataRoot()).map { [$0] } ?? [])
+        let protectedAction = PeerTurnEffectPolicy.requiresPeerApproval(tool, input: input)
         var decidedRequester = fullMacOn && protectedAction
             && ChatToolSessionContext.envelope?.workIdentity?.hasPrefix("carry.") == true ? "Full Mac" : nil
         if botDesktop, fullMacOn, case .allow = decision {
             await audit(Self.securityEnvelope(envelope, decision: .allow,
-                reason: "Agent decided for a helper"))
+                reason: "The agent decided for a helper"))
             decidedRequester = "a helper"
         }
         let peerTurnID = ChatToolSessionContext.envelope?.verifiedUserId
         let taint = PeerDataTaint.current
         let trustedBridge = PeerDataTaint.trustedTurn
-        let peerApproval = PeerDataTaintDispatcher.peerApproval(tool: tool, capabilities: envelope.capabilities, input: input,
-            surface: surface, fullMac: fullMacOn, protectedAction: protectedAction, peerName: peerDisplayName(peerID: peerTurnID))
+        let peerApproval = PeerDataTaintDispatcher.peerApproval(surface: surface,
+            protectedAction: protectedAction, peerName: peerDisplayName(peerID: peerTurnID))
         let requester = peerApproval.requester
         // The person answered this command's card (one card per command, User
         // 10-20): the peers that steer this run act for the rest of it.
@@ -565,14 +561,14 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     return source.contains(" ") ? source : source.prefix(1).uppercased() + source.dropFirst()
                 }.joined(separator: ", ")
                 decision = .requireApproval(reason: PeerTurnEffectPolicy.floorReason(
-                    tool: tool, input: input, capabilities: Set(envelope.capabilities), requester: named.isEmpty ? requester ?? "" : named,
+                    tool: tool, input: input, requester: named.isEmpty ? requester ?? "" : named,
                     quote: Self.peerQuote(taint?.lastLine ?? "")))
             } else if let requester, protectedAction {
                 if fullMacOn {
                     // Hers under Full Mac (User 10-01): no card, and he sees it.
                     if case .allow = decision {
                         await audit(Self.securityEnvelope(envelope, decision: .allow,
-                            reason: "Agent decided for \(requester)"))
+                            reason: "The agent decided for \(requester)"))
                         decidedRequester = requester
                     }
                 } else if peerApproval.required {
@@ -686,10 +682,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 return ChatToolOutcome.refusedBeforeRunning(refusal)
             }
             let ownsACPConnectCard: Bool
-            if tool == "agent_connect", case .string(let name)? = input["name"],
-               input["endpoint"] == nil, input["app_bundle_id"] == nil,
-               input["disconnect"] == nil,
-               input["transport"] == nil || input["transport"] == .string("auto") {
+            if namedConnect, case .string(let name)? = input["name"] {
                 ownsACPConnectCard = AgentHostDirectory.row(named: name)?.acp != nil
             } else { ownsACPConnectCard = false }
             if !securityAsked, envelope.capabilities.contains("approval_stage") || ownsACPConnectCard {
@@ -941,7 +934,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 try await AgentHostConnection.$personApproved.withValue(personApprovedHost) {
                     if let call = AuthoredToolEffects.call, call.tool == tool { return try await call.perform() }
                     if AuthoredToolEffects.primitiveCapabilities[tool] != nil || tool.hasPrefix("fetch.") {
-                        throw AutonomyGateError.toolDenied(reason: "The originating part run ended. Call the part again; its broker cannot be recreated for replay.")
+                        throw ToolFailureError("The originating ability run ended; its primitive broker is no longer available. This primitive call did not run.",
+                            effects: .none, owner: "originating ability run",
+                            nextCall: (try? SwiftNativeTurnEngine.dispatchReceiptCall().serialize(pretty: false)),
+                            code: "primitive_broker_ended", status: .refused,
+                            instruction: "Read the originating run's receipts and inspect any uncertain effects. A new ability run is new execution, not a replay of this primitive; start one only after reconciling earlier work.", recovery: .reconcile)
                     }
                     return try await inner.dispatch(tool: tool, input: finalInput, surface: surface)
                 }

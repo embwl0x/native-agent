@@ -2,6 +2,7 @@ import AgentWorkspace
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+// Blueprint: | `ToolCausalBoundary.swift` | `ToolCausalBoundary` enum; `hasCanonicalMotorOwner`, `motorReference` |
 
 /// Pure edge contract between an immediate tool envelope and the canonical
 /// domain owner that can later prove what actually happened. This type owns no
@@ -12,7 +13,6 @@ public enum ToolCausalBoundary {
         case workshopExecution = "workshop_execution"
         case browser
         case macControl = "mac_control"
-        case externalSend = "external_send"
         case agentBridge = "agent_bridge"
     }
 
@@ -41,28 +41,6 @@ public enum ToolCausalBoundary {
             return nil
         }
         return reference(tool: rawTool, object: output)
-    }
-
-    /// Used when a domain owner may have durably recorded an operation before
-    /// its client throws and therefore no result envelope is available.
-    public static func motorReference(
-        tool rawTool: String,
-        ownerActionID rawOwnerActionID: String
-    ) -> MotorReference? {
-        guard let binding = binding(for: rawTool),
-              let ownerActionID = normalizedIdentity(rawOwnerActionID) else { return nil }
-        return MotorReference(domain: binding.domain, ownerActionID: ownerActionID)
-    }
-
-    /// External MCP results are transport evidence, never self-certifying
-    /// evidence that an external effect settled. NativeAgent's compatibility
-    /// MCP server is excluded because it has no external transport/effect.
-    public static func isExternalProtocolTool(_ rawTool: String) -> Bool {
-        let normalized = rawTool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard normalized.hasPrefix("mcp__") else { return false }
-        let remainder = normalized.dropFirst("mcp__".count)
-        guard let separator = remainder.range(of: "__") else { return false }
-        return remainder[..<separator.lowerBound] != "nativeagent-internal"
     }
 
     private static func reference(tool rawTool: String, object output: JSONValue) -> MotorReference? {
@@ -109,8 +87,6 @@ public enum ToolCausalBoundary {
         // reads set no effect at all (no CGEvent, no AXUIElementPerformAction,
         // no attribute write), so they have no motor owner to reference.
         // Binding them would manufacture a consequence that never happened.
-        case "external_send", "slack_post_message", "agentmail_send":
-            return (.externalSend, ["approvalId", "approval_id"])
         // Builder messages settle asynchronously. The durable bridge job owns
         // the returned message id, which is the exact key used by
         // DelegationStatusProjector and the event-driven outcome loop.

@@ -1,6 +1,8 @@
 import Foundation
 import Darwin
 
+// Blueprint: | `FileLockSidecarLifecycle.swift` | `FileLockSidecarLifecycle`: bounded locked reaping of old regular orphan sidecars; live/fresh/link sidecars stay untouched |
+
 private final class FileLockSidecarEnumerationFailure: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: Error?

@@ -6,8 +6,9 @@ import PersistenceCore
 import NotificationInbox
 import Privacy
 import MacIntegration
-import ChatOrchestration
+import ChatToolRuntime
 import ProviderRouting
+// Blueprint: | `InlineInteractionDelivery.swift` | Inbox pointers and inline-card delivery; BackgroundLoops owns observation and cancellation; `settle` releases its notification token and joins the retained recovery scan |
 
 /// Inbox rows are pointers. The originating transcript still owns the card,
 /// its revision, verification and continuation, on every surface.
@@ -39,7 +40,7 @@ public enum InlineInteractionDelivery {
         }
         if action == "verify" {
             let selection = try await InlineInteractionResolver.selectionForReturn(card, dataRoot: dataRoot)
-            let checked = card.state.failureReason == nil ? card : try await InlineInteractionResolver.begin(
+            let checked = !card.state.isRetryable ? card : try await InlineInteractionResolver.begin(
                 id: id, sessionID: session, expectedRevision: revision, dataRoot: dataRoot)
             let settled = try await InlineInteractionResolver.complete(id: id, sessionID: session,
                 selection: selection, scope: card.kind == .modelChoice ? .persistent : nil,
@@ -53,7 +54,7 @@ public enum InlineInteractionDelivery {
             throw NSError(domain: "InteractionCard", code: 2, userInfo: [NSLocalizedDescriptionKey: "The Mac's controls are unavailable."])
         }
         switch descriptor.control {
-        case .internetAccounts, .chromeSetup, .pairDevice, .trustPostureRequired, .connectorOAuth:
+        case .internetAccounts, .chromeSetup, .pairDevice, .trustPostureRequired, .keyring:
             return ["status": "error", "message": "This request needs its Mac setup control. Complete it on the Mac, then tap Check again here."]
         case .unknown, .unavailable:
             return ["status": "error", "message": descriptor.unavailableReason ?? "This build has no control for this card."]
@@ -153,25 +154,31 @@ public enum InlineInteractionDelivery {
     }
 
     @MainActor
-    public static func observe() async {
+    public static func observe(dataRoot root: URL = PersistenceCore.defaultDataRoot()) async {
+        guard !Task.isCancelled else { return }
         // Register before recovery so an arrival racing the initial read is
         // buffered. Notifications carry IDs only, never authority or secrets.
-        let changes = NotificationCenter.default.notifications(named: InlineInteractionWire.changedNotification)
-            .compactMap { $0.object as? String }
-        let root = PersistenceCore.defaultDataRoot()
+        let (changes, continuation) = AsyncStream<String>.makeStream()
+        nonisolated(unsafe) let token = NotificationCenter.default.addObserver(
+            forName: InlineInteractionWire.changedNotification, object: nil, queue: nil
+        ) { notification in
+            if let session = notification.object as? String { continuation.yield(session) }
+        }
+        continuation.onTermination = { _ in NotificationCenter.default.removeObserver(token) }
         // Recover delivery pointers from durable cards after a relaunch. This
         // is one pass, not a polling scan; subsequent reads target one session.
         // Only transcripts whose bytes hold an interaction row are parsed: the
         // rest have no card to recover, and parsing every one held the launch.
-        let sessions = await Task.detached(priority: .utility) {
+        let recovery = Task.detached(priority: .utility) {
             let directory = root.appendingPathComponent("chat/messages", isDirectory: true)
             let marker = Data(InlineInteractionWire.transcriptKind.utf8)
             do {
                 return try FileManager.default.contentsOfDirectory(at: directory,
                     includingPropertiesForKeys: nil).filter { $0.pathExtension == "jsonl" }
                     .filter { url in
+                        guard !Task.isCancelled else { return false }
                         // An unreadable one is still handed on, so its read failure is logged.
-                        autoreleasepool {
+                        return autoreleasepool {
                             (try? Data(contentsOf: url, options: .alwaysMapped)).map { $0.range(of: marker) != nil } ?? true
                         }
                     }
@@ -180,15 +187,27 @@ public enum InlineInteractionDelivery {
                 nativeLog("[interaction-notification] recovery read failed: %@", error.localizedDescription)
                 return []
             }
-        }.value
-        for session in sessions {
-            guard !Task.isCancelled else { return }
-            await refresh(sessionID: session, dataRoot: root, notify: false)
         }
-        await InlineInteractionResolver.platform.writeInteractionSnapshots()
-        for await session in changes {
+        await withTaskCancellationHandler {
+            let sessions = await recovery.value
+            for session in sessions {
+                guard !Task.isCancelled else { return }
+                await refresh(sessionID: session, dataRoot: root, notify: false)
+            }
             guard !Task.isCancelled else { return }
-            await refresh(sessionID: session, dataRoot: root, notify: true)
+            await InlineInteractionResolver.platform.writeInteractionSnapshots()
+            for await session in changes {
+                guard !Task.isCancelled else { return }
+                await refresh(sessionID: session, dataRoot: root, notify: true)
+            }
+        } onCancel: {
+            continuation.finish()
+            recovery.cancel()
+        }
+        await settle {
+            continuation.finish()
+            recovery.cancel()
+            _ = await recovery.value
         }
     }
 
@@ -196,7 +215,7 @@ public enum InlineInteractionDelivery {
     private static func refresh(sessionID: String, dataRoot: URL, notify: Bool) async {
         guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) == sessionID else { return }
         let result = await InlineInteractionResolver.checkedInteractionsByRow(sessionID: sessionID, dataRoot: dataRoot)
-        guard case .success(let pairs) = result, !pairs.isEmpty else { return }
+        guard !Task.isCancelled, case .success(let pairs) = result, !pairs.isEmpty else { return }
         let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
         let activeIDs: Set<String>
         do {
@@ -211,9 +230,11 @@ public enum InlineInteractionDelivery {
             nativeLog("[interaction-notification] inbox read failed: %@", error.localizedDescription)
             return
         }
+        guard !Task.isCancelled else { return }
         var changed = false
         let owed = Set(((try? await ExperienceStore.at(dataRoot).open()) ?? []).map(\.id))
         for pair in pairs {
+            guard !Task.isCancelled else { return }
             let card = pair.interaction
             let id = "interaction:\(card.id)"
             // The card is a decision the person owes her, under the id she is
@@ -259,6 +280,7 @@ public enum InlineInteractionDelivery {
                 ]
                 if held, notify { row["held_delivery"] = .array([.string("phone"), .string("mac")]) }
                 let inserted = try await inbox.appendUnique(.object(row), id: id)
+                guard !Task.isCancelled else { return }
                 changed = inserted || changed
                 // The note's claim permits another delivery attempt without
                 // duplicating a mirror outside its originating conversation.
@@ -267,6 +289,7 @@ public enum InlineInteractionDelivery {
                     telegram: InlineInteractionResolver.platform.telegramApprovalFiler, quiet: held || !notify) {
                     changed = true
                 }
+                guard !Task.isCancelled else { return }
                 guard inserted, notify, !held else { continue }
                 do {
                     try await InlineInteractionResolver.platform.routeInteractionAttention(
@@ -275,6 +298,7 @@ public enum InlineInteractionDelivery {
                 } catch {
                     nativeLog("[interaction-notification] push failed: %@", error.localizedDescription)
                 }
+                guard !Task.isCancelled else { return }
                 await InlineInteractionResolver.platform.postInteractionBanner(
                     title: title, body: body, sessionID: sessionID
                 )
@@ -282,9 +306,9 @@ public enum InlineInteractionDelivery {
                 nativeLog("[interaction-notification] delivery failed: %@", error.localizedDescription)
             }
         }
-        guard changed else { return }
+        guard changed, !Task.isCancelled else { return }
         await InlineInteractionResolver.platform.refreshInteractionInbox()
-        if notify { await InlineInteractionResolver.platform.writeInteractionSnapshots() }
+        if notify, !Task.isCancelled { await InlineInteractionResolver.platform.writeInteractionSnapshots() }
     }
 
     /// The same signed inbox-action transport the phone already uses. Opening

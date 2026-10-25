@@ -4,6 +4,7 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import Transcripts
+// Blueprint: | `ChatHistoryIndex.swift` | `ChatHistoryIndex` class; `shared`, `absorb`, `absorbAll`; durable content-addressed index of transcript lines for history search (chat/index/history.sqlite) |
 
 /// One durable index per history. Every transcript line is projected for
 /// search once in its life and kept by the hash of its bytes, so a line that
@@ -17,6 +18,7 @@ import Transcripts
 /// Derived and rebuildable: chat/index can be dropped at the cost of one
 /// rebuild. The database mirrors the in-memory index; a database that cannot
 /// open or write leaves search working from memory and says so in her pulse.
+/// SQLite/WAL/SHM are excluded from backup, export and phone sync; PrivacyMap: chat.
 public final class ChatHistoryIndex: @unchecked Sendable {
     /// The code that projects rows. Projection applies redaction, peer
     /// provenance and tool names owned elsewhere, so each row carries the build
@@ -64,6 +66,9 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         DispatchQueue.concurrentPerform(iterations: listed.count) { _ = try? lines(at: listed[$0].1, current: true) }
         let parsed = parsedCount() - before
         let seconds = Date().timeIntervalSince(started)
+        lock.lock()
+        let storeError = self.storeError
+        lock.unlock()
         OrganPulse.record("history_index", found: parsed,
             note: "\(listed.count) transcripts, \(parsed) new lines, \(String(format: "%.1f", seconds)) s"
                 + (storeError.map { "; not durable: \($0)" } ?? ""))

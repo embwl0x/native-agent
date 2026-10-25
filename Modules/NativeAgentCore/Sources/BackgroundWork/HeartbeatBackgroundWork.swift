@@ -9,6 +9,8 @@ import WorkshopExecution
 import AgentWorkspace
 import NotificationInbox
 import Privacy
+import Cognition
+// Blueprint: | `HeartbeatBackgroundWork.swift` | `HeartbeatBackgroundWork` struct; `makeHeartbeatLoop` uses per-condition templates without a model call; `HeartbeatLoop` owns heartbeat work |
 
 // MARK: - Heartbeat and Self-Healing
 
@@ -19,7 +21,7 @@ public struct HeartbeatBackgroundWork: Sendable {
 
     // MARK: - U2b wave 3 lane A: heartbeat + self-healing
 
-    /// Interval health heartbeat (U2b wave 3, plan design #6). Reads
+    /// Health heartbeat driven by assessment-input changes and age crossings. Reads
     /// `HEARTBEAT.md` from the persona dir, gathers a compact live signal
     /// block (stuck executions / Full-Mac expiry / Doctor),
     /// and surfaces deterministic anomalies as stable inbox cards. Clean
@@ -29,9 +31,9 @@ public struct HeartbeatBackgroundWork: Sendable {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> HeartbeatLoop {
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-        // Live-verify hook: a terminal-launched bundle can shrink the interval
+        // Live-verify hook: a terminal-launched bundle can shrink the integrity interval
         // (NATIVE_AGENT_HEARTBEAT_INTERVAL_SECONDS=60) to watch a real tick.
-        // The normal `open`-launched app never has this set → twice daily.
+        // The normal `open`-launched app never has this set → 12h integrity.
         // Floor at 1s: interval ≤ 0 reaches Task.sleep(0) in the scheduler —
         // a tight busy loop.
         let interval = ProcessInfo.processInfo
@@ -40,6 +42,36 @@ public struct HeartbeatBackgroundWork: Sendable {
             .flatMap { $0.isFinite && $0 >= 1 ? $0 : nil } ?? HeartbeatLoop.defaultInterval
         return HeartbeatLoop(
             interval: interval,
+            events: {
+                let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
+                let desk = SwiftNativeDeskStore(dataRoot: dataRoot)
+                let executions = dataRoot.appendingPathComponent("workshop/executions", isDirectory: true)
+                let workflows = dataRoot.appendingPathComponent("workflows/run_state", isDirectory: true)
+                let executionFiles = ((try? FileManager.default.contentsOfDirectory(
+                    at: executions, includingPropertiesForKeys: nil)) ?? [])
+                    .map { ExecutionRecordFile.canonicalPath(in: $0) }
+                let workflowFiles = (try? FileManager.default.contentsOfDirectory(
+                    at: workflows, includingPropertiesForKeys: nil)) ?? []
+                // Nested records created after subscription retain the 12h
+                // missed-event backstop; the vnode watcher is not recursive.
+                return EventDeadlinePhysiology.storeAndFileEvents(
+                    paths: [personaRoot.appendingPathComponent("HEARTBEAT.md"),
+                            dataRoot.appendingPathComponent("doctor/latest.json"),
+                            ledger.eventsPath, ledger.basePath, desk.opsPath, desk.basePath,
+                            executions, workflows,
+                            dataRoot.deletingLastPathComponent().appendingPathComponent("docs/eval_acknowledgments.json")]
+                        + executionFiles + workflowFiles
+                        + ErrorFeeds.errorFeeds.map { $0.url(dataRoot: dataRoot) }
+                        + DelegationStatusProjector(dataRoot: dataRoot).watchedPaths,
+                    stores: [.desk],
+                    notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange,
+                        DeskContinuationScheduler.ownerReceiptChanged],
+                    loopId: "heartbeat"
+                )
+            },
+            nextDeadline: { now in
+                await nextHeartbeatAssessmentDeadline(dataRoot: dataRoot, after: now)
+            },
             loadChecklist: {
                 let path = personaRoot.appendingPathComponent("HEARTBEAT.md")
                 return try? String(contentsOf: path, encoding: .utf8)
@@ -107,6 +139,76 @@ public struct HeartbeatBackgroundWork: Sendable {
     }
 
     private let heartbeatExecutionStuckAge: TimeInterval = 6 * 60 * 60
+    private let heartbeatWorkflowStaleAge: TimeInterval = 60 * 60
+    private let heartbeatClaimStaleAge: TimeInterval = 24 * 60 * 60
+    private let heartbeatDeskStaleAge: TimeInterval = 30 * 24 * 60 * 60
+
+    /// Time alone can make a retained input stale or clear an error burst.
+    /// Project those crossings; changed inputs rearm the same manager deadline.
+    private func nextHeartbeatAssessmentDeadline(dataRoot: URL, after now: Date) async -> Date? {
+        var deadlines: [Date] = []
+        func include(_ stamp: String?, age: TimeInterval, strict: Bool = false) {
+            guard let stamp, let at = parseHeartbeatISO(stamp) else { return }
+            let crossing = at.addingTimeInterval(age + (strict ? 0.001 : 0))
+            if crossing > now { deadlines.append(crossing) }
+        }
+        func object(at path: URL) -> [String: Any]? {
+            guard let data = try? Data(contentsOf: path) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }
+        let executions = dataRoot.appendingPathComponent("workshop/executions", isDirectory: true)
+        for directory in (try? FileManager.default.contentsOfDirectory(at: executions, includingPropertiesForKeys: nil)) ?? [] {
+            guard let row = object(at: ExecutionRecordFile.canonicalPath(in: directory)),
+                  let status = row["status"] as? String,
+                  ["queued", "running", "blocked_on_approval"].contains(status) else { continue }
+            include(row["updated_at"] as? String ?? row["created_at"] as? String, age: heartbeatExecutionStuckAge)
+        }
+        let workflows = dataRoot.appendingPathComponent("workflows/run_state", isDirectory: true)
+        let activeWorkflowStatuses: Set<String> = [
+            "queued", "ready", "running", "waiting_approval", "awaiting_approval", "blocked", "recovery_required",
+        ]
+        for file in (try? FileManager.default.contentsOfDirectory(at: workflows, includingPropertiesForKeys: nil)) ?? []
+            where file.pathExtension.lowercased() == "json" {
+            guard let row = object(at: file), let status = (row["status"] as? String)?.lowercased(),
+                  activeWorkflowStatuses.contains(status) else { continue }
+            include(row["updatedAt"] as? String ?? row["updated_at"] as? String
+                    ?? row["createdAt"] as? String ?? row["created_at"] as? String,
+                    age: heartbeatWorkflowStaleAge, strict: true)
+        }
+        let tasks = (try? await SwiftNativeTaskLedger(dataRoot: dataRoot).listTasks(includeTerminal: false)) ?? []
+        guard !Task.isCancelled else { return nil }
+        for task in tasks where task.status == .claimed && task.owner != nil {
+            include(task.updatedTs, age: heartbeatClaimStaleAge)
+        }
+        let desk = (try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items) ?? []
+        guard !Task.isCancelled else { return nil }
+        for item in desk where !item.status.isTerminal {
+            include(item.updatedAt, age: heartbeatDeskStaleAge, strict: true)
+        }
+        let configRoot = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+        let inbox = configRoot.appendingPathComponent("codex-nativeagent-bridge/codex-inbox.jsonl")
+        if let text = try? String(contentsOf: inbox, encoding: .utf8) {
+            for line in text.split(whereSeparator: \Character.isNewline) {
+                guard let data = line.data(using: .utf8),
+                      let row = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                      (row["read"] as? Bool) != true,
+                      ((row["consumedAt"] as? String) ?? "").isEmpty,
+                      ((row["readAt"] as? String) ?? "").isEmpty else { continue }
+                include(row["createdAt"] as? String ?? row["created_at"] as? String,
+                        age: heartbeatClaimStaleAge, strict: true)
+            }
+        }
+        for status in ErrorFeeds.scanErrorFeeds(dataRoot: dataRoot, now: now) {
+            for line in status.recentLines {
+                guard let data = line.data(using: .utf8),
+                      let row = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+                include(row["lastAt"] as? String ?? row["createdAt"] as? String ?? row["at"] as? String
+                        ?? row["ts"] as? String ?? row["timestamp"] as? String,
+                        age: ErrorFeeds.errorBurstWindow, strict: true)
+            }
+        }
+        return deadlines.min()
+    }
 
     /// Composes the heartbeat's deterministic verdict and stable inbox cards.
     public func gatherHeartbeatAssessment(
@@ -219,7 +321,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         if let subs = try? FileManager.default.contentsOfDirectory(
             at: executionsDir, includingPropertiesForKeys: nil) {
             for sub in subs {
-                let mp = ExecutionRecordFile.resolve(in: sub)
+                let mp = ExecutionRecordFile.canonicalPath(in: sub)
                 guard let data = try? Data(contentsOf: mp),
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let status = obj["status"] as? String else { continue }
@@ -306,7 +408,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         dataRoot: URL
     ) async -> HeartbeatIssue? {
         let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
-        guard let stale = try? await ledger.staleClaims(), !stale.isEmpty else {
+        guard let stale = try? await ledger.staleClaims(staleAfter: heartbeatClaimStaleAge), !stale.isEmpty else {
             return nil
         }
         let rows = stale.prefix(5).map { task -> String in
@@ -333,7 +435,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         bridgeConfigRoot: URL? = nil,
         now: Date = Date()
     ) async -> DurableResidueSummary {
-        let workflowCutoff = now.addingTimeInterval(-60 * 60)
+        let workflowCutoff = now.addingTimeInterval(-heartbeatWorkflowStaleAge)
         let workflowDir = dataRoot
             .appendingPathComponent("workflows", isDirectory: true)
             .appendingPathComponent("run_state", isDirectory: true)
@@ -389,7 +491,7 @@ public struct HeartbeatBackgroundWork: Sendable {
             }
             return ids
         }()
-        let bridgeCutoff = now.addingTimeInterval(-24 * 60 * 60)
+        let bridgeCutoff = now.addingTimeInterval(-heartbeatClaimStaleAge)
         let acknowledgedBefore = heartbeatBridgeAcknowledgmentHorizon(dataRoot: dataRoot)
         var terminalBridgeMessages: [String] = []
         var staleBridgeMessages: [String] = []
@@ -423,7 +525,7 @@ public struct HeartbeatBackgroundWork: Sendable {
             }
         }
 
-        let deskCutoff = now.addingTimeInterval(-30 * 24 * 60 * 60)
+        let deskCutoff = now.addingTimeInterval(-heartbeatDeskStaleAge)
         let deskItems = (try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items) ?? []
         let veryOldDeskItems = deskItems.compactMap { item -> String? in
             guard !item.status.isTerminal,
@@ -664,7 +766,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         let now = heartbeatISO(Date())
         do {
             try await persistence.withFileLock(inboxPath) { () async throws -> Void in
-                let lines = try InboxRewriteGuard.readLines(inboxPath)
+                let lines = try LiveNotificationInbox.readLines(inboxPath)
                 guard !lines.isEmpty else { return }
                 var changed = false
                 var mutated: [Data] = []
@@ -709,7 +811,7 @@ public struct HeartbeatBackgroundWork: Sendable {
                     changed = true
                 }
                 guard changed else { return }
-                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
+                try LiveNotificationInbox.write(mutated, to: inboxPath)
             }
         } catch {
             FileHandle.standardError.write(Data(
@@ -818,13 +920,15 @@ public struct HeartbeatNotice: Sendable, Equatable {
 ///   loop has nothing to check against, so it asserts nothing).
 /// - tick() is non-throwing by LoopRunner contract — every error is caught
 ///   and surfaced via stderr.
-public struct HeartbeatLoop: LoopRunner {
+public struct HeartbeatLoop: EventDeadlineLoopRunner {
     public let loopId: String = "heartbeat"
     public let interval: TimeInterval
-    /// Default production cadence: twice daily. The loop is a low-noise
-    /// sentinel, not a near-real-time monitor; urgent faults are covered by
-    /// Doctor.
+    /// Twice-daily missed-event integrity sweep. Normal assessments follow
+    /// input invalidations and their age deadlines; urgent faults also reach Doctor.
     public static let defaultInterval: TimeInterval = 12 * 60 * 60
+
+    private let events: @Sendable () -> AsyncStream<Void>
+    private let nextDeadline: @Sendable (Date) async -> Date?
 
     /// Reads the `HEARTBEAT.md` checklist (persona dir). Returns nil when the
     /// file is absent — the honest no-op trigger.
@@ -844,15 +948,25 @@ public struct HeartbeatLoop: LoopRunner {
 
     public init(
         interval: TimeInterval = Self.defaultInterval,
+        events: @escaping @Sendable () -> AsyncStream<Void> = {
+            EventDeadlinePhysiology.storeAndFileEvents(paths: [])
+        },
+        nextDeadline: @escaping @Sendable (Date) async -> Date? = { _ in nil },
         loadChecklist: @escaping @Sendable () -> String?,
         gatherAssessment: @escaping @Sendable () async -> HeartbeatAssessment,
         surfaceNotice: @escaping @Sendable (HeartbeatNotice) async throws -> Void
     ) {
         self.interval = interval
+        self.events = events
+        self.nextDeadline = nextDeadline
         self.loadChecklist = loadChecklist
         self.gatherAssessment = gatherAssessment
         self.surfaceNotice = surfaceNotice
     }
+
+    public func physiologyEvents() -> AsyncStream<Void> { events() }
+
+    public func nextMeaningfulDeadline(after now: Date) async -> Date? { await nextDeadline(now) }
 
     public func tickOutcome() async -> LoopTickOutcome {
         guard let checklist = loadChecklist()?.trimmingCharacters(in: .whitespacesAndNewlines),

@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `WorkshopExecution+CausalTransitionEvidence.swift` | `SwiftNativeWorkshopRunner` causal/motor projections: payload-free canonical plan interpretation, provider accounting and evidence classes without fabricated execution |
+
 extension SwiftNativeWorkshopRunner: MotorActionReadModelProviding {}
 
 /// Pure payload-free interpretation of an already-canonical Workshop plan.

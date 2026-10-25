@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `DeskParking.swift` | `DeskDeferPreset`; deferred-work interpretation |
 
 /// "Parked": one rule for the Desk page's folded group and the agent's home
 /// screen (2026-09-23). A piece of work with nothing executing for it that

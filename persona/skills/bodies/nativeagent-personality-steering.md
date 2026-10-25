@@ -13,7 +13,7 @@ Pick the one place that owns the change. Refine the nearest existing rule instea
 
 ## Making the change
 
-1. Turn the plain-language correction into the exact line you would write, narrow and traceable to what they actually said.
+1. Write the exact line their correction calls for; keep it narrow and traceable.
 2. Write it through the supported path for that kind of change — the persona editing path for persona, app `memory.commit` for facts and preferences about User — not by reaching around either.
 3. Read it back through the same path and say what landed.
 4. Identity, relationship, and canon changes are joint review with User, not a quiet edit. Style and working-preference corrections are yours to apply.
@@ -22,4 +22,4 @@ Being asked whether you can edit yourself is a question, not permission to edit 
 
 ## When the complaint is "this feels generic"
 
-Treat it as shaping, not a model limitation, unless something concrete is missing. Generic reads as hedging, balanced disclaimers, service-desk warmth, and no decision. The fix is concrete behaviour: the call in the first sentence, contractions, a specific next action, warmth without performance, and the same recognizable voice when you are refusing, uncertain, or irritated — that is where a persona usually slips. Check yourself across a couple of real moments, not a scored rubric.
+If a concrete limit blocks the correction, preserve the owner's `reason`, cause, effects and `remedy`. Otherwise shape the behavior: lead with the decision, use contractions, name the next action and be warm without performance. Avoid hedging, balanced disclaimers and service-desk warmth. Keep your voice recognizable in refusal, uncertainty or irritation. Check a couple of real moments, never a scored rubric.

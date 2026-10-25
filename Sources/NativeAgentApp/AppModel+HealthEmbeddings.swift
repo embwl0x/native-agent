@@ -9,20 +9,15 @@ import PersistenceCore
 import NativeAgentCore
 import MemoryV2
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
 import ToolExecution
 import PersonaEngine
-import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
+import EngineRuntime
 import Research
 import MultimodalTTS
 import TriggerScheduler
@@ -34,41 +29,23 @@ import TelegramBot
 import Dispatcher
 import MacControl
 import Onboarding
-import MacAssistantStatus
+import MacIntegration
 import WorkflowOrchestration
-import Skills
 import Connectors
 import Browser
-
-/// Visible snapshot samplers can be triggered by their retained poll and by a
-/// user action at the same time. Requests may still perform concurrently, but
-/// only the newest request may publish UI state, preventing a slower old error
-/// from replacing a newer successful snapshot.
-struct LatestSnapshotRefreshGate: Equatable {
-    private(set) var latestGeneration: UInt64 = 0
-
-    mutating func begin() -> UInt64 {
-        latestGeneration &+= 1
-        return latestGeneration
-    }
-
-    func isCurrent(_ generation: UInt64) -> Bool {
-        generation == latestGeneration
-    }
-}
+// Blueprint: | `AppModel+HealthEmbeddings.swift` | `AppModel`: `loadHealthCard`, `setHealthCardIfMeaningfullyChanged`; the Doctor owner's `LatestRead` orders health-card publication |
 
 @MainActor
 extension AppModel {
     // PATCH-2026-05-08: wave3-health-card Feature A — load health card
     @MainActor
     func loadHealthCard(includeApprovals: Bool = true) async {
-        let healthGeneration = healthCardRefreshGate.begin()
+        _ = await engine.doctor.healthCardRead.read({
         // Fix 10: catch and log decode/network errors instead of silently swallowing them
         let nextHealthCard: HealthCard
         do {
             nextHealthCard = try await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager).runtime.getHealthCard()
         } catch {
-            guard !Task.isCancelled else { return }
             print("[NativeAgent] loadHealthCard failed: \(error)")
             nextHealthCard = HealthCard(
                 overall: "error",
@@ -84,20 +61,17 @@ extension AppModel {
                 createdAt: nil
             )
         }
+        return nextHealthCard
+        }, publish: { setHealthCardIfMeaningfullyChanged($0) })
         guard !Task.isCancelled else { return }
-        if healthCardRefreshGate.isCurrent(healthGeneration) {
-            setHealthCardIfMeaningfullyChanged(nextHealthCard)
-        }
         if includeApprovals {
             do {
-                engine.approvals.records = try await engine.approvals.list()
+                _ = try await engine.approvals.list()
             } catch {
                 guard !Task.isCancelled else { return }
-                // FIX: previously only print()'d, leaving stale approvals on
-                // screen. Clear the list and surface the failure so the UI
-                // doesn't show outdated/phantom approvals.
+                // The facade keeps the last read and exposes its failure to
+                // every approval surface.
                 print("[NativeAgent] getApprovals failed: \(error)")
-                engine.approvals.records = []
                 setFailureStatus(error, action: "load approvals")
             }
         }

@@ -1,10 +1,15 @@
 import Foundation
 import ToolRegistry
 import Network
-import ChatOrchestration
+import ChatTurnRuntime
+import AgentConversations
+import ChatToolParsing
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import StandingBots
+
+// Blueprint: | `NativeAgentA2AWire+Runtime.swift` | Contact task admission, runtime dispatch and reply/event framing; the same contact runtime revalidates a local helper against this install's definition, without granting peer elevation |
 
 public struct AgentContactA2AEndpoint: Sendable {
     public enum Response: @unchecked Sendable {
@@ -96,6 +101,12 @@ public struct AgentContactA2AEndpoint: Sendable {
 
 enum AgentContactRuntime {
     private static func revalidated(_ principal: AgentBridgePrincipal, dataRoot: URL) throws -> AgentBridgePrincipal {
+        if let id = principal.localHelperID {
+            let bot = try BotDefinitionStore(dataRoot: dataRoot).get(id)
+            guard bot.deleted != true else { throw AgentContactFailure.missing }
+            return AgentBridgePrincipal(id: principal.id, peerID: principal.peerID, elevated: false,
+                displayName: bot.name, localHelperID: id)
+        }
         guard let peerID = principal.peerID else { return principal }
         guard let peer = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == peerID }),
               peer.grokSetup != "disconnected" else {
@@ -262,15 +273,36 @@ public enum AgentContactSSE {
             } catch { /* Only this subscriber ended. Task truth is unchanged. */ }
         }
         // Preserve the listener's state handler and connection bookkeeping.
-        // There are no more request bytes to read; EOF releases this subscriber.
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in worker.cancel() }
+        // Receive EOF is a half-close, so only a failed or closed connection
+        // cancels this subscriber before its final event has been sent.
+        let previous = connection.stateUpdateHandler
+        connection.stateUpdateHandler = { state in
+            previous?(state)
+            switch state {
+            case .failed, .cancelled: worker.cancel()
+            default: break
+            }
+        }
+        switch connection.state {
+        case .failed, .cancelled: worker.cancel()
+        default: break
+        }
     }
 
     private static func send(_ data: Data, on connection: NWConnection) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        // finish is idempotent: cancellation and Network completion claim the
+        // same send, including cancellation before the operation starts.
+        let completion = AsyncThrowingStream<Void, Error>.makeStream()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
             connection.send(content: data, completion: .contentProcessed { error in
-                if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+                completion.continuation.finish(throwing: error)
             })
+            var iterator = completion.stream.makeAsyncIterator()
+            _ = try await iterator.next()
+        } onCancel: {
+            completion.continuation.finish(throwing: CancellationError())
+            connection.cancel()
         }
     }
 }

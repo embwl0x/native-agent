@@ -1,5 +1,7 @@
 import Foundation
 
+// Blueprint: | `OrganismBehaviorPosture.swift` | `OrganismBehaviorPosture`: evidence-backed operational directives and review signals; default posture renders nothing |
+
 public protocol OrganismPostureProviding: Sendable {
     func organismBehaviorPosture() async -> OrganismBehaviorPosture?
 }
@@ -187,14 +189,9 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         chemicalState: ChemicalState,
         bodySchema: BodySchema
     ) -> OrganismLoopBudget {
-        switch bodySchema.resourcePressure {
-        case .critical:
-            return .sleep
-        case .high, .elevated:
-            return .conserve
-        case .nominal:
-            return chemicalState.fatigue >= 0.35 ? .conserve : .normal
-        }
+        // She is always on while the Mac is on (User 10-24): her model calls
+        // run at the provider, so neither heat nor tiredness budgets her work.
+        .normal
     }
 
     private static func notificationRequiresReceipt(bodySchema: BodySchema) -> Bool {
@@ -220,9 +217,6 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         }
         if bodySchema.notificationRequiresReceipt {
             out.append("Do not assume a phone notification was seen without a delivery receipt.")
-        }
-        if bodySchema.memoryRequiresCurrentContext {
-            out.append("Lean on the current conversation before relying on memory recall.")
         }
         return out
     }

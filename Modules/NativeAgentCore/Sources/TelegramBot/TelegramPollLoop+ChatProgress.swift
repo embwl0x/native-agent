@@ -1,10 +1,11 @@
 import Foundation
-import ChatOrchestration
+import ChatTurnRuntime
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import ChatSessionWork
+// Blueprint: | `TelegramPollLoop+ChatProgress.swift` | `TelegramPollLoop`: `makeTurnProgressCard`, `makeAssistantDelivery`, `makeProgressSink` |
 
 private actor TelegramTypingHeartbeat {
     let start: @Sendable () -> Task<Void, Never>
@@ -62,9 +63,11 @@ extension TelegramPollLoop {
         update: TelegramUpdate?,
         message: TelegramMessage?,
         text: String?
-    ) -> TelegramTurnProgressCardDriver {
-        TelegramTurnProgressCardDriver(
+    ) async -> TelegramTurnProgressCardDriver {
+        let face = await TelegramProgressFace(dataRoot: dataRoot, call: partFace)
+        return TelegramTurnProgressCardDriver(
             token: token,
+            face: face,
             destination: destination,
             turnId: turnId,
             sendCard: sendMessageWithReplyMarkupReturningId,
@@ -123,7 +126,7 @@ extension TelegramPollLoop {
             },
             persistDelivery: { delivery in
                 if let update {
-                    try await TelegramUpdateInbox(offsetURL: offsetURL).recordAssistantDelivery(
+                    try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).recordAssistantDelivery(
                         updateId: update.updateId, delivery: delivery
                     )
                 } else if let approvalId {
@@ -139,7 +142,8 @@ extension TelegramPollLoop {
                 let session: String?
                 let run: String?
                 if let update {
-                    let claim = try TelegramUpdateInbox(offsetURL: offsetURL).claim(updateId: update.updateId)
+                    let claim = try TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).claim(updateId: update.updateId)
+                    if claim.phase == .stopped { return true }
                     session = claim.assistantSessionId
                     run = claim.assistantRunId
                 } else if let approvalId {
@@ -147,6 +151,7 @@ extension TelegramPollLoop {
                     guard case .object(let state)? = approval.chatContinuation, let raw = state["delivery"] else {
                         throw TelegramBotError.underlying("Approval answer has no retained conversation.")
                     }
+                    if state["status"] == .string("stopped") { return true }
                     session = try JSONDecoder().decode(TelegramPendingApprovalContinuation.self,
                         from: raw.serializedData(pretty: false)).sessionId
                     run = nil
@@ -190,7 +195,7 @@ extension TelegramPollLoop {
         guard delivery != nil else { return nil }
         // No wire attempt can precede the delivery row. This canonical reply
         // survived a stop or restart between model settlement and that handoff.
-        return try await TelegramUpdateInbox(offsetURL: offsetURL).recordAssistantDelivery(
+        return try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).recordAssistantDelivery(
             updateId: claim.updateId, delivery: delivery, recovering: true
         )
     }
@@ -220,7 +225,7 @@ extension TelegramPollLoop {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         case .notice(_, let text):
-            let trimmed = TelegramTurnPresentationRenderer.userFacingProgress(text).trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         case .toolResult:
             return nil
@@ -320,7 +325,7 @@ extension TelegramPollLoop {
                 + "has no vision-capable handler wired — the image was "
                 + "not processed.)", [])
         }
-        throw TelegramBotError.unavailable
+        throw TelegramBotError.underlying("telegram_chat_handler_missing: No conversation handler is connected. The runtime owner must wire Telegram's chat handler in NativeAgent before accepting messages.")
     }
 
     static func chatErrorNotice(for error: Error) -> String {

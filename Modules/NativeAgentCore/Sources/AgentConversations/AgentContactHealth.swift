@@ -4,6 +4,8 @@ import Foundation
 import MacControl
 import NativeAgentCore
 import PersistenceCore
+import ProviderRouting
+// Blueprint: | `AgentContactHealth.swift` | Shared reply-path health from the newest receipt's `no_reply_expired`, delivery failures and round trips; an app, program or recipe change since the proof is unverified, named ("Unverified since Muse updated to 7.0", "…since Hermes updated to 0.22.0", "…since the recipe changed"), with no repair; the next send or `agent.verify` re-proves. `repair` is the one repair: the contact's own send run dry (`AgentRecipeStore.dryRun`), for a send that sent nothing (`heal`: one retry of the same operation, or a harness item), and `agent.verify`, never the background check, which reads the last send's repair (an A2A contact's runs its dry run, `AgentPeerDiscovery.a2aCheck`); a desktop chat whose log changed shape after Return is filed, never retried, and a send that lands closes the contact's bridge items. Detached refreshes share one projection. Durable verification claims bound background checks to once per episode and once per contact per hour, without resend or a new poller. |
 
 /// Single flight per root. Saved exchanges own reply health; readiness never proves
 /// a reply. The existing continuation and contact reads refresh it without resends.
@@ -63,7 +65,7 @@ public actor AgentContactHealth {
     private nonisolated static func claudePresence(inbox: URL) -> AgentLocalHealth {
         let path = inbox.deletingLastPathComponent().appendingPathComponent("claude-live")
         let at = (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date
-        let recent = at.map { Date().timeIntervalSince($0) < 600 } == true
+        let recent = at.map(AgentLocalHealth.isRecent) == true
         var presence = bridgePresence(recent)
         presence.checkedAt = at ?? .distantPast
         return presence
@@ -235,8 +237,10 @@ public actor AgentContactHealth {
         for (agent, probe) in probes {
             let history = records.filter { $0.agent == agent }
             let peer = peers.first { "peer:" + $0.id == agent }
+            let pullReplyProof = peer.flatMap(Self.checkIn) == nil ? nil : peer?.provenOutboundAt
             let good = (history.flatMap { $0.exchanges ?? [] }.filter { $0.reply != nil }.map { $0.settledAt ?? $0.sentAt }
-                + [peer?.roundTripProof?.at, peer?.mcpReturnProof?.at].compactMap { $0.flatMap(iso.date) }).max()
+                + [peer?.roundTripProof?.at, peer?.mcpReturnProof?.at,
+                   pullReplyProof].compactMap { $0.flatMap(iso.date) }).max()
             let newest = history.max { $0.updatedAt < $1.updatedAt }
             let expired = newest.flatMap { row -> Date? in
                 guard row.stop == nil, case .object(let receipt)? = row.receipt,
@@ -316,9 +320,9 @@ public actor AgentContactHealth {
                     "Sends to \(peer.name) cannot be delivered: \(why) He can still reach her by running the local message command on this Mac (nativeagent-link message, with his contact file); a reply typed in his own chat no longer arrives. Last good send \(good.map(iso.string) ?? "never")."
                 } else { nil }
                 observed.detail = dotWords ?? broken.map {
-                    "Reply path broken since \(iso.string(from: $0)); last good \(good.map(iso.string) ?? "never"). Open Connect for \(peer?.name ?? agent) and verify its reply path; do not resend the message."
+                    "Reply path broken since \(iso.string(from: $0)); last good \(good.map(iso.string) ?? "never"). Run agent.verify for \(peer?.name ?? agent); do not resend the message."
                 } ?? expired.map {
-                    "No reply by the deadline \(iso.string(from: $0)); last good \(good.map(iso.string) ?? "never"). Open Connect for \(peer?.name ?? agent) and verify its reply path; do not resend the message."
+                    "No reply by the deadline \(iso.string(from: $0)); last good \(good.map(iso.string) ?? "never"). Run agent.verify for \(peer?.name ?? agent); do not resend the message."
                 } ?? (interrupted ?? stalled).map { at in
                     let clock = DateFormatter()
                     clock.dateFormat = "HH:mm"
@@ -354,7 +358,7 @@ public actor AgentContactHealth {
             // Dot's word is overlaid live at every read (`present`); the stored
             // row drops it, so comparing the two never matched and every
             // refresh rewrote this watched file (a CPU loop, 10-12).
-            if let old = previous[agent], !old.sticky, old.lastGoodAt == good, Date().timeIntervalSince(old.checkedAt) < 300,
+            if let old = previous[agent], !old.sticky, old.lastGoodAt == good, Date().timeIntervalSince(old.checkedAt) < AgentLocalHealth.refreshInterval,
                old.failureOperation == operation { continue }
             if Task.isCancelled { return }
             var observed: AgentLocalHealth
@@ -404,24 +408,24 @@ public actor AgentContactHealth {
             } else if let peer, peer.transport == .a2a {
                 let found = try await Self.cardCheck(peer)
                 detail = (Self.text(found["detail"]) ?? "") + (Self.passed(.object(found))
-                    ? " An actual reply is still unproven; verify \(name) in Connect."
-                    : " Fix its recipe with agent.recipe_write, or ask \(name)'s owner to restore its card, then verify in Connect.")
+                    ? " An actual reply is still unproven; run agent.verify for \(name)."
+                    : " Fix its recipe with agent.recipe_write, or ask \(name)'s owner to restore its card, then run agent.verify.")
             } else if let peer, peer.transport == .nativeAgent {
                 let result = try await AgentPeerDiscovery.resolve(peer.endpoint, bearerToken: AgentPeerCredentials.read(peerID: peer.id))
                 detail = result.transport == peer.transport
-                    ? "Connection check passed; an actual reply is still unproven. Verify \(name) in Connect."
-                    : "Connection check failed. Ask \(name)'s owner to restore its advertised reply endpoint, then verify in Connect."
+                    ? "Connection check passed; an actual reply is still unproven. Run agent.verify for \(name)."
+                    : "Connection check failed. Ask \(name)'s owner to restore its advertised reply endpoint, then run agent.verify."
             } else {
                 if probe == .dot { ChatGPTDotIPCTransport.reconnect() }
                 let result = await inspect(probe)
                 detail = "Readiness check: \(result.detail). " + (result.status == "ready" || result.status == "live"
-                    ? "An actual reply is still unproven; verify \(name) in Connect."
-                    : "Restore \(name)'s installation or sign-in, then verify in Connect.")
+                    ? "An actual reply is still unproven; run agent.verify for \(name)."
+                    : "Restore \(name)'s installation or sign-in, then run agent.verify.")
             }
         } catch {
             detail = peer?.transport == .grokBot
-                ? String(error.localizedDescription.split(separator: "\n").first ?? "Routine verification failed.") + " Open Grok Bot's Routines and import the NativeAgent reply routine on Connect."
-                : "Restore \(name)'s reply endpoint or sign-in, then verify in Connect."
+                ? String(error.localizedDescription.split(separator: "\n").first ?? "Routine verification failed.") + " Open Grok Bot's Routines and restore the NativeAgent reply routine, then run agent.verify for \(name)."
+                : "Restore \(name)'s reply endpoint or sign-in, then run agent.verify."
         }
         guard var health = try? AgentLocalHealth.checkedRead(dataRoot) else { return }
         guard health[agent]?.repairFor == operation, health[agent]?.brokenSince != nil || health[agent]?.status == "no_reply_by_deadline" else { return }
@@ -534,13 +538,12 @@ public actor AgentContactHealth {
             guard name == "codex" else { return result("ready", "Program installed") }
             // `codex login status` answers from this file: signed in is a saved
             // ChatGPT token or API key in it. Only its presence is looked at.
-            let home = ProcessInfo.processInfo.environment["CODEX_HOME"].map { URL(fileURLWithPath: $0) }
-                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+            let authPath = OpenAIOAuthDirectAdapter.preferredAuthPath(source: .commandCLI)
             func present(_ value: JSONValue?) -> Bool {
                 if case .string(let text)? = value { return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                 return false
             }
-            guard let data = try? Data(contentsOf: home.appendingPathComponent("auth.json")),
+            guard let data = try? Data(contentsOf: authPath),
                   case .object(let auth)? = try? JSONValue.parse(data) else { return result("signed_out", "Signed out — run codex login") }
             var tokens: [String: JSONValue] = [:]
             if case .object(let saved)? = auth["tokens"] { tokens = saved }

@@ -8,15 +8,15 @@ import ProviderRouting
 import Foundation
 import CryptoKit
 import ToolRegistry
+import ToolExecution
 import MacControl
-import MCPDispatcher
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import TrustCenter
 import ChromeControl
-import Skills
 import Senses
+// Blueprint: | `ChatToolDispatchTrace.swift` | `ChatToolOutcome`: `normalizedFailure`, `failure`, `outputLooksSuccessful`; a turn-bound receipt is also the evidence of its act experience |
 
 // MARK: - Tool-output failure-shape heuristic
 
@@ -55,9 +55,12 @@ extension ChatToolOutcome {
         let oldReason = text("reason")
         // The tool's own code, wherever it says one (a Mac verb's detail.error).
         let inner: String? = if case .object(let detail)? = object["detail"], case .string(let error)? = detail["error"] { error } else { nil }
-        let code = [text("error_code"), text("errorCode"), oldReason, text("error"), inner].compactMap { $0 }.first {
-            isCode($0) && !["failed", "error"].contains($0)
-        } ?? "tool_failed"
+        let genericCodes: Set<String> = ["failed", "error", "dispatch_error", "tool_failed"]
+        let suppliedCodes = [text("failure_code"), text("error_code"), text("errorCode"), text("code")].compactMap { $0 }
+        let legacyCodes = [oldReason, text("error"), inner].compactMap { $0 }.filter(isCode)
+        let code = oldReason.flatMap { isCode($0) && !genericCodes.contains($0) ? $0 : nil }
+            ?? (suppliedCodes + legacyCodes).first { !genericCodes.contains($0) }
+            ?? suppliedCodes.first ?? legacyCodes.first ?? "tool_failed"
         let candidates = ["message", "spoken", "text", "detail", "output", "error", "content", "result", "fix", "recovery_hint", "hint"].flatMap { explanations(object[$0]) }
         // A process that failed says why on stderr and in its exit code.
         let exit = [object["exit_code"], object["exitCode"]].lazy.compactMap { value -> Int? in
@@ -78,55 +81,38 @@ extension ChatToolOutcome {
         let effects = text("effects") ?? (object["effects_unknown"] == .bool(true) ? "unknown"
             : object["not_run_status"] != nil || named.map { AgentWorkspaceEnvironment.readTools.contains($0) } == true
                 ? "none" : "unknown")
-        let explained: String? = candidates.first { !isCode($0) } ?? oldReason.flatMap { isCode($0) ? nil : $0 }
-        // Only codes said why: the first one still says what failed, in words.
-        let bare = (candidates.first ?? code).replacingOccurrences(of: "_", with: " ")
-        let worded = "The call failed: \(bare)." + (effects == "none" ? " Nothing changed." : "")
-        let message = explained ?? processFailure ?? worded
-        // Receipt readers own the meaning of reason/message, including refusal
-        // classification. Enrichment must never replace the tool's own fields.
-        // An added reason is the code, never a second copy of the message.
-        if object["failure_code"] == nil { object["failure_code"] = .string(code) }
-        if object["reason"] == nil { object["reason"] = .string(code) }
-        if object["message"] == nil { object["message"] = .string(message) }
+        let explained: String? = candidates.first { !isCode($0) && $0 != code }
+            ?? oldReason.flatMap { isCode($0) || $0 == code ? nil : $0 }
+        let message = explained ?? processFailure ?? "The action supplied no explanation."
+        // Preserve legacy prose reasons and their refusal classification.
+        // A coded reason is authoritative; failure_code projects the same cause.
+        object["failure_code"] = .string(code)
+        if oldReason == nil || oldReason.map(isCode) == true { object["reason"] = .string(code) }
+        // Canonical prose is already readable without another copy. Legacy
+        // error-only and nested receipts still need their existing projection.
+        let hasExplanation = ["detail", "message", "summary"].contains { text($0) != nil }
+            || oldReason.map { !isCode($0) && $0 != code } == true
+        if object["message"] == nil, !hasExplanation { object["message"] = .string(message) }
         if object["argument_path"] == nil { object["argument_path"] = .null }
         if object["accepted"] == nil { object["accepted"] = .null }
         if object["effects"] == nil { object["effects"] = .string(effects) }
-        if object["remedy"] == nil {
-            // A folded tool is an app action: she calls and finds it there,
-            // when the call came through the door. A lane that calls it by
-            // name (Workshop, studio wander) keeps its name.
+        if object["remedy"] == nil || object["remedy"] == .null {
+            // Project the owner's lever; neither a lookup nor a replay is a
+            // repair merely because this boundary can name the failed action.
+            object["remedy"] = nil
             let door = AppDoorReentry.perform != nil
-            let action = door ? named.flatMap { ToolNameAliases.appAction($0) } : nil
             let argument = text("argument_path")
-            let correction = effects == "none" && argument != nil && named != nil
-            var nextCall: JSONValue
-            switch named {
-            case "bot_create", "bot_update":
-                nextCall = .object(["tool": .string("bot_list"), "input": .object(["include_models": .bool(true)])])
-            case "scheduler_update_job":
-                nextCall = .object(["tool": .string("scheduler_list_jobs"), "input": .object([:])])
-            default:
-                // Through the door, app {find} shows an action's accepted args;
-                // for any other failure it is a round spent, not a next step.
-                let words = (action ?? named ?? "").replacingOccurrences(of: ".", with: " ").replacingOccurrences(of: "_", with: " ")
-                nextCall = door && correction && !words.isEmpty
-                    ? .object(["tool": .string("app"), "input": .object(["find": .string(words)])]) : .null
+            let correction = effects == "none" && argument != nil
+            let instruction = text("fix") ?? text("recovery_hint") ?? text("hint")
+            if let tap = text("tap") {
+                object["remedy"] = Repair.why(owner: text("owner") ?? named ?? "This action", tap: tap, instruction: instruction)
+            } else if case .object? = object["next_call"], let supplied = object["next_call"] {
+                object["remedy"] = .object([
+                    "kind": .string(correction ? "correct_arguments" : "inspect"),
+                    "instruction": .string(instruction ?? (correction ? "Correct \(argument!); use next_call." : "Use next_call.")),
+                    "next_call": door ? ToolNameAliases.appPointer(supplied) : supplied,
+                ])
             }
-            let fix = effects == "none" ? text("fix") : nil
-            if fix != nil { nextCall = .null }
-            else if door { nextCall = ToolNameAliases.appPointer(nextCall) }
-            object["remedy"] = .object([
-                "kind": .string(correction ? "correct_arguments" : "inspect"),
-                "instruction": .string(fix ?? (correction
-                    ? "Correct \(argument!) to the accepted shape, then call \(action.map { "app " + $0 } ?? named!) again with the intended values. Do not guess missing choices. Use next_call to inspect accepted choices or the current state if needed."
-                    : effects == "none"
-                        ? "Nothing changed. Do what the reason names, or tell the person why."
-                        : effects == "occurred"
-                            ? "The call took effect. Read the affected state before making another change; do not replay it blindly."
-                            : "It may have taken effect: read the affected state before retrying, or tell the person why.")),
-                "next_call": nextCall,
-            ])
         }
         return .object(object)
     }
@@ -158,49 +144,85 @@ extension ChatToolOutcome {
 
     public static func failure(error: any Error, tool: String? = nil, effects: ToolFailureError.Effects? = nil) -> JSONValue {
         if let back = error as? SkillRunContext.HandBack { return SkillRunContext.handBack(back.why) }
+        let evidence = error as? ToolFailureError
+        let sense = error as? SenseFailure
+        let cancelled = error is CancellationError || sense?.code == "cancelled"
+        let status = evidence?.status.rawValue ?? (cancelled ? "cancelled" : sense?.code == "timeout" ? "timeout" : "failed")
+        let code = evidence?.code ?? (evidence?.argumentPath != nil ? "invalid_arguments" : nil)
+            ?? sense?.code ?? (status == "failed" ? "dispatch_error" : status)
+        func rendered(_ text: String) -> String {
+            String(TurnTraceRedactor.redactText(text)
+                .replacingOccurrences(of: NSHomeDirectory(), with: "~").prefix(2_000))
+        }
+        let message = if let sense { rendered(sense.message) }
+            else if error is CancellationError { "The action was cancelled." }
+            else { errorMessage(error) }
         var object: [String: JSONValue] = [
-            "status": .string("failed"),
-            "failure_code": .string("dispatch_error"),
-            "reason": .string(errorMessage(error)),
-            "error": .string(errorMessage(error)),
+            "status": .string(status),
+            "failure_code": .string(code),
+            "reason": .string(code),
+            "detail": .string(message),
         ]
         if let effects { object["effects"] = .string(effects.rawValue) }
-        if let evidence = error as? ToolFailureError {
+        if let evidence {
             object["argument_path"] = evidence.argumentPath.map(JSONValue.string) ?? .null
             object["accepted"] = evidence.accepted.map { .string(ChatSecretRedactor.redactText($0)) } ?? .null
             object["effects"] = .string(evidence.effects.rawValue)
-            if evidence.argumentPath != nil { object["failure_code"] = .string("invalid_arguments") }
-            if let owner = evidence.owner, evidence.nextCall != nil || evidence.tap != nil {
-                let call = evidence.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
-                object["remedy"] = if evidence.personDecides, let tap = evidence.tap {
-                    Repair.why(owner: owner, tap: tap)
-                } else { Repair.remedy(owner: owner, nextCall: call, tap: evidence.tap) }
-            } else if let call = evidence.nextCall.flatMap({ try? JSONValue.parse(Data($0.utf8)) }) {
-                // A correction: the call that works next, no owner and no debt.
+            let parsed = evidence.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+            let call: JSONValue? = if case .object? = parsed { parsed } else { nil }
+            if evidence.recovery == .terminal {
+                object["remedy"] = Repair.terminal(instruction: evidence.instruction ?? "The owner marked this failure terminal; do not repeat the action.")
+            } else if evidence.personDecides, let tap = evidence.tap {
+                object["remedy"] = Repair.why(owner: evidence.owner ?? tool ?? "This action", tap: tap, instruction: evidence.instruction)
+            } else if evidence.recovery == .reconcile, let call {
+                object["remedy"] = Repair.reconcile(instruction: evidence.instruction ?? "Read next_call to reconcile effects before another change.", nextCall: call)
+            } else if let owner = evidence.owner, evidence.recovery == nil || evidence.recovery == .repair {
+                object["remedy"] = Repair.remedy(owner: owner, nextCall: call, tap: evidence.tap, instruction: evidence.instruction)
+            } else if let tap = evidence.tap {
+                object["remedy"] = Repair.why(owner: evidence.owner ?? tool ?? "This action", tap: tap, instruction: evidence.instruction)
+            } else if let call {
                 object["remedy"] = .object([
-                    "kind": .string(evidence.argumentPath != nil ? "correct_arguments" : "inspect"),
-                    "instruction": .string(evidence.message), "next_call": call,
+                    "kind": .string(evidence.recovery?.rawValue ?? (evidence.argumentPath != nil ? "correct_arguments" : "inspect")),
+                    "instruction": .string(evidence.instruction ?? (evidence.argumentPath.map { "Correct \($0); use next_call." } ?? "Use next_call.")),
+                    "next_call": call,
                 ])
+            }
+            if let owner = evidence.owner, case .object(var remedy)? = object["remedy"] {
+                remedy["owner"] = .string(owner)
+                object["remedy"] = .object(remedy)
             }
         }
         if let refusal = error as? AgentConversationStore.Failure { object["effects"] = .string(refusal.effects.rawValue) }
-        if let failure = error as? SenseFailure { object["remedy"] = failure.remedy }
-        if error is AgentWorkspaceFailure { object["effects"] = .string("none") }
-        // A skill's save, read or enable refused for its shape or state wrote nothing.
-        if let refusal = error as? SkillsError {
-            object["effects"] = .string("none")
-            // A shape or state refusal ran nothing; an invalid script may have run under interception.
-            if case .invalidScript = refusal {} else { object["execution"] = .string("not_run") }
+        if let sense {
+            object["remedy"] = sense.remedy
+            if let excerpt = sense.inputExcerpt { object["input_excerpt"] = .string(rendered(excerpt)) }
+            if let provenance = sense.provenance {
+                // Keep SenseProvenance's native Codable date representation.
+                var fields: [String: JSONValue] = [
+                    "senseID": .string(provenance.senseID), "version": .int(Int64(provenance.version)),
+                    "grownAt": .double(provenance.grownAt.timeIntervalSinceReferenceDate),
+                    "uses": .int(Int64(provenance.uses)), "corrections": .int(Int64(provenance.corrections)),
+                ]
+                if let origin = provenance.origin { fields["origin"] = .string(origin.rawValue) }
+                object["provenance"] = .object(fields)
+            }
         }
-        if let connector = error.missingConnectorID {
+        if error is AgentWorkspaceFailure { object["effects"] = .string("none") }
+        // A part's save or read refused for its shape or state wrote nothing.
+        if let refusal = error as? PartError {
             object["effects"] = .string("none")
-            object["outcome"] = .string("unmet")
-            object["fix"] = .string("The owner can sign in to \(connector) by requesting a setup card in chat or opening Connectors in Advanced view.")
+            if case .notFound = refusal { object["execution"] = .string("not_run") }
         }
         if let chrome = error as? ChromeControlRuntimeError {
             if let effects = chrome.failureEffects { object["effects"] = .string(effects.rawValue) }
             if let remedy = chrome.remedy { object["remedy"] = remedy }
             if case .outcomeUnknown = chrome { object["effects_unknown"] = .bool(true) }
+        }
+        if status == "cancelled" {
+            if object["effects"] == nil { object["effects"] = .string("unknown") }
+            if object["remedy"] == nil || object["remedy"] == .null {
+                object["remedy"] = Repair.terminal(instruction: "Do not repeat the cancelled action automatically.")
+            }
         }
         if let recovery = (error as? LocalizedError)?.recoverySuggestion,
            !recovery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -210,11 +232,6 @@ extension ChatToolOutcome {
             if case .toolDenied(let reason, let remedy) = gate {
                 if let remedy { object["remedy"] = remedy }
                 object["gate_reason"] = .string(ChatSecretRedactor.redactText(reason))
-                if let tool, reason.hasPrefix("autonomy=") || reason.hasPrefix("fileAccess=") {
-                    let sentence = ToolNotRunStatus.blockedSentence(reason: reason, tool: tool)
-                    object["reason"] = .string(sentence)
-                    object["error"] = .string(sentence)
-                }
             }
             return normalizedFailure(gate.notRunStatus.reporting(.object(object), tool: tool), tool: tool)
         }
@@ -315,13 +332,6 @@ extension ChatToolOutcome {
         if isDeterministicRefusal(output) {
             return .unknown
         }
-        // External protocol responses prove only that transport returned.
-        // They do not prove that any external effect settled, and a timeout or
-        // stream loss may occur after submission. Keep resident physiology
-        // neutral; the model and trace still receive the exact result/error.
-        if ToolCausalBoundary.isExternalProtocolTool(tool) {
-            return .unknown
-        }
         if hasCanonicalMotorOwner(tool) {
             // Once the envelope carries the canonical owner's identity, its
             // read model is the only consequence source. Before admission no
@@ -383,7 +393,7 @@ extension ChatToolOutcome {
         take("error_code", label: "code")
         take("errorCode", label: "code")
         take("failure_code", label: "code")
-        take("reason")
+        if object["reason"] != object["failure_code"] { take("reason") }
         take("status", label: "status")
         take("message")
         take("error")
@@ -623,13 +633,6 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             )),
         ]
         if let durationMs { payload["durationMs"] = .int(Int64(durationMs)) }
-        if tool == "app" {
-            let calls = if case .array(let calls)? = input["actions"] { calls } else { [JSONValue.object(input)] }
-            payload["callShapes"] = .array(calls.compactMap { call in
-                guard case .object(let fields) = call, case .string(let action)? = fields["action"] else { return nil }
-                return .object(["action": .string(action), "args": Self.argumentShape(fields["args"] ?? .object([:]))])
-            })
-        }
         if let parent { payload["parentId"] = .string(parent) }
         // An app call as a person is shown it: the action it ran.
         let shown = ToolNameAliases.shown(tool, input: .object(input)).name
@@ -813,20 +816,6 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             return .object(fields)
         case .array(let values): return .array(values.map(receiptFields))
         default: return .null
-        }
-    }
-
-    /// Structural evidence survives preview truncation and contains no values.
-    private static func argumentShape(_ value: JSONValue) -> JSONValue {
-        switch value {
-        case .object(let fields): return .object(fields.filter { !$0.key.hasPrefix("__") }.mapValues(argumentShape))
-        case .array(let values):
-            return .array(values.map(argumentShape).reduce(into: []) { if !$0.contains($1) { $0.append($1) } })
-        case .string: return .string("string")
-        case .bool: return .string("bool")
-        case .int: return .string("int")
-        case .double: return .string("number")
-        case .null: return .string("null")
         }
     }
 

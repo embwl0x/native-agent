@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+// Blueprint: | `MemoryRecordDisclosure.swift` | `MemoryRecordDisclosurePolicy`: pure shared record privacy/persona/surface disclosure, independent of Trust tool admission |
+
 public enum MemoryDisclosurePrivacy: String, Sendable, Codable, CaseIterable {
     case localPrivate = "local_private"
     case trustedRemote = "trusted_remote"

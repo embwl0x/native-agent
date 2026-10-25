@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+// Blueprint: | `NativeOAuthFlow+TokenStatus.swift` | Token clearing and badge projections of each adapter's credential verdict and effective expiry; Sendable sign-in/session-offer values travel in the checked provider snapshot; no independent readiness or credential-selection rules |
 
 public enum AnthropicOAuthCredentialReadState: Equatable {
     case missing
@@ -8,7 +9,7 @@ public enum AnthropicOAuthCredentialReadState: Equatable {
 }
 
 extension NativeOAuthFlow {
-    public enum CodexCLISessionOffer: Equatable {
+    public enum CodexCLISessionOffer: Equatable, Sendable {
         case available(email: String?, alreadyDeclined: Bool)
         case unavailable(reason: String)
     }
@@ -60,16 +61,10 @@ extension NativeOAuthFlow {
             // NATIVE_AGENT_DATA_ROOT env paths, the repo checkout's,
             // Application Support's and the default root's — so signing out of
             // one install wiped every other install's ChatGPT token.
-            // `allowSharedFallbacks: false` is exactly `<root>/codex_home/
-            // auth.json`, which is where in-app sign-in writes
-            // (`openAIAppOwnedAuthPath`).
             let root = dataRoot ?? PersistenceCore.defaultDataRoot()
             var removed = true
-            for path in OpenAIOAuthDirectAdapter.authPathCandidates(
-                dataRoot: root,
-                allowSharedFallbacks: false
-            ) {
-                guard !OpenAIOAuthDirectAdapter.isUserCodexPath(path) else { continue }
+            let path = openAIAppOwnedAuthPath(dataRoot: root)
+            if !OpenAIOAuthDirectAdapter.isUserCodexPath(path) {
                 if !removeCredentialFile(at: path) { removed = false }
                 // Codex children's access-only copy goes with the sign-in.
                 do { try OpenAIOAuthDirectAdapter.syncCodexChildCopy(from: path) } catch { removed = false }
@@ -119,54 +114,22 @@ extension NativeOAuthFlow {
         }
     }
 
-    private static func statusCredentialObject(at path: URL) throws -> [String: Any] {
-        if path.lastPathComponent == "xai_oauth_direct.json" {
-            return try XAIOAuthCredentialStore.read(at: path)
+    private static func credentialHealth(providerId: String, dataRoot: URL?) -> OAuthCredentialHealth? {
+        switch normalizedOAuthProviderId(providerId) {
+        case "openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct":
+            return try? ProviderOAuthCredentialMaintenance.status(provider: normalizedOAuthProviderId(providerId),
+                root: dataRoot ?? PersistenceCore.defaultDataRoot())
+        default: return nil
         }
-        return try NativeOAuthSupport.loadJSONObject(path)
     }
 
     private static func canRefresh(providerId: String, dataRoot: URL?) -> Bool {
-        let provider = normalizedOAuthProviderId(providerId)
-        guard let path = statusCredentialPath(providerId: providerId, dataRoot: dataRoot),
-              provider != "openai_oauth_direct" || !OpenAIOAuthDirectAdapter.isUserCodexPath(path),
-              let object = try? statusCredentialObject(at: path),
-              OAuthRefreshBinding.string(OAuthRefreshBinding.tokenSet(object, provider: provider)["refresh_token"]) != nil
-        else { return false }
-        return OAuthRefreshBinding.permitsRefresh(object, provider: provider)
+        credentialHealth(providerId: providerId, dataRoot: dataRoot)?.canRefresh == true
     }
 
-    /// Read the persisted `expires_at` for a provider, or nil if not
-    /// signed in / no expiry persisted.
+    /// The adapter's effective expiry, including its JWT/persisted precedence.
     public static func expiresAt(providerId: String, dataRoot: URL? = nil) -> Date? {
-        guard let path = statusCredentialPath(providerId: providerId, dataRoot: dataRoot) else {
-            return nil
-        }
-        guard let obj = try? statusCredentialObject(at: path)
-        else { return nil }
-        if let d = parseExpiresAt(obj["expires_at"]) { return d }
-        if let tokens = obj["tokens"] as? [String: Any] {
-            if let d = parseExpiresAt(tokens["expires_at"]) { return d }
-            if let access = tokens["access_token"] as? String,
-               let payload = jwtPayload(access) {
-                if let exp = payload["exp"] as? Int {
-                    return Date(timeIntervalSince1970: TimeInterval(exp))
-                }
-                if let exp = payload["exp"] as? Double {
-                    return Date(timeIntervalSince1970: exp)
-                }
-            }
-        }
-        if let access = obj["access_token"] as? String,
-           let payload = jwtPayload(access) {
-            if let exp = payload["exp"] as? Int {
-                return Date(timeIntervalSince1970: TimeInterval(exp))
-            }
-            if let exp = payload["exp"] as? Double {
-                return Date(timeIntervalSince1970: exp)
-            }
-        }
-        return nil
+        credentialHealth(providerId: providerId, dataRoot: dataRoot)?.expiresAt
     }
 
     /// Format `expires_at` as a short status string for the OAuth badge.
@@ -243,9 +206,9 @@ extension NativeOAuthFlow {
         guard let path = activeAuthPath
             ?? openAIStatusAuthPath(dataRoot: dataRoot, sharedCLIHome: sharedCLIHome)
         else { return nil }
-        guard OpenAIOAuthDirectAdapter.hasUsableTokens(at: path) else { return nil }
-        let sharedCLIAuth = sharedCLIHome
-            .appendingPathComponent("auth.json")
+        guard OpenAIOAuthDirectAdapter.hasAccessToken(at: path) else { return nil }
+        let sharedCLIAuth = OpenAIOAuthDirectAdapter.preferredAuthPath(
+            userCodexHome: sharedCLIHome, source: .sharedCLI)
             .resolvingSymlinksInPath().standardizedFileURL.path
         let activePath = path.resolvingSymlinksInPath().standardizedFileURL.path
         guard activePath == sharedCLIAuth else { return nil }
@@ -273,34 +236,9 @@ extension NativeOAuthFlow {
         return nil
     }
 
-    /// Best-effort on-disk auth check used by the UI status badge.
+    /// The adapter can use or renew this root's credential.
     public static func isSignedIn(providerId: String, dataRoot: URL? = nil) -> Bool {
-        switch normalizedOAuthProviderId(providerId) {
-        case "openai_oauth_direct":
-            // User, 2026-09-06: same root confinement as `statusCredentialPath`
-            // — the badge said "Signed in" off a credential belonging to a
-            // different root than the one the screen is showing.
-            guard let path = openAIStatusAuthPath(
-                dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()),
-                  let data = try? Data(contentsOf: path),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let tokens = obj["tokens"] as? [String: Any],
-                  let access = tokens["access_token"] as? String,
-                  !access.isEmpty
-            else { return false }
-            return true
-        case "anthropic_oauth_direct":
-            return anthropicOAuthCredentialState(dataRoot: dataRoot) == .ready
-        case "xai_oauth_direct":
-            guard let obj = try? XAIOAuthCredentialStore.read(at: XAIOAuthDirectAdapter.tokenPath(
-                      dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()))
-            else { return false }
-            if let s = obj["access_token"] as? String, !s.isEmpty { return true }
-            if let nested = (obj["tokens"] as? [String: Any])?["access_token"] as? String,
-               !nested.isEmpty { return true }
-            return false
-        default: return false
-        }
+        credentialHealth(providerId: providerId, dataRoot: dataRoot)?.configured == true
     }
 
     // MARK: - Paths (shared with the read-side adapters)
@@ -317,39 +255,14 @@ extension NativeOAuthFlow {
         )
     }
 
-    /// The ChatGPT credential a badge for `dataRoot` is allowed to read: that
-    /// root's own app-owned file, or — only when THAT root's consent record
-    /// allows it — the shared Codex CLI file. Nil when neither holds usable
-    /// tokens.
-    ///
-    /// User, 2026-09-06: the badge went through `preferredAuthPath`, which walks
-    /// every candidate on the machine (cwd repo, Application Support, the
-    /// default root) and returns the first usable one — so status for an
-    /// override root reported another root's sign-in, expiry and refreshability.
-    /// A root's status may never come from a different root's credential.
-    ///
-    /// `CODEX_HOME` stays a candidate for the DEFAULT root only: execution
-    /// there honours the process env unconditionally, while a client bound to
-    /// an override root rebinds `CODEX_HOME` to that root, so the process value
-    /// says nothing about it.
+    /// The adapter's runtime read selection, including process overrides for
+    /// the default root and confined CLI consent for alternate roots.
     public static func openAIStatusAuthPath(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        environment: [String: String] = ProcessInfo.processInfo.environment,
         sharedCLIHome: URL = OpenAIOAuthDirectAdapter.defaultUserCodexHome()
     ) -> URL? {
-        var candidates: [URL] = []
-        if dataRoot.standardizedFileURL.path
-            == PersistenceCore.defaultDataRoot().standardizedFileURL.path,
-           let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty {
-            candidates.append(
-                URL(fileURLWithPath: (codexHome as NSString).expandingTildeInPath)
-                    .appendingPathComponent("auth.json"))
-        }
-        candidates.append(openAIAppOwnedAuthPath(dataRoot: dataRoot))
-        if OpenAIOAuthDirectAdapter.cliAdoptionConsent(dataRoot: dataRoot) == .allowed {
-            candidates.append(sharedCLIHome.appendingPathComponent("auth.json"))
-        }
-        return candidates.first { OpenAIOAuthDirectAdapter.hasUsableTokens(at: $0) }
+        let path = OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot, userCodexHome: sharedCLIHome)
+        return OpenAIOAuthDirectAdapter.hasAccessToken(at: path) ? path : nil
     }
 
     public static func anthropicTokenPath(dataRoot: URL? = nil) -> URL {
@@ -372,13 +285,8 @@ extension NativeOAuthFlow {
             guard let object = decoded as? [String: Any] else {
                 return .unavailable("saved credentials are not a JSON object")
             }
-            let access = (object["access_token"] as? String)
-                ?? ((object["tokens"] as? [String: Any])?["access_token"] as? String)
-            guard let access,
-                  !access.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return .unavailable("saved credentials contain no access token")
-            }
-            return .ready
+            let status = AnthropicOAuthDirectAdapter.credentialStatus(object)
+            return status.usable ? .ready : .unavailable(status.detail)
         } catch {
             return .unavailable("saved credentials could not be read: \(error.localizedDescription)")
         }
@@ -407,7 +315,7 @@ extension NativeOAuthFlow {
             for key in ["tokens", "id_token", "account", "oauth_account_identity", "refresh_token_account_identity"] {
                 existing.removeValue(forKey: key)
             }
-            existing["client_id"] = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+            existing["client_id"] = ProviderOAuthConfig.anthropic.clientId
             existing["access_token"] = rawAccess
             // 2026-09-06: this is a new sign-in, not a refresh of the old account.
             existing["refresh_token"] = (tokens["refresh_token"] as? String) ?? ""
@@ -456,8 +364,8 @@ extension NativeOAuthFlow {
             return .unavailable(reason: reason)
         }
         guard consentState != .allowed else { return nil }
-        let auth = sharedCLIHome.appendingPathComponent("auth.json")
-        guard OpenAIOAuthDirectAdapter.hasUsableTokens(at: auth) else { return nil }
+        let auth = OpenAIOAuthDirectAdapter.preferredAuthPath(userCodexHome: sharedCLIHome, source: .sharedCLI)
+        guard OpenAIOAuthDirectAdapter.hasAccessToken(at: auth) else { return nil }
         return .available(
             email: openAIAccountEmail(at: auth),
             alreadyDeclined: consentState == .declined
@@ -479,8 +387,8 @@ extension NativeOAuthFlow {
     ) -> Bool {
         let id = providerId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard id == "openai_oauth_direct" || id == "codex" else { return false }
-        return OpenAIOAuthDirectAdapter.hasUsableTokens(
-            at: sharedCLIHome.appendingPathComponent("auth.json")
+        return OpenAIOAuthDirectAdapter.hasAccessToken(
+            at: OpenAIOAuthDirectAdapter.preferredAuthPath(userCodexHome: sharedCLIHome, source: .sharedCLI)
         )
     }
 
@@ -515,7 +423,7 @@ extension NativeOAuthFlow {
 }
 
 extension NativeOAuthFlow {
-    public struct SignInStatus: Equatable {
+    public struct SignInStatus: Equatable, Sendable {
         public let isSignedIn: Bool
         public let detail: String?
         public let error: String?

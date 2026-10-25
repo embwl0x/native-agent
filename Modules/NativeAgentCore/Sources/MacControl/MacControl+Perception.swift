@@ -11,6 +11,7 @@ import CoreGraphics
 #endif
 #if canImport(ApplicationServices)
 import ApplicationServices
+// Blueprint: | `MacControl+Perception.swift` | `SwiftNativeMacControl`: `handleRead`, `documentPath`; semantic view masks pixels from the complete AX snapshot's secret frames before sharing |
 #endif
 
 extension SwiftNativeMacControl {
@@ -607,15 +608,10 @@ extension SwiftNativeMacControl {
     /// One vocabulary for the self-refusal across every read tool.
     static let selfInspectionError = "self_inspection_unsupported"
     static let selfInspectionNote =
-        "this app's own window can never be captured: reading our own UI over AX "
-        + "deadlocks the app (in-process AppKit re-entry), so self-inspection is "
-        + "always refused. Our own window is worked IN PROCESS instead, through "
-        + "app: {page} reads any page with its settings and actions, "
-        + "page.screenshot draws one, setting.set works its controls, and the "
-        + "chat.* actions set or send the draft, pick the model, set the thinking "
-        + "level and open or close a card; page.show switches the rail page. "
-        + "Use app (desk.read, mind.inner_state, agent.introspect) "
-        + "for our own state, and screen only for another app\'s window."
+        "NativeAgent's own UI cannot be read through Accessibility: AppKit re-entry deadlocks it. "
+        + "Use app {page:\"current\"} for pages, settings and actions; page.screenshot for an image; "
+        + "setting.set for controls; chat.* for drafts, sending, model, Think and cards; page.show to select a page. "
+        + "desk.read, mind.inner_state and agent.introspect read NativeAgent's state. mac.look reads other apps."
 
     private func runningAppProjection() -> [String: JSONValue] {
         let front = accessibilitySource.frontmostApp()?.processIdentifier
@@ -961,7 +957,7 @@ extension SwiftNativeMacControl {
         seam["web_area_path"] = .array(web.path.map { .int(Int64($0)) })
         seam["chrome"] = .string(
             "browser chrome: toolbar + bookmarks bar, \(chromeControls) control(s) — "
-            + "call mac_look {scope: \"chrome\"} to address them"
+            + "use app {action:\"mac.look\",args:{part:\"toolbar\"}} to inspect the toolbar"
         )
         seam["chrome_controls"] = .int(Int64(chromeControls))
         return (
@@ -1695,7 +1691,7 @@ extension SwiftNativeMacControl {
                 output["frontmost_app"] = frontmostAppJSON
                 output["message"] = .string(
                     "\(name)'s window is minimized. go name:\"\(name)\" brings it back. "
-                    + "Its menu bar still works: act app:\"\(name)\" target:\"File > New\" makes a new window."
+                    + "Its menu bar still works: mac.act app:\"\(name)\" target:\"File > New\" makes a new window."
                 )
             } else if anchoredApp == nil, let front = accessibilitySource.frontmostApp(),
                       front.processIdentifier != getpid() {
@@ -1707,7 +1703,7 @@ extension SwiftNativeMacControl {
                 output["message"] = .string(
                     "\(anchoredApp.name) is running but has no window I can read right now "
                     + "(it may be minimized or have every window closed). Its menu bar still works: "
-                    + "act app:\"\(anchoredApp.name)\" target:\"File > New\" makes a new window, "
+                    + "mac.act app:\"\(anchoredApp.name)\" target:\"File > New\" makes a new window, "
                     + "and go name:\"\(anchoredApp.name)\" brings one back."
                 )
             }
@@ -1856,9 +1852,8 @@ extension SwiftNativeMacControl {
                 output["glance"] = .string(percept.glanceLine())
                 output["addressable_handles"] = .int(Int64(percept.affordances.count))
                 output["how_to_read"] = .string(
-                    "One distilled line. Call mac_look {grade: \"look\"} for the addressable "
-                    + "affordances (\(percept.affordances.count) labeled control(s) in this frame), "
-                    + "or {grade: \"stare\"} for the full AX tree."
+                    "One summary line; this frame has \(percept.affordances.count) labeled controls. "
+                    + "Use app {action:\"mac.look\",args:{part:\"controls\"}} to inspect controls, or mac.read for document text."
                 )
             } else if let rendering {
                 if case .object(let lookObject) = rendering.json {
@@ -2510,7 +2505,7 @@ extension SwiftNativeMacControl {
         // Motion perception needs subsecond frame spacing. Keep the legacy
         // human timestamp, but never round the machine observation clock.
         output["captured_at_epoch_seconds"] = .double(capturedAt.timeIntervalSince1970)
-        output["view_ttl_seconds"] = .int(Int64(MacScreenViewStore.ttlSeconds))
+        output["view_ttl_seconds"] = .int(Int64(MacLookFrameStore.ttlSeconds))
         output["marks"] = .array(marks)
         output["mark_count"] = .int(Int64(selection.marks.count))
         output["marks_omitted"] = .int(Int64(selection.omitted))
@@ -2538,7 +2533,7 @@ extension SwiftNativeMacControl {
             + "beside it, and one with label_source \"none\" has no name the app publishes."
         )
         output["how_to_act"] = .string(
-            "Act by name with act {verb: \"click\", target: \"<the element's name>\"}; it "
+            "Act by name with mac.act {verb: \"click\", target: \"<the element's name>\"}; it "
             + "presses the element the app's own way. Coordinates are for the parts of the picture "
             + "with no marks (canvas, game, video). Marks are only valid for THIS view."
         )
@@ -2673,7 +2668,7 @@ extension SwiftNativeMacControl {
             ])
 
         case "stop":
-            let wasActive = await attentionStore.stop()
+            let wasActive = await attentionStore.stopAttentionSession()
             await screenViewStore.invalidate()
             return result(ok: true, output: [
                 "active": .bool(false),
@@ -2741,10 +2736,8 @@ extension SwiftNativeMacControl {
     }
 
     static let screenRecordingNote =
-        "NativeAgent does not have Screen Recording permission yet, so the picture half of the "
-        + "view is missing (the accessibility legend still works). Grant it in System Settings → "
-        + "Privacy & Security → Screen Recording (toggle NativeAgent on) and restart the app. "
-        + "Only you can grant this — the app cannot toggle it. This is a SEPARATE permission from "
-        + "Accessibility."
+        "screen_recording_not_trusted: No image is available; the Accessibility legend still works. "
+        + "Ask the owner to enable System Settings > Privacy & Security > Screen Recording > NativeAgent "
+        + "and follow macOS's restart instruction if shown. This grant is separate from Accessibility."
 
 }

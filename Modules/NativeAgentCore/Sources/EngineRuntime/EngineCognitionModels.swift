@@ -7,6 +7,7 @@ import NativeAgentShared
 import PersistenceCore
 import DeviceSync
 import DreamREMCycle
+// Blueprint: | `EngineCognitionModels.swift` | `CognitionProposalsFeed` enum; `CognitionProposalsFeed`; `DreamRunResult` completion and status interpretation |
 
 public enum CognitionProposalsFeed: Sendable {
     public struct Pending: Sendable, Equatable {
@@ -267,7 +268,6 @@ extension DreamRunResult {
         if disabled { return "Dream cycle disabled" }
         if let reason = result["skipReason"] as? String {
             switch reason {
-            case "already_dreamt": return "Dream already ran for the target night"
             case "already_running": return "A dream cycle is already running"
             case "no_new_material": return "No new material to dream about"
             default: return "Dream cycle skipped: \(reason)"

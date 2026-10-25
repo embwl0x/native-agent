@@ -1,10 +1,14 @@
 import Foundation
 import BackgroundWork
 import NativeAgentShared
+import NativeAgentCore
+import AuthoredCapabilities
 import Observation
 import NotificationInbox
 import PersistenceCore
 import TriggerScheduler
+import Cognition
+// Blueprint: | `EngineInbox.swift` | InboxFacade publishes checked items, triggers and read errors through LatestRead; each caller receives its own rows; markRead and committed trigger changes use write; owner-scoped observe/observeTriggers, including canonical ability invalidations for authored trigger defaults, loading and availability; InboxItemRecord action/proactive prominence and newest physical row per stable card id. |
 
 extension InboxItemRecord {
     public var isUnread: Bool { normalizedStatus == "unread" }
@@ -12,9 +16,9 @@ extension InboxItemRecord {
 
 /// `NativeAgentEngine.inbox` (S10): the live notification inbox for one data
 /// root, as core `InboxItemRecord`s. Today's notes, the Inbox page, the chat
-/// strip and the badges render `items`; the read is nonisolated so the phone
-/// snapshot uses the same owner. Card actions run through the app's
-/// `InboxCardActions`.
+/// strip and the badges render `items`; LatestRead owns publication here.
+/// Phone snapshots receive their own checked read. Card actions run through
+/// the app's `InboxCardActions`.
 @MainActor
 @Observable
 public final class InboxFacade {
@@ -24,9 +28,35 @@ public final class InboxFacade {
     /// changes; another root gets its own.
     public nonisolated let store: LiveNotificationInbox
 
-    /// Every card, newest first, as of the last read.
-    public var items: [InboxItemRecord] = [] {
+    /// Every card, newest first, as of the last published read.
+    public private(set) var items: [InboxItemRecord] = [] {
         didSet { itemsDidChange?() }
+    }
+    public private(set) var loadError: String?
+    public private(set) var hasLoadedSnapshot = false
+    public var isLoading: Bool { pendingItemReads > 0 }
+    private var pendingItemReads = 0
+    public private(set) var triggerRows: [TriggerConfig] = []
+    public private(set) var triggersRead = false
+    public private(set) var triggerError: String?
+    public var isLoadingTriggers: Bool { pendingTriggerReads > 0 }
+    private var pendingTriggerReads = 0
+    @ObservationIgnored private lazy var itemRead = LatestRead()
+    @ObservationIgnored private lazy var triggerRead = LatestRead()
+
+    public var refreshErrorText: String? {
+        loadError.map { _ in
+            items.isEmpty ? "Couldn't read your notes. Try Refresh."
+                : "Couldn't refresh, so these notes may be out of date. Try Refresh."
+        }
+    }
+
+    public enum ContentPresentation { case loading, unavailable, empty, content }
+
+    public func contentPresentation(hasVisibleItems: Bool) -> ContentPresentation {
+        if hasVisibleItems { return .content }
+        if loadError != nil { return .unavailable }
+        return hasLoadedSnapshot ? .empty : .loading
     }
     @ObservationIgnored public var itemsDidChange: (@MainActor () -> Void)?
 
@@ -45,7 +75,27 @@ public final class InboxFacade {
     /// 2026-06-06: newest first — the file is append-only, so without the
     /// sort the just-fired card lands at the bottom. The phone's inbox
     /// snapshot inherits this order.
-    public nonisolated func list(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
+    public func list(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
+        pendingItemReads += 1
+        defer { pendingItemReads -= 1 }
+        let result: Result<[InboxItemRecord], Error> = await itemRead.read({
+            do { return .success(try await self.read()) }
+            catch { return .failure(error) }
+        }) { result in
+            switch result {
+            case .success(let loaded):
+                if items != loaded { items = loaded }
+                hasLoadedSnapshot = true
+                loadError = nil
+            case .failure(let error):
+                loadError = UserFacingError.message(error, action: "read your inbox")
+            }
+        }
+        let loaded = try result.get()
+        return unreadOnly ? loaded.filter(\.isUnread) : loaded
+    }
+
+    private nonisolated func read() async throws -> [InboxItemRecord] {
         let rows = try await store.rows()
         var items = InboxItemRecord.latest(in: rows)
         if !rows.isEmpty && items.isEmpty {
@@ -55,7 +105,6 @@ public final class InboxFacade {
                     + "refusing to render a corrupt inbox as empty"
             ])
         }
-        if unreadOnly { items = items.filter(\.isUnread) }
         items.sort { lhs, rhs in
             if lhs.created_at.isEmpty { return false }
             if rhs.created_at.isEmpty { return true }
@@ -65,17 +114,22 @@ public final class InboxFacade {
         return items
     }
 
-    /// A resolving card action publishes its refreshed state to the phone.
-    public func publishAfterAction(refresh: @MainActor () async -> Void) async {
-        await refresh()
-        await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots()
+    public func refresh() async { _ = try? await list() }
+
+    /// Mounted inbox surfaces observe the same source and publish to every reader.
+    public func observe() async {
+        await EventDeadlinePhysiology.refreshOnChanges(paths: [LiveNotificationInbox.livePath(dataRoot: dataRoot)]) {
+            await self.refresh()
+        }
     }
 
     /// Marks the shown card read after a successful read action. Reading does
     /// not settle an owner obligation.
     public func markRead(_ id: String) {
-        if let idx = items.firstIndex(where: { $0.id == id }), items[idx].isUnread {
-            items[idx].status = "read"
+        itemRead.write {
+            if let idx = items.firstIndex(where: { $0.id == id }), items[idx].isUnread {
+                items[idx].status = "read"
+            }
         }
     }
 }
@@ -83,19 +137,51 @@ public final class InboxFacade {
 // MARK: - Proactive triggers
 
 extension InboxFacade {
+    public func observeTriggers() async {
+        await EventDeadlinePhysiology.refreshOnChanges(
+            paths: [dataRoot.appendingPathComponent("triggers/trigger_config.json")],
+            notifications: [AbilityStore.didChange]
+        ) {
+            do { _ = try await self.triggers() }
+            catch { print("[inbox triggers] \(error.localizedDescription)") }
+        }
+    }
+
     /// The kinds of card she raises unasked (morning brief, idle check-in,
     /// file watch…), as TriggerScheduler keeps them for this root.
-    public nonisolated func triggers() async throws -> [TriggerConfig] {
-        try await makeTriggerScheduler(dataRoot: dataRoot).listInboxTriggers()
+    public func triggers() async throws -> [TriggerConfig] {
+        pendingTriggerReads += 1
+        defer { pendingTriggerReads -= 1 }
+        let result: Result<[TriggerConfig], Error> = await triggerRead.read({
+            do { return .success(try await NativeAgentEngine.makeNativeTriggerScheduler(dataRoot: dataRoot).listInboxTriggers()) }
+            catch { return .failure(error) }
+        }) { result in
+            triggersRead = true
+            switch result {
+            case .success(let loaded):
+                triggerRows = loaded
+                triggerError = nil
+            case .failure(let error):
+                triggerError = UserFacingError.message(error, action: "load triggers")
+            }
+        }
+        return try result.get()
     }
 
     /// Turn one trigger on or off. A name the scheduler does not know throws.
-    public nonisolated func setTrigger(_ name: String, enabled: Bool) async throws {
-        let scheduler = makeTriggerScheduler(dataRoot: dataRoot)
+    public func setTrigger(_ name: String, enabled: Bool) async throws {
+        let scheduler = NativeAgentEngine.makeNativeTriggerScheduler(dataRoot: dataRoot)
         let status = try await enabled
             ? scheduler.enableInboxTrigger(name: name)
             : scheduler.disableInboxTrigger(name: name)
         try Self.requireTrigger(status, name: name)
+        triggerRead.write {
+            if let enabled = status.enabled, let index = triggerRows.firstIndex(where: { $0.name == status.name }) {
+                triggerRows[index].enabled = enabled
+            }
+        }
+        do { _ = try await triggers() }
+        catch { print("[inbox triggers] \(error.localizedDescription)") }
     }
 
     private nonisolated static func requireTrigger(_ status: TriggerStatus, name: String) throws {
@@ -210,9 +296,8 @@ public enum InboxVisibleActionsPresentation {
 /// sank under the next hour of notices and was gone. Reading is not resolving;
 /// the same OwnerAttentionPolicy as the overview owns this section.
 ///
-/// Resolution is what removes it. A resolved approval's card stops coming back
-/// from the reload, which is the existing tombstone path — no second source of
-/// truth about what is outstanding.
+/// Resolution is what removes it. Every surface renders the latest checked
+/// InboxFacade revision, including a card restored by its durable owner.
 public enum InboxNeedsYou {
     public struct Sections {
         public let needsYou: [InboxItemRecord]

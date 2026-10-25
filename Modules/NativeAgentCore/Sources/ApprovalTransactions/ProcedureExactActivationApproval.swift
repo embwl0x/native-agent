@@ -4,6 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import Procedures
 import WorkshopExecution
+// Blueprint: | `ProcedureExactActivationApproval.swift` | `ApprovalTransactionCoordinator`: `applyResolvedProcedureExactActivation` |
 
 extension ApprovalTransactionCoordinator {
     /// Idempotent executor for the local-only exact-procedure activation card.

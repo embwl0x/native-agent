@@ -4,292 +4,21 @@ import AppToolRuntime
 import Agents
 import SwiftUI
 import NativeAgentCore
-import ChatOrchestration
-import PersistenceCore
-import Transcripts
 import StandingBots
 import SwarmRuns
 import NativeAgentShared
-import os
+// Blueprint: | `SimpleShellView.swift` | Simple and Advanced shells render the engine's shared contact, helper and typed crew projection; only selection and formatting remain local |
 
 // Simple view's window: one floating glass sidebar (the rail's plate) and the
 // agent's ordinary chat, a contact's or helper's thread, or a crew's work beside it.
-// Reads the stores the rest of the app already keeps; writes nothing.
+// Renders the engine's root-scoped contact, helper and crew projections.
 
 typealias SimpleContact = AgentContactPresentation
 typealias SimpleThreadLine = AgentContactThreadLine
 typealias SimpleFlight = AgentContactFlight
 
-@MainActor @Observable
-final class SimpleFlightProjection {
-    @ObservationIgnored var flight: SimpleFlight?
-    var structure: SimpleFlight?
-    var partial: String?
-    var hasPartial = false
-
-    func update(_ value: SimpleFlight?) {
-        flight = value
-        let text = value?.partial
-        if partial != text { partial = text }
-        if hasPartial != (text != nil) { hasPartial = text != nil }
-        var shape = value
-        if var live = shape?.live {
-            live.partial = nil
-            live.partialChars = 0
-            live.partialTruncated = false
-            live.lastActivityAt = live.startedAt
-            live.firstActivityAt = nil
-            shape?.live = live
-        }
-        if structure != shape { structure = shape }
-    }
-}
-
-/// A crew the agent sent out (`agent_swarm`): a few workers on one task, for
-/// as long as it runs, then its finished receipt. Uses the executor's shared
-/// projection of live progress and retained receipts.
-struct SimpleCrew: Identifiable, Equatable, Sendable {
-    let id: String
-    /// The task, in its first line.
-    let task: String
-    /// Still working (swarms/live.json); otherwise finished (swarms/runs.json).
-    let live: Bool
-    /// The run's own status word: running, completed, partial, failed, cancelled.
-    let status: String
-    let at: Date
-    let workers: [Worker]
-    /// The workers' findings pulled together, when the run asked for it.
-    let synthesis: String?
-
-    struct Worker: Identifiable, Equatable, Sendable {
-        let id: Int
-        let name: String
-        /// working, completed, failed, cancelled.
-        let status: String
-        let text: String
-    }
-
-    var settled: Bool { workers.allSatisfy { $0.status != "working" } }
-
-    /// Crews at work now, newest first, then the three most recently finished.
-    nonisolated static func read(root: URL) throws -> [SimpleCrew] {
-        let all = try SwiftNativeSwarmRunsReader(runsPath: root.appendingPathComponent("swarms/runs.json")).readCrews()
-        let finished = all.filter { $0["pid"] == nil }.compactMap { crew($0, live: false) }
-        let live = all.filter { $0["pid"] != nil }.compactMap { crew($0, live: true) }
-        return live.sorted { $0.at > $1.at } + finished.sorted { $0.at > $1.at }.prefix(3)
-    }
-
-    nonisolated private static func crew(_ row: [String: Any], live: Bool) -> SimpleCrew? {
-        guard let id = row["id"] as? String, let objective = row["objective"] as? String else { return nil }
-        let dates = ISO8601DateFormatter(), whole = ISO8601DateFormatter()
-        dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let at = (row["completedAt"] as? String ?? row["createdAt"] as? String)
-            .flatMap { dates.date(from: $0) ?? whole.date(from: $0) } ?? .distantPast
-        let workers = (row["workers"] as? [[String: Any]] ?? []).enumerated().map { index, worker in
-            let role = (worker["role"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? worker["name"] as? String ?? "Worker \(index + 1)"
-            let output = (worker["output"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            return Worker(id: index, name: role.prefix(1).uppercased() + role.dropFirst(),
-                          status: worker["status"] as? String ?? "working",
-                          text: output.isEmpty ? worker["error"] as? String ?? "" : output)
-        }
-        let synthesis = ((row["synthesis"] as? [String: Any])?["output"] as? String ?? row["synthesis"] as? String)
-            .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
-        let task = String(SimpleViewStore.firstLine(objective).prefix(120))
-        return SimpleCrew(id: id, task: task.isEmpty ? "A task" : task, live: live,
-                          status: row["status"] as? String ?? "running", at: at, workers: workers, synthesis: synthesis)
-    }
-}
-
-@MainActor @Observable
-final class SimpleViewStore {
-    /// Most recent exchange first; contacts never talked to keep their order
-    /// after them.
-    var contacts: [SimpleContact] = []
-    /// Per contact id, oldest first.
-    var lines: [String: [SimpleThreadLine]] = [:]
-    /// Contacts with a message still on its way or awaiting a reply.
-    var waiting: Set<String> = []
-    /// Where each contact's latest send stands when no reply is owed or
-    /// none came: delivered, read, failed, not delivered.
-    var status: [String: AgentConversationDelivery] = [:]
-    /// Per contact id: its live reply, queue and stop, while there are any.
-    @ObservationIgnored private var flights: [String: SimpleFlight] = [:]
-    @ObservationIgnored private var flightSlots: [String: SimpleFlightProjection] = [:]
-    var helpers: [BotsShelfRecord] = []
-    var helperRuns: [UUID: [ShelfEntry]] = [:]
-    /// False until the first read lands, so an empty list isn't claimed early.
-    var loaded = false
-    /// A failed refresh keeps the last proven conversation snapshot visible.
-    var refreshError: String?
-    /// Helpers with a run queued or under way now.
-    var running: Set<UUID> = []
-    /// Crews at work now, then the few most recently finished.
-    var crews: [SimpleCrew] = []
-
-    private typealias Snapshot = AgentContactThreads.Snapshot
-    private typealias ContactList = AgentContactThreads.ContactList
-
-    nonisolated static func key(_ helper: UUID) -> String { AgentContactThreads.key(helper) }
-
-    private func slot(_ id: String) -> SimpleFlightProjection {
-        if let slot = flightSlots[id] { return slot }
-        let slot = SimpleFlightProjection()
-        flightSlots[id] = slot
-        return slot
-    }
-
-    func flight(for id: String) -> SimpleFlight? {
-        let slot = slot(id)
-        _ = slot.structure
-        _ = slot.hasPartial
-        return slot.flight
-    }
-
-    func partial(for id: String) -> String? { slot(id).partial }
-
-    /// Reload whenever the contact list, the conversation records, a chat
-    /// (any append rewrites the chat index) or the helpers' shelf change on disk, a helper's run takes its
-    /// claim (`run.lock`), or one ends (in memory, so the queue says so), or
-    /// a built-in lane's inbox marks a message read. The live hub's partials
-    /// (a few writes a second while a reply streams) re-read only the flights.
-    func watch(root: URL, helpers ids: [UUID]) async {
-        let paths = ["agents/peers.json", "agents/conversations.json", "chat/sessions.json", "bots/definitions",
-                     "bots/shelf-index.json", "bots/run-queue.json", "agents/conversation-live.json",
-                     "agents/local-health.json", "agents/reply-reads.json"]
-            + ids.map { "bots/\($0.uuidString)/run.lock" }
-        let liveFile = root.appendingPathComponent("agents/conversation-live.json").standardizedFileURL
-        let bridges = InstallPaths.current.bridgeConfigRoot(dataRoot: root)
-        let inboxes = ["claude", "codex", "omp"].compactMap { AgentConversationDelivery.inbox(agent: $0, bridgeConfigRoot: bridges) }
-        let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) } + inboxes
-            + [bridges.appendingPathComponent("claude-bridge/claude-live")], emitInitial: true)
-        let (ticks, tick) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
-        // Set by every change, cleared just before a read: a tick buffered
-        // while that read's burst settled finds it clear and is skipped.
-        // `full` for anything but the live file, which sets only `live`.
-        let pending = OSAllocatedUnfairLock(initialState: (full: false, live: false))
-        let files = Task {
-            for await url in events.stream {
-                pending.withLock { if url == liveFile { $0.live = true } else { $0.full = true } }
-                tick.yield()
-            }
-        }
-        let ended = NotificationCenter.default.addObserver(forName: BotRunQueue.didChange, object: nil, queue: nil) { _ in
-            pending.withLock { $0.full = true }
-            tick.yield()
-        }
-        let dotChanged = NotificationCenter.default.addObserver(forName: ChatGPTDotIPCTransport.didChange, object: nil, queue: nil) { _ in
-            pending.withLock { $0.full = true }
-            tick.yield()
-        }
-        var last = Snapshot(contacts: contacts, lines: lines, waiting: waiting, status: status, flights: flights,
-                            helpers: helpers, running: running)
-        var list: ContactList?
-        await withTaskCancellationHandler {
-            for await _ in ticks {
-                guard !Task.isCancelled else { break }
-                guard pending.withLock({ $0.full || $0.live }) else { continue }
-                // One message writes several files; let the burst land first.
-                if loaded { try? await Task.sleep(for: .milliseconds(150)) }
-                guard !Task.isCancelled else { break }
-                let first = !loaded
-                let retry = refreshError != nil
-                let full = pending.withLock { state in
-                    defer { state = (false, false) }
-                    return state.full || first || retry
-                }
-                do {
-                    let (next, contactList, delta, runs) = try await Task.detached(priority: .userInitiated) { [last, list] in
-                        // A records change that rode in on the live file's tick still gets its full read.
-                        if !full, let flights = AgentContactThreads.readFlights(root: root, last: last) {
-                            var next = last
-                            next.flights = flights
-                            return (next, list, AgentContactThreads.changes(from: last, to: next), Optional<[UUID: [ShelfEntry]]>.none)
-                        }
-                        if try AgentPeerStore(dataRoot: root).list().contains(where: ChatGPTDotIPCTransport.owns) {
-                            _ = await SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false).chatGPTDotReadiness()
-                        }
-                        Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
-                        let (snapshot, contactList) = try AgentContactThreads.read(root: root, cached: list)
-                        var next = snapshot
-                        let tinted = next.contacts.indices.filter { next.contacts[$0].appBundleID == nil }
-                            .sorted { next.contacts[$0].id < next.contacts[$1].id }
-                        for (step, index) in tinted.enumerated() { next.contacts[index].tintSlot = step * 3 % SimpleAvatar.slotCount }
-                        let delta = AgentContactThreads.changes(from: last, to: next)
-                        let runs: [UUID: [ShelfEntry]]? = if delta?.helpers != nil || delta?.lines != nil {
-                            Dictionary(uniqueKeysWithValues: next.helpers.map { helper in
-                                let said = Set((next.lines[Self.key(helper.id)] ?? []).filter { !$0.fromAgent }
-                                    .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) })
-                                return (helper.id, Array(helper.sortedEntries.lazy.filter {
-                                    !said.contains($0.actualReply.trimmingCharacters(in: .whitespacesAndNewlines))
-                                }.prefix(40)))
-                            })
-                        } else { nil }
-                        return (next, contactList, delta, runs)
-                    }.value
-                    last = next
-                    list = contactList
-                    if let delta {
-                        if let value = delta.contacts { contacts = value }
-                        if let value = delta.lines { lines = value }
-                        if let value = delta.waiting { waiting = value }
-                        if let value = delta.status { status = value }
-                        if let value = delta.flights {
-                            for id in Set(flights.keys).union(value.keys) where flights[id] != value[id] {
-                                slot(id).update(value[id])
-                            }
-                            flights = value
-                        }
-                        if let value = delta.helpers { helpers = value }
-                        if let value = delta.running { running = value }
-                    }
-                    if let runs, helperRuns != runs { helperRuns = runs }
-                    if !loaded { loaded = true }
-                    refreshError = nil
-                } catch {
-                    refreshError = UserFacingError.message(error, action: "refresh conversations")
-                }
-            }
-        } onCancel: { events.cancel(); tick.finish() }
-        files.cancel()
-        NotificationCenter.default.removeObserver(ended)
-        NotificationCenter.default.removeObserver(dotChanged)
-    }
-
-    /// Crews on their own watch: runs.json keeps every finished run whole, so
-    /// it is read only when a crew changes, never on a contact's message.
-    func watchCrews(root: URL) async {
-        let paths = ["swarms/live.json", "swarms/runs.json"].map { root.appendingPathComponent($0) }
-        // The watcher arms on the folder, so the first crew is seen even
-        // before one has ever run. An empty folder; nothing else is written.
-        await Task.detached(priority: .utility) {
-            try? FileManager.default.createDirectory(at: paths[0].deletingLastPathComponent(), withIntermediateDirectories: true)
-        }.value
-        let events = FileChangeEvents(paths: paths, emitInitial: true)
-        await withTaskCancellationHandler {
-            for await _ in events.stream {
-                guard !Task.isCancelled else { break }
-                do {
-                    let next = try await Task.detached(priority: .utility) { try SimpleCrew.read(root: root) }.value
-                    if crews != next { crews = next }
-                } catch { refreshError = UserFacingError.message(error, action: "refresh crews") }
-            }
-        } onCancel: { events.cancel() }
-    }
-
-    /// A bridged turn without the bracketed notes the bridge puts on top (and
-    /// the bare contact-metadata line replies carried before 09-25).
-    nonisolated static func bridgedText(_ content: String) -> String { ContactThread.bridgedText(content) }
-
-    /// The first line of some text with its markdown marks gone, for a row.
-    nonisolated static func firstLine(_ text: String) -> String {
-        let line = text.split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .first { !$0.isEmpty } ?? ""
-        return line.replacingOccurrences(of: "**", with: "")
-            .replacingOccurrences(of: "`", with: "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "#>-* "))
-    }
-}
+typealias SimpleViewStore = ContactThreadsProjection
+typealias SimpleCrew = SwarmCrew
 
 extension EnvironmentValues {
     /// app_page_screenshot's "simple_settings_menu": the settings menu drawn
@@ -299,13 +28,10 @@ extension EnvironmentValues {
 
 struct SimpleShellView: View {
     enum Pane: Hashable { case agent, contact(String), helper(UUID), crew(String) }
-    private struct Watch: Equatable { let root: URL; let helpers: [UUID] }
 
     @Environment(AppModel.self) private var appModel
-    @State private var store = SimpleViewStore()
+    private var store: SimpleViewStore { appModel.engine.contactThreads }
     @State private var pane: Pane = .agent
-
-    private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
 
     /// The open contact, helper or crew left the lists (unreachable, deleted,
     /// or a finished crew past the newest three): back to the agent's chat,
@@ -351,11 +77,7 @@ struct SimpleShellView: View {
                 }
             }
         }
-        // Restarted when the helpers change, so each one's run.lock is watched.
-        .task(id: Watch(root: root, helpers: store.helpers.map(\.id))) {
-            await store.watch(root: root, helpers: store.helpers.map(\.id))
-        }
-        .task(id: root) { await store.watchCrews(root: root) }
+        .onAppear { store.start() }
         // An offscreen drawing waits for the first read, so the lists are there.
         .quietReadTask(live: false) {
             while !store.loaded, !Task.isCancelled { try? await Task.sleep(nanoseconds: 50_000_000) }
@@ -416,13 +138,11 @@ private struct SimpleSettingsMenuItems: View {
 /// one, so the full app can do what Simple does. Nothing open is the
 /// connection setup the tab always had.
 struct AgentThreadsTab: View {
-    private struct Watch: Equatable { let root: URL; let helpers: [UUID] }
 
     @Environment(AppModel.self) private var appModel
-    @State private var store = SimpleViewStore()
+    private var store: SimpleViewStore { appModel.engine.contactThreads }
     @State private var pane: SimpleShellView.Pane = .agent
 
-    private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
     private func openChat() { NativeAgentAppCoordinator.shared.request(.sidebar(.chat)) }
 
     var body: some View {
@@ -448,10 +168,7 @@ struct AgentThreadsTab: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .task(id: Watch(root: root, helpers: store.helpers.map(\.id))) {
-            await store.watch(root: root, helpers: store.helpers.map(\.id))
-        }
-        .task(id: root) { await store.watchCrews(root: root) }
+        .onAppear { store.start() }
         // An offscreen drawing waits for the first read, so the lists are there.
         .quietReadTask(live: false) {
             while !store.loaded, !Task.isCancelled { try? await Task.sleep(nanoseconds: 50_000_000) }
@@ -486,12 +203,7 @@ private struct SimpleSidebar: View {
 
     var body: some View {
         // Talked to, newest first; the rest fold at the end.
-        let health = AgentContactHealth.read(dataRoot: appModel.dataRootOverride ?? appModel.engine.dataRoot)
-        let contacts = store.contacts.map { contact in
-            var contact = contact
-            contact.health = health[contact.id]
-            return contact
-        }
+        let contacts = store.contacts
         let talked = contacts.filter { !isQuiet($0) }
         let unheard = contacts.filter(isQuiet)
         // The Mac's own sidebar List (User 09-27: all controls native): its
@@ -517,7 +229,7 @@ private struct SimpleSidebar: View {
                 .padding(.bottom, Self.sectionGap)
             }
             // Her home's people and helpers, in its order: the two sections.
-            ForEach(SurfaceLayoutLive.shared.layout.shown("home", profile: layoutProfile).filter { ["people", "helpers"].contains($0.name) },
+            ForEach(appModel.engine.layout.layout.shown("home", profile: layoutProfile).filter { ["people", "helpers"].contains($0.name) },
                     id: \.name) { block in
                 if block.name == "people" { agentsSection(talked: talked, unheard: unheard) } else { helpersSection }
             }
@@ -571,8 +283,8 @@ private struct SimpleSidebar: View {
 
     private var helpersSection: some View {
         Section {
-            // Crews at work lead the section, and leave it when they finish.
-            ForEach(store.crews.filter(\.live)) { crewRow($0) }
+            // Running and unknown crews stay here until their owner settles them.
+            ForEach(store.crews.filter { $0.liveness != .settled }) { crewRow($0) }
             if store.loaded && store.helpers.isEmpty {
                 quiet("None yet. Ask \(agentName) to make one.")
             }
@@ -588,7 +300,7 @@ private struct SimpleSidebar: View {
                 }
                 .accessibilityLabel("\(helper.definition.name), \(working ? "working now, " : "")\(timing)")
             }
-            let finished = store.crews.filter { !$0.live }
+            let finished = store.crews.filter { $0.liveness == .settled }
             if !finished.isEmpty {
                 DisclosureGroup(isExpanded: $showCrews) {
                     ForEach(finished) { crewRow($0) }
@@ -654,8 +366,8 @@ private struct SimpleSidebar: View {
     private func crewRow(_ crew: SimpleCrew) -> some View {
         let selected = pane == .crew(crew.id)
         let workers = crew.workers.count == 1 ? "1 worker" : "\(crew.workers.count) workers"
-        let name = crew.live ? "Working now" : crew.task
-        let line = crew.live ? "\(crew.task) · \(workers)" : "\(SimpleCrewThread.outcome(crew)) · \(workers)"
+        let name = crew.liveness == .unknown ? "Liveness unknown" : crew.live ? "Working now" : crew.task
+        let line = crew.liveness != .settled ? "\(crew.task) · \(workers)" : "\(SimpleCrewThread.outcome(crew)) · \(workers)"
         return row(.crew(crew.id)) {
             HStack(spacing: 10) {
                 SimpleClockTile(size: 30, symbol: "person.3", working: crew.live)
@@ -668,6 +380,7 @@ private struct SimpleSidebar: View {
     private func isQuiet(_ contact: SimpleContact) -> Bool {
         contact.lastActivityAt == nil && (store.lines[contact.id] ?? []).isEmpty && !store.waiting.contains(contact.id)
             && store.status[contact.id] == nil && store.flight(for: contact.id) == nil && contact.health?.problem == nil
+            && contact.owedExperiences.isEmpty
     }
 
     private func contactRow(_ contact: SimpleContact) -> some View {
@@ -712,23 +425,9 @@ private struct SimpleSidebar: View {
     }
 
     private func lastLine(_ contact: SimpleContact) -> String {
-        if let problem = contact.health?.problem { return problem }
-        let moving = flightWord(contact)
-        if moving == nil, store.waiting.contains(contact.id) { return "Waiting for a reply" }
-        // A quiet word for where the last send stands, ahead of its line.
-        let delivery: String? = switch store.status[contact.id] {
-        case .delivered?: "Delivered"
-        case .read?: "Read"
-        case .failed?: "No reply"
-        case .notDelivered?: "Not delivered"
-        default: nil
-        }
-        // Ready: its zero-token check passed just now (program runs, app
-        // installed, signed in, Dot's chat followable), not a model round-trip.
-        let word = moving ?? delivery ?? contact.health?.word
-        let latest = store.lines[contact.id]?.last { line in
-            !contact.recoveredFailure || !AgentLocalHealth.authenticationFailure(.string(line.text))
-        }
+        let word = contact.status(flight: store.flight(for: contact.id),
+            waiting: store.waiting.contains(contact.id), delivery: store.status[contact.id])
+        let latest = contact.latestLine(in: store.lines[contact.id] ?? [])
         guard let last = latest else {
             return word ?? (contact.lastActivityAt == nil ? "No messages yet" : "No retained messages")
         }
@@ -738,20 +437,6 @@ private struct SimpleSidebar: View {
         ago.unitsStyle = .short
         let when = (last.fromAgent ? "sent " : "replied ") + ago.localizedString(for: last.at, relativeTo: max(Date(), last.at))
         return word.map { "\($0) · \(when)" } ?? when.prefix(1).uppercased() + when.dropFirst()
-    }
-
-    /// What is moving on the thread now, in a word; it outranks Delivered
-    /// and Read. Nil leaves the waiting or delivery word to speak.
-    private func flightWord(_ contact: SimpleContact) -> String? {
-        guard let flight = store.flight(for: contact.id) else { return nil }
-        if flight.stop?.state == "stopping" { return "Stopping…" }
-        if flight.stop?.state == "stopped", !flight.inFlight { return "Stopped" }
-        if flight.working { return flight.partial != nil ? "Typing…" : "Working…" }
-        if flight.queued.contains(where: { $0.state == .sending }) { return "Sending…" }
-        if flight.inFlight { return nil }
-        if flight.queued.contains(where: { $0.state == .queued }) { return "Queued" }
-        if flight.queued.contains(where: { if case .held = $0.state { true } else { false } }) { return "Not sent" }
-        return nil
     }
 
     /// A section's word, and one line saying what lives there, so a stranger
@@ -947,6 +632,7 @@ private struct BreathingOrbLayer: NSViewRepresentable {
 
 /// The contact's app icon in a circle, or its initial on a tint of its own.
 struct SimpleAvatar: View {
+    @Environment(AppModel.self) private var appModel
     let contact: SimpleContact
     var size: CGFloat = 30
 
@@ -959,8 +645,10 @@ struct SimpleAvatar: View {
     @State private var loadedIcon: NSImage?
 
 
-    private static func tint(_ contact: SimpleContact) -> Color {
-        let rgb = tints[contact.tintSlot ?? 0]
+    private var tint: Color {
+        let index = appModel.engine.contactThreads.contacts.filter { $0.appBundleID == nil }
+            .sorted { $0.id < $1.id }.firstIndex { $0.id == contact.id } ?? 0
+        let rgb = Self.tints[index * 3 % Self.slotCount]
         return Color(red: Double(rgb >> 16 & 0xFF) / 255, green: Double(rgb >> 8 & 0xFF) / 255, blue: Double(rgb & 0xFF) / 255)
     }
 
@@ -972,7 +660,7 @@ struct SimpleAvatar: View {
                 // The icon's squircle fills the circle; its transparent margin falls outside.
                 Image(nsImage: icon).resizable().interpolation(.high).scaledToFit().scaleEffect(1.24)
             } else {
-                Self.tint(contact).overlay {
+                tint.overlay {
                     Text(contact.initial)
                         .font(.system(size: size * 0.46, weight: .semibold))
                         .foregroundStyle(.white)
