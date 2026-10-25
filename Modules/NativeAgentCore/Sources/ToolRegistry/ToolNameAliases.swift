@@ -129,7 +129,6 @@ public enum ToolNameAliases {
         "studio_journal": "studio.journal", "studio_journal_amend": "studio.amend", "studio_recall": "studio.recall",
         "studio_shelf_read": "studio.shelf", "studio_shelf_set": "studio.shelf_set", "studio_canon": "studio.canon",
         "studio_canon_resolve": "studio.canon_resolve", "dream_diary_read": "mind.dream_diary",
-        "hold_view": "mind.hold_view", "release_view": "mind.release_view",
         // Step 3, agents (User 10-02): contacts, conversations and the coding
         // bridges, one action each.
         "agent_contacts": "agent.contacts", "agent_message": "agent.message", "agent_read": "agent.read",

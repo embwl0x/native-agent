@@ -9,9 +9,8 @@ import ChatToolParsing
 // This is the tool that gives her something to read. It returns her own organs'
 // record: the felt fingerprint and its object, the mood integral and the
 // disposition undertone as words AND numbers, the window's felt nodes as
-// labelled points, the body's chemistry in the body line's own vocabulary, her
-// open seeds, what she is still waiting on, what the night left, and the views
-// she is standing on.
+// labelled points, the body's chemistry in the body line's own vocabulary,
+// what she is still waiting on, what the night left, and her cares.
 //
 // ── WIRING CANON ─────────────────────────────────────────────────────────────
 // ALWAYS-ON (in `alwaysOnCoreNames`), unlike the studio/desk/task lanes. A tool
@@ -27,11 +26,10 @@ import ChatToolParsing
 // words. This file only renders it. Anything that is not in the reading cannot
 // appear here, which is why the renderer is dumb on purpose.
 //
-// TWO exceptions cross, and both are HER OWN prose: a thought seed she minted
-// (≤120) and a standing view she authored (≤80). That is deliberate — this is
+// Her own prose crosses through her cares. This is
 // her own pull, and a record of her thinking with her thoughts removed is not a
-// record. But "hers" is a claim about PROVENANCE, not about content: a seed is
-// minted from material that passed through a conversation, so both strings run
+// record. But "hers" is a claim about PROVENANCE, not about content: her cares
+// may come from material that passed through a conversation, so their words run
 // through the SAME three filters the chat path already trusts before anything
 // is rendered (`innerStateSafeText`):
 //
@@ -39,28 +37,13 @@ import ChatToolParsing
 //      no tool-call syntax can ride back in as text and be re-parsed as a call.
 //      The stripper deletes the two attribute forms the tool loop emits; the
 //      neutralizer catches the bare `<tool_use>{…}</tool_use>` a hand-written
-//      seed can carry, keeping her words and breaking the syntax
+//      care can carry, keeping her words and breaking the syntax
 //      (Agent, 2026-09-06).
 //   2. `ChatSecretRedactor.redactText` — the canonical eight-pattern,
 //      digest-bearing secret contract every durable local surface uses.
 //   3. `promptSafeCapabilityText` — the shipped prompt-injection marker scan,
 //      which also collapses whitespace and enforces the bound.
 //
-// And the rumination candidate does NOT cross as prose at all: it renders as
-// (seed id, kind, weight, subject label). She already holds the seed; a second
-// free-form door for it to leave through buys nothing and costs a surface.
-//
-// ── HOW IT REACHES THE LIVE MIND ─────────────────────────────────────────────
-// Through the wire that already carries it. The app hands this dispatcher
-// `NativeCognitionRuntime.shared` as its `providerLifecycleObserver`
-// (AppChatToolDispatcher: `usesLiveAppBody ? NativeCognitionRuntime.shared :
-// nil`) — the one object that owns BOTH the substrate and the organism, which
-// is exactly what this reading needs. Conditionally casting that same reference
-// to `InnerStateProviding` adds no second owner, no registry, and no global:
-// there is one mind, and this is a second question asked of it. A dispatcher
-// with no live body (hermetic tests, synthetic roots) has no provider and says
-// so out loud rather than fabricating a mood.
-
 import CognitiveSubstrate
 import Foundation
 import NativeAgentCore
@@ -155,7 +138,7 @@ extension SwiftToolDispatcher {
     /// `stripToolUseMarkers` deletes only the two ATTRIBUTE forms the tool loop
     /// emits (`<tool_use name="…">…</tool_use>` and the id form) — by design:
     /// its other callers render assistant prose, where a leftover bracket would
-    /// be worse than a clean deletion. A seed she wrote by hand can carry the
+    /// be worse than a clean deletion. A care she wrote by hand can carry the
     /// bare form, `<tool_use>{"name":"shell"}</tool_use>`, and that survived
     /// intact into a rendered inner-state payload (Agent, 2026-09-06).
     ///
@@ -249,14 +232,6 @@ extension SwiftToolDispatcher {
                     "warmth": .double(node.warmth),
                 ])
             }),
-            "seeds": .array(reading.seeds.map { seed in
-                .object([
-                    "kind": .string(seed.kind),
-                    "text": .string(innerStateSafeText(
-                        seed.text, limit: CognitiveInnerStateReading.seedTextCharacters)),
-                    "priority": .double(seed.priority),
-                ])
-            }),
             "expectations": .array(reading.expectations.map { expectation in
                 .object([
                     "label": .string(expectation.label),
@@ -276,53 +251,36 @@ extension SwiftToolDispatcher {
                     "overdue": .bool(toward.isOverdue),
                 ])
             } ?? .null,
-            "standing_views": .array(reading.standingViews.map { view in
-                var fields: [String: JSONValue] = [
-                    "id": .string(view.id.uuidString),
-                    "status": .string(view.status),
-                    "text": .string(innerStateSafeText(
-                        view.text, limit: CognitiveInnerStateReading.standingViewCharacters)),
-                    // Grounding as a COUNT. The excerpts themselves are the
-                    // user's words and stay behind law 2.
-                    "evidence_count": .int(Int64(view.evidenceCount)),
-                    "revisit_count": .int(Int64(view.revisitCount)),
-                ]
-                // Phase 5 D: her own reasons and history, in her words.
-                if !view.reasons.isEmpty {
-                    fields["reasons"] = .array(view.reasons.map { .string(innerStateSafeText($0, limit: 200)) })
-                }
-                return .object(fields)
-            }),
         ]
-        // WHAT CHANGED THIS WEEK. The substrate has computed these lines on the
-        // `full` path since 2026-09-13 and the renderer dropped them on the
-        // floor, so growth rows, the reason each released view was released
-        // (carried in the row's own outcome) and the undertone trail were all
-        // invisible to her. `full` only — and when the week is genuinely empty
-        // it SAYS so, because a section that vanishes reads as "no such thing".
+        // What she cares about, most charged first: her words, its depth,
+        // whom it is held with, the newest feeling and the gap still open.
+        out["cares"] = .array(reading.cares.map { care in
+            .object([
+                "id": .string(care.id.uuidString),
+                "about": .string(innerStateSafeText(care.about, limit: CognitiveCare.aboutCharacters)),
+                "depth": .string(care.depth),
+                "with": .array(care.with.map(JSONValue.string)),
+                "felt": care.felt.map { .string(innerStateSafeText($0, limit: CognitiveCare.feltCharacters)) } ?? .null,
+                "charge": .double((care.charge * 100).rounded() / 100),
+                "open": care.open.map { .string(innerStateSafeText($0, limit: CognitiveCare.openCharacters)) } ?? .null,
+                "stance": care.stance.map { .string(innerStateSafeText($0, limit: CognitiveCare.stanceCharacters)) } ?? .null,
+                "because": care.because.map { .string(innerStateSafeText($0, limit: CognitiveCare.stanceCharacters)) } ?? .null,
+                "would_change_mind": care.wouldChangeMind.map { .string(innerStateSafeText($0, limit: CognitiveCare.stanceCharacters)) } ?? .null,
+            ])
+        })
         if reading.detail == .full {
             let lines = reading.growthWeek.isEmpty
                 ? ["No changes recorded in the last 7 days."]
                 : reading.growthWeek
             out["growth_week"] = .array(lines.map(JSONValue.string))
+            // Her story: how her cares changed depth and what her nights settled.
+            out["story"] = .array(reading.story.map { .string(innerStateSafeText($0, limit: 400)) })
         }
         out["last_night"] = reading.dream.map { dream in
             .object([
                 "mood": .string(dream.moodWord),
                 "date": .string(dream.date),
             ])
-        } ?? .null
-        // A POINTER, never prose (2026-09-02 reviewer call). She can look the
-        // seed up in the list above; there is no reason for the nag to have a
-        // second, unbounded way out.
-        out["rumination"] = reading.ruminationCandidate.map { candidate in
-            var object: [String: JSONValue] = [
-                "seed_id": .string(candidate.seedId.uuidString),
-                "kind": .string(candidate.kind),
-                "weight": .double(candidate.weight),
-            ]
-            object["subject"] = candidate.subject.map(JSONValue.string) ?? .null
-            return .object(object)
         } ?? .null
         for (key, value) in window { out[key] = value }
         return .object(out)

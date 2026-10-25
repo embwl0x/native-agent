@@ -13,6 +13,7 @@ extension CognitiveSQLiteStore {
                 artifacts[family.key] = try Self.fetchArtifacts(
                     db,
                     kindPrefix: family.kindPrefix,
+                    whole: family.whole,
                     limit: family.limit
                 )
             }
@@ -96,9 +97,11 @@ extension CognitiveSQLiteStore {
     private static func fetchArtifacts(
         _ db: Database,
         kindPrefix: String,
+        whole: Bool,
         limit: Int
     ) throws -> [JSONValue] {
-        let bounded = max(0, min(limit, 500))
+        // SQLite reads a negative LIMIT as none.
+        let bounded = whole ? -1 : max(0, min(limit, 500))
         let rows = try Row.fetchAll(
             db,
             sql: """
@@ -107,7 +110,7 @@ extension CognitiveSQLiteStore {
             ORDER BY updated_at DESC, id ASC
             LIMIT ?
             """,
-            arguments: ["\(kindPrefix)%", bounded]
+            arguments: [whole ? kindPrefix : "\(kindPrefix)%", bounded]
         )
         return try rows.map { row in
             let id: String = row["id"] ?? "<unknown>"

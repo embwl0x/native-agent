@@ -2,7 +2,7 @@ import Foundation
 import Experiences
 import PersistenceCore
 
-// Blueprint: | `CognitivePhaseModels.swift` | Cognition phase contracts: prepared turn projections, presentation commits, attention, workspace, capsule, seeds and standing-view values |
+// Blueprint: | `CognitivePhaseModels.swift` | Cognition phase contracts: prepared turn projections, presentation commits, attention, workspace, capsule and care values |
 
 public protocol CognitiveEventObserving: Sendable {
     func observe(_ event: CognitiveEvent) async
@@ -73,7 +73,7 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
     /// The record ids she rejected for this kind of message.
     public func suppressedMemoryRecordIDs(for message: String) -> Set<String> {
         guard !suppressedMemory.isEmpty else { return [] }
-        let terms = CognitiveSubstrate.appraisalConcernTerms(in: message)
+        let terms = CognitiveSubstrate.associationTerms(in: message)
         return Set(suppressedMemory.compactMap { id, signatures in
             signatures.contains { CognitiveSubstrate.suppressionCovers($0, messageTerms: terms) } ? id : nil
         })
@@ -188,6 +188,10 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
     /// Phase 5 B2/E2: User's verified turn before this one (`UserTurnStamp`),
     /// where the gap this turn closes opened. Nil when unknown or not his turn.
     public var previousUserTurnAt: Date?
+    /// Cares lane 2: whose words these are, as cares key people (`owner`, a
+    /// peer id, a helper's bot id). Nil for her own wake or a sender with no
+    /// person key: only her own cares press then.
+    public var speaker: String?
 
     public var resolvedTurnKind: CognitiveTurnKind {
         turnKind ?? CognitiveTurnKind.inferred(fromSignals: [
@@ -206,7 +210,8 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
         allowNonLiveProjection: Bool = false,
         turnKind: CognitiveTurnKind? = nil,
         fromUser: Bool = false,
-        previousUserTurnAt: Date? = nil
+        previousUserTurnAt: Date? = nil,
+        speaker: String? = nil
     ) {
         self.surface = surface
         self.userMessage = userMessage
@@ -220,6 +225,7 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
         self.turnKind = turnKind
         self.fromUser = fromUser
         self.previousUserTurnAt = previousUserTurnAt
+        self.speaker = speaker
     }
 }
 
@@ -349,89 +355,6 @@ public struct CognitiveAffectState: Sendable, Equatable {
     }
 }
 
-public enum CognitiveThoughtSeedKind: String, Sendable, Equatable, CaseIterable {
-    case openQuestion
-    case anomaly
-    case followUp
-    case reflectionTakeaway
-}
-
-public struct CognitiveThoughtSeed: Sendable, Equatable, Identifiable {
-    public var id: UUID
-    public var kind: CognitiveThoughtSeedKind
-    public var text: String
-    public var priority: Double
-    public var createdAt: Date
-    public var lastUpdatedAt: Date
-    public var sourceNodeIds: [UUID]
-    /// Nil means the source peers could not be established (including legacy seeds).
-    public var sourcePeerIds: [String]?
-    /// External material identities are not field-node evidence.
-    public var materialProvenances: [String]
-
-    public init(
-        id: UUID,
-        kind: CognitiveThoughtSeedKind,
-        text: String,
-        priority: Double,
-        createdAt: Date,
-        lastUpdatedAt: Date,
-        sourceNodeIds: [UUID] = [],
-        sourcePeerIds: [String]? = nil,
-        materialProvenances: [String] = []
-    ) {
-        self.id = id
-        self.kind = kind
-        self.text = text
-        self.priority = (priority).clamped01()
-        self.createdAt = createdAt
-        self.lastUpdatedAt = lastUpdatedAt
-        self.sourceNodeIds = sourceNodeIds
-        self.sourcePeerIds = sourcePeerIds
-        self.materialProvenances = materialProvenances
-    }
-}
-
-public struct CognitiveThoughtSuggestion: Sendable, Equatable, Identifiable {
-    public var id: UUID
-    public var seedId: UUID
-    public var kind: CognitiveThoughtSeedKind
-    public var text: String
-    public var interruptionScore: Double
-    public var priority: Double
-    public var createdAt: Date
-    public var surface: String
-    public var reason: String
-    public var sourceNodeIds: [UUID]
-    public var workspaceNodeIds: [UUID]
-
-    public init(
-        id: UUID,
-        seedId: UUID,
-        kind: CognitiveThoughtSeedKind,
-        text: String,
-        interruptionScore: Double,
-        priority: Double,
-        createdAt: Date,
-        surface: String,
-        reason: String,
-        sourceNodeIds: [UUID] = [],
-        workspaceNodeIds: [UUID] = []
-    ) {
-        self.id = id
-        self.seedId = seedId
-        self.kind = kind
-        self.text = text
-        self.interruptionScore = (interruptionScore).clamped01()
-        self.priority = (priority).clamped01()
-        self.createdAt = createdAt
-        self.surface = surface
-        self.reason = reason
-        self.sourceNodeIds = sourceNodeIds
-        self.workspaceNodeIds = workspaceNodeIds
-    }
-}
-
 public struct CognitiveEpisodeReference: Sendable, Equatable, Identifiable {
     public var id: UUID
     public var title: String
@@ -511,168 +434,152 @@ public struct CognitiveSchemaProposal: Sendable, Equatable, Identifiable {
     }
 }
 
-/// Wave E — a STANDING VIEW: a durable disposition Agent's reflection has settled into
-/// (a way she sees something, not a task or a rule). Proposal-shaped: every view enters
-/// `.proposed` and only User's `resolveStandingView(approved:)` activates it. Grounded in
-/// felt evidence — the mood valence and top felt workspace nodes at formation. Additive.
-public struct CognitiveStandingView: Sendable, Equatable, Identifiable {
+/// Personality lane 1 (2026-10-25): a CARE, something she cares about. One
+/// form for what views, opinions, interests and open thoughts each held a
+/// piece of: what it is, who it is held with, how deep it runs, what she
+/// thinks about it, what is still open, and every time it moved her. Its
+/// charge is read from that story, never stored.
+public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
+    /// How deep it runs, which sets how long a feeling about it lasts.
+    public enum Depth: String, Sendable, Equatable, Codable, CaseIterable {
+        case now, lately, season, life
+
+        public var halfLife: TimeInterval {
+            switch self {
+            case .now: return 2 * 3_600
+            case .lately: return 12 * 3_600
+            case .season: return 2 * 86_400
+            case .life: return 4 * 86_400
+            }
+        }
+    }
+
+    /// What she thinks or wants about it. A care with a stance is an opinion.
+    public struct Stance: Sendable, Equatable, Codable {
+        public var text: String
+        public var because: String
+        public var wouldChangeMind: String
+
+        public init(text: String, because: String, wouldChangeMind: String) {
+            self.text = String(text.prefix(CognitiveCare.stanceCharacters))
+            self.because = String(because.prefix(CognitiveCare.stanceCharacters))
+            self.wouldChangeMind = String(wouldChangeMind.prefix(CognitiveCare.stanceCharacters))
+        }
+    }
+
+    public enum Mover: String, Sendable, Equatable, Codable, CaseIterable {
+        case them, her, world
+    }
+
+    public struct DepthChange: Sendable, Equatable, Codable {
+        public var from: Depth
+        public var to: Depth
+        public init(from: Depth, to: Depth) { self.from = from; self.to = to }
+    }
+
+    /// One time it moved her: a pointer to what really happened (`source`:
+    /// `exchange:<session>/<turn>` or a memory id), never a second copy of it.
+    public struct Moment: Sendable, Equatable, Codable {
+        public var at: Date
+        /// -1...1: away from or toward what she cares about.
+        public var moved: Double
+        public var by: Mover
+        /// The person key when `by` is them.
+        public var who: String?
+        public var felt: String
+        public var note: String
+        public var source: String
+        public var depthChange: DepthChange?
+
+        public init(at: Date, moved: Double, by: Mover, who: String? = nil, felt: String, note: String,
+                    source: String, depthChange: DepthChange? = nil) {
+            self.at = at
+            self.moved = moved.isFinite ? min(1, max(-1, moved)) : 0
+            self.by = by
+            self.who = who
+            self.felt = String(felt.prefix(CognitiveCare.feltCharacters))
+            self.note = String(note.prefix(CognitiveCare.noteCharacters))
+            self.source = source
+            self.depthChange = depthChange
+        }
+    }
+
+    /// Movements older than the newest `storyMovements`, folded into one line.
+    public struct Folded: Sendable, Equatable, Codable {
+        public var count: Int
+        public var sumMoved: Double
+        public var since: Date
+    }
+
+    public enum Origin: Sendable, Equatable, Codable {
+        case seed, grown
+        case migrated(String)
+    }
+
     public var id: UUID
-    public var title: String
-    public var body: String
-    public var status: Status
-    public var moodValenceAtFormation: Double
-    public var evidenceNodeIds: [UUID]
-    /// The exact excerpt lines she reflected on when this view formed, with
-    /// their provenance stamps (2026-09-13). Bounded — at most
-    /// `maximumStandingViewEvidenceExcerpts`, oldest first, never rewritten by
-    /// a later workspace. "Why I came to see it this way" survives the moment
-    /// of formation because the words themselves are kept, not a pointer.
-    public var evidenceExcerpts: [String]
-    /// How many LATER reflections reached this same conclusion (2026-09-13).
-    /// Zero for a view reached once. A revisit attaches genuinely new evidence
-    /// and bumps this count; it NEVER changes `status`, and never adds
-    /// emotional weight. Agent: "'revisited' must not quietly harden into
-    /// 'settled'" — arriving at a thought again is not the user signing it.
-    public var revisitCount: Int
-    /// When the most recent revisit landed. `nil` until the first one.
-    public var lastRevisitedAt: Date?
-    /// Set when this view was proposed as a REVISION of an existing view —
-    /// a later reflection that CONTRADICTED it (2026-09-13). A contradiction is
-    /// never absorbed as more evidence for the view it contradicts; it opens a
-    /// real proposal of its own, pointing back at what it revises.
-    public var revisesViewId: UUID?
+    public var about: String
+    /// Person keys it is held between; empty means hers alone.
+    public var with: [String]
+    public var depth: Depth
+    public var stance: Stance?
+    /// The gap: an unanswered question or unfinished thing. nil is settled.
+    public var open: String?
+    public var story: [Moment]
+    public var folded: Folded?
+    public var origin: Origin
     public var createdAt: Date
     public var updatedAt: Date
-    public var lineageId: String
-    /// Phase 5 D (2026-10-03): the independent occurrences behind this view,
-    /// as `day|source` keys — a distinct day AND a distinct source
-    /// conversation or experience. Re-reading the same reflection material
-    /// adds nothing (Agent: "repeated ingestion is not conviction"). Bounded.
-    public var occurrences: [String]
-    /// Phase 5 D1 — an OPINION's reasons, in her words: why she thinks it,
-    /// and what would change her mind ("taste" for an aesthetic preference,
-    /// which age never makes stale). Empty on a plain view.
-    public var because: String
-    public var wouldChangeMind: String
-    /// What she used to think and the evidence that changed it, newest last.
-    public var revisions: [CognitiveViewRevision]
+    /// When the night faded it (never moved within its depth's horizon). It
+    /// stays in the store and is not shown or read as live; touched again, it
+    /// comes back.
+    public var fadedAt: Date?
 
-    public static let maximumOccurrences = 8
-    public static let maximumRevisions = 3
-    /// A factual opinion this long unrevisited is due for RECONSIDERATION
-    /// (shown to her reflection). Never a change and never a retirement.
-    public static let reconsiderAfter: TimeInterval = 30 * 24 * 60 * 60
-    /// An interest fades slowly unless she returns to it.
-    public static let interestHalfLife: TimeInterval = 14 * 24 * 60 * 60
-    public static let interestFloor = 0.25
+    public static let aboutCharacters = 120
+    public static let stanceCharacters = 200
+    public static let openCharacters = 200
+    public static let noteCharacters = 120
+    public static let feltCharacters = 40
+    /// The newest movements kept whole; every depth change is always kept.
+    public static let storyMovements = 24
+    /// The owner's person key.
+    public static let ownerKey = "owner"
 
-    /// Independent occurrences; a legacy row counts its formation plus revisits.
-    public var independentOccurrenceCount: Int {
-        occurrences.isEmpty ? 1 + revisitCount : occurrences.filter { !$0.hasPrefix("x:") }.count
-    }
-    public var hasReasons: Bool { !because.isEmpty && !wouldChangeMind.isEmpty }
-    public var isTaste: Bool { wouldChangeMind.lowercased().hasPrefix("taste") }
-    /// When she last stood behind this stance: formed, reaffirmed or revised.
-    public var stanceSince: Date {
-        max(createdAt, lastRevisitedAt ?? createdAt, revisions.last?.at ?? createdAt)
-    }
-    public func dueForReconsideration(at now: Date) -> Bool {
-        status == .opinion && !isTaste && now.timeIntervalSince(stanceSince) >= Self.reconsiderAfter
-    }
-    public func interestWeight(at now: Date) -> Double {
-        pow(0.5, max(0, now.timeIntervalSince(updatedAt)) / Self.interestHalfLife)
-    }
-    /// Hers alone: held by her hand, an opinion, or an interest.
-    public var isHers: Bool { status == .held || status == .opinion || status == .interest }
-
-    /// At most this many excerpts carried on one view — two per formation, and
-    /// a revisit may attach genuinely new ones. Bounded so a thought she keeps
-    /// returning to cannot grow an unbounded transcript behind it.
-    public static let maximumEvidenceExcerpts = 6
-    public static let maximumEvidenceNodeIds = 32
-
-    public static func boundedEvidenceNodeIds(_ ids: [UUID]) -> [UUID] {
-        var seen = Set<UUID>()
-        return Array(ids.reversed().filter { seen.insert($0).inserted }
-            .prefix(maximumEvidenceNodeIds).reversed())
-    }
-
-    public enum Status: String, Sendable, Equatable, CaseIterable {
-        case proposed, active, retired
-        /// HELD (User, 2026-09-02: "she should be able to have some views of her
-        /// own"). A view she adopted herself, from her own live turn — no user
-        /// signature, a weaker lean than `.active`, and retirable by the user
-        /// who never had to sign it. It is deliberately a fourth STATUS rather
-        /// than a flag on `.active`: every existing `status == .active` test in
-        /// the tree — the cap, the lived concerns, the capsule ranking, the
-        /// disposition nudge — then continues to mean "the user signed this",
-        /// and each place that should also honour a held view had to be changed
-        /// on purpose.
-        case held
-        /// Phase 5 D1: a view that recurred independently with its reasons —
-        /// hers, no signature. It never leans the felt lane, a pursuit or a tap.
-        case opinion
-        /// Phase 5 D2: what she explored in her hour, with her open question.
-        case interest
-    }
-
-    /// True for the two statuses that lean her at all. Never symmetric between
-    /// them: a `.held` view is ranked and weighted strictly under a `.active`
-    /// one everywhere both are consulted.
-    public var isLeaning: Bool { status == .active || status == .held }
-
-    public init(
-        id: UUID,
-        title: String,
-        body: String,
-        status: Status = .proposed,
-        moodValenceAtFormation: Double,
-        evidenceNodeIds: [UUID] = [],
-        evidenceExcerpts: [String] = [],
-        revisitCount: Int = 0,
-        lastRevisitedAt: Date? = nil,
-        revisesViewId: UUID? = nil,
-        createdAt: Date,
-        updatedAt: Date,
-        lineageId: String = "",
-        occurrences: [String] = [],
-        because: String = "",
-        wouldChangeMind: String = "",
-        revisions: [CognitiveViewRevision] = []
-    ) {
+    public init(id: UUID, about: String, with: [String] = [], depth: Depth, stance: Stance? = nil,
+                open: String? = nil, story: [Moment] = [], origin: Origin, createdAt: Date, updatedAt: Date) {
         self.id = id
-        self.title = title
-        self.body = body
-        self.status = status
-        self.moodValenceAtFormation = (moodValenceAtFormation).clampedSigned()
-        self.evidenceNodeIds = Self.boundedEvidenceNodeIds(evidenceNodeIds)
-        self.evidenceExcerpts = Array(evidenceExcerpts.prefix(Self.maximumEvidenceExcerpts))
-        self.revisitCount = max(0, revisitCount)
-        self.lastRevisitedAt = lastRevisitedAt
-        self.revisesViewId = revisesViewId
+        self.about = String(about.prefix(Self.aboutCharacters))
+        self.with = with
+        self.depth = depth
+        self.stance = stance
+        self.open = open.map { String($0.prefix(Self.openCharacters)) }
+        self.story = []
+        self.folded = nil
+        self.origin = origin
         self.createdAt = createdAt
         self.updatedAt = updatedAt
-        self.lineageId = lineageId
-        self.occurrences = Array(occurrences.suffix(Self.maximumOccurrences))
-        self.because = because
-        self.wouldChangeMind = wouldChangeMind
-        self.revisions = Array(revisions.suffix(Self.maximumRevisions))
+        for moment in story { record(moment) }
     }
-}
 
-/// Phase 5 D1: one revision of an opinion — the stance she held and the
-/// evidence that moved her off it.
-public struct CognitiveViewRevision: Sendable, Equatable {
-    public var priorStance: String
-    public var priorBecause: String
-    public var evidence: String
-    public var at: Date
+    /// Recent movement, signed, each decayed on this care's clock at read time.
+    public func charge(at now: Date) -> Double {
+        let halfLife = depth.halfLife
+        return story.reduce(0) { sum, moment in
+            sum + moment.moved * pow(0.5, max(0, now.timeIntervalSince(moment.at)) / halfLife)
+        }
+    }
 
-    public init(priorStance: String, priorBecause: String, evidence: String, at: Date) {
-        self.priorStance = priorStance
-        self.priorBecause = priorBecause
-        self.evidence = evidence
-        self.at = at
+    /// Place one moment in time order (a backdated one goes where it
+    /// happened). Past the newest `storyMovements` movements the oldest folds
+    /// into `folded`; depth changes never fold.
+    public mutating func record(_ moment: Moment) {
+        story.insert(moment, at: story.lastIndex(where: { $0.at <= moment.at }).map { $0 + 1 } ?? 0)
+        updatedAt = max(updatedAt, moment.at)
+        while story.filter({ $0.depthChange == nil }).count > Self.storyMovements,
+              let oldest = story.firstIndex(where: { $0.depthChange == nil }) {
+            let gone = story.remove(at: oldest)
+            folded = Folded(count: (folded?.count ?? 0) + 1, sumMoved: (folded?.sumMoved ?? 0) + gone.moved,
+                            since: min(folded?.since ?? gone.at, gone.at))
+        }
     }
 }
 
@@ -871,7 +778,7 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
     public var reasoningEffort: String
     public var requestedAt: Date
     /// The workspace nodes that ACTUALLY fed this prompt, frozen when the
-    /// prompt was built. The takeaway seed's evidence must be this set, not
+    /// prompt was built. A reflection's care evidence must be this set, not
     /// whatever the workspace holds after the model returns (Astra audit
     /// 2026-09-11, finding 7).
     public var sourceNodeIds: [UUID]
@@ -1057,7 +964,6 @@ public struct CognitiveObservatorySnapshot: Sendable, Equatable {
     public var generatedAt: Date
     public var nodeCount: Int
     public var workspaceCount: Int
-    public var thoughtSeedCount: Int
     public var episodeCount: Int
     public var reflectionCount: Int
     public var affect: CognitiveAffectState
@@ -1067,7 +973,6 @@ public struct CognitiveObservatorySnapshot: Sendable, Equatable {
         generatedAt: Date,
         nodeCount: Int,
         workspaceCount: Int,
-        thoughtSeedCount: Int,
         episodeCount: Int,
         reflectionCount: Int,
         affect: CognitiveAffectState,
@@ -1076,7 +981,6 @@ public struct CognitiveObservatorySnapshot: Sendable, Equatable {
         self.generatedAt = generatedAt
         self.nodeCount = nodeCount
         self.workspaceCount = workspaceCount
-        self.thoughtSeedCount = thoughtSeedCount
         self.episodeCount = episodeCount
         self.reflectionCount = reflectionCount
         self.affect = affect

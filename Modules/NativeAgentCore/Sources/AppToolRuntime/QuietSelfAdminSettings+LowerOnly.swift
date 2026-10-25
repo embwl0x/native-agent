@@ -29,7 +29,6 @@ extension QuietCognitionLane {
         case .background: await runtime.setBackgroundEnabled(enabled)
         case .reflection: await runtime.setReflectionEnabled(enabled)
         case .organism: await runtime.setOrganismKernelEnabled(enabled)
-        case .viewsExperiment: await runtime.setViewsExperimentEnabled(enabled)
         }
     }
 }

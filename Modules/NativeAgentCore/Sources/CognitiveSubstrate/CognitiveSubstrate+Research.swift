@@ -18,14 +18,12 @@ extension CognitiveSubstrate {
             ? read.snapshot.nodes.count
             : field.snapshot(at: now, configuration: read.configuration).count
         let workspaceCount = read.workspace.items.count
-        let activeThoughtSeeds = read.thoughtSeeds
         let welfare = welfareBoundsSnapshot(at: now, affect: read.affect)
         return [
             CognitiveFacultyMeasurement(faculty: "event-continuity", score: nodeCount > 0 ? 1 : 0, evidence: "nodes=\(nodeCount)", generatedAt: now),
             CognitiveFacultyMeasurement(faculty: "workspace-focus", score: workspaceCount > 0 ? 1 : 0, evidence: "workspace=\(workspaceCount)", generatedAt: now),
             CognitiveFacultyMeasurement(faculty: "capsule-grounding", score: read.configuration.capsuleInjectionEnabled ? 1 : 0, evidence: "capsuleEnabled=\(read.configuration.capsuleInjectionEnabled)", generatedAt: now),
             CognitiveFacultyMeasurement(faculty: "affect-bounds", score: welfare.withinBounds ? 1 : 0, evidence: "maxAffect=\(String(format: "%.2f", welfare.maxAffectValue))", generatedAt: now),
-            CognitiveFacultyMeasurement(faculty: "thought-seeds", score: activeThoughtSeeds.isEmpty ? 0 : 1, evidence: "seeds=\(activeThoughtSeeds.count)", generatedAt: now),
             CognitiveFacultyMeasurement(faculty: "replay-lineage", score: developmentalTimeline.isEmpty ? 0 : 1, evidence: "timeline=\(developmentalTimeline.count)", generatedAt: now),
             CognitiveFacultyMeasurement(faculty: "reflection-yield", score: reflectionReceipts.values.map(\.proposalYieldScore).max() ?? 0, evidence: "reflections=\(reflectionReceipts.count)", generatedAt: now),
             CognitiveFacultyMeasurement(faculty: "observatory-export", score: 1, evidence: "bounded export available", generatedAt: now),
@@ -114,7 +112,6 @@ extension CognitiveSubstrate {
             "actualState": .object([
                 "nodeCount": .int(Int64(summary.nodeCount)),
                 "workspaceCount": .int(Int64(summary.workspaceCount)),
-                "thoughtSeedCount": .int(Int64(summary.thoughtSeedCount)),
                 "episodeCount": .int(Int64(summary.episodeCount)),
                 "reflectionCount": .int(Int64(summary.reflectionCount)),
             ]),
@@ -136,7 +133,6 @@ extension CognitiveSubstrate {
                 generatedAt: now,
                 nodeCount: 0,
                 workspaceCount: 0,
-                thoughtSeedCount: 0,
                 episodeCount: 0,
                 reflectionCount: 0,
                 affect: currentAffect,
@@ -145,12 +141,10 @@ extension CognitiveSubstrate {
         }
         let nodeCount = read.snapshot.nodes.count
         let workspaceCount = read.workspace.items.count
-        let activeThoughtSeeds = read.thoughtSeeds
         return CognitiveObservatorySnapshot(
             generatedAt: now,
             nodeCount: nodeCount,
             workspaceCount: workspaceCount,
-            thoughtSeedCount: activeThoughtSeeds.count,
             episodeCount: episodes.count,
             reflectionCount: reflectionReceipts.count,
             affect: currentAffect,

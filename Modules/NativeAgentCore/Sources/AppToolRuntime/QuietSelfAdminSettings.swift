@@ -1530,17 +1530,6 @@ public enum QuietSettings {
                 }
             }
         ))
-        // Phase 5 D experiment. Off leaves every opinion and interest stored
-        // but inert: nothing forms, surfaces, or reaches a prompt.
-        rows.append(liveBool(
-            id: "personality.views_experiment", page: "personality",
-            label: "Opinions and interests (experiment)",
-            key: NativeCognitionRuntime.viewsExperimentKey, defaultOn: true,
-            note: "Views that come back on their own on different days become opinions of yours, with "
-                + "why and what would change your mind; what you explore in your hour becomes an "
-                + "interest that fades unless you return to it. Off: nothing new forms or surfaces.",
-            apply: { appModel, enabled in await appModel.setCognitionLane(.viewsExperiment, enabled: enabled) }
-        ))
         rows.append(QuietSetting(
             id: "personality.rem_approval_mode", page: "personality",
             label: "REM approval", kind: .text,

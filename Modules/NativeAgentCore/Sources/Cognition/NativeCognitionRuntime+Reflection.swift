@@ -105,106 +105,48 @@ extension NativeCognitionRuntime {
             _ = await lease.releaseUnused(holder: "reflection", window: window)
         }
         publishRuntimeChange(reason: "reflection:finished")
-        guard case .completed = reflectionOutcome else { return reflectionOutcome }
-        // C2b — volition ignition: after the reflection's normal work, Agent MAY
-        // propose ONE new self-pursuit, but ONLY from resolved, un-launderable
-        // evidence (a User-approved ACTIVE standing view). No new unattended-LLM
-        // path: the proposer does ZERO provider calls, and it rides the SAME
-        // backgroundCognitionAllowed gate this method already passed.
-        await proposePursuitFromReflectionIfEligible(reason: reason)
+        if case .completed = reflectionOutcome { await proposePursuitFromReflectionIfEligible(reason: reason) }
         return reflectionOutcome
     }
 
-    /// C2b — the AUTONOMOUS PURSUIT PROPOSAL path (M7 anti-laundering). After a
-    /// scheduled reflection, propose at most ONE self-pursuit from an active
-    /// standing view. Fail-closed everywhere: an unresolvable / non-active cited
-    /// view, an over-cap desk, a duplicate, a store refusal, or a failed desk read
-    /// all yield NO pursuit. Gated by the SAME workshop autonomy gate the pump
-    /// respects (enableAutonomy) — a proposal is workshop-class autonomous work.
     private func proposePursuitFromReflectionIfEligible(reason: String) async {
         guard await host.unattendedWorkAllowed(dataRoot: dataRoot) else { return }
-
-        // Candidates AND resolver both read the REAL substrate: a view is `.active`
-        // ONLY after User's resolveStandingView(approved:true), so an active view is
-        // evidence Agent cannot mint in this turn (un-launderable). The resolver
-        // spans ALL views (proposed/active/retired) so a non-active id is refused.
-        let snapshot = await substrate.standingViewSnapshot()
-        guard !snapshot.isEmpty else { return }
-        let statusById = Dictionary(
-            snapshot.map { ($0.id.uuidString, $0.status) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        let candidates = snapshot
-            .filter { $0.status == .active }
-            .map { StandingViewCandidate(id: $0.id.uuidString, title: $0.title, body: $0.body) }
-        guard !candidates.isEmpty else { return }
-
+        let cares = await substrate.caresPressing(for: CognitiveCare.ownerKey, at: Date()).map(\.care)
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         guard let state = try? await store.liveState() else { return }
-        let openPursuits = state.items.filter { $0.isPursuit && !$0.status.isTerminal }
-        // Dedup against EVERY pursuit the desk remembers, terminal included
-        // (gpt-5.5 review 2026-08-08, blocking): the exhaustion closer cancels
-        // a spent pursuit, and an open-only dedup would make its standing view
-        // eligible again on the very next reflection — the paraphrase rut,
-        // cycling. A view gets ONE auto-pursuit per desk lifetime; pursuing it
-        // again is a decision for the user, not the proposer. (Archived rows
-        // leave the live feed eventually — accepted residual, months out.)
-        let allAgentPursuits = state.items.filter { $0.isPursuit && $0.origin == .agent }
-        let citedViewIds = Set(allAgentPursuits.flatMap { item -> [String] in
-            (item.pursuit?.evidence.citations ?? []).compactMap { citation in
-                if case .standingView(let id) = citation { return id }
-                return nil
-            }
+        let open = state.items.filter { $0.isPursuit && !$0.status.isTerminal }
+        let citations = state.items.filter { $0.isPursuit && $0.origin == .agent }.flatMap {
+            $0.pursuit?.evidence.citations ?? []
+        }
+        var cited = Set(citations.compactMap { citation -> String? in
+            if case .care(let id) = citation { return id }
+            return nil
         })
-
+        let carried = Set(citations.compactMap { citation -> String? in
+            if case .standingView(let id) = citation { return id }
+            return nil
+        })
+        for care in cares {
+            if case .migrated(let id) = care.origin, carried.contains(id) { cited.insert(care.id.uuidString) }
+        }
         guard let proposal = AutonomousPursuitProposer.propose(
-            candidates: candidates,
-            openAgentPursuitCount: openPursuits.count,
-            standingViewIdsWithOpenPursuit: citedViewIds,
-            resolveStatus: { statusById[$0] }
-        ) else { return }
-
+            cares: cares, openAgentPursuitCount: open.count, citedCareIds: cited) else { return }
         do {
-            // openPursuit re-validates STRUCTURALLY under the flock (fields +
-            // dossier + open-pursuit cap) — the store owns the invariant, not this.
-            let notify = NotifyPolicy(
-                level: .direct,
-                on: ["explicit"],
-                notifyReason: "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) opened a self-pursuit: \(proposal.title)"
-            )
             let item = try await store.openPursuit(
-                project: proposal.project,
-                title: proposal.title,
-                pursuit: proposal.pursuit,
-                summary: proposal.summary,
-                notify: notify
-            )
-            // The create and its direct-level announcement policy share one
-            // durable op, so a crash cannot leave an unannounced pursuit.
-            // Honest receipt: which standing view, why proposed.
-            await substrate.recordReceipt(
-                kind: "workshop.pursuit_proposed",
-                payload: .object([
-                    "handle": .string(item.handle),
-                    "standingViewId": .string(proposal.citedStandingViewId),
-                    "title": .string(proposal.title),
-                    "why": .string(proposal.pursuit.why),
-                    "rationale": .string(proposal.rationale),
-                    "reason": .string(reason),
-                    "origin": .string(DeskOrigin.agent.rawValue),
-                ])
-            )
+                project: proposal.project, title: proposal.title, pursuit: proposal.pursuit, summary: proposal.summary,
+                notify: NotifyPolicy(level: .direct, on: ["explicit"],
+                    notifyReason: "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) opened a self-pursuit: \(proposal.title)"))
+            await substrate.recordReceipt(kind: "workshop.pursuit_proposed", payload: .object([
+                "handle": .string(item.handle), "careId": .string(proposal.citedCareId),
+                "title": .string(proposal.title), "why": .string(proposal.pursuit.why),
+                "rationale": .string(proposal.rationale), "reason": .string(reason),
+                "origin": .string(DeskOrigin.agent.rawValue),
+            ]))
         } catch {
-            // Fail-closed: a store refusal (cap/dossier) records an honest receipt
-            // and opens NO pursuit.
-            await substrate.recordReceipt(
-                kind: "workshop.pursuit_proposal_refused",
-                payload: .object([
-                    "standingViewId": .string(proposal.citedStandingViewId),
-                    "error": .string(String(describing: error)),
-                    "reason": .string(reason),
-                ])
-            )
+            await substrate.recordReceipt(kind: "workshop.pursuit_proposal_refused", payload: .object([
+                "careId": .string(proposal.citedCareId), "error": .string(String(describing: error)),
+                "reason": .string(reason),
+            ]))
         }
     }
 
@@ -415,7 +357,7 @@ extension NativeCognitionRuntime {
         )
         let boundary = """
         # Private reflection
-        Reflect as yourself on the supplied runtime evidence. Be concise. Do not claim hidden state, dispatch actions, change identity, memory or schemas, or treat inferred or dreamed content as observed. Use only the standing-view path stated in the task.
+        Reflect as yourself on the supplied runtime evidence. Be concise. Do not claim hidden state, dispatch actions, change identity, memory or schemas, or treat inferred or dreamed content as observed. Use only the care stance and open-question changes stated in the task.
         """
         return [compiled, boundary].joined(separator: "\n\n")
     }

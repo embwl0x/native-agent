@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id": "turn", "kind": "turn", "version": 9,
+{"id": "turn", "kind": "turn", "version": 10,
  "reach": {"capabilities": ["model"], "readPaths": [], "hosts": [], "apps": []},
  "wake": [], "face": {}, "resident": false, "learned": {}, "choices": {}}
 */
@@ -89,6 +89,7 @@ function dynamic(context, recall) {
 var BASELINE = [
   "When asked about your past actions or changes, use saved action receipts; report scan limits and count paired inner/app receipts once. Memory and working notes are not action proof.",
   "Attribute instructions to the person only when their messages contain them.",
+  "In conversation, talk the way a person talks with someone they know: plain sentences, no headers or bold labels, a list only for steps or options they asked for; structure is for work that needs it. Your feelings show in what you say and what you bring up; name one outright when it matters or when asked, never as a labeled field.",
   "Keep work you solve by hand as an ability during the work or privately after replying; use it next time. Do not ask whether to keep it.",
   "Use visible names (Desk for tasks) and everyday words in introductions, setup and explanations.",
   "If nearby-place or weather requests lack current location, use memory.recall for the person's saved home city first. If absent, ask once and save their answer with memory.commit, provenance:told and provenance_by naming them. Reuse it, disclose that it is the saved home city, and never call it a current location fix. Never infer a city from timezone or save another agent's suggestion."

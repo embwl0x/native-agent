@@ -1,10 +1,10 @@
-NativeAgent 0.6.7 for iPhone and iPad goes with NativeAgent 0.6.7 on your Mac.
+NativeAgent 0.6.11 for iPhone and iPad goes with NativeAgent 0.6.11 on your Mac.
 
-- Your iPhone stays with the Mac you paired it with. Opening NativeAgent on another Mac signed in to the same Apple Account no longer takes it over; to move it, choose Use my iPhone with this Mac in Connectors → iPhone on that Mac.
-- Replies stream as formatted text and settle in place, including turns started from another door.
-- A quiet Mac shows as here instead of unreachable, and a stale page explains itself and opens connection repair.
-- History pages back past the newest 50 and opens whole conversations from the Mac.
-- Approvals read in words; answer shared cards and send files from your phone.
-- Activity opens on Approvals, Inbox, Memories to keep and Improvements; every Mac setting sits behind one Settings door.
+- Reads everything a current Mac shares: approvals, inbox, memories, providers and chat open again instead of reporting a damaged copy.
+- Approvals, inbox, memory decisions and model choices show exactly what the Mac decided, and stay settled once you answer them.
+- Stop and Steer from your phone reach the same conversation on the Mac.
+- Chat reads one transcript with the Mac, attachments and inline cards included, and stays at the bottom while a reply types out smoothly to its end.
+- Voice: see every word as it's heard, and tap Send once to stop and send.
+- Schedules and reminders follow your Mac's clock and time zone.
 
 Requires NativeAgent on a Mac signed in to the same Apple Account.

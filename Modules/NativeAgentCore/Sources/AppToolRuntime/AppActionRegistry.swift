@@ -16,7 +16,7 @@ import StandingBots
 import ToolRegistry
 import TrustCenter
 import TurnTrace
-// Blueprint: | `AppActionRegistry.swift` | App action definitions and registry (`AppAction`, `AppActions`); dependency contracts omit the retired scriptability field; authored action lookup; one schema-aware semantic/lexical ranking for declared page items, built-ins, admitted tools, enabled skills and current senses, with shared retrieval stop words, a semantic relevance floor and model-epoch action vectors; explicitly requested retired tools are labeled read-only records; file Trash, recurring tasks and named contacts route to their owners; their own parts ranked and rendered from one inventory for the turn glance (`parts`), acknowledging only shown fresh parts; a receipt's `effect` names a run of them part as `part`; chat.post exposes the existing proactive speech seam |
+// Blueprint: | `AppActionRegistry.swift` | App action definitions and registry (`AppAction`, `AppActions`); dependency contracts omit the retired scriptability field; authored action lookup; one schema-aware semantic/lexical ranking for declared page items, built-ins, admitted tools, enabled skills and current senses, with shared retrieval stop words, a semantic relevance floor and model-epoch action vectors; explicitly requested retired tools are labeled read-only records; file Trash, recurring tasks and named contacts route to their owners; their own parts ranked and rendered from one inventory for the turn glance (`parts`), acknowledging only shown fresh parts; a receipt's `effect` names a run of their part as `part`; chat.post exposes the existing proactive speech seam |
 
 /// One button of NativeAgent's, as the `app` door offers it.
 ///
@@ -489,8 +489,8 @@ public enum AppActions {
         AppAction("memory.pin", "memories", "Pin a fact about the owner (user fact, preference, relationship, identity, attribute) to your prompt core, in pin order; moments stay in recall", ["id"],
                   capabilities: ["memory_write", "tool_call"], tool: "rewrite_memory", input: ["pinned": .bool(true)]),
 
-        // Her mind: Dreams (Personality), Self-Improvement and standing views
-        // (Today), the Observatory (Diagnostics → Cognition).
+        // Her mind: Dreams (Personality), Self-Improvement (Today),
+        // the Observatory (Diagnostics → Cognition).
         AppAction("mind.dream", "personality", "Run a dream pass", tool: "mind_run", input: verb("dream")),
         AppAction("mind.rem", "personality", "Run a REM pass", ["repair?:bool"], tool: "mind_run", input: verb("rem")),
         AppAction("scheduler.trigger_fire", "desk", "Reconcile a claimed trigger", ["surface", "name", "occurrence?"], tool: "mind_run", input: verb("trigger_fire")),
@@ -498,28 +498,20 @@ public enum AppActions {
                   input: verb("self_improvement")),
         AppAction("mind.misses", "today", "Your misses: corrections by lesson, this week against last, each with its history locator",
                  tool: "mind_run", input: verb("misses"), read: true),
-        AppAction("mind.decline_view", "today", "Decline a proposed standing view", ["view_id", "reason?"], irreversible: true,
-                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "mind_run", input: verb("decline_view")),
-        AppAction("mind.approve_view", "today", "Approve a standing view", ["view_id"],
-                  owner: .his("a standing view is his to sign"), tool: "mind_run", input: verb("approve_view")),
         AppAction("mind.think_now", "diagnostics", "Think now", tool: "mind_run", input: verb("think_now")),
         // Phase 5 B0: why something surfaced, and her two corrections.
         AppAction("mind.why", "personality", "Why a felt cue or memory surfaced on a turn (default: last completed turn)",
                   ["turn?"],tool: "mind_run", input: verb("why"), read: true),
         AppAction("mind.reject", "personality",
-                  "Stop a memory, view, thought or dream phrase surfacing for this kind of thing (source from mind.why)",
+                  "Stop a memory, care or dream phrase surfacing for this kind of thing (source from mind.why)",
                   ["source", "turn?", "always?:bool"], tool: "mind_run", input: verb("reject")),
         AppAction("mind.undo", "personality",
-                  "Undo one update of yours (a view, a thought, an undertone nudge); no item lists them",
+                  "Undo an undertone nudge of yours; no item lists them",
                   ["item?"], tool: "mind_run", input: verb("undo")),
-        // Phase 5 D1: her seat revises her own opinion, with the evidence.
-        AppAction("mind.revise", "personality",
-                  "Revise one of your opinions: what you think now and the evidence or argument that changed it",
-                  ["view_id", "view", "evidence", "unless?"], tool: "mind_run", input: verb("revise")),
         AppAction("mind.reflect", "diagnostics", "Reflect", tool: "mind_run", input: verb("reflect")),
         AppAction("mind.settle_body", "diagnostics", "Settle your body state (calm down when wound up)", tool: "mind_run", input: verb("settle_body")),
         AppAction("mind.reset_body", "diagnostics", "Reset body", tool: "mind_run", input: verb("reset_body")),
-        AppAction("mind.pin_concern", "diagnostics", "Pin concern", tool: "mind_run", input: verb("pin_concern")),
+        AppAction("mind.pin_concern", "diagnostics", "Keep a concern open in your cares; omitted concern uses what presses most", ["concern?"], tool: "mind_run", input: verb("pin_concern")),
         AppAction("mind.run_checks", "diagnostics", "Run checks", tool: "mind_run", input: verb("run_checks")),
         AppAction("mind.export_trace", "diagnostics", "Export trace", tool: "mind_run", input: verb("export_trace")),
         AppAction("mind.leave_workspace_out", "diagnostics", "Leave your workspace out of your thinking", tool: "mind_run",
@@ -697,8 +689,6 @@ public enum AppActions {
         .fold("studio_canon", "personality", read: true),
         .fold("studio_canon_resolve", "personality"),
         .fold("dream_diary_read", "personality", read: true),
-        .fold("hold_view", "today"),
-        .fold("release_view", "today"),
 
         // The peer-data latch binds subsequent scripted calls as it does a turn.
         .fold("agent_contacts", "agents", read: true),

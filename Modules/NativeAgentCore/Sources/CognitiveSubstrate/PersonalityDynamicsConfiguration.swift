@@ -88,14 +88,6 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// of two faint stirrings.
     public let feltAmbivalenceNodeFloor: Double = 0.14
 
-    // MARK: - Held standing views (2026-09-02)
-
-    /// What a view she adopted HERSELF weighs against one the user signed. Half
-    /// by construction: a held view is a real lean, not a settled conviction,
-    /// and it must never be able to outweigh something the user actually
-    /// approved.
-    public static let heldStandingViewWeightFactor: Double = 0.5
-
     // MARK: - Mood + disposition (CognitiveSubstrate+Mood.swift)
 
     public let moodRecencyHalfLife: TimeInterval = 6 * 60 * 60
@@ -121,36 +113,6 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// this window expires, whichever comes first — so a genuinely persistent
     /// state is never muted forever.
     public let fingerprintSuppressionWindow: TimeInterval = 20 * 60
-
-    // MARK: - Inner-line cadence (2026-09-01)
-
-    /// THE SAME LAW, FOR THE ONE LINE THAT CARRIES HER VIEWS. Measured over 777
-    /// live turns the single `- Inner:` line had 15 distinct texts, and the top
-    /// three led 124 / 108 / 98 turns each. Neither producer had a cadence: a
-    /// standing view is durable by construction, and a takeaway seed is ranked
-    /// on priority×recency with no surfaced-count at all, so whichever text won
-    /// once kept winning until it decayed out days later.
-    ///
-    /// After a line has LED `innerLineRepeatLimit` capsules it rests for
-    /// `innerLineRestTurns` capsules and the next eligible candidate leads —
-    /// rotation among candidates that are all relevant right now, never
-    /// silence-by-default.
-    public let innerLineRepeatLimit: Int = 3
-    public let innerLineRestTurns: Int = 12
-    /// THE NAG'S OWN CADENCE (item 6, 2026-09-02). A `- Thread:` line is an
-    /// unresolved thing intruding — the one line on the capsule whose whole
-    /// nature is to be unwelcome. It shares the Inner rotation ledger (so the
-    /// capsule still carries at most one Inner-or-Thread line) but gets the
-    /// strictest cadence in it: one lead, then a long rest. A nag on
-    /// consecutive turns is nagging; a nag once every twelve turns is a
-    /// person remembering something.
-    public let threadLineRepeatLimit: Int = 1
-    public let threadLineRestTurns: Int = 12
-    /// How heavy an unresolved seed must have grown before it may intrude at
-    /// all. Rumination weight rises with time unresolved (cap 0.35), so this
-    /// floor is what keeps a seed minted ten minutes ago from itching: a fresh
-    /// thing is not yet a thing you are carrying.
-    public let threadWeightFloor: Double = 0.15
 
     // MARK: - Felt session bridge (W4/P7)
 

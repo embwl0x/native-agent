@@ -48,7 +48,7 @@ import NativeAgentShared
 import Senses
 import ToolExecution
 import Studio
-// Blueprint: | `EngineLaunch.swift` | `NativeAgentEngine`: canonical memory attachment and launch recovery; discovery starts independently at launch, its install observation once part wakes are registered; trusted bundled seeds installed before ingress; current seeds follow changed shipped bodies, while edited/non-seed content and other occupied slots are preserved, each failure retained by AbilityFilesCheck and reported through Doctor to the person while launch continues; an installed seed the readable bundle no longer ships, still its proof's candidate and never re-enabled, is switched off through its registry (restorable); root-bound derived-state invalidation; NativeAgentEngine launch/recovery ordering, procedure-retention root admission and terminal drain, background loop manifest and surface/workshop/scheduler composition; native effects arrive through EngineBackgroundWorkHost; MCP servers a data root kept are raised to them once by name as theirs to grow (`raiseKeptMCPServers`), their file untouched and, since a launch line can carry a key, fenced from them file readers with its backup copies; `tellRetiredConnectors` removes retired service rows and tells their once which were set up; old credentials stay untouched and unread; the engine exposes the existing activity controller through its body host |
+// Blueprint: | `EngineLaunch.swift` | `NativeAgentEngine`: canonical memory attachment and launch recovery; discovery starts independently at launch, its install observation once part wakes are registered; trusted bundled seeds installed before ingress; current seeds follow changed shipped bodies, while edited/non-seed content and other occupied slots are preserved, each failure retained by AbilityFilesCheck and reported through Doctor to the person while launch continues; an installed seed the readable bundle no longer ships, still its proof's candidate and never re-enabled, is switched off through its registry (restorable); root-bound derived-state invalidation; NativeAgentEngine launch/recovery ordering, procedure-retention root admission and terminal drain, background loop manifest and surface/workshop/scheduler composition; native effects arrive through EngineBackgroundWorkHost; MCP servers a data root kept are raised to their once by name as theirs to grow (`raiseKeptMCPServers`), their file untouched and, since a launch line can carry a key, fenced from their file readers with its backup copies; `tellRetiredConnectors` removes retired service rows and tells their once which were set up; old credentials stay untouched and unread; the engine exposes the existing activity controller through its body host |
 
 /// Native effects used by Core's background composition. Scheduling, admission
 /// and reconciliation remain with the existing engine and background owners.
@@ -1315,6 +1315,7 @@ extension NativeAgentEngine {
             dreamMemoryDeltaProvider: DreamBackgroundWork.makeDreamMemoryDeltaProvider(dataRoot: root),
             dreamFeltSummaryProvider: DreamBackgroundWork.makeDreamFeltSummaryProvider(cognitionRuntime: cognitionRuntime(for: root)),
             dreamFeltOriginProvider: DreamBackgroundWork.makeDreamFeltOriginProvider(cognitionRuntime: cognitionRuntime(for: root)),
+            dreamCareNightProvider: DreamBackgroundWork.makeDreamCareNightProvider(cognitionRuntime: cognition),
             dreamReceiptSink: DreamBackgroundWork.makeDreamReceiptSink(cognitionRuntime: cognitionRuntime(for: root)),
             // …and the dream's mood flows back out into her slow disposition
             // layer, for the same reason (U2a, 2026-07-09).
@@ -1323,7 +1324,7 @@ extension NativeAgentEngine {
         )
         return try await DreamBackgroundWork.runDream(
             dataRoot: root, cycle: impl, cognitionRuntime: cognition,
-            force: force, trigger: trigger
+            force: force, trigger: trigger, notifications: EngineREMProposalNotifications()
         )
     }
 

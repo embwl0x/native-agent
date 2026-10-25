@@ -365,13 +365,6 @@ extension SwiftToolDispatcher {
         // read from tool input. See StudioCanonSeatGate.
         case "studio_canon_resolve":
             return try await impl_studio_canon_resolve(input: input, surface: surface)
-        // Item 7 (2026-09-02): the held tier's two verbs. Both are seated on
-        // her own live local turn inside the impl — see
-        // SwiftToolDispatcher+StandingViewTools.swift.
-        case "hold_view":
-            return await impl_hold_view(input: input, surface: surface)
-        case "release_view":
-            return await impl_release_view(input: input, surface: surface)
         case "search_kg":       return try await impl_search_kg(input: input, surface: surface)
         case "search_chat_history": return try await impl_search_chat_history(input: input, invokedAs: tool)
         case "workspace":
@@ -1048,7 +1041,7 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
         let input = ChatToolSessionInjection.apply(toolName: tool, input: rawInput)
         if let refusal = await argumentRefusal(tool: tool, input: input) { return refusal }
-        if ["studio_canon_resolve", "hold_view", "release_view"].contains(tool),
+        if tool == "studio_canon_resolve",
            case .failure(let refusal) = StudioCanonSeatGate.liveTurnProvenance(dispatchSurface: surface) {
             return .object(["status": .string("refused"), "refusal": .string(refusal.rawValue),
                 "reason": .string("\(tool): \(refusal.spoken). It is done from inside your own conversation, in your own turn.")])

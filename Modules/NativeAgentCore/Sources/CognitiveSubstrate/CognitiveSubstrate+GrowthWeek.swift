@@ -4,7 +4,7 @@ import Experiences
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+GrowthWeek.swift` | Frozen timeline, standing-view revision/retirement proof and decoded disposition transitions; `growthWeek`/`growthWeekLines` share the owned `growth-week.js` face. Readout grouping, titles, reasons, alternatives, ordering, cap and undertone prose are removed from Swift; canonical timeline source titles stay in Replay for its other consumers. |
+// Blueprint: | `CognitiveSubstrate+GrowthWeek.swift` | Frozen REM timeline and decoded disposition transitions; `growthWeek`/`growthWeekLines` share the owned `growth-week.js` face. Readout grouping, titles, reasons, alternatives, ordering, cap and undertone prose are removed from Swift; canonical timeline source titles stay in Replay for its other consumers. |
 
 public enum CognitiveGrowthOutcome: String, Sendable, Equatable, CaseIterable {
     /// Formed and still waiting on an answer. Never counts as a change she made.
@@ -14,21 +14,10 @@ public enum CognitiveGrowthOutcome: String, Sendable, Equatable, CaseIterable {
     case held
     /// The person signed it.
     case approved
-    /// A later reflection contradicted it and opened a revision — but that
-    /// revision is itself still only a PROPOSAL. The old view is still held /
-    /// active and has released nothing; saying "revised" here would show an
-    /// unapproved lesson as adopted (Agent's rule).
-    case revisionProposed
-    /// A later reflection contradicted it and the revision was ADOPTED. Only
-    /// now has the old view actually been released.
-    case revised
     /// She let it go on purpose.
     case letGo
     /// The person declined it.
     case declined
-    /// The set was full. NOT a change of mind — the distinction Agent asked for
-    /// and the one a reader is most likely to get wrong months later.
-    case outOfSet
     /// A proposal that aged out unanswered. Not released, not adopted, and not
     /// dressed up as either.
     case expiredUnresolved
@@ -49,7 +38,7 @@ public struct CognitiveDispositionTransition: Sendable, Equatable {
     /// After the experience was added — the move.
     public var afterContribution: Double
     public var at: Date
-    /// What contributed: the reflection, the dream night, the settled view.
+    /// What contributed: the reflection or the dream night.
     public var source: String
 
     public init(before: Double, afterDecay: Double, afterContribution: Double, at: Date, source: String) {
@@ -110,18 +99,6 @@ extension CognitiveSubstrate {
                 return outcome
             }
         }
-        // LEGACY ROWS. Written before the tag; their wording is fixed history,
-        // so reading it is safe here and nowhere else.
-        let summary = event.summary.lowercased()
-        if summary.hasPrefix("activated:") { return .approved }
-        if summary.hasPrefix("held (self-adopted)") { return .held }
-        if summary.hasPrefix("retired (chosen)") { return .letGo }
-        if summary.hasPrefix("retired (stale)") { return .expiredUnresolved }
-        if summary.hasPrefix("retired (displaced)")
-            || summary.hasPrefix("released (capacity)")
-            || summary.hasPrefix("retired (capacity)")
-            || summary.hasPrefix("out of the current set") { return .outOfSet }
-        if summary.hasPrefix("retired:") { return .declined }
         // The REM replay pass records a proposal's resolution with the status
         // in the TITLE and no tag at all, so every one of those rows read
         // "Schema proposal accepted — proposed" — the prose and the machine
@@ -138,7 +115,7 @@ extension CognitiveSubstrate {
 
 
     /// Captured before suspension: disposition numbers and revision evidence
-    /// cannot come from a different read than this timeline/view packet.
+    /// cannot come from a different read than this timeline packet.
     public func growthWeek(at now: Date? = nil) async -> CognitiveGrowthWeek {
         await growthWeek(from: await developmentalTimelineSnapshot(limit: 240), at: now)
     }
@@ -150,7 +127,8 @@ extension CognitiveSubstrate {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd"
         formatter.timeZone = .current
-        let events: [JSONValue] = timeline.filter { $0.occurredAt >= start && $0.occurredAt <= end }.map { event in
+        let events: [JSONValue] = timeline.filter { $0.occurredAt >= start && $0.occurredAt <= end
+            && !Self.isRetiredViewTimelineEvent($0) }.map { event in
             .object([
                 "id": .string(event.id.uuidString), "artifactId": event.artifactId.map { .string($0.uuidString) } ?? .null,
                 "kind": .string(event.kind.rawValue), "title": .string(event.title), "summary": .string(event.summary),
@@ -159,25 +137,9 @@ extension CognitiveSubstrate {
                 "outcome": Self.growthOutcome(of: event).map { .string($0.rawValue) } ?? .null,
             ])
         }
-        let views: [JSONValue] = standingViews.values.sorted { $0.id.uuidString < $1.id.uuidString }.map { view in
-            let predecessor = view.revisesViewId.flatMap { standingViews[$0] }
-            // Adoption alone is NOT release: the predecessor must really be retired.
-            let released = (view.status == .active || view.status == .held) && predecessor?.status == .retired
-            let happenedAt = released ? predecessor!.updatedAt : view.createdAt
-            return .object([
-                "id": .string(view.id.uuidString), "title": .string(view.title), "body": .string(view.body),
-                "status": .string(view.status.rawValue), "revises": view.revisesViewId.map { .string($0.uuidString) } ?? .null,
-                "createdAt": .double(view.createdAt.timeIntervalSince1970),
-                "released": .bool(released),
-                "inWindow": .bool(happenedAt >= start && happenedAt <= end),
-                "releasedAt": .double((predecessor?.updatedAt ?? view.updatedAt).timeIntervalSince1970),
-                "revisitCount": .int(Int64(view.revisitCount)),
-                "originExcerpt": .string(view.evidenceExcerpts.first ?? ""),
-            ])
-        }
         // Unicode character boundaries are a native text primitive, not a
         // clipping policy. JS chooses limits without splitting a Mac character.
-        let texts = timeline.flatMap { [$0.title,$0.summary] } + standingViews.values.flatMap { [$0.title,$0.body] }
+        let texts = timeline.flatMap { [$0.title,$0.summary] }
         var characterSet = Set<String>()
         for text in texts {
             let flat = text.replacingOccurrences(of:"\n",with:" ").trimmingCharacters(in:.whitespacesAndNewlines)
@@ -193,7 +155,7 @@ extension CognitiveSubstrate {
         }
         let input: JSONValue = .object([
             "clusters": .array(clusters.map(JSONValue.string)),
-            "events": .array(events), "views": .array(views),
+            "events": .array(events),
             "transitions": .array(dispositionTransitions.filter { $0.at >= start && $0.at <= end }.map { move in
                 .object([
                     "source": .string(move.source),

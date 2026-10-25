@@ -7,28 +7,7 @@ import NativeAgentShared
 import PersistenceCore
 import DeviceSync
 import DreamREMCycle
-// Blueprint: | `EngineCognitionModels.swift` | `CognitionProposalsFeed` enum; `CognitionProposalsFeed`; `DreamRunResult` completion and status interpretation |
-
-public enum CognitionProposalsFeed: Sendable {
-    public struct Pending: Sendable, Equatable {
-        public init(standingViews: [CognitiveStandingView] = []) {
-            self.standingViews = standingViews
-        }
-        public var standingViews: [CognitiveStandingView] = []
-        public var count: Int { standingViews.count }
-    }
-
-    public enum Read: Sendable, Equatable {
-        case available(Pending)
-        case unavailable(String)
-
-        public var pending: Pending {
-            guard case .available(let pending) = self else { return Pending() }
-            return pending
-        }
-    }
-
-}
+// Blueprint: | `EngineCognitionModels.swift` | `LivingStatusSnapshot` and `DreamRunResult` completion and status interpretation |
 
 public struct LivingStatusSnapshot: Sendable, Equatable {
     public var enabled: Bool
@@ -176,8 +155,7 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
 
     private static func carryLine(for organism: OrganismSnapshot) -> String {
         guard organism.enabled else { return "carrying no organism state" }
-        let proposals = organism.dreamRepairSummary.proposedStandingViews
-        return sanitized("carrying \(organism.signalCount) signals, \(organism.fieldSummary.nodeCount) field nodes, \(proposals) dream proposals")
+        return sanitized("carrying \(organism.signalCount) signals, \(organism.fieldSummary.nodeCount) field nodes")
     }
 
     private static func deskSummary(active: Int, blocked: Int) -> String {

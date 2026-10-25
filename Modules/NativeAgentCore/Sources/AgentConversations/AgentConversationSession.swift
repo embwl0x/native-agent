@@ -6,7 +6,7 @@ import NativeAgentCore
 import PersistenceCore
 import StandingBots
 import TurnTrace
-// Blueprint: | `AgentConversationSession.swift` | `AgentConversationSession` enum; `approvalRow`, `replayApproval`; `viaAbility` and `answer` (`agent.reply`): a contact reached through one of them abilities; queued follow-ups register for approval resolutions and execution settlements before reading, including replay failures recorded only in the approval store; conversation receipt writes also wake them, and they hold unsent at the one-day boundary without approval sampling; `clear_queue` withdraws queued and reserved messages immediately after cancellation admission, before cancelling or joining local work; sends and Stop requests settle through `settle`, with no persisted stopping state or second desktop terminal writer |
+// Blueprint: | `AgentConversationSession.swift` | `AgentConversationSession` enum; `approvalRow`, `replayApproval`; `viaAbility` and `answer` (`agent.reply`): a contact reached through one of their abilities; queued follow-ups register for approval resolutions and execution settlements before reading, including replay failures recorded only in the approval store; conversation receipt writes also wake them, and they hold unsent at the one-day boundary without approval sampling; `clear_queue` withdraws queued and reserved messages immediately after cancellation admission, before cancelling or joining local work; sends and Stop requests settle through `settle`, with no persisted stopping state or second desktop terminal writer |
 
 /// Approval execution retains the original exchange and all ordinary gates.
 public enum AgentConversationApproval {

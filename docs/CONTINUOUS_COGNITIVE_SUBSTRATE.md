@@ -25,7 +25,7 @@ using host ports. Core's `ChatTurnRuntime` consumes its turn projection.
 The Mac app supplies the host and UI: one brain, many doors.
 
 `NativeCognitionRuntime.loadConfiguration` defaults the master, capsule
-and background switches to enabled. Persistence, workspace, affect, seeds
+and background switches to enabled. Persistence, workspace, affect, cares
 and replay follow the master. Reflection has a separate enable preference
 and cost ceiling. After onboarding with a configured chat provider, when
 the master preference is absent, `initializeMissingInnerLifePreferences`
@@ -33,7 +33,7 @@ initializes missing inner-life choices, including reflection with a ceiling
 of two calls. This initialization preserves saved choices.
 
 The source supports event ingestion, persistence, workspace selection,
-capsules, affect, seeds, views, replay and reflection. It does not support the
+capsules, affect, cares, replay and reflection. It does not support the
 old text-extracted task prediction/commitment system.
 `CognitiveSubstrate+Research.swift` returns no score for provider-swap or
 self-model-accuracy experiments because those outcomes are not measured.
@@ -50,7 +50,7 @@ marked as app or script paths.
   proposals and affect do not establish canonical facts or rewrite persona.
   Replay reads existing Dream/REM output; canonical growth remains with its
   own proposal/apply path.
-- **Thought is not action authority:** the substrate's capsule, seed and
+- **Thought is not action authority:** the substrate's capsule, care and
   reflection outputs are data. Execution goes through the app action and
   Trust owners.
 - **Bounded context and storage:** preserve configuration caps, field decay,
@@ -83,7 +83,8 @@ These boundaries are represented by `CognitiveSubstrate.swift`,
    presentation window unconsumed.
 
 `CognitiveSubstrate+Workspace.swift` freezes the capsule's auxiliary inputs,
-including standing-view candidates, Sound scores and presentation state.
+including Sound scores and presentation state. Touched and pressing cares are
+resolved before the synchronous frozen render.
 Read-only inspection must not consume live presentation cadence.
 
 ## 3. State and bounds
@@ -95,7 +96,6 @@ sets:
 |---|---:|
 | Active continuity nodes | 256 |
 | Workspace items | 12 |
-| Thought seeds | 64 |
 | Capsule characters | 4,000 |
 
 `CognitiveSubstrate+Capsule.swift` takes the smaller of the configured
@@ -104,12 +104,20 @@ summary/metadata, decays nodes and maintains associations.
 `CognitiveSubstrate+Workspace.swift` scores eligible nodes, inhibits
 redundancy and returns reasons for selected items.
 
-Affect, mood, disposition, rumination and views share the substrate actor.
+Affect, mood, disposition and cares share the substrate actor.
 Personality dynamics supply numeric rates and thresholds
 (`PersonalityDynamicsConfiguration.swift`); capsule helpers render the
 bounded result. Somatic predictions belong to
 `CognitiveSubstrate/Organism/OrganismPrediction.swift`, not a duplicate
 task ledger inferred from assistant prose.
+
+Appraisal stakes read the live cares the event's words touch at cosine 0.40
+or more, including the four life seeds. A cold embedder supplies no match;
+no path kind grants a stake by itself. `CognitiveSubstrate+SemanticAppraisal.swift`
+uses the signed real charge of the closest touched care with a stance for
+the numeric worldview lens. The selected care cue carries the stance's words.
+Keyword concerns and the view-derived relationship warmth lean are retired;
+base affect and the organism's tenderness remain with their existing owners.
 
 ## 4. Persistence and lifecycle
 
@@ -122,6 +130,8 @@ transitions and pruning use database write transactions.
 before applying it. Failure produces degraded persistence health and blocks
 state writes; a successful retry restores the bundle before reopening them.
 `CognitiveSubstrate+Persistence.swift` owns the writes, not MemoryV2.
+Retired `standing_view` and `thought_seed` rows are protected from pruning
+and never loaded; their bytes stay on disk.
 
 `NativeCognitionRuntime.bootstrap` restores state; `flushForTermination`
 drains runtime work and persists continuity. `script/verify_release_artifact.sh`
@@ -154,22 +164,29 @@ together. It does not run the canonical Dream/REM scheduler.
 
 `CognitiveSubstrate+Reflection.swift` admits a call only when enabled,
 under its rolling 24-hour ceiling and without a current reservation.
-Spontaneous calls additionally require unresolved load; explicit requests
-bypass only that load test. The bounded prompt uses the capsule's provenance,
+Spontaneous calls additionally require unresolved load, read as the summed
+pressure of live open cares; explicit requests bypass only that load test.
+The bounded prompt uses the capsule's provenance,
 adds IDs for quoted source excerpts and records external material provenance.
 
 `NativeCognitionRuntime+Reflection.swift` executes through checked provider
 routing and records success, failure or cancellation. The reflection surface
 is `cognition_reflection`; no model is pinned by this blueprint.
-Reflection may propose a standing view. With `personality.views_experiment`
-enabled, a claim with reasons and a condition for changing it can become an
-opinion after two independent occurrences on different days with nonoverlapping
-sources; untrusted-peer-fed reflections do not count. Reconsideration can
-revise it only with evidence or an argument. Their opt-in hour can separately
-record and revisit open interests. Opinions and interests have caps of eight
-and five and enter held-tier capsule presentation only under the experiment
-and relevance gates; the bridge still lists only active, held and proposed
-views. See [SUBCONSCIOUS.md](SUBCONSCIOUS.md#opinions-and-interests).
+Reflection's `view:`, `because:` and `unless:` lines set a care's stance
+through `applyCares`, by them. The closest live care at cosine 0.40 or more
+receives it; otherwise they grows a new care. Untrusted-fed reflections write
+no care stance. A replaced stance stays in the care's story. Their opt-in hour reads
+open cares and writes its question back to one. The retired `standing_view`
+family is never loaded and remains byte-preserved on disk; no standing-view
+actions, bridge routes or experiment setting remain.
+Reflection's takeaway sets `open` through `applyReflectionCare` on the
+closest live care at cosine 0.40 or more, else a new care of theirs; the same
+taint check blocks care writes. The live-turn-gated `mind.pin_concern` uses
+`applyCares` by their to keep an open concern on that same matching rule.
+After-turn `closes` and the night settle it. Desk tasks do not feed their mind.
+The automatic Desk proposer may cite only a live, non-seed, life-depth care
+with a stance: `care.life` approval precedes eligibility, and existing Desk
+deduplication, capacity and unattended-work gates remain.
 The reflection receipt's yield score measures proposal production relative to
 estimated cost, not improved judgment or a validated personality benefit.
 

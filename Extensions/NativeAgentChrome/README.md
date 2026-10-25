@@ -2,9 +2,9 @@
 
 The Chrome `NativeAgent` tab group is Agent's workspace and ownership state.
 Every other tab belongs to the person. Activation, trusted pointer/keyboard/wheel/touch
-input, or an address-bar navigation ungroups one of them tabs immediately and
+input, or an address-bar navigation ungroups one of their tabs immediately and
 stops their pending actions. App and extension restarts recover tabs directly
-from the group. Nothing closes a tab except an explicit close of them own tab.
+from the group. Nothing closes a tab except an explicit close of their own tab.
 
 Each conversation remembers its last tab ID. Navigation reuses that tab while
 it remains in the group, otherwise creates an inactive grouped tab. Reads and

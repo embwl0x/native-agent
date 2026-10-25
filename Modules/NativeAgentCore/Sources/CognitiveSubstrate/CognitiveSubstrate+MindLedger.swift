@@ -3,7 +3,7 @@
 //
 // Agent: "reject a bad association, and reverse an update without rewriting my
 // whole history." Two bounded lists in ONE artifact row (`mind_ledger`):
-//   * suppressions — (source, context signature): this memory, view or seed
+//   * suppressions — (source, context signature): this memory or care
 //     must not surface for this kind of thing. Every selector that can surface
 //     the source honors it (the felt cue, the unbidden recall, the memory lane).
 //   * undo — the PREVIOUS value of each item her own update changed, just the
@@ -19,7 +19,7 @@ import Studio
 // Blueprint: | `CognitiveSubstrate+MindLedger.swift` | `CognitiveSubstrate` mind ledger: bounded association suppressions and undo entries, persistence and restoration |
 
 public struct CognitiveAssociationSuppression: Sendable, Equatable {
-    /// `memory:<record id>`, `view:<uuid>`, `seed:<uuid>` or `dream:<date>#<n>`;
+    /// `memory:<record id>`, `care:<uuid>` or `dream:<date>#<n>`;
     /// an outreach subject may also be `desk:<handle>` or `ship:<builder>[:<id>]`.
     public var source: String
     /// The signature of the turn it surfaced on. Empty means never.
@@ -28,7 +28,7 @@ public struct CognitiveAssociationSuppression: Sendable, Equatable {
 }
 
 public struct CognitiveUndoEntry: Sendable, Equatable {
-    /// `view:<uuid>`, `seed:<uuid>` or `disposition`.
+    /// `disposition`.
     public var key: String
     public var what: String
     /// The item before the update; `.null` when the update created it.
@@ -44,6 +44,16 @@ public enum CognitiveUndoOutcome: Sendable, Equatable {
 }
 
 extension CognitiveSubstrate {
+    static func associationTermsMatch(_ queryTerm: String, _ documentTerm: String) -> Bool {
+        if queryTerm == documentTerm { return true }
+        let inflectionSuffixes: Set<String> = ["s", "es", "ed", "ing", "er", "ers", "ion", "ions"]
+        let (short, long) = queryTerm.count < documentTerm.count
+            ? (queryTerm, documentTerm) : (documentTerm, queryTerm)
+        guard short.count >= associationMinimumTermLength,
+              long.hasPrefix(short) else { return false }
+        return inflectionSuffixes.contains(String(long.dropFirst(short.count)))
+    }
+
     static let maximumAssociationSuppressions = 48
     static let maximumUndoEntries = 24
     static let associationSignatureTermCap = 8
@@ -52,16 +62,16 @@ extension CognitiveSubstrate {
 
     /// What a turn is about, as a few content terms: the context half of a
     /// suppression and of every `mind.why` record. Same tokenizer the
-    /// standing-view relevance uses.
+    /// continuity matching uses.
     public static func associationSignature(_ text: String) -> [String] {
-        Array(appraisalConcernTerms(in: text).prefix(associationSignatureTermCap)).sorted()
+        Array(associationTerms(in: text).prefix(associationSignatureTermCap)).sorted()
     }
 
     /// A suppression covers a message that shares at least two of its terms
     /// (all of them when it has fewer). No terms: always.
     public static func suppressionCovers(_ terms: [String], messageTerms: [String]) -> Bool {
         guard !terms.isEmpty else { return true }
-        let shared = terms.filter { term in messageTerms.contains { standingViewTermsMatch($0, term) } }.count
+        let shared = terms.filter { term in messageTerms.contains { associationTermsMatch($0, term) } }.count
         return shared >= min(2, terms.count)
     }
 
@@ -88,13 +98,12 @@ extension CognitiveSubstrate {
         terms: [String],
         seat: StudioCanonTurnProvenance
     ) async -> String? {
-        // The same seat hold/release use: her own live turn, never a bridge.
+        // Her own live turn, never a bridge.
         guard seat.isComplete else { return "a rejection is made from inside your own turn" }
         let source = String(source.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
-        guard ["memory:", "view:", "seed:", "dream:", "desk:", "ship:"].contains(where: source.hasPrefix), source.count > 6 else {
-            return "source must be memory:<id>, view:<id>, seed:<id>, dream:<id>, desk:<handle> or ship:<builder>[:<id>]"
+        guard ["memory:", "care:", "dream:", "desk:", "ship:"].contains(where: source.hasPrefix), source.count > 6 else {
+            return "source must be memory:<id>, care:<id>, dream:<id>, desk:<handle> or ship:<builder>[:<id>]"
         }
-        if let refusal = rejectionRefusal(source) { return refusal }
         let terms = Array(terms.prefix(Self.associationSignatureTermCap)).sorted()
         associationSuppressions.removeAll { $0.source == source && $0.terms == terms }
         associationSuppressions.append(.init(source: source, terms: terms, at: dependencies.now()))
@@ -109,41 +118,11 @@ extension CognitiveSubstrate {
         return nil
     }
 
-    /// User's authority, never hers to suppress: a view he signed, a concern
-    /// he pinned. (Memory authority — pinned core, corrections, safety — is
-    /// checked by the runtime, which can read the memory store.)
-    func rejectionRefusal(_ source: String) -> String? {
-        if source.hasPrefix("view:"), let id = UUID(uuidString: String(source.dropFirst(5))),
-           standingViews[id]?.status == .active {
-            return "The owner signed that view; it is theirs to retire, not yours to suppress"
-        }
-        if source.hasPrefix("seed:"), let id = UUID(uuidString: String(source.dropFirst(5))),
-           thoughtSeeds[id]?.text.hasPrefix("Pinned concern:") == true {
-            return "The owner pinned that concern; it is not yours to suppress"
-        }
-        return nil
-    }
-
     public func associationSuppressionSnapshot() -> [CognitiveAssociationSuppression] {
         associationSuppressions
     }
 
     // MARK: - Undo
-
-    static func undoStamp(_ view: CognitiveStandingView?) -> String {
-        guard let view else { return "none" }
-        return "\(view.status.rawValue)|\(view.updatedAt.timeIntervalSince1970)|\(view.revisitCount)|\(view.evidenceExcerpts.count)"
-    }
-
-    /// Decay rewrites a seed's priority and clock, so a seed's stamp is what an
-    /// update changes: its wording and its evidence.
-    static func undoStamp(_ seed: CognitiveThoughtSeed?) -> String {
-        guard let seed else { return "none" }
-        let stamp = "\(seed.text)|\(seed.sourceNodeIds.count)|\(seed.createdAt.timeIntervalSince1970)"
-        guard seed.sourcePeerIds != nil || !seed.materialProvenances.isEmpty else { return stamp }
-        let peers = seed.sourcePeerIds.map { $0.sorted().joined(separator: ",") } ?? "unknown"
-        return "\(stamp)|\(peers)|\(seed.materialProvenances)"
-    }
 
     static func undoStamp(_ disposition: CognitiveDisposition) -> String {
         "\(disposition.valence)|\(disposition.updatedAt.timeIntervalSince1970)"
@@ -178,7 +157,6 @@ extension CognitiveSubstrate {
         defer { endMaintenanceTransition() }
         let now = dependencies.now()
         var artifacts: [CognitiveArtifactWrite] = []
-        var deletedArtifactIDs: [UUID] = []
         let rollback: () -> Void
         let previousValue: JSONValue
         if key == "disposition" {
@@ -213,57 +191,6 @@ extension CognitiveSubstrate {
                     self.dispositionTransitions = previousTransitions
                 }
             }
-        } else if key.hasPrefix("view:"), let id = UUID(uuidString: String(key.dropFirst(5))) {
-            let current = standingViews[id]
-            guard Self.undoStamp(current) == entry.stamp else {
-                return .refused(reason: "that view changed again since your update",
-                                current: current?.toJSON() ?? .null)
-            }
-            let prior = standingView(fromPayload: entry.previous)
-            if prior?.status == .held, current?.status != .held,
-               standingViews.values.filter({ $0.status == .held }).count >= Self.maximumHeldStandingViews {
-                return .refused(reason: "you already hold \(Self.maximumHeldStandingViews) views; release one first",
-                                current: current?.toJSON() ?? .null)
-            }
-            if let prior { standingViews[id] = prior } else { standingViews.removeValue(forKey: id) }
-            markDirty(at: now)
-            if let prior, prior.status != .retired {
-                artifacts.append(CognitiveArtifactWrite(
-                    kind: "standing_view", id: id, status: prior.status.rawValue,
-                    score: max(0, prior.moodValenceAtFormation), payload: prior.toJSON()))
-            } else {
-                deletedArtifactIDs.append(id)
-            }
-            previousValue = current?.toJSON() ?? .null
-            rollback = {
-                if self.standingViews[id] == prior {
-                    self.standingViews[id] = current
-                }
-            }
-        } else if key.hasPrefix("seed:"), let id = UUID(uuidString: String(key.dropFirst(5))) {
-            let current = thoughtSeeds[id]
-            guard Self.undoStamp(current) == entry.stamp else {
-                return .refused(reason: "that thought changed again since your update",
-                                current: current?.toJSON() ?? .null)
-            }
-            let prior = thoughtSeed(fromPayload: entry.previous)
-            if let prior {
-                thoughtSeeds[id] = prior
-                artifacts.append(CognitiveArtifactWrite(
-                    kind: "thought_seed", id: id, status: "open", score: prior.priority, payload: prior.toJSON()))
-            } else {
-                thoughtSeeds.removeValue(forKey: id)
-                deletedArtifactIDs.append(id)
-            }
-            thoughtSeedRevision &+= 1
-            markDirty(at: now)
-            previousValue = current?.toJSON() ?? .null
-            rollback = {
-                if self.thoughtSeeds[id] == prior {
-                    self.thoughtSeeds[id] = current
-                    self.thoughtSeedRevision &+= 1
-                }
-            }
         } else {
             return .refused(reason: "unknown item \(key)", current: .null)
         }
@@ -272,7 +199,7 @@ extension CognitiveSubstrate {
             kind: "mind_ledger", id: stableArtifactID("mind_ledger"), status: "current", score: 0,
             payload: mindLedgerArtifactPayload(at: now, undoEntries: undoLedger.filter { $0 != entry })))
         do {
-            try await persistArtifactTransition(artifacts: artifacts, deletedArtifactIDs: deletedArtifactIDs, at: now)
+            try await persistArtifactTransition(artifacts: artifacts, deletedArtifactIDs: [], at: now)
         } catch {
             rollback()
             markDirty(at: dependencies.now())
@@ -327,7 +254,9 @@ extension CognitiveSubstrate {
         guard case .object(let object)? = payloads.first else { return }
         if case .array(let rows)? = object["suppressions"] {
             for case .object(let row) in rows {
-                guard let source = stringValue(row["source"]), let at = dateValue(row["at"]) else { continue }
+                guard let source = stringValue(row["source"]),
+                      ["memory:", "care:", "dream:", "desk:", "ship:"].contains(where: source.hasPrefix),
+                      let at = dateValue(row["at"]) else { continue }
                 var terms: [String] = []
                 if case .array(let values)? = row["terms"] { terms = values.compactMap { stringValue($0) } }
                 associationSuppressions.append(.init(source: source, terms: terms, at: at))
@@ -336,7 +265,7 @@ extension CognitiveSubstrate {
         }
         if case .array(let rows)? = object["undo"] {
             for case .object(let row) in rows {
-                guard let key = stringValue(row["key"]), let stamp = stringValue(row["stamp"]),
+                guard let key = stringValue(row["key"]), key == "disposition", let stamp = stringValue(row["stamp"]),
                       let at = dateValue(row["at"]) else { continue }
                 undoLedger.append(.init(
                     key: key, what: stringValue(row["what"]) ?? key, previous: row["previous"] ?? .null,

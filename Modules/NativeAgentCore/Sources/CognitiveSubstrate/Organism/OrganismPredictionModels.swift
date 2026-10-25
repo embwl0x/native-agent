@@ -43,7 +43,7 @@ public enum OrganismPredictionKind: String, Codable, Sendable, Equatable, CaseIt
 /// Item 46 — the semantic prediction lane's whole contract in one place.
 ///
 /// SCOPE DISCIPLINE, stated up front: this lane derives from EXISTING appraisal
-/// signals and makes no LLM call, ever. The organism cannot see a standing view
+/// signals and makes no LLM call, ever. The organism cannot read cares
 /// or run an appraisal — that owner is `CognitiveSubstrate` — so the two facts
 /// the lane needs cross on somatic-signal metadata, and nothing else does:
 /// what she expects (minted on her own completed turn) and how it landed
@@ -55,11 +55,10 @@ public enum OrganismPredictionKind: String, Codable, Sendable, Equatable, CaseIt
 public enum OrganismSemanticExpectation {
     /// Metadata key on an `.assistantSpoke` signal: an OBJECT carrying the
     /// concern she has at stake in the turn she just finished plus that turn's
-    /// scope. The concern is a bounded LABEL (a lived-concern name such as
-    /// `view:<lineage>`), never the content of the work.
+    /// scope. The label is a care id (`care:<UUID>`), never the content of the work.
     ///
     /// The same key carries `{session, turn}` alone as PROVENANCE on the felt
-    /// cognitive event a semantic resolution produces (see D-2, review fix 6).
+    /// cognitive event a semantic resolution produces.
     public static let mintMetadataKey = "semanticExpectation"
     /// Metadata key on a `.userSpoke` signal: an OBJECT carrying the appraisal
     /// owner's read of how the previous turn landed, plus the scope of the
@@ -286,9 +285,7 @@ public enum OrganismHorizonRegister {
     public static let idPrefix = "horizon"
     /// The `subject.label` the runtime stamps on a horizon resolution's felt
     /// cognitive event. Distinct from every `OrganismPredictionKind` raw value
-    /// so D-2's gate can admit this family by name without widening the
-    /// semantic lane's conditional entry (see
-    /// `CognitiveSubstrate+AppraisalStakes.swift`).
+    /// so its source stays explicit; admission still requires a touched care.
     public static let resolutionPathLabel = "horizonExpectation"
     /// Field separator for the encoded source token. Excluded from labels by
     /// `canonicalLabel`, so a label can never split a token.

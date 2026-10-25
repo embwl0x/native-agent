@@ -1,6 +1,8 @@
 // Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
 
 import Foundation
+import ChatTurnRuntime
+import BackgroundLoops
 import AgentWorkspace
 import CognitiveSubstrate
 import Context
@@ -144,7 +146,6 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
             let context = await Task.detached(priority: .utility) {
                 HerScreen.queueContext(dataRoot: root, now: at, ownTurn: true)
             }.value
-            await applyDeskRuminations(from: state, context: context, revision: revision, generation: generation)
             if generation == pursuitProjectionGeneration, revision == SwiftNativeDeskStore.currentRevision, !isFlushedForTermination {
                 if pursuitCandidates != state.items { sourceWakes.reachDirty = true }
                 pursuitCandidates = state.items
@@ -197,5 +198,80 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
             await startPursuitRefresh()
         }
         await rescheduleResidualRepairDeadline()
+    }
+}
+
+extension NativeCognitionRuntime {
+    static func carries(_ item: DeskItem) -> Bool {
+        item.project == MyQueue.project || item.assignee == "agent"
+    }
+
+    static func carriedTouch(_ item: DeskItem, at now: Date) -> Date {
+        max(Self.deskDate(item.openedAt) ?? now,
+            item.notes.filter { $0.author == "agent" }.compactMap { Self.deskDate($0.ts) }.max() ?? .distantPast)
+    }
+
+    /// One salience law, one exact-deadline owner and one existing wake door.
+    func considerCarried() async -> Date? {
+        guard !isFlushedForTermination, !pursuitRefreshInFlight, !pursuitRefreshQueued,
+              let revision = pursuitReadRevision, let candidates = queueTurnCandidates().candidates,
+              var context = pursuitCarriedContext else { return nil }
+        let at = now(), root = dataRoot
+        let generation = residualDeadline.generation
+        guard candidates.contains(where: { Self.carries($0) && !$0.isPursuit }) else { return nil }
+        guard !liveTurnInFlight else { return nil }
+        let lastTurnActivityAt = await ChatTurnSteering.shared.turnActivityOrSeed(for: root, at: at)
+        let quietAt = lastTurnActivityAt.addingTimeInterval(StudioWanderLane.quietInterval)
+        guard revision == SwiftNativeDeskStore.currentRevision else { return nil }
+        let opportunities = ResidentWake.carriedOpportunities(dataRoot: root,
+            items: candidates.filter { Self.carries($0) && !$0.isPursuit }, at: at)
+        var next: Date?, best: DeskItem?
+        var readyByTime: [Date: Set<String>] = [:]
+        for item in candidates {
+            guard let wakeAt = opportunities[item.handle] else { continue }
+            var crossing = wakeAt
+            if let entry = MyQueue.entry(item), case .at(let due) = MyQueue.when(entry) {
+                crossing = max(crossing, due)
+            }
+            if let deferred = item.deferUntil.flatMap(DeskSequencing.parseDeferStamp) { crossing = max(crossing, deferred) }
+            crossing = max(crossing, quietAt)
+            context.now = max(at, crossing)
+            let ready = readyByTime[context.now] ?? Set(MyQueueReady.ready(items: candidates, context: context).map(\.handle))
+            readyByTime[context.now] = ready
+            guard ready.contains(item.handle) else { continue }
+            if crossing > at { next = min(next ?? crossing, crossing); continue }
+            if let current = best {
+                if Self.carriedTouch(item, at: at) < Self.carriedTouch(current, at: at) { best = item }
+            } else { best = item }
+        }
+        guard let best else { return next }
+        let freedom = StudioWanderLane.decide(now: at, turnInFlight: liveTurnInFlight,
+            lastTurnActivityAt: lastTurnActivityAt, lastWanderAt: nil)
+        guard freedom == .wander else {
+            guard freedom == .notQuiet else { return next }
+            let freeAt = Date(timeIntervalSinceReferenceDate: quietAt.timeIntervalSinceReferenceDate.nextUp)
+            return min(next ?? freeAt, freeAt)
+        }
+        guard revision == SwiftNativeDeskStore.currentRevision else { return nil }
+        guard !liveTurnInFlight,
+              generation == residualDeadline.generation, !isFlushedForTermination else { return next }
+        ResidentWake.shared.request(dataRoot: root, reason: "what you carry", items: [ResidentWake.carriedArrival(best, crossing: at)])
+        return next
+    }
+
+    /// Desk touch stamps are ISO-8601, with or without fractional seconds.
+    static func deskDate(_ raw: String) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: trimmed) { return date }
+        if let date = ISO8601DateFormatter().date(from: trimmed) { return date }
+        let day = DateFormatter()
+        day.calendar = Calendar(identifier: .gregorian)
+        day.locale = Locale(identifier: "en_US_POSIX")
+        day.timeZone = .current
+        day.dateFormat = "yyyy-MM-dd"
+        return day.date(from: trimmed)
     }
 }

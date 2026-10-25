@@ -15,22 +15,17 @@ public actor CognitiveSubstrate {
     var residentRestoreIsAuthoritative = false
     var restoreInFlight = false
     var field = ContinuityField()
-    var thoughtSeeds: [UUID: CognitiveThoughtSeed] = [:]
-    var thoughtSeedRevision: UInt64 = 0
     /// Item 47: internal rather than private — the developmental recall pull
     /// (CognitiveSubstrate+DevelopmentalRecall.swift) is a read of these two
     /// stores from a sibling file in the same module. Still no external writer.
     var episodes: [UUID: CognitiveEpisodeReference] = [:]
     var schemaProposals: [UUID: CognitiveSchemaProposal] = [:]
-    /// Standing views persist one artifact each. Approval activates proposed
-    /// views; interests and recurring opinions enter their own statuses
-    /// directly and do not become `.active`/`.held` through that path.
-    var standingViews: [UUID: CognitiveStandingView] = [:]
-    /// 2026-09-06: the cap repair's artifact deletes used to be swallowed, so a
-    /// store that cannot accept deletes re-demoted the same views on every
-    /// launch in silence. One log line per launch — the repair itself stays
-    /// best-effort, and a line per overflowing view per restore would be noise.
-    var didLogStandingViewCapRepairFailure = false
+    /// What she cares about, one artifact each (see +Cares.swift), the
+    /// one-time seed/migration marker, and the embedder's vectors for the
+    /// cares, keyed by id and current while `updatedAt` is unchanged.
+    var cares: [UUID: CognitiveCare] = [:]
+    var careMigration: CognitiveCareMigration?
+    var careVectors: [UUID: (updatedAt: Date, vector: [Float])] = [:]
     var developmentalTimeline: [UUID: CognitiveDevelopmentalTimelineEvent] = [:]
     var replayEvidenceIds: Set<String> = []
     var reflectionReceipts: [UUID: CognitiveReflectionReceipt] = [:]
@@ -106,13 +101,6 @@ public actor CognitiveSubstrate {
     // Release/re-feel ledgers are transient. Dream residue and its claim key
     // persist together; their field comments below name that owner.
 
-    /// Item 6 — seeds whose weight has been cleared, and when. Pruned past
-    /// `ruminationReleaseMemory`.
-    var ruminationReleasedAt: [UUID: Date] = [:]
-    /// Item 6 — relief felt-moments staged for the runtime's drain, capped
-    /// at `pendingRuminationReleaseCap`; pending deliveries keep their slots.
-    var pendingRuminationReleases: [CognitiveEvent] = []
-    var isDrainingRuminationReleases = false
     /// Item 7 — the night's residue: a mood with no source, spent over the
     /// first accepted turns after waking. Persisted (family `dream_residue`)
     /// alongside its claim key so a restart neither loses nor re-mints it.
@@ -120,15 +108,6 @@ public actor CognitiveSubstrate {
     /// Item 7 — which night the current residue belongs to (the committed
     /// dream's id, else the local calendar day). One night, one residue.
     var dreamResidueClaimKey: String?
-    /// Item 6 (2026-09-02) — open things an EXTERNAL owner holds (Desk items
-    /// she opened), pushed by the owner-side reader. In-memory: canonical Desk
-    /// state is the durable copy, and re-reading it is one file away.
-    var externalRuminations: [String: CognitiveExternalRumination] = [:]
-    /// Closed commitments retain their relief until the shared buffer has room.
-    var deferredExternalRuminationRelief: [String: CognitiveEvent] = [:]
-    /// When that set was last read, so a turn can ask "is it stale" without
-    /// touching disk.
-    var externalRuminationsRefreshedAt: Date?
     /// Item 7 — when each felt node was last RE-FELT through recall. One nudge
     /// per node per hour; pruned by the same owner.
     var lastRefeltAt: [UUID: Date] = [:]
@@ -264,8 +243,7 @@ public actor CognitiveSubstrate {
 
     var settlingRun = 0
 
-    /// 2026-09-01 — the rut nudge's change-driven cadence, and the inner line's
-    /// per-text cadence ledger. Both are PRESENTATION state in exactly the sense
+    /// The rut nudge's change-driven cadence is presentation state in the sense
     /// the fingerprint run already is: memory-only, live-path only, advanced by
     /// `applyCapsulePresentationCommit` after the provider accepts the turn.
     var soundRutSignature: String?
@@ -275,8 +253,6 @@ public actor CognitiveSubstrate {
     /// Bounded like every other counted family: once it is past any gate it
     /// could satisfy, a larger number carries no more meaning.
     static let soundRutTurnCounterCap = 10_000
-    var innerLineRuns: [String: Int] = [:]
-    var innerTextShown: [String: CognitiveCapsulePresentationState.InnerTextExposure] = [:]
     /// Presentation receipts for the felt line's object + ambivalence organs
     /// (2026-09-02). Counters only — see `CognitiveCapsulePresentationState`.
     var feltObjectCount = 0
@@ -323,15 +299,15 @@ public actor CognitiveSubstrate {
             soundRutLastSurfacedAt: soundRutLastSurfacedAt,
             soundRutTurnsSinceSurfaced: soundRutTurnsSinceSurfaced,
             soundRutEarlyRepeatSpent: soundRutEarlyRepeatSpent,
-            innerLineRuns: innerLineRuns,
             feltObjectCount: feltObjectCount,
             ambivalenceCount: ambivalenceCount,
             lastAmbivalenceAt: lastAmbivalenceAt,
             remindedOfLastSurfacedAt: remindedOfLastSurfacedAt,
             remindedOfTurnsSinceSurfaced: remindedOfTurnsSinceSurfaced,
             remindedOfSurfaced: remindedOfSurfaced,
-            innerTextShown: innerTextShown,
-            dreamThemeSurfaced: dreamThemeSurfaced
+            dreamThemeSurfaced: dreamThemeSurfaced,
+            careReleased: careReleased,
+            careLineRest: careLineRest
         )
     }
 
@@ -397,6 +373,10 @@ public actor CognitiveSubstrate {
     /// Phase 5 B1: dream theme id → when it surfaced (see the
     /// presentation state).
     var dreamThemeSurfaced: [String: Date] = [:]
+    /// Cares lane 2: care id → when she last meant to bring it up (see the
+    /// presentation state).
+    var careReleased: [String: Date] = [:]
+    var careLineRest: [String: CognitiveCapsulePresentationState.CareLineRest] = [:]
 
     /// How the agent names the user in her inner voice — resolved from the
     /// configured persona, never hardcoded. Falls back to grammar-safe "you".
@@ -486,11 +466,11 @@ public actor CognitiveSubstrate {
         dirtyRevision &+= 1
         residentRestoreIsAuthoritative = true
         field.clear()
-        thoughtSeeds.removeAll(keepingCapacity: false)
-        thoughtSeedRevision &+= 1
         episodes.removeAll(keepingCapacity: false)
         schemaProposals.removeAll(keepingCapacity: false)
-        standingViews.removeAll(keepingCapacity: false)
+        cares.removeAll(keepingCapacity: false)
+        careMigration = nil
+        careVectors.removeAll(keepingCapacity: false)
         developmentalTimeline.removeAll(keepingCapacity: false)
         replayEvidenceIds.removeAll(keepingCapacity: false)
         reflectionReceipts.removeAll(keepingCapacity: false)
@@ -507,11 +487,6 @@ public actor CognitiveSubstrate {
         undoLedger.removeAll(keepingCapacity: false)
         dreamResidue = nil
         dreamResidueClaimKey = nil
-        ruminationReleasedAt.removeAll(keepingCapacity: false)
-        pendingRuminationReleases.removeAll(keepingCapacity: false)
-        externalRuminations.removeAll(keepingCapacity: false)
-        deferredExternalRuminationRelief.removeAll(keepingCapacity: false)
-        externalRuminationsRefreshedAt = nil
         lastRefeltAt.removeAll(keepingCapacity: false)
         lastRefeltRecordAt.removeAll(keepingCapacity: false)
         ablations.removeAll(keepingCapacity: false)
@@ -527,6 +502,8 @@ public actor CognitiveSubstrate {
         owedSinceGap = nil
         lastSessionBridgeAt = nil
         dreamThemeSurfaced.removeAll(keepingCapacity: false)
+        careReleased.removeAll(keepingCapacity: false)
+        careLineRest.removeAll(keepingCapacity: false)
         feltObjectCount = 0
         ambivalenceCount = 0
         lastAmbivalenceAt = nil
@@ -547,8 +524,6 @@ public actor CognitiveSubstrate {
         // substrate no longer has, and must not dose.
         clearCaringState()
         momentAffect.removeAll(keepingCapacity: false)
-        innerLineRuns.removeAll(keepingCapacity: false)
-        innerTextShown.removeAll(keepingCapacity: false)
         capsulePresentationDirty = false
         dirtySince = nil
         lastUserPresenceAt = nil

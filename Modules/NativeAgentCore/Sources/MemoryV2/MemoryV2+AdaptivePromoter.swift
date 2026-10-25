@@ -172,7 +172,8 @@ public actor AdaptiveMemoryPromoter {
     private var memoryManager: (any MemoryManaging)?
     /// The person's configured name, read fresh so a rename shows up.
     private var personName: (@Sendable () -> String?)? = nil
-    private var prepareInterpretation: (@Sendable (AfterTurnOrigin) async -> AfterTurnContext?)?
+    /// Given the turn's origin and her reply.
+    private var prepareInterpretation: (@Sendable (AfterTurnOrigin, String) async -> AfterTurnContext?)?
     /// The Bool is true when the novelty gate skipped the call (Phase 5A).
     private var finishInterpretation: (@Sendable (AfterTurnContext, AfterTurnInterpretation?, Bool) async -> Void)?
     private var observationTail: Task<AdaptiveMemoryObservation, Never>?
@@ -280,7 +281,7 @@ public actor AdaptiveMemoryPromoter {
     }
 
     public func configureInterpretation(
-        prepare: @escaping @Sendable (AfterTurnOrigin) async -> AfterTurnContext?,
+        prepare: @escaping @Sendable (AfterTurnOrigin, String) async -> AfterTurnContext?,
         isIdle: @escaping @Sendable () async -> Bool,
         finish: @escaping @Sendable (AfterTurnContext, AfterTurnInterpretation?, Bool) async -> Void
     ) {
@@ -604,7 +605,7 @@ public actor AdaptiveMemoryPromoter {
         // memory, and use_count is the signal that vetoes eviction.
         let context: AfterTurnContext?
         if !recovery, let origin, origin.sessionId == sessionId {
-            context = await prepareInterpretation?(origin)
+            context = await prepareInterpretation?(origin, assistant)
         } else { context = nil }
         let author = MemoryMoments.author(surface: surface,
             peer: peerAuthority ?? (speaker != nil || context?.event.sourceClass == .imported))
@@ -690,6 +691,7 @@ public actor AdaptiveMemoryPromoter {
                 case .affect: reason = .invalidAffect
                 case .memories: reason = .invalidMemories
                 case .moment: reason = .invalidMoment
+                case .cares: reason = .invalidCares
                 default: reason = .provider
                 }
             }

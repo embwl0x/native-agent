@@ -144,7 +144,6 @@ public enum ContextSourceKind: String, Codable, CaseIterable, Sendable {
     case skill
     case desk
     case dream
-    case standingView = "standing_view"
     case project
     case capability
     case other

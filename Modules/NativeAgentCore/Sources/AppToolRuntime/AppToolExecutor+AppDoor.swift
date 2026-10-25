@@ -1418,7 +1418,7 @@ extension AppToolExecutor {
         }
         // Validate before an owner-only preview can claim a callable target.
         let ownerRemedy: JSONValue = {
-            let target = Self.doorText(args["id"] ?? args["provider"] ?? args["view_id"])
+            let target = Self.doorText(args["id"] ?? args["provider"])
             let tap: String
             switch action.id {
             case "inbox.open_on_mac": tap = "Inbox → \(target) → Open on Mac"
@@ -1432,7 +1432,6 @@ extension AppToolExecutor {
             case "telegram.disconnect": tap = "Connectors → Telegram → Disconnect Telegram"
             case "pairing.remove": tap = "Connectors → iPhone → \(target) → Remove"
             case "backup.restore": tap = "Trust → Advanced → Backups → \(target) → Restore"
-            case "mind.approve_view": tap = "Today → Standing views → \(target) → Approve"
             case "desk.approve": tap = "Desk → \(target) → Approve"
             default: return .null // Actions owned by the agent never use this remedy.
             }

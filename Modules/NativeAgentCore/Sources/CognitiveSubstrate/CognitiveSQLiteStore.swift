@@ -19,13 +19,6 @@ struct CognitiveSQLitePruneResult: Sendable, Equatable {
     }
 }
 
-struct CognitiveArtifactReplacement: Sendable, Equatable {
-    var id: UUID
-    var status: String
-    var score: Double
-    var payload: JSONValue
-}
-
 struct CognitiveArtifactWrite: Sendable, Equatable {
     var kind: String
     var id: UUID
@@ -46,10 +39,12 @@ struct CognitiveReceiptWrite: Sendable, Equatable {
 /// pruneArtifacts always deletes exactly `count - cap` rows (protected rows sort
 /// last, but they are still spent once the unprotected supply runs out), so the
 /// table is bounded at `cap` no matter how many families are listed here or how
-/// lopsidedly they fill. Floors sum to 625 against the live artifact cap of 604
-/// (`artifactCap` = 128 seeds + 256 nodes + 128 seeds + 2 reflections × 14 + 64):
-/// deliberately ABOVE the cap, which under a full-of-protected-rows worst case
-/// costs the lowest-priority family its floor and still lands the table on 604.
+/// lopsidedly they fill. A full protected family may spend its floor when
+/// the rest of the table has no unprotected rows left.
+/// Kinds the generic cap never counts or evicts. Cares have no count cap:
+/// lane 3's night fades the unused ones, and the four seeds never go.
+private let cognitiveUnprunedArtifactKinds: Set<String> = ["care", "care_migration", "standing_view", "thought_seed"]
+
 private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     "affect": 32,
     // One row, rewritten in place: the capsule cadence ledger. Tiny, but losing
@@ -60,13 +55,12 @@ private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     "mind_ledger": 1,
     "disposition": 32,
     "emotional_consolidation": 32,
-    "thought_seed": 128,
     "episode": 64,
     "schema_proposal": 64,
-    "standing_view": 60,
     // Retired from resident cognition, but old rows remain byte-preserved for
     // backup/migration readers rather than being silently deleted at store open.
     "identity_proposal": 32,
+    "standing_view": 60,
     "developmental_timeline": 128,
     "reflection_receipt": 32,
     "experiment": 20,
@@ -103,6 +97,9 @@ struct CognitiveArtifactFamilyLoad: Sendable, Equatable {
     var key: String
     var kindPrefix: String
     var limit: Int
+    /// Every row of exactly this kind, not a prefix and not capped: `care`
+    /// must not also load `care_migration`, and cares have no count cap.
+    var whole = false
 }
 
 struct CognitiveSQLiteRestoreBundle: Sendable, Equatable {
@@ -180,17 +177,6 @@ public actor CognitiveSQLiteStore {
                 WHERE kind LIKE 'prediction%'
                    OR kind LIKE 'commitment%'
                    OR kind LIKE 'cue_authoring%'
-                """)
-            // Legacy neglected-commitment THOUGHT SEEDS live under kind
-            // 'thought_seed' with the seed's own kind inside payload_json.
-            // Their enum case is removed, so restore already skips them — but
-            // restoreThoughtSeeds loads a bounded newest-N slice, and dead rows
-            // left in place would crowd surviving reflection-takeaway seeds out
-            // of that window on legacy DBs (review finding 2026-07-01).
-            try db.execute(sql: """
-                DELETE FROM cognitive_artifacts
-                WHERE kind = 'thought_seed'
-                  AND json_extract(payload_json, '$.kind') = 'neglectedCommitment'
                 """)
             // R8a cue authoring had already lost its capsule consumer before
             // the lane was retired. Remove its inert node decorations so they
@@ -385,14 +371,12 @@ public actor CognitiveSQLiteStore {
         }
     }
 
-    /// Commit one complete cognition-maintenance transition. Thought-seed
-    /// decay, affect/ambient settlement, emotional consolidation, stale-view
-    /// retirement, the exact node snapshot, and their receipts either all
+    /// Commit one complete cognition-maintenance transition. Affect/ambient
+    /// settlement, emotional consolidation, the exact node snapshot, and their receipts all
     /// become durable or none do. This deliberately remains inside the one
     /// canonical cognition store; maintenance does not gain a second ledger.
     func commitMaintenance(
         nodes: [CognitiveNode],
-        thoughtSeeds: [CognitiveArtifactReplacement]?,
         artifacts: [CognitiveArtifactWrite],
         deletedArtifactIDs: [UUID],
         receipts: [CognitiveReceiptWrite],
@@ -405,24 +389,6 @@ public actor CognitiveSQLiteStore {
             try db.execute(sql: "DELETE FROM cognitive_nodes")
             for node in nodes {
                 try Self.insertNode(db, node: node, at: now)
-            }
-
-            if let thoughtSeeds {
-                try db.execute(
-                    sql: "DELETE FROM cognitive_artifacts WHERE kind = ?",
-                    arguments: ["thought_seed"]
-                )
-                for record in thoughtSeeds {
-                    try Self.insertArtifact(
-                        db,
-                        kind: "thought_seed",
-                        id: record.id,
-                        status: record.status,
-                        score: record.score,
-                        payload: record.payload,
-                        at: now
-                    )
-                }
             }
 
             for artifact in artifacts {
@@ -465,91 +431,6 @@ public actor CognitiveSQLiteStore {
         }
     }
 
-    /// Atomically replace one complete in-memory artifact family and enforce the
-    /// global retention policy before commit. This is the persistence boundary
-    /// for lifecycle-managed families such as thought seeds: decay, cap eviction,
-    /// score updates, stale-row deletion, and protected-family pruning become one
-    /// durable transition, so a restart cannot resurrect rows removed in memory.
-    func replaceArtifactFamily(
-        kind: String,
-        records: [CognitiveArtifactReplacement],
-        at now: Date,
-        maxArtifacts: Int
-    ) async throws {
-        try await dbQueue.write { db in
-            // The delete-and-reinsert is a persistence detail, not a birth. Keep
-            // each surviving row's original created_at so "created today" read
-            // from SQL means created today — an eleven-day-old seed that is
-            // merely rewritten must not look fresh.
-            var priorCreatedAt: [String: Double] = [:]
-            for row in try Row.fetchAll(
-                db,
-                sql: "SELECT id, created_at FROM cognitive_artifacts WHERE kind = ?",
-                arguments: [kind]
-            ) {
-                if let id: String = row["id"], let created: Double = row["created_at"] {
-                    priorCreatedAt[id] = created
-                }
-            }
-            let oldIDs = Set(priorCreatedAt.keys)
-            try db.execute(
-                sql: "DELETE FROM cognitive_artifacts WHERE kind = ?",
-                arguments: [kind]
-            )
-            for record in records {
-                try Self.insertArtifact(
-                    db,
-                    kind: kind,
-                    id: record.id,
-                    status: record.status,
-                    score: record.score,
-                    payload: record.payload,
-                    at: now,
-                    createdAt: priorCreatedAt[record.id.uuidString].map {
-                        Date(timeIntervalSince1970: $0)
-                    }
-                )
-            }
-            let globallyEvicted = try Self.pruneArtifacts(
-                db,
-                maxArtifacts: maxArtifacts,
-                protectedMinimums: cognitiveProtectedArtifactMinimums
-            )
-            let newIDs = Set(records.map { $0.id.uuidString })
-            let lifecycleRemoved = oldIDs.subtracting(newIDs)
-            if !lifecycleRemoved.isEmpty || !globallyEvicted.isEmpty {
-                let payload: JSONValue = .object([
-                    "family": .string(kind),
-                    "familyRowCount": .int(Int64(records.count)),
-                    "lifecycleRemoved": .int(Int64(lifecycleRemoved.count)),
-                    "globallyEvicted": .int(Int64(globallyEvicted.count)),
-                    "maxArtifacts": .int(Int64(maxArtifacts)),
-                ])
-                try Self.insertReceipt(
-                    db,
-                    kind: "artifact.family_transition",
-                    payload: payload,
-                    at: now
-                )
-            }
-        }
-    }
-
-    /// Delete a single artifact row by id. Additive API (Wave E): retired standing views
-    /// remove their artifact instead of upserting status=retired — their audit trail lives
-    /// in the developmental timeline — so bounded restores (`loadArtifacts(limit:)`, ordered
-    /// by updated_at DESC) can never be crowded out by retired history, and the global
-    /// prune can never evict a long-lived ACTIVE view in favor of newer retired rows
-    /// (gpt-5.5 review, 2026-07-02).
-    public func deleteArtifact(id: UUID) async throws {
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: "DELETE FROM cognitive_artifacts WHERE id = ?",
-                arguments: [id.uuidString]
-            )
-        }
-    }
-
     public func appendReceipt(
         kind: String,
         payload: JSONValue,
@@ -565,18 +446,8 @@ public actor CognitiveSQLiteStore {
                 """,
                 arguments: [id.uuidString, kind, payloadJSON, now.timeIntervalSince1970]
             )
-            // R2-C (2026-07-09): receipts are NO LONGER mirrored into
-            // cognitive_artifacts. Nothing ever read the "receipt.<kind>" mirror,
-            // and high-frequency kinds (cognition.resource_skip fired hundreds of
-            // times/week) flooded the ~516-row artifact cap; the kind-blind prune
-            // then evicted the RARE artifacts — standing views, schema proposals,
-            // thought seeds, episodes, identity/timeline — which is what
-            // restorePersistentState restores from. Net effect in the wild: her
-            // durable inner life was amputated to skip-noise on every prune cycle
-            // (live store 2026-07-09: 510/516 artifacts were receipt mirrors; zero
-            // views/seeds/episodes survived). Legacy identity-proposal rows are
-            // also retained for migration compatibility. Receipts live in cognitive_receipts
-            // (10k cap) — the one copy is the right copy.
+            // Receipts live only in cognitive_receipts (10k cap). Mirroring
+            // them into artifacts crowded durable state out of restoration.
         }
     }
 
@@ -682,15 +553,19 @@ public actor CognitiveSQLiteStore {
         protectedMinimums: [String: Int]
     ) throws -> [String] {
         let boundedCap = max(0, maxArtifacts)
+        let exempt = cognitiveUnprunedArtifactKinds
+        let exemptMarks = Array(repeating: "?", count: exempt.count).joined(separator: ",")
         let count = try Int.fetchOne(
             db,
-            sql: "SELECT COUNT(*) FROM cognitive_artifacts"
+            sql: "SELECT COUNT(*) FROM cognitive_artifacts WHERE kind NOT IN (\(exemptMarks))",
+            arguments: StatementArguments(Array(exempt))
         ) ?? 0
         let overflow = count - boundedCap
         guard overflow > 0 else { return [] }
         let rows = try Row.fetchAll(
             db,
-            sql: "SELECT id, kind, status, updated_at FROM cognitive_artifacts"
+            sql: "SELECT id, kind, status, updated_at FROM cognitive_artifacts WHERE kind NOT IN (\(exemptMarks))",
+            arguments: StatementArguments(Array(exempt))
         ).compactMap { row -> ArtifactPruneRow? in
             guard let id: String = row["id"],
                   let kind: String = row["kind"],

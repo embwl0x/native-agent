@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplayChecked`; schema status and dated REM resolutions share the inbox's decision snapshot by proposal identity; adoption requires its application claim; unmatched retained history stays explicitly unavailable, without persisting another status or resolution |
+// Blueprint: | `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplayChecked`; schema status and dated REM resolutions share the inbox's decision snapshot by proposal identity; adoption requires its application claim; unmatched retained history stays explicitly unavailable; retired view/opinion/interest events never enter timeline or growth-week readouts |
 
 extension CognitiveSubstrate {
     /// Scheduled replay's checked boundary. All replay artifacts, lineage, and
@@ -224,19 +224,25 @@ extension CognitiveSubstrate {
         return sentence.count >= 16 ? sentence : lesson
     }
 
+    /// These immutable titles identify history from the retired view family,
+    /// including its opinion and interest statuses. Her story now lives in cares.
+    static func isRetiredViewTimelineEvent(_ event: CognitiveDevelopmentalTimelineEvent) -> Bool {
+        let title = event.title.lowercased()
+        return ["standing view", "opinion formed", "opinion reconsidered", "opinion revised",
+                "interest from her hour", "returned to an interest", "out of the current set"]
+            .contains(where: title.hasPrefix)
+    }
+
     public func developmentalTimelineSnapshot(limit: Int = 40) async -> [CognitiveDevelopmentalTimelineEvent] {
         developmentalTimelineSnapshot(proposals: await schemaProposalSnapshot(), limit: limit)
     }
 
     public func developmentalTimelineSnapshot(proposals: [CognitiveSchemaProposal], limit: Int) -> [CognitiveDevelopmentalTimelineEvent] {
-        // Phase 5 D: flag off, opinion and interest history is hidden too.
-        let hidden: Set<UUID> = configuration.viewsExperimentEnabled ? [] : Set(standingViews.values
-            .filter { $0.status == .opinion || $0.status == .interest }.map(\.id))
         let regenerated = Set(proposals.map(\.lineageId))
         var result = developmentalTimeline.values.compactMap { event -> CognitiveDevelopmentalTimelineEvent? in
             let isProposal = event.kind == .schemaProposal || event.kind == .proposalResolution
             guard !(isProposal && regenerated.contains(event.lineageId)),
-                  event.artifactId.map({ !hidden.contains($0) }) ?? true else { return nil }
+                  !Self.isRetiredViewTimelineEvent(event) else { return nil }
             var event = event
             if isProposal && event.lineageId.hasPrefix("rem:") {
                 event.externalEvidenceIds.removeAll { $0.hasPrefix("outcome:") }

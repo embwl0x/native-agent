@@ -4,7 +4,7 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import Transcripts
-// Blueprint: | `ChatHistoryIndex.swift` | `ChatHistoryIndex` class; `shared`, `absorb`, `absorbAll`; durable content-addressed index of transcript lines for history search (chat/index/history.sqlite) |
+// Blueprint: | `ChatHistoryIndex.swift` | `ChatHistoryIndex` class; `shared`, `absorb`, `absorbAll`, `livedLines`; durable content-addressed index of transcript lines for history search (chat/index/history.sqlite) |
 
 /// One durable index per history. Every transcript line is projected for
 /// search once in its life and kept by the hash of its bytes, so a line that
@@ -30,7 +30,7 @@ public final class ChatHistoryIndex: @unchecked Sendable {
     }()
 
     /// The stored table shapes; bump when the tables below change.
-    static let schema = 1
+    static let schema = 2
 
     public static func shared(dataRoot: URL) -> ChatHistoryIndex {
         let root = dataRoot.resolvingSymlinksInPath().standardizedFileURL
@@ -76,6 +76,43 @@ public final class ChatHistoryIndex: @unchecked Sendable {
     }
 
     // MARK: - Reading
+
+    /// One conversation line as history holds it: who said it, when, the
+    /// stored words. For the one reader outside the tool lane, the reading of
+    /// her recent life into cares.
+    public struct LivedLine: Sendable {
+        public let conversation: String
+        public let role: String
+        public let messageId: String?
+        /// The turn's run: a reply and the message it answers share it.
+        public let runId: String?
+        public let at: Date
+        public let words: String
+        public let author: String?
+        public let peer: String?
+        /// The writer marked it machinery, not something said.
+        public let mechanical: Bool
+    }
+
+    /// Every user and assistant line since `since`, from every transcript and
+    /// its archived copies, in file order per transcript. A line kept in both
+    /// a transcript and an archive copy comes back once.
+    public func livedLines(since: Date) throws -> [LivedLine] {
+        let listed = try ChatSessionRetention.transcriptFiles(
+            dataRoot: dataRoot, archived: ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot))
+        var seen: Set<String> = []
+        var out: [LivedLine] = []
+        for (conversation, file) in listed {
+            for row in try rows(at: file, receipts: false) {
+                guard row.valid, row.shape == 2, let role = row.role, role == "user" || role == "assistant",
+                      let at = row.instant, at >= since, let words = row.rawContent,
+                      seen.insert("\(conversation)|\(row.messageId ?? row.identity)").inserted else { continue }
+                out.append(LivedLine(conversation: conversation, role: role, messageId: row.messageId, runId: row.runId, at: at,
+                                     words: words, author: row.author, peer: row.peer, mechanical: row.mechanical))
+            }
+        }
+        return out
+    }
 
     /// The rows of one transcript, in file order, with the receipt lane on
     /// tool rows when asked. Throws when the file cannot be read as UTF-8.
@@ -309,13 +346,13 @@ public final class ChatHistoryIndex: @unchecked Sendable {
                     try db.execute(sql: """
                         INSERT OR REPLACE INTO line (hash, valid, identity, role, run_id, message_id, timestamp,
                             raw_content, content, searchable, instant, author, route, peer, tool, display_prefix, shape,
-                            projector)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            projector, mechanical)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, arguments: [hash, row.valid, row.identity == row.messageId ? nil : row.identity,
                                          row.role, row.runId, row.messageId, row.timestamp, row.rawContent, content,
                                          row.searchable == row.content ? nil : row.searchable,
                                          row.instant?.timeIntervalSince1970, row.author, row.route, row.peer,
-                                         row.tool, row.displayPrefix, row.shape, Self.projector])
+                                         row.tool, row.displayPrefix, row.shape, Self.projector, row.mechanical])
                 }
                 for (hash, receipt) in newReceipts {
                     try db.execute(sql: "INSERT OR REPLACE INTO receipt (hash, content, searchable, instant, peer) VALUES (?, ?, ?, ?, ?)",
@@ -363,7 +400,7 @@ public final class ChatHistoryIndex: @unchecked Sendable {
                     CREATE TABLE line (hash BLOB PRIMARY KEY, valid INTEGER NOT NULL, shape INTEGER NOT NULL, identity TEXT, role TEXT,
                         run_id TEXT, message_id TEXT, timestamp TEXT, raw_content TEXT, content TEXT,
                         searchable TEXT, instant REAL, author TEXT, route TEXT, peer TEXT, tool TEXT,
-                        display_prefix TEXT NOT NULL, projector TEXT NOT NULL);
+                        display_prefix TEXT NOT NULL, projector TEXT NOT NULL, mechanical INTEGER NOT NULL);
                     CREATE TABLE receipt (hash BLOB PRIMARY KEY, content BLOB NOT NULL, searchable TEXT,
                         instant REAL, peer TEXT);
                     CREATE TABLE file (path TEXT PRIMARY KEY, inode INTEGER NOT NULL, size INTEGER NOT NULL,
@@ -375,7 +412,7 @@ public final class ChatHistoryIndex: @unchecked Sendable {
             try database.read { db in
                 let lines = try Row.fetchCursor(db, sql: """
                     SELECT hash, valid, identity, role, run_id, message_id, timestamp, raw_content, content,
-                        searchable, instant, author, route, peer, tool, display_prefix, shape, projector FROM line
+                        searchable, instant, author, route, peer, tool, display_prefix, shape, projector, mechanical FROM line
                     """)
                 while let line = try lines.next() {
                     let role: String? = line[3], messageId: String? = line[5], rawContent: String? = line[7]
@@ -390,7 +427,7 @@ public final class ChatHistoryIndex: @unchecked Sendable {
                         searchable: searchable, folded: searchable.lowercased(),
                         instant: (line[10] as Double?).map(Date.init(timeIntervalSince1970:)),
                         author: line[11], route: line[12], peer: line[13], tool: line[14], displayPrefix: line[15],
-                        shape: line[16])
+                        shape: line[16], mechanical: line[18])
                 }
                 let receiptRows = try Row.fetchCursor(db, sql: "SELECT hash, content, searchable, instant, peer FROM receipt")
                 while let receipt = try receiptRows.next() {

@@ -33,6 +33,8 @@ public struct DreamReport: Sendable, Equatable {
     public var skipReason: String?
     /// The exact committed entry, delivered to reflection without a latest-item lookup.
     public var reflectionMaterial: [String: CognitiveReflectionCause] = [:]
+    /// Her cares as the committed dream was shown them, with its answer lines.
+    public var careNight: CognitiveCareNight?
 
     public init(
         sessionsProcessed: Int = 0,
@@ -122,6 +124,10 @@ public struct DreamFeltOrigin: Sendable, Equatable {
 /// empty, so a dream with nothing wired cites nothing and reads exactly as it
 /// did before.
 public typealias DreamFeltOriginProvider = @Sendable () async throws -> [DreamFeltOrigin]
+
+/// Her cares for the dream prompt: what moved her today and what is still open,
+/// with the keys the dream may answer by. nil when the inner life is off.
+public typealias DreamCareNightProvider = @Sendable () async -> CognitiveCareNight?
 
 /// Receipt channel for the dream lane. DreamREMCycle holds no substrate
 /// reference (and must not: cognition lives above it), so a receipt it owns is

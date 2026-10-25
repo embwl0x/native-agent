@@ -9,6 +9,8 @@ struct DreamPayload: Decodable {
     let emergingThemes: [String]
     let surprisingMoments: [String]
     let claims: [DreamEntryProvenance]
+    /// Optional `settled: <key>: <how>` / `let go: <key>` lines about her open cares.
+    let cares: [String]
 
     private enum CodingKeys: String, CodingKey {
         case title
@@ -18,6 +20,7 @@ struct DreamPayload: Decodable {
         case emergingThemes = "emerging_themes"
         case surprisingMoments = "surprising_moments"
         case claims
+        case cares
     }
 
     init(from decoder: Decoder) throws {
@@ -33,6 +36,7 @@ struct DreamPayload: Decodable {
         emergingThemes = try container.decode([String].self, forKey: .emergingThemes)
         surprisingMoments = try container.decode([String].self, forKey: .surprisingMoments)
         claims = try container.decode([DreamEntryProvenance].self, forKey: .claims)
+        cares = try container.decodeIfPresent([String].self, forKey: .cares) ?? []
 
         guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DecodingError.dataCorruptedError(

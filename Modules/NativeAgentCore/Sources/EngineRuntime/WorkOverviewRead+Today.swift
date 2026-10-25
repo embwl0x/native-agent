@@ -15,7 +15,7 @@ import AuthoredCapabilities
 import AppToolRuntime
 import ToolExecution
 import Senses
-// Blueprint: | `WorkOverviewRead+Today.swift` | `TodayProjection` freezes checked sources and provenance, feeds the pure `today-readout.js` faces through L0's version/epoch cache, binds source IDs to native dates and note links, and publishes through `LatestRead`; waiting counts share a pure face too. `TodayDreamDigest` reads the latest dream through `DreamNight`; native input supplies its title, mood and timestamp, never diary Markdown for JS to parse. Narration, grouping, due words and ordering live in the part. Unbound rows are omitted individually with native reasons; other activity, Ahead, earlier notes and note links remain. Native unavailable evidence, localization, live clock gutters and cognition subscription remain. Mac and quiet reads consume the same prepared rows |
+// Blueprint: | `WorkOverviewRead+Today.swift` | `TodayProjection` freezes checked sources and provenance, feeds the pure `today-readout.js` faces through L0's version/epoch cache, binds source IDs to native dates and note links, and publishes through `LatestRead`; waiting counts share a pure face too. `TodayDreamDigest` reads the latest dream through `DreamNight`; native input supplies its title, mood and timestamp, never diary Markdown for JS to parse. Narration, grouping, due words and ordering live in the part. Unbound rows are omitted individually with native reasons; other activity, Ahead, earlier notes and note links remain. Native unavailable evidence, localization and live clock gutters remain. Mac and quiet reads consume the same prepared rows |
 
 /// One line of her day. Payload-free by construction: a title, one plain
 /// sentence, and when it happened (or is due). `details` is non-empty only on
@@ -697,18 +697,13 @@ public final class TodayProjection {
     public var dreamUnavailable = false
     private var readCount = 0
     public var isReading: Bool { readCount > 0 }
-    public private(set) var pending = CognitionProposalsFeed.Pending()
-    public private(set) var cognitionUnavailable: String?
     @ObservationIgnored private var sourceTask: Task<Void, Never>?
-    @ObservationIgnored private var cognitionTask: Task<Void, Never>?
     @ObservationIgnored private lazy var dayRead = LatestRead()
-    @ObservationIgnored private lazy var cognitionRead = LatestRead()
 
     public nonisolated init() {}
 
     deinit {
         sourceTask?.cancel()
-        cognitionTask?.cancel()
     }
 
     public func start(engine: NativeAgentEngine,
@@ -738,25 +733,11 @@ public final class TodayProjection {
                 if let engine { await self?.refresh(engine, activeSessionID: activeSessionID()) }
             }
         }
-        let cognition = engine.cognitionView
-        cognitionTask = Task { [weak self] in
-            let changes = await cognition.changes()
-            await self?.refreshCognition(cognition)
-            for await _ in changes {
-                if Task.isCancelled { break }
-                await self?.refreshCognition(cognition)
-            }
-            if !Task.isCancelled {
-                self?.cognitionUnavailable = "Cognition update subscription ended. Refresh Activity to retry."
-            }
-        }
     }
 
     public func stop() {
         sourceTask?.cancel()
-        cognitionTask?.cancel()
         sourceTask = nil
-        cognitionTask = nil
     }
 
     public func refresh(_ engine: NativeAgentEngine, activeSessionID: String) async {
@@ -831,20 +812,6 @@ public final class TodayProjection {
             }
         }, publish: {
             (snapshot, didRows, earlierNotes, noteItems, dreamUnavailable) = $0
-        })
-        await refreshCognition(engine.cognitionView)
-    }
-
-    private func refreshCognition(_ cognition: CognitionViewFacade) async {
-        await cognitionRead.read({ await cognition.pendingProposals() }, publish: { result in
-            switch result {
-            case .available(let value):
-                pending = value
-                cognitionUnavailable = nil
-            case .unavailable(let detail):
-                pending = .init()
-                cognitionUnavailable = detail
-            }
         })
     }
 

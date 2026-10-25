@@ -17,7 +17,7 @@ import Privacy
 import Studio
 import TurnTrace
 
-// Blueprint: | `NativeCognitionRuntime+MindLedger.swift` | `NativeCognitionRuntime` mind ledger: trace-backed why, association rejection, opinion revision and undo through substrate owners |
+// Blueprint: | `NativeCognitionRuntime+MindLedger.swift` | `NativeCognitionRuntime` mind ledger: trace-backed why, association rejection and undertone undo through substrate owners |
 
 extension NativeCognitionRuntime {
     /// Why and terminal rows of today and yesterday (calendar days), newest
@@ -142,18 +142,6 @@ extension NativeCognitionRuntime {
                 return nil
             }
         }
-        let seedSources = sources.filter { $0.hasPrefix("seed:") }
-        if !seedSources.isEmpty {
-            let seeds = await substrate.thoughtSeedSnapshot()
-            for source in seedSources {
-                guard let id = UUID(uuidString: String(source.dropFirst(5))),
-                      let seed = seeds.first(where: { $0.id == id }) else { return nil }
-                if seed.kind == .reflectionTakeaway {
-                    guard let peers = seed.sourcePeerIds,
-                          peers.allSatisfy({ PeerTrust.ownerTrusts($0, dataRoot: dataRoot) }) else { return nil }
-                }
-            }
-        }
         // Gap prose may quote memories or peers, but the trace retains no
         // source provenance with which to check their current disclosure.
         func redactGapText(_ value: JSONValue) -> JSONValue {
@@ -171,7 +159,7 @@ extension NativeCognitionRuntime {
         return redactGapText(payload)
     }
 
-    /// She rejects one association: `source` (memory:/view:/seed:/dream:, or an
+    /// She rejects one association: `source` (memory:/care:/dream:, or an
     /// outreach subject desk:/ship:, which any rejection stops outright) stops
     /// surfacing for messages like `turn`'s, or for any message when `always`.
     public func rejectAssociation(
@@ -221,18 +209,6 @@ extension NativeCognitionRuntime {
         }
         if tags.contains("safety") { return "that memory is tagged safety; it always stands" }
         return nil
-    }
-
-    /// Phase 5 D1: her own revision of one of her opinions, with its evidence.
-    public func reviseOpinion(
-        id: UUID, stance: String, evidence: String, wouldChangeMind: String,
-        seat: StudioCanonTurnProvenance
-    ) async -> String? {
-        await bootstrap()
-        let refusal = await substrate.reviseOpinion(
-            id: id, stance: stance, evidence: evidence, wouldChangeMind: wouldChangeMind, seat: seat)
-        if refusal == nil { publishRuntimeChange(reason: "mind:opinion_revised") }
-        return refusal
     }
 
     /// Undo one update of hers, or list what can be undone when `item` is nil.

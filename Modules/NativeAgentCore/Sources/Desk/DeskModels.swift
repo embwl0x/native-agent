@@ -492,7 +492,7 @@ public struct DeskNote: Sendable, Equatable {
 // Citations are TYPED — free-string refs can't smuggle a pursuit past the gate.
 // Wave A validates STRUCTURE (ids non-empty, dates parseable, counts positive)
 // and the SOURCE-MIX rule (friction alone is insufficient); resolution against
-// the live standing-view / dream-digest / trace stores is Wave C's job. The type
+// the live care / dream-digest / trace stores is Wave C's job. The type
 // makes an uncited or friction-only pursuit impossible to construct at WRITE
 // time — the REM evidence-date precedent (recurrence across ≥2 dates), lifted
 // into the Desk.
@@ -500,6 +500,7 @@ public struct DeskNote: Sendable, Equatable {
 /// One typed evidence citation. `traceFriction` is the ONLY friction source and
 /// never qualifies a pursuit by itself (source-mix rule).
 public enum DossierSource: Sendable, Equatable {
+    case care(id: String)
     case standingView(id: String)
     case dreamDigest(id: String)
     case openQuestionSeed(id: String)
@@ -510,6 +511,7 @@ public enum DossierSource: Sendable, Equatable {
     /// Wire token written as the citation's `source` field.
     public var token: String {
         switch self {
+        case .care: return "care"
         case .standingView: return "standing_view"
         case .dreamDigest: return "dream_digest"
         case .openQuestionSeed: return "open_question_seed"
@@ -526,7 +528,7 @@ public enum DossierSource: Sendable, Equatable {
     /// on failure (ids non-empty, dates parseable + recurrent, counts positive).
     public func structuralError() -> String? {
         switch self {
-        case .standingView(let id), .dreamDigest(let id), .openQuestionSeed(let id):
+        case .care(let id), .standingView(let id), .dreamDigest(let id), .openQuestionSeed(let id):
             return id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "\(token): id is empty" : nil
         case .feltSalience(let dates):
@@ -557,6 +559,8 @@ public enum DossierSource: Sendable, Equatable {
 
     public func toJSON() -> JSONValue {
         switch self {
+        case .care(let id):
+            return .object(["source": .string(token), "id": .string(id)])
         case .standingView(let id):
             return .object(["source": .string(token), "id": .string(id)])
         case .dreamDigest(let id):
@@ -582,6 +586,9 @@ public enum DossierSource: Sendable, Equatable {
     public static func fromJSON(_ value: JSONValue) -> DossierSource? {
         guard case .object(let obj) = value, let token = jsonString(obj, "source") else { return nil }
         switch token {
+        case "care":
+            guard let id = jsonString(obj, "id") else { return nil }
+            return .care(id: id)
         case "standing_view":
             guard let id = jsonString(obj, "id") else { return nil }
             return .standingView(id: id)

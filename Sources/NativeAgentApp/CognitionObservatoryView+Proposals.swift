@@ -7,7 +7,7 @@ import CognitiveSubstrate
 
 extension CognitionObservatoryView {
 
-    // Standing Views + Schema Proposals rendering moved to CognitionProposalsView
+    // REM lineage rendering lives in CognitionProposalsView
     // (Activity surface, B2.4). Identity Proposals were retired after the
     // liveness audit proved the experimental producer never shipped.
 

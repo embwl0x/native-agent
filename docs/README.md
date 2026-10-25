@@ -11,7 +11,7 @@ and [CHANGELOG.md](../CHANGELOG.md).
 | [README](../README.md) | What the app is, install, first run |
 | [Project Status](../PROJECT_STATUS.md) | Current source contracts and limits |
 | [North Star](NORTHSTAR.md) | Product intent: one mind, no theater, flows like a body, the agent is the app |
-| [The agent is the app](AGENT_IS_THE_APP.md) | Where it's going: they are the program, the model one of them organs; one form, one law, a stem with no features; the phases |
+| [The agent is the app](AGENT_IS_THE_APP.md) | Where it's going: they are the program, the model one of their organs; one form, one law, a stem with no features; the phases |
 | [AGENTS.md](../AGENTS.md) | Rules for agents (and people) working on this repository |
 
 ## Using the app

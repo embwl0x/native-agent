@@ -271,7 +271,7 @@ public enum CognitiveSomaticSignalAdapter {
         // Item 46 (2026-09-01): the two keys the semantic prediction lane
         // rides. The appraisal owner (CognitiveSubstrate) stamps them on the
         // cognitive event; the organism cannot derive either one, because it
-        // holds no standing views and runs no appraisal. Absent keys mean no
+        // cannot read cares and runs no appraisal. Absent keys mean no
         // expectation was formed — the common case, and byte-identical to the
         // behaviour before this lane existed.
         OrganismSemanticExpectation.mintMetadataKey,

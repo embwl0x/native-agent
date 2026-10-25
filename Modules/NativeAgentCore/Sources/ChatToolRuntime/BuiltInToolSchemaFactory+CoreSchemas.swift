@@ -1849,7 +1849,7 @@ extension BuiltInToolSchemaFactory {
                             ("description", .string("Typed citations in the required source shape. At least one non-friction source is required; live source existence is not checked by preview.")),
                             ("items", ToolSchema.obj([("anyOf", .array([
                                 ToolSchema.obj([("type", .string("object")), ("additionalProperties", .bool(false)),
-                                     ("properties", ToolSchema.obj([("source", ToolSchema.enumStringSchema(["standing_view", "dream_digest", "open_question_seed"])),
+                                     ("properties", ToolSchema.obj([("source", ToolSchema.enumStringSchema(["care", "dream_digest"])),
                                                          ("id", nonEmptyStringSchema("Exact source record ID."))])),
                                      ("required", .array(["source", "id"].map(JSONValue.string)))]),
                                 ToolSchema.obj([("type", .string("object")), ("additionalProperties", .bool(false)),
@@ -2092,35 +2092,6 @@ extension BuiltInToolSchemaFactory {
                         ("note", ToolSchema.strSchema("Optional line recorded on the row, in your own words.")),
                     ],
                     required: ["proposal_id", "decision"]
-                )
-            ),
-            // The held standing-view tier (item 7, 2026-09-02). CLOSED schemas:
-            // a view id and an optional note, and nothing else. There is
-            // deliberately no "body" field on hold_view — a view is FORMED by
-            // reflection and held here, so the tool can never become a second
-            // door for minting convictions out of a sentence typed mid-turn.
-            requestedSchema(
-                name: "hold_view",
-                toolClass: .write,
-                description: Self.holdViewToolDescription,
-                parametersJSON: ToolSchema.params(
-                    properties: [
-                        ("view_id", ToolSchema.strSchema("The id of one of your proposed standing views, from app mind.inner_state.")),
-                        ("note", ToolSchema.strSchema("Optional line echoed in the returned receipt, capped at 120 characters; not saved to the timeline.")),
-                    ],
-                    required: ["view_id"]
-                )
-            ),
-            requestedSchema(
-                name: "release_view",
-                toolClass: .write,
-                description: Self.releaseViewToolDescription,
-                parametersJSON: ToolSchema.params(
-                    properties: [
-                        ("view_id", ToolSchema.strSchema("The id of your held view, opinion or interest from app mind.inner_state; an owner-signed active view is theirs to retire.")),
-                        ("note", ToolSchema.strSchema("Optional line echoed in the returned receipt, capped at 120 characters; not saved to the timeline.")),
-                    ],
-                    required: ["view_id"]
                 )
             ),
             // The moments lane (2026-09-02). Lazy, like the studio pair: a

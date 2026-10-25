@@ -122,6 +122,8 @@ public struct DreamEntry: Sendable, Codable, Equatable, Identifiable {
 public struct DreamRunResult: Sendable, Codable, Equatable {
     public var rawResponse: JSONValue
     public var reflectionMaterial: [String: CognitiveReflectionCause] = [:]
+    /// Her cares as the committed dream saw and answered them, for the night's pass.
+    public var careNight: CognitiveCareNight?
     public init(rawResponse: JSONValue, reflectionMaterial: [String: CognitiveReflectionCause] = [:]) {
         self.rawResponse = rawResponse
         self.reflectionMaterial = reflectionMaterial
@@ -564,6 +566,7 @@ public actor SwiftNativeDreamREMCycle {
         dreamMemoryDeltaProvider: DreamMemoryDeltaProvider? = nil,
         dreamFeltSummaryProvider: DreamFeltSummaryProvider? = nil,
         dreamFeltOriginProvider: DreamFeltOriginProvider? = nil,
+        dreamCareNightProvider: DreamCareNightProvider? = nil,
         dreamReceiptSink: DreamReceiptSink? = nil,
         dreamMoodSink: DreamDatedMoodSink? = nil,
         remStageApproval: REMApprovalStager? = nil,
@@ -583,6 +586,7 @@ public actor SwiftNativeDreamREMCycle {
             memoryDeltaProvider: dreamMemoryDeltaProvider ?? { _ in [] },
             feltSummaryProvider: dreamFeltSummaryProvider ?? { nil },
             feltOriginProvider: dreamFeltOriginProvider ?? { [] },
+            careNightProvider: dreamCareNightProvider ?? { nil },
             receiptSink: dreamReceiptSink ?? { _, _ in },
             datedMoodSink: dreamMoodSink ?? { _, _ in true },
             gate: effectiveGate
@@ -650,7 +654,9 @@ public actor SwiftNativeDreamREMCycle {
             response["remedy"] = report.repair ?? Repair.remedy(owner: "dream cycle",
                 nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("mind.dream")])]), tap: nil)
         }
-        return DreamRunResult(rawResponse: .object(response), reflectionMaterial: report.reflectionMaterial)
+        var result = DreamRunResult(rawResponse: .object(response), reflectionMaterial: report.reflectionMaterial)
+        result.careNight = report.careNight
+        return result
     }
 
     public func repairREM() async throws -> Int {

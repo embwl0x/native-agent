@@ -71,15 +71,6 @@ public final class CognitionViewFacade {
         await runtime?.observatoryDetailRead()
     }
 
-    public nonisolated func pendingProposals() async -> CognitionProposalsFeed.Read {
-        guard let standingViews = await runtime?.proposedStandingViews() else {
-            return .unavailable("Cognition proposals are unavailable while cognition is off.")
-        }
-        return .available(.init(
-            standingViews: standingViews
-        ))
-    }
-
     public func refreshProposals() async {
         _ = await proposalsRead.read({ await runtime?.observatoryDetail() }, publish: { proposalsDetail = $0 })
     }

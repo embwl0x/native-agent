@@ -17,7 +17,7 @@
 //     field is read through `peekNodes` / `peekDecayedNodes` (never
 //     `workspaceSnapshot()`, which routes through the field's MUTATING snapshot
 //     and would let an introspection pull advance decay anchors and evict
-//     nodes). Affect, mood, disposition and seeds are read through their
+//     nodes). Affect, mood, disposition and cares are read through their
 //     existing read-time projections. Asking herself how she feels must not
 //     change how she feels.
 //
@@ -27,8 +27,7 @@
 //     `session:message` there), never the user's words. Chemistry is reported
 //     in the EXISTING body-line vocabulary, never as numbers dressed as words.
 //     The dream contributes a mood word and a date; its text stays in the
-//     journal. The only free text that crosses is HER OWN — seed text she
-//     minted, and the standing views she authored and User approved.
+//     journal. The only free text that crosses is her own care and stance.
 //
 //  3. NORTHSTAR CLAUSE 6 — REACH, NOT WEIGHT. None of this is injected. It
 //     costs one tool row in the catalog and zero prompt bytes until she pulls
@@ -42,7 +41,7 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+InnerState.swift` | `CognitiveSubstrate.innerStateReading`: record-backed mind/body introspection, selection reasons and felt/rumination/toward projections |
+// Blueprint: | `CognitiveSubstrate+InnerState.swift` | `CognitiveSubstrate.innerStateReading`: record-backed mind/body introspection, selection reasons and felt/care/toward projections |
 
 // MARK: - The reading
 
@@ -91,19 +90,6 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
             self.valence = valence.clampedSigned()
             self.arousal = arousal.clamped01()
             self.warmth = warmth.clamped01()
-        }
-    }
-
-    /// An open thought seed — HER OWN text, which is why it may cross.
-    public struct Seed: Sendable, Equatable {
-        public let kind: String
-        public let text: String
-        public let priority: Double
-
-        public init(kind: String, text: String, priority: Double) {
-            self.kind = kind
-            self.text = String(text.prefix(CognitiveInnerStateReading.seedTextCharacters))
-            self.priority = priority.clamped01()
         }
     }
 
@@ -161,76 +147,47 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         }
     }
 
-    /// What is nagging, as a POINTER — never as prose.
-    ///
-    /// Reviewer call (2026-09-02): a free-form `rumination` string is a second
-    /// door for content to leave the mind through, and it is not one she needs
-    /// open — she already holds the seed. So the candidate is identified, not
-    /// quoted: the seed id she can look up, its kind, how much weight it has
-    /// accumulated, and the subject label it is about.
-    public struct RuminationCandidate: Sendable, Equatable {
-        public let seedId: UUID
-        public let kind: String
-        public let weight: Double
-        public let subject: String?
-
-        public init(seedId: UUID, kind: String, weight: Double, subject: String?) {
-            self.seedId = seedId
-            self.kind = kind
-            self.weight = weight.clamped01()
-            self.subject = subject.map {
-                String($0.prefix(CognitiveInnerStateReading.subjectLabelCharacters))
-            }
-        }
-    }
-
-    /// A view she formed and User approved (or one still proposed and waiting).
-    ///
-    /// Agent, 2026-09-02, live: standing views could not be resolved by id from
-    /// any of her tools, so she could see a view and still not reference it. The
-    /// id is the full artifact UUID — the same one the approval surface uses —
-    /// so a view she reads here she can also name.
-    public struct StandingView: Sendable, Equatable {
+    /// What she cares about, as her own words and its charge right now.
+    public struct Care: Sendable, Equatable {
         public let id: UUID
-        public let status: String
-        /// The view's own first 80 characters. Her sentence, hers to quote.
-        public let text: String
-        /// HOW MANY passages the view formed on, never the passages (law 2 —
-        /// those are the user's words and they stay in the substrate). Agent,
-        /// 2026-09-13: a view she cannot tell is grounded reads as an opinion.
-        /// The count says it rests on something; `standing_view_read` is where
-        /// the excerpts themselves live.
-        public let evidenceCount: Int
-        /// How many times she has come back to it. A view that held up.
-        public let revisitCount: Int
-        /// Phase 5 D: an opinion's why, what would change it, what it used to
-        /// be and what changed it; an interest's earlier questions. Her words.
-        public let reasons: [String]
+        public let about: String
+        public let depth: String
+        public let with: [String]
+        /// The newest felt word in its story.
+        public let felt: String?
+        public let charge: Double
+        public let open: String?
+        public let stance: String?
+        public let because: String?
+        public let wouldChangeMind: String?
 
-        public init(id: UUID, status: String, text: String,
-                    evidenceCount: Int = 0, revisitCount: Int = 0, reasons: [String] = []) {
+        public init(id: UUID, about: String, depth: String, with: [String], felt: String?,
+                    charge: Double, open: String?, stance: String?, because: String? = nil,
+                    wouldChangeMind: String? = nil) {
             self.id = id
-            self.status = status
-            self.text = String(text.prefix(CognitiveInnerStateReading.standingViewCharacters))
-            self.evidenceCount = max(0, evidenceCount)
-            self.revisitCount = max(0, revisitCount)
-            self.reasons = Array(reasons.prefix(6).map { String($0.prefix(200)) })
+            self.about = about
+            self.depth = depth
+            self.with = with
+            self.felt = felt
+            self.charge = charge.isFinite ? charge : 0
+            self.open = open
+            self.stance = stance
+            self.because = because
+            self.wouldChangeMind = wouldChangeMind
         }
     }
 
     // MARK: Bounds (design law 6 — everything is bounded)
 
     public static let subjectLabelCharacters = 32
-    public static let seedTextCharacters = 120
-    public static let standingViewCharacters = 80
     public static let maximumFeltNodes = 12
     /// The split inside that cap: the week's loudest, then the newest of what
     /// is left. `recentFeltNodes` is what guarantees a quiet day is visible.
     public static let strongestFeltNodes = 8
     public static let recentFeltNodes = 4
-    public static let maximumSeeds = 5
     public static let maximumExpectations = 5
-    public static let maximumStandingViews = 5
+    /// Compact shows the most charged few; full shows every live care.
+    public static let compactCares = 8
     /// Bounded like everything else. A week she can read in one breath.
     public static let maximumGrowthWeekLines = 12
     /// Compact is not a different report — it is the same report, shorter.
@@ -306,26 +263,28 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     public let chemistryWords: [String]
 
     // Optional organism reads. Other lanes in this wave (fatigue and the
-    // diurnal clock, `toward`, rumination) land separately; this reading
+    // diurnal clock and `toward`) land separately; this reading
     // CONSUMES them when the caller has them and reports their absence
     // honestly when it does not. It never blocks on them.
     public let fatigue: Double?
     public let timeOfDayPhase: String?
-    public let ruminationCandidate: RuminationCandidate?
 
-    public let seeds: [Seed]
     public let expectations: [Expectation]
     /// The nearest open horizon, or nil when she is facing nothing — which
     /// renders as silence, not as a flat word.
     public let toward: Toward?
     public let dream: DreamResidue?
-    public let standingViews: [StandingView]
     /// WHAT CHANGED THIS WEEK, AND WHY — the same rows the growth surface
     /// prints, so she and the person are reading one week and not two
     /// (2026-09-13). `full` ONLY: this is the answer to "what have I actually
     /// become lately", not part of "how are you". Never always-present prompt
     /// material — she has to ask for it.
     public let growthWeek: [String]
+    /// Live cares, most charged first.
+    public let cares: [Care]
+    /// `full` only: her depth changes and what her nights settled or let go,
+    /// newest first, one plain line each.
+    public let story: [String]
 
     public init(
         generatedAt: Date,
@@ -343,13 +302,12 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         chemistryWords: [String] = [],
         fatigue: Double? = nil,
         timeOfDayPhase: String? = nil,
-        ruminationCandidate: RuminationCandidate? = nil,
-        seeds: [Seed] = [],
         expectations: [Expectation] = [],
         toward: Toward? = nil,
         dream: DreamResidue? = nil,
-        standingViews: [StandingView] = [],
-        growthWeek: [String] = []
+        growthWeek: [String] = [],
+        cares: [Care] = [],
+        story: [String] = []
     ) {
         self.generatedAt = generatedAt
         self.windowHours = min(
@@ -366,7 +324,6 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         self.dispositionValence = dispositionValence.clampedSigned()
         self.dispositionWord = dispositionWord
         let feltCap = detail == .full ? Self.maximumFeltNodes : Self.compactFeltNodes
-        let listCap = detail == .full ? Self.maximumSeeds : Self.compactListItems
         // A PLAIN PREFIX WOULD UNDO THE SPLIT. The builder puts the strongest
         // first and the newest after them, so `prefix` in compact detail would
         // cut off exactly the recent half this exists to guarantee. Trim each
@@ -375,15 +332,13 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         self.chemistryWords = Array(chemistryWords.prefix(4))
         self.fatigue = fatigue.map { $0.clamped01() }
         self.timeOfDayPhase = timeOfDayPhase.map { String($0.prefix(Self.subjectLabelCharacters)) }
-        self.ruminationCandidate = ruminationCandidate
-        self.seeds = Array(seeds.prefix(listCap))
         self.expectations = Array(
             expectations.prefix(detail == .full ? Self.maximumExpectations : Self.compactListItems))
         self.toward = toward
         self.dream = dream
-        self.standingViews = Array(
-            standingViews.prefix(detail == .full ? Self.maximumStandingViews : Self.compactListItems))
         self.growthWeek = detail == .full ? Array(growthWeek.prefix(Self.maximumGrowthWeekLines)) : []
+        self.cares = detail == .full ? cares : Array(cares.prefix(Self.compactCares))
+        self.story = detail == .full ? story : []
     }
 
     /// The honest "cognition is off" answer. Not zeros pretending to be a mood.
@@ -623,45 +578,6 @@ extension CognitiveSubstrate {
             }
         let felt = Array(strongest) + recent
 
-        let seeds = projectedThoughtSeeds(at: now)
-            .filter(isUsefulThoughtSeed)
-            .filter { seed in
-                guard seed.kind == .reflectionTakeaway else { return true }
-                guard let peers = seed.sourcePeerIds else { return false }
-                return peers.allSatisfy { dependencies.peerTrusted($0) }
-            }
-            .sorted(by: thoughtSeedPrioritySort)
-            .prefix(CognitiveInnerStateReading.maximumSeeds)
-            .map {
-                CognitiveInnerStateReading.Seed(
-                    kind: $0.kind.rawValue, text: $0.text, priority: $0.priority)
-            }
-
-        // Views she can NAME: active first (those are the ones that steer),
-        // then proposals still waiting on User. Retired views are gone, not
-        // hidden — they do not appear at all.
-        let experiment = configuration.viewsExperimentEnabled
-        let views = standingViews.values
-            .filter { $0.status != .retired
-                && (experiment || ($0.status != .opinion && $0.status != .interest)) }
-            .sorted { lhs, rhs in
-                if (lhs.status == .active) != (rhs.status == .active) {
-                    return lhs.status == .active
-                }
-                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
-                return lhs.id.uuidString < rhs.id.uuidString
-            }
-            .prefix(CognitiveInnerStateReading.maximumStandingViews)
-            .map {
-                CognitiveInnerStateReading.StandingView(
-                    id: $0.id, status: $0.status.rawValue, text: $0.body,
-                    // Phase 5 D (Agent): independent occurrences, not how many
-                    // nodes re-reading the same material dragged along.
-                    evidenceCount: $0.independentOccurrenceCount,
-                    revisitCount: $0.revisitCount,
-                    reasons: Self.innerStateReasons($0, at: now))
-            }
-
         return CognitiveInnerStateReading(
             generatedAt: now,
             windowHours: window,
@@ -678,8 +594,6 @@ extension CognitiveSubstrate {
             chemistryWords: Self.innerStateChemistryWords(organism.projection),
             fatigue: organism.fatigue,
             timeOfDayPhase: Self.innerStateTimeOfDayWord(organism.diurnal),
-            ruminationCandidate: innerStateRumination(at: now, surface: surface),
-            seeds: Array(seeds),
             expectations: organism.expectations,
             toward: organism.toward.map {
                 CognitiveInnerStateReading.Toward(
@@ -691,25 +605,22 @@ extension CognitiveSubstrate {
                 )
             },
             dream: innerStateDreamResidue(),
-            standingViews: Array(views),
             // Computed only when she asked for `full` — the projection walks
             // the timeline, and "how are you" must stay cheap.
-            growthWeek: detail == .full ? await growthWeekLines(at: now) : []
+            growthWeek: detail == .full ? await growthWeekLines(at: now) : [],
+            cares: cares.values.filter { $0.fadedAt == nil }
+                .map { (care: $0, charge: $0.charge(at: now)) }
+                .sorted { abs($0.charge) != abs($1.charge) ? abs($0.charge) > abs($1.charge)
+                    : $0.care.updatedAt > $1.care.updatedAt }
+                .map {
+                    CognitiveInnerStateReading.Care(
+                        id: $0.care.id, about: $0.care.about, depth: $0.care.depth.rawValue, with: $0.care.with,
+                        felt: $0.care.story.last(where: { $0.depthChange == nil })?.felt, charge: $0.charge,
+                        open: $0.care.open, stance: $0.care.stance?.text,
+                        because: $0.care.stance?.because, wouldChangeMind: $0.care.stance?.wouldChangeMind)
+                },
+            story: detail == .full ? careStoryLines() : []
         )
-    }
-
-    static func innerStateReasons(_ view: CognitiveStandingView, at now: Date) -> [String] {
-        switch view.status {
-        case .opinion:
-            var lines = ["because: \(view.because)", "would change if: \(view.wouldChangeMind)"]
-            lines += view.revisions.reversed().map { "used to think: \($0.priorStance) — changed by: \($0.evidence)" }
-            if view.dueForReconsideration(at: now) { lines.append("held a while: due for your reconsideration") }
-            return lines
-        case .interest:
-            return view.evidenceExcerpts.reversed().map { "earlier question: \($0)" }
-        default:
-            return []
-        }
     }
 
     /// The hot set, decayed on COPIES: reading her mind never changes it.
@@ -796,52 +707,6 @@ extension CognitiveSubstrate {
         if diurnal.nightliness >= feltLatenessFloor { return "late" }
         if diurnal.nightliness <= 1 - feltLatenessFloor { return "daytime" }
         return "ordinary hours"
-    }
-
-    /// What is itching, as a POINTER.
-    ///
-    /// The rumination lane owns the weight law and the D-2 stakes gate; this
-    /// only takes its heaviest candidate and DROPS THE TEXT, resolving a subject
-    /// label from the seed's own evidence instead. She already holds the seed —
-    /// its id is a complete pointer — so there is no reason for the nag to have
-    /// a second, prose-shaped way out of the machine.
-    func innerStateRumination(at now: Date, surface: String?) -> CognitiveInnerStateReading.RuminationCandidate? {
-        guard let heaviest = ruminationCandidates(at: now).first(where: { candidate in
-            ruminationIsPermitted(candidate, on: surface)
-        }) else { return nil }
-        // The subject is the first LIVED source node the seed still has in the
-        // field. A nag whose evidence has been evicted keeps its pointer and
-        // loses its label — honest, and the same bound the rumination read
-        // itself already lives under.
-        var livedById: [UUID: CognitiveNode] = [:]
-        for node in field.peekNodes()
-        where field.cachedTurnKind(for: node).contributesToLivedState {
-            livedById[node.id] = node
-        }
-        let seed = thoughtSeeds[heaviest.seedId]
-        let subject = (seed?.sourceNodeIds ?? [])
-            .lazy
-            .compactMap { livedById[$0] }
-            .first
-            .flatMap { Self.innerStateSubjectLabel($0) }
-            // A nag with no lived node left (evicted, or Desk-fed and never
-            // lived) still names WHAT is turning, from its own text: the same
-            // safe abstract the Thread line renders. "subject null for three
-            // builds" (her read, 2026-09-02) was the pointer without the name.
-            ?? Self.feltSafeObjectPhrase(
-                in: seed?.text ?? heaviest.text,
-                maxCharacters: CognitiveInnerStateReading.subjectLabelCharacters
-            )
-            // A Desk-fed nag has no seed row at all; its label IS the subject.
-            ?? (heaviest.externalId != nil
-                ? String(heaviest.text.prefix(CognitiveInnerStateReading.subjectLabelCharacters))
-                : nil)
-        return CognitiveInnerStateReading.RuminationCandidate(
-            seedId: heaviest.seedId,
-            kind: heaviest.kind.rawValue,
-            weight: heaviest.weight,
-            subject: subject
-        )
     }
 
     /// A payload-free label for a node's subject, or NIL when the node cannot

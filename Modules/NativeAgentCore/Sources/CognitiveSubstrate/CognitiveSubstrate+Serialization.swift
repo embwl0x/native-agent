@@ -31,22 +31,6 @@ extension CognitiveAffectState {
     }
 }
 
-extension CognitiveThoughtSeed {
-    func toJSON() -> JSONValue {
-        .object([
-            "id": .string(id.uuidString),
-            "kind": .string(kind.rawValue),
-            "text": .string(text),
-            "priority": .double(priority),
-            "createdAt": .double(createdAt.timeIntervalSince1970),
-            "lastUpdatedAt": .double(lastUpdatedAt.timeIntervalSince1970),
-            "sourceNodeIds": .array(sourceNodeIds.map { .string($0.uuidString) }),
-            "sourcePeerIds": sourcePeerIds.map { .array($0.map { .string($0) }) } ?? .null,
-            "materialProvenances": .array(materialProvenances.map { .string($0) }),
-        ])
-    }
-}
-
 extension CognitiveEpisodeReference {
     func toJSON() -> JSONValue {
         .object([
@@ -180,7 +164,7 @@ extension CognitiveReflectionReceipt {
             "reasoningEffort": .string(request.reasoningEffort),
             "requestedAt": .double(request.requestedAt.timeIntervalSince1970),
             // 2026-09-13: the frozen evidence and the excerpt lines are part of
-            // the receipt now that a standing view is formed FROM them. Before
+            // the receipt so care changes keep what formed them. Before
             // this the restore path rebuilt the request without either, so a
             // receipt re-read after a relaunch could not say what it was about.
             "requestSourceNodeIds": .array(request.sourceNodeIds.map { .string($0.uuidString) }),

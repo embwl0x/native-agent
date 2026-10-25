@@ -145,8 +145,8 @@ removed assistant-prose task ledger.
 | ID | Item | Status | Source / limit |
 |---|---|---|---|
 | CCS-P6-D1 | Affect vector | Source | `CognitiveAffectState` in `S/CognitivePhaseModels.swift` |
-| CCS-P6-D2 | Event updates | Source | S `+Affect`, `+Ingest`, `+CaringAppraisal` |
-| CCS-P6-D3 | Attention influence | Source | S `+Workspace.workspaceScore` and `+ThoughtSeeds.interruptionScore` |
+| CCS-P6-D2 | Event updates | Source | S `+Affect`, `+Ingest`, `+CaringAppraisal`; `+SemanticAppraisal` reads touched live cares at cosine 0.40 or more for stakes and a stance care's signed real charge for the worldview lens |
+| CCS-P6-D3 | Attention influence | Source | S `+Workspace.workspaceScore` |
 | CCS-P6-D4 | Affect display | Source | UI `CognitionObservatoryView+Affect.swift` |
 | CCS-P6-D5 | Expression | Source | S `+Capsule` renders internal context; affect itself sends no user message |
 | CCS-P6-A1 | Bounds | Source | Affect values clamped; S `+Research.welfareBoundsSnapshot` reports bounds |
@@ -155,21 +155,17 @@ removed assistant-prose task ledger.
 | CCS-P6-A4 | Work admission | Source | S dirty/configuration guards; R event coalescing and deadlines |
 | CCS-P6-A5 | Useful ablation effect | Unverified | S `+Research` reports ablation settings, not causal benefit |
 
-## Phase 7 - Thought Seeds And Endogenous Cognition
+## Phase 7 - Open Cares And Endogenous Cognition
 
 | ID | Item | Status | Source / limit |
 |---|---|---|---|
-| CCS-P7-D1 | Typed seeds | Source | `CognitiveThoughtSeedKind` in `S/CognitivePhaseModels.swift` |
-| CCS-P7-D2 | Seed creation during settlement | Source | S `+Workspace.runMicrocycleChecked` |
-| CCS-P7-D3 | Merge, decay and cap | Source | S `+ThoughtSeeds` |
-| CCS-P7-D4 | Workspace-linked suggestions | Source | `thoughtSuggestionSnapshot` |
+| CCS-P7-D1, CCS-P7-D2, CCS-P7-D3, CCS-P7-D4 | Typed seeds, settlement minting, ranking and suggestions | Retired | Open cares replace the parallel seed/rumination mechanism; old `thought_seed` rows are never loaded and remain byte-preserved |
 | CCS-P7-D5 | Provider-call authority | Boundary | Reflection admission/execution belongs to S/R `+Reflection` |
-| CCS-P7-D6 | Inspection | Source | UI `CognitionObservatoryView+ThoughtSeeds.swift` |
-| CCS-P7-A1 | Low-priority expiry | Source | S `+ThoughtSeeds.decayThoughtSeedsInMemory` |
-| CCS-P7-A2 | Duplicate merge | Source | S `+ThoughtSeeds.addThoughtSeed` |
+| CCS-P7-D6 | Inspection | Source | S `+InnerState` returns live cares and their open gaps through `mind.inner_state` |
+| CCS-P7-A1, CCS-P7-A2 | Seed expiry and duplicate merge | Retired | Cares keep one open gap; charge is read from their story and the night owns fading |
 | CCS-P7-A3 | Extracted overdue commitments | Retired | The Phase 5 task ledger is absent |
-| CCS-P7-A4 | Interruption score | Source | S `+ThoughtSeeds.interruptionScore`; usefulness unmeasured here |
-| CCS-P7-A5 | Direct action dispatch | Boundary | Seed suggestions carry data; app/Trust owners execute actions |
+| CCS-P7-A4 | Open-care pressure | Source | S `+CaresMind.carePressure`; S `+Reflection` sums live open pressure for admission |
+| CCS-P7-A5 | Direct action dispatch | Boundary | Cares carry state; app/Trust owners execute actions |
 
 ## Phase 8 - Replay And Developmental Self-Model
 
@@ -183,7 +179,7 @@ removed assistant-prose task ledger.
 | CCS-P8-D6 | Timeline | Source | S `+Replay.developmentalTimelineSnapshot` |
 | CCS-P8-A1 | Replay deduplication | Source | `integrateReplayChecked` checks external evidence IDs |
 | CCS-P8-A2 | Repeated evidence establishes a trait | Unverified | No general trait-validity threshold claimed |
-| CCS-P8-A3 | Inspect/resolve proposals | Source | UI `Sources/NativeAgentApp/CognitionProposalsView.swift` (its actions included); R schema/view methods |
+| CCS-P8-A3 | Inspect/resolve proposals | Source | UI `Sources/NativeAgentApp/CognitionProposalsView.swift` (its actions included); R schema methods |
 | CCS-P8-A4 | Personality stability under noise | Unverified | A proposal boundary alone does not measure personality stability |
 
 ## Phase 9 - Budgeted Reflective Calls
@@ -198,10 +194,10 @@ removed assistant-prose task ledger.
 | CCS-P9-D6 | Provenance | Source | Capsule IDs plus quoted-excerpt IDs and external material provenance |
 | CCS-P9-D7 | Enable policy | Source | R preference/onboarding initialization; S admission gate |
 | CCS-P9-A1 | Disabled-call gate | Source | S `reflectionCostRefusal` |
-| CCS-P9-A2 | Action authority | Boundary | Reflection can propose a view; app/Trust own effects |
+| CCS-P9-A2 | Action authority | Boundary | Reflection can write a care's stance; app/Trust own effects |
 | CCS-P9-A3 | Measurable improvement | Unverified | Proposal yield is not a judgment-quality measurement |
 | CCS-P9-A4 | Bounded cost mechanism | Source | Prompt/result bounds, receipt cost estimates and call ceiling |
-| CCS-P9-A5 | Identity write boundary | Boundary | Reflection parser proposes standing views; canonical growth has its own owner |
+| CCS-P9-A5 | Identity write boundary | Boundary | Reflection writes care stances through `applyCares`, excluding untrusted-fed material; canonical growth has its own owner |
 
 ## Phase 10 - Consciousness Observatory And Research Harness
 

@@ -9,7 +9,7 @@
 //
 //   1. On device, from state she already has, a few CANDIDATES — each a thing,
 //      with its source and why it might be worth his time: a plan of User's
-//      coming due on the Desk, an opinion she revised with its evidence, an
+//      coming due on the Desk, an open care of hers pressing to be said, an opinion she revised with its evidence, an
 //      interest she came back to with a better question, what a trusted
 //      builder shipped, a gentle dream association about him.
 //   2. TIMING GATES, all on device: his quiet hours, not while he is talking
@@ -47,12 +47,12 @@ import TurnTrace
 /// One thing worth sharing, and why.
 struct ReachCandidate: Sendable, Equatable {
     enum Kind: Int, Sendable, Comparable {
-        case plan, opinion, interest, shipped, dream
+        case plan, care, shipped, dream
         static func < (lhs: Kind, rhs: Kind) -> Bool { lhs.rawValue < rhs.rawValue }
-        var name: String { ["plan", "opinion", "interest", "shipped", "dream"][rawValue] }
+        var name: String { ["plan", "care", "shipped", "dream"][rawValue] }
     }
     var kind: Kind
-    /// `desk:<handle>`, `view:<uuid>`, `ship:<builder>:<id>` or `dream:<id>`:
+    /// `desk:<handle>`, `care:<uuid>`, `view:<uuid>`, `ship:<builder>:<id>` or `dream:<id>`:
     /// what the cooldown keys on and what `mind.reject` takes.
     var subject: String
     var source: String
@@ -574,22 +574,17 @@ extension NativeCognitionRuntime {
         var out: [ReachCandidate] = []
         let person = Self.resolvedPerson(dataRoot: dataRoot)
 
-        // An opinion she revised, with what changed it; an interest she came
-        // back to with a better question. (The views experiment's own flag.)
-        for view in await substrate.standingViewSnapshot() {
-            if view.status == .opinion, let revision = view.revisions.last {
-                out.append(ReachCandidate(
-                    kind: .opinion, subject: "view:\(view.id.uuidString)", source: "an opinion of yours",
-                    why: "you changed your mind, and why is the interesting part",
-                    text: "you used to think \"\(Self.clipped(revision.priorStance, 140))\"; now \"\(Self.clipped(view.body, 140))\", "
-                        + "because \(Self.clipped(revision.evidence, 160))",
-                    at: revision.at))
-            } else if view.status == .interest, view.revisitCount >= 1, let back = view.lastRevisitedAt {
-                out.append(ReachCandidate(
-                    kind: .interest, subject: "view:\(view.id.uuidString)", source: "your interest \"\(Self.clipped(view.title, 60))\"",
-                    why: "you came back to it with a better question",
-                    text: "\"\(Self.clipped(view.body, 200))\"", at: back))
-            }
+        // The open care pressing hardest, held with him or hers alone: what
+        // she would bring up if they were talking. It happened when it last moved.
+        if let top = await substrate.caresPressing(for: CognitiveCare.ownerKey, at: instant)
+            .first(where: { $0.care.open != nil }),
+           top.pressure >= CognitiveSubstrate.careReleasePressure,
+           let open = top.care.open, let newest = top.care.story.last {
+            out.append(ReachCandidate(
+                kind: .care, subject: "care:\(top.care.id.uuidString)", source: "something on your mind",
+                why: newest.note,
+                text: "\"\(Self.clipped(top.care.about, 120))\", still wondering: \(Self.clipped(open, 200))",
+                at: newest.at))
         }
 
         // A plan of his on the Desk that just came due (parked until a day,

@@ -82,7 +82,6 @@ extension SwiftToolDispatcher {
         "studio_shelf_read", "studio_shelf_set",
         "dream_diary_read",
         "studio_canon", "studio_canon_resolve",
-        "hold_view", "release_view",
         "memory_moments_pending", "memory_moment_review",
         // User, 2026-09-05: curation of her own store, a deliberate pass.
         "forget_memory", "rebuild_knowledge_graph",

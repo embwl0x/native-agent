@@ -1131,8 +1131,22 @@ extension SwiftNativeChatOrchestrationClient {
                 redactedContent: ChatSecretRedactor.redactText(TurnRelevanceContext.queryUserMessage ?? userMessage)
             ),
             fromUser: fromUser,
-            previousUserTurnAt: fromUser ? UserTurnStamp.previous(dataRoot: dataRoot) : nil
+            previousUserTurnAt: fromUser ? UserTurnStamp.previous(dataRoot: dataRoot) : nil,
+            speaker: fromUser ? CognitiveCare.ownerKey : Self.cognitivePeerSpeaker(sessionId: sessionId)
         )
+    }
+
+    /// A peer's person key, read from the session and origin the way the
+    /// after-turn cares read a peer's words; nil when the turn names no peer.
+    static func cognitivePeerSpeaker(sessionId: String) -> String? {
+        var metadata: [String: JSONValue] = ["sessionId": .string(sessionId)]
+        if let origin = ChatPersistenceContext.originProvenance {
+            var object: [String: JSONValue] = [:]
+            if let agent = origin.agent { object["agent"] = .string(agent) }
+            if let authored = origin.authored { object["authored"] = .string(authored.rawValue) }
+            metadata["origin"] = .object(object)
+        }
+        return CognitiveSubstrate.peerIdentity(metadata: metadata).map(CognitiveCareProvenance.personKey)
     }
 
     /// Phase 5 B2: a turn User started himself — the verified OWNER, not

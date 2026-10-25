@@ -6,11 +6,6 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     public var enabled: Bool
     public var persistenceEnabled: Bool
     public var capsuleInjectionEnabled: Bool
-    /// Phase 5 D experiment (`personality.views_experiment`): opinions that
-    /// form on independent recurrence and interests from her hour. Off leaves
-    /// every opinion and interest row stored but inert — nothing forms,
-    /// surfaces, or reaches a prompt.
-    public var viewsExperimentEnabled: Bool
     public var affectEnabled: Bool { enabled }
     public var backgroundMicrocyclesEnabled: Bool
     public var reflectiveCallsEnabled: Bool
@@ -22,7 +17,6 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     public var maximumSummaryCharacters: Int
     public var maximumCapsuleCharacters: Int
     public var maximumWorkspaceItems: Int
-    public var maximumThoughtSeeds: Int
     /// HARD cost ceiling on reflection calls in a ROLLING 24h window — the
     /// spend fence, NOT the trigger. Admission is unresolved load
     /// (`reflectionLoadThreshold`); this only says how much a hard day may
@@ -30,8 +24,7 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     /// receipts, but the window rolls instead of resetting at midnight.
     public var dailyReflectionCallBudget: Int
     /// Admission threshold for a SPONTANEOUS reflection: unresolved load
-    /// (thought-seed backlog x interruption score x disposition drift, read as
-    /// a 0...1 geometric mean) must reach this before an unattended call is
+    /// (summed pressure from live open cares) must reach this before an unattended call is
     /// admitted. A quiet day never reaches it and spends nothing. A reflection
     /// a person asked for is not gated by it — only by the ceiling.
     public var reflectionLoadThreshold: Double
@@ -44,7 +37,6 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         enabled: Bool = false,
         persistenceEnabled: Bool = false,
         capsuleInjectionEnabled: Bool = false,
-        viewsExperimentEnabled: Bool = true,
         backgroundMicrocyclesEnabled: Bool = false,
         reflectiveCallsEnabled: Bool = false,
         maximumActiveNodes: Int = 256,
@@ -54,7 +46,6 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         maximumSummaryCharacters: Int = 500,
         maximumCapsuleCharacters: Int = 1800,
         maximumWorkspaceItems: Int = 12,
-        maximumThoughtSeeds: Int = 128,
         dailyReflectionCallBudget: Int = 0,
         reflectionLoadThreshold: Double = 0.35,
         reflectionSurface: String = "cognition_reflection",
@@ -67,7 +58,6 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         self.enabled = enabled
         self.persistenceEnabled = persistenceEnabled
         self.capsuleInjectionEnabled = capsuleInjectionEnabled
-        self.viewsExperimentEnabled = viewsExperimentEnabled
         self.backgroundMicrocyclesEnabled = backgroundMicrocyclesEnabled
         self.reflectiveCallsEnabled = reflectiveCallsEnabled
         self.maximumActiveNodes = max(1, maximumActiveNodes)
@@ -77,7 +67,6 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         self.maximumSummaryCharacters = max(0, maximumSummaryCharacters)
         self.maximumCapsuleCharacters = max(0, maximumCapsuleCharacters)
         self.maximumWorkspaceItems = max(1, maximumWorkspaceItems)
-        self.maximumThoughtSeeds = max(0, maximumThoughtSeeds)
         self.dailyReflectionCallBudget = max(0, dailyReflectionCallBudget)
         self.reflectionLoadThreshold = reflectionLoadThreshold.clamped01()
         self.reflectionSurface = Self.cleaned(reflectionSurface, fallback: "cognition_reflection")

@@ -12,7 +12,7 @@ import TurnTrace
 import Dispatcher
 import PersonaEngine
 import AgentWorkspace
-// Blueprint: | `StandingBotModel.swift` | Helper adapter supplies the existing provider codec, checked tool chain and transcript writer to StandingBots' own model loop, without resident context or after-turn work; its own session compacts through the shared compactor at the shared threshold, and its thread with them is its memory of it |
+// Blueprint: | `StandingBotModel.swift` | Helper adapter supplies the existing provider codec, checked tool chain and transcript writer to StandingBots' own model loop, without resident context or after-turn work; its own session compacts through the shared compactor at the shared threshold, and its thread with their is its memory of it |
 
 extension SwiftNativeChatOrchestrationClient {
     func runStandingBot(_ bot: BotDefinition, message: String, choice: ProviderTurnChoice,

@@ -252,11 +252,10 @@ extension EngineDoctorRuntime {
         let counts = [
             ("nodes", detail.substrate.nodeCount, detail.configuration.maximumActiveNodes),
             ("workspace items", detail.workspace.items.count, detail.configuration.maximumWorkspaceItems),
-            ("thought seeds", detail.thoughtSeeds.count, detail.configuration.maximumThoughtSeeds),
         ]
         let overflow = counts.filter { $0.1 > $0.2 }
         guard !overflow.isEmpty else {
-            return CheckResult(source: "cognition configuration: capacity", id: id, title: title, status: "ok", detail: "Nodes, workspace, and thought seeds are within their configured caps.")
+            return CheckResult(source: "cognition configuration: capacity", id: id, title: title, status: "ok", detail: "Nodes and workspace are within their configured caps.")
         }
         // The substrate enforces these caps; a measured overflow is the build's to fix.
         return CheckResult(source: "cognition configuration: capacity", id: id, title: title, status: "warn",

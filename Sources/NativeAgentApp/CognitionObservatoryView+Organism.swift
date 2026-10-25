@@ -231,7 +231,6 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             .init(label: "Warm links", value: "\(snapshot.dreamRepairSummary.strengthenedEdges)"),
             .init(label: "Noisy links", value: "\(snapshot.dreamRepairSummary.weakenedEdges)"),
             .init(label: "Flags", value: "\(snapshot.dreamRepairSummary.flaggedContradictions)"),
-            .init(label: "View proposals", value: "\(snapshot.dreamRepairSummary.proposedStandingViews)"),
             Self.decimal("Residual repair pressure", snapshot.residualRepairOpportunity.pressure),
             .init(label: "Residual evidence", value: "\(snapshot.residualRepairOpportunity.evidenceCount)"),
             .init(label: "Residual repair ready", value: snapshot.residualRepairOpportunity.ready ? "yes" : "no"),

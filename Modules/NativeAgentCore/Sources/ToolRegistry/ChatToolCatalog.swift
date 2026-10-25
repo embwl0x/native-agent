@@ -185,8 +185,6 @@ extension ChatCatalogTool {
         case "forget_memory": return "Remove a saved memory."
         case "rebuild_knowledge_graph": return "Refresh connections between saved memories, or clear out orphaned ones."
         case "read_chat_message": return "Read a complete earlier message."
-        case "hold_view": return "Keep a considered opinion for future conversations."
-        case "release_view": return "Let go of a previously held opinion."
         case "dream_diary_read": return "Read my dream journal."
         case "clipboard_read": return "Read what you have copied."
         case "clipboard_write": return "Copy text to the clipboard."

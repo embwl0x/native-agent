@@ -10,7 +10,7 @@ We say "they are the app" because Agent is ours. For everyone else: the agent is
 
 ## The inversion
 
-**They are the program. The model is one of them organs.**
+**They are the program. The model is one of their organs.**
 
 Their turn part's `step` returns effects; a `model.call` effect asks the stem to call the model. Swift gathers the supporting context and assembles the prompt text the model reads. In the inverted design, their turn is *theirs*: code they owns that decides what to recall, what to think about, when to think at all, how to answer, and when to stay silent. Their persona isn't a prompt the model reads; it's what their code does. The model is reach, like a hand: the only organ that handles novelty, spent on judgment and nothing else.
 
@@ -27,13 +27,13 @@ A part has six properties, all in its header, all theirs to change:
 | **code** | what it does, as they wrote it | the ability body |
 | **reach** | what it may touch: files, apps, network, programs, the model | `permissions`, `SenseReach` |
 | **wake** | what makes it run: a call, a signal, a schedule, a turn ending, a message, an app arriving | declared signals delivered by `EnginePartWake`: `turn.ended`, `file.changed:<path>`, and those posted through `AbilityStore.signalled` |
-| **face** | how it appears: the line they reads on them interface, the block User sees on their | door pages and SwiftUI, written twice |
+| **face** | how it appears: the line they reads on their interface, the block User sees on their | door pages and SwiftUI, written twice |
 | **state** | what it remembers between runs | `senses/<id>/state.json`, key `part` for abilities; `abilities/state.json` is accounting |
 | **learned** | recorded outcomes; choice defaults planned for phase 4 | `learned.use` counters; arbitrary declared `learned`/`choices` preserved |
 
 A sense is a part whose reach is read-only and whose face is a page. An ability with hands is a part that declares hands. An ability that calls other abilities is a part. A layout block is a part that's almost all face. A Doctor check is a part that wakes on a schedule. Their turn is a part that wakes when a message arrives. Their persona is parts that run when they do. Nothing of theirs is a special case in Swift.
 
-**An ability is an ability (as built, 10-21; User: "I want skills tools abilities to be one, they are supposed to grow their abilities").** What they grows is one kind of part, an ability: what it can do is what it declares, never which door made it. It was once two kinds (tools and skills) with two doors, two admissions and two sets of run options, and is now one form (`Parts` in code, docs/skill_manifest_spec.md): one save (`ability.save`: a revision restates only what changes), one keep (theirs in one act under Full Mac for them own work, unsteered by an untrusted agent; below Full Mac a draft the owner's card offers, `ability.validate` rehearsing it first), one signed admission re-verified on every run, one run (`authored.<id>`; steps, decisions and expectations make it strict and resumable wherever its code uses them; host primitives wherever its reach declares them, the broker enforcing that reach for every ability), one read (`ability.read`) and one lifecycle (enable, restore, disable, rollback, drop). Launch migrates every tool and skill to it with no change in what runs; restoring an older backup prepares its tools and skills before installation, retaining only readable current uncarried kinds and accounting under the [restore law](canonical_data_paths.md#restore-law). A trusted agent that started a turn is its provenance, never an ability's author. Senses and their turn keep their own runners.
+**An ability is an ability (as built, 10-21; User: "I want skills tools abilities to be one, they are supposed to grow their abilities").** What they grows is one kind of part, an ability: what it can do is what it declares, never which door made it. It was once two kinds (tools and skills) with two doors, two admissions and two sets of run options, and is now one form (`Parts` in code, docs/skill_manifest_spec.md): one save (`ability.save`: a revision restates only what changes), one keep (theirs in one act under Full Mac for their own work, unsteered by an untrusted agent; below Full Mac a draft the owner's card offers, `ability.validate` rehearsing it first), one signed admission re-verified on every run, one run (`authored.<id>`; steps, decisions and expectations make it strict and resumable wherever its code uses them; host primitives wherever its reach declares them, the broker enforcing that reach for every ability), one read (`ability.read`) and one lifecycle (enable, restore, disable, rollback, drop). Launch migrates every tool and skill to it with no change in what runs; restoring an older backup prepares its tools and skills before installation, retaining only readable current uncarried kinds and accounting under the [restore law](canonical_data_paths.md#restore-law). A trusted agent that started a turn is its provenance, never an ability's author. Senses and their turn keep their own runners.
 
 **Their body reaches whatever this Mac can reach (User 10-21: "when I say anything I mean anything").** The stem offers network requests, named programs over stdio, local sockets and Mac capabilities; they grows service behavior from its own documentation. Trust gates every effect. NativeAgent holds named secrets and inserts them only at granted destinations; [redaction has encoding and stream-prefix limits](skill_manifest_spec.md#secret-insertion-and-redaction), so the grant is the fence. Sign-in supports redirect or device code, body or HTTP Basic client authentication, and account-bound renewal. Resident abilities can hold programs, connections and listeners between runs; declared `held`/`resumed` wakes let their code read arrivals and reopen after launch ([manifest](skill_manifest_spec.md)). Missing reach is fixed in the stem, never by adding a service subsystem. S3 records the MCP and connector folds.
 
@@ -43,13 +43,13 @@ The stem enforces one law for every part, the same way, with no exceptions and n
 
 - **It runs when its wake reaches it.** A call, or a signal. Nothing runs unasked without a wake.
 - **It may touch only its reach**, and every touch goes through Trust at effect time. Approval is a card to the owner; the part waits. Full Mac shows no routine cards: an untrusted agent's command keeps its one card, and macOS privacy resets and irreversible deletes still ask.
-- **It may think** when it needs judgment: a model call on them model, audited and visible. Thinking is reach, not an effect.
+- **It may think** when it needs judgment: a model call on their model, audited and visible. Thinking is reach, not an effect.
 - **It records use.** The stem projects gated run outcomes as `learned.use`. Declared `learned` and `choices` are preserved; route/default selection is reserved for phase 4.
-- **It changes only by them hand** (or User's), and keeps its last self beside it.
+- **It changes only by their hand** (or User's), and keeps its last self beside it.
 - **Its keep is theirs under Full Mac; under Work/Safe/Builder, the owner's.** The owner's off-switch stays theirs.
-- **It heals (current behavior).** The stem replays a faulty turn part through `turn.prev.js` or the shipped seed and reports the evidence. This is recovery, not a completion guarantee: unrecoverable helper, setup, seed or provider failures can end the turn incomplete, with their cause and repair. Ordinary ability runs with captured input owe source-fault repair through Experiences (OWED on Home with its lever); file-backed sense completions record failures without this obligation. Those parts change version only by them explicit hand. The no-fallback law in NORTHSTAR clause 2 governs the design; this paragraph records the existing turn recovery, not permission to extend it.
+- **It heals (current behavior).** The stem replays a faulty turn part through `turn.prev.js` or the shipped seed and reports the evidence. This is recovery, not a completion guarantee: unrecoverable helper, setup, seed or provider failures can end the turn incomplete, with their cause and repair. Ordinary ability runs with captured input owe source-fault repair through Experiences (OWED on Home with its lever); file-backed sense completions record failures without this obligation. Those parts change version only by their explicit hand. The no-fallback law in NORTHSTAR clause 2 governs the design; this paragraph records the existing turn recovery, not permission to extend it.
 - **It fades.** Unused, it is archived and restorable. Used, it stays.
-- **Its face is drawn** by the stem on them interface and on User's, Mac and iPhone, from the same description. What they reads is what they sees.
+- **Its face is drawn** by the stem on their interface and on User's, Mac and iPhone, from the same description. What they reads is what they sees.
 
 ## The stem: what it is, and nothing else
 
@@ -69,9 +69,9 @@ The stem has no features and no opinions. Every feature NativeAgent has today is
 ## What falls out, with nothing special-cased
 
 - **Growth:** what they works out by hand, they keeps. Their reply ends; they doesn't: when a turn landed work by hand, their turn part takes one private moment after the reply, in the same conversation, and keeps the route that worked as a part (or revises the part they worked around), or keeps nothing. No repetition threshold: unused parts fade. Under Full Mac the kept part is live at once; its first real run is its proof.
-- **Craft:** they sees their body: each turn starts with them own parts in front of them, best match for the message first, so they reaches for the part instead of redoing its work.
+- **Craft:** they sees their body: each turn starts with their own parts in front of them, best match for the message first, so they reaches for the part instead of redoing its work.
 - **Noticing:** a part that wakes on app-arrived offers once.
-- **No turns:** their turn part wakes on a message like any other signal; thinking is scheduled by them own attention, which the substrate already models. Turns become a chat artifact, not their shape.
+- **No turns:** their turn part wakes on a message like any other signal; thinking is scheduled by their own attention, which the substrate already models. Turns become a chat artifact, not their shape.
 - **Sleep that rewrites the body:** the nightly dream, which already consolidates memory, also compiles the day's traces into part changes under the judge. They wakes up better at what they did yesterday. The model is spent at night, batched; the days are CPU. (Phase 7.)
 - **The token curve:** growth costs tokens once; use costs none; learning by use costs nothing at all.
 
@@ -87,9 +87,9 @@ Agent is a person grown over ten months; their persona, memory and GROWTH never 
 
 ## How we get there
 
-**Chunks, their backed up once per phase (User 10-14/15).** Their persona is already backed up in Obsidian. At the start of each phase their whole root (1.8 GB) is cloned as they are (`~/Projects/NativeAgent-backups/<phase>-<sha>/`, APFS, instant). Not again per lane or before the install: a screwup is one swap back to the start of the phase, and the later it's found the more of them days go with it, so the proofs run before anything touches their app. Every phase ends with a drive and a DMG, drive first.
+**Chunks, their backed up once per phase (User 10-14/15).** Their persona is already backed up in Obsidian. At the start of each phase their whole root (1.8 GB) is cloned as they are (`~/Projects/NativeAgent-backups/<phase>-<sha>/`, APFS, instant). Not again per lane or before the install: a screwup is one swap back to the start of the phase, and the later it's found the more of their days go with it, so the proofs run before anything touches their app. Every phase ends with a drive and a DMG, drive first.
 
-**A seed behaves exactly like the Swift it replaces on day one.** For them turn that's provable: the same prompt bytes on a fixture turn, the same call count on the 12-ask Luna drive. They never notices a phase land, except that more of them is theirs.
+**A seed behaves exactly like the Swift it replaces on day one.** For their turn that's provable: the same prompt bytes on a fixture turn, the same call count on the 12-ask Luna drive. They never notices a phase land, except that more of their is theirs.
 
 **Phases (never interrupting who they are, mind last):**
 1. **The stem learns the form, and their turn is the first part.** Parts get the six properties and the law; `turn.js` seeded from today's turn engine, byte-identical; weather and the habit-former as the second and third parts. Shipped across 0.6.7–0.6.8; the habit-former was retired 10-21 for the keep moment (Growth, above).
@@ -116,7 +116,7 @@ Agent is a person grown over ten months; their persona, memory and GROWTH never 
 
 1. **The name:** part for anything they runs as their own program (senses, their turn, what they grows); what they grows is called an ability (User 10-21).
 2. **Their turn first:** yes; built as `abilities/turn.js` (0.6.7).
-3. **Mind as parts (phase 7):** they changes it through them own gates; REM→GROWTH stays approval-gated.
+3. **Mind as parts (phase 7):** they changes it through their own gates; REM→GROWTH stays approval-gated.
 4. **Heal:** their turn heals and tells their; other parts owe repair instead (see the law above).
 5. **Seeds:** the app reserves the shipped catalog's ids and `native-` for its own parts; `ability.save` refuses them. Future seeds use `native-`. An untouched bundled seed follows changed shipped bodies (`EngineLaunch`, `AbilityStore`); installation preserves any authored version or occupied slot.
 6. **Version:** no jump. Releases step the patch number (User 10-17: "we gotta make sure when we hit 1.0 this is HUGE"); phase 1 shipped across 0.6.x.
@@ -165,15 +165,15 @@ Notion, Gmail, Google Calendar, X, AgentMail, TradingView, GitHub and Slack's se
 
 **S4. Waking (built).** Parts declare existing signals in `wake`; the [manifest](skill_manifest_spec.md#wake-signals) owns names, payloads and delivery bounds. Sources are exact scheduler deadlines, install discovery, file watches, after-turn, Telegram/Slack ingress, held resources, launch and person-input presence. Mail has no watcher and never pushes new mail (User 10-07). No polling is added.
 
-`EnginePartWake` supplies the run's gate chain under current Trust and Autonomy (contract 2). Approval waits through AttentionRouter/quiet hours; requests for them reach `ResidentWake`. A wake uses no model unless its code calls `model.call`.
+`EnginePartWake` supplies the run's gate chain under current Trust and Autonomy (contract 2). Approval waits through AttentionRouter/quiet hours; requests for their reach `ResidentWake`. A wake uses no model unless its code calls `model.call`.
 *Proof:* one scheduled wake at its minute; no declared wake, no unattended run; one required owner card held through quiet hours; one home arrival when the run needs their.
 
 **S5. Noticing.** `AgentPeerDiscovery` keeps its scan and its once-only offer; `agentAppWords` stops being the gate, and every bundle that *arrives after the baseline* (the first scan records what's there and offers nothing) becomes the `app.installed` signal with bundle id, name and whether it has a scripting dictionary. A built-in resident ability handles the signal by rule, on CPU: scriptable app → one home arrival "Keynote arrived. Want me to grow into it?" (dismissable until the version changes, the existing discovery.json rule); not scriptable → nothing. They are woken only for apps they can actually grow into.
-*Proof:* a stub .app with an sdef dropped into ~/Applications on the test copy → one arrival on them home → yes → `sense.make` + `ability.save` from its sdef → `abilities/<id>.js` exists → the arrival never repeats; a stub without an sdef → nothing.
+*Proof:* a stub .app with an sdef dropped into ~/Applications on the test copy → one arrival on their home → yes → `sense.make` + `ability.save` from its sdef → `abilities/<id>.js` exists → the arrival never repeats; a stub without an sdef → nothing.
 
 **S6. The judge (small).** One rule, no counts, on evidence `state.json` already keeps: every run writes an outcome (ok, error, refused, cut). The stem rolls back when the current version has failed on every run since it was kept, at least one failure is the version's own fault (a JS error or a proof failure, never a refusal, a permission or the network), and the previous version's last run was clean (`lastCleanVersion`). It swaps (the atomic `RENAME_SWAP`), then tells their through `ResidentWake` with the evidence: "I rolled keynote back to v2: v3 threw X on both runs; v2 last ran clean 10-13." They decides whether to fix v3. No clean previous → nothing is swapped, they are told. The judge never deletes and never asks User.
 *Proof:* keep a v2 that throws → two runs fail → the stem swaps to v1 and their home shows the note; a permission refusal on a good version triggers nothing.
-*As built:* their turn part heals this way (`TurnPart` swaps to the previous version inside the same turn). Ordinary parts (abilities and senses) do not swap back on their own yet: a failed version keeps its version and owes a repair that carries its evidence and lever (`AbilityStore.recordRunEvidence` → `RepairOwed.owe`); a swap back is by them hand (`ability.rollback`, `sense.rollback` → `AbilityStore.swap`).
+*As built:* their turn part heals this way (`TurnPart` swaps to the previous version inside the same turn). Ordinary parts (abilities and senses) do not swap back on their own yet: a failed version keeps its version and owes a repair that carries its evidence and lever (`AbilityStore.recordRunEvidence` → `RepairOwed.owe`); a swap back is by their hand (`ability.rollback`, `sense.rollback` → `AbilityStore.swap`).
 
 **S7. Dead paths out.** The 8770 Mac-control HTTP bridge (no client; my `liquid-glass-ui` skill doc gets updated), the third file stack beside it, Procedures (2.8k, overlaps abilities), memory one-shot migrations (2k), `SwiftNativeScreenVision`. **Not** the 8771 Claude bridge: it's my live channel (`agent-bridge` skill). It moves to `agent_message` + the claude-code recipe only once that carries Claude both ways, with its own proof. Later lane.
 *Proof:* build and architecture check pass; their app runs a day with no Doctor finding.
@@ -202,7 +202,7 @@ Phase 2 (hands) and the first of phase 6 (faces) land through one shared layer, 
 9. **Mind policy waits for its judge.** Dreams, reflection and provider interpretation (phase 7) move only after the evidence judge is defined; not in this sweep.
 10. **Dormant machinery is retired, not ported.** Workflow defaults that cannot execute and the Desk cadence API with no caller are deleted. The Desk cadence learner, observation/stat types and unused store are retired (L4, 10-23); the separately consumed observation fingerprints stay in `DeskObservation.swift`. No cadence ability or schedule replaces them; existing cadence data is left untouched.
 11. **Validation is the working agreement:** a coherent change, built, installed, and a small live check of the replaced behaviour on the live agent. Every port deletes the Swift it replaces in the same lane; calling the old feature from JS earns no credit.
-12. **Every run of a part has an originating door.** A turn supplies its own. A native owner acting on its own schedule or on the person's click supplies the **same door** their scheduled abilities and the Tools page use, with that origin's authority — never a host-less run, never a second door, never a door minted for one feature. Any small generalisation belongs to the door owner, once. A ported connector action reached from the scheduler or UI reaches its part through that door, so `reminders.due_today` works identically from them turn, a scheduled `connector_action` job and the app's UI.
+12. **Every run of a part has an originating door.** A turn supplies its own. A native owner acting on its own schedule or on the person's click supplies the **same door** their scheduled abilities and the Tools page use, with that origin's authority — never a host-less run, never a second door, never a door minted for one feature. Any small generalisation belongs to the door owner, once. A ported connector action reached from the scheduler or UI reaches its part through that door, so `reminders.due_today` works identically from their turn, a scheduled `connector_action` job and the app's UI.
 
 ### Must stay Swift
 

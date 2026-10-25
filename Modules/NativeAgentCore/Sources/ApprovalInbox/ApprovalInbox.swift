@@ -590,6 +590,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         "self_improvement.apply",
         "skill.proposal",
         "rem.proposal",
+        // A care becoming part of who she is (life depth), from her night.
+        "care.life",
         "memory.repair",
         "memory.kind_backfill",
         "memory.consolidation.swap",

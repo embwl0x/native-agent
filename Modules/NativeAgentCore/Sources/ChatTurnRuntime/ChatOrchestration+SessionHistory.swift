@@ -8,7 +8,7 @@ import PersistenceCore
 import TurnTrace
 // v2Prefix delivery ladder: supportsMidConversationSystem / …ClearAt.
 import ProviderRouting
-// Blueprint: | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`: `buildTurnContextWithHistory` (history and digest gathered for them turn part), `fireAssemblyStageEvent`, `injectingSessionDigest` |
+// Blueprint: | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`: `buildTurnContextWithHistory` (history and digest gathered for their turn part), `fireAssemblyStageEvent`, `injectingSessionDigest` |
 
 // MARK: - SwiftNativeTurnEngine + history threading
 

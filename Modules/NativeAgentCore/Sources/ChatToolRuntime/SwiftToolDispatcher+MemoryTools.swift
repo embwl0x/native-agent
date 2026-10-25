@@ -566,7 +566,7 @@ extension SwiftToolDispatcher {
         meta.merge(MemoryMoments.turnMetadata(turnId: TurnTraceContext.turnId, origin: AfterTurnSource.origin)) { current, _ in current }
         // A moment she keeps on purpose (kind "moment") carries how it felt,
         // so the same lanes that serve extracted moments — reminded-of,
-        // re-feel on recall, rumination — treat it as one of hers. Valence is
+        // re-feel on recall — treat it as one of hers. Valence is
         // clamped; salience defaults high because she chose to keep it.
         if let valence = Self.optionalNumber(input["valence"]) {
             meta["valence"] = .double(min(1, max(-1, valence)))

@@ -153,12 +153,6 @@ extension CognitiveSubstrate {
             // exchanges rather than two events.
             consumeDreamResidueTurn(at: now)
         }
-        // HEAL (item 6). Only the user's own words can answer an open thing —
-        // her own summary is her own voice, and appraising that was killed
-        // twice already (design law 3).
-        if Self.isUserAuthored(event.kind) {
-            releaseAnsweredRuminations(answeredBy: event.summary, at: now)
-        }
         // Persistence is intentionally NOT here — this function must stay synchronous so
         // callers can apply affect and stamp a node tag in one await-free segment. The
         // affect artifact is persisted by the async caller (updateAffectFromEvent, or
@@ -588,20 +582,6 @@ extension CognitiveSubstrate {
     /// Pure read-time affect at an explicit instant. Canonical persistence keeps
     /// the last materialized anchor; callers observe analytic decay, ambient calm,
     /// and the warm-presence floor without advancing that anchor or writing.
-    /// THE ITCH, as a floor (item 6, 2026-09-02). A third ambient layer beside
-    /// quiet calming and the warm-presence floor, and built the same way: a pure
-    /// read-time `max`, never a stored delta, so it can rise and fall with what
-    /// is actually unresolved instead of ratcheting. Zero floors → byte-identical
-    /// to the affect this function returned before the lane existed.
-    private func ruminated(_ state: CognitiveAffectState, at now: Date) -> CognitiveAffectState {
-        let floors = ruminationPressureFloors(at: now)
-        guard floors.uncertainty > 0 || floors.taskPressure > 0 else { return state }
-        var next = state
-        next.uncertainty = max(next.uncertainty, floors.uncertainty)
-        next.taskPressure = max(next.taskPressure, floors.taskPressure)
-        return next
-    }
-
     func projectedAffect(
         at now: Date,
         dynamics capturedDynamics: PersonalityDynamicsConfiguration? = nil
@@ -609,9 +589,9 @@ extension CognitiveSubstrate {
         guard configuration.enabled else { return affect }
         let source = affect
         var next = decayedAffect(source, to: now, dynamics: capturedDynamics)
-        guard let lastPresence = lastUserPresenceAt else { return ruminated(next, at: now) }
+        guard let lastPresence = lastUserPresenceAt else { return next }
         let quietBoundary = lastPresence.addingTimeInterval(Self.ambientPresenceGap)
-        guard now >= quietBoundary else { return ruminated(next, at: now) }
+        guard now >= quietBoundary else { return next }
 
         // Apply only the quiet interval not already materialized in `source`.
         // A later maintenance/shutdown checkpoint can therefore persist this
@@ -636,7 +616,7 @@ extension CognitiveSubstrate {
             }
         }
         next.updatedAt = now
-        return ruminated(next, at: now)
+        return next
     }
 
 }

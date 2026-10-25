@@ -15,7 +15,7 @@ For the memory standard, see [What a good memory is](memory-quality.md).
 Turn interpretation or an explicit save → MemoryV2 → canonical SQLite
 transaction → derived projections → selected context or explicit recall.
 
-Agent reaches memory through them one `app` tool:
+Agent reaches memory through their one `app` tool:
 
 ```text
 app {"page":"memories"}

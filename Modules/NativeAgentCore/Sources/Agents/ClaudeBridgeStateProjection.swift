@@ -327,22 +327,12 @@ public enum ClaudeBridgeStateProjection {
             "strengthenedEdges": summary.strengthenedEdges,
             "weakenedEdges": summary.weakenedEdges,
             "flaggedContradictions": summary.flaggedContradictions,
-            "proposedStandingViews": summary.proposedStandingViews,
             "feltDaySummaryCharacters": summary.feltDaySummaryCharacters,
             "latestEvidence": summary.latestEvidence.map { evidence in
                 [
                     "id": evidence.id,
                     "label": evidence.label,
                     "summary": evidence.summary,
-                ]
-            },
-            "standingViewProposals": summary.standingViewProposals.map { proposal in
-                [
-                    "id": proposal.id,
-                    "title": proposal.title,
-                    "rationale": proposal.rationale,
-                    "evidenceIDs": proposal.evidenceIDs,
-                    "reviewRequired": proposal.reviewRequired,
                 ]
             },
         ]

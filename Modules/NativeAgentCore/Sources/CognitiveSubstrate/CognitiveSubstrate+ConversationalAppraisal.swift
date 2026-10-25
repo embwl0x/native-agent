@@ -1,5 +1,6 @@
 import Foundation
-// Blueprint: | `CognitiveSubstrate+ConversationalAppraisal.swift` | `CognitiveSubstrate`: `relationalWarmthBoost`, `isUserAuthored`, `conversationalAppraisal` |
+import PersistenceCore
+// Blueprint: | `CognitiveSubstrate+ConversationalAppraisal.swift` | `CognitiveSubstrate`: conversational appraisal and warmth, relational provenance, open completion and association signatures |
 
 extension CognitiveSubstrate {
     /// Relational-warmth signal for the affect layer. Returns >0 ONLY on genuine
@@ -219,12 +220,9 @@ extension CognitiveSubstrate {
             "that mattered", "that meant a lot", "you caught", "nice catch", "good catch",
         ]) {
             a.valence += 0.16; a.warmth += 0.12
-            // A MIXED line stings half as hard. "not sloppy this time; great
-            // work" trips the criticism lexicon on the substring and the praise
-            // on the phrase; praise in the same breath means the hard word was
-            // a contrast, not a verdict. Half the negative valence comes back,
-            // so the standing-view margin holds (StandingViewsTests) while an
-            // unmixed hard word keeps its full sting (turn regression).
+            // A mixed line stings half as hard: "not sloppy this time; great
+            // work" matches both criticism and praise. Half the negative
+            // valence comes back while an unmixed hard word keeps its full sting.
             if negative, valenceAfterNegatives < 0 {
                 a.valence -= valenceAfterNegatives * 0.5
             }
@@ -328,5 +326,249 @@ extension CognitiveSubstrate {
     static let landingReactionScale = 0.24
     static func landingScore(fromReactionValence valence: Double) -> Double {
         (valence / landingReactionScale).clampedSigned()
+    }
+}
+
+extension CognitiveSubstrate {
+    static let associationTermLimit = 6
+    static let associationMinimumTermLength = 5
+
+    /// Distinctive terms for bounded capsule association and suppression signatures.
+    static func associationTerms(in text: String) -> [String] {
+        let lowered = text.lowercased()
+        var seen: Set<String> = []
+        var candidates: [String] = []
+        for raw in lowered.split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
+            let word = String(raw)
+            guard word.count >= associationMinimumTermLength else { continue }
+            guard !associationStopWords.contains(word) else { continue }
+            guard !seen.contains(word) else { continue }
+            seen.insert(word)
+            candidates.append(word)
+        }
+        candidates.sort { lhs, rhs in
+            if lhs.count != rhs.count { return lhs.count > rhs.count }
+            return lhs < rhs
+        }
+        return Array(candidates.prefix(associationTermLimit))
+    }
+
+    /// Words long enough to survive the length filter but too ordinary to mean
+    /// anything. Kept deliberately small — this is a floor against noise, not an
+    /// attempt at linguistics.
+    static let associationStopWords: Set<String> = [
+        "about", "after", "again", "against", "along", "already", "also",
+        "always", "another", "anything", "around", "because", "been", "before",
+        "being", "between", "both", "cannot", "could", "doesn", "doing", "done",
+        "during", "each", "either", "enough", "even", "ever", "every",
+        "everything", "from", "further", "getting", "going", "have", "having",
+        "here", "however", "instead", "into", "itself", "just", "keep", "like",
+        "made", "make", "making", "many", "matter", "maybe", "might", "more",
+        "most", "much", "must", "myself", "never", "nothing", "often", "only",
+        "other", "over", "quite", "rather", "really", "same",
+        "should", "since", "some", "someone", "something", "still", "such",
+        "than", "that", "their", "them", "then", "there", "these", "they",
+        "thing", "things", "think", "this", "those", "though", "through",
+        "toward", "under", "until", "upon", "very", "want", "were",
+        "what", "when", "where", "whether", "which", "while", "will", "with",
+        "within", "without", "would", "your", "yours", "yourself",
+    ]
+
+}
+
+extension CognitiveSubstrate {
+
+    /// Who is on the other end of this event's words.
+    enum RelationalSource: Equatable {
+        /// The configured user. The whole of the relationship until now.
+        case user
+        /// Another agent, by its own payload-free name ("claude", "codex").
+        case peer(String)
+        /// Her own reply, or tool output, or anything else that is not somebody
+        /// speaking to her. Never appraises — Law 3.
+        case selfOrMachine
+
+        /// How far this source's words move her, as a multiple of User's.
+        var appraisalWeight: Double {
+            switch self {
+            case .user: return 1.0
+            case .peer: return CognitiveSubstrate.peerAppraisalWeight
+            case .selfOrMachine: return 0
+            }
+        }
+
+        /// Payload-free subject for the felt node — WHO moved her. Nil for the
+        /// user, because the ordinary relationship needs no qualifier.
+        var subjectLabel: String? {
+            if case .peer(let agent) = self { return agent }
+            return nil
+        }
+    }
+
+    /// A peer moves her half as much as User does. One number, one place.
+    static let peerAppraisalWeight = 0.5
+    /// Longest agent name that can become a felt subject. Route provenance is
+    /// bounded to 80 upstream; this is the word-level cap for a capsule subject.
+    static let peerSubjectCharacterCap = 24
+
+    /// Route provenance she trusts to name a peer. A pair, not two independent
+    /// checks: `claude-bridge` claiming to be `codex` is a contradiction, and a
+    /// contradiction must not borrow either lane's identity.
+    static let peerRouteAllowlist: Set<String> = [
+        "claude-bridge/claude",
+        "codex-bridge/codex",
+        "omp-bridge/omp",
+    ]
+
+    /// Classify the speaker. Out-of-band evidence ONLY: the trust class the
+    /// persistence seam assigned and the origin record it wrote. The message
+    /// text is never consulted — an in-band "[from: claude, via bridge]" prefix
+    /// is exactly the forgeable claim this must not trust, and the same string
+    /// is typeable by the human.
+    ///
+    /// THREE things must agree before another voice is allowed to move her:
+    ///
+    ///   1. the persistence seam classified the row `.imported`, i.e. a bridge
+    ///      injected it and it is not a locally typed message;
+    ///   2. the lane ATTESTED that its agent composed the text
+    ///      (`origin.authored == .agent`) — because `.imported` alone says only
+    ///      that the words came over a bridge, and Claude relaying "User says:
+    ///      ship it" is User speaking on a bridge, not a peer;
+    ///   3. the (surface, agent) pair is a route this build knows.
+    ///
+    /// Anything short of all three is `.user`. That is the conservative
+    /// direction on purpose: mistaking a peer for User costs her half a degree of
+    /// warmth on one turn, while mistaking User for a peer would quietly halve
+    /// the weight of the relationship the whole system is built around.
+    static func relationalSource(for event: CognitiveEvent) -> RelationalSource {
+        guard isUserAuthored(event.kind) else { return .selfOrMachine }
+        guard event.sourceClass == .imported else { return .user }
+        guard case .object(let origin)? = event.metadata["origin"] else { return .user }
+        guard case .string(let authored)? = origin["authored"],
+              authored.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                == peerAuthoredAttestation else { return .user }
+        guard case .string(let rawSurface)? = origin["surface"],
+              case .string(let rawAgent)? = origin["agent"] else { return .user }
+        let surface = normalizedRouteComponent(rawSurface)
+        let agent = normalizedRouteComponent(rawAgent)
+        guard peerRouteAllowlist.contains("\(surface)/\(agent)"),
+              let name = peerAgentName(in: event) else { return .user }
+        return .peer(name)
+    }
+
+    /// The one attestation value that grants peer standing.
+    static let peerAuthoredAttestation = "agent"
+
+    private static func normalizedRouteComponent(_ raw: String) -> String {
+        String(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .replacingOccurrences(of: "_", with: "-")
+                .prefix(80)
+        )
+    }
+
+    /// The agent name inside the out-of-band origin object, canonicalised to a
+    /// bare word. Nil when the record carries none.
+    static func peerAgentName(in event: CognitiveEvent) -> String? {
+        guard case .object(let origin)? = event.metadata["origin"] else { return nil }
+        let raw: String?
+        if case .string(let agent)? = origin["agent"] {
+            raw = agent
+        } else if case .string(let surface)? = origin["surface"] {
+            // Fall back to the route: "claude-bridge" → "claude".
+            raw = surface
+        } else {
+            raw = nil
+        }
+        guard let raw else { return nil }
+        var cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        for suffix in ["-bridge", "_bridge"] where cleaned.hasSuffix(suffix) {
+            cleaned = String(cleaned.dropLast(suffix.count))
+        }
+        let word = cleaned.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        guard !word.isEmpty else { return nil }
+        return String(word.prefix(peerSubjectCharacterCap))
+    }
+
+    /// The conversational appraisal to use for `event`, weighted by WHO said it.
+    ///
+    /// This replaces the `isUserAuthored ? conversationalAppraisal : empty`
+    /// expression at the ingest hot path. For User it returns exactly what that
+    /// expression returned; for her own output it returns exactly the empty
+    /// appraisal that expression returned; for a peer it returns the same
+    /// lexicon read scaled to `peerAppraisalWeight`.
+    ///
+    /// Pure function of `event`, so it remains safe to compute once at ingest
+    /// and thread through `semanticAppraisal`, `emotionTag`,
+    /// `applyAffectFromEvent`, and `reconsolidatePendingCompletion` — which is
+    /// what the hot path already does with the value it replaces.
+    func relationalAppraisal(for event: CognitiveEvent) -> AffectAppraisal {
+        let source = Self.relationalSource(for: event)
+        let weight = source.appraisalWeight
+        guard weight > 0 else { return AffectAppraisal() }
+        var appraisal = afterTurnAppraisals[event.subject.id] ?? AffectAppraisal()
+        guard weight != 1.0 else { return appraisal }
+        appraisal.valence *= weight
+        appraisal.warmth *= weight
+        appraisal.tension *= weight
+        appraisal.pressure *= weight
+        appraisal.arousal *= weight
+        // `affection` is not a magnitude — it is the FLOOR that stops received
+        // warmth from stamping as a wound, and it is applied downstream as a
+        // fixed `max(pierced, -0.12)`. Left alone it was the one channel a peer
+        // still moved at User's full strength: on a hard morning a peer's
+        // greeting would hold her valence up exactly as far as his does, which
+        // is the "everything routes through User" defect inverted rather than
+        // fixed. So the flag survives — a peer's greeting is still a greeting —
+        // and its floor travels with the same weight everything else does.
+        appraisal.affectionWeight = weight
+        return appraisal
+    }
+
+    /// The relational warmth boost for `event`, weighted the same way — but
+    /// scaled for PEERS ONLY.
+    ///
+    /// The user case must pass through untouched for the obvious reason, and so
+    /// must her own turns: this cue is historically sampled for every lived
+    /// event and read by `semanticAppraisal` as a boolean
+    /// (`lexicalRelational`), not only by the affect layer's user-gated warmth.
+    /// Zeroing it for `.assistantTurnCompleted` would quietly change what a
+    /// relationship stake means, which is a different change than this one.
+    func relationalWarmthBoost(for event: CognitiveEvent, precomputed: Double) -> Double {
+        guard case .peer = Self.relationalSource(for: event) else { return precomputed }
+        return precomputed * Self.peerAppraisalWeight
+    }
+
+    /// Item 5, source (d) — "a question she asked that has no answer yet".
+    ///
+    /// Two dates and nothing else: when her last completion opened, and when it
+    /// stops being answerable. Payload-free by construction — the node key, the
+    /// session, and the text of what she said all stay inside the actor.
+    ///
+    /// `openedAt` is what makes this usable as a horizon. The obvious shape —
+    /// a bare `pendingCompletionOpen: Bool` plus "due in ten minutes from now" —
+    /// re-dates the expectation on every read, so the horizon can never actually
+    /// pass, and a slot that quietly aged out becomes indistinguishable from one
+    /// he answered. With the real open time the row's due instant is fixed at
+    /// mint: he answers and the source disappears while the horizon is still
+    /// ahead (relief); nobody answers and the horizon passes with the source
+    /// still there (waiting).
+    public struct OpenCompletionRead: Sendable, Equatable {
+        public let openedAt: Date
+        public let expiresAt: Date
+    }
+
+    /// The open completion slot as of `now`, or nil when nothing is hanging.
+    /// Applies the same expiry the reconsolidation path applies, so a stale slot
+    /// reads as absent rather than as an expectation she is still holding.
+    public func openCompletion(at now: Date) -> OpenCompletionRead? {
+        guard let pending = pendingCompletion else { return nil }
+        let age = now.timeIntervalSince(pending.recordedAt)
+        guard age >= 0, age <= Self.pendingCompletionMaxAge else { return nil }
+        return OpenCompletionRead(
+            openedAt: pending.recordedAt,
+            expiresAt: pending.recordedAt.addingTimeInterval(Self.pendingCompletionMaxAge)
+        )
     }
 }

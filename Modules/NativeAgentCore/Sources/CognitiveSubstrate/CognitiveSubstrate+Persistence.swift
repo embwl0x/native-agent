@@ -130,61 +130,8 @@ extension CognitiveSubstrate {
             artifacts: artifacts, deletedArtifactIDs: deletedArtifactIDs, at: now)
     }
 
-    /// Persist the complete current thought-seed family as one exact SQLite
-    /// transition. Callers own in-memory rollback when this throws.
-    func persistThoughtSeedFamily() async throws {
-        guard configuration.persistenceEnabled else { return }
-        guard !persistenceWritesBlocked else {
-            throw CognitivePersistenceError.writesBlocked(
-                status: persistenceHealth.status,
-                detail: persistenceHealth.failureDetail
-            )
-        }
-        guard let store else { throw CognitivePersistenceError.storeUnavailable }
-        let rows = thoughtSeeds.values.map { seed in
-            CognitiveArtifactReplacement(
-                id: seed.id,
-                status: "open",
-                score: seed.priority,
-                payload: seed.toJSON()
-            )
-        }
-        do {
-            try await store.replaceArtifactFamily(
-                kind: "thought_seed",
-                records: rows,
-                at: dependencies.now(),
-                maxArtifacts: artifactCap(configuration)
-            )
-            if persistenceHealth.status == .degraded,
-               persistenceHealth.failureStage == "artifact.thought_seed" {
-                persistenceHealth = CognitivePersistenceHealth(
-                    status: .healthy,
-                    writesBlocked: false,
-                    lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
-                    lastSuccessfulRestoreAt: persistenceHealth.lastSuccessfulRestoreAt
-                )
-            }
-        } catch {
-            let detail = bounded(String(describing: error), maxCharacters: 320)
-            persistenceHealth = CognitivePersistenceHealth(
-                status: .degraded,
-                writesBlocked: false,
-                lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
-                lastSuccessfulRestoreAt: persistenceHealth.lastSuccessfulRestoreAt,
-                failureStage: "artifact.thought_seed",
-                failureDetail: detail
-            )
-            throw CognitivePersistenceError.artifactWriteFailed(
-                family: "thought_seed",
-                detail: detail
-            )
-        }
-    }
-
     func persistMaintenanceTransition(
         nodes: [CognitiveNode],
-        thoughtSeeds: [CognitiveArtifactReplacement]?,
         artifacts: [CognitiveArtifactWrite],
         deletedArtifactIDs: [UUID],
         receipts: [CognitiveReceiptWrite],
@@ -200,7 +147,6 @@ extension CognitiveSubstrate {
         }
         try await store.commitMaintenance(
             nodes: nodes,
-            thoughtSeeds: thoughtSeeds,
             artifacts: artifacts,
             deletedArtifactIDs: deletedArtifactIDs,
             receipts: receipts,
@@ -210,35 +156,10 @@ extension CognitiveSubstrate {
         )
     }
 
-    /// Remove a persisted artifact row (Wave E: retired standing views delete their
-    /// artifact — the timeline carries the history — so bounded restores and the global
-    /// prune can never crowd out live state with retired rows).
-    func deleteArtifactRecord(id: UUID) async {
-        await notingPersistence("artifact.delete.\(id.uuidString)") { try await deleteArtifactRecordChecked(id: id) }
-    }
-
-    /// Same delete, but a caller that has already changed in-memory state on
-    /// the strength of it can SEE the failure (2026-09-06): silently swallowing
-    /// it let a retirement report success while the artifact stayed in the
-    /// store, so the view came back on the next restore.
-    func deleteArtifactRecordChecked(id: UUID) async throws {
-        guard configuration.persistenceEnabled else { return }
-        guard let store else { throw CognitivePersistenceError.storeUnavailable }
-        guard !persistenceWritesBlocked else {
-            throw CognitivePersistenceError.writesBlocked(
-                status: persistenceHealth.status,
-                detail: persistenceHealth.failureDetail
-            )
-        }
-        try await store.deleteArtifact(id: id)
-    }
-
     func artifactCap(_ configuration: CognitiveConfiguration) -> Int {
         max(
             64,
-            configuration.maximumThoughtSeeds
-                + configuration.maximumActiveNodes
-                + configuration.maximumThoughtSeeds
+            configuration.maximumActiveNodes
                 + configuration.dailyReflectionCallBudget * 14
                 + 64
         )
@@ -251,8 +172,8 @@ extension CognitiveSubstrate {
 extension CognitiveSubstrate {
     // Each artifact family is disk-capped and restart-capped, but the in-process
     // dict grew without bound over a days-long run so `.values` scans went O(N).
-    // These caps mirror `enforceThoughtSeedCap` (+ThoughtSeeds.swift): evict the
-    // oldest by timestamp at each record tail, retained-N matched to the family's
+    // Evict the oldest by timestamp at each record tail, retained-N matched to
+    // the family's
     // restore limit in `restoreArtifactFamilyLoads()`. The disk copy survives, so
     // eviction is safe — restart reloads up to the same N.
 

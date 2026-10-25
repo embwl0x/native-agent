@@ -275,7 +275,7 @@ extension CognitiveSubstrate {
         // neutrally, which is the thing this wave exists to fix.
         noteMomentAffect(moments, at: read.fixedAt)
         // Phase 5 B0: a moment she rejected for this kind of thing is not a cue.
-        let messageTerms = Self.appraisalConcernTerms(in: request.userMessage)
+        let messageTerms = Self.associationTerms(in: request.userMessage)
         return Self.remindedOfSelection(
             from: moments.filter { !isSuppressed("memory:" + $0.id, messageTerms: messageTerms) },
             familySign: sign,

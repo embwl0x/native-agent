@@ -26,7 +26,35 @@ extension NativeCognitionRuntime {
             for await event in stream where event.phase == .requested || event.phase == .resolved {
                 guard !Task.isCancelled else { return }
                 await self?.ingestApprovalLifecycleEvent(event)
+                if event.phase == .resolved, event.record.action == CognitiveSubstrate.careLifeApprovalAction,
+                   event.record.decision == "approved" {
+                    await self?.applyCareLifeApproval(event.record)
+                }
             }
+        }
+    }
+
+    /// The care a life card names, read from its payload.
+    public nonisolated static func careLifeCardCareID(_ record: ApprovalRecord) -> UUID? {
+        guard case .object(let payload) = record.payload, case .string(let id)? = payload["careId"] else { return nil }
+        return UUID(uuidString: id)
+    }
+
+    /// An approved life card: the care becomes part of who she is, and the
+    /// approval says so. Called live on the resolution and again by the night
+    /// for one the live path missed; a care already at life depth is a no-op.
+    public func applyCareLifeApproval(_ record: ApprovalRecord) async {
+        guard record.decision == "approved", let id = Self.careLifeCardCareID(record) else { return }
+        let applied = await substrateForIntegration().deepenCareToLife(id, source: "approval:\(record.id)")
+        do {
+            try await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                record.id, executedAction: .object(["op": .string("care_life"), "careId": .string(id.uuidString),
+                                                    "applied": .bool(applied)]),
+                detail: applied ? "It is part of who I am now (life depth)."
+                    : "That care is no longer in my mind (cleared or off), so nothing changed.")
+        } catch {
+            nativeLog("[cares] life card %@ applied=%@ but not annotated: %@", record.id,
+                      applied ? "true" : "false", error.localizedDescription)
         }
     }
 
@@ -154,34 +182,6 @@ extension NativeCognitionRuntime {
             if await substrate.ingestResident(feltEvent) {
                 scheduleDirtyMicrocycle(
                     reason: "felt_resolution:\(felt.kind.rawValue)"
-                )
-            }
-        }
-        await drainRuminationReleasesIntoSubstrate()
-    }
-
-    /// Item 6 (2026-09-02) — HEAL. The substrate stages a relief felt-moment
-    /// when an itching seed is answered, exactly as the kernel stages its own
-    /// resolution felt-moments, and this is the same drain shape: back through
-    /// `ingestResident`, where the D-2 stakes gate decides whether it becomes a
-    /// node at all. Nothing here composes a feeling — the lane already sized it
-    /// to the weight that was actually carried.
-    ///
-    /// Rides the felt-resolution drain because that runs after every accepted
-    /// event on both kernel-feed paths, so a nag answered in the user's next
-    /// sentence heals within the same turn.
-    ///
-    /// HONEST SCOPE: that drain runs only when the somatic bus accepted, i.e.
-    /// only while the organism is enabled. With the organism off, the WEIGHT
-    /// still clears the instant the thing is answered — the pressure floors are
-    /// a pure read over seeds that no longer exist, so the exhale is real — and
-    /// only the felt NODE waits for the buffer's next drain (capped drop-oldest
-    /// at the source, so it cannot grow).
-    func drainRuminationReleasesIntoSubstrate() async {
-        for event in await substrate.drainRuminationReleaseEvents() {
-            if await substrate.ingestResident(event) {
-                scheduleDirtyMicrocycle(
-                    reason: "rumination_release"
                 )
             }
         }
@@ -496,7 +496,7 @@ extension NativeCognitionRuntime {
         await refreshOrganismDiurnalClockIfInvalidated(at: fixedAt)
         var liveRead: OrganismBodyRead
         // This composite host/transport gauge has no complete push owner. Keep
-        // its two-second sampled cache; source-owned preferences/ruminations
+        // its two-second sampled cache; source-owned preferences
         // above no longer rescan on this cadence.
         if let cached = cachedBodyRead, fixedAt.timeIntervalSince(cached.at) < 2.0 {
             liveRead = cached.read

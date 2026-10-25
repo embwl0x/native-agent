@@ -17,8 +17,6 @@ enum CognitionObservatoryPanelID: String, CaseIterable, Sendable {
     case associations
     case tensions
     case affect
-    case seeds
-    case interruptions
     case timeline
     case capsule
     case reflections
@@ -99,7 +97,6 @@ struct CognitionObservatoryView: View {
         get { cognition.lastRefresh }
         nonmutating set { cognition.lastRefresh = newValue }
     }
-    @State private var pinNotice: String?
 
     init(
         cognition: CognitionViewFacade,
@@ -261,24 +258,11 @@ struct CognitionObservatoryView: View {
                                 }
                             }
                             .disabled(!enabled || !workspaceAblated)
-                            Button("Pin a concern", systemImage: "pin") {
-                                Task {
-                                    pinNotice = await runtime.pinTopConcern()
-                                        .map { "Pinned: \($0)" } ?? "Nothing pressing to pin right now."
-                                    await refresh()
-                                }
-                            }
-                            .disabled(!enabled)
                         }
                         if workspaceAblated {
                             Label("The workspace is being left out — the thought summary and background thinking ignore it until it is included again.", systemImage: "eye.slash")
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
-                        }
-                        if let pinNotice {
-                            Text(pinNotice)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
                         }
                         if let evaluationSamplerOutcome {
                             Label(
@@ -363,18 +347,6 @@ struct CognitionObservatoryView: View {
                     // task-tracking machinery (fully deleted 2026-07-01) — task-tracking is
                     // out of Agent's cognition (User, 2026-06-30). Her cognition is
                     // feelings/views/continuity, not a to-do.
-                    collapsible(.seeds, title: "Thought seeds", systemImage: "sparkles", tint: .yellow,
-                                count: detail.thoughtSeeds.count) {
-                        thoughtSeeds(detail.thoughtSeeds)
-                    }
-                    collapsible(.interruptions, title: "Suggested interruptions", systemImage: "lightbulb", tint: .mint,
-                                count: detail.thoughtSuggestions.count) {
-                        thoughtSuggestions(detail.thoughtSuggestions)
-                    }
-                    // Standing Views + Schema Proposals are APPROVAL-shaped and
-                    // moved to the Activity surface (B2.4); Identity Proposals was
-                    // retired after its experimental producer proved inert.
-                    // This segment is the read-only observational core.
                     collapsible(.timeline, title: "How I have grown", systemImage: "timeline.selection", tint: .pink,
                                 count: detail.developmentalTimeline.count) {
                         developmentalTimeline(detail.developmentalTimeline, week: detail.growthWeek)

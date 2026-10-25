@@ -2,6 +2,7 @@ import Foundation
 import ApprovalInbox
 import BackgroundLoops
 import ChatTurnRuntime
+import ChatToolRuntime
 import AgentConversations
 import CognitiveSubstrate
 import Context
@@ -16,6 +17,7 @@ import DreamREMCycle
 import ProviderRouting
 import AuthoredCapabilities
 import NativeAgentShared
+import Studio
 // Blueprint: | `NativeCognitionRuntime.swift` | `NativeCognitionRuntime` actor; `rememberNonLiveTurnKind`; Desk candidates/approval context publish together with the read's Desk revision, checked at turn and wake admission; generation orders refreshes; observes Experiences for carried wait settlement, caching only its last read to ignore unchanged replay events; settled live turns trigger one held-memory drain at idle; `GrowthWeekProjection` binds frozen growth facts to L0's version/source cache through the native host |
 
 public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProviding {
@@ -109,7 +111,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// below. This site never reads `scheduledAt`.)
     var residualDeadline = CoalescingDeadline()  // internal for actor extensions (move-only Wave C)
     /// One exact deadline derived from cognition's real discrete lifecycle
-    /// boundaries. Continuous affect, node, and thought-seed decay stays
+    /// boundaries. Continuous affect and node decay stay
     /// analytic at read time and therefore owns no periodic wake. (C6: shares
     /// the `CoalescingDeadline` mechanics; the force/notBefore/short-circuit
     /// projection stays in `rescheduleCognitionMaintenanceDeadline`.)
@@ -606,6 +608,105 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         await rescheduleResidualRepairDeadline()
         await rescheduleCognitionMaintenanceDeadline()
         publishRuntimeChange(reason: "bootstrap")
+        await readRecentLifeIntoCaresIfOwed()
+    }
+
+    /// Once, after the cares migration: her last 72 hours of lived
+    /// conversation, one cares-only call per (conversation, local day) holding
+    /// at least two exchanges, so an existing agent wakes with cares from what
+    /// she lived. One group's failure is logged with its cause and the rest
+    /// continue; groups already read are never read again.
+    private func readRecentLifeIntoCaresIfOwed() async {
+        guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL,
+              let (alreadyRead, generation) = await substrate.careLifeReadingOwed() else { return }
+        let lines: [ChatHistoryIndex.LivedLine]
+        do {
+            lines = try ChatHistoryIndex.shared(dataRoot: dataRoot).livedLines(since: now().addingTimeInterval(-72 * 3_600))
+        } catch {
+            nativeLog("cares: her recent life was not read, chat history unreadable: %@", error.localizedDescription)
+            return
+        }
+        let day = DateFormatter()
+        day.dateFormat = "yyyy-MM-dd"
+        let owner = Self.resolveUserName(dataRoot: dataRoot)
+        func name(_ speaker: String) -> String {
+            speaker == CognitiveCare.ownerKey ? (owner.isEmpty ? "the person" : owner) : "agent \(speaker)"
+        }
+        // One group per (conversation, local day, speaker): that speaker's
+        // lines and her replies to them. Her wake prompts and a helper's own
+        // runs are not conversations she lived; a row its writer marked
+        // machinery, or a debug/verification exchange, is not lived talk, and
+        // neither is her reply to one. A reply joins the message with its run
+        // id; a row with none joins the message before it.
+        struct Group { var speaker: String; var parts: [String] = []; var exchanges = 0; var last: ChatHistoryIndex.LivedLine }
+        var groups: [String: Group] = [:]
+        let conversations = Dictionary(grouping: lines.filter {
+            $0.conversation != "resident-wake" && !$0.conversation.hasPrefix("bot-")
+        }, by: \.conversation)
+        for (conversation, rows) in conversations {
+            var current: String?
+            var asked = false
+            var runs: [String: String?] = [:]
+            var answeredRuns: Set<String> = []
+            for line in rows.sorted(by: { $0.at < $1.at }) {
+                let lived = !line.mechanical
+                    && CognitiveTurnKind.inferred(fromSignals: [line.words]).contributesToLivedState
+                if line.role == "user" {
+                    guard lived, line.author != "self" else {
+                        current = nil
+                        if let run = line.runId { runs[run] = .some(nil) }
+                        continue
+                    }
+                    let speaker = CognitiveCareProvenance.personKey(line.peer ?? CognitiveCare.ownerKey)
+                    let key = "\(conversation)|\(day.string(from: line.at))|\(speaker)"
+                    groups[key, default: Group(speaker: speaker, last: line)].parts.append("\(name(speaker)): \(line.words)")
+                    groups[key]?.last = line
+                    current = key
+                    asked = true
+                    if let run = line.runId { runs[run] = key }
+                } else if lived {
+                    let key: String
+                    if let run = line.runId {
+                        guard let paired = runs[run] ?? nil else { continue }
+                        key = paired
+                        if answeredRuns.insert(run).inserted { groups[key]?.exchanges += 1 }
+                    } else {
+                        guard let adjacent = current else { continue }
+                        key = adjacent
+                        if asked { groups[key]?.exchanges += 1 }
+                    }
+                    asked = false
+                    groups[key]?.parts.append("Her reply: \(line.words)")
+                    groups[key]?.last = line
+                }
+            }
+        }
+        let manager = MindMemoryManager(makeLLMClient: { [host, dataRoot, weak self] in
+            host.backgroundLLMClient(dataRoot: dataRoot, cognition: self)
+        })
+        var passFailed = false
+        for (key, group) in groups.sorted(by: { $0.key < $1.key })
+        where !alreadyRead.contains(key) && group.exchanges >= 2 {
+            let trusted = group.speaker == CognitiveCare.ownerKey || PeerTrust.ownerTrusts(group.speaker, dataRoot: dataRoot)
+            let conversation = String(group.parts.joined(separator: "\n").suffix(12_000))
+            let shown = await substrate.caresShown(for: conversation)
+            do {
+                let judgments = try await LLMCallContext.$purpose.withValue("memory_interpret") {
+                    try await manager.appraiseCares(conversation: conversation, speaker: name(group.speaker), shown: shown)
+                }
+                try await substrate.applyCares(judgments, provenance: CognitiveCareProvenance(
+                    speaker: group.speaker, trusted: trusted, appAuthored: false,
+                    source: "exchange:\(group.last.conversation)/\(group.last.messageId ?? "")", at: group.last.at),
+                    generation: generation)
+                await substrate.noteCareLifeReadingGroup(key, failure: nil, generation: generation)
+            } catch {
+                let why = (error as? AfterTurnMemoryFailure)?.detail ?? String(describing: error)
+                passFailed = true
+                nativeLog("cares: reading %@ into her cares failed: %@", key, why)
+                await substrate.noteCareLifeReadingGroup(key, failure: why, generation: generation)
+            }
+        }
+        await substrate.finishCareLifeReading(passFailed: passFailed, generation: generation)
     }
 
     public func changes() -> AsyncStream<NativeCognitionRuntimeChange> {
@@ -695,8 +796,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 : []
         }
         await AdaptiveMemoryPromoter.shared.configureInterpretation(
-            prepare: { [substrate] origin in
-                await substrate.afterTurnContext(origin: origin)
+            prepare: { [substrate] origin, reply in
+                await substrate.afterTurnContext(origin: origin, reply: reply)
             },
             isIdle: { [weak self, dataRoot] in
                 guard let self,
@@ -714,7 +815,11 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 }
                 let reaction = await substrate.finishAfterTurn(context, appraisal: interpretation?.affect,
                                                                caring: interpretation?.caring)
-                await self?.standingViewsSourceChanged()
+                if let interpretation {
+                    await substrate.applyCares(interpretation.cares, context: context,
+                                               appAuthored: interpretation.appAuthored)
+                }
+                await self?.caresSourceChanged()
                 // Phase 5 E3: a correction from the person she took in (kept as
                 // a standing correction) is her own outcome: a little more sure.
                 if let self, context.event.sourceClass != .imported,
@@ -774,14 +879,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         // no `memoryRecordIds` at all).
         await noteServedMoments(for: inherited.event)
         let substrateAccepted = await substrate.ingestResident(inherited.event)
-        // Item 46's remaining hop (see the header of
-        // CognitiveSubstrate+AppraisalConcerns.swift). Only the appraisal owner
-        // holds standing views, so only it can say a lived concern is at stake
-        // (mint) or how this turn lands on the completion it answers (react);
-        // the organism reads the event's own metadata. This is the one place
-        // that hands the SAME event to both owners. Pure, synchronous, no LLM,
-        // and empty for the overwhelming majority of events. Read AFTER ingest
-        // so a reaction can see the completion this turn is answering.
+        // Semantic expectations use the same cares as event appraisal; the
+        // substrate names a touched care and scopes the completion it answers.
+        // The organism reads only metadata. Read after ingest so its reaction
+        // refers to the completion the turn actually answered.
         var enriched = inherited.event
         for (key, value) in await substrate.semanticExpectationMetadata(for: inherited.event) {
             enriched.metadata[key] = value
@@ -1096,10 +1197,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             elapsedNanoseconds / 1_000_000,
             UInt64(Int.max)
         ))
-        // A microcycle may create or resolve thought seeds and standing views.
+        // A microcycle may change the field and its visible projections.
         // Re-project the single maintenance deadline after that canonical
         // transition; ordinary reads and quiet elapsed time remain wake-free.
-        await standingViewsSourceChanged()
+        await caresSourceChanged()
         await rescheduleCognitionMaintenanceDeadline()
         // `runMicrocycle` publishes after the substrate commit; scheduled
         // settlement publishes once more after its telemetry has reached the
@@ -1290,11 +1391,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             substrate: read.snapshot,
             workspace: read.workspace,
             associations: await substrate.associationSnapshot(),
-            thoughtSeeds: read.thoughtSeeds,
-            thoughtSuggestions: await substrate.thoughtSuggestionSnapshot(surface: "observatory", workspace: read.workspace),
             episodes: await substrate.episodeSnapshot(),
             schemaProposals: schemas,
-            standingViews: await substrate.standingViewSnapshot(),
             developmentalTimeline: Array(timeline.prefix(40)),
             growthWeek: await substrate.growthWeek(from: timeline),
             reflections: await substrate.reflectionReceiptSnapshot(),
@@ -1331,7 +1429,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             substrate: cognition.snapshot,
             workspace: cognition.workspace,
             associations: await substrate.doctorAssociationSnapshot(at: date),
-            thoughtSeeds: cognition.thoughtSeeds,
             receiptRead: await substrate.receiptReadSnapshot(),
             welfareBounds: await substrate.welfareBoundsSnapshot(),
             organism: organism.snapshot,
@@ -1366,11 +1463,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         publishRuntimeChange(reason: "configuration:reflection")
     }
 
-    public func setViewsExperimentEnabled(_ enabled: Bool) async {
-        preferenceDefaults.set(enabled, forKey: Self.viewsExperimentKey)
-        await refreshConfiguration()
-        publishRuntimeChange(reason: "configuration:views_experiment")
-    }
+
 
     public func setReflectionBudget(_ budget: Int) async {
         preferenceDefaults.set(max(0, budget), forKey: Self.reflectionBudgetKey)
@@ -1395,11 +1488,24 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         await refreshConfiguration()
         if enabled {
             if alreadyBootstrapped {
+                // A launch with the inner life off restored none of her mind;
+                // waking restores it (seeding and migrating her cares) and
+                // reads her recent life if that is still owed.
+                do {
+                    try await substrate.restorePersistentState()
+                } catch {
+                    bootstrapFailure = "cognitive restore failed: \(error.localizedDescription)"
+                    await substrate.recordReceipt(
+                        kind: "lifecycle.restore_failed",
+                        payload: .object(["error": .string(String(describing: error))])
+                    )
+                }
+                Task { await self.readRecentLifeIntoCaresIfOwed() }
                 organismContinuityRestored = false
                 await restoreOrganismContinuityIfAvailable()
                 await refreshOrganismBodySchema(reason: "subconscious enabled")
                 await persistOrganismContinuity(reason: "subconscious enabled")
-                // Desk changes while she was off did not reach her ruminations;
+                // Desk changes while she was off did not reach the work projection;
                 // waking reads the Desk once.
                 await startPursuitRefresh()
             } else {
@@ -1578,6 +1684,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             return .persistenceFailed(detail)
         }
         await substrate.clearTransientState()
+        // The wiped store keeps its four seeds; her life is read again at the next launch.
+        await substrate.establishCares()
         await organismKernel.clearTransientState()
         await rescheduleCognitionMaintenanceDeadline()
         lastInjectedCapsule = nil
@@ -1595,22 +1703,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
 
     /// Same seam, carrying the persistence outcome (2026-09-06) so the review
     /// surfaces can tell "saved" from "changed in memory only".
-    public func resolveStandingViewChecked(id: UUID, approved: Bool) async -> StandingViewTransition {
-        let resolved = await substrate.resolveStandingViewChecked(id: id, approved: approved)
-        guard resolved.view != nil else { return resolved }
-        scheduleDirtyMicrocycle(reason: "standing_view_resolution")
-        publishRuntimeChange(reason: "proposal:standing_view_resolved")
-        return resolved
-    }
+
 
     /// Same seam, carrying the persistence outcome (2026-09-06).
-    public func retireStandingViewChecked(id: UUID) async -> StandingViewTransition {
-        let retired = await substrate.retireStandingViewChecked(id: id)
-        guard retired.view != nil else { return retired }
-        scheduleDirtyMicrocycle(reason: "standing_view_retirement")
-        publishRuntimeChange(reason: "proposal:standing_view_retired")
-        return retired
-    }
+
 
     public func setAblation(_ key: String, enabled: Bool) async {
         await substrate.setAblation(key, enabled: enabled)
@@ -1618,22 +1714,13 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     }
 
     @discardableResult
-    public func pinTopConcern() async -> String? {
+    public func pinTopConcern(text: String? = nil, seat: StudioCanonTurnProvenance) async throws -> String? {
+        guard seat.isComplete else { return nil }
         await bootstrap()
-        guard let suggestion = await substrate.thoughtSuggestionSnapshot(
-            surface: "observatory",
-            limit: 1,
-            minimumInterruptionScore: 0
-        ).first else { return nil }
-        _ = await substrate.addThoughtSeed(
-            kind: .followUp,
-            text: "Pinned concern: \(suggestion.text)",
-            priority: 1,
-            sourceNodeIds: suggestion.sourceNodeIds
-        )
+        guard let concern = try await substrate.pinConcern(text, source: "turn:\(seat.surface)/\(seat.turnID)") else { return nil }
         scheduleDirtyMicrocycle(reason: "concern_pinned")
-        publishRuntimeChange(reason: "thought_seed:pinned")
-        return suggestion.text
+        publishRuntimeChange(reason: "care:pinned")
+        return concern
     }
 
     @discardableResult
@@ -1764,14 +1851,12 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             enabled: enabled,
             persistenceEnabled: enabled,
             capsuleInjectionEnabled: capsuleEnabled,
-            viewsExperimentEnabled: defaults.object(forKey: viewsExperimentKey) as? Bool ?? true,
             backgroundMicrocyclesEnabled: backgroundEnabled,
             reflectiveCallsEnabled: reflectionEnabled,
             maximumActiveNodes: 256,
             defaultDecayHalfLife: 60 * 60,
             maximumCapsuleCharacters: 4_000,
             maximumWorkspaceItems: 12,
-            maximumThoughtSeeds: 64,
             dailyReflectionCallBudget: budget,
             reflectionLoadThreshold: storedLoadThreshold ?? CognitiveConfiguration().reflectionLoadThreshold,
             reflectionSurface: "cognition_reflection",
@@ -1849,7 +1934,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     private static let backgroundKey = "cognitiveSubstrateBackgroundEnabled"
     private static let reflectionKey = "cognitiveSubstrateReflectionEnabled"
     /// Phase 5 D: the opinions-and-interests experiment, default on.
-    public static let viewsExperimentKey = "personalityViewsExperimentEnabled"
     private static let reflectionBudgetKey = "cognitiveSubstrateDailyReflectionBudget"
     /// Unresolved-load admission threshold for spontaneous reflection. No UI
     /// knob: the ceiling is what User steers; this is the shape's tuning seam.

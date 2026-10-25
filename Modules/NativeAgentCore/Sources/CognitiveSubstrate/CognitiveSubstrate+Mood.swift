@@ -92,8 +92,8 @@ extension CognitiveSubstrate {
 
     // MARK: - Disposition — the SLOW felt layer (User, 2026-07-09: "reflections need
     // to have an impact too — those help her feelings and stuff be a little slower
-    // moving"). Only CONSIDERED outcomes move it — three writers today: a reflection's
-    // tone, the nightly dream's mood, and a standing view User settles by approving it.
+    // moving"). Only considered outcomes move it: reflection tone, the nightly
+    // dream's mood, and repeated organism resolution patterns.
     // Never per-turn events, so it can never become a second fast channel. It decays
     // toward 0 over ~a day and feeds derivedMood as a small baseline term; the felt
     // fingerprint inherits it through mood — zero new capsule words, her feelings just
@@ -102,18 +102,13 @@ extension CognitiveSubstrate {
     /// Day-scale half-life: a settled morning reflection still colors the evening
     /// and has honestly faded by tomorrow night. (Fast affect axes: 20–90 min.)
     // `dispositionHalfLife` — W4/P1: now PersonalityDynamicsConfiguration.
-    /// Per-write nudge (≤2 reflections + 1 dream + rare approvals per day × 0.08,
+    /// Per-write nudge (reflections, dream and resolution patterns × 0.08,
     /// capped below): a gentle standing tone, structurally unable to ratchet.
     // `dispositionNudgeMagnitude` — W4/P1: now PersonalityDynamicsConfiguration.
     /// Hard cap on the disposition's reach — an undertone, never the mood itself.
     // `dispositionValenceCap` — W4/P1: now PersonalityDynamicsConfiguration.
     /// Weight of the disposition term inside derivedMood.
     static let dispositionMoodWeight = 0.15
-    /// A standing view formed inside this neutral mood band carries no felt sign —
-    /// approving it settles a VIEW, not a tone, so the disposition stays untouched.
-    /// (Same band `moodCongruence` treats as "mood hasn't left neutral".)
-    static let dispositionNeutralValenceBand = 0.15
-
     /// Mood-congruent recall: max score contribution (small — flavors, never dominates).
     static let moodCongruenceWeight: Double = 0.08
     /// Congruence only applies once mood has left the neutral band.
@@ -225,16 +220,14 @@ extension CognitiveSubstrate {
     /// can no longer be flooded by receipt mirrors (the R2-C store fix).
     ///
     /// EVERY writer routes through here, so the cap + day-scale decay hold for all of
-    /// them jointly: reflection tone, the nightly dream's mood, and User settling a
-    /// standing view. No writer can ratchet, and no writer can outrun the others.
+    /// them jointly: reflection tone, the nightly dream's mood, and repeated
+    /// organism resolution patterns. No writer can ratchet, and no writer can outrun the others.
     /// HOMEOSTASIS (item 6, 2026-09-02). What one write gives back toward zero,
     /// proportional to where the undertone already sits.
     ///
     /// MEASURED DEFECT: disposition was pinned at +0.35 — the rail — and had
     /// been for days. The 30-hour half-life is real, but it only runs BETWEEN
-    /// writes, and there are four writers (reflection tone twice a day, the
-    /// nightly dream's mood, an approved standing view, repeated organism
-    /// resolution patterns). Four +0.08 nudges a day is 0.32 of drive against
+    /// writes. Four +0.08 nudges a day is 0.32 of drive against
     /// ~0.15 a day of decay, so the cap was not a bound on a moving value, it
     /// was the value. A slow layer that never moves is not slow, it is stuck —
     /// and a stuck undertone is the opposite of "one thing on Tuesday and a

@@ -768,7 +768,7 @@ private extension ContextMarkdownCompiler {
             return (.procedure, .procedure)
         case .desk:
             return (.fact, .fact)
-        case .dream, .standingView:
+        case .dream:
             return (.evidence, .evidence)
         case .project:
             return (.project, .untrustedExternalData)

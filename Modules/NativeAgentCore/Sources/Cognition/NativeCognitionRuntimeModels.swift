@@ -14,11 +14,8 @@ public struct CognitiveObservatoryDetail: Sendable {
     public var substrate: CognitiveSubstrateSnapshot
     public var workspace: CognitiveWorkspaceSnapshot
     public var associations: [CognitiveAssociationEdge]
-    public var thoughtSeeds: [CognitiveThoughtSeed]
-    public var thoughtSuggestions: [CognitiveThoughtSuggestion]
     var episodes: [CognitiveEpisodeReference]
     public var schemaProposals: [CognitiveSchemaProposal]
-    public var standingViews: [CognitiveStandingView]
     public var developmentalTimeline: [CognitiveDevelopmentalTimelineEvent]
     /// 2026-09-13: the seven-day readout — what changed this week and why —
     /// projected from the timeline above and grouped by lesson or view. The
@@ -75,7 +72,6 @@ public struct CognitiveDoctorRead: Sendable {
     public let substrate: CognitiveSubstrateSnapshot
     public let workspace: CognitiveWorkspaceSnapshot
     public let associations: [CognitiveAssociationEdge]
-    public let thoughtSeeds: [CognitiveThoughtSeed]
     public let receiptRead: CognitiveReceiptRead
     public let welfareBounds: CognitiveWelfareBounds
     public let organism: OrganismSnapshot

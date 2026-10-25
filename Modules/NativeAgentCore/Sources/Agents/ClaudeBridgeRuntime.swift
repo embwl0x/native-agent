@@ -676,7 +676,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
 
         let components = path.dropFirst().split(separator: "/", maxSplits: 1).map(String.init)
         let lane = components.first ?? ""
-        let operation = path.hasPrefix("/standing_views") ? path : components.count == 2 ? "/" + components[1] : path
+        let operation = components.count == 2 ? "/" + components[1] : path
         let principal = bridgeCallerPrincipal(headers: headers)
         if let peerID = principal?.peerID { AgentPeerStore(dataRoot: host.dataRoot).recordProof(peerID: peerID, inbound: true) }
 
@@ -764,18 +764,6 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 return
             }
             handleEventsStream(conn: conn)
-        case "/standing_views":
-            guard method == "GET" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            handleStandingViewsList(conn: conn)
-        case "/standing_views/resolve":
-            guard method == "POST" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            handleStandingViewResolve(conn: conn, body: body)
         default:
             writeJSON(conn, status: 404, obj: ["error": "unknown_path", "path": path])
         }

@@ -1602,18 +1602,10 @@ extension MacSyncEngine {
                 reflexCandidates: 0,
                 reflexesNeedReview: 0,
                 approvedReflexBiases: nil,
-                standingViewProposals: snapshot.dreamRepairSummary.proposedStandingViews
+                standingViewProposals: nil
             ),
             reflexCandidates: nil,
-            standingViewProposals: snapshot.dreamRepairSummary.standingViewProposals.prefix(4).map {
-                OrganismLivingStandingViewProposalFile(
-                    id: $0.id,
-                    title: $0.title,
-                    rationale: $0.rationale,
-                    evidenceIDs: $0.evidenceIDs,
-                    reviewRequired: $0.reviewRequired
-                )
-            },
+            standingViewProposals: nil,
             availability: snapshot.enabled ? .live : .disabled
         )
     }

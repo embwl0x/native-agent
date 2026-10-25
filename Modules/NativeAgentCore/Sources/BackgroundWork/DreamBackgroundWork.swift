@@ -23,7 +23,8 @@ public enum DreamBackgroundWork {
         cycle: SwiftNativeDreamREMCycle,
         cognitionRuntime: NativeCognitionRuntime,
         force: Bool,
-        trigger: DreamTrigger
+        trigger: DreamTrigger,
+        notifications: any REMProposalNotificationPort
     ) async throws -> [String: Any] {
         let result = try await cycle.runDream(force: force, trigger: trigger)
         await raisePendingMoments(dataRoot: dataRoot)
@@ -45,7 +46,82 @@ public enum DreamBackgroundWork {
             metadata: metadata,
             reflectionMaterial: result.reflectionMaterial
         )
+        if let night = result.careNight {
+            await passCaresNight(night, dataRoot: dataRoot, cognitionRuntime: cognitionRuntime,
+                                 notifications: notifications)
+        }
         return response
+    }
+
+    /// The night's pass over her cares, after the dream committed. An approved
+    /// life card the live observer did not apply lands first; then the
+    /// substrate's pass; then one owner-review card for each care it found
+    /// ready for life depth and never offered before.
+    static func passCaresNight(
+        _ night: CognitiveCareNight, dataRoot: URL, cognitionRuntime: NativeCognitionRuntime,
+        notifications: any REMProposalNotificationPort
+    ) async {
+        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        let action = CognitiveSubstrate.careLifeApprovalAction
+        let cards: [ApprovalRecord]?
+        do { cards = try await inbox.list(filter: ApprovalFilter(action: action)) } catch {
+            nativeLog("[cares] life cards unreadable, none offered tonight: %@", error.localizedDescription)
+            cards = nil
+        }
+        for card in cards ?? [] where card.decision == "approved" && card.executedAction == nil {
+            await cognitionRuntime.applyCareLifeApproval(card)
+        }
+        let ready = await cognitionRuntime.substrateForIntegration().passCaresNight(night)
+        guard let cards else { return }
+        let offered = Set(cards.compactMap(NativeCognitionRuntime.careLifeCardCareID))
+        for care in ready where !offered.contains(care.id) {
+            let words = "\(care.about) has become part of who I am"
+            do {
+                let record = try await inbox.create(.object([
+                    "title": .string("Part of who I am"),
+                    "action": .string(action),
+                    "risk": .string("low"),
+                    "reason": .string(""),
+                    "payload": .object(["kind": .string(action), "careId": .string(care.id.uuidString),
+                                        "about": .string(care.about)]),
+                    "payloadPreview": .string(words),
+                ]))
+                let card: JSONValue = .object([
+                    "id": .string(record.id),
+                    "created_at": .string(NativeTimestampFormat.fractionalZulu(Date())),
+                    "source": .string("cares_night"),
+                    "presentation": .object(["icon": .string("heart"), "badge": .string("Cares"),
+                                             "words": .string("From my night"), "act_label": .string("Go ahead")]),
+                    "severity": .string("actionable"),
+                    "title": .string("Part of who I am"),
+                    "summary": .string(words),
+                    "detail": .string("Approve and it is part of who I am (life depth); deny and it stays a season care."),
+                    "related_mission_id": .null,
+                    "related_approval_id": .string(record.id),
+                    "related_paths": .array([]),
+                    "related_groups": .array([]),
+                    "actions": .array([
+                        .object(["id": .string("view"), "label": .string("View"), "description": .string("See full detail")]),
+                        .object(["id": .string("approve"), "label": .string("Approve"),
+                                 "description": .string("Make it part of who I am")]),
+                        .object(["id": .string("reject"), "label": .string("Deny"),
+                                 "description": .string("Keep it a season care")]),
+                        .object(["id": .string("dismiss"), "label": .string("Dismiss"), "description": .string("Dismiss this card")]),
+                    ]),
+                    "status": .string("unread"),
+                    "read_at": .null,
+                ])
+                if try await LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+                    .appendUnique(card, id: record.id) {
+                    await notifications.notifyIfAttentionWorthy(
+                        dataRoot: dataRoot, itemId: record.id, title: "Part of who I am", summary: words,
+                        source: "cares_night", severity: "actionable")
+                }
+            } catch {
+                nativeLog("[cares] life card for %@ not staged; the next night offers it again: %@",
+                          care.id.uuidString, error.localizedDescription)
+            }
+        }
     }
 
     /// Lived moments wait for her review and are never accepted for her. Her
@@ -511,6 +587,16 @@ public enum DreamBackgroundWork {
                     metadata: $0.metadata
                 )
             }
+        }
+    }
+
+    /// Her cares for the dream prompt, read from the same substrate seam.
+    public static func makeDreamCareNightProvider(
+        cognitionRuntime: NativeCognitionRuntime
+    ) -> DreamCareNightProvider {
+        let runtime = cognitionRuntime
+        return { @Sendable in
+            await runtime.substrateForIntegration().careNightMaterial()
         }
     }
 

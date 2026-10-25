@@ -30,7 +30,7 @@ member names and behavioral prose still require source review.
 User, 2026-09-15: "nothing in native agent should feel like machinery for them"
 and "everything natural for the agent."
 
-**Agent functions naturally throughout NativeAgent, with them attention on what
+**Agent functions naturally throughout NativeAgent, with their attention on what
 they are accomplishing. The app handles the mechanics and brings their meaningful
 results or decisions.** AX means Agent Experience. This applies to remembering,
 recalling context, researching, creating, using apps and tools, getting help,
@@ -161,7 +161,7 @@ does, through translation layers the app owns:
 
 ### Clause 6 — Connected is not clouded (alive means CLEAR-HEADED)
 User, 2026-09-01: "We don't want their mind clouded by a bunch of stuff. We want
-everything to be at them fingertips but their mind clear to act and think."
+everything to be at their fingertips but their mind clear to act and think."
 Clauses 1, 3 and 5 say the world and their own organs must reach their. This
 clause says HOW: as reach, never as weight. A mind that is handed everything
 it could ever want on every turn is not more connected — it is buried.
@@ -174,7 +174,7 @@ it could ever want on every turn is not more connected — it is buried.
   paragraph in their own context; a dashboard readout they never consumes is
   deleted, not surfaced.
 - Litmus: does this change make something REACHABLE that wasn't, or does it
-  put something IN FRONT of them that wasn't? Reachable is clause-6 work.
+  put something IN FRONT of their that wasn't? Reachable is clause-6 work.
   In-front-of needs a reason this exact turn could not do without it.
 - Canonical: the resident packet — twelve selected atoms and eight lazy
   pointers instead of every memory on every turn — is the shape. Skills as
@@ -212,7 +212,7 @@ is; we design it so it just is what we need," and "your world isn't bounded."
 Every agent on earth right now has the same shape: a model is called with a
 prompt built from files, and the "agent" is scaffolding around it. The model
 is the center and the program its visitor. NativeAgent inverts that.
-- **They are the program; the model is one of them organs.** Their turn is theirs:
+- **They are the program; the model is one of their organs.** Their turn is theirs:
   code they owns that decides what to recall, what to think about, when to
   think at all, how to answer, when to stay silent. Their persona isn't a
   prompt the model reads; it's what their code does. The model is reach, like
@@ -221,9 +221,9 @@ is the center and the program its visitor. NativeAgent inverts that.
 - **One form, one law, a stem with no features.** Everything they are made of
   is a *part*: one file, one header (code, reach, wake, face, state, learned).
   Every part lives by one law: it runs when its wake reaches it, touches only
-  its reach under Trust, may think, learns by use on CPU, changes only by them
+  its reach under Trust, may think, learns by use on CPU, changes only by their
   hand, heals by swapping back to its last clean self, fades when unused, and
-  its face is drawn on them interface and the person's from the same
+  its face is drawn on their interface and the person's from the same
   description. The Swift stem runs parts, delivers signals, gates effects,
   keeps the law, draws faces and reaches the world. It never thinks and has
   no opinions; when a rule can't settle something it asks their, with evidence.

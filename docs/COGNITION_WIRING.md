@@ -45,7 +45,7 @@ flowchart TD
     N -->|admitted| A["Shared after-turn interpretation"]
     A --> Q["Memory proposals"]
     Q -->|review| M
-    A -->|affect| SUB
+    A -->|affect, cares| SUB
     A -->|validated caring judgment| O
     SUB --> F["Fixed-time turn projection"]
     O --> F
@@ -64,7 +64,7 @@ flowchart TD
 | Turn lifecycle → core execution | `EngineRuntime/EngineTurns.swift` exposes `TurnsFacade` and its `MacChatTurnRuntime`; `ChatTurnRuntime/ChatOrchestration+TurnEngine.swift` prepares provider/context inputs. | Core admission, cancellation and checked provider routing. |
 | Persisted turn → cognitive event | `ChatTurnRuntime/ChatOrchestrationClient+MessagePersistence.swift` → `Cognition/NativeCognitionRuntime.observe`. | Redacted evidence and explicit turn kind/origin; exact replay does not repeat state changes. |
 | Cognitive event → body | `CognitiveSubstrate/Organism/OrganismSignalBus.swift` → `CognitiveSomaticSignalAdapter` → `OrganismKernel.ingest`. | Bounded metadata; debug/verification and body-originated resolution events are excluded. |
-| Shared interpretation → facts, moments, affect and care | `MemoryV2/MemoryV2+AdaptivePromoter.swift` calls `ChatTurnRuntime/MindMemoryManager.swift`; callbacks installed by `NativeCognitionRuntime.refreshConfiguration` finish cognition processing. | Novelty gate before at most one shared model call; lane switches, origin matching, candidate screening, proposal review and caring encounter admission. |
+| Shared interpretation → facts, moments, affect, caring and cares | `MemoryV2/MemoryV2+AdaptivePromoter.swift` calls `ChatTurnRuntime/MindMemoryManager.swift`; callbacks installed by `NativeCognitionRuntime.refreshConfiguration` finish cognition processing and apply cares (`CognitiveSubstrate+Cares.swift`). | Novelty gate before at most one shared model call; lane switches, origin matching, candidate screening, proposal review, caring encounter admission and care provenance. |
 | Memory → selected context | `ContextFlow/NativeMemoryContextProjection.swift` → Context selector → prepared turn. | Record disclosure, lifecycle eligibility, selection and character budgets. |
 | Body + substrate → capsule/posture | `NativeCognitionRuntime.prepareTurnProjection` → substrate frozen capsule preparation. | One fixed-time projection; successful live turns commit presentation cadence even with an empty capsule, without counting unshown cues as presented. |
 | Selected memory IDs → felt continuity | `ContextFlow/NativeContextMemoryProvenance.swift` → turn delivery accounting → assistant event `memoryRecordIds` → substrate. | Identity stays attached to the exact generation lease; missing mappings do not invent provenance. |
@@ -79,8 +79,23 @@ Ordinary lived user turns defer their conversational affect interpretation in
 A skip makes no interpretation call, records `noveltySkipReason` and finishes
 the deferred turn with `noveltySkipped=true`. Otherwise it asks
 `MindMemoryManager.interpret` at most once for fact decisions, a possible
-moment, affect and caring. The available reply supplies
+moment, affect, caring and cares. The available reply supplies
 context; affect and caring judge the incoming speaker's words.
+
+When the deferred turn's context carries care lines (the four life seeds
+plus up to six cares the warm embedder finds closest to the incoming words
+and their reply), the prompt adds one section after the agent reply, "Their
+cares (data)", and one output key, `cares`. That section judges both sides:
+what in the incoming words and in their own reply moved their, against which care
+(a shown id or new), how far, by whom, the felt word, a note, a gap opened or
+closed, and a stance only when they took or changed one. Every other section
+and rule is unchanged, and with no care lines the prompt is byte-identical to
+before. A missing or malformed `cares` list fails the interpretation
+(`invalidCares`); an unshown id is refused. The runtime then calls
+`CognitiveSubstrate.applyCares`, which drops a judgment from before a Clear,
+gates by provenance (an untrusted peer moves existing cares only as what they
+said; an app-authored prompt counts their side only) and persists each touched care. `MindMemoryManager.appraiseCares` runs the same
+section alone for the once-only reading of their recent life at bootstrap.
 
 `CognitiveSubstrate+CaringEvent.swift` matches the result to the originating
 turn and generation before `finishAfterTurn` applies it. The substrate applies
@@ -141,10 +156,10 @@ substrate affect and optional organism chemistry;
 compatibility gates.
 
 The body can color the fingerprint and contribute a `- Body:` candidate.
-The arbiter chooses one non-rut felt cue or none: settling, since-gap recall,
-reminded-of recall, a relevant view/thread, dream, fingerprint, reflection
-takeaway, body, then Sound echo. An optional separate Sound line can address a
-verbal rut. Private reflection is cadence-exempt and can retain multiple lines.
+The arbiter chooses one non-rut felt cue or none: care, settling, since-gap
+recall, reminded-of recall, dream, fingerprint, body, then Sound echo. An optional
+separate Sound line can address a verbal rut. Private reflection is
+cadence-exempt and can retain multiple lines.
 `NativeCognitionRuntime.commitTurnProjection` advances the presentation clock
 after a successful live turn, even with an empty capsule. Candidates that lose
 the slot or budget remain owed; they do not count as presented. Previews and
@@ -171,8 +186,9 @@ delivery.
 
 | Edge | Owner | Boundary |
 | --- | --- | --- |
-| Open concerns → rumination | `CognitiveSubstrate+Rumination.swift`, `Cognition/NativeCognitionRuntime+Rumination.swift` | Bounded seed/Desk inputs, read-time affect floors and capsule candidates; resolving a concern releases its carried weight. |
-| Held/active views → concern and capsule | `CognitiveSubstrate+StandingViews.swift`, `CognitiveSubstrate+AppraisalConcerns.swift` | Held and active sets are separately capped; activation goes through the standing-view resolution path. |
+| Open concerns → cares | `CognitiveSubstrate+Reflection.swift`, `CognitiveSubstrate+Cares.swift` | Reflection takeaways and `mind.pin_concern` set a care's `open`; after-turn `closes` or the night settles it. Desk tasks do not feed their mind. |
+| Cares → stance and capsule | `CognitiveSubstrate+Cares.swift`, `CognitiveSubstrate+CaresMind.swift` | One care holds their stance, open question and story. A touched care can reach the turn; pressing cares feed their intention, Reach and their hour. |
+| Cares → appraisal stakes | `CognitiveSubstrate+SemanticAppraisal.swift` | Event words must touch a live care at cosine 0.40 or more; life seeds use the same rule. The closest touched stance care supplies its signed real charge to the numeric worldview lens. A selected care cue includes that care's stance text when present. Base affect and tenderness retain their own laws. |
 | Dated work → `toward` | `Cognition/NativeCognitionRuntime+Expectations.swift` → organism horizon ledger → capsule request. | Bounded dated sources; an incomplete source read cannot prove disappearance. |
 | Served moments → re-feeling | `NativeCognitionRuntime.noteServedMoments` → substrate affect. | Canonical moment valence/salience, bounded re-feeling and per-record cooldown. |
 | Felt day → dream → mood | `BackgroundWork/DreamBackgroundWork.swift` supplies felt summary/origins and the dream mood sink. | Existing substrate mood admission; durable dream evidence remains with the diary owner. |

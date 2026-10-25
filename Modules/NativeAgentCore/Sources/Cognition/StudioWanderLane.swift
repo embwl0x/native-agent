@@ -295,38 +295,33 @@ public enum StudioWanderLane {
     /// the lane decline to even ask rather than manufacture a prompt out of
     /// nothing.
     public struct Material: Sendable, Equatable {
-        /// `openQuestion` / `anomaly` thought-seed texts, newest first.
-        public var curiosity: [String]
         /// The studio-intake part's invitation for what is in reach.
         public var invitations: [String]
         /// Titles she has written about lately — so she can notice a rut, not
         /// so anything avoids one for her.
         public var recentJournalTitles: [String]
-        /// Phase 5 D2: her open interests ("topic — her question"), strongest
-        /// first. Offered ahead of everything else, never assigned.
-        public var interests: [String]
-        /// Phase 5 D2: the experiment is on, so the hour may end with the
-        /// question she would come back with.
+        /// Her own open cares, most pressing first.
+        /// ("topic — her question"). Offered ahead of everything else, never assigned.
+        public var cares: [String]
+        /// The hour may end with the question she would come back with.
         public var asksForQuestion: Bool
 
         public init(
-            curiosity: [String] = [],
             invitations: [String] = [],
             recentJournalTitles: [String] = [],
-            interests: [String] = [],
+            cares: [String] = [],
             asksForQuestion: Bool = false
         ) {
-            self.curiosity = curiosity
             self.invitations = invitations
             self.recentJournalTitles = recentJournalTitles
-            self.interests = interests
+            self.cares = cares
             self.asksForQuestion = asksForQuestion
         }
 
         /// Nothing of her own to look at. The hour still happened; she simply
         /// had nothing in reach, which is a decline and not a failure.
         public var isEmpty: Bool {
-            curiosity.isEmpty && invitations.isEmpty && interests.isEmpty
+            invitations.isEmpty && cares.isEmpty
         }
 
         public static let bulletLimit = 8
@@ -390,11 +385,8 @@ public enum StudioWanderLane {
             sections.append("Nothing is on the table today. The hour is still yours: anything you are "
                 + "curious about is fair, or decline.")
         }
-        if !material.interests.isEmpty {
-            sections.append("# You were wondering\n" + Material.bullets(material.interests))
-        }
-        if !material.curiosity.isEmpty {
-            sections.append("# Still open for you\n" + Material.bullets(material.curiosity))
+        if !material.cares.isEmpty {
+            sections.append("# You were wondering\n" + Material.bullets(material.cares))
         }
         if !material.invitations.isEmpty {
             sections.append("# In reach\n" + Material.bullets(material.invitations))

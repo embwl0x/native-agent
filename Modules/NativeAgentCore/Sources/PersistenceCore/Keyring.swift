@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `Keyring.swift` | `Keyring` enum: the one keyring's storage — a secret by them name in one Keychain service with the hosts and programs the person granted it for, its renewal and when it was granted; `kept`, every entry by name; `{{secret:<name>}}` names; a program grant is the executable's path and code identity; no network |
+// Blueprint: | `Keyring.swift` | `Keyring` enum: the one keyring's storage — a secret by their name in one Keychain service with the hosts and programs the person granted it for, its renewal and when it was granted; `kept`, every entry by name; `{{secret:<name>}}` names; a program grant is the executable's path and code identity; no network |
 
 /// The one keyring (docs/AGENT_IS_THE_APP.md, "Reach"): where every secret
 /// her abilities reach with is kept, under the name she gave it, in this

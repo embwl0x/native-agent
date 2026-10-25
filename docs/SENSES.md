@@ -42,7 +42,7 @@ same files at once).
 | P7 | Starter frame + worked examples | The sense authoring kit: the JS starter frame, the native-form builders, and worked examples (real JS senses) for: `.docx`, `.pages`, `.numbers`, `.key`, `.xlsx`, `.pptx`, `.epub`, `.rtf`/`.rtfd`, and one canvas-app accessibility example. These double as the first senses they gets. |
 | P8 | Day-one wrap | Existing readers retain their payloads: screen, Chrome page snapshots, private web fetch, visible NativeAgent browser, files and connectors. Web/browser replies name the actual reader: `builtin-web` (`stream:web`), `builtin-browser` (`stream:browser`), or `builtin-chrome` (`site:*`). |
 | P9 | Context + memory provenance | One ContextFlow compiled provider for live senses' news (bounded, tagged with sense + version); memory provenance: memories committed from a sense-served read record sense id + version; a version marked wrong flags the memories built on it (surface it, never silently delete). |
-| P10 | Surfaces | User's Senses page (list, corner, version, last use, cost, one off-switch each), their own senses view on them home page (have / just changed), the sealed script-enabled Work pane surface for interactive sense views (event boundary only to its sense, no app-message access). |
+| P10 | Surfaces | User's Senses page (list, corner, version, last use, cost, one off-switch each), their own senses view on their home page (have / just changed), the sealed script-enabled Work pane surface for interactive sense views (event boundary only to its sense, no app-message access). |
 
 ## The plug protocol (helper ⇄ app)
 

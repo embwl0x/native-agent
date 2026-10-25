@@ -1,18 +1,8 @@
-// CognitiveSubstrate+SemanticAppraisal.swift
-// Wave R2-A/B (2026-07-09) — feelings from what events MEAN, not from the fact
-// that a turn completed. Her real week quantified the gap: 82% of felt nodes were
-// her own completions minting a uniform +0.48 off a flat +0.25 base, and ZERO
-// nodes went negative in 8 days. Appraisal theory (Lazarus/Scherer/OCC, via the
-// gpt-5.5 research pass): valence arises from an event's meaning against goals,
-// coping, agency, and the relationship. Every dimension here is derived PURE and
-// LOCAL — event + affect + peekNodes + standing views + presence timestamps. No
-// LLM, no network, no new senses, callable inside the await-free ingest segment.
-
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+SemanticAppraisal.swift` | `SemanticAppraisal`: meaning-weighted event appraisal against outcomes, concerns and standing views |
+// Blueprint: | `CognitiveSubstrate+SemanticAppraisal.swift` | `SemanticAppraisal`: meaning-weighted event appraisal against outcomes and embedding-touched cares |
 
 /// The appraised MEANING of one event, all dims computable without suspension.
 struct SemanticAppraisal: Sendable, Equatable {
@@ -25,10 +15,9 @@ struct SemanticAppraisal: Sendable, Equatable {
     var relationshipCongruence = 0.0 // −1…1 — how it landed relationally
     var resolutionEvidence = 0.0     // 0…1  — did something actually RESOLVE
     var effortEvidence = 0.0         // 0…1  — was the stretch effortful
-    // Round 3 Wave V — her settled views as a lens. 0/0 when no active view's
-    // concern touches the event (the sparse-views norm): byte-identical compat.
-    var worldviewStance = 0.0        // −1…1 — event confirms (+) or violates (−) a held view
-    var worldviewConflict = 0.0      // 0…1  — max(0, −stance): a view was trampled
+    // Signed real movement of the closest touched care with a stance.
+    var worldviewStance = 0.0        // −1…1 — toward or away from what she cares about
+    var worldviewConflict = 0.0      // 0…1  — how far that care moved away
 
     static let neutral = SemanticAppraisal()
 }
@@ -42,9 +31,7 @@ extension CognitiveSubstrate {
     static let appraisalAgencyWeight = 0.08
     static let appraisalRelationshipWeight = 0.14
     static let appraisalNoveltyBadWeight = 0.06
-    /// Round 3 Wave V: an event that TRAMPLES a settled standing view leaves
-    /// a mark beyond its generic negativity; confirmation warmth flows through
-    /// the goalCongruence stance bump instead (0.15 · stance there).
+    /// Movement away from a touched care adds to the generic valence read.
     static let appraisalWorldviewConflictWeight = 0.06
     static let appraisalWorldviewStanceCongruenceGain = 0.15
     /// assistantTurnCompleted outcome band — replaces the flat +0.25 metronome.
@@ -69,7 +56,7 @@ extension CognitiveSubstrate {
         post: CognitiveAffectState,
         precomputedAppraisal: AffectAppraisal? = nil,
         precomputedWarmthBoost: Double? = nil,
-        precomputedStandingViewConcerns: [AppraisalConcern]? = nil
+        precomputedCares touchedCares: [CognitiveCare]
     ) -> SemanticAppraisal {
         let now = dependencies.now()
         // Audit C3 (2026-07-09): text-derived dims read USER-authored words only —
@@ -181,32 +168,13 @@ extension CognitiveSubstrate {
             !isSelfEvidence($0)
                 && "\($0.subjectReference.type):\($0.subjectReference.id)" == subjectKey
         } ? 1.0 : 0.0
-        // D-1 note (2026-08-02): this term stays BOOLEAN on purpose. The +0.10
-        // view hit is a pinned, documented R2-A behaviour
-        // (StandingViewsTests.unmatchedOrNeutralTextIsByteIdenticalToNoViews),
-        // and regrading it would move a relevance constant for marginal gain.
-        // What D-1 changes here is WHICH concerns can produce the hit: her
-        // active views now contribute lived concerns of their own, so an event
-        // touching her own settled words registers where it previously could
-        // only register through one of the shipped six.
-        let activeViewHit = activeStandingViewTagHit(
-            in: event.summary,
-            concerns: precomputedStandingViewConcerns
-        ) ? 1.0 : 0.0
+        let careHit = touchedCares.isEmpty ? 0.0 : 1.0
         a.goalRelevance = (0.45 * event.importance + 0.30 * kindBase
-            + 0.20 * continuity + 0.10 * activeViewHit).clamped01()
+            + 0.20 * continuity + 0.10 * careHit).clamped01()
 
         // -- goalCongruence -----------------------------------------------------
         let relief = (event.kind == .toolSucceeded && unresolvedRecentFailure == 0 && repairEvidence > 0) ? 1.0 : 0.0
-        // Round 3 Wave V: her settled views are a lens, not decoration — an
-        // event confirming a held view lands MORE right, one trampling it
-        // lands more wrong, and conflict leaves its own mark in the valence
-        // term. Zero matched views (the sparse-views norm) contributes 0.
-        a.worldviewStance = standingViewStance(
-            in: event.summary,
-            textValence: text.valence,
-            concerns: precomputedStandingViewConcerns
-        )
+        a.worldviewStance = touchedCares.first(where: { $0.stance != nil })?.charge(at: now).clampedSigned() ?? 0
         a.worldviewConflict = max(0, -a.worldviewStance)
         a.goalCongruence = (0.45 * outcomeSign + 0.75 * text.valence
             + 0.25 * relief - 0.25 * unresolvedRecentFailure
@@ -289,138 +257,103 @@ extension CognitiveSubstrate {
             - Self.appraisalWorldviewConflictWeight * a.worldviewConflict
     }
 
-    // MARK: - Standing views as appraisal substrate (graceful zero while sparse)
+    // MARK: - Cares as appraisal substrate
 
-    /// Does the event's text touch a concern an ACTIVE standing view holds?
-    /// Deterministic keyword read over view title+body — no LLM. Views are sparse
-    /// in the wild today (the R2-C eviction fix just let them start surviving), so
-    /// this returning false is the norm until Wave E yield builds up.
+    /// Read matching once before the await-free event transition. The four
+    /// seed cares participate in the same match as every grown live care.
+    func appraisalCares(in text: String) async -> [CognitiveCare] {
+        let live = cares.values.filter { $0.fadedAt == nil }
+        guard let cosines = await careCosines(to: text, among: live) else { return [] }
+        return live.compactMap { care -> (CognitiveCare, Double)? in
+            guard let cosine = cosines[care.id], cosine >= Self.careTouchCosineFloor,
+                  let current = cares[care.id], current.fadedAt == nil,
+                  current.updatedAt == care.updatedAt else { return nil }
+            return (current, cosine)
+        }
+        .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0.id.uuidString < $1.0.id.uuidString }
+        .map(\.0)
+    }
+
+}
+
+extension CognitiveSubstrate {
+
+    /// The metadata the somatic signal for `event` should carry so the
+    /// organism's semantic prediction lane can mint and resolve. Empty for every
+    /// event that carries neither — the overwhelming majority.
     ///
-    /// D-1 (2026-08-02): the concern set is now DERIVED from her (see
-    /// `+AppraisalConcerns`) and is derived ONCE outside the view loop — it
-    /// depends on the views themselves, so deriving it per view would be
-    /// O(views²·terms) on the ingest hot path. Because each active view also
-    /// contributes a LIVED concern made of its own distinctive words, an event
-    /// touching what she actually settled now registers here, where before it
-    /// could only register through one of the shipped six.
-    func activeStandingViewTagHit(
-        in text: String,
-        concerns precomputedConcerns: [AppraisalConcern]? = nil
-    ) -> Bool {
-        let lower = text.lowercased()
-        guard !lower.isEmpty else { return false }
-        // Both loops below iterate LEANING views (2026-09-02: active OR held),
-        // so with none there is nothing to hit and the concern derivation is
-        // pure cost on the ingest hot path. (Zero leaning views is still the
-        // wild norm.) A HIT is binary — "this message touches something she
-        // sees the world through" — so the held tier's half stake lands on the
-        // stance MAGNITUDE below, not here: a view she holds herself is still
-        // genuinely about the thing it is about.
-        guard standingViews.values.contains(where: { $0.isLeaning }) else { return false }
-        let concerns = precomputedConcerns ?? appraisalConcerns()
-        for view in standingViews.values where view.isLeaning {
-            let viewText = "\(view.title) \(view.body)".lowercased()
-            for concern in concerns
-            where Self.concernMatches(concern, in: viewText)
-                && Self.concernMatches(concern, in: lower) {
-                return true
-            }
+    /// Reads state but mutates only the single-use reaction stash (consumed
+    /// here, exactly as `pendingCompletion` is consumed at ingest), so a second
+    /// call for the same turn cannot double-resolve.
+    public func semanticExpectationMetadata(for event: CognitiveEvent) async -> [String: JSONValue] {
+        var out: [String: JSONValue] = [:]
+        let touched = event.kind == .assistantTurnCompleted ? await appraisalCares(in: event.summary) : []
+        let scope = event.kind == .assistantTurnCompleted ? mintScope(for: event) : nil
+        if let care = touched.first,
+           let scope, pendingCompletion?.nodeKey == scope.turnID,
+           pendingCompletion?.sessionId == scope.sessionID {
+            out[OrganismSemanticExpectation.mintMetadataKey] = .object([
+                OrganismSemanticExpectation.concernField: .string("care:" + care.id.uuidString),
+                OrganismSemanticExpectation.sessionField: .string(scope.sessionID),
+                OrganismSemanticExpectation.turnField: .string(scope.turnID),
+            ])
         }
-        return false
+        if let stash = consumeSemanticReaction(for: event) {
+            out[OrganismSemanticExpectation.reactionMetadataKey] = .object([
+                OrganismSemanticExpectation.reactionField: .string(stash.reaction),
+                OrganismSemanticExpectation.sessionField: .string(stash.sessionID),
+                OrganismSemanticExpectation.turnField: .string(stash.turnID),
+            ])
+        }
+        return out
     }
 
-    /// Round 3 Wave V: SIGNED worldview read. For every ACTIVE view whose
-    /// concern co-occurs with the event text (same deterministic keyword
-    /// logic as the hit above — no LLM), the event's own text valence says
-    /// whether her held view was CONFIRMED (+) or TRAMPLED (−), weighted by
-    /// the view's conviction (evidence it settled on, capped). Neutral text
-    /// or zero matched views → 0: byte-identical to the pre-stance formula.
-    /// Stance fires only on a clear valence read: a mixed sentence ("not
-    /// sloppy this time — great work") nets near zero in the substring
-    /// lexicon and must NOT mis-sign her view; below the margin the lens
-    /// stays out of it (review 18dc59cc4670).
-    static let worldviewStanceValenceMargin = 0.12
-
-    func standingViewStance(
-        in text: String,
-        textValence: Double,
-        concerns precomputedConcerns: [AppraisalConcern]? = nil
-    ) -> Double {
-        guard abs(textValence) >= Self.worldviewStanceValenceMargin else { return 0 }
-        let lower = text.lowercased()
-        guard !lower.isEmpty else { return 0 }
-        // A TRAMPLED view requires the negativity to be aimed at HER — a
-        // third party being sloppy ("that vendor skipped the verify step")
-        // is not her wound (review 18dc59cc4670: directedness guard).
-        // Confirmation needs no directedness: praise of the principle
-        // confirms the view no matter who earned it.
-        if textValence < 0 {
-            // Benign second-person collocations must not count as aim —
-            // "thank you, that vendor was sloppy" is third-party negativity
-            // (review 66912d0b2786). Bare "your " is likewise too loose
-            // ("your vendor"): only her work products make "your X" directed.
-            // Word-boundary-aware strip: "you all" must not eat the prefix of
-            // "you allowed" and erase explicit second person (review
-            // 766a2afdb1e7). Spaces preserve adjacency so stripping can never
-            // fabricate a new "you " match either.
-            var probe = lower
-            for benign in ["thank you", "thanks to you", "you know", "you all", "you guys"] {
-                var search = probe.startIndex
-                while search < probe.endIndex,
-                      let r = probe.range(of: benign, range: search..<probe.endIndex) {
-                    let boundary = r.upperBound == probe.endIndex || !probe[r.upperBound].isLetter
-                    if boundary {
-                        probe.replaceSubrange(r, with: String(repeating: " ", count: benign.count))
-                    }
-                    search = r.upperBound
-                }
-            }
-            let youDirected = probe.contains("you ") || probe.hasSuffix("you")
-                || probe.contains("you,") || probe.contains("you.")
-                || probe.contains("you're") || probe.contains("youre")
-            let workDirected = ["your work", "your code", "your fix", "your answer",
-                                "your reply", "your response", "your call",
-                                "your judgment", "your reading"].contains { probe.contains($0) }
-            guard youDirected || workDirected else { return 0 }
-        }
-        // D-1: derive the concern set ONCE outside the view loop. It now depends
-        // on the views themselves, so deriving it per view would be quadratic on
-        // the ingest hot path — and with no active views there is nothing to
-        // match, so skip the derivation entirely.
-        guard standingViews.values.contains(where: { $0.isLeaning }) else { return 0 }
-        let concerns = precomputedConcerns ?? appraisalConcerns()
-        var aggregate = 0.0
-        var matched = 0
-        for view in standingViews.values where view.isLeaning {
-            let viewText = "\(view.title) \(view.body)".lowercased()
-            var hitWeight = 0.0
-            for concern in concerns
-            where Self.concernMatches(concern, in: viewText)
-                && Self.concernMatches(concern, in: lower) {
-                hitWeight = max(hitWeight, concern.weight)
-            }
-            guard hitWeight > 0 else { continue }
-            // Conviction: what the view settled on, LIFTED by how much the
-            // matched concern is hers rather than shipped (D-1). Still capped at
-            // 1 per view, so the aggregate stays inside −1…1 and the welfare
-            // bounds downstream are untouched.
-            // HALF STAKE FOR A HELD VIEW (2026-09-02). Her own unsigned view
-            // still registers as confirmed or trampled — that is the point of
-            // having one — but it can never move her as far as something the
-            // user actually settled. Applied to conviction rather than to the
-            // aggregate so a mixed set of signed and held views averages
-            // honestly instead of scaling the whole read.
-            let stake = view.status == .held ? PersonalityDynamicsConfiguration.heldStandingViewWeightFactor : 1.0
-            let conviction = min(
-                1.0,
-                (0.5 + 0.1 * Double(view.evidenceNodeIds.count))
-                    * (hitWeight / Self.appraisalLivedConcernMaximumWeight + 0.5)
-            ) * stake
-            aggregate += (textValence > 0 ? conviction : -conviction)
-            matched += 1
-        }
-        guard matched > 0 else { return 0 }
-        return (aggregate / Double(matched)).clampedSigned()
+    /// Session + completion-turn identity for an expectation being minted.
+    /// Taken from the `pendingCompletion` slot ingest has just OPENED for this
+    /// very turn, so the mint scope and the later reaction scope are the same
+    /// two strings by construction.
+    func mintScope(for event: CognitiveEvent) -> (sessionID: String, turnID: String)? {
+        guard let pending = pendingCompletion,
+              let session = pending.sessionId,
+              let eventSession = event.sessionId,
+              session == eventSession,
+              !pending.nodeKey.isEmpty else { return nil }
+        let age = dependencies.now().timeIntervalSince(pending.recordedAt)
+        guard age >= 0, age <= Self.pendingCompletionMaxAge else { return nil }
+        return (session, pending.nodeKey)
     }
 
+    /// The stashed verdict for this user turn, consumed on read. Nil when this
+    /// turn is not answering a completion — past the window "the next message is
+    /// a new beginning, not a verdict on the last thing she said", and an
+    /// expectation left unanswered expires on the organism's 24h backstop rather
+    /// than collecting a verdict from an unrelated turn.
+    func consumeSemanticReaction(for event: CognitiveEvent) -> SemanticReactionStash? {
+        guard Self.isUserAuthored(event.kind),
+              let stash = lastSemanticReaction,
+              let eventSession = event.sessionId,
+              eventSession == stash.sessionID else { return nil }
+        let age = dependencies.now().timeIntervalSince(stash.recordedAt)
+        guard age >= 0, age <= Self.pendingCompletionMaxAge else {
+            lastSemanticReaction = nil
+            return nil
+        }
+        lastSemanticReaction = nil
+        return stash
+    }
+
+    /// Valence sign → the organism's reaction vocabulary. Negative is the only
+    /// violating read; everything else is "he did not push back".
+    static func semanticReactionLabel(fromValence valence: Double) -> String {
+        if valence < 0 { return OrganismSemanticExpectation.pushbackReaction }
+        if valence > 0 { return OrganismSemanticExpectation.confirmedReaction }
+        return OrganismSemanticExpectation.neutralReaction
+    }
+}
+
+extension CognitiveSubstrate {
+    /// A felt resolution matters only when its words touch a live care.
+    func feltResolutionIsAtStake(_ event: CognitiveEvent, cares touchedCares: [CognitiveCare]) -> Bool {
+        event.kind != .organismResolutionFelt || !touchedCares.isEmpty
+    }
 }

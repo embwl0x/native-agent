@@ -23,6 +23,9 @@ struct BubbleView: View, Equatable {
     @State private var attachmentCountWithoutPreview = 0
     @State private var audioPreview: URL?
     @State private var audioError: String?
+    /// How much of the text the paced reveal had caught up with when it last
+    /// rested; nil when this bubble never paced (a reply loaded settled).
+    @State private var revealedBytes: Int?
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message && lhs.streamingHint == rhs.streamingHint
@@ -126,6 +129,10 @@ struct BubbleView: View, Equatable {
     /// own lines), 2 a settled reply as markdown.
     private var phase: Int {
         if message.isStreaming || isLiveTurn { return message.text.isEmpty ? 0 : 1 }
+        // A settled reply keeps typing until the reveal has caught up, then
+        // turns to markdown: the finished text often lands a moment after the
+        // first words, and swapping at once showed it all in one jump.
+        if let revealed = revealedBytes, revealed < message.text.utf8.count { return 1 }
         return message.role == .assistant && !message.text.isEmpty ? 2 : 1
     }
 
@@ -156,7 +163,8 @@ struct BubbleView: View, Equatable {
                 Text(message.text.isEmpty ? " " : message.text)
             } else {
                 // The phone's ~1 s batches carry up to ~1,200 characters (up to 4 bytes each).
-                PacedStreamingText(text: message.text, maxLagBytes: 4_800, inline: ChatInlineMarkdown(MobileChatMarkdown.inline))
+                PacedStreamingText(text: message.text, maxLagBytes: 4_800, inline: ChatInlineMarkdown(MobileChatMarkdown.inline),
+                                   onCaughtUp: { revealedBytes = message.text.utf8.count })
             }
         }
         .font(isUser ? .subheadline : .body)

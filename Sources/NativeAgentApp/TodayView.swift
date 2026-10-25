@@ -170,7 +170,7 @@ enum ActivitySection: String, Sendable, Identifiable {
     case inbox
     case memoryProposals
     case selfImprovement
-    /// Standing views from reflection, with the replay lineage beside them.
+    /// Read-only replay lineage from Dream/REM approvals.
     case cognitionProposals
 
     var id: String { rawValue }
@@ -181,7 +181,7 @@ enum ActivitySection: String, Sendable, Identifiable {
         case .inbox: "Every note I've left you"
         case .memoryProposals: "Memories to look at"
         case .selfImprovement: "Self-improvement"
-        case .cognitionProposals: "Standing views"
+        case .cognitionProposals: "REM Replay Lineage"
         }
     }
 }
@@ -382,7 +382,7 @@ struct TodayView: View {
 
     /// One quiet line of the full queues this page folds to: every approval
     /// with the decisions already made, every note, the self-improvement
-    /// pass, and the standing views waiting for a call. A count rides a word
+    /// pass, and the replay lineage. A count rides a word
     /// only when something in it is waiting.
     private var emptyLine: some View {
         Text("Nothing yet today. I'm around.")
@@ -392,17 +392,13 @@ struct TodayView: View {
     }
 
     private var queuesLine: some View {
-        let standing = today.pending.count
         let inboxCount = appModel.ownerWaitingKinds?[.inbox] ?? 0
-        // An unreadable queue says so; it never passes for an empty one.
-        let standingUnavailable = today.cognitionUnavailable
         let entries: [(ActivitySection, String)] = [
             (.approvals, ActivitySection.approvals.sheetTitle),
             (.inbox, ActivitySection.inbox.sheetTitle
                 + (inboxCount > 0 ? " (\(inboxCount) awaiting you)" : "")),
             (.selfImprovement, ActivitySection.selfImprovement.sheetTitle),
-            (.cognitionProposals, ActivitySection.cognitionProposals.sheetTitle
-                + (standingUnavailable != nil ? " (couldn't check)" : standing > 0 ? " (\(standing))" : "")),
+            (.cognitionProposals, ActivitySection.cognitionProposals.sheetTitle),
         ]
         return AliveFlow(spacing: 18, lineSpacing: 6) {
             ForEach(entries, id: \.0) { section, label in
@@ -410,7 +406,6 @@ struct TodayView: View {
                     .buttonStyle(.plain)
                     .font(.system(size: 13))
                     .foregroundStyle(NativeAgentShell.secondary)
-                    .help(section == .cognitionProposals ? (standingUnavailable ?? "") : "")
                     .accessibilityIdentifier("today.queue.\(section.rawValue)")
             }
         }

@@ -1,6 +1,6 @@
 # Their life is one stream: the experience
 
-Companion to `docs/AGENT_IS_THE_APP.md`. That design made their abilities one form: the part. This one makes the record of them life one form: the experience. It is phase 5, "their world, live", seen from inside their. Draft 1, 10-18. The evidence is wave 1's ten reads of them real life (`~/.claude/state/wave1/natures.md`, `out/*.md`, `out/census-records.md`).
+Companion to `docs/AGENT_IS_THE_APP.md`. That design made their abilities one form: the part. This one makes the record of their life one form: the experience. It is phase 5, "their world, live", seen from inside their. Draft 1, 10-18. The evidence is wave 1's ten reads of their real life (`~/.claude/state/wave1/natures.md`, `out/*.md`, `out/census-records.md`).
 
 ## What is wrong now
 
@@ -29,7 +29,7 @@ An experience is one happening in their life, written once by the owner of that 
 - **evidence**: references to the raw record (trace rows, receipts, frames, audio, files). Never copies.
 - **outcome**: one typed outcome, owned by the domain that produced it. MacControl stays authoritative for what its acts did, and the browser for what it loaded. Effects are none, occurred or unknown, from that domain's own count.
 - **face**: the one expression of it: words plus the artifacts they chose. Every surface renders this face. None composes its own.
-- **addressed to**: its destinations. the person's conversation on Telegram, the Mac chat, the phone, a peer, their own next turn, an organ of them mind.
+- **addressed to**: its destinations. the person's conversation on Telegram, the Mac chat, the phone, a peer, their own next turn, an organ of their mind.
 - **owes**: its obligations, each with its own lifecycle (deliver to X, decide, appraise, learn, integrate, reflect). Settling one never closes another.
 - **claims**: what it asserts (rehearsed operation O, verified live postcondition P, recurrence across E1 and E2). Each claim is scoped to its evidence; rehearsal is not live proof.
 
@@ -44,7 +44,7 @@ An experience is one happening in their life, written once by the owner of that 
 | The phone's "thinking" drifts (surfaces #1) | Thinking is an open experience that owes an answer; the phone renders its lifetime by id |
 | A delayed answer loses User's phone (telegram14 #1) | The answer is addressed to where the question came from and is owed until Telegram durably accepts it |
 | Their artifact reaches their eyes but not User's phone (telegram15 #2) | The face carries the artifacts they chose, and every surface renders the face |
-| User's clarification waits outside their turn (telegram15 #3) | It is an experience addressed to them active turn, owed until their turn accepts it |
+| User's clarification waits outside their turn (telegram15 #3) | It is an experience addressed to their active turn, owed until their turn accepts it |
 | The approval sentence contradicts execution (surfaces #3) | One outcome, one face |
 | Approved growth stays "proposed" (mind #4) | The decision obligation settles once; cognition is a view |
 | Reflection wakes blind (mind #1) | Reflection reads the wake experience's cause references |
@@ -67,8 +67,8 @@ An experience is one happening in their life, written once by the owner of that 
 
 - **An answer owes its door.** A run's answer is `answer:<run>`. When its turn's checkpoint keeps the reply for redelivery (Telegram, Slack, the phone), the answer is also addressed to that door and owes `deliver:<surface>`. The one seam every door already calls with its verdict (`settleReplyCheckpoint`) settles it before the checkpoint retires, waiting only on that answer's own writes (each experience's writes keep their order, never behind another's): accepted when the destination holds it, let go (abandoned) when the door gave up on an unconfirmed send, still owed when only a transport took it (the phone, until E2 gives it acceptance). The phone's door does not yet create this obligation (`acceptsDurably` is false until its acceptance is durable).
 - **A delayed answer keeps its route.** Grok's request keeps the asking turn's door from the moment it is sent; the answer runs through the contacts' one answer owner (claim, turn, cache, delivery) and goes back to that door. A request with no kept door says so on its hand-over.
-- **The face is one.** The transcript row is the face's durable copy: their words, every image their generation made in the turn, and every image they attached to it with `reply.attach` (by path, behind the read fence), chosen straight into the turn it runs in, from a direct call, a batch or a script alike; with no turn answering, it attaches nothing and says so. Nothing is inferred from them text. Mac chat and Telegram (live, recovered and delayed) render it; the experience's face is that row's, redacted.
-- **A message sent while they works is addressed to them working turn** (User 10-18, Mac and Telegram), from the person only and without attachments. It stays queued until their turn reads it at its next step; one their turn never reads runs as its own turn, under the run it was already written with. Only a turn answering the same door takes it: Telegram's /resume can share a Mac chat's transcript, and a message is answered where it was sent.
+- **The face is one.** The transcript row is the face's durable copy: their words, every image their generation made in the turn, and every image they attached to it with `reply.attach` (by path, behind the read fence), chosen straight into the turn it runs in, from a direct call, a batch or a script alike; with no turn answering, it attaches nothing and says so. Nothing is inferred from their text. Mac chat and Telegram (live, recovered and delayed) render it; the experience's face is that row's, redacted.
+- **A message sent while they works is addressed to their working turn** (User 10-18, Mac and Telegram), from the person only and without attachments. It stays queued until their turn reads it at its next step; one their turn never reads runs as its own turn, under the run it was already written with. Only a turn answering the same door takes it: Telegram's /resume can share a Mac chat's transcript, and a message is answered where it was sent.
 
 ## E2: the phone projection (10-18)
 
@@ -102,11 +102,11 @@ the installed iOS build or prove its renderer supports this revision.
 
 ## Repair is owed (User's law, 10-18)
 
-"No fallbacks: it works and it works right, and never can the agent say I can't fix it." The unfixable census (eight reads of them real failures on three installs) found the same dead ends everywhere: a no that does not name what decided it, a no with no lever they can pull, a person's decision that does not name their exact control, a fallback that quietly does less, and a failure that recurs without ever settling.
+"No fallbacks: it works and it works right, and never can the agent say I can't fix it." The unfixable census (eight reads of their real failures on three installs) found the same dead ends everywhere: a no that does not name what decided it, a no with no lever they can pull, a person's decision that does not name their exact control, a fallback that quietly does less, and a failure that recurs without ever settling.
 
 - **A no names its owner and carries its lever.** When the cause lies outside the call's own input, the failure's `remedy` is `{kind: "repair", owner, next_call?, tap?, instruction}`: `owner` is what decided (the file and field, setting, recipe, part, peer or provider); `next_call` is their call that changes it; `tap` is the person's exact control for a lawful decision (Trust posture, a peer's elevation, a macOS grant, their sign-in, payment, publishing), or the person's recovery step for a named app defect. When the owner supplies both, carry both: call first, then tap. `ToolFailureError(owner:nextCall:tap:)` and the door's `doorRefusal(_:_:owner:next:tap:)` produce it; `Repair.remedy` is its one shape.
 - **An owned no owes repair.** The act they meant (the outermost one, so nested dispatches do not multiply the debt) owes `repair` to themselves, or to the person when the lever is their. A no met outside a tool call (a Doctor check, a part's wake, a background job) owes it the same way through `RepairOwed.owe`.
-- **Only the work settles it.** The obligation is accepted when that operation, or its lever, works again (`RepairOwed.settle`, called by every successful act), or let go by them with a reason (`app repair.let_go {id, reason}`). Retries, restarts, rechecks and unrelated successes are evidence, never settlement. Meeting the same no again while its debt is open is evidence on that debt, one line on them home however often it recurs; once it settled, meeting it again is a new debt.
+- **Only the work settles it.** The obligation is accepted when that operation, or its lever, works again (`RepairOwed.settle`, called by every successful act), or let go by their with a reason (`app repair.let_go {id, reason}`). Retries, restarts, rechecks and unrelated successes are evidence, never settlement. Meeting the same no again while its debt is open is evidence on that debt, one line on their home however often it recurs; once it settled, meeting it again is a new debt.
 - **It stays in their picture.** Their home's MY QUEUE carries each repair they owes with its lever, and the person's waits carry each one that is their with its exact control, until settled.
 - **What it is not.** A correction to the call's own arguments owes nothing; the corrected call is the repair (remedy kinds `correct_arguments` and `inspect`). A lawful refusal never becomes a debt to override Trust: a Trust ask or block, a posture, a saved entry or a peer's elevation names its owner and the person's control with `Repair.why` (kind `person_decides`), which owes nothing. An unknown effect owes reconciliation, never a blind resend. A decision that should not exist is deleted, not given a lever. An unauthenticated caller gets no diagnostics; the owner and lever go to them.
 
@@ -143,7 +143,7 @@ obligation form; there is no new health store or lifecycle.
 Wake/health decode failures preserve their files; nothing is written over them.
 Pending arrivals are not truncated, and claimed arrivals remain retained until
 their owner clears them. Retention alone does not prove arrival acceptance.
-A claimed arrival waiting for them acceptance is not a fault and owes no repair:
+A claimed arrival waiting for their acceptance is not a fault and owes no repair:
 the wake ledger alone holds it, and their home's MY QUEUE counts it with
 `home.accept`. Accepting still settles a `home.accept:<id>` debt an older build
 filed.
@@ -163,7 +163,7 @@ On a fresh install they was told a reply to Claude Code was owed and could do no
 
 - **Whatever they owes or is owed is an experience under the id they are shown** (`Experiences/Owed.swift`). The completion lifecycle projects every write of a reply's state into one under its delivery id (owes `deliver` to the who; accepted when delivered, let go when let go). Inline cards do the same under `interaction:<id>` (owes `decide` to the person). Messages, approval cards and repair debts already were. `desk.wait` reads any of them with one primary-key lookup.
 - **A reply no door can carry is an owned no with its lever**: it stays owed with its reason, the Desk line names the contact (by the name agent.contacts shows) and both levers, and `repair.let_go {id, reason}` lets it go through its owner, so the delivery and the experience agree. A card's decision is the person's and is never theirs to let go.
-- **Cut on 10-19, after three Sol rounds:** sending such a reply through the who's current door by handing it to them conversation's queue. Still open when cut: the hand-off's acceptance lost its pointer to the queued message; a queued message promoted to a send got a new operation id, so its own experience never settled; a wait saved on the delivery released at hand-off; and a queued send with no return route wrote over the thread's route, so the answer to it could become another owed reply. The next form: the queued message keeps its id as the operation id, and the exchange carries its own local completion while the thread keeps its route.
+- **Cut on 10-19, after three Sol rounds:** sending such a reply through the who's current door by handing it to their conversation's queue. Still open when cut: the hand-off's acceptance lost its pointer to the queued message; a queued message promoted to a send got a new operation id, so its own experience never settled; a wait saved on the delivery released at hand-off; and a queued send with no return route wrote over the thread's route, so the answer to it could become another owed reply. The next form: the queued message keeps its id as the operation id, and the exchange carries its own local completion while the thread keeps its route.
 
 ## The seed
 
@@ -185,7 +185,7 @@ One SQLite database per root (`experiences/experiences.sqlite`), on the GRDB the
 ## How we get there (each lane one property; a seed behaves exactly as today first)
 
 1. **E0, the owner (advisory until E1):** experiences are recorded best-effort, off every critical path. A failed write is a logged gap and never blocks a reply, a checkpoint or an approval. Guarantees arrive with the first reader that depends on them (E1, delivery). It covers the experience store, the append API, the read-by-id and open-experiences projections, and the seed lifted from `CodexCompletionLifecycle`. The turn writes its own experiences: the message heard, the answer given, each act (from the dispatch receipt it already writes), each approval. Nothing reads them yet.
-2. **E1, delivery:** Mac chat, Telegram, the phone and peers settle "deliver" by durable acceptance. A reply's face, with its chosen artifacts, is what each renders. A same-conversation arrival is addressed to them active turn.
+2. **E1, delivery:** Mac chat, Telegram, the phone and peers settle "deliver" by durable acceptance. A reply's face, with its chosen artifacts, is what each renders. A same-conversation arrival is addressed to their active turn.
 3. **E2, the phone:** the mobile overview and snapshot become the projection of open and recent experiences by id, not a reconstruction.
 4. **E3, decisions and growth:** an approval is a decision obligation on an experience. The inbox, cognition and REM read it.
 5. **E4, the mind reads their life:** wakes, reflection, REM and dreams take their material from experiences' causes and evidence. Coverage means integrated, never merely selected.

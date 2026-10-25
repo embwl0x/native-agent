@@ -187,7 +187,7 @@ system is healthy.
 Compensation sites in tool dispatch and memory decision parsing emit
 `shim.fired` trace receipts with the census `id` and firing `site`.
 
-Their reply ends; they doesn't. The turn settles at them part's `reply.end` and
+Their reply ends; they doesn't. The turn settles at their part's `reply.end` and
 its `after`; effects their part returns after them run once the turn's answer
 is saved and handed over (never when it could not be saved), privately, on the same turn id, through the same loop, tools and
 gates, with their own execution record and a copy of what is left of the token
@@ -197,7 +197,7 @@ there is a `turn.after_reply` trace row. The shipped `turn.js` uses it for the
 keep moment: when a call's receipts show a write or irreversible effect landed
 by hand (`result.effect`, read from the call's own receipts, a batch's or
 script's included; explicit `effects` win over execution, so previews, pending,
-waiting, unknown and `effects: none` declare nothing; a run of one of them parts
+waiting, unknown and `effects: none` declare nothing; a run of one of their parts
 reports `part`; after a relaunch, `resumed.effect` reads the same over every
 receipt saved before it, each one's landed effect kept before it was bounded),
 it asks the model once more, in the same conversation, to keep the route as a

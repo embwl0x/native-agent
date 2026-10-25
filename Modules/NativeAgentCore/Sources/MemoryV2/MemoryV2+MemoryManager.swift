@@ -122,16 +122,23 @@ public struct AfterTurnInterpretation: Sendable {
     public let moment: MomentCandidate?
     public let affect: CognitiveSubstrate.AffectAppraisal
     public let caring: CaringAppraisalVerdict
+    /// What moved her against the cares she was shown.
+    public let cares: [CognitiveCareJudgment]
+    /// The incoming words were the app's, so only her side of the exchange counts.
+    public let appAuthored: Bool
     public let model: String?
     public let surface: String
 
     public init(memories: [MemoryManagerDecision], moment: MomentCandidate?,
                 affect: CognitiveSubstrate.AffectAppraisal, caring: CaringAppraisalVerdict,
+                cares: [CognitiveCareJudgment] = [], appAuthored: Bool = false,
                 model: String?, surface: String) {
         self.memories = memories
         self.moment = moment
         self.affect = affect
         self.caring = caring
+        self.cares = cares
+        self.appAuthored = appAuthored
         self.model = model
         self.surface = surface
     }
@@ -145,7 +152,7 @@ public struct AfterTurnInterpretation: Sendable {
 public struct AfterTurnMemoryFailure: Error, Codable, Sendable, Hashable {
     public enum Reason: String, Codable, Sendable, Hashable {
         case deadline, cancelled, provider, invalidJSON, missingSections
-        case invalidCaring, invalidAffect, invalidMemories, invalidMoment
+        case invalidCaring, invalidAffect, invalidMemories, invalidMoment, invalidCares
         case authExpired, codexCLISessionExpired, rateLimited, overloaded, contextTooLong
         case network, outputLimit, refused, requestRejected, invalidProviderResponse, routingUnavailable, modelUnavailable
     }
@@ -177,6 +184,7 @@ public struct AfterTurnMemoryFailure: Error, Codable, Sendable, Hashable {
         case .invalidAffect: return .affect
         case .invalidMemories: return .memories
         case .invalidMoment: return .moment
+        case .invalidCares: return .cares
         default: return .provider
         }
     }
@@ -184,7 +192,7 @@ public struct AfterTurnMemoryFailure: Error, Codable, Sendable, Hashable {
 
 public enum AfterTurnInterpretationFailure: String, Error, Sendable {
     case provider, authentication, deadline, cancellation
-    case envelope, caring, affect, memories, moment
+    case envelope, caring, affect, memories, moment, cares
 }
 
 /// No incoming message returns nil; failures throw bounded recovery evidence.

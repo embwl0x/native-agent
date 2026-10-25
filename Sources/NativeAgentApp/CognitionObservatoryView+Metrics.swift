@@ -47,7 +47,6 @@ enum CognitionTensionsPresentation {
             counters: [
                 counter(label: "Nodes", count: detail.summary.nodeCount, cap: configuration.maximumActiveNodes),
                 counter(label: "Workspace", count: detail.summary.workspaceCount, cap: configuration.maximumWorkspaceItems),
-                counter(label: "Thought seeds", count: detail.summary.thoughtSeedCount, cap: configuration.maximumThoughtSeeds),
             ]
         )
     }
@@ -68,7 +67,6 @@ extension CognitionObservatoryView {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: NativeAgentSpacing.md)], spacing: NativeAgentSpacing.md) {
             MetricTile(title: "Nodes", value: "\(detail.summary.nodeCount)", systemImage: "circle.hexagonpath")
             MetricTile(title: "Workspace", value: "\(detail.summary.workspaceCount)", systemImage: "rectangle.3.group")
-            MetricTile(title: "Seeds", value: "\(detail.summary.thoughtSeedCount)", systemImage: "sparkles")
             MetricTile(title: "Reflections", value: "\(detail.summary.reflectionCount)", systemImage: "brain.head.profile")
             MetricTile(
                 title: "Persistence",

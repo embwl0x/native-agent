@@ -532,12 +532,6 @@ extension QuietSelfAdminRender {
         // The page's blocks (ui/layout.json, today): the waiting card, then
         // the queues its links open, in the order the window shows them.
         var queues: [JSONValue] = []
-        if let reason = today.cognitionUnavailable {
-            queues.append(section("Proposed views", [reason]))
-        } else {
-            queues.append(section("Proposed views", today.pending.standingViews.isEmpty ? ["None."]
-                : today.pending.standingViews.map { "\($0.id): \($0.title)" }))
-        }
         if !pending.isEmpty {
             queues.append(section("Approvals", pending.prefix(12).map { "\($0.title) — \($0.action), risk \($0.risk)" }))
         }

@@ -77,8 +77,6 @@ public protocol QuietSettingsHost: AnyObject {
 /// at a time, each through its own runtime setter.
 public enum QuietCognitionLane: Sendable {
     case capsule, background, reflection, organism
-    /// Phase 5 D: opinions and interests (`personality.views_experiment`).
-    case viewsExperiment
 }
 
 /// One proactive-inbox trigger as the Notifications page lists it.

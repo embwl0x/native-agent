@@ -189,7 +189,7 @@ extension NativeCognitionRuntime {
         // does NOT consume her hour: the refractory advances only when the hour
         // actually happened.
 
-        let (material, sourceFailures) = await composeStudioWanderMaterial()
+        let (material, sourceFailures, offeredCares) = await composeStudioWanderMaterial()
         // 2026-09-06: a source that could not be READ used to look exactly like
         // a source that was empty, and the decline below consumed her 24 h
         // refractory on the strength of it. A failed read is a failed run: it
@@ -316,7 +316,10 @@ extension NativeCognitionRuntime {
                 .first(where: { $0.id == journalEntryID }) {
                 topic = entry.work.title
             }
-            await substrate.noteInterest(question: question, topic: topic)
+            await substrate.noteHourWondering(
+                question, topic: topic, offered: offeredCares,
+                source: journalEntryID.map { "studio:" + $0 }
+                    ?? "studio_wander:\(NativeTimestampFormat.sixDigitUTCOffset(admittedAt))")
         }
     }
 
@@ -410,13 +413,12 @@ extension NativeCognitionRuntime {
     /// as "nothing of mine was in reach", a successful decline that consumed
     /// the 24 h refractory. A read failure is not a decline.
     private func composeStudioWanderMaterial() async -> (
-        material: StudioWanderLane.Material, sourceFailures: [String]
+        material: StudioWanderLane.Material, sourceFailures: [String], offeredCares: [UUID]
     ) {
         let store = SwiftNativeStudioStore(dataRoot: dataRoot)
         var sourceFailures: [String] = []
-        // Phase 5 D: her open questions, not the substrate's pressure readings
-        // or bare titles (every live "curiosity" line was a pressure re-check).
-        let curiosity = await substrate.curiosityForHour()
+        // Her own open cares, most pressing first.
+        let cares = await substrate.caresForHour()
 
         var invitations: [StudioEncounterCandidate]
         do {
@@ -470,7 +472,6 @@ extension NativeCognitionRuntime {
             invitationLines = try JSONDecoder().decode([String].self, from: result.serializedData(pretty: false))
         } catch { sourceFailures.append("studio invitations: \(error.localizedDescription)") }
         let material = StudioWanderLane.Material(
-            curiosity: curiosity,
             // An invitation she cannot open is a tease. A consult User filed is
             // named by its id, and `studio_consult_read` is the only way to see
             // the artifact refs inside it — so the line carries the id, and the
@@ -479,12 +480,11 @@ extension NativeCognitionRuntime {
             // description-only encounter her own rule forbids.
             invitations: invitationLines,
             recentJournalTitles: Array(recentTitles),
-            interests: await substrate.openInterests().prefix(2).map { interest in
-                interest.title == interest.body ? interest.body : "\(interest.title) — \(interest.body)"
-            },
-            asksForQuestion: await substrate.viewsExperimentEnabled()
+            cares: cares.map { "\($0.about) — \($0.open ?? "")" },
+            // An open care of hers asks for the question she comes back with.
+            asksForQuestion: true
         )
-        return (material, sourceFailures)
+        return (material, sourceFailures, cares.map(\.id))
     }
 
     /// Her hour has its own routing row: model and reasoning effort are chosen in

@@ -26,6 +26,12 @@ extension CognitiveSubstrate {
         _ event: CognitiveEvent,
         defersPersistenceToMicrocycle: Bool
     ) async -> Bool {
+        guard configuration.enabled else { return false }
+        let aboutness = event.kind == .organismResolutionFelt
+            ? "\(event.summary) \(event.subject.id) \(event.subject.label ?? "")"
+            : event.summary
+        let touchedCares = event.turnKind.contributesToLivedState
+            ? await appraisalCares(in: aboutness) : []
         // Only a caller that commits inline must not interleave with the
         // maintenance commit. Resident admission marks the state dirty, which
         // tells a suspended maintenance pass not to revert over it, and the
@@ -39,7 +45,7 @@ extension CognitiveSubstrate {
         // plumbing reporting in. Rejected BEFORE any state is touched (no seen
         // key consumed, no node, no affect, no attention publish), so the felt
         // layer gets quieter instead of louder. Gates this one event class only.
-        guard feltResolutionIsAtStake(event) else { return false }
+        guard feltResolutionIsAtStake(event, cares: touchedCares) else { return false }
         // A duplicate CognitiveEvent is inert across the WHOLE cognition owner,
         // not merely ContinuityField structure. This await-free O(1) check keeps
         // affect, mood, relational-presence anchors, pending completion, revision,
@@ -49,7 +55,7 @@ extension CognitiveSubstrate {
         // One deterministic scan bundle per admitted user turn. This stays
         // inside the actor's await-free transition and owns no state: it only
         // prevents affect, semantic appraisal, and retrospective landing from
-        // rescanning the same already-loaded text and standing views.
+        // rescanning the same already-loaded text and cares.
         let buildsAffectBundle = configuration.enabled
             && event.turnKind.contributesToLivedState
         // Item 8 (2026-09-02) — OTHERS MOVE HER. This used to read
@@ -62,7 +68,7 @@ extension CognitiveSubstrate {
         // Still the single pure scan per admitted event: it is threaded into
         // semanticAppraisal, emotionTag, applyAffectFromEvent and
         // reconsolidatePendingCompletion below, exactly as before.
-        // See CognitiveSubstrate+AppraisalConcerns.swift.
+        // See CognitiveSubstrate+ConversationalAppraisal.swift.
         let defersInterpretation = buildsAffectBundle && Self.isUserAuthored(event.kind)
             && event.sessionId?.hasPrefix("bot-") == false
         let userAppraisal = buildsAffectBundle && !defersInterpretation
@@ -150,22 +156,12 @@ extension CognitiveSubstrate {
             // Compute the conversational appraisal ONCE and thread it through both
             // consumers — semanticAppraisal and emotionTag each used to run the
             // heavy ~10-pass lexicon scan on the identical summary (hot-path dedup).
-            // Concerns depend on the post-event affect epoch, so derive them
-            // once here after applyAffectFromEvent rather than before it.
-            // LEANING, not just signed (2026-09-02): this is a hot-path SKIP,
-            // and an empty array here is not "derive them yourself" — it is a
-            // precomputed empty set that matches nothing. With held views but
-            // no active one, the old test silently deleted her own views from
-            // every appraisal.
-            let standingViewConcerns = standingViews.values.contains { $0.isLeaning }
-                ? appraisalConcerns()
-                : []
             let semantic = semanticAppraisal(
                 for: event,
                 post: updatedAffect,
                 precomputedAppraisal: userAppraisal,
                 precomputedWarmthBoost: turnWarmthBoost,
-                precomputedStandingViewConcerns: standingViewConcerns
+                precomputedCares: touchedCares
             )
             let tag = emotionTag(
                 for: event,

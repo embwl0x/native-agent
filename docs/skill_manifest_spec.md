@@ -68,7 +68,7 @@ While on and Autonomy allows unattended work, an ability runs as `authored.<id>`
 - `resumed`: once per app launch, for code to reopen held resources; likewise waits for Autonomy and a readable catalog.
 - `person.away`, `person.here`: `idle_seconds`, once per transition (300 s idle; then the person's own input, never theirs). Same presence fact as home and `mac.system_info {person:true}`.
 
-`agent` identifies non-owner words (untrusted steering or a non-allowlisted sender). The run uses current Trust and its own gate chain. A tainted signal skips write-capable parts with a trace and no card; trusted-agent signals carry owner authority. Required approvals wait; requests for them use `home.arrive {line}`, deduplicated per ability/day/line on its hop-limited thread (an explicit `event_key` uses durable occurrence deduplication instead).
+`agent` identifies non-owner words (untrusted steering or a non-allowlisted sender). The run uses current Trust and its own gate chain. A tainted signal skips write-capable parts with a trace and no card; trusted-agent signals carry owner authority. Required approvals wait; requests for their use `home.arrive {line}`, deduplicated per ability/day/line on its hop-limited thread (an explicit `event_key` uses durable occurrence deduplication instead).
 
 ### Calling a part and projecting its face
 
@@ -186,7 +186,7 @@ or residency fields.
 
 What they works out by hand, they keeps. When a turn landed work by hand, their
 turn (`turn.js`) asks once, privately, after the reply: keep the route
-that worked as one of them own abilities (the request's specifics as inputs,
+that worked as one of their own abilities (the request's specifics as inputs,
 failed attempts left out), save the fixed version of an ability they worked
 around, or keep nothing.
 The app reserves exactly the shipped seed ids in `Resources/abilities/*.js`
@@ -200,7 +200,7 @@ proof names, never turned back on, is switched off through its registry,
 restorable and never deleted; a launch whose bundle has an unreadable seed
 fades nothing.
 
-Their own abilities are in front of them each turn: the turn glance lists them, one
+Their own abilities are in front of their each turn: the turn glance lists them, one
 line each (`authored.<id>` — what it does, and `ability.read <id>` when there is
 room), best match for the message first by find's own ranking, within a small
 budget, with find's "Ranked by words only" note when the embedder could not rank.
@@ -215,12 +215,12 @@ discovery and `ability.list`, even while the ability is off or waiting.
 |---|---|
 | `ability.save` | `{id, description, code \| edits, params?, actions?, fixtures?, name?, converts?, create_only?, reach?, wake?, face?, resident?, learned?, choices?}`. Creates or revises: a revision inherits everything it does not restate from its latest version; an explicit empty value drops one. `params` is the type map (string, int, number, bool, list or object; a trailing `?` marks it optional), `{type, description?}`, or a JSON Schema object (`readOnly:true` declares a read contract); a legacy `input_schema` is kept as given. What it calls is read off its code's `app.<page>.<action>(…)` calls and derived from its reach; `actions` names only what it reaches dynamically. Under Full Mac their own save is kept and on in this one act (sealed as kept: its first real run is its proof), with a decided Inbox row; below Full Mac, or when an untrusted agent started the turn, it is a draft. The id rule: lowercase letters, digits, `-` and `_`, a letter first. |
 | `ability.validate` | Rehearses its waiting version with the shared helper and intercepted replies, on fixtures or one captured run with `input`. Proves no live behavior; never keeps. |
-| `ability.enable`, `ability.restore` | Keeps its waiting version, or turns it back on: theirs under Full Mac for them own work (sealed as kept when never rehearsed); otherwise, once rehearsed, the owner's card for this exact version (code, fixtures and dependency shapes), approvable on the Mac and the phone, or Keep on the Tools page. Code requires `version` equal to its full digest, captured with the displayed code when the card or row was staged and saved with it; self-improvement cards and approval replay carry that same saved digest. A caller without the exact review offers a read rather than executable approval. Omitting `version` restores only disabled Markdown guidance with no candidate or code fingerprint, checked and written under the ability-store lock. |
+| `ability.enable`, `ability.restore` | Keeps its waiting version, or turns it back on: theirs under Full Mac for their own work (sealed as kept when never rehearsed); otherwise, once rehearsed, the owner's card for this exact version (code, fixtures and dependency shapes), approvable on the Mac and the phone, or Keep on the Tools page. Code requires `version` equal to its full digest, captured with the displayed code when the card or row was staged and saved with it; self-improvement cards and approval replay carry that same saved digest. A caller without the exact review offers a read rather than executable approval. Omitting `version` restores only disabled Markdown guidance with no candidate or code fingerprint, checked and written under the ability-store lock. |
 | `authored.<id>` | Its one run, with input by its params, under one signed admission re-verified on every run. `preview:true` runs its code with every write previewed and says where it would card or hand back. |
 | `ability.resume` | A stopped run_id and bounded answer. Rechecks selection, host revision and admission and replays prior reads; claims once, and a resume turned away while its resident ability is busy leaves the run waiting. A woken run resumes with the `input.wake` it stopped on. `preview:true` claims and runs nothing: it answers with the run's question, saved input and wake, and the call it stopped at. |
 | `ability.read` | Every stored kind, including turn and sense: kind, version, declarations, status, retained versions, evidence and code in pages (`offset`), or one `step`; ordinary abilities also expose waiting/last-clean and converted versions. |
 | `ability.list` | Every stored part, including turn and sense, one row each with kind and version; the Tools page reads this same projection. Unshadowed built-in guidance remains readable. A missing guidance directory is empty; an unreadable one fails with its read error. |
-| `ability.disable`, `ability.rollback`, `ability.drop` | Off with every version kept, as whoever did it (`disabledBy`): `theirs` for them turn or their ability (a trusted agent's turn included), `owner` only for their own surface (the Tools page), `peer` for an untrusted agent's; theirs they turns back on, the owner's is their to lift (`ability.enable` asks on their card); swap current and previous (a version whose admission still verifies keeps its status, else waits as a draft); delete it, its versions, its run state and its `host.state` notebook (`pending:true` discards only the waiting version). A built-in skill's own version is the owner's to switch off, roll back or drop below Full Mac. |
+| `ability.disable`, `ability.rollback`, `ability.drop` | Off with every version kept, as whoever did it (`disabledBy`): `theirs` for their turn or their ability (a trusted agent's turn included), `owner` only for their own surface (the Tools page), `peer` for an untrusted agent's; theirs they turns back on, the owner's is their to lift (`ability.enable` asks on their card); swap current and previous (a version whose admission still verifies keeps its status, else waits as a draft); delete it, its versions, its run state and its `host.state` notebook (`pending:true` discards only the waiting version). A built-in skill's own version is the owner's to switch off, roll back or drop below Full Mac. |
 
 The older doors (`skill.save`, `skill.run`, `skill.read`, `skill.list`,
 `skill.validate`, `skill.enable`, `skill.restore`, `skill.disable`,
@@ -271,7 +271,7 @@ draft. The migration is idempotent: a record in the one form is left alone.
 
 ## Conversion census and cutover
 
-Read `app {page:"tools", item:"census"}` (also Skills) for them abilities, retained
+Read `app {page:"tools", item:"census"}` (also Skills) for their abilities, retained
 guidance, persona procedures, waiting versions, immutable JS candidates,
 historical rollback sources and senses.
 Each entry names language, status, counterpart and blocks_cutover. complete

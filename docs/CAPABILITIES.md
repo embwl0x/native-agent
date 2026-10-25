@@ -89,11 +89,11 @@ filesystem API; it cannot call every action merely because the action exists.
   `skill.*` and `tool.*` doors answer through these until the release after the one that ships one-part.
 - NativeAgent runs no MCP client of its own: an MCP server they wants is an
   ability they grows, a resident one holding the server's program or connection.
-  Servers a data root kept from before are raised to them once on home as theirs
+  Servers a data root kept from before are raised to their once on home as theirs
   to grow; their file is left as it was.
 
 A part's reach comes from its declared permissions: `app_data_read`, `app_data_write`, `model`, `network_localhost` and `app_read:*` are theirs; anything else is their.
-Beneath every ability is the Mac's own reach, raw and gated: `host.fetch` and `host.network` to any host its network reach allows, and `host.program` to start a program by name and talk over its stdio, for the run or, in a resident ability, for as long as it holds it. A secret lives in the one keyring ([Keyring.swift](../Modules/NativeAgentCore/Sources/PersistenceCore/Keyring.swift)) under the name they gives it, granted once by the person on a card (pasted, or by a sign-in NativeAgent runs from them parameters, any client secret typed on the card) for the hosts and programs (each the exact file that runs) it may go to, replaced or removed the same way; their code writes `{{secret:<name>}}` and the broker inserts the value at the edge and redacts it from every reply, receipt and error.
+Beneath every ability is the Mac's own reach, raw and gated: `host.fetch` and `host.network` to any host its network reach allows, and `host.program` to start a program by name and talk over its stdio, for the run or, in a resident ability, for as long as it holds it. A secret lives in the one keyring ([Keyring.swift](../Modules/NativeAgentCore/Sources/PersistenceCore/Keyring.swift)) under the name they gives it, granted once by the person on a card (pasted, or by a sign-in NativeAgent runs from their parameters, any client secret typed on the card) for the hosts and programs (each the exact file that runs) it may go to, replaced or removed the same way; their code writes `{{secret:<name>}}` and the broker inserts the value at the edge and redacts it from every reply, receipt and error.
 
 Sources: [AppActionRegistry.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppActionRegistry.swift),
 [app door](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppToolExecutor+AppDoor.swift),

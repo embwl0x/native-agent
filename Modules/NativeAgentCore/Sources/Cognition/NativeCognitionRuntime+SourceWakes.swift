@@ -5,7 +5,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Desk
-// Blueprint: | `NativeCognitionRuntime+SourceWakes.swift` | Runtime-owned source observations for canon, horizon, Reach, standing views and quiet-hour preferences; registration precedes reads, renewed directory children remain watched, canon arms journal membership before enumerating input children and compares input stamps to ignore audit output and unchanged directory events, stop cancels observations, and the existing residual deadline owns source cooldown/eligibility/expiry boundaries |
+// Blueprint: | `NativeCognitionRuntime+SourceWakes.swift` | Runtime-owned source observations for canon, horizon, Reach, cares and quiet-hour preferences; registration precedes reads, renewed directory children remain watched, canon arms journal membership before enumerating input children and compares input stamps to ignore audit output and unchanged directory events, stop cancels observations, and the existing residual deadline owns source cooldown/eligibility/expiry boundaries |
 
 /// Source invalidations and their real time boundaries, owned by this runtime.
 /// No interval samples unchanged sources; the existing residual deadline owns
@@ -15,8 +15,8 @@ struct CognitiveSourceWakes: Sendable {
     var horizonObservation: Task<Void, Never>?
     var reachObservation: Task<Void, Never>?
     var clockObservation: Task<Void, Never>?
-    var standingViewObservation: Task<Void, Never>?
-    var lastStandingViews: [CognitiveStandingView]?
+    var careObservation: Task<Void, Never>?
+    var lastCares: [CognitiveCare]?
     var canonReady = false
     var canonInputs: [URL: SnapshotTailOpLog.FileStamp]?
     var horizonReady = false
@@ -39,7 +39,7 @@ struct CognitiveSourceWakes: Sendable {
         horizonObservation?.cancel()
         reachObservation?.cancel()
         clockObservation?.cancel()
-        standingViewObservation?.cancel()
+        careObservation?.cancel()
     }
 }
 
@@ -182,13 +182,13 @@ extension NativeCognitionRuntime {
                 await self?.clockSourceChanged()
             }
         }
-        let standingViews = EventDeadlinePhysiology.storeAndFileEvents(paths:
+        let careChanges = EventDeadlinePhysiology.storeAndFileEvents(paths:
             ["cognition/cognition.sqlite", "cognition/cognition.sqlite-wal"].map { root.appendingPathComponent($0) })
-        sourceWakes.standingViewObservation = Task { [weak self] in
-            await self?.standingViewsSourceChanged()
-            for await _ in standingViews {
+        sourceWakes.careObservation = Task { [weak self] in
+            await self?.caresSourceChanged()
+            for await _ in careChanges {
                 guard !Task.isCancelled else { return }
-                await self?.standingViewsSourceChanged()
+                await self?.caresSourceChanged()
             }
         }
     }
@@ -247,11 +247,12 @@ extension NativeCognitionRuntime {
         await rescheduleResidualRepairDeadline()
     }
 
-    func standingViewsSourceChanged() async {
+    func caresSourceChanged() async {
         guard !isFlushedForTermination, !Task.isCancelled else { return }
-        let views = await substrate.standingViewSnapshot()
-        guard !isFlushedForTermination, !Task.isCancelled, sourceWakes.lastStandingViews != views else { return }
-        sourceWakes.lastStandingViews = views
+        let cares = await substrate.caresPressing(for: CognitiveCare.ownerKey, at: Date())
+            .map(\.care).sorted { $0.id.uuidString < $1.id.uuidString }
+        guard !isFlushedForTermination, !Task.isCancelled, sourceWakes.lastCares != cares else { return }
+        sourceWakes.lastCares = cares
         sourceWakes.reachDirty = true
         await rescheduleResidualRepairDeadline()
     }

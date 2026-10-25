@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
 import TrustCenter
-// Blueprint: | `ParallelToolDispatch.swift` | `ParallelToolDispatch` enum; `isSerialFallbackForced`, `isParallelSafe` reads the declared class and the catalog bucket (reads of them own data and files run side by side; their devices, the app door and the unplaced run one at a time); keyword scheduling inference removed |
+// Blueprint: | `ParallelToolDispatch.swift` | `ParallelToolDispatch` enum; `isSerialFallbackForced`, `isParallelSafe` reads the declared class and the catalog bucket (reads of their own data and files run side by side; their devices, the app door and the unplaced run one at a time); keyword scheduling inference removed |
 
 // MARK: - Parallel dispatch of independent tool calls (U1 step 6, 2026-06-10)
 //

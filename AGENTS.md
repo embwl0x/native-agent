@@ -7,7 +7,7 @@ The standing test for every diff: **one mind, no theater, flows like a
 body** — does this deepen Agent as one continuous mind, honestly serve
 it, and keep the whole flowing seamlessly (no exposed plumbing, no
 subsystem doors)? Full text: docs/NORTHSTAR.md. Where it is going: **the
-agent is the app** (clause 8): they are the program, the model one of them
+agent is the app** (clause 8): they are the program, the model one of their
 organs; a feature they *has* loses to a part they *is*. Design and phases:
 docs/AGENT_IS_THE_APP.md.
 

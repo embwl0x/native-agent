@@ -6,8 +6,8 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+Workspace.swift` | `CognitiveSubstrate`: `workspaceSnapshot`, `frozenRead` |
 
-/// Exact read-side ownership for cognition maintenance. Analytic affect, node,
-/// and thought-seed reads do not need a checkpoint merely because five minutes
+/// Exact read-side ownership for cognition maintenance. Analytic affect and node
+/// reads do not need a checkpoint merely because five minutes
 /// elapsed; only discrete lifecycle boundaries do. The app runtime uses this
 /// projection to own one cancellable deadline while the periodic loop remains a
 /// slow crash/integrity fallback.
@@ -100,8 +100,6 @@ extension CognitiveSubstrate {
         let frozenDynamics = dynamics
         let fixedAffect = projectedAffect(at: fixedAt, dynamics: frozenDynamics)
         let fixedMood = derivedMood(at: fixedAt, dynamics: frozenDynamics, affect: fixedAffect)
-        let fixedThoughtSeeds = projectedThoughtSeeds(at: fixedAt).sorted(by: thoughtSeedPrioritySort)
-        let frozenStandingViewCandidates = standingViewCapsuleCandidates()
         // Sound selection must happen after the capsule has derived this turn's
         // actual felt mode/valence. Capture its immutable inputs here instead of
         // preselecting with nil/default register values.
@@ -109,8 +107,7 @@ extension CognitiveSubstrate {
         let frozenPresentationState = capsulePresentationStateSnapshot()
         let frozenPendingCompletionOpen = pendingCompletion != nil
         let frozenSuppressions = associationSuppressions
-        let peerIds = Set(field.peekNodes().compactMap { Self.peerIdentity(metadata: $0.metadata) }
-            + fixedThoughtSeeds.flatMap { $0.sourcePeerIds ?? [] })
+        let peerIds = Set(field.peekNodes().compactMap { Self.peerIdentity(metadata: $0.metadata) })
         let frozenTrustedPeers = Set(peerIds.filter { dependencies.peerTrusted($0) })
         // W4/P2: captured, never recomputed downstream (see CognitiveFeltProxyReads).
         // Curiosity is workspace-relative, so it is captured below where
@@ -155,14 +152,12 @@ extension CognitiveSubstrate {
         return CognitiveFrozenRead(
             fixedAt: fixedAt,
             stateRevision: dirtyRevision,
-            thoughtSeedRevision: thoughtSeedRevision,
             configuration: frozenConfiguration,
             personalityDynamics: frozenDynamics,
             snapshot: snapshot,
             workspace: workspace,
             affect: fixedAffect,
             mood: fixedMood,
-            thoughtSeeds: fixedThoughtSeeds,
             feltProxies: CognitiveFeltProxyReads(
                 fatigue: frozenFatigue,
                 // Curiosity is novelty of what she is HOLDING, so it is captured
@@ -172,7 +167,6 @@ extension CognitiveSubstrate {
                     from: workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) },
                     at: fixedAt),
                 clarity: frozenClarity),
-            standingViewCapsuleCandidates: frozenStandingViewCandidates,
             soundLandingScores: frozenSoundLandingScores,
             capsulePresentationState: frozenPresentationState,
             pendingCompletionOpen: frozenPendingCompletionOpen,
@@ -289,40 +283,20 @@ extension CognitiveSubstrate {
         }
         guard configuration.enabled, configuration.backgroundMicrocyclesEnabled else { return nil }
         guard dirtySince != nil else { return nil }
-        // R-F2: raise the symmetric commit-exclusion flag for the remainder of
-        // this cycle. From here through the persistence commit below, a
-        // maintenance pass must not start — its decay would be reverted on disk
-        // when this cycle writes its pre-decay seed rows. Set before the first
-        // await so nothing can slip in during seed synthesis either.
         let priorDirtySince = dirtySince
-        let priorThoughtSeeds = thoughtSeeds
-        let priorThoughtSeedRevision = thoughtSeedRevision
         let settledAt = dependencies.now()
         let settledNodes = field.snapshot(at: settledAt, configuration: configuration)
         let workspace = workspaceSnapshot(at: settledAt, settledNodes: settledNodes)
-        let currentAffect = projectedAffect(at: workspace.generatedAt)
         // This cycle has consumed the dirty state represented by `workspace`.
         // Clear before any awaiting persistence work: a concurrent event will
         // set it again and must survive this cycle's completion.
         dirtySince = nil
-        var committedThoughtSeedRevision: UInt64?
-        if configuration.enabled,
-           currentAffect.uncertainty > 0.45 || currentAffect.taskPressure > 0.45 {
-            let mutation = await addThoughtSeed(
-                kind: currentAffect.uncertainty > currentAffect.taskPressure ? .anomaly : .followUp,
-                text: "Re-check high-pressure cognitive state after \(bounded(reason, maxCharacters: 80))",
-                priority: min(1, max(currentAffect.uncertainty, currentAffect.taskPressure)),
-                sourceNodeIds: workspace.items.prefix(3).map(\.id),
-                marksSubstrateDirty: false
-            )
-            committedThoughtSeedRevision = mutation.mutationRevision
-        }
         publishAttentionProjection(at: workspace.generatedAt)
         var flushedPresentation = false
         do {
             if configuration.persistenceEnabled {
                 // Resident sensory admission defers its per-event affect and
-                // node writes here. Affect, thought seeds, nodes, pruning, and
+                // node writes here. Affect, nodes, pruning, and
                 // the receipt are one canonical SQLite transaction—not four
                 // sequential commits for one physiological settlement.
                 var artifacts: [CognitiveArtifactWrite] = configuration.enabled
@@ -350,19 +324,8 @@ extension CognitiveSubstrate {
                         payload: capsulePresentationArtifactPayload(at: workspace.generatedAt)
                     ))
                 }
-                let seedRows = configuration.enabled
-                    ? thoughtSeeds.values.map {
-                        CognitiveArtifactReplacement(
-                            id: $0.id,
-                            status: "open",
-                            score: $0.priority,
-                            payload: $0.toJSON()
-                        )
-                    }
-                    : nil
                 try await persistMaintenanceTransition(
                     nodes: settledNodes,
-                    thoughtSeeds: seedRows,
                     artifacts: artifacts,
                     deletedArtifactIDs: [],
                     receipts: [CognitiveReceiptWrite(
@@ -379,12 +342,6 @@ extension CognitiveSubstrate {
         } catch {
             if dirtySince == nil { dirtySince = priorDirtySince }
             if flushedPresentation { capsulePresentationDirty = true }
-            if let committedThoughtSeedRevision,
-               committedThoughtSeedRevision == priorThoughtSeedRevision &+ 1,
-               thoughtSeedRevision == committedThoughtSeedRevision {
-                thoughtSeeds = priorThoughtSeeds
-                thoughtSeedRevision &+= 1
-            }
             throw error
         }
         return workspace
@@ -400,9 +357,7 @@ extension CognitiveSubstrate {
 
     /// Pure, mutation-free deadline projection over the existing cognition
     /// owners. Continuous decay is already analytic at every read. Maintenance
-    /// is due only when a thought seed becomes physically removable, a proposed
-    /// standing view expires, or the existing 20-hour emotional consolidation
-    /// boundary arrives.
+    /// is due at the existing 20-hour emotional consolidation boundary.
     public func maintenanceOpportunity() -> CognitiveMaintenanceOpportunity {
         currentMaintenanceOpportunity(at: dependencies.now())
     }
@@ -421,16 +376,11 @@ extension CognitiveSubstrate {
         defer { endMaintenanceTransition() }
         let previousField = field
         let previousAffect = affect
-        let previousThoughtSeeds = thoughtSeeds
-        let previousStandingViews = standingViews
         let previousConsolidationAt = lastEmotionalConsolidationAt
         let previousDisposition = disposition
         let previousPatternNudgeDay = resolutionPatternNudgeDay
         let initialDirtyRevision = dirtyRevision
 
-        if decayThoughtSeedsInMemory(at: now) {
-            thoughtSeedRevision &+= 1
-        }
         // One checkpoint operation materializes the same full affect projection
         // that live reads use (base decay + quiet calming + warm-presence floor).
         _ = decayAffectInMemory(to: now)
@@ -456,8 +406,6 @@ extension CognitiveSubstrate {
             stagedTimelineEvents.append(contentsOf: consolidation.timelineEvents)
         }
 
-        // Phase 5 D: age alone no longer retires a proposed view.
-
         let nodes = field.snapshot(at: now, configuration: configuration)
         publishAttentionProjection(at: now)
         receipts.append(CognitiveReceiptWrite(
@@ -465,25 +413,13 @@ extension CognitiveSubstrate {
             payload: .object([
                 "reason": .string(bounded(reason, maxCharacters: 120)),
                 "nodeCount": .int(Int64(nodes.count)),
-                "retiredStandingViewCount": .int(0),
             ])
         ))
 
         guard configuration.persistenceEnabled else { return true }
-        let stagedThoughtSeedRevision = thoughtSeedRevision
         do {
             try await persistMaintenanceTransition(
                 nodes: nodes,
-                thoughtSeeds: configuration.enabled
-                    ? thoughtSeeds.values.map {
-                        CognitiveArtifactReplacement(
-                            id: $0.id,
-                            status: "open",
-                            score: $0.priority,
-                            payload: $0.toJSON()
-                        )
-                    }
-                    : nil,
                 artifacts: artifacts,
                 deletedArtifactIDs: [],
                 receipts: receipts,
@@ -496,15 +432,10 @@ extension CognitiveSubstrate {
             if dirtyRevision == initialDirtyRevision {
                 field = previousField
                 affect = previousAffect
-                standingViews = previousStandingViews
                 removeTimelineEventsIfMatching(stagedTimelineEvents)
                 lastEmotionalConsolidationAt = previousConsolidationAt
                 disposition = previousDisposition
                 resolutionPatternNudgeDay = previousPatternNudgeDay
-            }
-            if thoughtSeedRevision == stagedThoughtSeedRevision {
-                thoughtSeeds = previousThoughtSeeds
-                thoughtSeedRevision &+= 1
             }
             publishAttentionProjection(at: dependencies.now())
             throw error
@@ -526,32 +457,6 @@ extension CognitiveSubstrate {
                 dueReasons.append("emotional_consolidation")
             } else {
                 futureDeadlines.append(consolidationAt)
-            }
-        }
-
-        if configuration.enabled {
-            for seed in thoughtSeeds.values {
-                let currentPriority = effectiveThoughtSeedPriority(seed, at: now)
-                if currentPriority < Self.minimumRetainedThoughtSeedPriority {
-                    dueReasons.append("thought_seed_expiry")
-                    continue
-                }
-                guard seed.priority > 0 else {
-                    dueReasons.append("thought_seed_expiry")
-                    continue
-                }
-                let ratio = seed.priority / Self.minimumRetainedThoughtSeedPriority
-                guard ratio.isFinite, ratio > 0 else { continue }
-                // Physical deletion uses `< minimum`, so schedule just beyond
-                // the exact equality boundary and avoid an immediate no-op loop.
-                let seconds = Self.thoughtSeedPriorityHalfLife * log2(ratio)
-                guard seconds.isFinite else { continue }
-                let expiry = seed.lastUpdatedAt.addingTimeInterval(max(0, seconds) + 0.001)
-                if expiry <= now {
-                    dueReasons.append("thought_seed_expiry")
-                } else {
-                    futureDeadlines.append(expiry)
-                }
             }
         }
 

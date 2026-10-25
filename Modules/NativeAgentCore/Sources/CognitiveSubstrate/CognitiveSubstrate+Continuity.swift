@@ -66,7 +66,7 @@ extension CognitiveSubstrate {
               request.resolvedTurnKind == .live,
               Self.dreamThemeCadenceAllows(
                 read.capsulePresentationState.dreamThemeSurfaced, at: read.fixedAt) else { return nil }
-        let terms = Self.appraisalConcernTerms(in: request.userMessage)
+        let terms = Self.associationTerms(in: request.userMessage)
         guard terms.count >= Self.dreamThemeMinimumTerms else { return nil }
         let spent = Set(read.capsulePresentationState.dreamThemeSurfaced
             .filter { read.fixedAt.timeIntervalSince($0.value) < Self.dreamThemeRepeatWindow }.keys)

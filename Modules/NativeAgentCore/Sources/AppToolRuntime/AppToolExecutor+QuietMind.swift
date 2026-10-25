@@ -105,28 +105,14 @@ extension AppToolExecutor {
             guard case .object(let fields) = await runtime.why(turn: turn) else { return (false, "No why record.", [:]) }
             return (fields["status"] == .string("ok"),
                     AppToolExecutor.inputString(fields["detail"]) ?? "Why it surfaced, from the turn trace.", fields)
-        case "reject", "undo", "revise":
-            // Phase 5 B0: the seat hold_view/release_view use — her own live
-            // local turn, refused on a bridge, executor, replay or phone lane.
+        case "reject", "undo":
+            // Her own live local turn, refused on a bridge, executor, replay or phone lane.
             let seat: StudioCanonTurnProvenance
             switch StudioCanonSeatGate.liveTurnProvenance() {
             case .success(let provenance): seat = provenance
             case .failure(let refusal):
                 return (false, "mind.\(verb): \(refusal.spoken). It is done from inside your own conversation, in your own turn.",
                         ["reason": .string(refusal.rawValue)])
-            }
-            if verb == "revise" {
-                let raw = AppToolExecutor.inputString(input["view_id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                guard let id = UUID(uuidString: raw) else {
-                    return (false, "mind.revise: name the opinion by its view_id, from app mind.inner_state.", [:])
-                }
-                let refusal = await runtime.reviseOpinion(
-                    id: id, stance: AppToolExecutor.inputString(input["view"]) ?? "",
-                    evidence: AppToolExecutor.inputString(input["evidence"]) ?? "",
-                    wouldChangeMind: AppToolExecutor.inputString(input["unless"]) ?? "", seat: seat)
-                return refusal == nil
-                    ? (true, "Revised. The earlier view and what changed it are kept; mind.undo reverses it.", ["view_id": .string(raw)])
-                    : (false, "Not revised: \(refusal!).", ["view_id": .string(raw)])
             }
             if verb == "undo" {
                 let outcome = await runtime.undo(item: AppToolExecutor.inputString(input["item"]), seat: seat)
@@ -159,10 +145,22 @@ extension AppToolExecutor {
             _ = await runtime.observatoryDetailRead()
             return body(outcome, verb == "settle_body" ? "settled" : "reset")
         case "pin_concern":
-            guard let pinned = await runtime.pinTopConcern() else {
-                return (true, "Nothing pressing to pin right now.", ["changed": .bool(false)])
+            let seat: StudioCanonTurnProvenance
+            switch StudioCanonSeatGate.liveTurnProvenance() {
+            case .success(let provenance): seat = provenance
+            case .failure(let refusal):
+                return (false, "mind.pin_concern: \(refusal.spoken). It is done from inside your own conversation, in your own turn.",
+                        ["reason": .string(refusal.rawValue)])
             }
-            return (true, "Pinned: \(pinned)", [:])
+            do {
+                guard let pinned = try await runtime.pinTopConcern(
+                    text: AppToolExecutor.inputString(input["concern"]), seat: seat) else {
+                    return (true, "Nothing pressing to pin right now.", ["changed": .bool(false)])
+                }
+                return (true, "Kept open: \(pinned)", [:])
+            } catch {
+                return (false, "The concern was not saved: \(error)." + Self.quietMindRetry, [:])
+            }
         case "run_checks":
             let outcome = await runtime.runResearchHarness()
             return (!outcome.isFailed, outcome.presentationText + (outcome.isFailed ? Self.quietMindRetry : ""), [:])
@@ -181,23 +179,6 @@ extension AppToolExecutor {
             return (true, include
                 ? "The workspace is included again."
                 : "The workspace is left out: the thought summary and background thinking ignore it until include_workspace.", [:])
-        case "decline_view", "approve_view":
-            let approve = verb == "approve_view"
-            let raw = AppToolExecutor.inputString(input["view_id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard let id = UUID(uuidString: raw), let view = detail.standingViews.first(where: { $0.id == id }) else {
-                return (false, "No standing view has id \(raw.isEmpty ? "(none passed)" : raw). app mind.inner_state lists your proposed views with their ids.", [:])
-            }
-            let outcome = await runtime.resolveStandingViewWithOutcome(id: id, approved: approve)
-            switch outcome.status {
-            case .applied:
-                guard approve else { return (true, "Declined \"\(view.title)\"; it is retired.", ["view_id": .string(raw)]) }
-                recordQuietMindDecision("mind.approve_view \(view.title)", input: input, dataRoot: dataRoot)
-                return (true, "Approved \"\(view.title)\"; it is a standing view now.", ["view_id": .string(raw)])
-            case .unavailable(let why): return (false, why + " app mind.inner_state shows its status now.", [:])
-            case .notSaved(let why):
-                return (false, "\(approve ? "Approved" : "Declined") in memory, but not saved: \(why). "
-                    + "It may come back after a restart." + Self.quietMindRetry, [:])
-            }
         case "clear":
             // The Observatory's Clear.
             switch await runtime.clearTransientState() {

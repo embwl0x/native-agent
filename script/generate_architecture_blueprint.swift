@@ -8,8 +8,8 @@ let check = arguments.contains("--check")
 let repoIndex = arguments.firstIndex(of: "--repo")
 // realpath, not resolvingSymlinksInPath: Foundation maps /private/tmp back to
 // /tmp, while the enumerator hands back /private/tmp paths.
-let repo = URL(fileURLWithPath: realpath(repoIndex.map { arguments[$0 + 1] } ?? FileManager.default.currentDirectoryPath, nil)
-    .map { defer { free($0) }; return String(cString: $0) } ?? FileManager.default.currentDirectoryPath)
+let given = repoIndex.map { arguments[$0 + 1] } ?? FileManager.default.currentDirectoryPath
+let repo = URL(fileURLWithPath: realpath(given, nil).map { defer { free($0) }; return String(cString: $0) } ?? given)
 let document = repo.appendingPathComponent("docs/ARCHITECTURE_BLUEPRINT.md")
 let original = try String(contentsOf: document, encoding: .utf8)
 struct Scope: Decodable { let blueprintRoots: [String] }

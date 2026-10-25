@@ -54,15 +54,6 @@ extension NativeCognitionRuntime: InnerStateProviding {
         // ABSENCE READS AS ABSENCE (W4/P2's rule): with the organism off there
         // is no chemistry and no fatigue to report, and a zero would be a
         // fabricated calm rather than an honest silence.
-        // The three sibling lanes in this wave have landed, so the reading is
-        // whole: the body's clock (#3/#10), the forward-facing register (#4),
-        // and the nag (#5). Each is still OPTIONAL at the type level — a body
-        // with no clock configured, or a mind facing nothing, reports absence
-        // rather than a plausible-looking default.
-        //
-        // The rumination candidate is NOT passed in: it is substrate-owned
-        // (`ruminationCandidates(at:)`), so the reading computes it itself
-        // rather than having the runtime marshal it back and forth.
         let organism = CognitiveInnerStateOrganismReads(
             projection: frozen.snapshot.enabled ? frozen.projection : nil,
             fatigue: frozen.snapshot.enabled ? frozen.snapshot.chemicalState.fatigue : nil,

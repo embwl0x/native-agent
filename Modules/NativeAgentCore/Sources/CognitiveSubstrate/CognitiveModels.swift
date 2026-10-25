@@ -233,11 +233,6 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     /// The one early repeat (she fed the rut again after it was named) has
     /// been spent for the current signature; a new signature re-arms it.
     public var soundRutEarlyRepeatSpent: Bool
-    /// Per-inner-line cadence ledger, keyed by the line's stable key.
-    /// A non-negative value counts capsules this line has LED; a negative value
-    /// counts the capsules of rest it still owes. Bounded by
-    /// `innerLineLedgerCapacity`; the whole map is presentation-only.
-    public var innerLineRuns: [String: Int]
     /// PRESENTATION RECEIPTS for the two 2026-09-02 felt-line organs. Both are
     /// counters, never text: how many accepted capsules carried an OBJECT on the
     /// felt line, and how many carried the one allowed contradicting second
@@ -262,32 +257,26 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     /// second unbidden recall, it is a loop. Bounded by
     /// `remindedOfLedgerCapacity`; ids only, never text.
     public var remindedOfSurfaced: [String: Date]
-    /// INNER EXPIRES AS TEXT (Phase 5A, 2026-10-03). Per Inner/Thread line
-    /// key: when it was first shown and on how many turns. Past
-    /// `innerTextMaxShows` or `innerTextMaxAge` the line stops rendering; the
-    /// seed or view behind it is untouched. Bounded, keys only, never text.
-    public var innerTextShown: [String: InnerTextExposure]
     /// Phase 5 B1: dream residue phrase id → when it surfaced. The newest
     /// stamp is the line's cooldown; a phrase never surfaces twice in a
     /// diary's life. Ids only, never text.
     public var dreamThemeSurfaced: [String: Date]
+    /// Cares lane 2: care id → when she last meant to bring it up. It rests
+    /// 12 h unless it moved again since. Ids only, never text.
+    public var careReleased: [String: Date]
+    /// Care id → when its plain "On your mind" line showed and how many
+    /// accepted turns it still rests. Ids only, never text.
+    public var careLineRest: [String: CareLineRest]
 
-    public struct InnerTextExposure: Sendable, Equatable {
-        public var firstShownAt: Date
-        public var shows: Int
-        public init(firstShownAt: Date, shows: Int) {
-            self.firstShownAt = firstShownAt
-            self.shows = shows
+    public struct CareLineRest: Sendable, Equatable {
+        public var shownAt: Date
+        public var turnsLeft: Int
+        public init(shownAt: Date, turnsLeft: Int) {
+            self.shownAt = shownAt
+            self.turnsLeft = turnsLeft
         }
     }
 
-    public static let innerLineLedgerCapacity = 24
-    public static let innerTextLedgerCapacity = 48
-    public static let innerTextMaxShows = 6
-    public static let innerTextMaxAge: TimeInterval = 4 * 3_600
-    /// A record older than this is forgotten, so a durable view can be said
-    /// again another week; a stale takeaway has decayed out long before.
-    public static let innerTextForgetAfter: TimeInterval = 72 * 3_600
     public static let remindedOfLedgerCapacity = 16
 
     public init(
@@ -301,15 +290,15 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         soundRutLastSurfacedAt: Date? = nil,
         soundRutTurnsSinceSurfaced: Int = 0,
         soundRutEarlyRepeatSpent: Bool = false,
-        innerLineRuns: [String: Int] = [:],
         feltObjectCount: Int = 0,
         ambivalenceCount: Int = 0,
         lastAmbivalenceAt: Date? = nil,
         remindedOfLastSurfacedAt: Date? = nil,
         remindedOfTurnsSinceSurfaced: Int = 0,
         remindedOfSurfaced: [String: Date] = [:],
-        innerTextShown: [String: InnerTextExposure] = [:],
-        dreamThemeSurfaced: [String: Date] = [:]
+        dreamThemeSurfaced: [String: Date] = [:],
+        careReleased: [String: Date] = [:],
+        careLineRest: [String: CareLineRest] = [:]
     ) {
         self.fingerprintFamily = fingerprintFamily
         self.fingerprintCount = max(0, fingerprintCount)
@@ -321,60 +310,28 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         self.soundRutLastSurfacedAt = soundRutLastSurfacedAt
         self.soundRutTurnsSinceSurfaced = max(0, soundRutTurnsSinceSurfaced)
         self.soundRutEarlyRepeatSpent = soundRutEarlyRepeatSpent
-        self.innerLineRuns = innerLineRuns
         self.feltObjectCount = max(0, feltObjectCount)
         self.ambivalenceCount = max(0, ambivalenceCount)
         self.lastAmbivalenceAt = lastAmbivalenceAt
         self.remindedOfLastSurfacedAt = remindedOfLastSurfacedAt
         self.remindedOfTurnsSinceSurfaced = max(0, remindedOfTurnsSinceSurfaced)
         self.remindedOfSurfaced = remindedOfSurfaced
-        self.innerTextShown = innerTextShown
         self.dreamThemeSurfaced = dreamThemeSurfaced
-    }
-}
-
-/// One frozen standing-view line plus the exact concern vocabulary captured
-/// for it. Selection can therefore use the current turn without rereading live
-/// standing views or concern state.
-public struct CognitiveStandingViewCapsuleCandidate: Sendable, Equatable {
-    public let id: UUID
-    public let line: String
-    public let concernKeywords: [String]
-    public let updatedAt: Date
-    /// Which TIER this candidate belongs to (2026-09-02). A held view — one she
-    /// adopted herself, unsigned — is ranked strictly below every user-approved
-    /// active view rather than competing with them on relevance score, so the
-    /// tier has to survive the freeze into the frozen read.
-    public let isHeld: Bool
-
-    public init(
-        id: UUID,
-        line: String,
-        concernKeywords: [String],
-        updatedAt: Date,
-        isHeld: Bool = false
-    ) {
-        self.id = id
-        self.line = line
-        self.concernKeywords = concernKeywords
-        self.updatedAt = updatedAt
-        self.isHeld = isHeld
+        self.careReleased = careReleased
+        self.careLineRest = careLineRest
     }
 }
 
 public struct CognitiveFrozenRead: Sendable, Equatable {
     public let fixedAt: Date
     public let stateRevision: UInt64
-    public let thoughtSeedRevision: UInt64
     public let configuration: CognitiveConfiguration
     public let personalityDynamics: PersonalityDynamicsConfiguration
     public let snapshot: CognitiveSubstrateSnapshot
     public let workspace: CognitiveWorkspaceSnapshot
     public let affect: CognitiveAffectState
     public let mood: CognitiveMoodReading
-    public let thoughtSeeds: [CognitiveThoughtSeed]
     public let feltProxies: CognitiveFeltProxyReads
-    public let standingViewCapsuleCandidates: [CognitiveStandingViewCapsuleCandidate]
     public let soundLandingScores: [UUID: Double]
     public let capsulePresentationState: CognitiveCapsulePresentationState
     public let pendingCompletionOpen: Bool
@@ -384,16 +341,13 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
     public init(
         fixedAt: Date,
         stateRevision: UInt64,
-        thoughtSeedRevision: UInt64,
         configuration: CognitiveConfiguration,
         personalityDynamics: PersonalityDynamicsConfiguration = .default,
         snapshot: CognitiveSubstrateSnapshot,
         workspace: CognitiveWorkspaceSnapshot,
         affect: CognitiveAffectState = CognitiveAffectState(),
         mood: CognitiveMoodReading = CognitiveMoodReading(valence: 0, basis: 0),
-        thoughtSeeds: [CognitiveThoughtSeed] = [],
         feltProxies: CognitiveFeltProxyReads = .absent,
-        standingViewCapsuleCandidates: [CognitiveStandingViewCapsuleCandidate] = [],
         soundLandingScores: [UUID: Double] = [:],
         capsulePresentationState: CognitiveCapsulePresentationState = CognitiveCapsulePresentationState(),
         pendingCompletionOpen: Bool = false,
@@ -402,16 +356,13 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
     ) {
         self.fixedAt = fixedAt
         self.stateRevision = stateRevision
-        self.thoughtSeedRevision = thoughtSeedRevision
         self.configuration = configuration
         self.personalityDynamics = personalityDynamics
         self.snapshot = snapshot
         self.workspace = workspace
         self.affect = affect
         self.mood = mood
-        self.thoughtSeeds = thoughtSeeds
         self.feltProxies = feltProxies
-        self.standingViewCapsuleCandidates = standingViewCapsuleCandidates
         self.soundLandingScores = soundLandingScores
         self.capsulePresentationState = capsulePresentationState
         self.pendingCompletionOpen = pendingCompletionOpen

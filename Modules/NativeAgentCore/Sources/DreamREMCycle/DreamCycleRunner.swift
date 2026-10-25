@@ -25,6 +25,7 @@ public actor DreamCycleRunner {
     private let memoryDeltaProvider: DreamMemoryDeltaProvider
     private let feltSummaryProvider: DreamFeltSummaryProvider
     private let feltOriginProvider: DreamFeltOriginProvider
+    private let careNightProvider: DreamCareNightProvider
     private let receiptSink: DreamReceiptSink
     private let datedMoodSink: DreamDatedMoodSink?
     /// The already-resolved trust gate, when the caller has one. Supplied, it
@@ -59,6 +60,7 @@ public actor DreamCycleRunner {
         memoryDeltaProvider: @escaping DreamMemoryDeltaProvider = { _ in [] },
         feltSummaryProvider: @escaping DreamFeltSummaryProvider = { nil },
         feltOriginProvider: @escaping DreamFeltOriginProvider = { [] },
+        careNightProvider: @escaping DreamCareNightProvider = { nil },
         receiptSink: @escaping DreamReceiptSink = { _, _ in },
         datedMoodSink: DreamDatedMoodSink? = nil,
         gate: DreamREMGatePolicy? = nil,
@@ -73,6 +75,7 @@ public actor DreamCycleRunner {
         self.memoryDeltaProvider = memoryDeltaProvider
         self.feltSummaryProvider = feltSummaryProvider
         self.feltOriginProvider = feltOriginProvider
+        self.careNightProvider = careNightProvider
         self.receiptSink = receiptSink
         self.datedMoodSink = datedMoodSink
         self.gate = gate
@@ -223,6 +226,7 @@ public actor DreamCycleRunner {
             report.errors.append("felt context read failed: \(error)")
             return report
         }
+        let careNight = await careNightProvider()
         let citedStudioEntryIDs = Self.studioEntryCitations(
             from: feltOrigins, feltSummary: feltSummary)
         let dreamSystem = Self.dreamSystemPrompt(personaDocs: personaDocs)
@@ -232,6 +236,7 @@ public actor DreamCycleRunner {
         let prompt = buildCombinedPrompt(
             dateKey: dateKey,
             messages: messages, memoryDeltas: memoryDeltas, feltSummary: feltSummary,
+            careBlock: careNight?.block ?? "",
             sourcePeerIds: CognitiveReflectionCause.unionPeerIds(messages.map { row in
                 row.source.flatMap { sourceMaterial[$0]?.sourcePeerIds }
             }))
@@ -344,6 +349,9 @@ public actor DreamCycleRunner {
         report.reflectionMaterial = sourceMaterial
         report.reflectionMaterial["dream_diary/\(dateKey).md"] = CognitiveReflectionCause(
             text: markdown, sourcePeerIds: prompt.peerIds, sourceRefs: sourceMaterial.keys.sorted())
+        report.careNight = careNight.map {
+            CognitiveCareNight(block: $0.block, keys: $0.keys, answers: payload.cares, source: "dream_diary/\(dateKey).md")
+        }
         // Change-only: a dream whose feeling owes nothing to the journal emits
         // NO receipt at all — the ordinary case must not become the loudest
         // thing in the ledger. Fired after the entry committed, for the same
@@ -515,6 +523,7 @@ public actor DreamCycleRunner {
         messages: [(sessionId: String, role: String, content: String, source: String?)],
         memoryDeltas: [String],
         feltSummary: String? = nil,
+        careBlock: String = "",
         sourcePeerIds: [String]?
     ) -> (text: String, peerIds: [String]?) {
         var convLines: [String] = []
@@ -570,7 +579,7 @@ public actor DreamCycleRunner {
 
         // These prose-only providers carry no provenance attestation.
         let peers = CognitiveReflectionCause.unionPeerIds([sourcePeerIds]
-            + (selfHalf.isEmpty && feltBlock.isEmpty ? [] : [nil]))
+            + (selfHalf.isEmpty && feltBlock.isEmpty && careBlock.isEmpty ? [] : [nil]))
         return ("""
         Date: \(dateKey)
 
@@ -578,7 +587,7 @@ public actor DreamCycleRunner {
         \(worldHalf)
         --- SELF HALF (what you've absorbed about yourself since the last dream) ---
         \(selfBody)
-        \(feltBlock)Reflect on BOTH halves at equal weight and produce the JSON dream \
+        \(feltBlock)\(careBlock)Reflect on BOTH halves at equal weight and produce the JSON dream \
         entry described in the system prompt. The summary is YOUR reflective \
         voice — neither a recap of the user's side nor a status report. If the \
         recent stretch was user-heavy, the Self half is what keeps this from \

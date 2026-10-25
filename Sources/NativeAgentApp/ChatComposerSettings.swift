@@ -168,7 +168,7 @@ extension QuietComposerCommands {
 
     static let sheets: [String: ActivitySection] = [
         "approvals": .approvals, "today_inbox": .inbox, "memory_proposals": .memoryProposals,
-        "self_improvement": .selfImprovement, "standing_views": .cognitionProposals,
+        "self_improvement": .selfImprovement,
     ]
     static let tabs: [String: (page: SidebarItem, tab: String)] = [
         "knowledge": (.memories, "knowledge"), "minds": (.personality, "minds"),

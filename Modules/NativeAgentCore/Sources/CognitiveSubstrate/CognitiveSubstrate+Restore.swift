@@ -88,7 +88,7 @@ extension CognitiveSubstrate {
             if residentRestoreIsAuthoritative {
                 reconciled.artifacts[family] = rows
             } else if !rows.isEmpty {
-                let identityField = family == "rumination_release" ? "seedId" : "id"
+                let identityField = "id"
                 if rows.allSatisfy({ row in
                     guard case .object(let object) = row else { return false }
                     return uuidValue(object[identityField]) != nil
@@ -107,10 +107,10 @@ extension CognitiveSubstrate {
                 }
             }
         }
-        let clampedStandingViewIds = applyRestoreBundle(reconciled)
+        applyRestoreBundle(reconciled)
         residentRestoreIsAuthoritative = true
         // Commit the reconciled nodes and artifacts together, including the
-        // exact bounded seed family and resident removals.
+        // resident removals.
         do {
             try await persistReconciledRestoreState(replacing: bundle)
         } catch {
@@ -132,16 +132,11 @@ extension CognitiveSubstrate {
         )
         await reconcileRestoredAffectWithRecentConversation(nodes: field.peekNodes())
         publishAttentionProjection(at: dependencies.now())
-        // Defensive repair: a half-persisted approval (crash between the active upsert and
-        // the cap deletes) could leave >cap active rows — demote LRU + heal the store.
-        await repairStandingViewCapIfNeeded()
-        // Persist any future-timestamp clamps so the repair survives restarts.
-        await persistClampedStandingViews(ids: clampedStandingViewIds)
+        await establishCares()
         try? await store.appendReceipt(
             kind: "lifecycle.restore",
             payload: .object([
                 "nodeCount": .int(Int64(field.peekNodes().count)),
-                "thoughtSeedCount": .int(Int64(projectedThoughtSeeds(at: dependencies.now()).count)),
                 "episodeCount": .int(Int64(episodes.count)),
                 "schemaProposalCount": .int(Int64(schemaProposals.count)),
                 "timelineCount": .int(Int64(developmentalTimeline.count)),
@@ -155,17 +150,15 @@ extension CognitiveSubstrate {
     }
 
     private func residentRestoreArtifacts(at now: Date) -> [String: [JSONValue]] {
+        let careRows = careRestoreRows()
         var rows: [String: [JSONValue]] = [
-            "thought_seed": thoughtSeeds.values.map { $0.toJSON() },
             "episode": episodes.values.map { $0.toJSON() },
             "schema_proposal": schemaProposals.values.map { $0.toJSON() },
-            "standing_view": standingViews.values.map { $0.toJSON() },
+            "care": careRows.cares,
+            "care_migration": careRows.migration,
             "developmental_timeline": developmentalTimeline.values.map { $0.toJSON() },
             "reflection_receipt": reflectionReceipts.values.map { $0.toJSON() },
             "experiment": experimentResults.values.map { $0.toJSON() },
-            "rumination_release": ruminationReleasedAt.map { id, at in
-                .object(["seedId": .string(id.uuidString), "releasedAt": .double(at.timeIntervalSince1970)])
-            },
             "emotional_consolidation": lastEmotionalConsolidationAt.map {
                 [.object(["ranAt": .double($0.timeIntervalSince1970)])]
             } ?? [],
@@ -193,9 +186,6 @@ extension CognitiveSubstrate {
 
     private func restoreArtifactID(family: String, payload: JSONValue) -> UUID {
         guard case .object(let object) = payload else { return stableArtifactID(family) }
-        if family == "rumination_release", let seedID = uuidValue(object["seedId"]) {
-            return stableArtifactID("rumination_release|\(seedID.uuidString)")
-        }
         return uuidValue(object["id"]) ?? stableArtifactID(family)
     }
 
@@ -205,11 +195,10 @@ extension CognitiveSubstrate {
         let families = residentRestoreArtifacts(at: now)
         var artifacts: [CognitiveArtifactWrite] = []
         var retainedIDs: Set<UUID> = []
-        for (family, rows) in families where family != "thought_seed" {
+        for (family, rows) in families {
             for payload in rows {
                 guard case .object(let object) = payload else { continue }
                 let id = restoreArtifactID(family: family, payload: payload)
-                if family == "standing_view", stringValue(object["status"]) == "retired" { continue }
                 retainedIDs.insert(id)
                 // Counts in this diagnostic payload live only in SQLite. A
                 // matching consolidation clock does not replace that evidence.
@@ -222,8 +211,7 @@ extension CognitiveSubstrate {
                 case "episode", "developmental_timeline": status = "recorded"; score = 0.5
                 case "reflection_receipt": status = object["cancelled"] == .bool(true) ? "cancelled" : "recorded"
                 case "experiment": status = "recorded"
-                case "rumination_release": status = "released"
-                case "standing_view": score = max(0, doubleValue(object["moodValenceAtFormation"]) ?? 0)
+                case "care": status = (object["fadedAt"] ?? .null) == .null ? "live" : "faded"
                 case "disposition": score = ((doubleValue(object["valence"]) ?? 0) + 1) / 2
                 case "affect": score = doubleValue(object["arousal"]) ?? 0
                 default: break
@@ -234,15 +222,12 @@ extension CognitiveSubstrate {
             }
         }
         let deletedIDs = bundle.artifacts.flatMap { family, rows in
-            family == "thought_seed" ? [] : rows.map { restoreArtifactID(family: family, payload: $0) }
+            rows.map { restoreArtifactID(family: family, payload: $0) }
         }.filter { !retainedIDs.contains($0) }
         markDirty(at: now)
         // Ordinary writes remain blocked until this recovery transaction lands.
         try await store.commitMaintenance(
             nodes: field.snapshot(at: now, configuration: configuration),
-            thoughtSeeds: thoughtSeeds.values.map {
-                CognitiveArtifactReplacement(id: $0.id, status: "open", score: $0.priority, payload: $0.toJSON())
-            },
             artifacts: artifacts, deletedArtifactIDs: deletedIDs, receipts: [],
             maxNodes: configuration.maximumActiveNodes, maxArtifacts: artifactCap(configuration), at: now
         )
@@ -257,29 +242,17 @@ extension CognitiveSubstrate {
                 limit: 1
             ),
             CognitiveArtifactFamilyLoad(key: "disposition", kindPrefix: "disposition", limit: 1),
-            // Personality depth wave, items 6 and 7 (2026-09-02). Both are
-            // at-most-once claims, so they must outlive a crash: a released nag
-            // must not heal twice, and a committed dream must leave exactly one
-            // residue.
+            // A committed dream leaves exactly one residue across restarts.
             CognitiveArtifactFamilyLoad(key: "dream_residue", kindPrefix: "dream_residue", limit: 1),
-            CognitiveArtifactFamilyLoad(
-                key: "rumination_release",
-                kindPrefix: "rumination_release",
-                limit: 64
-            ),
             CognitiveArtifactFamilyLoad(
                 key: "emotional_consolidation",
                 kindPrefix: "emotional_consolidation",
                 limit: 1
             ),
-            CognitiveArtifactFamilyLoad(
-                key: "thought_seed",
-                kindPrefix: "thought_seed",
-                limit: configuration.maximumThoughtSeeds
-            ),
             CognitiveArtifactFamilyLoad(key: "episode", kindPrefix: "episode", limit: 120),
             CognitiveArtifactFamilyLoad(key: "schema_proposal", kindPrefix: "schema_proposal", limit: 120),
-            CognitiveArtifactFamilyLoad(key: "standing_view", kindPrefix: "standing_view", limit: 60),
+            CognitiveArtifactFamilyLoad(key: "care", kindPrefix: "care", limit: 0, whole: true),
+            CognitiveArtifactFamilyLoad(key: "care_migration", kindPrefix: "care_migration", limit: 1),
             CognitiveArtifactFamilyLoad(
                 key: "developmental_timeline",
                 kindPrefix: "developmental_timeline",
@@ -328,19 +301,8 @@ extension CognitiveSubstrate {
                 && doubleValue(object["valence"]) != nil
         case "dream_residue":
             return dateValue(object["updatedAt"]) != nil
-        case "rumination_release":
-            return uuidValue(object["seedId"]) != nil
-                && dateValue(object["releasedAt"]) != nil
         case "emotional_consolidation":
             return dateValue(object["ranAt"]) != nil
-        case "thought_seed":
-            guard let kind = stringValue(object["kind"]) else { return false }
-            return uuidValue(object["id"]) != nil
-                && CognitiveThoughtSeedKind(rawValue: kind) != nil
-                && stringValue(object["text"]) != nil
-                && doubleValue(object["priority"]) != nil
-                && dateValue(object["createdAt"]) != nil
-                && dateValue(object["lastUpdatedAt"]) != nil
         case "episode":
             return uuidValue(object["id"]) != nil
                 && stringValue(object["title"]) != nil
@@ -352,14 +314,6 @@ extension CognitiveSubstrate {
                 && stringValue(object["body"]) != nil
                 && stringValue(object["target"]) != nil
                 && dateValue(object["createdAt"]) != nil
-        case "standing_view":
-            guard let status = stringValue(object["status"]) else { return false }
-            return uuidValue(object["id"]) != nil
-                && stringValue(object["title"]) != nil
-                && stringValue(object["body"]) != nil
-                && CognitiveStandingView.Status(rawValue: status) != nil
-                && dateValue(object["createdAt"]) != nil
-                && dateValue(object["updatedAt"]) != nil
         case "developmental_timeline":
             guard let kind = stringValue(object["kind"]) else { return false }
             return uuidValue(object["id"]) != nil
@@ -381,6 +335,10 @@ extension CognitiveSubstrate {
                 && dateValue(object["createdAt"]) != nil
         case "mind_ledger":
             return dateValue(object["updatedAt"]) != nil
+        case "care":
+            return Self.careDecoded(CognitiveCare.self, payload) != nil
+        case "care_migration":
+            return Self.careDecoded(CognitiveCareMigration.self, payload) != nil
         case "experiment":
             guard let kind = stringValue(object["kind"]) else { return false }
             return uuidValue(object["id"]) != nil
@@ -393,7 +351,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    private func applyRestoreBundle(_ bundle: CognitiveSQLiteRestoreBundle) -> [UUID] {
+    private func applyRestoreBundle(_ bundle: CognitiveSQLiteRestoreBundle) {
         // A successfully loaded (or explicitly cleared) resident field also
         // owns evictions and deletions. A disk snapshot cannot revive them.
         if !residentRestoreIsAuthoritative {
@@ -412,14 +370,11 @@ extension CognitiveSubstrate {
         restoreCapsulePresentation(from: payloads("capsule_presentation"))
         restoreDisposition(from: payloads("disposition"))
         restoreEmotionalConsolidation(from: payloads("emotional_consolidation"))
-        restoreThoughtSeeds(from: payloads("thought_seed"))
         restoreDreamResidue(from: payloads("dream_residue"))
-        // AFTER the seed family: a release marker drops the seed it released, so
-        // a seed row that outlived its own removal cannot come back and nag.
-        restoreRuminationReleases(from: payloads("rumination_release"))
         restoreEpisodes(from: payloads("episode"))
         restoreSchemaProposals(from: payloads("schema_proposal"))
-        let clampedStandingViewIds = restoreStandingViews(from: payloads("standing_view"))
+        restoreCares(from: payloads("care"))
+        restoreCareMigration(from: payloads("care_migration"))
         restoreDevelopmentalTimeline(from: payloads("developmental_timeline"))
         restoreReflectionReceipts(from: payloads("reflection_receipt"))
         restoreExperimentResults(from: payloads("experiment"))
@@ -429,7 +384,6 @@ extension CognitiveSubstrate {
         enforceDevelopmentalTimelineCap()
         enforceReflectionReceiptCap()
         enforceExperimentResultCap()
-        return clampedStandingViewIds
     }
 
     private func restoreFailureStage(for error: Error) -> String {

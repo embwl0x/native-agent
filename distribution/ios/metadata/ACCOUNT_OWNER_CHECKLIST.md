@@ -3,6 +3,43 @@
 These steps require the NativeAgent Apple Developer/App Store Connect account
 and cannot be completed or truthfully verified from source alone.
 
+## 0.6.11 build 25 — 2026-10-25
+
+- [x] Build 24 on User's phone: the chat held at the bottom; their reply showed a
+  word or two, paused, then appeared whole.
+- [x] Build 25 from main `7ebf2607e` (a settled reply keeps typing until the
+  paced reveal catches up, then turns to markdown): archived, exported,
+  uploaded 2026-10-25 15:07Z ("Upload succeeded"). TestFlight internal; not
+  yet submitted for App Store review.
+
+## 0.6.11 build 24 — 2026-10-25
+
+- [x] Build 23 on User's phone: the chat still jumped on send and twitched as a
+  reply settled.
+- [x] Build 24 from main `da716a966` (chat follows the bottom with the scroll
+  view's own anchor; watched in the simulator replaying send, stream and
+  settle): archived, exported, uploaded 2026-10-25 14:39Z ("Upload
+  succeeded"). TestFlight internal; not yet submitted for App Store review.
+
+## 0.6.11 build 23 — 2026-10-25
+
+- [x] Build 22 reached User's phone from TestFlight; the damaged-copy banner
+  was gone.
+- [x] Build 23 from main `8ec2e4721` (personality lane 5 on the Mac side; chat
+  stays at the bottom when a reply settles; the voice transcript shows every
+  word; Send while dictating stops and sends): archive and export passed,
+  uploaded 2026-10-25 14:13Z ("Upload succeeded"). TestFlight internal; not
+  yet submitted for App Store review.
+
+## 0.6.11 build 22 — 2026-10-25
+
+- [x] Build 22 from main `ad8cd9024` (reads what Mac 0.6.11 publishes; the
+  App Store build could not decode approvals, inbox, memories, memory
+  proposals, providers and chat): `script/ios_release.sh --archive --export`
+  passed from clean commit `57377f01d`, nothing skipped; IPA validated.
+- [x] Uploaded 2026-10-25 13:01Z (Xcode "Upload succeeded", "Uploaded package
+  is processing"). TestFlight internal; not submitted for App Store review.
+
 ## 0.6.7 build 20 — 2026-10-19
 
 - [x] iOS bumped to `0.6.7 (20)` with rewritten What's New

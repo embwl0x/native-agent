@@ -1,4 +1,5 @@
 import AgentConversations
+import CognitiveSubstrate
 import AgentWorkspace
 import ToolRegistry
 import Foundation
@@ -66,6 +67,9 @@ struct ChatHistorySearchRow: Sendable {
     /// As the canonical transcript reader sees the line: 0 not JSON, 1 JSON it
     /// rejects (not an object, or no string role and words), 2 a message.
     var shape = 0
+    /// The writer marked the row machinery (card copy, a failure row, a
+    /// notice, a compaction summary): `CognitiveMechanicalRowKind.marksMechanicalRow`.
+    var mechanical = false
 
     var isToolRow: Bool { role?.lowercased() == "tool" }
 }
@@ -665,7 +669,8 @@ extension SwiftToolDispatcher {
                 peer: role != "tool" ? persistedHistoryPeer(role: role, row: obj) : nil,
                 tool: name.flatMap { $0.isEmpty ? nil : ToolNameAliases.shown($0, inputJSON: string(metadata["inputJSON"])).name },
                 displayPrefix: chatHistoryDisplayEvidence("", role: role, row: obj),
-                shape: string(obj["role"]) != nil && (string(obj["content"]) ?? string(obj["text"])) != nil ? 2 : 1)
+                shape: string(obj["role"]) != nil && (string(obj["content"]) ?? string(obj["text"])) != nil ? 2 : 1,
+                mechanical: CognitiveMechanicalRowKind.marksMechanicalRow(metadata))
         }
         guard role == "tool" else { return (project(words ?? ""), nil) }
         // Receipt metadata is an explicit evidence lane, never conversation recall.

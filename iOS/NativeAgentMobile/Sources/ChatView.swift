@@ -66,6 +66,8 @@ struct ChatView: View {
     /// drops what it heard. Keyed, not the raw id, so the main session's nil id
     /// is still distinguishable from "no dictation in flight".
     @State private var dictationSessionKey: String?
+    /// Send was tapped while dictating: the send happens when the words land.
+    @State private var sendWhenDictationLands = false
 
     private let maxPendingPhotos = 4
     // CloudKitDeviceTransport caps the complete encoded BridgeMessage at
@@ -103,6 +105,7 @@ struct ChatView: View {
         // Before any name is known the fallback is the product, not the agent.
         return agentDisplayName == NativeAgentIdentity.displayName(nil) ? "Message…" : "Message \(agentDisplayName)…"
     }
+
 
     // Process-local visual fixture: no transcript/cache writes and no transport sends.
     private var isChatSample: Bool {
@@ -450,7 +453,12 @@ struct ChatView: View {
                             chatEmptyState
                                 .containerRelativeFrame(.vertical)
                         } else {
-                            LazyVStack(alignment: .leading, spacing: 26) {
+                            // Eager on purpose: the transcript is paged (newest 50, then
+                            // older on request), and exact row heights are what let the
+                            // bottom anchor hold when a streamed reply is replaced by its
+                            // settled self. A lazy stack estimated that row and the anchored
+                            // view landed past the content (blank chat after a reply).
+                            VStack(alignment: .leading, spacing: 26) {
                                 if store.canLoadOlderHistory {
                                     Button(store.isLoadingHistory ? "Loading earlier messages…" : "Load earlier messages") {
                                         Task { await store.loadOlderHistory() }
@@ -469,13 +477,6 @@ struct ChatView: View {
                                             cardsAvailable: transcriptReadError == nil
 	                                    )
                                         .equatable()
-                                        // The paced reveal grows the live reply
-                                        // between ~1 s batches; keep following it.
-                                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { _ in
-                                            if msg.isStreaming || store.liveTurnBubbles.values.contains(msg.id) {
-                                                scheduleScrollToBottom(proxy, animated: false)
-                                            }
-                                        }
 	                                    .id(msg.id.uuidString)
 	                                    // phase 6: entrance animates ONLY when the
 	                                    // append seam (ChatStore.send) supplies a
@@ -523,6 +524,7 @@ struct ChatView: View {
                                 // Reaching the bottom by hand is following again:
                                 // the Latest button goes away on its own.
                                 Color.clear.frame(height: 1)
+                                    .id(Self.chatBottomID)
                                     .onAppear {
                                         let follow = ChatFollowPresentation.followLatest()
                                         autoFollowChat = follow.autoFollow
@@ -534,6 +536,12 @@ struct ChatView: View {
                             .padding(.horizontal, 20).padding(.vertical, 12)
                         }
                     }
+                    // One follow: the scroll view itself keeps the bottom in place while
+                    // her reply streams, settles and grows, and while the composer changes
+                    // height. Scrolled up, the reading position stays put instead.
+                    // Explicit scrolls remain only for what the person does (send,
+                    // switch chats, Latest, the keyboard).
+                    .defaultScrollAnchor(autoFollowChat ? .bottom : .top)
                     // The transcript softens out under the composer and the tab bar.
                     .aliveBottomFade(room: AliveChatRoom(store: store))
                     // The scroll view owns the inset: SwiftUI measures every composer
@@ -565,9 +573,6 @@ struct ChatView: View {
                         }
                         .animation(.easeOut(duration: 0.18), value: showLatestButton)
                     }
-                    .onGeometryChange(for: CGFloat.self) { $0.size.height - $0.safeAreaInsets.bottom } action: { _ in
-                        scheduleScrollToBottom(proxy, animated: false)
-                    }
                     // 2026-05-09 fix: keyboard would not dismiss when the user tapped
                     // off the textfield.  scrollDismissesKeyboard(.interactively)
                     // makes the keyboard slide down as the scroll view drags it
@@ -598,16 +603,6 @@ struct ChatView: View {
                         scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 120, force: true)
                     }
                     .onChange(of: store.messages.count) {
-                        scheduleScrollToBottom(proxy, animated: false)
-                    }
-                    .onChange(of: exchanges) { scheduleScrollToBottom(proxy, animated: false) }
-                    .onChange(of: store.messages.last?.text) {
-                        scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 16)
-                    }
-                    .onChange(of: store.messages.last?.isStreaming) {
-                        scheduleScrollToBottom(proxy, animated: false)
-                    }
-                    .onChange(of: store.isLoading) {
                         scheduleScrollToBottom(proxy, animated: false)
                     }
                     // B2: a straggler reply landed after its bubble timed out —
@@ -853,6 +848,9 @@ struct ChatView: View {
             }
             // Append transcript to input field when user releases mic button
             .onChange(of: voiceInput.lastFinalTranscript) { _, newValue in
+                // A pending one-tap send belongs to this dictation only.
+                let sendNow = sendWhenDictationLands
+                sendWhenDictationLands = false
                 guard !newValue.isEmpty else { return }
                 // 2026-09-06: only the conversation the user dictated into
                 // receives the words.
@@ -864,6 +862,11 @@ struct ChatView: View {
                 } else {
                     draft.text += " " + newValue
                 }
+                if sendNow { DispatchQueue.main.async { submitMessage() } }
+            }
+            // No words came back (the error says why): nothing to send.
+            .onChange(of: voiceInput.error) { _, error in
+                if error != nil { sendWhenDictationLands = false }
             }
             .onChange(of: selectedPhotoItems) { previousItems, items in
                 if items.isEmpty && suppressNextEmptyPhotoSelection {
@@ -883,13 +886,17 @@ struct ChatView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "mic.fill")
                         .foregroundStyle(NativeAgentPalette.agentAccent)
+                    // Every word as it is heard: the line grows with the talk, and a
+                    // long one keeps its newest words in view.
                     Text(voiceInput.transcript.isEmpty ? (voiceInput.statusText ?? "Listening") : voiceInput.transcript)
                         .font(AppFont.body.italic())
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(1...8)
+                        .truncationMode(.head)
+                        .fixedSize(horizontal: false, vertical: true)
                     Spacer()
                 }
-                .frame(height: 28)
+                .frame(minHeight: 28)
                 .padding(.horizontal, 4)
             }
             if !pendingPhotos.isEmpty || !pendingFiles.isEmpty || isLoadingPhotos {
@@ -930,9 +937,15 @@ struct ChatView: View {
                 } else {
 
                 Button {
-                    submitMessage()
+                    if voiceInput.isListening || voiceInput.isStarting {
+                        // One tap: stop listening, and send once the words land.
+                        sendWhenDictationLands = true
+                        voiceInput.stop()
+                    } else {
+                        submitMessage()
+                    }
                 } label: {
-                    let active = canSend && !store.isSwitchingSession
+                    let active = (canSend || voiceInput.isListening || voiceInput.isStarting) && !store.isSwitchingSession
                     Image(systemName: "arrow.up")
                         .font(.system(size: 15, weight: .bold))
                         .foregroundStyle(active ? Color.white : AlivePalette.secondary)
@@ -951,7 +964,7 @@ struct ChatView: View {
                         }
                         .frame(width: 44, height: 44)
                 }
-                .disabled(!canSend || store.isSwitchingSession)
+                .disabled(!(canSend || voiceInput.isListening || voiceInput.isStarting) || store.isSwitchingSession)
                 .accessibilityLabel("Send message")
                 }
             }
@@ -1888,6 +1901,8 @@ struct ChatView: View {
         store.importSharedItems(controls: runtimeControls)
     }
 
+    static let chatBottomID = "chat-bottom"
+
     private func scheduleScrollToBottom(
         _ proxy: ScrollViewProxy,
         animated: Bool = false,
@@ -1896,10 +1911,10 @@ struct ChatView: View {
     ) {
         guard !visibleMessages.isEmpty else { return }
         guard force || autoFollowChat else { return }
-        guard let lastMessage = visibleMessages.last else { return }
-        let targetID = otherRoomRows[""]?.last.map { "other-room:" + $0.id } ?? lastMessage.id.uuidString
+        // The true bottom: below the last reply and whatever follows it
+        // (other-room rows, cards, approvals), not the last reply's own edge.
         guard let serial = scrollScheduler.schedule(
-            targetID: targetID,
+            targetID: Self.chatBottomID,
             animated: animated,
             force: force
         ) else { return }

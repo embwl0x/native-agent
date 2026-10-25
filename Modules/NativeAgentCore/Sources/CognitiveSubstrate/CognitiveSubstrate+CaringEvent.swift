@@ -68,11 +68,15 @@ public struct AfterTurnContext: Sendable {
     public let event: CognitiveEvent
     public let caring: CaringAppraisalRequest?
     public let generation: UInt64
+    /// The cares the call is shown for this exchange; empty asks nothing about cares.
+    public let cares: [CognitiveCareLine]
 
-    public init(event: CognitiveEvent, caring: CaringAppraisalRequest?, generation: UInt64) {
+    public init(event: CognitiveEvent, caring: CaringAppraisalRequest?, generation: UInt64,
+                cares: [CognitiveCareLine] = []) {
         self.event = event
         self.caring = caring
         self.generation = generation
+        self.cares = cares
     }
 }
 
@@ -319,24 +323,29 @@ extension CognitiveSubstrate {
     }
 
     /// Ask the model, once per turn, without blocking the turn, and hand the
-    /// verdict to the body the moment it lands.
-    public func afterTurnContext(origin: AfterTurnOrigin) -> AfterTurnContext? {
+    /// verdict to the body the moment it lands. `reply` is her answer: the
+    /// cares shown are the ones closest to both sides of the exchange.
+    public func afterTurnContext(origin: AfterTurnOrigin, reply: String) async -> AfterTurnContext? {
         guard let deferred = deferredTurns.first(where: {
             $0.context.event.sessionId == origin.sessionId
                 && $0.context.event.metadata["messageId"] == .string(origin.messageId)
                 && (origin.runId == nil || $0.context.event.metadata["runId"] == origin.runId.map(JSONValue.string))
         }) else { return nil }
         let context = deferred.context
-        guard let request = context.caring, request.relayed else { return context }
-        let current = CaringAppraisalRequest(userMessage: request.userMessage, at: request.at,
-            context: request.context, relayed: true,
-            recentEncounters: recentCaringEncounters.filter { $0.at <= request.at },
-            personName: request.personName, session: request.session, turn: request.turn)
-        return AfterTurnContext(event: context.event, caring: current, generation: context.generation)
+        var caring = context.caring
+        if let request = caring, request.relayed {
+            caring = CaringAppraisalRequest(userMessage: request.userMessage, at: request.at,
+                context: request.context, relayed: true,
+                recentEncounters: recentCaringEncounters.filter { $0.at <= request.at },
+                personName: request.personName, session: request.session, turn: request.turn)
+        }
+        return AfterTurnContext(event: context.event, caring: caring, generation: context.generation,
+                                cares: await caresShown(for: origin.userMessage + "\n" + reply))
     }
 
     public func finishAfterTurn(_ context: AfterTurnContext, appraisal: AffectAppraisal?,
                                 caring: CaringAppraisalVerdict?) async -> [String: JSONValue]? {
+        let touchedCares = await appraisalCares(in: context.event.summary)
         await waitForMaintenanceTransition()
         guard context.generation == caringAppraisalGeneration,
               let index = deferredTurns.firstIndex(where: {
@@ -364,7 +373,8 @@ extension CognitiveSubstrate {
                                           precomputedWarmthBoost: weighted.warmthBoost)
         if let outcome = deferred.outcome, field.node(forKey: outcome.key) != nil {
             let semantic = semanticAppraisal(for: context.event, post: updated,
-                precomputedAppraisal: weighted, precomputedWarmthBoost: weighted.warmthBoost)
+                precomputedAppraisal: weighted, precomputedWarmthBoost: weighted.warmthBoost,
+                precomputedCares: touchedCares)
             let tag = emotionTag(for: context.event, affect: updated, semantic: semantic,
                                  precomputedAppraisal: weighted)
             field.stampEmotionTag(key: outcome.key, tag: tag, isNewNode: true, configuration: configuration)
@@ -374,7 +384,7 @@ extension CognitiveSubstrate {
         reconsolidatePendingCompletion(with: context.event, outcome: deferred.outcome,
                                        now: context.event.occurredAt, precomputedAppraisal: weighted)
         pendingCompletion = currentCompletion
-        let reaction = semanticExpectationMetadata(for: context.event)
+        let reaction = await semanticExpectationMetadata(for: context.event)
         if weighted.warmthBoost > 0 { lastWarmPresenceAt = context.event.occurredAt }
         markDirty(at: now)
         publishAttentionProjection(at: now)

@@ -240,11 +240,16 @@ public struct PacedStreamingText: View {
     /// that is still the whole text, so a jump to the end also pauses.
     @State private var restedAt = -1
 
-    public init(text: String, maxLagBytes: Int = ChatStreamPacer.maxLagBytes, inline: ChatInlineMarkdown? = nil, isVisible: Bool = true) {
+    /// Called each time the reveal has caught up with the whole text.
+    var onCaughtUp: (() -> Void)?
+
+    public init(text: String, maxLagBytes: Int = ChatStreamPacer.maxLagBytes, inline: ChatInlineMarkdown? = nil,
+                isVisible: Bool = true, onCaughtUp: (() -> Void)? = nil) {
         self.text = text
         self.maxLagBytes = maxLagBytes
         self.inline = inline
         self.isVisible = isVisible
+        self.onCaughtUp = onCaughtUp
     }
 
     public var body: some View {
@@ -254,13 +259,17 @@ public struct PacedStreamingText: View {
                 if let prepared = pacer.preparedView { prepared }
             } else if reduceMotion {
                 visible(text[...])
+                    .onChange(of: text, initial: true) { onCaughtUp?() }
             } else {
                 TimelineView(.animation(minimumInterval: 1.0 / 60, paused: restedAt == text.utf8.count)) { context in
                     let now = context.date.timeIntervalSinceReferenceDate
                     let shown = pacer.advance(text, now: now, maxLagBytes: maxLagBytes)
                     let restMark = pacer.isResting(text) ? text.utf8.count : -1
                     visible(text[..<text.utf8.index(text.utf8.startIndex, offsetBy: shown)], now: now)
-                        .onChange(of: restMark, initial: true) { _, mark in restedAt = mark }
+                        .onChange(of: restMark, initial: true) { _, mark in
+                            restedAt = mark
+                            if mark >= 0 { onCaughtUp?() }
+                        }
                 }
             }
         }
