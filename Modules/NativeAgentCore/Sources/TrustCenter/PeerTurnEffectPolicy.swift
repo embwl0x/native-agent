@@ -137,10 +137,11 @@ public enum PeerTurnEffectPolicy {
         readPeerData: Bool = false
     ) -> String? {
         let who = peer.display
-        let name = normalized(ToolNameAliases.ranTool(tool, input: input))
-        guard name == "commit_memory" else { return nil }
+        // Through the app door the save's own arguments sit under `args`.
+        let ran = ToolNameAliases.ranCall(tool, input: input)
+        guard normalized(ran.tool) == "commit_memory" else { return nil }
         // Peer-turn memory notes require provenance="told" and provenance_by naming the peer.
-        let kind = string(input["provenance"])?
+        let kind = string(ran.input["provenance"])?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard kind == "told" else {
             let origin = readPeerData ? "This turn read data from" : "The request came from"
@@ -149,7 +150,7 @@ public enum PeerTurnEffectPolicy {
                 + "provenance=\"told\" and provenance_by=\"\(who)\", so the note "
                 + "records what \(who) reported rather than established fact."
         }
-        let by = string(input["provenance_by"])?
+        let by = string(ran.input["provenance_by"])?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !by.isEmpty else {
             return "Set provenance_by=\"\(who)\" — provenance=\"told\" without "

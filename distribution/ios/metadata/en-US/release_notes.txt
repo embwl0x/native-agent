@@ -1,10 +1,8 @@
-NativeAgent 0.6.11 for iPhone and iPad goes with NativeAgent 0.6.11 on your Mac.
+NativeAgent 0.6.13 for iPhone and iPad goes with NativeAgent 0.6.13 on your Mac.
 
-- Reads everything a current Mac shares: approvals, inbox, memories, providers and chat open again instead of reporting a damaged copy.
-- Approvals, inbox, memory decisions and model choices show exactly what the Mac decided, and stay settled once you answer them.
-- Stop and Steer from your phone reach the same conversation on the Mac.
-- Chat reads one transcript with the Mac, attachments and inline cards included, and stays at the bottom while a reply types out smoothly to its end.
-- Voice: see every word as it's heard, and tap Send once to stop and send.
-- Schedules and reminders follow your Mac's clock and time zone.
+- Reads everything a 0.6.13 Mac shares: chat, approvals, inbox, memories and models.
+- Only a decision still owed sits at the bottom of the chat; a request that already finished, failed or expired stays with its turn and in Activity.
+- Approvals you answer on the phone settle through the same signed path as the Mac, and the card shows what happened.
+- Leaner: much of the phone's code was simplified with nothing taken away.
 
 Requires NativeAgent on a Mac signed in to the same Apple Account.

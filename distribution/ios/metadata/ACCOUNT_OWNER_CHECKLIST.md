@@ -3,6 +3,13 @@
 These steps require the NativeAgent Apple Developer/App Store Connect account
 and cannot be completed or truthfully verified from source alone.
 
+## 0.6.13 build 26 — 2026-10-29
+
+- [x] Build 26 from main `9f49fd16c` (goes with Mac 0.6.13; only a decision
+  still owed sits at the bottom of the chat): `script/ios_release.sh --archive
+  --export` passed, uploaded 2026-10-29 ("Upload succeeded"). TestFlight
+  internal; not yet submitted for App Store review.
+
 ## 0.6.11 build 25 — 2026-10-25
 
 - [x] Build 24 on User's phone: the chat held at the bottom; their reply showed a
